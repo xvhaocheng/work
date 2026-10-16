@@ -1,3 +1,15 @@
+# 2026年10月16日 MAP-DMA-VISIBILITY-CONTRACT-1：持久B可见性条件合同完成
+
+保留V-C＋每轮合法CPU/A/B交接的持久整页B映射条件设计。保守CQ保留mode、frame、B整页base三个逻辑值，先B整页for_cpu再处理frame，无独立binding token；旧句柄和A sync均不代替B交接。 在固定dma-iommu中，物理起点及size按实际IOVA granule对齐的B整页map不走该处bounce；普通O0-T每包整页fresh map同获益。真实bounce旧数据反例只用于其触发分支。收益候选仍是少做IOVA/PTE，须覆盖sync、lookup、prepare、CQ、控制、关闭及失败费用；未实现、native未知、未选论文主线。
+
+CPU、带宽、有效完成和每策略S∪P∪C_app∪C_sw∪Q_retire物理并集分别报告并去重，区分应用复制与后端bounce；B非bounce不证明A非bounce，不强套同一PFN轨迹。
+
+下一MAP-ALIGNED-STREAM-REUSE-EVIDENCE-1为evidence_gated_not_auto_scheduled：仅新且匹配backend／granule／sync合同的完整成本与生命周期证据，或具体部署能力差项触发；不自动开发、实验、建模或重复旧数据搜索，不等一般许可、CPU／内存价值确认或用户保证痛点。
+
+12个root主文件、26处root直接读段、16项worker清单、4份HTTP200原件和3次官方web open，仅属provenance，非测量。0生产源码修改、实验、状态／性能模型、构建、host设备probe或板测。Codex-only；API与backend请求gpt-6.1-sol/high，文档请求gpt-6.1-sol/medium；actual独立model/effort metadata unknown，不声称root切换。 B1/I/D/A5/A2与独立事项保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；10月15—28日窗口不重启。
+
+[本轮入口](iommu-platform/out/mapping-dma-visibility-20261016/README.md)／[裁决](iommu-platform/out/mapping-dma-visibility-20261016/root/decision-analysis.md)／[接受](iommu-platform/out/mapping-dma-visibility-20261016/root/root-result-acceptance.json)／[下一证据gate](iommu-platform/out/mapping-dma-visibility-20261016/root/next-minimal-contract.json)／[文档验收](iommu-platform/out/mapping-dma-visibility-20261016/documentation/verification.json)。以下完整即时旧字节后缀保留；既存14组历史失效链接只登记。
+
 # 2026年10月16日 MAP-OWNER-REPRESENTATION-COST-1：四种表示条件比较完成
 
 MAP-OWNER-REPRESENTATION-COST-1已完成四种表示的条件比较，保留V-C固定值稀疏表：seqcount稳定命中可免reader锁，odd／冲突须在同一writer锁内完整relookup。可条件免逐record grace；frame、全部片段／bias、operation及target/config/ctx/allocator整体寿命仍须保持。普通R/O3同享，不是新seqcount算法，未证独占或原生净赢，未选论文主线。 K信用、H容量及实际metadata RAM分开；固定预留字节不因空槽增加而减少。强RCU可先重发布payload、预留有界spares及批量退休；CPU、真实S/P/C/Q物理并集与分配反馈、PTE/IOVA、带宽和有效完成分别报告，native仍null。

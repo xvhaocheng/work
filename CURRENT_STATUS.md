@@ -1,12 +1,12 @@
-# 当前状态：映射关联表示比较完成，下一为贡献证据门槛
+# 当前状态：持久B映射可见性条件合同完成，下一为对齐复用证据门槛
 
-2026年10月16日（JST）。**V-C固定值稀疏表保留为条件表示设计；未实现、未证独占或净收益，未选论文主线。** [研究计划](研究计划.md)为唯一总计划，[研究导航](研究导航.md)定位资产。
+2026年10月16日（JST）。**未实现、native未知、未选论文主线。** [研究计划](研究计划.md)为唯一总计划，[研究导航](研究导航.md)定位资产。
 
 ## 全局安排与下一证据
 
-- MAP-OWNER-REPRESENTATION-COST-1已完成四种表示的条件比较，保留V-C固定值稀疏表：seqcount稳定命中可免reader锁，odd／冲突须在同一writer锁内完整relookup。可条件免逐record grace；frame、全部片段／bias、operation及target/config/ctx/allocator整体寿命仍须保持。普通R/O3同享，不是新seqcount算法，未证独占或原生净赢，未选论文主线。
-- K信用、H容量及实际metadata RAM分开；固定预留字节不因空槽增加而减少。强RCU可先重发布payload、预留有界spares及批量退休；CPU、真实S/P/C/Q物理并集与分配反馈、PTE/IOVA、带宽和有效完成分别报告，native仍null。
-- 下一MAP-VALUE-TABLE-CONTRIBUTION-EVIDENCE-1为evidence_gated_not_auto_scheduled：仅新代表性完整成本／生命周期或具体部署能力差项触发；不自动开发、采集、建模、重复数据搜索／旧账或继续拆相同协议，不等待一般许可、价值确认或用户保证痛点。 [本轮入口](iommu-platform/out/mapping-owner-representation-20261016/README.md)／[裁决](iommu-platform/out/mapping-owner-representation-20261016/root/decision-analysis.md)／[假设卡](iommu-platform/out/mapping-owner-representation-20261016/root/hypothesis-card.json)／[接受](iommu-platform/out/mapping-owner-representation-20261016/root/root-result-acceptance.json)／[下一证据gate](iommu-platform/out/mapping-owner-representation-20261016/root/next-minimal-contract.json)。
+- 保留V-C＋每轮合法CPU/A/B交接的持久整页B映射条件设计。保守CQ保留mode、frame、B整页base三个逻辑值，先B整页for_cpu再处理frame，无独立binding token；旧句柄和A sync均不代替B交接。
+- 在固定dma-iommu中，物理起点及size按实际IOVA granule对齐的B整页map不走该处bounce；普通O0-T每包整页fresh map同获益。真实bounce旧数据反例只用于其触发分支。收益候选仍是少做IOVA/PTE，须覆盖sync、lookup、prepare、CQ、控制、关闭及失败费用；未实现、native未知、未选论文主线。 CPU、带宽、有效完成和每策略S∪P∪C_app∪C_sw∪Q_retire物理并集分别报告并去重，区分应用复制与后端bounce；B非bounce不证明A非bounce，不强套同一PFN轨迹。
+- 下一MAP-ALIGNED-STREAM-REUSE-EVIDENCE-1为evidence_gated_not_auto_scheduled：仅新且匹配backend／granule／sync合同的完整成本与生命周期证据，或具体部署能力差项触发；不自动开发、实验、建模或重复旧数据搜索，不等一般许可、CPU／内存价值确认或用户保证痛点。 [本轮入口](iommu-platform/out/mapping-dma-visibility-20261016/README.md)／[裁决](iommu-platform/out/mapping-dma-visibility-20261016/root/decision-analysis.md)／[接受](iommu-platform/out/mapping-dma-visibility-20261016/root/root-result-acceptance.json)／[下一证据gate](iommu-platform/out/mapping-dma-visibility-20261016/root/next-minimal-contract.json)。
 
 ## 各分支最新进展
 
@@ -16,7 +16,7 @@
 
 ## 硬件与执行状态
 
-13处root直接读段行界、9项frame primary及13项混合表示证据、2份raw HTTP200哈希核验通过，仅属provenance；另有2次官方web open。0生产源码编辑、native／新模型／旧实验／旧账／构建、数据重搜、host设备probe或硬件动作。Codex-only；frame核查请求Sol/high、表示分析Sol/xhigh、文档Sol/medium；actual独立model/effort metadata unknown，不声称root切换。 B1/I/D/A5/A2及并发独立事项保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；10月15—28日窗口不重启。详见[执行账](iommu-platform/out/mapping-owner-representation-20261016/root/execution-ledger.json)。
+12个root主文件、26处root直接读段、16项worker清单、4份HTTP200原件和3次官方web open，仅属provenance，非测量。0生产源码修改、实验、状态／性能模型、构建、host设备probe或板测。Codex-only；API与backend请求gpt-6.1-sol/high，文档请求gpt-6.1-sol/medium；actual独立model/effort metadata unknown，不声称root切换。 B1/I/D/A5/A2与独立事项保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；10月15—28日窗口不重启。 详见[执行账](iommu-platform/out/mapping-dma-visibility-20261016/root/execution-ledger.json)。
 
 ## 独立工程事项
 
