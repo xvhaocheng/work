@@ -1,0 +1,320 @@
+--- linux/drivers/misc/idma.c
++++ linux/drivers/misc/idma.c
+@@ -5,7 +5,9 @@
+ #include <linux/io.h>
+ #include <linux/iommu.h>
+ #include <linux/iopoll.h>
++#include <linux/irqflags.h>
+ #include <linux/kernel.h>
++#include <linux/preempt.h>
+ #include <linux/ktime.h>
+ #include <linux/miscdevice.h>
+ #include <linux/mm.h>
+@@ -130,6 +132,18 @@
+ 	struct idma_e3_diag_lane *diagnostic;
+ };
+ 
++struct idma_batch_start {
++	bool attempted;
++	bool has_a;
++	bool a_triggered;
++	bool v_triggered;
++	u32 v_did, a_did;
++	u64 a_id, v_id;
++	u64 a_begin_ns, a_end_ns;
++	u64 v_begin_ns, v_end_ns;
++	u64 irq_span_ns;
++};
++
+ static DEFINE_MUTEX(idma_devices_lock);
+ static struct idma_device *idma_devices[IDMA_MAX_DEVS];
+ /* All experiment preparation, IOVA mappings and DMA execution are serialized. */
+@@ -390,10 +404,8 @@
+ 	dev_crit(s->dev, "experiment DMA not safely drained; buffers retained until reboot\n");
+ }
+ 
+-static int idma_submit(struct idma_stream *s, bool measured)
+-{
+-	u64 now;
+-
++static void idma_submit_config(struct idma_stream *s)
++{
+ 	if (s->diagnostic && s->batch_started)
+ 		s->diagnostic->launch_begin_ns = ktime_get_ns();
+ 	s->offset = s->next_offset;
+@@ -401,14 +413,11 @@
+ 	writeq(s->dst_iova + s->offset, s->idma->reg + IDMA_DST_ADDR_REG_OFFSET);
+ 	writeq(s->chunk, s->idma->reg + IDMA_NUM_BYTES_REG_OFFSET);
+ 	writeq(0, s->idma->reg + IDMA_CONF_REG_OFFSET);
+-	s->transfer_id = readq(s->idma->reg + IDMA_NEXT_ID_REG_OFFSET);
+-	if (!s->transfer_id) {
+-		/* Without a valid ID we cannot prove that buffers are no longer used. */
+-		idma_quarantine(s);
+-		return -EIO;
+-	}
+-	/* Include configuration writes and the NEXT_ID trigger in refill cost. */
+-	now = ktime_get_ns();
++}
++
++static void idma_submit_commit(struct idma_stream *s, u64 id, bool measured, u64 now)
++{
++	s->transfer_id = id;
+ 	if (s->diagnostic) {
+ 		if (s->batch_started)
+ 			s->diagnostic->launch_end_ns = now;
+@@ -430,7 +439,151 @@
+ 		s->next_offset = 0;
+ 	if (measured)
+ 		s->stats->submitted++;
++}
++
++static int idma_submit(struct idma_stream *s, bool measured)
++{
++	u64 now, id;
++
++	idma_submit_config(s);
++	id = readq(s->idma->reg + IDMA_NEXT_ID_REG_OFFSET);
++	if (!id) {
++		/* Without a valid ID we cannot prove that buffers are no longer used. */
++		idma_quarantine(s);
++		return -EIO;
++	}
++	/* Include configuration writes and the NEXT_ID trigger in refill cost. */
++	now = ktime_get_ns();
++	idma_submit_commit(s, id, measured, now);
+ 	return 0;
++}
++
++/*
++ * Bounded software batch start.  Both register sets are configured before any
++ * NEXT_ID trigger.  Only the ordered A-then-V trigger reads, the software
++ * timestamp reads and the per-stream commit bookkeeping run with IRQs and
++ * preemption disabled.  The section is non-sleeping and never covers polling,
++ * drain, quarantine, allocation, logging or cond_resched.
++ *
++ * a_triggered/v_triggered mean the corresponding NEXT_ID read was executed,
++ * even when it returned zero.  a_id/v_id carry the raw readback (zero on
++ * failure).  irq_span_ns is the ktime bracket around the protected trigger
++ * reads; the real IRQ-off interval extends a bounded few instructions on both
++ * sides and is not a cycle-accurate or interrupt-latency measurement.
++ */
++static int idma_batch_start(struct idma_stream *v, struct idma_stream *a,
++			    u64 deadline, u64 *end_ns,
++			    struct idma_batch_start *start)
++{
++	unsigned long flags;
++	u64 a_id = 0, v_id = 0;
++	int ret;
++
++	if (ktime_get_ns() >= deadline) {
++		ret = -ETIMEDOUT;
++		goto out;
++	}
++	if (signal_pending(current)) {
++		ret = -EINTR;
++		goto out;
++	}
++
++	/*
++	 * Ownership and configuration are outside the protected trigger section.
++	 * Mark batch_started before the trigger so failure handling keeps the
++	 * same STOP/drain retention ownership as the ordinary batch path.
++	 */
++	if (a) {
++		a->batch_started = true;
++		idma_submit_config(a);
++	}
++	v->batch_started = true;
++	idma_submit_config(v);
++
++	start->attempted = true;
++	preempt_disable();
++	local_irq_save(flags);
++
++	if (a) {
++		start->a_begin_ns = ktime_get_ns();
++		a_id = readq(a->idma->reg + IDMA_NEXT_ID_REG_OFFSET);
++		start->a_end_ns = ktime_get_ns();
++		start->a_triggered = true;
++		start->a_id = a_id;
++		if (!a_id) {
++			local_irq_restore(flags);
++			preempt_enable();
++			/* V was only configured, never triggered. */
++			v->batch_started = false;
++			if (v->diagnostic) {
++				v->diagnostic->launch_begin_ns = 0;
++				v->diagnostic->launch_end_ns = 0;
++			}
++			idma_quarantine(a);
++			ret = -EIO;
++			goto out;
++		}
++		idma_submit_commit(a, a_id, false, start->a_end_ns);
++	}
++
++	start->v_begin_ns = ktime_get_ns();
++	v_id = readq(v->idma->reg + IDMA_NEXT_ID_REG_OFFSET);
++	start->v_end_ns = ktime_get_ns();
++	start->v_triggered = true;
++	start->v_id = v_id;
++	if (!v_id) {
++		local_irq_restore(flags);
++		preempt_enable();
++		idma_quarantine(v);
++		ret = -EIO;
++		goto out;
++	}
++	idma_submit_commit(v, v_id, false, start->v_end_ns);
++
++	local_irq_restore(flags);
++	preempt_enable();
++
++	start->irq_span_ns = start->v_end_ns -
++		(a ? start->a_begin_ns : start->v_begin_ns);
++	return 0;
++
++out:
++	if (start->attempted) {
++		if (start->a_triggered && start->v_triggered)
++			start->irq_span_ns = start->v_end_ns - start->a_begin_ns;
++		else if (start->a_triggered)
++			start->irq_span_ns = start->a_end_ns - start->a_begin_ns;
++		else if (start->v_triggered)
++			start->irq_span_ns = start->v_end_ns - start->v_begin_ns;
++	}
++	*end_ns = ktime_get_ns();
++	return ret;
++}
++
++/*
++ * Log contract (version 1), emitted only after the observation finisher and
++ * all error aggregation.  Timestamps are software ktime brackets around the
++ * protected trigger reads; they are not hardware issue timestamps, cycle
++ * accurate or an interrupt-latency proof.  a_triggered/v_triggered mean the
++ * corresponding NEXT_ID read was attempted; a_id/v_id are the raw readbacks
++ * and may be zero on failure.  a_to_v_ns is valid only when both A and V
++ * trigger reads were attempted.
++ */
++static void idma_batch_start_log(struct device *dev,
++				 const struct idma_batch_start *start,
++				 u64 sequence, int error)
++{
++	u64 a_to_v_ns = 0;
++
++	if (start->has_a && start->a_triggered && start->v_triggered)
++		a_to_v_ns = start->v_begin_ns - start->a_begin_ns;
++	dev_info(dev,
++		 "idma_batch_start version=1 seq=%llu method=irq_pair v_did=%u a_did=%u attempted=%u has_a=%u a_triggered=%u v_triggered=%u a_id=%llu v_id=%llu a_begin_ns=%llu a_end_ns=%llu v_begin_ns=%llu v_end_ns=%llu irq_span_ns=%llu a_to_v_ns=%llu error=%d\n",
++		 sequence, start->v_did, start->a_did, start->attempted,
++		 start->has_a, start->a_triggered, start->v_triggered,
++		 start->a_id, start->v_id, start->a_begin_ns, start->a_end_ns,
++		 start->v_begin_ns, start->v_end_ns, start->irq_span_ns,
++		 a_to_v_ns, error);
+ }
+ 
+ /* 1: completion observed; 0: pending; negative: failed. Never refills itself. */
+@@ -642,29 +795,15 @@
+ }
+ 
+ static int idma_batch_window(struct idma_stream *v, struct idma_stream *a,
+-			     u64 deadline, u64 *end_ns)
++			     u64 deadline, u64 *end_ns,
++			     struct idma_batch_start *start)
+ {
+ 	u32 spins = 0;
+ 	int ret;
+ 
+-	if (ktime_get_ns() >= deadline) {
+-		ret = -ETIMEDOUT;
+-		goto out;
+-	}
+-	if (signal_pending(current)) {
+-		ret = -EINTR;
+-		goto out;
+-	}
+-	if (a) {
+-		a->batch_started = true;
+-		ret = idma_submit(a, false);
+-		if (ret)
+-			goto out;
+-	}
+-	v->batch_started = true;
+-	ret = idma_submit(v, false);
++	ret = idma_batch_start(v, a, deadline, end_ns, start);
+ 	if (ret)
+-		goto out;
++		return ret;
+ 	v->deadline_ns = deadline;
+ 	for (;;) {
+ 		if (ktime_get_ns() >= deadline) {
+@@ -686,7 +825,6 @@
+ 			cond_resched();
+ 		cpu_relax();
+ 	}
+- out:
+ 	*end_ns = ktime_get_ns();
+ 	return ret;
+ }
+@@ -2012,6 +2150,7 @@
+ 	struct idma_observation observation = { .batch = batch, .e3 = !!pair, .queue_pair = queue_pair,
+ 		.delay128 = pair && pair->first_delay == 128, .p4m = !!p4m };
+ 	struct idma_stream *v = &streams[0], *a = NULL;
++	struct idma_batch_start batch_start = {};
+ 	struct idma_device *aggressor = NULL;
+ 	struct riscv_iommu_hpm_session *hpm = NULL;
+ 	struct riscv_iommu_hpm_sample before, after;
+@@ -2050,6 +2189,9 @@
+ 		e.aggressor_did = aggressor->did;
+ 		a = &streams[1];
+ 	}
++	batch_start.v_did = victim->did;
++	batch_start.a_did = a ? aggressor->did : IDMA_EXPERIMENT_NO_AGGRESSOR;
++	batch_start.has_a = !!a;
+ 	if (p4m) {
+ 		ret = idma_gap_preflight(victim, aggressor);
+ 		if (ret)
+@@ -2088,6 +2230,14 @@
+ 		}
+ 	}
+  run_round:
++	batch_start.attempted = false;
++	batch_start.a_triggered = false;
++	batch_start.v_triggered = false;
++	batch_start.a_id = 0;
++	batch_start.v_id = 0;
++	batch_start.a_begin_ns = batch_start.a_end_ns = 0;
++	batch_start.v_begin_ns = batch_start.v_end_ns = 0;
++	batch_start.irq_span_ns = 0;
+ 	if (diagnostic) {
+ 		diag = &diagnostic[round];
+ 		v->diagnostic = &diag->lane[0];
+@@ -2180,7 +2330,7 @@
+ 	start = ktime_get_ns();
+ 	e.snapshot_before_ns = start - stamp;
+ 	e.measurement_started = 1;
+-	ret = batch ? idma_batch_window(v, a, deadline, &end) :
++	ret = batch ? idma_batch_window(v, a, deadline, &end, &batch_start) :
+ 		idma_run_window(v, a, e.victim_transfers, deadline, true, &end);
+ 	e.victim_elapsed_ns = end - start;
+ 	e.measurement_complete = !ret;
+@@ -2260,6 +2410,9 @@
+ 		e.status = ret;
+ 		pair->result[round] = e;
+ 		pair->sequence[round] = observation.sequence;
++		if (batch)
++			idma_batch_start_log(victim->miscdev.parent, &batch_start,
++					     observation.sequence, ret);
+ 		if (!ret)
+ 			pair->rounds_completed++;
+ 		if (!ret && round == 0) {
+@@ -2278,6 +2431,9 @@
+ 				goto out_cleanup;
+ 			goto run_round;
+ 		}
++	} else if (batch) {
++		idma_batch_start_log(victim->miscdev.parent, &batch_start,
++				     observation.sequence, ret);
+ 	}
+ 	if (a)
+ 		idma_stream_cleanup(a);

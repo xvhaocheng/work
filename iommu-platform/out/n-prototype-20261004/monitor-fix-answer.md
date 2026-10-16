@@ -1,0 +1,161 @@
+```diff
+--- a/cva6/corev_apu/fpga/src/dma_nonblock_observer.sv
++++ b/cva6/corev_apu/fpga/src/dma_nonblock_observer.sv
+@@ -73,3 +73,4 @@
+     logic [3:0]  cat;
++    logic        arm_overlap;
+ 
+     always_comb begin
+@@ -93,7 +94,9 @@
+             else if (nn_11)    cat = 4'd12;
+             else               cat = 4'd13;
+         end
+ 
++        arm_overlap = arm && (open || close);
++
+         state_d = state_q;
+         seq_d   = seq_q;
+         err_d   = err_q;
+@@ -100,30 +103,46 @@
+         for (int i = 0; i < 16; i++) cnt_d[i] = cnt_q[i];
+ 
+         // ---- commands ----
+-        // ARM clears the window and arms. Invalid while active: set error and
+-        // preserve the in-flight window.
+-        if (arm) begin
+-            if (state_q == S_ACTIVE) begin
+-                err_d[E_OVERLAP] = 1'b1;
+-            end else begin
+-                seq_d   = seq_q + 64'd1;
+-                state_d = S_ARMED;
+-                err_d   = '0;
+-                for (int i = 0; i < 16; i++) cnt_d[i] = '0;
+-            end
+-        end
+-
+-        // OPEN is only legal from ARMED. No open-edge event is counted.
+-        if (open) begin
+-            if (state_d == S_ARMED)       state_d = S_ACTIVE;
+-            else if (state_d == S_ACTIVE) err_d[E_OVERLAP]      = 1'b1; // open while active
+-            else                          err_d[E_OPEN_NO_ARM]  = 1'b1; // open without arm
+-        end
+-
+-        // CLOSE is only legal while active. Freezes the window.
+-        if (close) begin
+-            if (state_d == S_ACTIVE) state_d = S_FROZEN;
+-            else                     err_d[E_CLOSE_NO_ACT] = 1'b1;
+-        end
++        // ARM clears the window and arms. Invalid while active or when asserted
++        // together with OPEN/CLOSE: set overlap error and preserve the window.
++        if (arm) begin
++            if (arm_overlap) begin
++                err_d[E_OVERLAP] = 1'b1;
++            end else if (state_q == S_ACTIVE) begin
++                err_d[E_OVERLAP] = 1'b1;
++            end else begin
++                state_d = S_ARMED;
++                err_d   = '0;
++                for (int i = 0; i < 16; i++) cnt_d[i] = '0;
++                if (seq_q == {64{1'b1}}) err_d[E_OVERFLOW] = 1'b1;
++                else                     seq_d = seq_q + 64'd1;
++            end
++        end
++
++        // OPEN is only legal from registered ARMED, with no same-cycle ARM.
++        // No open-edge event is counted.
++        if (open) begin
++            if (arm) begin
++                err_d[E_OVERLAP] = 1'b1; // ARM/OPEN overlap is invalid
++            end else if (state_q == S_ARMED) begin
++                state_d = S_ACTIVE;
++            end else if (state_q == S_ACTIVE) begin
++                err_d[E_OVERLAP] = 1'b1; // open while active
++            end else begin
++                err_d[E_OPEN_NO_ARM] = 1'b1; // open without arm
++            end
++        end
++
++        // CLOSE is only legal while registered ACTIVE, with no same-cycle ARM.
++        // Freezes the window.
++        if (close) begin
++            if (arm) begin
++                err_d[E_OVERLAP] = 1'b1; // ARM/CLOSE overlap is invalid
++            end else if (state_q == S_ACTIVE) begin
++                state_d = S_FROZEN;
++            end else begin
++                err_d[E_CLOSE_NO_ACT] = 1'b1;
++            end
++        end
+ 
+         // ---- window accumulation (open, close] ----
+--- a/tests/nonblock_observer_test.cpp
++++ b/tests/nonblock_observer_test.cpp
+@@ -14,4 +14,5 @@
+ static void tick() {
+-    dut->clk = 1; dut->eval();   // posedge captures inputs
++    dut->clk = 0; dut->eval();   // settle inputs before posedge
++    dut->clk = 1; dut->eval();   // posedge captures inputs
+     dut->clk = 0; dut->eval();
+ }
+@@ -147,6 +148,40 @@
+     if (mode == 1)
+         check("mode1 fast err", (rd(15) >> 5) & 1, 1);
+     else
+         check("mode2 no mode1", (rd(15) >> 5) & 1, 0);
+ 
++    // ---- focused reset + ARM/OPEN overlap contract ----
++    dut->rst = 1; idle(); tick();
++    dut->rst = 0; idle(); dut->eval();
++    check("overlap-reset flags",  rd(3),  0);
++    check("overlap-reset seq",    rd(4),  0);
++    check("overlap-reset cycles", rd(5),  0);
++    check("overlap-reset err",    rd(15), 0);
++
++    // ARM and OPEN asserted together is invalid: overlap error, no window.
++    idle(); dut->arm = 1; dut->open = 1; tick();
++    idle(); dut->eval();
++    check("arm+open overlap err", (rd(15) >> 2) & 1, 1);
++    check("arm+open not active",  (rd(3) >> 1) & 1, 0);
++    check("arm+open not armed",   (rd(3) >> 0) & 1, 0);
++    check("arm+open seq held",    rd(4), 0);
++
++    // A clean ARM after the overlap is accepted and clears the error.
++    idle(); dut->arm = 1; tick();
++    idle(); dut->eval();
++    check("clean-arm err clear", (rd(15) >> 2) & 1, 0);
++    check("clean-arm armed",     rd(3), 0x1);
++    check("clean-arm seq",       rd(4), 1);
++
++    // The open edge remains excluded and the close edge remains counted.
++    idle(); dut->open = 1; tick();
++    idle(); dut->eval();
++    check("close-edge open active", (rd(3) >> 1) & 1, 1);
++    check("close-edge open cycles", rd(5), 0);
++
++    idle(); dut->close = 1; tick();
++    idle(); dut->eval();
++    check("close-edge frozen", (rd(3) >> 2) & 1, 1);
++    check("close-edge cycles", rd(5), 1);
++
+     delete dut;
+--- a/tests/test_nonblock_observer.py
++++ b/tests/test_nonblock_observer.py
+@@ -53,3 +53,4 @@
+     args = ap.parse_args()
++    args.build_root = os.path.abspath(args.build_root)
+ 
+     modes = [2] if args.no_mode1 else [2, 1]
+--- a/tests/nonblock_banked_test.cpp
++++ b/tests/nonblock_banked_test.cpp
+@@ -45,7 +45,5 @@
+ static uint64_t make_test_word(uint64_t word_index) {
+-    uint64_t v = 0;
+-    for (int b = 0; b < 8; ++b)
+-        v |= (uint64_t)(uint8_t)((word_index * 8 + (uint64_t)b) & 0xFF)
+-             << (8 * b);
+-    return v;
++    // Odd 64-bit multiplier + xor constant: a full-width permutation, so every
++    // word index in 0..511 is unique and the old low-byte repeat is avoided.
++    return (word_index * 0x9E3779B97F4A7C15ULL) ^ 0xA5C3E10D2B4F9678ULL;
+ }
+```

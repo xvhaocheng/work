@@ -1,0 +1,464 @@
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -31,6 +31,13 @@
+ #include <linux/vmalloc.h>
+ 
+ #include "dma-iommu.h"
++
++#if IS_BUILTIN(CONFIG_RISCV_IOMMU)
++#include <linux/iommu-finite.h>
++#include <linux/overflow.h>
++#include <linux/sort.h>
++#include "../../kernel/dma/debug.h"
++#endif
+ 
+ struct iommu_dma_msi_page {
+ 	struct list_head	list;
+@@ -1609,6 +1616,217 @@
+ 	.opt_mapping_size	= iommu_dma_opt_mapping_size,
+ };
+ 
++#if IS_BUILTIN(CONFIG_RISCV_IOMMU)
++static int iommu_finite_pa_cmp(const void *a, const void *b)
++{
++	u64 pa = *(const u64 *)a, pb = *(const u64 *)b;
++
++	return (pa > pb) - (pa < pb);
++}
++
++/*
++ * Only the finite kernel owner's GFP_KERNEL dma_alloc_attrs records are
++ * admissible. CPU/IOVA identity checks do not establish atomic-pool provenance.
++ * No old allocation/free/unmap callback is changed by this additive path.
++ */
++int iommu_dma_free_finite_checked(struct device *dev,
++				  struct iommu_finite_allocation *items,
++				  unsigned int nr,
++				  int (*checked_sync)(void *), void *sync_data)
++{
++	struct iommu_domain *domain;
++	struct iommu_dma_cookie *cookie;
++	struct iova_domain *iovad;
++	struct iommu_finite_leaf *leaves = NULL, leaf;
++	struct iommu_iotlb_gather gather;
++	u64 *pas = NULL;
++	size_t total_pages = 0, nr_leaves = 0, nr_pas = 0, off, n;
++	unsigned int i, j;
++	int ret = -EINVAL;
++
++	if (!dev || !items || !nr || nr > 8 || !checked_sync)
++		return -EINVAL;
++	if (irqs_disabled() || in_interrupt())
++		return -EWOULDBLOCK;
++	if (get_dma_ops(dev) != &iommu_dma_ops)
++		return -EOPNOTSUPP;
++#ifdef CONFIG_DMA_OPS_BYPASS
++	if (dev->dma_ops_bypass)
++		return -EOPNOTSUPP;
++#endif
++#ifdef CONFIG_DMA_DECLARE_COHERENT
++	if (dev->dma_mem)
++		return -EOPNOTSUPP;
++#endif
++	domain = iommu_get_dma_domain(dev);
++	if (!domain || domain != iommu_get_domain_for_dev(dev) ||
++	    domain->type != IOMMU_DOMAIN_DMA || !domain->iova_cookie)
++		return -EOPNOTSUPP;
++	cookie = domain->iova_cookie;
++	if (cookie->type != IOMMU_DMA_IOVA_COOKIE ||
++	    READ_ONCE(cookie->fq_domain))
++		return -EOPNOTSUPP;
++	iovad = &cookie->iovad;
++	if (iovad->granule != PAGE_SIZE || iovad->granule != SZ_4K)
++		return -EOPNOTSUPP;
++
++	/* Check every allocation before revoking even one PTE. */
++	for (i = 0; i < nr; i++) {
++		struct iommu_finite_allocation *item = &items[i];
++		struct iova *reservation;
++		unsigned long cpu_end, iova_end;
++		size_t pages;
++
++		if (!item->cpu_addr || !item->size ||
++		    !IS_ALIGNED(item->size, PAGE_SIZE) ||
++		    !IS_ALIGNED((unsigned long)item->cpu_addr, PAGE_SIZE) ||
++		    !IS_ALIGNED(item->handle, PAGE_SIZE) ||
++		    item->handle > ULONG_MAX ||
++		    check_add_overflow((unsigned long)item->cpu_addr,
++				       item->size, &cpu_end) ||
++		    check_add_overflow((unsigned long)item->handle,
++				       item->size, &iova_end))
++			goto out;
++		pages = item->size >> PAGE_SHIFT;
++		/* __iommu_dma_free uses an int page count. */
++		if (pages > INT_MAX ||
++		    check_add_overflow(total_pages, pages, &total_pages)) {
++			ret = -E2BIG;
++			goto out;
++		}
++		for (j = 0; j < i; j++)
++			if (((unsigned long)item->cpu_addr <
++			     (unsigned long)items[j].cpu_addr + items[j].size &&
++			     (unsigned long)items[j].cpu_addr < cpu_end) ||
++			    (item->handle < items[j].handle + items[j].size &&
++			     items[j].handle < iova_end))
++				goto out;
++		if (is_vmalloc_addr(item->cpu_addr)) {
++			struct vm_struct *area = find_vm_area(item->cpu_addr);
++
++			if (!area || area->addr != item->cpu_addr ||
++			    area->flags != VM_DMA_COHERENT ||
++			    get_vm_area_size(area) != item->size)
++				goto out;
++		} else if (!virt_addr_valid(item->cpu_addr)) {
++			goto out;
++		}
++		reservation = find_iova(iovad, item->handle >> PAGE_SHIFT);
++		/* Narrow interface: reject allocator padding, not foreign extents. */
++		if (!reservation || reservation->pfn_lo !=
++		    item->handle >> PAGE_SHIFT || iova_size(reservation) != pages)
++			goto out;
++	}
++	leaves = kvcalloc(total_pages, sizeof(*leaves), GFP_KERNEL);
++	pas = kvcalloc(total_pages, sizeof(*pas), GFP_KERNEL);
++	if (!leaves || !pas) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	for (i = 0; i < nr; i++) {
++		struct iommu_finite_allocation *item = &items[i];
++
++		for (off = 0; off < item->size; off += leaf.bytes) {
++			ret = riscv_iommu_finite_leaf(dev, item->handle + off,
++						      &leaf);
++			if (ret)
++				goto out;
++			if (leaf.iova != item->handle + off || !leaf.bytes ||
++			    !IS_ALIGNED(leaf.bytes, PAGE_SIZE) ||
++			    leaf.bytes > item->size - off ||
++			    (leaf.pte & (BIT_ULL(0) | BIT_ULL(1) | BIT_ULL(2))) !=
++				 (BIT_ULL(0) | BIT_ULL(1) | BIT_ULL(2)) ||
++			    (leaf.pte & BIT_ULL(3))) {
++				ret = -EPROTO;
++				goto out;
++			}
++			if (!(domain->pgsize_bitmap & leaf.bytes)) {
++				ret = -EOPNOTSUPP;
++				goto out;
++			}
++			leaves[nr_leaves++] = leaf;
++			for (n = 0; n < leaf.bytes; n += PAGE_SIZE) {
++				void *addr = item->cpu_addr + off + n;
++				struct page *page;
++
++				if (!is_vmalloc_addr(addr) && !virt_addr_valid(addr)) {
++					ret = -EINVAL;
++					goto out;
++				}
++				page = is_vmalloc_addr(addr) ? vmalloc_to_page(addr) :
++								 virt_to_page(addr);
++				if (!page || page_to_phys(page) != leaf.pa + n) {
++					ret = -ESTALE;
++					goto out;
++				}
++				pas[nr_pas++] = page_to_phys(page);
++			}
++		}
++	}
++	sort(pas, nr_pas, sizeof(*pas), iommu_finite_pa_cmp, NULL);
++	for (n = 1; n < nr_pas; n++)
++		if (pas[n] == pas[n - 1]) {
++			ret = -EXDEV;
++			goto out;
++		}
++
++	/* IOVA reservations and all CPU/backing objects remain owned here. */
++	for (n = 0; n < nr_leaves; n++) {
++		ret = riscv_iommu_finite_leaf(dev, leaves[n].iova, &leaf);
++		if (ret)
++			goto out;
++		if (memcmp(&leaf, &leaves[n], sizeof(leaf))) {
++			ret = -ESTALE;
++			goto out;
++		}
++		iommu_iotlb_gather_init(&gather);
++		if (iommu_unmap_fast(domain, leaf.iova, leaf.bytes, &gather) !=
++		    leaf.bytes) {
++			ret = -EIO;
++			goto out;
++		}
++		/* The validated RISC-V leaf callback never retires table pages. */
++		if (WARN_ON_ONCE(!list_empty(&gather.freelist))) {
++			ret = -EOPNOTSUPP;
++			goto out;
++		}
++	}
++	for (i = 0; i < nr; i++)
++		for (off = 0; off < items[i].size; off += PAGE_SIZE) {
++			ret = riscv_iommu_finite_leaf(dev, items[i].handle + off,
++						      &leaf);
++			if (ret != -ENOENT) {
++				if (!ret)
++					ret = -EBUSY;
++				goto out;
++			}
++		}
++	ret = checked_sync(sync_data);
++	if (ret)
++		goto out;
++	if (iommu_get_dma_domain(dev) != domain ||
++	    iommu_get_domain_for_dev(dev) != domain ||
++	    get_dma_ops(dev) != &iommu_dma_ops || READ_ONCE(cookie->fq_domain)) {
++		ret = -ESTALE;
++		goto out;
++	}
++
++	/* Checked invalidation succeeded AFTER the PTE revocations. No second unmap. */
++	for (i = 0; i < nr; i++) {
++		iommu_dma_free_iova(cookie, items[i].handle, items[i].size, NULL);
++		debug_dma_free_coherent(dev, items[i].size,
++					items[i].cpu_addr, items[i].handle);
++		__iommu_dma_free(dev, items[i].size, items[i].cpu_addr);
++	}
++	ret = 0;
++out:
++	kvfree(pas);
++	kvfree(leaves);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(iommu_dma_free_finite_checked);
++#endif /* IS_BUILTIN(CONFIG_RISCV_IOMMU) */
++
+ /*
+  * The IOMMU core code allocates the default DMA domain, which the underlying
+  * IOMMU driver needs to support via the dma-iommu layer.
+--- a/drivers/iommu/riscv/io_pgtable.c
++++ b/drivers/iommu/riscv/io_pgtable.c
+@@ -11,8 +11,11 @@
+ 
+ #include <linux/atomic.h>
+ #include <linux/bitops.h>
++#include <linux/export.h>
+ #include <linux/io-pgtable.h>
++#include <linux/iommu-finite.h>
+ #include <linux/kernel.h>
++#include <linux/lockdep.h>
+ #include <linux/sizes.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
+@@ -225,6 +228,143 @@
+ 	return pfn_to_phys(pte_pfn(*pte)) | (iova & ((1UL << leaf_shift) - 1));
+ }
+ 
++#if IS_BUILTIN(CONFIG_RISCV_IOMMU)
++/* Caller-held HPM/binding/extent ownership is required; see iommu-finite.h. */
++int riscv_iommu_finite_leaf(struct device *dev, unsigned long iova,
++			    struct iommu_finite_leaf *out)
++{
++	struct riscv_iommu_endpoint *ep;
++	struct riscv_iommu_domain *domain;
++	struct iommu_domain *core;
++	pmd_t *table;
++	unsigned int shift, i;
++	u64 tc, fsc, value, next_pa;
++	int ret = 0;
++
++	if (!out)
++		return -EINVAL;
++	memset(out, 0, sizeof(*out));
++	ep = riscv_iommu_hpm_endpoint(dev);
++	if (!ep || !ep->iommu)
++		return -EOPNOTSUPP;
++	if (!mutex_is_locked(&ep->iommu->hpm_lock))
++		return -EPERM;
++	lockdep_assert_held(&ep->iommu->hpm_lock);
++	core = iommu_get_domain_for_dev(dev);
++	if (!core || core->type != IOMMU_DOMAIN_DMA || !ep->domain ||
++	    &ep->domain->domain != core)
++		return -ESTALE;
++	domain = ep->domain;
++
++	/* Same lock order as attach. This is NOT a legacy map/unmap lock. */
++	mutex_lock(&domain->lock);
++	mutex_lock(&ep->lock);
++	if (ep->dev != dev || ep->domain != domain ||
++	    iommu_get_domain_for_dev(dev) != core ||
++	    domain->iommu != ep->iommu) {
++		ret = -ESTALE;
++		goto out_unlock;
++	}
++	if (!list_is_singular(&domain->endpoints) ||
++	    list_first_entry(&domain->endpoints,
++			     struct riscv_iommu_endpoint, domains) != ep) {
++		ret = -EXDEV;
++		goto out_unlock;
++	}
++	if (domain->g_stage || domain->nested || ep->pasid_enabled ||
++	    !ep->dc || !domain->pgd_root ||
++	    domain->mode != RISCV_IOMMU_DC_FSC_IOSATP_MODE_SV39 ||
++	    PAGE_SHIFT != 12 || PGDIR_SHIFT != 30 ||
++	    domain->pgtbl.ops.map_pages != riscv_iommu_map_pages ||
++	    domain->pgtbl.ops.unmap_pages != riscv_iommu_unmap_pages ||
++	    domain->pgtbl.ops.iova_to_phys != riscv_iommu_iova_to_phys) {
++		ret = -EOPNOTSUPP;
++		goto out_unlock;
++	}
++	tc = le64_to_cpu(READ_ONCE(ep->dc->tc));
++	fsc = le64_to_cpu(READ_ONCE(ep->dc->fsc));
++	if (!(tc & RISCV_IOMMU_DC_TC_V) ||
++	    (tc & (RISCV_IOMMU_DC_TC_EN_ATS | RISCV_IOMMU_DC_TC_EN_PRI |
++		   RISCV_IOMMU_DC_TC_PDTV | RISCV_IOMMU_DC_TC_T2GPA |
++		   RISCV_IOMMU_DC_TC_SXL)) ||
++	    FIELD_GET(RISCV_IOMMU_DC_IOHGATP_MODE,
++		      le64_to_cpu(READ_ONCE(ep->dc->iohgatp))) !=
++				RISCV_IOMMU_DC_IOHGATP_MODE_BARE) {
++		ret = -EOPNOTSUPP;
++		goto out_unlock;
++	}
++	if (!virt_addr_valid(domain->pgd_root) ||
++	    !IS_ALIGNED((unsigned long)domain->pgd_root, PAGE_SIZE) ||
++	    FIELD_GET(RISCV_IOMMU_DC_FSC_MODE, fsc) != domain->mode ||
++	    FIELD_GET(RISCV_IOMMU_DC_FSC_PPN, fsc) !=
++				virt_to_pfn(domain->pgd_root)) {
++		ret = -ESTALE;
++		goto out_unlock;
++	}
++	if (iova < core->geometry.aperture_start ||
++	    iova > core->geometry.aperture_end) {
++		ret = -ERANGE;
++		goto out_unlock;
++	}
++
++	table = (pmd_t *)domain->pgd_root;
++	for (shift = PGDIR_SHIFT; ; shift -= 9) {
++		if (out->table_count == ARRAY_SIZE(out->tables)) {
++			ret = -EOVERFLOW;
++			break;
++		}
++		out->tables[out->table_count++] = virt_to_phys(table);
++		value = pmd_val(READ_ONCE(table[(iova >> shift) &
++					       (PTRS_PER_PMD - 1)]));
++		out->pte = value;
++		if (!value) {
++			ret = -ENOENT;
++			break;
++		}
++		if (!(value & _PAGE_PRESENT) ||
++		    (value & ~((u64)_PAGE_PFN_MASK | GENMASK_ULL(9, 0)))) {
++			ret = -EPROTO;
++			break;
++		}
++		next_pa = ((value & _PAGE_PFN_MASK) >> _PAGE_PFN_SHIFT)
++								<< PAGE_SHIFT;
++		if (value & (_PAGE_READ | _PAGE_WRITE | _PAGE_EXEC)) {
++			if ((value & _PAGE_WRITE) && !(value & _PAGE_READ)) {
++				ret = -EPROTO;
++				break;
++			}
++			out->bytes = BIT_ULL(shift);
++			if (!IS_ALIGNED(next_pa, out->bytes)) {
++				ret = -EPROTO;
++				break;
++			}
++			out->iova = ALIGN_DOWN((u64)iova, out->bytes);
++			out->pa = next_pa;
++			break;
++		}
++		if (shift == PAGE_SHIFT ||
++		    (value & GENMASK_ULL(9, 0)) != _PAGE_TABLE ||
++		    !pfn_valid(next_pa >> PAGE_SHIFT)) {
++			ret = -EPROTO;
++			break;
++		}
++		for (i = 0; i < out->table_count; i++)
++			if (out->tables[i] == next_pa)
++				break;
++		if (i != out->table_count) {
++			ret = -ELOOP;
++			break;
++		}
++		table = (pmd_t *)pfn_to_virt(next_pa >> PAGE_SHIFT);
++	}
++out_unlock:
++	mutex_unlock(&ep->lock);
++	mutex_unlock(&domain->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(riscv_iommu_finite_leaf);
++#endif
++
+ static void riscv_iommu_tlb_inv_all(void *cookie)
+ {
+ 	// cookie is domain
+--- /dev/null
++++ b/include/linux/iommu-finite.h
+@@ -0,0 +1,69 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_IOMMU_FINITE_H
++#define _LINUX_IOMMU_FINITE_H
++
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/types.h>
++
++struct device;
++
++/* iova and pa are the actual leaf bases, not the queried byte address. */
++struct iommu_finite_leaf {
++	u64 iova, pa, bytes, pte;
++	u64 tables[5]; /* Actual page-table page PAs, root first. */
++	u32 table_count, reserved;
++};
++
++struct iommu_finite_allocation {
++	void *cpu_addr;
++	dma_addr_t handle;
++	size_t size;
++};
++
++/*
++ * Private finite-owner interface, not a general DMA allocation validator.
++ * The caller owns the HPM session, keeps device/domain binding stable, and
++ * excludes every other map/unmap or DMA user of these allocation extents.
++ * The domain must have exactly this one endpoint. Domain->lock does NOT
++ * serialize the legacy map/unmap callbacks.
++ *
++ * items must be the caller's exact kernel-owned successful dma_alloc_attrs
++ * records from GFP_KERNEL allocations, with FORCE_CONTIGUOUS or the normal
++ * remap fallback. No user-supplied kernel pointer, direct/coherent override,
++ * atomic pool, NO_KERNEL_MAPPING allocation, or foreign allocation is valid.
++ * Atomic-pool provenance is a caller precondition: this kernel has no public
++ * non-destructive membership query, and the helper does not pretend otherwise.
++ *
++ * Before release, the caller has proved all owned DONE IDs and global quiet.
++ * checked_sync must publish the PTE stores and complete a checked host-S1
++ * invalidation/fence, without issuing DMA, changing binding or releasing HPM.
++ * A nonzero result retains ALL IOVA reservations and backing, even if PTEs
++ * were partially/fully revoked. Quarantine the owner; do not retry or remap.
++ * Records are never rewritten; on success they describe RELEASED resources.
++ */
++/* dma-iommu is built in; a modular RISC-V provider is not supported here. */
++#if IS_BUILTIN(CONFIG_RISCV_IOMMU)
++int riscv_iommu_finite_leaf(struct device *dev, unsigned long iova,
++			    struct iommu_finite_leaf *out);
++int iommu_dma_free_finite_checked(struct device *dev,
++				  struct iommu_finite_allocation *items,
++				  unsigned int nr,
++				  int (*checked_sync)(void *), void *sync_data);
++#else
++static inline int riscv_iommu_finite_leaf(struct device *dev,
++					  unsigned long iova, struct iommu_finite_leaf *out)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int iommu_dma_free_finite_checked(struct device *dev,
++						struct iommu_finite_allocation *items,
++						unsigned int nr,
++						int (*checked_sync)(void *), void *sync_data)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
++#endif /* _LINUX_IOMMU_FINITE_H */

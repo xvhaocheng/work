@@ -1,0 +1,910 @@
+--- a/bench/idma_experiment.c
++++ b/bench/idma_experiment.c
+@@ -15,7 +15,8 @@
+ 
+ struct options {
+ 	const char *device;
+-	int caps_only, batch;
++	int caps_only, batch, p4m;
++	uint32_t a_gap_cycles;
+ 	struct idma_experiment request;
+ };
+ 
+@@ -31,6 +32,9 @@
+ 	     "  --warmup N             Warmup transfers (default 256; 0 disables)\n"
+ 	     "  --timeout-ms N         Run timeout (default 60000)\n"
+ 	     "  --batch                Hardware batch copies; requires batch BIT/kernel\n"
++	     "  --p4m                  P4M shared-window run (implies hardware batch)\n"
++	     "  --a-gap-cycles N       Aggressor inter-copy hardware gap cycles (0..4294967295)\n"
++	     "                         Solo (--aggressor none) requires --a-gap-cycles 0\n"
+ 	     "  --caps                 Query capabilities without running a trial\n"
+ 	     "  --help                 Show this help\n"
+ 	     "All numbers are unsigned decimal integers. One JSON record per trial.\n"
+@@ -63,6 +67,7 @@
+ 	static const char *const names[] = {
+ 		"--device", "--aggressor", "--victim-pages", "--aggressor-pages",
+ 		"--chunk", "--transfers", "--warmup", "--timeout-ms", "--caps", "--batch",
++		"--p4m", "--a-gap-cycles",
+ 	};
+ 	unsigned int seen = 0;
+ 	int i, help = 0;
+@@ -92,9 +97,10 @@
+ 			return -1;
+ 		}
+ 		seen |= 1U << opt;
+-		if (opt == 8 || opt == 9) {
++		if (opt == 8 || opt == 9 || opt == 10) {
+ 			if (opt == 8) o->caps_only = 1;
+-			else o->batch = 1;
++			else if (opt == 9) o->batch = 1;
++			else o->p4m = 1;
+ 			continue;
+ 		}
+ 		if (++i == argc) {
+@@ -127,8 +133,20 @@
+ 		case 5: o->request.victim_transfers = number; break;
+ 		case 6: o->request.warmup_transfers = number; break;
+ 		case 7: o->request.run_timeout_ms = (uint32_t)number; break;
+-		}
+-	}
++		case 11: o->a_gap_cycles = (uint32_t)number; break;
++		}
++	}
++	if ((seen & (1U << 11)) && !o->p4m) {
++		snprintf(err, size, "--a-gap-cycles requires --p4m");
++		return -1;
++	}
++	if (o->p4m && o->request.aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR &&
++	    o->a_gap_cycles) {
++		snprintf(err, size, "Solo P4M requires --a-gap-cycles 0");
++		return -1;
++	}
++	if (o->p4m)
++		o->batch = 1;
+ 	if (!o->request.victim_pages || !o->request.aggressor_pages ||
+ 	    !o->request.chunk_bytes || !o->request.victim_transfers ||
+ 	    !o->request.run_timeout_ms) {
+@@ -159,6 +177,7 @@
+ 	const struct idma_experiment *r = &o->request;
+ 	unsigned int i;
+ 	uint32_t required = IDMA_EXPERIMENT_CAP_DID_HPM |
++		(o->p4m ? IDMA_EXPERIMENT_CAP_P4M : 0) |
+ 		(o->batch ? IDMA_EXPERIMENT_CAP_HW_BATCH : IDMA_EXPERIMENT_CAP_SW_REFILL);
+ 
+ 	if (c->abi_version != IDMA_EXPERIMENT_ABI || c->struct_size != sizeof(*c)) {
+@@ -178,7 +197,7 @@
+ 	if (o->caps_only)
+ 		return 0;
+ 	if ((c->capabilities & required) != required) {
+-		snprintf(err, size, "driver lacks required DID HPM or selected supply-mode support");
++		snprintf(err, size, "driver lacks required DID HPM, P4M or selected supply-mode support");
+ 		return -1;
+ 	}
+ 	if (r->aggressor_id != IDMA_EXPERIMENT_NO_AGGRESSOR &&
+@@ -250,15 +269,154 @@
+ 	printf(",\"data_errors\":%u,\"quarantined\":%u}", s->data_errors, s->quarantined);
+ }
+ 
++static int validate_p4m(const struct options *o, const struct idma_experiment_caps *c,
++			const struct idma_p4m *p, char *err, size_t size)
++{
++	const __u64 *w = p->window;
++	__u64 flags = w[15];
++	int has_a = !!(flags & 0x1ULL);
++	unsigned int i;
++
++	if (p->observer_status) {
++		snprintf(err, size, "P4M observer status is not zero");
++		return -1;
++	}
++	if (w[0] != 0x49444d4150344d01ULL) {
++		snprintf(err, size, "P4M bank magic mismatch");
++		return -1;
++	}
++	if (!(flags & 0x2ULL)) {
++		snprintf(err, size, "P4M bank is not marked closed");
++		return -1;
++	}
++	if (flags & ~0x7ULL) {
++		snprintf(err, size, "P4M flags contain unknown bits");
++		return -1;
++	}
++	if (!w[1]) {
++		snprintf(err, size, "P4M hardware cycle count is zero");
++		return -1;
++	}
++	if (w[12]) {
++		snprintf(err, size, "P4M task/error mask is nonzero");
++		return -1;
++	}
++	if (w[13] != o->request.victim_transfers ||
++	    w[14] != o->request.victim_transfers) {
++		snprintf(err, size, "P4M V issued/done count mismatch");
++		return -1;
++	}
++	if (p->experiment.victim_did != c->did ||
++	    (o->request.aggressor_id != IDMA_EXPERIMENT_NO_AGGRESSOR &&
++	     (!p->experiment.aggressor_did ||
++	      p->experiment.aggressor_did == p->experiment.victim_did))) {
++		snprintf(err, size, "P4M DID role mismatch");
++		return -1;
++	}
++	if (o->request.aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR) {
++		if (has_a) {
++			snprintf(err, size, "P4M Solo reports hasA");
++			return -1;
++		}
++		for (i = 2; i <= 12; i++) {
++			if (w[i]) {
++				snprintf(err, size, "P4M Solo field %u is nonzero", i);
++				return -1;
++			}
++		}
++		return 0;
++	}
++	if (!has_a) {
++		snprintf(err, size, "P4M corun omitted hasA flag");
++		return -1;
++	}
++	if (w[4] > 1 || w[5] > 1 || w[6] > 1 || w[7] > 1) {
++		snprintf(err, size, "P4M inflight/carry/opening-edge field exceeds 1");
++		return -1;
++	}
++	if (w[4] + w[2] != w[3] + w[5]) {
++		snprintf(err, size, "P4M conservation mismatch");
++		return -1;
++	}
++	if (w[6] > w[4] || w[6] > w[3]) {
++		snprintf(err, size, "P4M carried done exceeds boundary/in-window done");
++		return -1;
++	}
++	if (!!w[4] != !!w[8] || !!w[5] != !!w[9]) {
++		snprintf(err, size, "P4M inflight ID does not match inflight state");
++		return -1;
++	}
++	if (!!w[3] != (!!w[10] && !!w[11])) {
++		snprintf(err, size, "P4M first/last done ID does not match done count");
++		return -1;
++	}
++	return 0;
++}
++
++static void print_p4m(const struct idma_p4m *p, uint32_t requested_gap)
++{
++	const __u64 *w = p->window;
++	__u64 cycles = w[1];
++	int has_a = !!(w[15] & 0x1ULL);
++	int closed = !!(w[15] & 0x2ULL);
++	int strict = !!(w[15] & 0x4ULL);
++	int conservation = has_a ? (w[4] + w[2] == w[3] + w[5]) : 1;
++	unsigned int i;
++
++	printf("{\"requested_gap_cycles\":%u,\"sequence\":%" PRIu64 ",\"observer_status\":%" PRIu64 ",",
++	       requested_gap, (uint64_t)p->sequence, (uint64_t)p->observer_status);
++	printf("\"raw_window\":[");
++	for (i = 0; i < IDMA_P4M_WORDS16; i++) {
++		if (i) putchar(',');
++		printf("%" PRIu64, (uint64_t)w[i]);
++	}
++	printf("],\"raw_observation\":[");
++	for (i = 0; i < IDMA_P4M_OBS_WORDS35; i++) {
++		if (i) putchar(',');
++		printf("%" PRIu64, (uint64_t)p->observation[i]);
++	}
++	printf("],");
++	print_u64("bank_magic", (uint64_t)w[0]);
++	putchar(','); print_u64("cycles", (uint64_t)cycles);
++	putchar(','); print_u64("hardware_window_ns", (uint64_t)cycles * 20ULL);
++	putchar(','); print_u64("a_issue_window", (uint64_t)w[2]);
++	putchar(','); print_u64("a_done_window", (uint64_t)w[3]);
++	putchar(','); print_u64("a_inflight_at_issue", (uint64_t)w[4]);
++	putchar(','); print_u64("a_inflight_at_done", (uint64_t)w[5]);
++	putchar(','); print_u64("a_done_before_open", (uint64_t)w[6]);
++	putchar(','); print_u64("a_issue_opening_edge", (uint64_t)w[7]);
++	putchar(','); print_u64("a_opening_inflight_id", (uint64_t)w[8]);
++	putchar(','); print_u64("a_closing_inflight_id", (uint64_t)w[9]);
++	putchar(','); print_u64("a_first_done_id", (uint64_t)w[10]);
++	putchar(','); print_u64("a_last_done_id", (uint64_t)w[11]);
++	putchar(','); print_u64("task_error_mask", (uint64_t)w[12]);
++	putchar(','); print_u64("v_issued", (uint64_t)w[13]);
++	putchar(','); print_u64("v_done", (uint64_t)w[14]);
++	putchar(','); print_u64("flags", (uint64_t)w[15]);
++	printf(",\"has_a\":%s,\"closed\":%s,\"strict_preopening_inflight\":%s,",
++	       has_a ? "true" : "false", closed ? "true" : "false", strict ? "true" : "false");
++	printf("\"conservation\":%s,", conservation ? "true" : "false");
++	print_u64("a_completed_jobs_window", (uint64_t)w[3]);
++	putchar(','); print_u64("a_progress_window_bytes", (uint64_t)w[3] * 4096ULL);
++	putchar(',');
++	if (cycles)
++		printf("\"a_completed_jobs_per_ns\":%" PRIu64, (uint64_t)w[3] / (uint64_t)cycles);
++	else
++		printf("\"a_completed_jobs_per_ns\":null");
++	printf(",\"platform_hz\":50000000,\"cycle_ns\":20}");
++}
++
+ static void report(int argc, char **argv, const struct options *o,
+ 		   const struct idma_experiment_caps *c, int have_caps,
+ 		   const struct idma_experiment *r, int have_result, int attempted,
++		   const struct idma_p4m *p4m, int have_p4m,
+ 		   const char *stage, const char *err, int saved_errno, int success)
+ {
+ 	int i;
+ 
+ 	printf("{\"schema\":\"%s\",\"success\":%s,\"stage\":",
+-	       o->batch ? "idma.batch.v1" : "idma.experiment.v1", success ? "true" : "false");
++	       o->p4m ? "idma.p4m.v1" : (o->batch ? "idma.batch.v1" : "idma.experiment.v1"),
++	       success ? "true" : "false");
+ 	json_string(stage);
+ 	printf(",\"error\":");
+ 	if (*err) json_string(err); else printf("null");
+@@ -280,6 +438,9 @@
+ 	       o->request.aggressor_pages, o->request.chunk_bytes, o->request.run_timeout_ms);
+ 	print_u64("victim_transfers", o->request.victim_transfers);
+ 	putchar(','); print_u64("warmup_transfers", o->request.warmup_transfers);
++	if (o->p4m) {
++		putchar(','); print_u64("a_gap_cycles", o->a_gap_cycles);
++	}
+ 	printf(",\"reserved\":[0,0,0,0,0,0,0,0]},\"capabilities\":");
+ 	if (have_caps) {
+ 		printf("{\"abi_version\":%u,\"struct_size\":%u,\"flags\":%u,"
+@@ -319,6 +480,27 @@
+ 		else print_stats(&r->aggressor, r->hpm_configured, r->measurement_started, o->batch);
+ 		putchar('}');
+ 	} else printf("null");
++	if (o->p4m) {
++		printf(",\"p4m\":");
++		if (have_p4m)
++			print_p4m(p4m, o->a_gap_cycles);
++		else
++			printf("null");
++	}
++	if (o->p4m) {
++		printf(",\"semantics\":{\"supply\":\"P4M hardware batch with shared observer window\",\"");
++		printf("\"window\":\"(open,close] cycles*20ns at fixed 50 MHz platform assumption\",\"");
++		printf("\"a_progress\":\"completed A jobs in window * chunk; not AXI/bus bytes\",\"");
++		printf("\"a_completed_rate\":\"window done jobs / hardware window; not bus throughput\",\"");
++		printf("\"whole_run_a\":\"result.aggressor is whole-run A stats, separate from window\",\"");
++		printf("\"hpm_window\":\"HPM software snapshots bracket software window and are separate\",\"");
++		printf("\"before_window_carry\":\"window[6] counts A jobs issued before opening edge and completed inside\",\"");
++		printf("\"baseline\":\"compare only against same-version gap0 self-control\",\"");
++		printf("\"board_short\":\"platform-p4m short: Solo/A1/A8 gap0 plus A8 gap1000 engineering check\",\"");
++		printf("\"pilot_defaults\":\"later full pilot 4096 transfers, 256 warmup; not auto-run here\",\"");
++		printf("\"calibration\":\"unverified\"}}\n");
++		return;
++	}
+ 	if (o->batch) {
+ 		printf(",\"semantics\":{\"supply\":\"hardware batch, software polls batch completion\","
+ 		       "\"victim_elapsed_ns\":\"software window includes A/V launch and final polling; hardware window is in idma_batch_obs\","
+@@ -361,9 +543,10 @@
+ 	};
+ 	struct idma_experiment_caps caps = {0};
+ 	struct idma_experiment result = {0};
++	struct idma_p4m p4m_result = {0};
+ 	char err[256] = "";
+ 	const char *stage = "arguments";
+-	int fd = -1, saved_errno = 0, have_caps = 0, have_result = 0;
++	int fd = -1, saved_errno = 0, have_caps = 0, have_result = 0, have_p4m = 0;
+ 	int attempted = 0, success = 0, rc;
+ 
+ 	rc = parse(argc, argv, &o, err, sizeof(err));
+@@ -389,10 +572,18 @@
+ 		goto done;
+ 	}
+ 	stage = "run";
+-	result = o.request;
+ 	attempted = 1;
+ 	/* Never retry a run ioctl on EINTR: it might already have submitted DMA. */
+-	rc = ioctl(fd, o.batch ? IDMA_IOC_RUN_BATCH : IDMA_IOC_RUN_EXPERIMENT, &result);
++	if (o.p4m) {
++		p4m_result.experiment = o.request;
++		p4m_result.aggressor_gap_cycles = o.a_gap_cycles;
++		rc = ioctl(fd, IDMA_IOC_RUN_P4M, &p4m_result);
++		have_p4m = 1;
++		result = p4m_result.experiment;
++	} else {
++		result = o.request;
++		rc = ioctl(fd, o.batch ? IDMA_IOC_RUN_BATCH : IDMA_IOC_RUN_EXPERIMENT, &result);
++	}
+ 	saved_errno = rc < 0 ? errno : 0;
+ 	have_result = rc >= 0 || result.status < 0;
+ 	if (rc < 0) {
+@@ -418,6 +609,8 @@
+ 		snprintf(err, sizeof(err), "trial result lacks required measurement or has inconsistent work counts");
+ 		goto done;
+ 	}
++	if (o.p4m && validate_p4m(&o, &caps, &p4m_result, err, sizeof(err)))
++		goto done;
+ 	success = 1;
+ 	goto done;
+ 
+@@ -434,7 +627,7 @@
+ 	if (*err)
+ 		fprintf(stderr, "idma_experiment: %s\n", err);
+ 	report(argc, argv, &o, &caps, have_caps, &result, have_result, attempted,
+-	       stage, err, saved_errno, success);
++	       &p4m_result, have_p4m, stage, err, saved_errno, success);
+ 	if (fflush(stdout) == EOF)
+ 		return EXIT_FAILURE;
+ 	return success ? EXIT_SUCCESS : EXIT_FAILURE;
+--- a/tests/experiment_cli_test_stub.c
++++ b/tests/experiment_cli_test_stub.c
+@@ -26,6 +26,45 @@
+ 	fclose(f);
+ }
+ 
++static void fill_p4m(struct idma_p4m *p)
++{
++	int has_a = p->experiment.aggressor_id != IDMA_EXPERIMENT_NO_AGGRESSOR;
++	unsigned int i;
++
++	memset(p->observation, 0, sizeof(p->observation));
++	memset(p->window, 0, sizeof(p->window));
++	p->sequence = 1;
++	p->observer_status = 0;
++	p->window[0] = 0x49444d4150344d01ULL;
++	p->window[1] = 1000;
++	p->window[2] = has_a ? 10 : 0;
++	p->window[3] = has_a ? 8 : 0;
++	p->window[4] = has_a ? 1 : 0;
++	p->window[5] = has_a ? 3 : 0;
++	p->window[6] = has_a ? 1 : 0;
++	p->window[7] = 0;
++	p->window[8] = has_a ? 4 : 0;
++	p->window[9] = has_a ? 5 : 0;
++	p->window[10] = has_a ? 5 : 0;
++	p->window[11] = has_a ? 12 : 0;
++	p->window[12] = 0;
++	p->window[13] = p->experiment.victim_transfers;
++	p->window[14] = p->experiment.victim_transfers;
++	p->window[15] = has_a ? 0x7ULL : 0x2ULL;
++	for (i = 0; i < IDMA_P4M_OBS_WORDS35; i++)
++		p->observation[i] = 0x1000 + i;
++	if (mode("p4m_bank_magic")) p->window[0]++;
++	if (mode("p4m_bank_closed")) p->window[15] &= ~0x2ULL;
++	if (mode("p4m_cycles")) p->window[1] = 0;
++	if (mode("p4m_conservation")) p->window[3]++;
++	if (mode("p4m_flags")) p->window[15] |= 0x8ULL;
++	if (mode("p4m_ids")) p->window[8] = 0;
++	if (mode("p4m_vcount")) p->window[13]--;
++	if (mode("p4m_status")) p->experiment.status = -EIO;
++	if (mode("p4m_solo_nonzero") && !has_a) p->window[2] = 1;
++	if (mode("p4m_nohasA") && has_a) p->window[15] &= ~0x1ULL;
++}
++
+ int ioctl(int fd, unsigned long request, ...)
+ {
+ 	va_list ap;
+@@ -47,7 +86,8 @@
+ 		memset(c, 0, sizeof(*c));
+ 		c->abi_version = IDMA_EXPERIMENT_ABI;
+ 		c->struct_size = sizeof(*c);
+-		c->capabilities = IDMA_EXPERIMENT_CAP_DID_HPM | IDMA_EXPERIMENT_CAP_SW_REFILL | IDMA_EXPERIMENT_CAP_HW_BATCH;
++		c->capabilities = IDMA_EXPERIMENT_CAP_DID_HPM | IDMA_EXPERIMENT_CAP_SW_REFILL |
++			IDMA_EXPERIMENT_CAP_HW_BATCH | IDMA_EXPERIMENT_CAP_P4M;
+ 		c->device_id = 0;
+ 		c->did = 10;
+ 		c->max_pages = 4096;
+@@ -60,17 +100,31 @@
+ 		if (mode("caps_limit")) c->max_pages = 0;
+ 		if (mode("caps_no_hpm")) c->capabilities &= ~IDMA_EXPERIMENT_CAP_DID_HPM;
+ 		if (mode("caps_no_batch")) c->capabilities &= ~IDMA_EXPERIMENT_CAP_HW_BATCH;
++		if (mode("caps_no_p4m")) c->capabilities &= ~IDMA_EXPERIMENT_CAP_P4M;
+ 		if (mode("caps_no_refill")) c->capabilities &= ~IDMA_EXPERIMENT_CAP_SW_REFILL;
+ 		return mode("caps_positive") ? 1 : 0;
+ 	}
+-	if (request == IDMA_IOC_RUN_EXPERIMENT || request == IDMA_IOC_RUN_BATCH) {
+-		struct idma_experiment *r = arg;
+-
+-		record(request == IDMA_IOC_RUN_BATCH ? "batch" : "run");
++	if (request == IDMA_IOC_RUN_EXPERIMENT || request == IDMA_IOC_RUN_BATCH ||
++	    request == IDMA_IOC_RUN_P4M) {
++		struct idma_experiment *r;
++		struct idma_p4m *p4m = NULL;
++
++		if (request == IDMA_IOC_RUN_P4M) {
++			p4m = arg;
++			r = &p4m->experiment;
++			record("p4m");
++		} else {
++			r = arg;
++			record(request == IDMA_IOC_RUN_BATCH ? "batch" : "run");
++		}
+ 		if (r->abi_version != IDMA_EXPERIMENT_ABI || r->struct_size != sizeof(*r) || r->flags)
+ 			abort();
+ 		for (i = 0; i < sizeof(r->reserved) / sizeof(r->reserved[0]); i++)
+ 			if (r->reserved[i]) abort();
++		if (p4m) {
++			for (i = 0; i < sizeof(p4m->reserved) / sizeof(p4m->reserved[0]); i++)
++				if (p4m->reserved[i]) abort();
++		}
+ 		if (mode("run_enotty") || mode("run_eintr")) {
+ 			errno = mode("run_eintr") ? EINTR : ENOTTY;
+ 			return -1;
+@@ -138,6 +192,8 @@
+ 			errno = ETIMEDOUT;
+ 			return -1;
+ 		}
++		if (p4m)
++			fill_p4m(p4m);
+ 		return mode("run_positive") ? 1 : 0;
+ 	}
+ 	abort();
+--- a/tests/experiment_cli_test.py
++++ b/tests/experiment_cli_test.py
+@@ -109,6 +109,55 @@
+                      "run_incomplete", "run_positive"):
+             run(["--aggressor", "1"], mode=mode, good=False)
+ 
++        row = run(["--p4m"], calls=("caps", "p4m"))
++        assert row["schema"] == "idma.p4m.v1"
++        assert row["p4m"]["conservation"] is True
++        assert len(row["p4m"]["raw_window"]) == 16
++        assert len(row["p4m"]["raw_observation"]) == 35
++        assert row["p4m"]["hardware_window_ns"] == 20000
++        assert row["p4m"]["a_progress_window_bytes"] == 8 * 4096
++        assert row["p4m"]["has_a"] is False
++        assert row["p4m"]["closed"] is True
++
++        row = run(["--p4m", "--batch"], calls=("caps", "p4m"))
++        assert row["schema"] == "idma.p4m.v1"
++
++        row = run(["--p4m", "--aggressor", "1"], calls=("caps", "p4m"))
++        assert row["p4m"]["has_a"] is True
++        assert row["p4m"]["a_progress_window_bytes"] == 8 * 4096
++
++        row = run(["--p4m", "--aggressor", "1", "--a-gap-cycles", "1000"],
++                  calls=("caps", "p4m"))
++        assert row["input"]["a_gap_cycles"] == 1000
++        assert row["p4m"]["requested_gap_cycles"] == 1000
++
++        for args in (["--a-gap-cycles", "0"], ["--a-gap-cycles", "1000"],
++                     ["--p4m", "--aggressor", "none", "--a-gap-cycles", "1"],
++                     ["--p4m", "--a-gap-cycles", "4294967296"],
++                     ["--p4m", "--chunk", "256"], ["--p4m", "--transfers", "1048577"],
++                     ["--p4m", "--p4m"]):
++            row = run(args, good=False, calls=())
++            assert row["stage"] == "arguments" and row["result"] is None
++
++        run(["--p4m"], mode="caps_no_p4m", good=False, calls=("caps",))
++        run(["--p4m"], mode="caps_no_batch", good=False, calls=("caps",))
++
++        for mode in ("p4m_bank_magic", "p4m_bank_closed", "p4m_cycles", "p4m_conservation",
++                     "p4m_flags", "p4m_ids", "p4m_vcount", "p4m_status"):
++            row = run(["--p4m", "--aggressor", "1"], mode=mode, good=False,
++                      calls=("caps", "p4m"))
++            assert row["success"] is False
++            assert row["p4m"] is not None
++            assert row["errno"] == 0
++        row = run(["--p4m"], mode="p4m_solo_nonzero", good=False, calls=("caps", "p4m"))
++        assert row["success"] is False and row["p4m"] is not None
++        row = run(["--p4m", "--aggressor", "1"], mode="p4m_nohasA", good=False,
++                  calls=("caps", "p4m"))
++        assert row["success"] is False and row["p4m"] is not None
++        row = run(["--p4m"], mode="run_enotty", good=False, calls=("caps", "p4m"))
++        assert row["errno"] == errno.ENOTTY
++        assert row["result"] is None
++
+         for mode in ("run_enotty", "run_eintr"):
+             row = run(mode=mode, good=False)
+             assert row["result"] is None
+--- a/scripts/rootfs.py
++++ b/scripts/rootfs.py
+@@ -11,6 +11,7 @@
+     'idma_e3_pair': 'out/bench/idma_e3_pair',
+     'idma_experiment': 'out/bench/idma_experiment',
+     'platform-smoke': 'tests/board-smoke.sh',
++    'platform-p4m': 'tests/board-p4m.sh',
+     'platform-timeout': 'out/bench/platform-timeout',
+ }
+ 
+--- a/tests/test_rootfs.py
++++ b/tests/test_rootfs.py
+@@ -27,6 +27,7 @@
+         (self.root / 'out/bench/idma_e3_controlled').write_bytes(b'new controlled experiment binary')
+         (self.root / 'tests/board-smoke.sh').write_bytes(b'#!/bin/sh\nexit 0\n')
+         (self.root / 'tests/board-e3-controlled.sh').write_bytes(b'#!/bin/sh\nexit 0\n')
++        (self.root / 'tests/board-p4m.sh').write_bytes(b'#!/bin/sh\nexit 0\n')
+         (self.root / 'out/bench/platform-timeout').write_bytes(b'new timeout binary')
+         # These old and unrelated artifacts must remain on disk but never be packed.
+         for name in sorted(rootfs.LEGACY_NAMES | {'unexpected-program'}):
+@@ -59,6 +60,7 @@
+             'usr/bin/idma_e3_controlled', './usr/bin/idma_e3_controlled',
+             'idma_e3_controlled', 'usr/bin/platform-e3-controlled',
+             './usr/bin/platform-e3-controlled', 'platform-e3-controlled',
++            'usr/bin/platform-p4m', './usr/bin/platform-p4m', 'platform-p4m',
+         ]
+         self.base([(name, self.file, b'old copy') for name in names])
+         entries = self.pack()
+@@ -68,6 +70,7 @@
+             'dev/idma0', 'etc/banner', 'usr/bin/idma_experiment', 'usr/bin/platform-smoke',
+             'usr/bin/platform-timeout', 'usr/bin/idma_e3_pair',
+             'usr/bin/idma_e3_controlled', 'usr/bin/platform-e3-controlled',
++            'usr/bin/platform-p4m',
+         })
+         for name, source in rootfs.EXECUTABLES.items():
+             fields, body = packed['usr/bin/' + name]
+@@ -115,6 +118,15 @@
+             self.pack()
+         self.assertEqual(output.read_bytes(), b'previous rootfs')
+ 
++    def test_missing_p4m_runner_preserves_existing_output(self):
++        self.base()
++        output = self.root / 'out/rootfs.cpio'
++        output.write_bytes(b'previous rootfs')
++        (self.root / 'tests/board-p4m.sh').unlink()
++        with self.assertRaises(FileNotFoundError):
++            self.pack()
++        self.assertEqual(output.read_bytes(), b'previous rootfs')
++
+     def test_unrelated_duplicate_rejected_before_output_replaced(self):
+         self.base([('./etc/banner', self.file, b'ambiguous duplicate')])
+         output = self.root / 'out/rootfs.cpio'
+--- /dev/null
++++ b/tests/board-p4m.sh
+@@ -0,0 +1,229 @@
++#!/bin/sh
++# SPDX-License-Identifier: GPL-2.0
++# P4M short board runner.
++#
++# Usage: platform-p4m short [OUTPUT_DIR]
++#
++# Short acceptance only: four trials, each 64 transfers, warmup 8, 4 KiB.
++#   1 Solo        --aggressor none  --a-gap-cycles 0
++#   2 A1 gap0     --aggressor 1     --aggressor-pages 1 --a-gap-cycles 0
++#   3 A8 gap0     --aggressor 1     --aggressor-pages 8 --a-gap-cycles 0
++#   4 A8 gap1000  --aggressor 1     --aggressor-pages 8 --a-gap-cycles 1000
++#
++# This is an engineering check, not a formal gap sweep. It does not run the
++# later full pilot (4096 transfers, 256 warmup) automatically.
++#
++# OUTPUT_DIR is created new; it must not already exist.
++# Default OUTPUT_DIR is /tmp/p4m-$$.
++#
++# No dmesg clear, no network, no SD burn, no ioctl retry, no hidden failure.
++# Every case requires a readable decimal taint of exactly 0 before and after
++# the run; any nonzero/unknown readback stops the run and is preserved.
++#
++# Exit codes:
++#   0            clean complete
++#   1..3         first CLI/taint failure (CLI rc, 3 taint gate)
++#   4            capture/output failure after an otherwise clean run
++#   127          required command missing
++#   129/130/143  HUP/INT/TERM signal
++#   2            usage or fatal setup error
++set -u
++
++PATH=/sbin:/bin:/usr/sbin:/usr/bin
++export PATH
++
++usage() {
++    cat <<'EOF'
++Usage: platform-p4m short [OUTPUT_DIR]
++  short  4 short P4M trials:
++         1 Solo gap0
++         2 A1 gap0
++         3 A8 gap0
++         4 A8 gap1000 engineering check
++OUTPUT_DIR must not exist. Default: /tmp/p4m-$$.
++Each trial uses 64 transfers, warmup 8, 4096-byte chunk.
++No formal grid and no automatic 4096/256 pilot.
++EOF
++}
++
++fatal() {
++    echo "P4M: fatal: $*" >&2
++    exit 2
++}
++
++[ $# -ge 1 ] && [ $# -le 2 ] || { usage >&2; exit 2; }
++mode=$1
++case "$mode" in
++    short) ;;
++    *) usage >&2; exit 2 ;;
++esac
++
++if [ $# -eq 2 ]; then
++    OUT=$2
++else
++    OUT=/tmp/p4m-$$
++fi
++
++if [ -e "$OUT" ]; then
++    fatal "output directory already exists: $OUT"
++fi
++mkdir "$OUT" || fatal "mkdir failed: $OUT"
++
++read_taint() {
++    if value=$(cat /proc/sys/kernel/tainted 2>/dev/null); then
++        case "$value" in
++            ''|*[!0-9]*) echo unknown ;;
++            *) echo "$value" ;;
++        esac
++    else
++        echo unknown
++    fi
++}
++
++save_dmesg() {
++    dmesg > "$OUT/dmesg.raw" 2> "$OUT/dmesg.err"
++    dmesg_rc=$?
++    if [ "$dmesg_rc" -eq 0 ]; then
++        emit_rc=0
++        echo "P4M: dmesg.raw begin" >&2 || emit_rc=1
++        cat "$OUT/dmesg.raw" >&2 || emit_rc=1
++        echo "P4M: dmesg.raw end" >&2 || emit_rc=1
++        if [ "$emit_rc" -ne 0 ]; then
++            echo "P4M: dmesg.raw cat failed" >&2
++            return 4
++        fi
++        return 0
++    fi
++    echo "dmesg collection failed rc=$dmesg_rc" > "$OUT/dmesg.error"
++    echo "P4M: dmesg collection failed rc=$dmesg_rc" >&2
++    echo "P4M: dmesg.raw begin (partial)" >&2
++    cat "$OUT/dmesg.raw" >&2 2>/dev/null || echo "P4M: dmesg.raw cat failed" >&2
++    echo "P4M: dmesg.raw end (partial)" >&2
++    if [ -s "$OUT/dmesg.err" ]; then
++        echo "P4M: dmesg.err begin" >&2
++        cat "$OUT/dmesg.err" >&2 2>/dev/null || echo "P4M: dmesg.err cat failed" >&2
++        echo "P4M: dmesg.err end" >&2
++    fi
++    return "$dmesg_rc"
++}
++
++save_taint() {
++    final_taint=$(read_taint)
++    if ! echo "$final_taint" > "$OUT/taint.txt"; then
++        echo "P4M: taint write failed" >&2
++        return 1
++    fi
++    echo "P4M: final_taint=$final_taint" >&2
++    if [ "$final_taint" != "0" ]; then
++        echo "P4M: final taint not clean (value=$final_taint)" >&2
++        return 1
++    fi
++    return 0
++}
++
++collection_failed=0
++
++cleanup() {
++    rc=$?
++    trap - EXIT HUP INT TERM
++    save_dmesg || collection_failed=1
++    save_taint || collection_failed=1
++    if [ "$collection_failed" -ne 0 ] && [ "$rc" -eq 0 ]; then
++        rc=4
++    fi
++    echo "P4M: final_exit=$rc collection_failed=$collection_failed" >&2
++    if [ "$rc" -eq 0 ]; then
++        if ! echo "P4M: complete ok mode=$mode output=$OUT"; then
++            echo "P4M: complete marker write failed" >&2
++            rc=4
++        fi
++    fi
++    exit "$rc"
++}
++
++run_case() {
++    name=$1
++    shift
++
++    stdout_file="$OUT/$name.json"
++    stderr_file="$OUT/$name.err"
++
++    before_taint=$(read_taint)
++    if [ "$before_taint" != "0" ]; then
++        echo "P4M: case=$name before_taint=$before_taint refusing to run" >&2
++        return 3
++    fi
++
++    echo "P4M: case=$name begin taint=$before_taint args=$*" >&2
++    platform-timeout 120 idma_experiment "$@" > "$stdout_file" 2> "$stderr_file"
++    rc=$?
++    after_taint=$(read_taint)
++    echo "P4M: case=$name exit=$rc taint=$after_taint" >&2
++
++    cat_failed=0
++    cat "$stdout_file" || {
++        echo "P4M: case=$name stdout cat failed" >&2
++        cat_failed=1
++    }
++    if [ -s "$stderr_file" ]; then
++        cat "$stderr_file" >&2 || {
++            echo "P4M: case=$name stderr cat failed" >&2
++            cat_failed=1
++        }
++    fi
++
++    if [ "$rc" -ne 0 ]; then
++        echo "P4M: case=$name failed rc=$rc" >&2
++        return "$rc"
++    fi
++    if [ "$cat_failed" -ne 0 ]; then
++        return 4
++    fi
++    if [ "$after_taint" != "0" ]; then
++        echo "P4M: case=$name after_taint=$after_taint stopping" >&2
++        return 3
++    fi
++    return 0
++}
++
++trap cleanup EXIT
++trap 'exit 129' HUP
++trap 'exit 130' INT
++trap 'exit 143' TERM
++
++: > "$OUT/input.txt" || fatal "input write failed: $OUT/input.txt"
++{
++    echo "mode=$mode"
++    echo "output=$OUT"
++} >> "$OUT/input.txt" || fatal "input write failed: $OUT/input.txt"
++
++if ! cat > "$OUT/matrix.txt" <<'EOF'
++short:
++1 Solo        --aggressor none  --a-gap-cycles 0
++2 A1 gap0     --aggressor 1     --aggressor-pages 1 --a-gap-cycles 0
++3 A8 gap0     --aggressor 1     --aggressor-pages 8 --a-gap-cycles 0
++4 A8 gap1000  --aggressor 1     --aggressor-pages 8 --a-gap-cycles 1000
++EOF
++then
++    fatal "matrix write failed: $OUT/matrix.txt"
++fi
++
++if ! command -v platform-timeout >/dev/null 2>&1; then
++    echo "P4M: missing command: platform-timeout" >&2
++    exit 127
++fi
++if ! command -v idma_experiment >/dev/null 2>&1; then
++    echo "P4M: missing command: idma_experiment" >&2
++    exit 127
++fi
++
++run_case solo --p4m --aggressor none --a-gap-cycles 0 \
++    --victim-pages 1 --chunk 4096 --transfers 64 --warmup 8 --timeout-ms 10000 || exit $?
++run_case a1-gap0 --p4m --aggressor 1 --aggressor-pages 1 --a-gap-cycles 0 \
++    --victim-pages 1 --chunk 4096 --transfers 64 --warmup 8 --timeout-ms 10000 || exit $?
++run_case a8-gap0 --p4m --aggressor 1 --aggressor-pages 8 --a-gap-cycles 0 \
++    --victim-pages 1 --chunk 4096 --transfers 64 --warmup 8 --timeout-ms 10000 || exit $?
++run_case a8-gap1000 --p4m --aggressor 1 --aggressor-pages 8 --a-gap-cycles 1000 \
++    --victim-pages 1 --chunk 4096 --transfers 64 --warmup 8 --timeout-ms 10000 || exit $?
++
++exit 0
+--- /dev/null
++++ b/tests/test_board_p4m.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++"""Host-only checks for the P4M board runner script.
++
++These tests do not run FPGA code, DMA, HPM, or any board command. They only
++validate script syntax, argument gating, and fail-stop behavior when required
++commands are absent.
++"""
++
++from pathlib import Path
++import subprocess
++import tempfile
++import unittest
++
++
++ROOT = Path(__file__).resolve().parents[1]
++SCRIPT = ROOT / "tests" / "board-p4m.sh"
++
++
++class BoardP4mScriptTest(unittest.TestCase):
++    def run_script(self, *args):
++        return subprocess.run(["sh", str(SCRIPT), *args], text=True,
++                              capture_output=True, check=False)
++
++    def test_shell_syntax(self):
++        result = subprocess.run(["sh", "-n", str(SCRIPT)], text=True,
++                                capture_output=True, check=False)
++        self.assertEqual(result.returncode, 0, result.stderr)
++
++    def test_requires_short_mode(self):
++        for args in ((), ("bogus",)):
++            result = self.run_script(*args)
++            self.assertEqual(result.returncode, 2, result)
++            self.assertIn("Usage: platform-p4m", result.stderr)
++
++    def test_rejects_existing_output_directory(self):
++        with tempfile.TemporaryDirectory() as temporary:
++            out = Path(temporary) / "existing"
++            out.mkdir()
++            result = self.run_script("short", str(out))
++            self.assertEqual(result.returncode, 2, result)
++            self.assertIn("already exists", result.stderr)
++
++    def test_missing_commands_fail_stop_and_keep_logs(self):
++        with tempfile.TemporaryDirectory() as temporary:
++            out = Path(temporary) / "out"
++            result = self.run_script("short", str(out))
++            self.assertEqual(result.returncode, 127, result)
++            self.assertIn("missing command", result.stderr)
++            self.assertTrue(out.is_dir())
++            self.assertTrue((out / "input.txt").is_file())
++            self.assertTrue((out / "matrix.txt").is_file())
++            self.assertTrue((out / "taint.txt").is_file())
++            matrix = (out / "matrix.txt").read_text()
++            self.assertIn("Solo", matrix)
++            self.assertIn("A1 gap0", matrix)
++            self.assertIn("A8 gap1000", matrix)
++
++    def test_no_full_pilot_execution(self):
++        text = SCRIPT.read_text()
++        self.assertIn("4096", text)
++        self.assertIn("256", text)
++        self.assertNotIn("run_main", text)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/configs/migration-4dma-p4m.json
+@@ -0,0 +1,11 @@
++{
++  "description": "DS50/50, P4M shared-window A progress and fixed-gap baseline: short acceptance only Solo/A1/A8 gap0 plus A8 gap1000 engineering check; formal 4096/256 pilot pending.",
++  "board": "genesys2",
++  "num_dma": 4,
++  "device_ids": [10, 11, 12, 13],
++  "iotlb_entries": 16,
++  "ds_delay_input": 50,
++  "ds_delay_output": 50,
++  "cpu_hz": 50000000,
++  "timebase_hz": 25000000
++}
+--- /dev/null
++++ b/P4M_BASELINE.md
+@@ -0,0 +1,51 @@
++# P4M 基线说明
++
++**状态：板上尚未运行；构建状态待定；本文件不编造版本、哈希或结果。**
++
++本文件说明 P4M 共同窗口测量的访问模式、读法与短验收命令。它不主张已测量收益，也不承诺“小改动”“创新”或“有效果”。
++
++## 访问模式
++
++- V 使用 1 页源/目的；A1 使用 1 页，A8 使用 8 页；IOTLB 16 项。
++- 短验收保持既有轮询方式。A 描述符间固定间隔由硬件在上一整个 copy 完成并 drain 之后插入，**不由 CPU 每请求轮询定步**。
++- `gap = 0` 不引入额外等待，也不改变原握手与任务顺序。
++- 本卡只做短验收：Solo、A1、A8 gap0，加一次 A8 gap1000 工程检查；不是正式 gap 网格。
++- 后续正式预试默认 4096 transfers、256 warmup，但本卡不自动运行完整 4096/256。
++
++## 窗口语义
++
++- 硬件窗口为 `(open, close]`。
++- 开边界事件不计入 issue/done 汇总；开边界在途采样发生在事件之后。
++- 关边界事件计入汇总；关边界在途采样发生在事件之后。
++- 在 `open` 之前发出、但在窗口内完成的 A copy 单独报告为 `a_done_before_open`（`window[6]`），不当作窗口内启动的进展。
++- 守恒关系：`start + issue = done + end`；`carry done <= start`、`<= done`、`<= 1`。
++- Solo 时 A 相关字段为零，flags 无 `hasA`，`closed` 有效。
++
++## 基线要求
++
++- 必须使用**同版本 v7 自身的 gap0 自对照**；不能把旧 V 周期基线直接拼成新版本结论。
++- 选择性 PTW 128 干预在连续性能基线里关闭，避免把人工放大当成自然收益。
++- 正式比较前先冻结 gap 点与重复数；本卡不编造这些参数。
++
++## 指标
++
++- `cycles * 20 ns`：固定 50 MHz 平台假设；不是每次板级校准结果。
++- `A_progress_window = A_completed_jobs_window * 4096`：窗口内完整 A copy 数乘 chunk；**不是** AXI/总线字节数。
++- `A_completed_rate` 使用窗口内 done jobs / 硬件窗口时长；**不是**总线吞吐。
++- `result.aggressor` 是整轮 A 统计，包含启动与最终 drain；必须与窗口内 A 统计分开。
++- HPM 软件快照窗口单独标记，不能直接当成 P4M 硬件窗口。
++
++## 板上命令
++
++```
++platform-p4m short [OUTPUT_DIR]
++```
++
++短验收 4 次，每次 64 transfers、warmup 8、4 KiB：
++
++1. Solo：`--aggressor none --a-gap-cycles 0`
++2. A1 gap0：`--aggressor 1 --aggressor-pages 1 --a-gap-cycles 0`
++3. A8 gap0：`--aggressor 1 --aggressor-pages 8 --a-gap-cycles 0`
++4. A8 gap1000：`--aggressor 1 --aggressor-pages 8 --a-gap-cycles 1000`
++
++脚本保留 JSON、stderr、dmesg 原始输出与 taint；错误、quarantine、timeout 或缺少命令时停止。

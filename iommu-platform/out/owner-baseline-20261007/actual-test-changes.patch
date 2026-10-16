@@ -1,0 +1,235 @@
+--- a/tests/nonblock_actual_dma_top.sv
++++ b/tests/nonblock_actual_dma_top.sv
+@@ -52,6 +52,9 @@
+     // ---- runtime mode inputs (forwarded to the harness) --------------------
+     input  logic nonblock_enable_i,
+     input  logic policy_partition_i,
++    // Test-only ordinary baseline: suppress non-owner full-buffer permission.
++    // The actual DMA buffer capacity and certificate observation stay intact.
++    input  logic owner_only_i,
+ 
+     // ---------------- completion AXI  (re-export of nonblock_banked_top) ----
+     output logic         comp_aw_valid,
+@@ -661,7 +664,7 @@
+         .nonblock_busy_o       ( dbg_nonblock_busy   ),
+         .in_flight_o           ( dbg_in_flight       ),
+ 
+-        .fullbuffer_jobs_i     ( fullbuffer_jobs_o   ),
++        .fullbuffer_jobs_i     ( fullbuffer_jobs_o & {2{!owner_only_i}} ),
+ 
+         .dbg_tl_req_valid      ( dbg_tl_req_valid    ),
+         .dbg_tl_req_ready      ( dbg_tl_req_ready    ),
+--- a/tests/nonblock_actual_dma_system_top.sv
++++ b/tests/nonblock_actual_dma_system_top.sv
+@@ -4,7 +4,7 @@
+ //
+ // BOUNDED DIAGNOSTIC, TEST-ONLY SYSTEM-INTEGRATION WRAPPER -- NOT PRODUCTION RTL.
+ //
+-// This wrapper re-instantiates the UNCHANGED tests/nonblock_actual_dma_top.sv
++// This wrapper re-instantiates tests/nonblock_actual_dma_top.sv
+ // (real DMA0/DMA1 + real axi_mux + banked CTL <-> TL harness) and wraps it in a
+ // TEST-ONLY approximation of the board fabric built from PRODUCTION modules:
+ //
+@@ -87,6 +87,7 @@
+ 
+     input  logic        nonblock_enable_i,
+     input  logic        policy_partition_i,
++    input  logic        owner_only_i,
+ 
+     // Test-only read-admission proxy controls (SYSTEM build only).
+     input  logic [2:0]  read_admit_mode_i,
+@@ -1049,7 +1050,7 @@
+     );
+ 
+     // ========================================================================
+-    // The inner UNCHANGED harness
++    // The inner actual-DMA harness (owner-only switch is test-only).
+     // ========================================================================
+     nonblock_actual_dma_top #(
+         .NonblockEnable      (NonblockEnable),
+@@ -1061,6 +1062,7 @@
+         .rst_ni,
+         .nonblock_enable_i  (nonblock_enable_i),
+         .policy_partition_i (policy_partition_i),
++        .owner_only_i       (owner_only_i),
+ 
+         .comp_aw_valid (u_comp_aw_valid),
+         .comp_aw_id    (u_comp_aw_id),
+--- a/tests/nonblock_actual_dma_test.cpp
++++ b/tests/nonblock_actual_dma_test.cpp
+@@ -191,6 +191,14 @@
+     bool     nonblock_enable   = true;
+     bool     policy_partition  = false;
+     bool     v_cold_dst        = false;
++    // Owner-only admission gate.  BOTH tops expose owner_only_i; tick()
++    // drives owner_only_i = owner_only && measurement_phase every cycle, so
++    // this knob alone is inert until the post-warm measurement phase.
++    bool     owner_only        = false;
++    // Raised after the warm phase and held through the terminal checks (see
++    // run_scenario()); cleared at scenario start so repeated scenarios are
++    // well defined.  Never set or cleared by win_open.
++    bool     measurement_phase = false;
+     uint32_t ptw_latency       = 1;
+     uint32_t a_pages           = 8;
+     uint32_t v_gap_cycles      = 1000;
+@@ -244,6 +252,14 @@
+     // cumulative-difference arithmetic is used.
+     std::string read_admit_mode_str = "none";
+     uint32_t    read_admit_mode_val = 0;
++    // +read-admit-measure-only=0|1 (default 0).  While it is 1 and the post-warm
++    // measurement phase is NOT active (reset ticks, warm-up and the warm A
++    // drain), tick() forces read_admit_mode_i to 1, i.e. the SAME single-slot
++    // proxy buffer used by +read-admit=buffer.  From measurement_phase onward
++    // the requested read_admit_mode_val is driven unchanged, so the measured
++    // window keeps the requested admission mode while the warm phase runs the
++    // buffer.  Default false reproduces the previous behaviour exactly.
++    bool        read_admit_measure_only = false;
+     uint32_t    read_budget         = 256;
+     uint32_t    read_period         = 256;
+ 
+@@ -577,8 +593,13 @@
+     void tick() {
+         top->nonblock_enable_i  = nonblock_enable  ? 1 : 0;
+         top->policy_partition_i = policy_partition ? 1 : 0;
+-#ifdef ACTUAL_DMA_SYSTEM
+-        top->read_admit_mode_i = read_admit_mode_val;
++        // Present on BOTH tops: suppress fullbuffer_jobs_i admission
++        // permission only while owner_only is requested and the post-warm
++        // measurement phase is active.  Buffer size is unchanged.
++        top->owner_only_i       = (owner_only && measurement_phase) ? 1 : 0;
++#ifdef ACTUAL_DMA_SYSTEM
++        top->read_admit_mode_i =
++            (read_admit_measure_only && !measurement_phase) ? 1 : read_admit_mode_val;
+         top->read_budget_i     = read_budget;
+         top->read_period_i     = read_period;
+ #endif
+@@ -1478,7 +1499,7 @@
+         std::printf(
+             "ACTUAL-DMA-WINDOW-JSON {"
+             "\"schema\":\"actual-dma-window-v1\","
+-            "\"mode\":\"%s\",\"v_cold_dst\":%d,"
++            "\"mode\":\"%s\",\"v_cold_dst\":%d,\"owner_only\":%d,"
+             "\"v_dst_iova\":%llu,\"v_dst_pa\":%llu,"
+             "\"runtime_N\":%d,\"policy_enable\":%d,"
+             "\"a_pages\":%u,\"v_gap\":%u,\"v_transfers\":%u,\"warmup\":%u,"
+@@ -1510,6 +1531,7 @@
+             "\"window_definition\":\"hardware_first_V_issue_to_final_V_done_(open,close]\","
+             "\"unavailable\":[\"comp_aw_stall\",\"comp_ar_stall\"]}\n",
+             name, (int)v_cold_dst,
++            (int)(owner_only && measurement_phase),
+             (unsigned long long)v_measure_dst_iova(),
+             (unsigned long long)v_measure_dst_pa(),
+             (int)enable, (int)policy_partition,
+@@ -1547,12 +1569,14 @@
+         std::printf("READ-ADMIT-WINDOW-JSON {"
+             "\"schema\":\"read-admit-window-v1\","
+             "\"mode\":\"%s\",\"read_admit\":\"%s\",\"budget\":%u,\"period\":%u,"
++            "\"measure_only\":%d,"
+             "\"captures\":%llu,\"offer_handshakes\":%llu,\"firstoffers\":%llu,"
+             "\"fastread_captures\":%llu,"
+             "\"gate_stall\":%llu,\"ingress_stall\":%llu,\"budget_stall\":%llu,"
+             "\"phase_resets\":%llu,\"exemptoffers\":%llu,"
+             "\"oversizeescape\":%llu,\"fast_gated_offers\":%llu}\n",
+             name, read_admit_mode_str.c_str(), read_budget, read_period,
++            (int)read_admit_measure_only,
+             (unsigned long long)w_ra_captures,
+             (unsigned long long)w_ra_offer_handshakes,
+             (unsigned long long)w_ra_firstoffers,
+@@ -1837,6 +1861,11 @@
+                     (int)policy_partition);
+ 
+         setup_memory(a_pages);
++        // Repeated-scenario hygiene: enter with the owner-only measurement
++        // phase OFF so the reset ticks and the whole warm phase drive
++        // owner_only_i low.  Warm caches and already-selected requests are
++        // untouched.
++        measurement_phase = false;
+         reset(enable);
+         scenario_start      = g_cycle;
+         last_progress_cycle = g_cycle;
+@@ -1862,6 +1891,13 @@
+                     (unsigned long long)warm_hw_a_done,
+                     warm_a_drain_cycles,
+                     warm_end_cycle - warm_start_cycle);
++
++        // ---- 1b. owner-only measurement phase --------------------------
++        // Raised after warm + drain and their summary, before either batch is
++        // configured or triggered, and held through STOP A, check_quiet, the
++        // byte verification and the terminal checks.  Deliberately NOT gated
++        // on win_open: closing the measurement window does not release it.
++        measurement_phase = true;
+ 
+         // ---- 2. configure BOTH batches before any trigger --------------
+         // A autonomous: ring over a_pages, no gap.
+@@ -2110,6 +2146,7 @@
+     uint32_t    ptw_lat  = 31;
+     uint64_t    a_target = 1048576ULL;
+     bool        v_cold_dst = false;
++    bool        owner_only = false;
+ #ifdef ACTUAL_DMA_SYSTEM
+     bool        cpu_writes = false;
+     bool        ds_priority = false;
+@@ -2117,6 +2154,7 @@
+     std::string read_admit = "none";
+     uint32_t    read_budget = 256;
+     uint32_t    read_period = 256;
++    bool        read_admit_measure_only = false;
+ #endif
+ 
+     for (int i = 1; i < argc; ++i) {
+@@ -2143,6 +2181,16 @@
+             }
+             v_cold_dst = (parsed != 0);
+         }
++        if (const char* v = val("owner-only")) {
++            char* end = nullptr;
++            const unsigned long parsed = std::strtoul(v, &end, 0);
++            if (end == v || *end != '\0' || parsed > 1) {
++                std::fprintf(stderr,
++                    "nonblock_actual_dma_test: invalid +owner-only='%s' (expected 0|1)\n", v);
++                return 2;
++            }
++            owner_only = (parsed != 0);
++        }
+ #ifdef ACTUAL_DMA_SYSTEM
+         if (const char* v = val("cpu-writes")) cpu_writes = (std::strtoul(v, nullptr, 0) != 0);
+         if (const char* v = val("ds-priority")) ds_priority = (std::strtoul(v, nullptr, 0) != 0);
+@@ -2150,6 +2198,16 @@
+         if (const char* v = val("read-admit"))  read_admit = v;
+         if (const char* v = val("read-budget")) read_budget = (uint32_t)std::strtoul(v, nullptr, 0);
+         if (const char* v = val("read-period")) read_period = (uint32_t)std::strtoul(v, nullptr, 0);
++        if (const char* v = val("read-admit-measure-only")) {
++            char* end = nullptr;
++            const unsigned long parsed = std::strtoul(v, &end, 0);
++            if (end == v || *end != '\0' || parsed > 1) {
++                std::fprintf(stderr,
++                    "nonblock_actual_dma_test: invalid +read-admit-measure-only='%s' (expected 0|1)\n", v);
++                return 2;
++            }
++            read_admit_measure_only = (parsed != 0);
++        }
+ #endif
+     }
+ 
+@@ -2219,6 +2277,7 @@
+                 a_pages, v_gap, transfers, warmup, ptw_lat,
+                 (unsigned long long)a_target);
+     std::printf("NOTE: ptw latency is a plain model delay (DDL/DDR), NOT MIG-matched.\n");
++    std::printf("nonblock_actual_dma_test: owner_only=%d\n", (int)owner_only);
+ #ifdef ACTUAL_DMA_SYSTEM
+     std::printf("nonblock_actual_dma_test: cpu_writes=%d\n", (int)cpu_writes);
+     std::printf("nonblock_actual_dma_test: read_admit=%s budget=%u period=%u\n",
+@@ -2235,11 +2294,13 @@
+         tb.ptw_latency     = ptw_lat;
+         tb.a_target        = a_target;
+         tb.v_cold_dst      = v_cold_dst;
++        tb.owner_only      = owner_only;
+ #ifdef ACTUAL_DMA_SYSTEM
+         tb.cpu_writes      = cpu_writes;
+         tb.ds_priority     = ds_priority;
+         tb.read_admit_mode_str = read_admit;
+         tb.read_admit_mode_val = read_admit_val;
++        tb.read_admit_measure_only = read_admit_measure_only;
+         tb.read_budget         = read_budget;
+         tb.read_period         = read_period;
+         if (!trace_path.empty()) {

@@ -1,0 +1,5 @@
+**验证补充（追加到阻断清单/验证记录）** 以下以给定 log 为真、未重跑：composition TL PASS（out/paper-route-review-20261004/composition-tl-test-fixed.log:1）；CLI 合同 9 项 OK（…/composition-cli-contract-fixed.log:1–5）；plan 34 项 OK 且含 total==172（…/composition-plan-tests.log:11,37–39）；Mac 入口 5 项 OK 并落 plan.json（172 cases）（…/mac-composition-entry-test.log:3,8）；composition_control 默认与 gen_full 均 PASS（…/composition-control-final-test.log:7,13）；IOTLB 25834 次检查 0 失败（…/composition-iotlb-test-fixed.log:1）。旧 TL/IOTLB/frontend/driver 编译 exit 0 为前文既有证据，此处只引用不重复。Linux 构建 complete（out/paper-route-review-20261004/software-build-state.json:6,25）。
+
+上述仅覆盖模块/组合仿真、工具合同与构建，不等于综合时序、板级或全系统上板通过。BIT 首次构建在布线期间原进程停止、原因未知，现从同 source physopt DCP 在 out/paper-route-review-20261004/recovery-v1/recovery-state.json 恢复，尚未完成，暂无可引用的回读/时序/DRC 结论（recovery-v1/REVIEW.md:1）。全系统上板仍待：四模式同 BIT 无跨区污染、P 条目级、N 真实 fast、PN 与单项取舍、S/S 散度、V gap 真实等待、样本保留与交付物（五轮 review:63–69、74）。
+
+边界与纪律：单 boot 探索、n3 不能声称显著；科学阴性（fast==0、miss==0、P/PN 无收益）不自动技术失败，不重跑/不剔除，失败保留原始结果（spec:46）。本文不把构建完成等同上板验收、不宣布创新成立；旧 method88 强对照负结果与 N v5 触发但无稳定收益继续保留（五轮 review:76）。

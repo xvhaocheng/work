@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
+"""Verilate and run the read->write coupled banked nonblocking test.
+
+Builds tests/nonblock_coupled_test.cpp against exactly the same RTL source
+list and include directories as tests/test_nonblock_banked.py.  No RTL file is
+copied or duplicated: the source list is imported from the sibling runner.
+
+RR overlap sweep (all 12 scenarios in one run):
+    python3 tests/test_nonblock_coupled.py --overlap --order rr
+
+v2 full-4KiB coupling buffer (same RTL, runtime flag only; see --couple-depth):
+    python3 tests/test_nonblock_coupled.py --overlap --order rr --couple-depth 512
+
+Legacy control (default coupling depth 3):
+    python3 tests/test_nonblock_coupled.py --legacy --overlap --order rr
+Legacy control, v2 depth:
+    python3 tests/test_nonblock_coupled.py --legacy --overlap --order rr --couple-depth 512
+"""
+
+import argparse
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT  = ROOT / "out" / "nonblock-coupled"
+
+TOP = "nonblock_banked_top"
+
+
+def load_sibling():
+    path = Path(__file__).resolve().parent / "test_nonblock_banked.py"
+    if not path.is_file():
+        sys.exit("sibling runner missing: {}".format(path))
+    spec = importlib.util.spec_from_file_location("nonblock_banked_runner", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def tail(path: Path, lines: int = 200) -> str:
+    try:
+        text = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(text[-lines:]) + "\n"
+
+
+def require(path: Path) -> Path:
+    if not path.exists():
+        sys.exit("required file missing: {}".format(path))
+    return path
+
+
+def dedup(paths):
+    seen, out = set(), []
+    for p in paths:
+        if p is None or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("-G", "--legacy", action="store_true",
+                    help="build the legacy control harness "
+                         "(BankedEnable=0, NonblockEnable=0)")
+    ap.add_argument("--overlap", action="store_true",
+                    help="enable the two half-burst overlap stimulus mode "
+                         "(same RTL, opt-in).  Builds in a SEPARATE obj "
+                         "directory so the default PASS build is never "
+                         "overwritten.  Forwarded to the C++ harness as "
+                         "--overlap.  The RR sweep is "
+                         "--overlap --order rr; add --legacy for the "
+                         "legacy control run.")
+    ap.add_argument("--order", choices=("vv", "aa", "av", "rr"), default="vv",
+                    help="upstream request priority order, forwarded to the "
+                         "C++ harness as +order=<...> (default: vv).  "
+                         "'rr' selects the independent AR/AW round-robin "
+                         "stimulus that interleaves the two DMAs' halves on "
+                         "the shared upstream port, e.g. V.h0 -> A.h0 -> "
+                         "V.h1 -> A.h1; combine with --overlap to cover all "
+                         "12 scenarios with that legal AXI ordering.")
+    ap.add_argument("--couple-depth", type=int, choices=(3, 512), default=3,
+                    help="per-DMA read->write coupling FIFO depth, forwarded to "
+                         "the C++ harness as +couple-depth=<...> (default: 3). "
+                         "3 is the historical v1 3-beat coupling depth every "
+                         "existing log was produced with; 512 is the v2 full "
+                         "4 KiB job (both 2 KiB halves) buffered per DMA lane. "
+                         "Runtime flag only: the RTL source list and the obj "
+                         "directory are deliberately unchanged, because the same "
+                         "harness back-pressures and checks at both depths.")
+    ap.add_argument("--reduced", action="store_true",
+                    help="reduced OT4/W8 config instead of the board OT8/W32 config")
+    ap.add_argument("--scenario", default=None,
+                    help="run only the named scenario "
+                         "(forwarded to the C++ harness as +scenario=)")
+    opts = ap.parse_args()
+
+    sibling = load_sibling()
+    tb = ROOT / "tests" / "nonblock_coupled_test.cpp"
+    sources = dedup([require(p) for p in sibling.SOURCES])
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    # Default mode keeps its original obj dir so an already-passing build is
+    # never overwritten.  Only the opt-in overlap mode uses a sub-directory.
+    # --couple-depth is a RUNTIME flag only: same RTL, same Verilator source
+    # list, no new SV adapter, so it never appears in the obj dir.  A depth-3
+    # run and a depth-512 run of the same mode therefore reuse one binary.
+    obj_root = (OUT
+                / ("legacy" if opts.legacy else "banked")
+                / ("reduced" if opts.reduced else "board"))
+    if opts.overlap:
+        obj_root = obj_root / "overlap"
+    obj_dir = obj_root / "obj"
+    obj_dir.mkdir(parents=True, exist_ok=True)
+
+    # board depth: OT8 / W32 by default; --reduced selects OT4 / W8.
+    num_ot, w_fifo = (4, 8) if opts.reduced else (8, 32)
+    banked   = 0 if opts.legacy else 1
+    nonblock = 0 if opts.legacy else 1
+
+    args = [
+        "verilator",
+        "--cc",
+        "--exe",
+        "--build",
+        "-Wno-fatal",
+        "+define+ASSERTS_OFF",
+        "--top-module",
+        TOP,
+        "--Mdir",
+        str(obj_dir),
+        "-GBankedEnable={}".format(banked),
+        "-GNonblockEnable={}".format(nonblock),
+        "-GNumOutstandingTrans={}".format(num_ot),
+        "-GWFifoDepth={}".format(w_fifo),
+    ]
+    for inc in sibling.INCDIRS:
+        args += ["-I{}".format(inc)]
+    args += [str(p) for p in sources]
+    args += [str(tb)]
+
+    build_log = OUT / "build.log"
+    with build_log.open("w") as log:
+        build = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT)
+    if build.returncode != 0:
+        sys.stderr.write(tail(build_log))
+        return 1
+
+    exe = obj_dir / "V{}".format(TOP)
+    if not exe.exists():
+        sys.stderr.write(tail(build_log))
+        sys.stderr.write("verilator did not produce {}\n".format(exe))
+        return 1
+
+    run_args = [str(exe), "+order={}".format(opts.order),
+                "+couple-depth={}".format(opts.couple_depth)]
+    if opts.scenario:
+        run_args.append("+scenario={}".format(opts.scenario))
+    if opts.overlap:
+        run_args.append("--overlap")
+    print("test_nonblock_coupled: couple_depth={} order={} overlap={}".format(
+        opts.couple_depth, opts.order, int(opts.overlap)))
+    run = subprocess.run(run_args)
+    return run.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,627 @@
+--- a/tests/test_nonblock_actual_dma.py
++++ b/tests/test_nonblock_actual_dma.py
+@@ -29,6 +29,10 @@
+ --------
+     python3 tests/test_nonblock_actual_dma.py --mode s --transfers 4096
+     python3 tests/test_nonblock_actual_dma.py --mode n --transfers 64 --ptw-latency 31
++
++    # policy P/PN: ONE -GPolicyEnable=1 build serves both runtime modes
++    python3 tests/test_nonblock_actual_dma.py --system --mode p  --transfers 64 --warmup 256 --v-gap 0
++    python3 tests/test_nonblock_actual_dma.py --system --mode pn --transfers 64 --warmup 256 --v-gap 0
+ """
+ 
+ import argparse
+@@ -203,10 +207,14 @@
+ 
+ def main() -> int:
+     ap = argparse.ArgumentParser(description=__doc__)
+-    ap.add_argument("--mode", choices=("s", "n"), default="s",
++    ap.add_argument("--mode", choices=("s", "n", "p", "pn"), default="s",
+                     help="runtime IOMMU mode: s -> nonblock_enable_i=0 "
+                          "(nonblocking disabled), n -> nonblock_enable_i=1 "
+-                         "(nonblocking enabled)")
++                         "(nonblocking enabled); p / pn use the SAME two "
++                         "runtime values but are elaborated with "
++                         "-GPolicyEnable=1 and driven with "
++                         "policy_partition_i=1 (own object directory; ONE "
++                         "build serves both p and pn at run time)")
+     ap.add_argument("--a-pages", type=int, default=8,
+                     help="number of 4 KiB aggressor pages in the A ring")
+     ap.add_argument("--v-gap", type=int, default=1000,
+@@ -243,21 +251,38 @@
+ 
+     if opts.system:
+         top_name = "nonblock_actual_dma_system_top"
+-        obj_dir  = OUT / "obj-system"
+         defines  = ["-CFLAGS", "-DACTUAL_DMA_SYSTEM"]
+         extra    = [require(ROOT / "tests" / "nonblock_actual_dma_top.sv")] + [require(p) for p in system_sources()]
+     else:
+         top_name = TOP
+-        obj_dir  = OUT / "obj"
+         defines  = []
+         extra    = [require(ROOT / "tests" / "nonblock_actual_dma_top.sv")]
+ 
+     if opts.system_atomics:
+-        obj_dir = OUT / "obj-system-atomics"
+         defines += ["-GDdrAtomics=1"]
+     if opts.cpu_writes:
+-        obj_dir = OUT / "obj-system-atomics-cpu-writes"
+         defines += ["-GCpuWrites=1"]
++
++    # ---- run-time mode p / pn : policy build -----------------------------
++    # p / pn are the policy variants of s / n.  They share ONE elaboration
++    # (PolicyEnable=1) and differ only in the run-time nonblock_enable_i that
++    # tests/nonblock_actual_dma_test.cpp drives, so a single build serves both.
++    policy = opts.mode in ("p", "pn")
++    if policy:
++        defines += ["-GPolicyEnable=1"]
++
++    # One object directory (and one build log) per (policy, system, atomics,
++    # cpu-writes) combination.  With policy == 0 the names are the historical
++    # ones byte for byte: obj / obj-system / obj-system-atomics /
++    # obj-system-atomics-cpu-writes.  A separate directory is mandatory
++    # because --build reuses objects when only -G / -D change.
++    tag = (["policy"] if policy else []) + \
++          (["system"] if opts.system else []) + \
++          (["atomics"] if opts.system_atomics else []) + \
++          (["cpu-writes"] if opts.cpu_writes else [])
++    obj_dir   = OUT / "-".join(["obj"] + tag)
++    build_log = OUT / ("-".join(["build"] + tag) + ".log")
++
+     atomics = CVA6 / "corev_apu" / "src" / "axi_riscv_atomics" / "src"
+     if opts.system:
+         extra += [require(atomics / name) for name in (
+@@ -293,9 +318,6 @@
+     args += [str(p) for p in sources]
+     args += [str(tb)]
+ 
+-    build_log = OUT / ("build-system-atomics-cpu-writes.log" if opts.cpu_writes else
+-                       "build-system-atomics.log" if opts.system_atomics else
+-                       "build-system.log" if opts.system else "build.log")
+     with build_log.open("w") as log:
+         build = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT)
+     if build.returncode != 0:
+--- a/tests/nonblock_actual_dma_test.cpp
++++ b/tests/nonblock_actual_dma_test.cpp
+@@ -69,6 +69,7 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include <algorithm>
+ 
+ // ---------------------------------------------------------------------------
+ // identifiers / addresses / sizes (identical to the coupled harness)
+@@ -176,6 +177,7 @@
+         uint8_t  id      = 0;
+         uint32_t beat    = 0;
+         int      latency = 1;
++        long     accepted_cycle = 0;
+     };
+     std::deque<MemRead> mem_q;                 // SINGLE ordered R-return queue
+ 
+@@ -280,6 +282,55 @@
+     uint64_t n_fast = 0;                 // fast (nonblocking hit) responses
+     uint64_t n_fast_bank[2] = {0, 0};    // ... split by bank
+ 
++    // ---------------- measurement window (pre-edge gated) -----------------
++    // Arm before the batch triggers; open at first hardware V issue, close
++    // at the v_transfers-th hardware V done. Count (open, close] pre-edges.
++    // Software configure/poll/drain ticks do not extend this window.
++    // Every counter below is accumulated inside tick() from the PRE-EDGE
++    // sample taken before the rising edge, so no post-edge value is ever
++    // counted.  The A/V busy tracking reuses the pulse convention of the
++    // existing warm_hw_* scoreboard (tick(), dbg_dma_issue/dbg_dma_done).
++    bool     win_open        = false;
++    bool     win_armed       = false;
++    bool     win_seen        = false;
++    long     win_open_cycle  = 0;
++    long     win_close_cycle = 0;
++    uint64_t w_cycles        = 0;
++    uint64_t w_v_done        = 0;   // dbg_dma_done bit0 pulses in window
++    uint64_t w_a_done        = 0;   // dbg_dma_done bit1 pulses in window
++    bool     w_v_busy        = false;
++    bool     w_a_busy        = false;
++    uint64_t w_both_pending  = 0;   // V and A both unfinished
++    uint64_t w_tl_accept     = 0, w_tl_resp = 0;
++    uint64_t w_req_bank[2]   = {0, 0};
++    uint64_t w_resp_bank[2]  = {0, 0};
++    uint64_t w_fast          = 0;
++    uint64_t w_fast_bank[2]  = {0, 0};
++    uint64_t w_iotlb_lookup  = 0, w_iotlb_hit = 0;
++    uint64_t w_ptw_active    = 0, w_ptw_r_fire = 0;
++#ifdef ACTUAL_DMA_SYSTEM
++    uint64_t w_ddr_ar = 0, w_ddr_aw = 0, w_ddr_w = 0, w_ddr_r = 0, w_ddr_b = 0;
++    uint64_t w_ddr_ar_slv[4] = {0, 0, 0, 0};   // by xbar port id = ID[5:4]
++    uint64_t w_ddr_aw_slv[4] = {0, 0, 0, 0};
++    uint64_t w_ddr_aw_v = 0, w_ddr_aw_a = 0;   // AW by destination region
++    uint64_t w_ddr_ar_stall = 0, w_ddr_r_stall = 0;
++    uint64_t w_ddr_aw_stall = 0, w_ddr_w_stall = 0;
++    uint64_t w_comp_ar_fire = 0, w_comp_aw_fire = 0, w_comp_w_fire = 0;
++    uint64_t w_ddtw_ar_fire = 0, w_ptw_ar_fire = 0;
++    uint64_t w_ds_ar_stall  = 0, w_ds_r_stall  = 0;
++    uint64_t w_ingress_aw_stall[2] = {0, 0};
++    uint64_t w_aw_raw[4] = {0, 0, 0, 0};
++    uint64_t w_aw_class[5] = {0, 0, 0, 0, 0};
++    uint64_t w_fill[2] = {0, 0}, w_ptw_bank_cycles[2] = {0, 0};
++    uint64_t w_ds_behind_comp_cycles = 0;
++    bool ds_priority = false;  // model-only causal intervention, window only
++    bool ddr_r_held = false;
++    FILE* event_trace = nullptr;
++    bool trace_ptw_active = false;
++    unsigned trace_aw_flags = 0;
++    uint64_t w_ds_latency_sum = 0, w_ds_latency_n = 0, w_ds_latency_max = 0;
++#endif
++
+     // Debug-only reset baselines.  DONE waits use the NEXT_ID captured by
+     // trigger(), never these values.
+     uint64_t v_done_last = 0, a_done_last = 0;
+@@ -288,7 +339,20 @@
+     static const long CFG_TIMEOUT     = 100000L;
+ 
+     Tb() : top(new TopT) {}
+-    ~Tb() { top->final(); delete top; }
++    ~Tb() {
++#ifdef ACTUAL_DMA_SYSTEM
++        if (event_trace) std::fclose(event_trace);
++#endif
++        top->final(); delete top;
++    }
++#ifdef ACTUAL_DMA_SYSTEM
++    void trace_event(const char* event, unsigned tag, uint64_t addr, uint64_t value) {
++        if (event_trace && win_open)
++            std::fprintf(event_trace, "%ld,%s,%u,%llu,%llu\n",
++                g_cycle - win_open_cycle, event, tag,
++                (unsigned long long)addr, (unsigned long long)value);
++    }
++#endif
+ 
+     // ---------------------------------------------------------------------
+     // memory helpers (identical to coupled harness)
+@@ -448,6 +512,17 @@
+ 
+         top->ddr_r_valid = 0;
+         if (mem_q.empty()) return;
++        // AXI allows R interleaving across different IDs. Promote only the
++        // oldest DS request, retaining order within every ID and preserving
++        // a VALID payload held from the prior tick. No DUT arbitration changes.
++        // Each request retains its original latency/beat state after rotation.
++        if (ds_priority && win_open && !ddr_r_held &&
++            ((mem_q.front().id >> 4) & 3) != 3) {
++            auto ds = std::find_if(mem_q.begin(), mem_q.end(), [](const MemRead& r) {
++                return ((r.id >> 4) & 3) == 3;
++            });
++            if (ds != mem_q.end()) std::rotate(mem_q.begin(), ds, ds + 1);
++        }
+         MemRead& h = mem_q.front();
+         if (h.latency > 0) { h.latency--; return; }
+ 
+@@ -490,6 +565,7 @@
+         const bool     f_ddr_w    = top->ddr_w_valid  && top->ddr_w_ready;
+         const bool     f_ddr_b    = top->ddr_b_valid  && top->ddr_b_ready;
+         const bool     f_ddr_r    = top->ddr_r_valid  && top->ddr_r_ready;
++        const bool     s_ddr_r_held = top->ddr_r_valid && !top->ddr_r_ready;
+         const uint64_t s_ddr_ar_a = top->ddr_ar_addr;
+         const uint32_t s_ddr_ar_l = (uint32_t)top->ddr_ar_len;
+         const uint32_t s_ddr_ar_i = (uint32_t)top->ddr_ar_id;
+@@ -593,6 +669,140 @@
+             if (top->dbg_tl_iotlb_hit) ++n_iotlb_hit;
+         }
+ 
++        // ================= measurement window (pre-edge) ==================
++        // Gated by win_open; see the counter block in class Tb.  Nothing is
++        // counted during warm-up, the A drain, drain-to-quiet or the byte
++        // verification, because win_open is false there.
++        // Track actual job occupancy from before the trigger sequence. This
++        // includes A's first issue even when it precedes the window opening.
++        const uint32_t measure_issue = (uint32_t)top->dbg_dma_issue & 3u;
++        const uint32_t measure_done = (uint32_t)top->dbg_dma_done & 3u;
++        const bool opening = win_armed && !win_seen && (measure_issue & 1u);
++        if (opening) {
++            win_open = true;
++            win_seen = true;
++            win_open_cycle = g_cycle;
++        }
++        if (win_open && !opening) {
++            ++w_cycles;
++
++            const uint32_t w_dnn = (uint32_t)top->dbg_dma_done  & 3u;
++            if (w_dnn & 1u) ++w_v_done;
++            if (w_dnn & 2u) ++w_a_done;
++            if (w_v_busy && w_a_busy) ++w_both_pending;
++
++            if (top->dbg_tl_req_valid && top->dbg_tl_req_ready) {
++                ++w_tl_accept;
++                ++w_req_bank[top->dbg_tl_req_bank & 1];
++            }
++            if (top->dbg_tl_resp_valid && top->dbg_tl_resp_ready) {
++                ++w_tl_resp;
++                ++w_resp_bank[top->dbg_tl_resp_bank & 1];
++            }
++            if (top->dbg_fast_resp_valid && top->dbg_fast_resp_ready) {
++                ++w_fast;
++                ++w_fast_bank[top->dbg_fast_resp_bank & 1];
++            }
++            if (top->dbg_tl_iotlb_lookup) {
++                ++w_iotlb_lookup;
++                if (top->dbg_tl_iotlb_hit) ++w_iotlb_hit;
++            }
++            // ptw_active is a LEVEL (counted per cycle, like the existing
++            // whole-scenario counter); ptw_r_fire is a pulse.
++            if (top->dbg_tl_ptw_active) ++w_ptw_active;
++            if (top->dbg_tl_ptw_r_fire) ++w_ptw_r_fire;
++#ifdef ACTUAL_DMA_SYSTEM
++            if (top->dbg_tl_ptw_active != trace_ptw_active)
++                trace_event(top->dbg_tl_ptw_active ? "ptw_start" : "ptw_end",
++                            top->dbg_main_bank, 0, 0);
++            trace_ptw_active = top->dbg_tl_ptw_active;
++            unsigned aw_flags = top->dbg_tr_aw_stall ? (top->dbg_aw_wait_flags | 16u) : 0;
++            if (aw_flags != trace_aw_flags)
++                trace_event("aw_wait_change", top->dbg_tr_aw_bank, 0, aw_flags);
++            trace_aw_flags = aw_flags;
++            if (w_dnn) trace_event("dma_done", w_dnn, 0, w_v_done);
++            if (top->dbg_fast_resp_valid && top->dbg_fast_resp_ready)
++                trace_event("fast_response", top->dbg_fast_resp_bank, 0, 0);
++            if (top->dbg_iotlb_fill) trace_event("fill", top->dbg_main_bank, 0, 0);
++            if (top->dbg_ptw_ar_fire) trace_event("ptw_ar", top->dbg_main_bank, 0, 0);
++            if (top->dbg_tl_ptw_r_fire) trace_event("ptw_r", top->dbg_main_bank, 0, 0);
++            if (f_ddr_ar) trace_event("ddr_ar", s_ddr_ar_i, s_ddr_ar_a, s_ddr_ar_l);
++            if (f_ddr_aw) trace_event("ddr_aw", s_ddr_aw_i, s_ddr_aw_a, s_ddr_aw_l);
++            if (f_ddr_r && mem_q.front().beat == 0)
++                trace_event("ddr_r_first", mem_q.front().id, mem_q.front().addr,
++                            g_cycle - mem_q.front().accepted_cycle);
++            if (f_ddr_r && top->ddr_r_last) {
++                const MemRead& r = mem_q.front();
++                trace_event("ddr_r_last", r.id, r.addr, g_cycle - r.accepted_cycle);
++                if (((r.id >> 4) & 3) == 3 && r.accepted_cycle > win_open_cycle) {
++                    uint64_t latency = g_cycle - r.accepted_cycle;
++                    ++w_ds_latency_n;
++                    w_ds_latency_sum += latency;
++                    w_ds_latency_max = std::max(w_ds_latency_max, latency);
++                }
++            }
++            // Shared DDR port.  f_ddr_* are this tick's PRE-EDGE fire flags;
++            // the stall counters use the PRE-EDGE valid/ready sample.
++            // NOTE: drive_ddr() drives ddr_aw_ready / ddr_w_ready to 1
++            // permanently, so w_ddr_aw_stall / w_ddr_w_stall are structurally
++            // 0 in this model.  They must NOT be read as "the board never
++            // backpressures shared AW": this DDR model has no AW backpressure
++            // at all.
++            if (f_ddr_ar) { ++w_ddr_ar; ++w_ddr_ar_slv[(s_ddr_ar_i >> 4) & 3]; }
++            if (f_ddr_aw) {
++                ++w_ddr_aw;
++                ++w_ddr_aw_slv[(s_ddr_aw_i >> 4) & 3];
++                // Destination region: the A ring lives at A_SRC_PA_BASE
++                // (0x9000_0000+) and V at V_SRC_PA (0x8000_0000+); everything
++                // below the synthetic CPU scratch (0x8100_0000) is V.
++                if (s_ddr_aw_a >= A_SRC_PA_BASE)      ++w_ddr_aw_a;
++                else if (s_ddr_aw_a >= V_SRC_PA &&
++                         s_ddr_aw_a <  CPU_WR_ADDR)   ++w_ddr_aw_v;
++            }
++            if (f_ddr_w) ++w_ddr_w;
++            if (f_ddr_r) ++w_ddr_r;
++            if (f_ddr_b) ++w_ddr_b;
++            if (top->ddr_ar_valid && !top->ddr_ar_ready) ++w_ddr_ar_stall;
++            if (top->ddr_r_valid  && !top->ddr_r_ready)  ++w_ddr_r_stall;
++            if (top->ddr_aw_valid && !top->ddr_aw_ready) ++w_ddr_aw_stall;
++            if (top->ddr_w_valid  && !top->ddr_w_ready)  ++w_ddr_w_stall;
++            if (top->dbg_comp_ar_fire) ++w_comp_ar_fire;
++            if (top->dbg_comp_aw_fire) ++w_comp_aw_fire;
++            if (top->dbg_comp_w_fire)  ++w_comp_w_fire;
++            if (top->dbg_ddtw_ar_fire) ++w_ddtw_ar_fire;
++            if (top->dbg_ptw_ar_fire)  ++w_ptw_ar_fire;
++            if (top->dbg_ds_ar_valid && !top->dbg_ds_ar_ready) ++w_ds_ar_stall;
++            if (top->dbg_ds_r_valid  && !top->dbg_ds_r_ready)  ++w_ds_r_stall;
++            if (top->dbg_tr_aw_stall) {
++                ++w_ingress_aw_stall[top->dbg_tr_aw_bank & 1];
++                unsigned flags = top->dbg_aw_wait_flags;
++                unsigned cls = 4;
++                for (unsigned i = 0; i < 4; ++i) {
++                    if (flags & (1u << i)) { ++w_aw_raw[i]; if (cls == 4) cls = i; }
++                }
++                ++w_aw_class[cls];
++            }
++            if (top->dbg_iotlb_fill) ++w_fill[top->dbg_main_bank & 1];
++            if (top->dbg_tl_ptw_active) ++w_ptw_bank_cycles[top->dbg_main_bank & 1];
++            if (!mem_q.empty() && ((mem_q.front().id >> 4) & 3) == 2) {
++                for (const auto& r : mem_q) {
++                    if (((r.id >> 4) & 3) == 3) { ++w_ds_behind_comp_cycles; break; }
++                }
++            }
++#endif
++            if (w_v_done == v_transfers) {
++                win_open = false;
++                win_armed = false;
++                win_close_cycle = g_cycle;
++            }
++        }
++        if (win_armed || opening || win_close_cycle == g_cycle) {
++            if (measure_done & 1u) w_v_busy = false;
++            if (measure_issue & 1u) w_v_busy = true;
++            if (measure_done & 2u) w_a_busy = false;
++            if (measure_issue & 2u) w_a_busy = true;
++        }
++
+ #ifdef ACTUAL_DMA_SYSTEM
+         // Underlying walker counters: the real ds_if merge hides the external
+         // dd/ptw ports, so walk evidence comes from the harness taps.
+@@ -632,12 +842,14 @@
+         top->eval();
+ 
+ #ifdef ACTUAL_DMA_SYSTEM
++        ddr_r_held = s_ddr_r_held;
+         if (f_ddr_ar) {
+             ++n_ddr_ar;
+             ++n_slv_ar[(s_ddr_ar_i >> 4) & 3];
+             MemRead r; r.port = P_DDR; r.addr = s_ddr_ar_a;
+             r.len = (uint8_t)s_ddr_ar_l; r.id = (uint8_t)s_ddr_ar_i;
+             r.beat = 0; r.latency = (int)ptw_latency;
++            r.accepted_cycle = g_cycle;
+             mem_q.push_back(r);
+         }
+         if (f_ddr_aw) {
+@@ -813,6 +1025,30 @@
+         n_resp_bank[0] = n_resp_bank[1] = 0;
+         n_fast = 0;
+         n_fast_bank[0] = n_fast_bank[1] = 0;
++
++        // Measurement window starts CLOSED; run_scenario() opens it only for
++        // the A/V trigger -> V-complete interval.
++        win_open        = false;
++        win_armed       = false;
++        win_seen        = false;
++        win_open_cycle  = 0;
++        win_close_cycle = 0;
++        w_cycles        = 0;
++        w_v_done        = 0;
++        w_a_done        = 0;
++        w_v_busy        = false;
++        w_a_busy        = false;
++        w_both_pending  = 0;
++        w_tl_accept     = 0;
++        w_tl_resp       = 0;
++        w_req_bank[0]   = w_req_bank[1]  = 0;
++        w_resp_bank[0]  = w_resp_bank[1] = 0;
++        w_fast          = 0;
++        w_fast_bank[0]  = w_fast_bank[1] = 0;
++        w_iotlb_lookup  = 0;
++        w_iotlb_hit     = 0;
++        w_ptw_active    = 0;
++        w_ptw_r_fire    = 0;
+         v_done_last = a_done_last = 0;
+         warm_a_page         = 0;
+         warm_v_submitted    = 0;
+@@ -842,6 +1078,26 @@
+         n_ddr_ar = n_ddr_aw = n_ddr_b = n_ddr_r = 0;
+         n_slv_ar[0] = n_slv_ar[1] = n_slv_ar[2] = n_slv_ar[3] = 0;
+         n_walk_ddtw = n_walk_ptw = 0;
++
++        w_ddr_ar = w_ddr_aw = w_ddr_w = w_ddr_r = w_ddr_b = 0;
++        w_ddr_ar_slv[0] = w_ddr_ar_slv[1] = w_ddr_ar_slv[2] = w_ddr_ar_slv[3] = 0;
++        w_ddr_aw_slv[0] = w_ddr_aw_slv[1] = w_ddr_aw_slv[2] = w_ddr_aw_slv[3] = 0;
++        w_ddr_aw_v = w_ddr_aw_a = 0;
++        w_ddr_ar_stall = w_ddr_r_stall = 0;
++        w_ddr_aw_stall = w_ddr_w_stall = 0;
++        w_comp_ar_fire = w_comp_aw_fire = w_comp_w_fire = 0;
++        w_ddtw_ar_fire = w_ptw_ar_fire = 0;
++        w_ds_ar_stall  = w_ds_r_stall  = 0;
++        w_ingress_aw_stall[0] = w_ingress_aw_stall[1] = 0;
++        for (auto& c : w_aw_raw) c = 0;
++        for (auto& c : w_aw_class) c = 0;
++        w_fill[0] = w_fill[1] = 0;
++        w_ptw_bank_cycles[0] = w_ptw_bank_cycles[1] = 0;
++        w_ds_behind_comp_cycles = 0;
++        w_ds_latency_sum = w_ds_latency_n = w_ds_latency_max = 0;
++        ddr_r_held = false;
++        trace_ptw_active = false;
++        trace_aw_flags = 0;
+         cpu_progress_cycle = g_cycle;
+         last_cpu_issued    = 0;
+         last_cpu_completed = 0;
+@@ -1027,6 +1283,116 @@
+     }
+ 
+     // ---------------------------------------------------------------------
++    // One-line, schema-tagged MEASUREMENT-WINDOW summary (system builds).
++    // Every number is either a counter accumulated inside tick() while
++    // win_open was true, or derived from such a counter, so warm-up, the A
++    // drain, drain-to-quiet and the byte verification are excluded by
++    // construction.  "unavailable" names the classifications this harness
++    // CANNOT see today; they are listed instead of being reported as 0.
++    // ---------------------------------------------------------------------
++    void report_window(const char* name, bool enable) {
++#ifdef ACTUAL_DMA_SYSTEM
++        CHECK(w_cycles == (uint64_t)(win_close_cycle - win_open_cycle),
++              "measurement-window cycle count does not match its markers");
++        CHECK(win_seen && !win_open && w_v_done == v_transfers,
++              "hardware measurement window did not contain all V completions");
++        CHECK(!policy_partition || top->dbg_policy_elaborated,
++              "p/pn require a PolicyEnable=1 elaboration");
++        // Non-vacuity is checked by each diagnostic's acceptance criteria;
++        // a valid hot-cache n/pn workload may legitimately have zero fast hits.
++        uint64_t classified = 0;
++        for (auto c : w_aw_class) classified += c;
++        CHECK(classified == w_ingress_aw_stall[0] + w_ingress_aw_stall[1],
++              "AW classification does not cover exactly the ingress stall cycles");
++        std::printf("ACTUAL-DMA-DDR-JSON {\"schema\":\"actual-dma-ddr-v1\","
++            "\"mode\":\"%s\",\"ds_priority_window_only\":%d,"
++            "\"completed_window_ds_reads\":%llu,\"ds_read_latency_sum\":%llu,"
++            "\"ds_read_latency_max\":%llu}\n", name, (int)ds_priority,
++            (unsigned long long)w_ds_latency_n, (unsigned long long)w_ds_latency_sum,
++            (unsigned long long)w_ds_latency_max);
++        std::printf("ACTUAL-DMA-PATH-JSON {\"schema\":\"actual-dma-path-v1\","
++            "\"mode\":\"%s\",\"ingress_aw_stall_v\":%llu,\"ingress_aw_stall_a\":%llu,"
++            "\"aw_class\":[%llu,%llu,%llu,%llu,%llu],\"aw_raw\":[%llu,%llu,%llu,%llu],"
++            "\"fill_v\":%llu,\"fill_a\":%llu,\"ptw_cycles_v\":%llu,\"ptw_cycles_a\":%llu,"
++            "\"ds_behind_comp_cycles\":%llu}\n", name,
++            (unsigned long long)w_ingress_aw_stall[0], (unsigned long long)w_ingress_aw_stall[1],
++            (unsigned long long)w_aw_class[0], (unsigned long long)w_aw_class[1],
++            (unsigned long long)w_aw_class[2], (unsigned long long)w_aw_class[3],
++            (unsigned long long)w_aw_class[4], (unsigned long long)w_aw_raw[0],
++            (unsigned long long)w_aw_raw[1], (unsigned long long)w_aw_raw[2],
++            (unsigned long long)w_aw_raw[3], (unsigned long long)w_fill[0],
++            (unsigned long long)w_fill[1], (unsigned long long)w_ptw_bank_cycles[0],
++            (unsigned long long)w_ptw_bank_cycles[1], (unsigned long long)w_ds_behind_comp_cycles);
++        std::printf(
++            "ACTUAL-DMA-WINDOW-JSON {"
++            "\"schema\":\"actual-dma-window-v1\","
++            "\"mode\":\"%s\",\"runtime_N\":%d,\"policy_enable\":%d,"
++            "\"a_pages\":%u,\"v_gap\":%u,\"v_transfers\":%u,\"warmup\":%u,"
++            "\"ptw_latency\":%u,\"a_target\":%llu,"
++            "\"W_cycles\":%llu,\"win_open_cycle\":%ld,"
++            "\"win_close_cycle\":%ld,"
++            "\"window\":{"
++            "\"v_completed\":%llu,\"a_completed\":%llu,"
++            "\"both_pending_cycles\":%llu,"
++            "\"fast\":%llu,\"fast_bank0\":%llu,\"fast_bank1\":%llu,"
++            "\"tl_accept\":%llu,\"tl_resp\":%llu,"
++            "\"tl_req_bank0\":%llu,\"tl_req_bank1\":%llu,"
++            "\"iotlb_lookup\":%llu,\"iotlb_hit\":%llu,\"iotlb_miss\":%llu,"
++            "\"ptw_active_cycles\":%llu,\"ptw_r_fire\":%llu,"
++            "\"walk_ddtw_ar\":%llu,\"walk_ptw_ar\":%llu,"
++            "\"ddr_ar\":%llu,\"ddr_aw\":%llu,\"ddr_w\":%llu,"
++            "\"ddr_r\":%llu,\"ddr_b\":%llu,"
++            "\"ddr_ar_stall\":%llu,\"ddr_r_stall\":%llu,"
++            "\"ddr_aw_stall\":%llu,\"ddr_w_stall\":%llu,"
++            "\"ddr_ar_slv0_cpu\":%llu,\"ddr_ar_slv2_comp\":%llu,"
++            "\"ddr_ar_slv3_ds\":%llu,"
++            "\"ddr_aw_slv0_cpu\":%llu,\"ddr_aw_slv2_comp\":%llu,"
++            "\"ddr_aw_slv3_ds\":%llu,"
++            "\"ddr_aw_v_region\":%llu,\"ddr_aw_a_region\":%llu,"
++            "\"comp_ar_fire\":%llu,\"comp_aw_fire\":%llu,"
++            "\"comp_w_fire\":%llu,"
++            "\"ds_ar_stall\":%llu,\"ds_r_stall\":%llu"
++            "},"
++            "\"window_definition\":\"hardware_first_V_issue_to_final_V_done_(open,close]\","
++            "\"unavailable\":[\"comp_aw_stall\",\"comp_ar_stall\"]}\n",
++            name, (int)enable, (int)policy_partition,
++            a_pages, v_gap_cycles, v_transfers, warmup, ptw_latency,
++            (unsigned long long)a_target,
++            (unsigned long long)w_cycles, win_open_cycle, win_close_cycle,
++            (unsigned long long)w_v_done, (unsigned long long)w_a_done,
++            (unsigned long long)w_both_pending,
++            (unsigned long long)w_fast,
++            (unsigned long long)w_fast_bank[0],
++            (unsigned long long)w_fast_bank[1],
++            (unsigned long long)w_tl_accept, (unsigned long long)w_tl_resp,
++            (unsigned long long)w_req_bank[0], (unsigned long long)w_req_bank[1],
++            (unsigned long long)w_iotlb_lookup, (unsigned long long)w_iotlb_hit,
++            (unsigned long long)(w_iotlb_lookup - w_iotlb_hit),
++            (unsigned long long)w_ptw_active, (unsigned long long)w_ptw_r_fire,
++            (unsigned long long)w_ddtw_ar_fire, (unsigned long long)w_ptw_ar_fire,
++            (unsigned long long)w_ddr_ar, (unsigned long long)w_ddr_aw,
++            (unsigned long long)w_ddr_w, (unsigned long long)w_ddr_r,
++            (unsigned long long)w_ddr_b,
++            (unsigned long long)w_ddr_ar_stall, (unsigned long long)w_ddr_r_stall,
++            (unsigned long long)w_ddr_aw_stall, (unsigned long long)w_ddr_w_stall,
++            (unsigned long long)w_ddr_ar_slv[0],
++            (unsigned long long)w_ddr_ar_slv[2],
++            (unsigned long long)w_ddr_ar_slv[3],
++            (unsigned long long)w_ddr_aw_slv[0],
++            (unsigned long long)w_ddr_aw_slv[2],
++            (unsigned long long)w_ddr_aw_slv[3],
++            (unsigned long long)w_ddr_aw_v, (unsigned long long)w_ddr_aw_a,
++            (unsigned long long)w_comp_ar_fire,
++            (unsigned long long)w_comp_aw_fire,
++            (unsigned long long)w_comp_w_fire,
++            (unsigned long long)w_ds_ar_stall, (unsigned long long)w_ds_r_stall);
++#else
++        (void)name;
++        (void)enable;
++#endif
++    }
++
++    // ---------------------------------------------------------------------
+     // batch helpers
+     // ---------------------------------------------------------------------
+     // returns {error, complete, stopped, active, enable}
+@@ -1329,6 +1695,7 @@
+                         (uint64_t)v_transfers, 1, v_gap_cycles);
+ 
+         // ---- 3. A NEXT_ID then V NEXT_ID -------------------------------
++        win_armed = true;
+         start_batch(SEL_A);
+         start_batch(SEL_V);
+ 
+@@ -1370,6 +1737,10 @@
+             }
+             (void)t;
+         }
++
++        // tick() already froze the window at the final hardware V done.
++        // Print before drain; final PASS still requires all data checks.
++        report_window(name, enable);
+ 
+         // ---- 5. STOP A and drain ---------------------------------------
+         stop_batch(SEL_A);
+@@ -1529,6 +1900,8 @@
+     uint64_t    a_target = 1048576ULL;
+ #ifdef ACTUAL_DMA_SYSTEM
+     bool        cpu_writes = false;
++    bool        ds_priority = false;
++    std::string trace_path;
+ #endif
+ 
+     for (int i = 1; i < argc; ++i) {
+@@ -1547,13 +1920,15 @@
+         if (const char* v = val("a-target"))  a_target = std::strtoull(v, nullptr, 0);
+ #ifdef ACTUAL_DMA_SYSTEM
+         if (const char* v = val("cpu-writes")) cpu_writes = (std::strtoul(v, nullptr, 0) != 0);
++        if (const char* v = val("ds-priority")) ds_priority = (std::strtoul(v, nullptr, 0) != 0);
++        if (const char* v = val("event-trace")) trace_path = v;
+ #endif
+     }
+ 
+     // ---- strict validation ------------------------------------------------
+-    if (mode != "s" && mode != "n") {
+-        std::fprintf(stderr, "nonblock_actual_dma_test: invalid +mode='%s' (expected s|n)\n",
+-                     mode.c_str());
++    if (mode != "s" && mode != "n" && mode != "p" && mode != "pn") {
++        std::fprintf(stderr, "nonblock_actual_dma_test: invalid +mode='%s' "
++                             "(expected s|n|p|pn)\n", mode.c_str());
+         return 2;
+     }
+     if (a_pages == 0) {
+@@ -1569,10 +1944,16 @@
+         return 2;
+     }
+ 
+-    // The wrapper forwards --mode into the runtime nonblock_enable_i input.
+-    //   s -> Nonblock = 0 (nonblocking DISABLED)
+-    //   n -> Nonblock = 1 (nonblocking ENABLED)
+-    const bool enable = (mode == "n");
++    // The wrapper forwards --mode into the run-time nonblock_enable_i and
++    // policy_partition_i inputs.  policy_partition_i is only effective in a
++    // build elaborated with -GPolicyEnable=1; tests/test_nonblock_actual_dma.py
++    // adds that define (and an own object directory) for p / pn only.
++    //   s  -> Nonblock = 0, policy_partition = 0
++    //   n  -> Nonblock = 1, policy_partition = 0
++    //   p  -> Nonblock = 0, policy_partition = 1
++    //   pn -> Nonblock = 1, policy_partition = 1
++    const bool enable = (mode == "n" || mode == "pn");
++    const bool policy = (mode == "p" || mode == "pn");
+ 
+     std::printf("nonblock_actual_dma_test: mode=%s (nonblock_enable=%d)\n",
+                 mode.c_str(), (int)enable);
+@@ -1596,12 +1977,18 @@
+         tb.a_target        = a_target;
+ #ifdef ACTUAL_DMA_SYSTEM
+         tb.cpu_writes      = cpu_writes;
+-#endif
+-        tb.policy_partition= false;
+-        tb.run_scenario(enable ? "n" : "s", enable);
++        tb.ds_priority     = ds_priority;
++        if (!trace_path.empty()) {
++            tb.event_trace = std::fopen(trace_path.c_str(), "w");
++            CHECK(tb.event_trace, "cannot open event trace output");
++            std::fprintf(tb.event_trace, "cycle,event,tag,address,value\n");
++        }
++#endif
++        tb.policy_partition= policy;
++        tb.run_scenario(mode.c_str(), enable);
+     } catch (const std::exception& e) {
+         std::fprintf(stderr, "nonblock_actual_dma_test: SCENARIO-FAIL %s: %s\n",
+-                     (enable ? "n" : "s"), e.what());
++                     mode.c_str(), e.what());
+         rc = 1;
+     }
+ 

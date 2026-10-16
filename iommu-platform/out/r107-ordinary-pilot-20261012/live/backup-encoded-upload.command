@@ -1,0 +1,1 @@
+base64 /tmp/r107-stage111/original-mmcblk0p1.bin > /tmp/r107-stage111/original-mmcblk0p1.b64 && wc -c /tmp/r107-stage111/original-mmcblk0p1.b64 && wget -Y off -T 60 -q -O /tmp/r107-stage111/backup-transfer-receipt.json --post-file /tmp/r107-stage111/original-mmcblk0p1.b64 http://192.168.77.1:18080/backup-base64 && cat /tmp/r107-stage111/backup-transfer-receipt.json

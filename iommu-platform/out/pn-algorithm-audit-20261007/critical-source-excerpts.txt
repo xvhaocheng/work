@@ -1,0 +1,1452 @@
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv ORIGINAL LINES 140-355
+140:     localparam int unsigned PLEN = RVIOMMUCfg.PAddrWidth;
+141:     localparam int unsigned PPNW = PLEN-12;
+142: 
+143:     typedef enum logic [2:0] {
+144:         IDLE        = 3'b000,
+145:         DDT         = 3'b001,
+146:         PDT         = 3'b010,
+147:         PT          = 3'b011,
+148:         MSI         = 3'b100,
+149:         ERROR       = 3'b101,
+150:         COMPLETE    = 3'b110
+151:     } tl_wrap_state_t;
+152:     tl_wrap_state_t state_q, state_n;
+153: 
+154:     //-----------------
+155:     // Request Arbiter
+156:     //-----------------
+157:     trans_resp_data_t slow_resp_data, fast_resp_data;
+158:     logic slow_resp_valid, slow_resp_ready, fast_resp_valid, fast_resp_ready;
+159:     logic normal_trans_ready, normal_gate, n_intercept, n_accept, n_busy;
+160:     logic n_window;
+161:     logic [15:0] n_diag;
+162:     logic n_ddtc_lu, n_ddtc_touch, n_iotlb_lu, n_iotlb_touch;
+163:     device_id_t n_ddtc_did;
+164:     logic [GPPNW39-1:0] n_iotlb_vpn;
+165:     pscid_t n_iotlb_pscid;
+166:     logic cache_ddtc_hit, cache_iotlb_hit;
+167:     logic cache_iotlb_en1, cache_iotlb_en2;
+168:     trans_req_data_t    arb_req_data;
+169:     logic               arb_req_valid;
+170:     logic               arb_req_ready;
+171:     trans_req_data_t    req_data;
+172:     logic               req_valid;
+173:     logic               req_ready;
+174:     assign req_ready = (debug_resp_valid_o & debug_resp_ready_i) |
+175:                        (slow_resp_valid & slow_resp_ready) |
+176:                        (ats_trans_resp_valid_o & ats_trans_resp_ready_i) ;
+177: 
+178:     // Priority is given to normal transactions
+179:     // We can keep the arbitrer in any case, as data_i and valid_i are '0
+180:     // when debug/ATS are unsupported
+181:     stream_arbiter #(
+182:         .DATA_T   (trans_req_data_t),
+183:         .N_INP    (3),
+184:         .ARBITER  ("prio")
+185:     ) i_req_arbiter (
+186:         .clk_i          (clk_i),
+187:         .rst_ni         (rst_ni),
+188: 
+189:         .inp_data_i     ({ats_trans_req_data_i,     debug_req_data_i,     trans_req_data_i }),
+190:         .inp_valid_i    ({ats_trans_req_valid_i && normal_gate,
+191:                           debug_req_valid_i && normal_gate,
+192:                           trans_req_valid_i && normal_gate}),
+193:         .inp_ready_o    ({ats_trans_req_ready_o,    debug_req_ready_o,    normal_trans_ready}),
+194: 
+195:         .oup_data_o     (arb_req_data),
+196:         .oup_valid_o    (arb_req_valid),
+197:         .oup_ready_i    (arb_req_ready)
+198:     );
+199: 
+200:     spill_register #(
+201:         .T          (trans_req_data_t),
+202:         .Bypass     (1'b0)
+203:     ) i_req_spill_register (
+204:         .clk_i      (clk_i),
+205:         .rst_ni     (rst_ni),
+206: 
+207:         .data_i     (arb_req_data),
+208:         .valid_i    (arb_req_valid),
+209:         .ready_o    (arb_req_ready),
+210: 
+211:         .data_o     (req_data),
+212:         .valid_o    (req_valid),
+213:         .ready_i    (req_ready)
+214:     );
+215: 
+216:     //-----------------------
+217:     // Translation Data Regs
+218:     //-----------------------
+219:     dc_t                dc_q,           dc_n;
+220:     rv_iommu::pc_t      pc_q,           pc_n;
+221:     logic               en_1S_q,        en_1S_n;
+222:     logic               en_2S_q,        en_2S_n;
+223:     rv_iommu::gscid_t   gscid_q,        gscid_n;
+224:     rv_iommu::pscid_t   pscid_q,        pscid_n;
+225:     rv_iommu::ppn_t     iohgatp_ppn_q,  iohgatp_ppn_n;
+226:     rv_iommu::ppn_t     iosatp_ppn_q,   iosatp_ppn_n;
+227:     paddr_t             spaddr_q,       spaddr_n;
+228:     logic               r_q,            r_n;
+229:     logic               w_q,            w_n;
+230:     logic               x_q,            x_n;
+231:     logic               u_q,            u_n;
+232:     logic               g_q,            g_n;
+233:     logic               sum_q,          sum_n;
+234:     logic               t2gpa_q,        t2gpa_n;
+235:     logic               bypass_q,       bypass_n;
+236:     logic [2:0]         range_q,        range_n;
+237: 
+238: 
+239: 
+240:     //-------------
+241:     // IOATC Wires
+242:     //-------------
+243:     // DDTC
+244:     logic                    ddtc_lu;
+245:     rv_iommu::device_id_t    ddtc_lu_did;
+246:     logic                    ddtc_lu_hit;
+247:     dc_t                     ddtc_dc;
+248:     ddtc_up_t                ddtc_update;
+249:     assign ddtc_lu          = (state_q == DDT) | ats_ddtc_valid_i | n_ddtc_lu;
+250:     assign ddtc_lu_did      = n_ddtc_lu ? n_ddtc_did :
+251:                              ats_ddtc_valid_i ? ats_ddtc_did_i : req_data.did;
+252:     assign ddtc_lu_hit = cache_ddtc_hit && !n_ddtc_lu;
+253:     assign ats_ddtc_ready_o = ~ddtc_lu_hit;
+254:     assign ats_ddtc_tc_o.en_pri = dc_q.tc.en_pri;
+255:     assign ats_ddtc_tc_o.en_ats = dc_q.tc.en_ats;
+256:     assign ats_ddtc_tc_o.prpr   = dc_q.tc.prpr;
+257: 
+258:     // PDTC
+259:     logic                    pdtc_lu_hit;
+260:     rv_iommu::pc_t           pdtc_lu_content;
+261:     // IOTLB
+262:     logic                           iotlb_lu;
+263:     logic [rv_iommu::GPPNW39-1:0]   iotlb_lu_vpn;
+264:     rv_iommu::pscid_t               iotlb_lu_pscid;
+265:     rv_iommu::gscid_t               iotlb_lu_gscid;
+266:     logic                           iotlb_lu_hit;
+267:     rv_iommu::iotlb_content_t       iotlb_lu_content;
+268:     rv_iommu::iotlb_up_t            ptw_iotlb_update, msi_iotlb_update;
+269:     rv_iommu::iotlb_up_t            iotlb_update;
+270:     rv_iommu::research_t            iotlb_research;
+271:     assign iotlb_lu         = (state_q == PT) | (state_q == MSI) | n_iotlb_lu;
+272:     assign iotlb_lu_vpn     = n_iotlb_lu ? n_iotlb_vpn : req_data.iova[rv_iommu::GPLEN39-1:12];
+273:     assign iotlb_lu_pscid   = n_iotlb_lu ? n_iotlb_pscid : pscid_q;
+274:     assign iotlb_lu_gscid   = n_iotlb_lu ? '0 : gscid_q;
+275:     assign cache_iotlb_en1 = n_iotlb_lu ? 1'b1 : en_1S_q;
+276:     assign cache_iotlb_en2 = n_iotlb_lu ? 1'b0 : en_2S_q;
+277:     assign iotlb_lu_hit = cache_iotlb_hit && !n_iotlb_lu;
+278:     assign iotlb_update     = (msi_iotlb_update.update) ?
+279:                               (msi_iotlb_update) :
+280:                               (ptw_iotlb_update);
+281: 
+282:     // Two lifecycle tags (one outstanding request per bank), one response port.
+283:     // A rejected probe never handshakes: the original arbiter later accepts it.
+284:     assign normal_gate = !NonblockEnable ||
+285:                          (state_q == IDLE && !req_valid && !n_intercept);
+286:     assign trans_req_ready_o = n_intercept ? n_accept : (normal_trans_ready && normal_gate);
+287:     assign nonblock_fire_o = n_accept;
+288:     assign nonblock_busy_o = n_busy;
+289:     // All lifecycle storage must be empty; incoming VALID also excludes a
+290:     // same-edge configuration. Never reset or discard a pending response.
+291:     assign policy_quiet_o = state_q == IDLE && !req_valid && !arb_req_valid &&
+292:         !trans_req_valid_i && !ats_trans_req_valid_i && !debug_req_valid_i &&
+293:         !ats_ddtc_valid_i && !n_busy && !n_intercept && !n_accept &&
+294:         !fast_resp_valid && !slow_resp_valid && !ats_trans_resp_valid_o &&
+295:         !debug_resp_valid_o && !fault_valid_o && !e3_ptw_active &&
+296:         !ddtw_axi_req_o.ar_valid && !pdtw_axi_req_o.ar_valid &&
+297:         !ptw_axi_req_o.ar_valid && !msiptw_axi_req_o.ar_valid &&
+298:         !ddtw_axi_resp_i.r_valid && !pdtw_axi_resp_i.r_valid &&
+299:         !ptw_axi_resp_i.r_valid && !msiptw_axi_resp_i.r_valid &&
+300:         !iotlb_update.update && !ddtc_update.update &&
+301:         !iotinval_i.inval_vma && !iotinval_i.inval_gvma &&
+302:         !iodirinval_i.inval_ddtc && !iodirinval_i.inval_pdtc;
+303:     assign n_window = state_q == PT && e3_ptw_active && en_1S_q &&
+304:                       !en_2S_q && !ddt_imp_trans_q && !pdt_imp_trans_q &&
+305:                       !req_data.is_debug && trans_req_data_i.bank != req_data.bank &&
+306:                       !ats_ddtc_valid_i && !debug_req_valid_i && !ats_trans_req_valid_i;
+307:     assign nonblock_diag_o = {n_diag[15:1],
+308:         (state_q == PT && e3_ptw_active && en_1S_q && !en_2S_q)};
+309:     if (NonblockEnable) begin : gen_nonblock_hit
+310:         rv_iommu_nonblock_hit #(
+311:             .PAddrWidth(PLEN),
+312:             .HasMsiContext(RVIOMMUCfg.MSITrans != rv_iommu_cfg::MSI_DISABLED),
+313:             .dc_t(dc_t), .req_t(trans_req_data_t),
+314:             .resp_t(trans_resp_data_t), .ddtp_t(iommu_reg2hw_ddtp_reg_t)
+315:         ) i_hit (
+316:             .clk_i, .rst_ni, .enable_i(nonblock_enable_i),
+317:             .window_i(n_window),
+318:             .candidate_i(trans_req_data_i), .candidate_valid_i(trans_req_valid_i),
+319:             .normal_fire_i(trans_req_valid_i && normal_trans_ready && normal_gate),
+320:             .invalidate_i(iotinval_i.inval_vma || iotinval_i.inval_gvma ||
+321:                           iodirinval_i.inval_ddtc || iodirinval_i.inval_pdtc),
+322:             .ddtp_i(ddtp_i), .intercept_o(n_intercept), .accept_o(n_accept),
+323:             .busy_o(n_busy), .ddtc_lookup_o(n_ddtc_lu), .ddtc_touch_o(n_ddtc_touch),
+324:             .ddtc_did_o(n_ddtc_did), .ddtc_hit_i(cache_ddtc_hit), .ddtc_dc_i(ddtc_dc),
+325:             .iotlb_lookup_o(n_iotlb_lu), .iotlb_touch_o(n_iotlb_touch),
+326:             .iotlb_vpn_o(n_iotlb_vpn), .iotlb_pscid_o(n_iotlb_pscid),
+327:             .iotlb_hit_i(cache_iotlb_hit), .iotlb_content_i(iotlb_lu_content),
+328:             .response_o(fast_resp_data), .response_valid_o(fast_resp_valid),
+329:             .response_ready_i(fast_resp_ready), .diag_o(n_diag)
+330:         );
+331:     end else begin : gen_no_nonblock_hit
+332:         assign n_diag = '0;
+333:         assign n_intercept = 0;
+334:         assign n_accept = 0;
+335:         assign n_busy = 0;
+336:         assign n_ddtc_lu = 0;
+337:         assign n_ddtc_touch = 0;
+338:         assign n_ddtc_did = '0;
+339:         assign n_iotlb_lu = 0;
+340:         assign n_iotlb_touch = 0;
+341:         assign n_iotlb_vpn = '0;
+342:         assign n_iotlb_pscid = '0;
+343:         assign fast_resp_data = '0;
+344:         assign fast_resp_valid = 0;
+345:     end
+346:     stream_arbiter #(.DATA_T(trans_resp_data_t), .N_INP(2), .ARBITER("rr"))
+347:         i_nonblock_response_arbiter (
+348:             .clk_i, .rst_ni, .inp_data_i({fast_resp_data, slow_resp_data}),
+349:             .inp_valid_i({fast_resp_valid, slow_resp_valid}),
+350:             .inp_ready_o({fast_resp_ready, slow_resp_ready}),
+351:             .oup_data_o(trans_resp_data_o), .oup_valid_o(trans_resp_valid_o),
+352:             .oup_ready_i(trans_resp_ready_i)
+353:         );
+354: 
+355:     //-----------------
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv ORIGINAL LINES 650-710
+650:         assign pdtw_pdt_gppn   = '0;
+651:     end
+652:     endgenerate
+653: 
+654:     //----------------------------------
+655:     // IO Translation Look-aside Buffer
+656:     //----------------------------------
+657:     rv_iommu_iotlb #(
+658:         .TouchEnable(NonblockEnable),
+659:         .PolicyEnable(PolicyEnable),
+660:         .PartitionLocalHistory(PolicyEnable),
+661:         .RVIOMMUCfg     (RVIOMMUCfg)
+662:     ) i_rv_iommu_iotlb (
+663:         .clk_i          (clk_i),
+664:         .rst_ni         (rst_ni),
+665: 
+666:         .update_i       (iotlb_update),
+667:         .inval_i        (iotinval_i),
+668:         .policy_clear_i (PolicyEnable && policy_clear_i),
+669:         // Owner is the stable main PTW/MSI request, never a fast probe DID.
+670:         .policy_mask_i  (PolicyEnable && policy_partition_i ?
+671:             (req_data.did == policy_did_i ?
+672:              RVIOMMUCfg.NumIotlbEntries'(16'h0003) :
+673:              RVIOMMUCfg.NumIotlbEntries'(16'hfffc)) : '1),
+674: 
+675:         .lookup_i       (iotlb_lu),
+676:         .touch_i        (!n_iotlb_lu || n_iotlb_touch),
+677:         .lu_vpn_i       (iotlb_lu_vpn),
+678:         .lu_pscid_i     (iotlb_lu_pscid),
+679:         .lu_gscid_i     (iotlb_lu_gscid),
+680:         .en_1S_i        (cache_iotlb_en1),
+681:         .en_2S_i        (cache_iotlb_en2),
+682:         .lu_hit_o       (cache_iotlb_hit),
+683:         .lu_content_o   (iotlb_lu_content),
+684:         .research_o     (iotlb_research)
+685:     );
+686: 
+687:     //-------------------
+688:     // Page Table Walker
+689:     //-------------------
+690:     axi_req_t e3_ptw_req;
+691:     axi_resp_t e3_ptw_resp;
+692:     logic e3_seen_q, e3_first_hit_q, e3_normal, e3_ptw_active;
+693:     logic [1:0] e3_level;
+694:     logic [63:0] e3_pte_q;
+695:     logic e3_capture, e3_available, e3_consume, e3_error, e3_a_s1_miss;
+696:     logic [7:0] e3_extra;
+697:     assign e3_normal = req_valid && !req_data.is_debug &&
+698:         (req_data.ttype == rv_iommu::UNTRANSLATED_R || req_data.ttype == rv_iommu::UNTRANSLATED_W);
+699:     always_ff @(posedge clk_i or negedge rst_ni) begin
+700:         if (!rst_ni) begin e3_seen_q <= 0; e3_first_hit_q <= 0; e3_pte_q <= 0; end
+701:         else begin
+702:             if (state_q == IDLE) begin e3_seen_q <= 0; e3_first_hit_q <= 0; end
+703:             else if (state_q == PT && !e3_seen_q) begin
+704:                 e3_seen_q <= 1; e3_first_hit_q <= iotlb_lu_hit;
+705:             end
+706:             if (e3_ptw_req.ar_valid && e3_ptw_resp.ar_ready) e3_pte_q <= 64'(e3_ptw_req.ar.addr);
+707:         end
+708:     end
+709:     assign e3_a_s1_miss = e3_normal && req_data.did == 24'd11 &&
+710:         state_q == PT && e3_seen_q && !e3_first_hit_q && en_1S_q && !en_2S_q &&
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv ORIGINAL LINES 950-1040
+950:     always_comb begin : translation_ctl_comb
+951: 
+952:         // Default values
+953:         debug_resp_valid_o     = 1'b0;
+954:         slow_resp_valid     = 1'b0;
+955:         ats_trans_resp_valid_o = 1'b0;
+956:         fault_valid_o          = 1'b0;
+957: 
+958:         hpm_events_o                = '0;
+959:         hpm_events_o.filters.did    = req_data.did;
+960:         hpm_events_o.filters.pid_v  = req_data.pid_valid;
+961:         hpm_events_o.filters.pid    = req_data.pid;
+962:         hpm_events_o.filters.gscid  = gscid_q;
+963:         hpm_events_o.filters.pscid  = pscid_q;
+964: 
+965:         state_n         = state_q;
+966: 
+967:         dc_n            = dc_q;
+968:         pc_n            = pc_q;
+969:         en_1S_n         = en_1S_q;
+970:         en_2S_n         = en_2S_q;
+971:         gscid_n         = gscid_q;
+972:         pscid_n         = pscid_q;
+973:         iohgatp_ppn_n   = iohgatp_ppn_q;
+974:         iosatp_ppn_n    = iosatp_ppn_q;
+975:         spaddr_n        = spaddr_q;
+976:         ddt_imp_trans_n = ddt_imp_trans_q;
+977:         pdt_imp_trans_n = pdt_imp_trans_q;
+978:         pdt_gppn_n      = pdt_gppn_q;
+979: 
+980:         error_n         = error_q;
+981:         error_code_n    = error_code_q;
+982:         error_gpaddr_n  = error_gpaddr_q;
+983:         error_2S_n      = error_2S_q;
+984:         error_2S_int_n  = error_2S_int_q;
+985: 
+986:         ignore_n        = ignore_q;
+987:         is_superpage_n  = is_superpage_q;
+988:         is_mrif_n       = is_mrif_q;
+989:         iova_is_msi_n   = iova_is_msi_q;
+990:         msi_1S_data_n   = msi_1S_data_q;
+991:         mrif_n          = mrif_q;
+992: 
+993:         range_n         = range_q;
+994:         bypass_n        = bypass_q;
+995:         x_n             = x_q;
+996:         w_n             = w_q;
+997:         r_n             = r_q;
+998:         u_n             = u_q;
+999:         g_n             = g_q;
+1000:         t2gpa_n         = t2gpa_q;
+1001:         sum_n           = sum_q;
+1002: 
+1003:         unique case (state_q)
+1004: 
+1005:             // Preliminary checks
+1006:             IDLE: begin
+1007: 
+1008:                 if (req_valid) begin
+1009: 
+1010:                     // Clear error registers
+1011:                     error_n         = 1'b0;
+1012:                     error_2S_n      = 1'b0;
+1013:                     error_2S_int_n  = 1'b0;
+1014:                     error_gpaddr_n  = '0;
+1015:                     ignore_n        = 1'b0;
+1016:                     is_mrif_n       = 1'b0;
+1017: 
+1018:                     // default
+1019:                     spaddr_n        = paddr_t'(req_data.iova);
+1020:                     state_n         = COMPLETE;
+1021:                     error_code_n    = rv_iommu::TRANS_TYPE_DISALLOWED;
+1022: 
+1023:                     // Signal event
+1024:                     hpm_events_o.valid = 1'b1;
+1025:                     hpm_events_o.etype_msk = (is_translated) ?
+1026:                                              (rv_iommu::hpm_etype_mask_t'(1) << rv_iommu::T_REQ) :
+1027:                                              ((is_pcie_ats_req) ?
+1028:                                               (rv_iommu::hpm_etype_mask_t'(1) << rv_iommu::ATS_REQ) :
+1029:                                               (rv_iommu::hpm_etype_mask_t'(1) << rv_iommu::UT_REQ));
+1030:                     hpm_events_o.filters.gscid_v    = 1'b0;
+1031:                     hpm_events_o.filters.pscid_v    = 1'b0;
+1032: 
+1033:                     // From Spec:
+1034:                     // If ddtp.iommu_mode == Off then stop and report "All inbound transactions disallowed" (cause = 256).
+1035:                     if (ddtp_i.iommu_mode.q == 4'b0000) begin
+1036:                         state_n         = ERROR;
+1037:                         error_code_n    = rv_iommu::ALL_INB_TRANSACTIONS_DISALLOWED;
+1038:                     end
+1039: 
+1040:                     // From Spec:
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv ORIGINAL LINES 1280-1338
+1280:             // IOTLB lookup and PTW Walk
+1281:             PT: begin
+1282: 
+1283:                 msi_1S_data_n = msi_1S_content;
+1284: 
+1285:                 // Signal PT Walk if occurred
+1286:                 hpm_events_o.valid              = ~iotlb_lu_hit;
+1287:                 hpm_events_o.etype_msk          = (rv_iommu::hpm_etype_mask_t'(1) << rv_iommu::IOTLB_MISS) |
+1288:                                                   (rv_iommu::hpm_etype_mask_t'(en_1S_q) << rv_iommu::S1_PTW) |
+1289:                                                   (rv_iommu::hpm_etype_mask_t'(en_2S_q) << rv_iommu::S2_PTW);
+1290:                 hpm_events_o.filters.gscid_v    = 1'b1;
+1291:                 hpm_events_o.filters.pscid_v    = 1'b1;
+1292: 
+1293:                 /*
+1294:                   A Page Table Walk may end in:
+1295:                     (1) Error;
+1296:                     (2) Successful implicit 2nd-stage translation;
+1297:                     (3) MSI GPA;
+1298:                     (4) IOTLB update and hit
+1299:                 */
+1300: 
+1301:                 // (1) PTW error
+1302:                 if (ptw_error) begin
+1303:                     error_2S_n      = ptw_error_2S;
+1304:                     error_2S_int_n  = ptw_error_2S_int;
+1305:                     error_gpaddr_n  = ptw_bad_gpaddr;
+1306:                     error_code_n    = ptw_cause;
+1307:                     state_n         = (dc_q.tc.dtf) ?
+1308:                                         (COMPLETE) :
+1309:                                         (ERROR);
+1310:                 end
+1311: 
+1312:                 // (2) Implicit 2nd-stage translation completed
+1313:                 if (imp_done) begin
+1314:                     if (ddt_imp_trans_q) begin
+1315:                         ddt_imp_trans_n = 1'b0;
+1316:                         state_n         = DDT;
+1317:                     end
+1318:                     else if (pdt_imp_trans_q) begin
+1319:                         pdt_imp_trans_n = 1'b0;
+1320:                         state_n         = PDT;
+1321:                     end
+1322:                 end
+1323: 
+1324:                 // (3) GPA is MSI address
+1325:                 if (gpaddr_is_msi) begin
+1326:                     state_n = MSI;
+1327:                 end
+1328: 
+1329:                 // (4) IOTLB hit
+1330:                 if (iotlb_lu_hit) begin
+1331:                     state_n         = COMPLETE;
+1332:                     is_superpage_n  = iotlb_lu_content.content_1S.is_2M |
+1333:                                       iotlb_lu_content.content_1S.is_1G |
+1334:                                       iotlb_lu_content.content_2S.is_2M |
+1335:                                       iotlb_lu_content.content_2S.is_1G;
+1336: 
+1337:                     if(en_2S_q && en_2S_q) begin
+1338:                        x_n = iotlb_lu_content.content_2S.x;
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv ORIGINAL LINES 1450-1575
+1450:                         // Encode translated PPN acording to the size
+1451:                         if (req_data.is_debug) begin
+1452:                             if (iotlb_lu_content.content_2S.is_2M || iotlb_lu_content.content_1S.is_2M)
+1453:                                 spaddr_n[20:12] = {1'b0, {8{1'b1}}};
+1454:                             else if (iotlb_lu_content.content_2S.is_1G || iotlb_lu_content.content_1S.is_1G)
+1455:                                 spaddr_n[29:12] = {1'b0, {17{1'b1}}};
+1456:                         end
+1457:                     end
+1458:                 end
+1459:             end
+1460: 
+1461:             // IOTLB/MRIFC lookup and PTW Walk
+1462:             MSI: begin
+1463: 
+1464:                 // MSI Translation supported
+1465:                 if (RVIOMMUCfg.MSITrans != rv_iommu_cfg::MSI_DISABLED) begin
+1466: 
+1467:                     // default
+1468:                     error_code_n    = rv_iommu::TRANS_TYPE_DISALLOWED;
+1469:                     spaddr_n        = {iotlb_lu_content.content_2S.ppn[PPNW-1:0],
+1470:                                         req_data.iova[11:0]};
+1471:                     mrif_n          = mrifc_lu_content;
+1472: 
+1473:                     /*
+1474:                       An MSI Page Table Walk may end in:
+1475:                         (1) Error;
+1476:                         (2) Ignored transaction;
+1477:                         (3) IOTLB update and hit;
+1478:                         (4) MRIFC update and hit
+1479:                     */
+1480: 
+1481:                     // (1) MSI PTW error
+1482:                     if (msi_ptw_error) begin
+1483:                         error_code_n = msi_ptw_cause;
+1484:                         state_n = (dc_q.tc.dtf) ? (COMPLETE) : (ERROR);
+1485:                     end
+1486: 
+1487:                     // (2) Ignore transaction
+1488:                     if (msi_ptw_ignore) begin
+1489:                         ignore_n    = 1'b1;
+1490:                         state_n     = COMPLETE;
+1491:                     end
+1492: 
+1493:                     // (3) MSI PTE in BT mode
+1494:                     if (iotlb_lu_hit) begin
+1495:                         state_n     = COMPLETE;
+1496:                     end
+1497: 
+1498:                     // (4) MSI PTE in MRIF mode
+1499:                     if (mrifc_lu_hit) begin
+1500:                         state_n     = COMPLETE;
+1501:                         is_mrif_n   = 1'b1;
+1502:                         if (req_data.is_debug) begin
+1503:                             state_n = ERROR;
+1504:                         end
+1505:                     end
+1506:                 end
+1507: 
+1508:                 // MSI Translation not supported
+1509:                 else begin
+1510:                     state_n         = ERROR;
+1511:                     error_code_n    = rv_iommu::TRANS_TYPE_DISALLOWED;
+1512:                 end
+1513:             end
+1514: 
+1515:             ERROR: begin
+1516:                 if(req_data.ttype == rv_iommu::PCIE_ATS_TRANS_REQ) begin
+1517:                     if( error_code_q != INSTR_PAGE_FAULT       &&
+1518:                         error_code_q != LOAD_PAGE_FAULT        &&
+1519:                         error_code_q != STORE_PAGE_FAULT       &&
+1520:                         error_code_q != INSTR_GUEST_PAGE_FAULT &&
+1521:                         error_code_q != LOAD_GUEST_PAGE_FAULT  &&
+1522:                         error_code_q != STORE_GUEST_PAGE_FAULT &&
+1523:                         error_code_q != MSI_PTE_INVALID        &&
+1524:                         error_code_q != PDT_ENTRY_INVALID) begin
+1525: 
+1526:                         error_n = 1'b1;
+1527:                         state_n = COMPLETE;
+1528:                     end else begin
+1529:                         error_n = 1'b1;
+1530:                         fault_valid_o = 1'b1;
+1531:                         if (fault_ready_i) begin
+1532:                             state_n = COMPLETE;
+1533:                         end
+1534:                     end
+1535:                 end else begin
+1536:                     error_n = 1'b1;
+1537:                     fault_valid_o = 1'b1;
+1538:                     if (fault_ready_i) begin
+1539:                         state_n = COMPLETE;
+1540:                     end
+1541:                 end
+1542:             end
+1543: 
+1544:             // Translation completion
+1545:             COMPLETE: begin
+1546: 
+1547:                 // Debug translation
+1548:                 if (req_data.is_debug) begin
+1549:                     debug_resp_valid_o  = 1'b1;
+1550:                     if (debug_resp_ready_i) begin
+1551:                         state_n = IDLE;
+1552:                     end
+1553:                 end
+1554:                 // ATS transltion
+1555:                 else if(req_data.ttype == rv_iommu::PCIE_ATS_TRANS_REQ) begin
+1556:                     ats_trans_resp_valid_o  = 1'b1;
+1557:                     if (ats_trans_resp_ready_i) begin
+1558:                         state_n = IDLE;
+1559:                     end
+1560:                 end
+1561:                 // Normal translation
+1562:                 else begin
+1563:                     slow_resp_valid  = 1'b1;
+1564:                     if (slow_resp_ready) begin
+1565:                         state_n = IDLE;
+1566:                     end
+1567:                 end
+1568:             end
+1569: 
+1570:             default: begin
+1571:                 state_n = IDLE;
+1572:             end
+1573:         endcase
+1574:     end
+1575: 
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_nonblock_hit.sv ORIGINAL LINES 1-177
+1: // SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
+2: // Finite two-bank, S1/Sv39/4KiB hit path. Misses and unsupported requests are
+3: // left unaccepted and subsequently use the normal translation/fault path.
+4: // The DDTC and IOTLB ports below are time-shared with the original walker.
+5: module rv_iommu_nonblock_hit
+6:   import rv_iommu::*;
+7: #(
+8:   parameter int unsigned PAddrWidth = 56,
+9:   parameter bit HasMsiContext = 0,
+10:   parameter type dc_t = logic,
+11:   parameter type req_t = logic,
+12:   parameter type resp_t = logic,
+13:   parameter type ddtp_t = logic
+14: )(
+15:   input logic clk_i, rst_ni,
+16:   input logic enable_i, window_i,
+17:   input req_t candidate_i,
+18:   input logic candidate_valid_i, normal_fire_i,
+19:   input logic invalidate_i,
+20:   input ddtp_t ddtp_i,
+21:   output logic intercept_o, accept_o, busy_o,
+22:   output logic ddtc_lookup_o, ddtc_touch_o,
+23:   output device_id_t ddtc_did_o,
+24:   input logic ddtc_hit_i,
+25:   input dc_t ddtc_dc_i,
+26:   output logic iotlb_lookup_o, iotlb_touch_o,
+27:   output logic [GPPNW39-1:0] iotlb_vpn_o,
+28:   output pscid_t iotlb_pscid_o,
+29:   input logic iotlb_hit_i,
+30:   input iotlb_content_t iotlb_content_i,
+31:   output resp_t response_o,
+32:   output logic response_valid_o,
+33:   input logic response_ready_i,
+34:   output logic [15:0] diag_o
+35: );
+36:   typedef enum logic [2:0] {IDLE, DC, LEAF, OUT, REJECT} state_t;
+37:   state_t state_q;
+38:   req_t req_q;
+39:   dc_t dc_q;
+40:   ddtp_t ddtp_q;
+41:   resp_t resp_q;
+42:   logic start, dc_ok, leaf_ok, msi_safe, msi_leaf_safe;
+43:   logic probe_stable;
+44:   logic is_write, is_read, canonical;
+45:   localparam int unsigned PPNW = PAddrWidth - 12;
+46: 
+47:   assign start = state_q == IDLE && enable_i && window_i &&
+48:                  candidate_valid_i && !invalidate_i;
+49:   assign busy_o = state_q != IDLE && state_q != REJECT;
+50:   assign intercept_o = start || busy_o;
+51:   assign ddtc_lookup_o = state_q == DC || state_q == LEAF;
+52:   assign ddtc_did_o = req_q.did;
+53:   assign iotlb_lookup_o = state_q == LEAF;
+54:   assign iotlb_vpn_o = req_q.iova[GPLEN39-1:12];
+55:   assign iotlb_pscid_o = dc_q.ta.pscid;
+56:   assign is_write = req_q.ttype == UNTRANSLATED_W;
+57:   assign is_read = req_q.ttype == UNTRANSLATED_R;
+58:   assign canonical = req_q.iova[63:39] == {25{req_q.iova[38]}};
+59: 
+60:   // The actual cached DC belongs to this request. No active-walker context
+61:   // or saved inferred PSCID is used. All excluded cases fall through.
+62:   if (HasMsiContext) begin : gen_msi_guard
+63:     // Flat MSI can coexist with ordinary S1 copies. Exclude both the input
+64:     // range and the cached S1 GPA range, using the normal TL/PTW match widths.
+65:     // Reads are conservatively excluded too; MSI/reserved modes fall through.
+66:     logic input_is_msi, leaf_is_msi;
+67:     assign input_is_msi =
+68:         (req_q.iova[VLEN39-1:12] & ~ddtc_dc_i.msi_addr_mask.mask[VPNW39-1:0]) ==
+69:         (ddtc_dc_i.msi_addr_pattern.pattern[VPNW39-1:0] &
+70:          ~ddtc_dc_i.msi_addr_mask.mask[VPNW39-1:0]);
+71:     assign leaf_is_msi =
+72:         (iotlb_content_i.content_1S.ppn[GPPNW39-1:0] &
+73:          ~dc_q.msi_addr_mask.mask[GPPNW39-1:0]) ==
+74:         (dc_q.msi_addr_pattern.pattern[GPPNW39-1:0] &
+75:          ~dc_q.msi_addr_mask.mask[GPPNW39-1:0]);
+76:     assign msi_safe = ddtc_dc_i.msiptp.mode == 0 ||
+77:                      (ddtc_dc_i.msiptp.mode == 1 && !input_is_msi);
+78:     assign msi_leaf_safe = dc_q.msiptp.mode == 0 ||
+79:                           (dc_q.msiptp.mode == 1 && !leaf_is_msi);
+80:   end else begin : gen_no_msi
+81:     assign msi_safe = 1'b1;
+82:     assign msi_leaf_safe = 1'b1;
+83:   end
+84:   assign dc_ok = msi_safe && ddtc_hit_i && ddtc_dc_i.tc.v &&
+85:       !ddtc_dc_i.tc.pdtv && !ddtc_dc_i.tc.sxl &&
+86:       !ddtc_dc_i.tc.t2gpa && !ddtc_dc_i.tc.en_ats &&
+87:       !ddtc_dc_i.tc.en_pri && !req_q.pid_valid && !req_q.priv &&
+88:       !req_q.is_debug && (is_write || is_read) && canonical &&
+89:       ddtc_dc_i.fsc.mode == ModeSv39 &&
+90:       ddtc_dc_i.iohgatp.mode == ModeBare &&
+91:       ((ddtp_i.iommu_mode.q == 2 && req_q.did[23:6] == 0) ||
+92:        (ddtp_i.iommu_mode.q == 3 && req_q.did[23:15] == 0) ||
+93:        ddtp_i.iommu_mode.q == 4);
+94:   assign leaf_ok = msi_leaf_safe && iotlb_hit_i && iotlb_content_i.content_1S.v &&
+95:       iotlb_content_i.content_1S.u &&
+96:       !iotlb_content_i.content_1S.is_1G &&
+97:       !iotlb_content_i.content_1S.is_2M &&
+98:       (is_write ? iotlb_content_i.content_1S.w :
+99:                   iotlb_content_i.content_1S.r);
+100:   assign accept_o = state_q == LEAF && enable_i &&
+101:       candidate_valid_i && candidate_i == req_q &&
+102:       !invalidate_i && ddtp_i == ddtp_q && dc_ok &&
+103:       ddtc_dc_i == dc_q && leaf_ok;
+104:   // Probes do not change replacement state; only an actually accepted hit
+105:   // touches both real caches, exactly once.
+106:   assign ddtc_touch_o = accept_o;
+107:   assign iotlb_touch_o = accept_o;
+108:   assign response_o = resp_q;
+109:   assign response_valid_o = state_q == OUT;
+110: 
+111:   assign probe_stable = enable_i && candidate_valid_i && candidate_i == req_q &&
+112:                         !invalidate_i && ddtp_i == ddtp_q;
+113:   // Passive reach/rejection events. They do not participate in any handshake.
+114:   always_comb begin
+115:     diag_o = '0;
+116:     diag_o[1] = window_i;
+117:     diag_o[2] = window_i && candidate_valid_i;
+118:     diag_o[3] = start;
+119:     diag_o[4] = state_q == DC;
+120:     diag_o[5] = state_q == DC && dc_ok && probe_stable;
+121:     diag_o[6] = state_q == LEAF;
+122:     diag_o[7] = state_q == LEAF && leaf_ok;
+123:     diag_o[8] = state_q == DC && ddtc_hit_i && !msi_safe;
+124:     diag_o[9] = state_q == LEAF && iotlb_hit_i && !msi_leaf_safe;
+125:     diag_o[10] = state_q == LEAF && !iotlb_hit_i;
+126:     diag_o[11] = accept_o;
+127:     diag_o[12] = state_q == DC && !ddtc_hit_i;
+128:     diag_o[13] = state_q == DC && ddtc_hit_i && msi_safe &&
+129:                  (!dc_ok || !probe_stable);
+130:     diag_o[14] = state_q == LEAF && iotlb_hit_i && msi_leaf_safe && !accept_o;
+131:     diag_o[15] = enable_i;
+132:   end
+133: 
+134:   always_ff @(posedge clk_i or negedge rst_ni) begin
+135:     if (!rst_ni) begin
+136:       state_q <= IDLE;
+137:       req_q <= '0;
+138:       dc_q <= '0;
+139:       ddtp_q <= '0;
+140:       resp_q <= '0;
+141:     end else begin
+142:       case (state_q)
+143:         IDLE: if (start) begin
+144:           req_q <= candidate_i;
+145:           ddtp_q <= ddtp_i;
+146:           state_q <= DC;
+147:         end
+148:         DC: begin
+149:           if (!enable_i || invalidate_i || ddtp_i != ddtp_q ||
+150:               !dc_ok || !candidate_valid_i || candidate_i != req_q)
+151:             state_q <= REJECT;
+152:           else begin
+153:             dc_q <= ddtc_dc_i;
+154:             state_q <= LEAF;
+155:           end
+156:         end
+157:         LEAF: begin
+158:           if (accept_o) begin
+159:             resp_q <= '0;
+160:             resp_q.bank <= req_q.bank;
+161:             resp_q.spaddr <= {iotlb_content_i.content_1S.ppn[PPNW-1:0],
+162:                               req_q.iova[11:0]};
+163:             resp_q.r <= iotlb_content_i.content_1S.r;
+164:             resp_q.w <= iotlb_content_i.content_1S.w;
+165:             resp_q.x <= iotlb_content_i.content_1S.x;
+166:             resp_q.u <= iotlb_content_i.content_1S.u;
+167:             resp_q.g <= iotlb_content_i.content_1S.g;
+168:             state_q <= OUT;
+169:           end else state_q <= REJECT;
+170:         end
+171:         OUT: if (response_ready_i) state_q <= IDLE;
+172:         REJECT: if (normal_fire_i || !candidate_valid_i) state_q <= IDLE;
+173:         default: state_q <= IDLE;
+174:       endcase
+175:     end
+176:   end
+177: endmodule
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_iotlb.sv ORIGINAL LINES 83-140
+83:     //--------
+84:     // Lookup
+85:     //--------
+86:     always_comb begin : lookup
+87:         vpn0 = lu_vpn_i[8:0];
+88:         vpn1 = lu_vpn_i[17:9];
+89:         vpn2 = lu_vpn_i[rv_iommu::GPPNW39-1:18];
+90: 
+91:         lu_hit          = '{default: 0};
+92:         lu_hit_o        = 1'b0;
+93:         lu_content_o    = '{default: 0};
+94: 
+95:         match_pscid     = '{default: 0};
+96:         match_gscid     = '{default: 0};
+97:         match_stage     = '{default: 0};
+98:         is_1G           = '{default: 0};
+99:         is_2M           = '{default: 0};
+100: 
+101:         if (lookup_i) begin
+102:             
+103:             for (int unsigned i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++) begin
+104:         
+105:                 // PSCID match
+106:                 match_pscid[i] = (((lu_pscid_i == tags_q[i].pscid) || content_q[i].content_1S.g) && en_1S_i) || !en_1S_i;
+107: 
+108:                 // GSCID match
+109:                 match_gscid[i] = (lu_gscid_i == tags_q[i].gscid && en_2S_i) || !en_2S_i;
+110: 
+111:                 is_1G[i] = rv_iommu::is_trans_1G(   en_1S_i,
+112:                                                     en_2S_i,
+113:                                                     content_q[i].content_1S.is_1G,
+114:                                                     content_q[i].content_2S.is_1G
+115:                                                 );
+116: 
+117:                 is_2M[i] = rv_iommu::is_trans_2M(   en_1S_i,
+118:                                                     en_2S_i,
+119:                                                     content_q[i].content_1S.is_1G,
+120:                                                     content_q[i].content_1S.is_2M,
+121:                                                     content_q[i].content_2S.is_1G,
+122:                                                     content_q[i].content_2S.is_2M
+123:                                                 );
+124: 
+125:                 // Stage match
+126:                 match_stage[i] = (tags_q[i].en_2S == en_2S_i) && (tags_q[i].en_1S == en_1S_i);
+127:                 
+128:                 // Full match
+129:                 if (tags_q[i].valid && match_pscid[i] && match_gscid[i] && match_stage[i] && (vpn2 == tags_q[i].vpn2)) begin
+130:                     
+131:                     // 1G match | 2M match | 4k match
+132:                     if (is_1G[i] || ((vpn1 == tags_q[i].vpn1) && (is_2M[i] || vpn0 == tags_q[i].vpn0))) begin
+133:                         lu_content_o    = content_q[i];
+134:                         lu_hit_o        = 1'b1;
+135:                         lu_hit[i]       = 1'b1;
+136:                     end
+137:                 end
+138:             end
+139:         end
+140:     end
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_iotlb.sv ORIGINAL LINES 317-425
+317:             // update
+318:             else if (update_i.update && replace_en[i]) begin
+319: 
+320:                 tags_n[i] = '{
+321:                     pscid:      update_i.pscid,
+322:                     gscid:      update_i.gscid,
+323:                     vpn2:       update_i.vpn[rv_iommu::GPPNW39-1:18],
+324:                     vpn1:       update_i.vpn[17:9],
+325:                     vpn0:       update_i.vpn[8:0],
+326:                     en_1S:      en_1S_i,
+327:                     en_2S:      en_2S_i,
+328:                     valid:      1'b1
+329:                 };
+330:                 
+331:                 content_n[i] = update_i.content;
+332:             end
+333:         end
+334:     end
+335: 
+336:     //-----------------------------------------------
+337:     // PLRU - Pseudo Least Recently Used Replacement
+338:     //-----------------------------------------------
+339:     logic[(RVIOMMUCfg.NumIotlbEntries-2):0] plru_tree_q, plru_tree_n;
+340: 
+341:     function automatic logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] history_nodes(
+342:         input logic [RVIOMMUCfg.NumIotlbEntries-1:0] owners
+343:     );
+344:         logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] nodes;
+345:         nodes = '0;
+346:         for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++)
+347:             nodes[RVIOMMUCfg.NumIotlbEntries-1+i] = owners[i];
+348:         for (int i = RVIOMMUCfg.NumIotlbEntries-2; i >= 0; i--)
+349:             nodes[i] = nodes[2*i+1] | nodes[2*i+2];
+350:         return nodes;
+351:     endfunction
+352: 
+353:     localparam logic [RVIOMMUCfg.NumIotlbEntries-1:0] ProtectedWays =
+354:         RVIOMMUCfg.NumIotlbEntries'(16'h0003);
+355:     localparam logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] ProtectedNodes =
+356:         history_nodes(ProtectedWays);
+357:     localparam logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] BackgroundNodes =
+358:         history_nodes(~ProtectedWays);
+359:     logic partition_local_active;
+360:     assign partition_local_active = PartitionLocalHistory && PolicyEnable &&
+361:         RVIOMMUCfg.NumIotlbEntries == 16 &&
+362:         ((policy_mask_i == ProtectedWays) || (policy_mask_i == ~ProtectedWays));
+363: 
+364:     logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] eligible_nodes;
+365:     logic [RVIOMMUCfg.NumIotlbEntries-1:0] allocation_mask;
+366:     assign allocation_mask = PolicyEnable ? policy_mask_i : '1;
+367:     always_comb begin
+368:         eligible_nodes = '0;
+369:         for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++)
+370:             eligible_nodes[RVIOMMUCfg.NumIotlbEntries-1+i] = allocation_mask[i];
+371:         for (int i = RVIOMMUCfg.NumIotlbEntries-2; i >= 0; i--)
+372:             eligible_nodes[i] = eligible_nodes[2*i+1] | eligible_nodes[2*i+2];
+373:     end
+374: 
+375:     always_comb begin : plru_replacement
+376:         plru_tree_n = plru_tree_q;
+377:         
+378:         for (int unsigned i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++) begin
+379:             automatic int unsigned idx_base, shift, new_index;
+380:             idx_base    = 0;
+381:             shift       = 0;
+382:             new_index   = 0;
+383: 
+384:             if (lu_hit[i] && (!TouchEnable || touch_i)) begin
+385:                 for (int unsigned lvl = 0; lvl < $clog2(RVIOMMUCfg.NumIotlbEntries); lvl++) begin
+386:                     idx_base = $unsigned((2**lvl)-1);
+387:                     shift = $clog2(RVIOMMUCfg.NumIotlbEntries) - lvl;
+388:                     new_index =  ~((i >> (shift-1)) & 32'b1);
+389:                     // Fill ownership belongs to the main request, but a hit
+390:                     // may belong to a different fast request. Derive touch
+391:                     // ownership from the resident way, never policy_mask_i.
+392:                     // A branch used by only one child of this partition is
+393:                     // forced by the allocation mask and needs no history.
+394:                     if (!partition_local_active ||
+395:                         (i < 2 ?
+396:                          (ProtectedNodes[2*(idx_base + (i >> shift))+1] &&
+397:                           ProtectedNodes[2*(idx_base + (i >> shift))+2]) :
+398:                          (BackgroundNodes[2*(idx_base + (i >> shift))+1] &&
+399:                           BackgroundNodes[2*(idx_base + (i >> shift))+2])))
+400:                         plru_tree_n[idx_base + (i >> shift)] = new_index[0];
+401:                 end
+402:             end
+403:         end
+404: 
+405:         for (int unsigned i = 0; i < RVIOMMUCfg.NumIotlbEntries; i += 1) begin
+406:             automatic logic en, choose_right;
+407:             automatic int unsigned idx_base, shift, new_index;
+408:             en = 1'b1;
+409: 
+410:             for (int unsigned lvl = 0; lvl < $clog2(RVIOMMUCfg.NumIotlbEntries); lvl++) begin
+411:                 idx_base = $unsigned((2**lvl)-1);
+412:                 shift = $clog2(RVIOMMUCfg.NumIotlbEntries) - lvl;
+413:                 new_index =  (i >> (shift-1)) & 32'b1;
+414:                 // Follow tree-PLRU whenever that child has eligible leaves.
+415:                 // A full mask reproduces the original victim bit for bit.
+416:                 choose_right = eligible_nodes[2*(idx_base + (i>>shift))+2] &&
+417:                     (!eligible_nodes[2*(idx_base + (i>>shift))+1] ||
+418:                      plru_tree_q[idx_base + (i>>shift)]);
+419:                 if (new_index[0]) en &= choose_right;
+420:                 else en &= ~choose_right;
+421:             end
+422:             replace_en[i] = en && allocation_mask[i];
+423:         end
+424:         if (PolicyEnable && policy_clear_i) plru_tree_n = '0;
+425:     end
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_banked_ctl.sv ORIGINAL LINES 235-278
+235:     // Incoming bank select demux
+236:     //   * select is the IMMUTABLE ORIGINAL AXI ID bit BankIdBit (AW / AR)
+237:     //   * no extra spills, no ID modification (IDs stay ORIGINAL width)
+238:     //   * MaxTrans = original NumOutstandingTrans*2  (documented tracker
+239:     //     capacity for the two banks together), UniqueIds = 0
+240:     //=========================================================================
+241:     logic aw_sel;
+242:     logic ar_sel;
+243:     assign aw_sel = tr_axi_req_i.aw.id[BankIdBit];
+244:     assign ar_sel = tr_axi_req_i.ar.id[BankIdBit];
+245: 
+246:     // The input demux keeps W ownership until LAST. A source read from the
+247:     // other bank can otherwise fill its DMA's small R->W FIFO while its AW
+248:     // cannot enter that demux. The shared memory R channel then cannot return
+249:     // the current owner's source data or page-table reads: a circular wait.
+250:     // Delay SELECTING such reads, rather than withdrawing an AXI/TL VALID.
+251:     // Writes and already-selected transactions retain their original protocol.
+252:     // A visible new AW also reserves admission before its input handshake.
+253:     // W may legally finish before a stalled AW is accepted, hence the signed
+254:     // balance (minimum -1 for that reserved head), rather than an unsigned
+255:     // AW-minus-LAST counter that could underflow.
+256:     logic signed [31:0] w_unfilled_q;
+257:     logic w_owner_q, read_owner, restrict_reads;
+258:     logic [1:0] bank_read_admit;
+259:     assign restrict_reads = (w_unfilled_q > 0) || tr_axi_req_i.aw_valid;
+260:     assign read_owner = (w_unfilled_q > 0) ? w_owner_q : aw_sel;
+261:     // If a new AW enters this bank on this edge, its FIFO head only becomes
+262:     // visible on the next cycle. Do not select an older queued AR one cycle
+263:     // ahead of that AW. When the AW FIFO is full (no AW handshake), allow the
+264:     // current owner to read and drain already-prepared writes instead.
+265:     assign bank_read_admit[0] = ((w_unfilled_q > 0) ? !read_owner : !restrict_reads)
+266:                                 && !(aw_accept && !aw_sel);
+267:     assign bank_read_admit[1] = ((w_unfilled_q > 0) ?  read_owner : !restrict_reads)
+268:                                 && !(aw_accept &&  aw_sel);
+269:     always_ff @(posedge clk_i or negedge rst_ni) begin
+270:         if (!rst_ni) begin
+271:             w_unfilled_q <= '0;
+272:             w_owner_q <= 1'b0;
+273:         end else begin
+274:             w_unfilled_q <= w_unfilled_q + (aw_accept ? 32'sd1 : 32'sd0)
+275:                                            - (w_last_accept ? 32'sd1 : 32'sd0);
+276:             if (aw_accept && w_unfilled_q <= 0) w_owner_q <= aw_sel;
+277:         end
+278:     end
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_banked_ctl.sv ORIGINAL LINES 339-409
+339:         ) i_bank (
+340:             .clk_i,
+341:             .rst_ni,
+342:             .read_admit_i       (bank_read_admit[b]),
+343:             .fullbuffer_job_i   (fullbuffer_jobs_i[b]),
+344:             .tr_axi_req_i       (bank_tr_req[b]),
+345:             .tr_axi_resp_o      (bank_tr_resp[b]),
+346:             .comp_axi_resp_i    (bank_comp_resp[b]),
+347:             .comp_axi_req_o     (bank_comp_req[b]),
+348:             .mrif_axi_resp_i    (mrif_axi_resp_i),
+349:             .trans_req_data_o   (bank_trans_req_data[b]),
+350:             .trans_req_valid_o  (bank_trans_req_valid[b]),
+351:             .trans_req_ready_i  (bank_trans_req_ready[b]),
+352:             .trans_resp_data_i  (bank_trans_resp_data[b]),
+353:             .trans_resp_valid_i (bank_trans_resp_valid[b]),
+354:             .trans_resp_ready_o (bank_trans_resp_ready[b]),
+355:             .mrif_fault_ready_i (mrif_fault_ready_i),
+356:             .in_flight_o        (bank_busy[b])
+357:         );
+358:     end
+359: 
+360:     // MRIF is disabled: the single wrapper MRIF port is tied to zero.
+361:     assign mrif_axi_req_o     = '0;
+362:     assign mrif_fault_data_o  = '0;
+363:     assign mrif_fault_valid_o = 1'b0;
+364: 
+365:     //=========================================================================
+366:     // Translation request merge (round-robin, stable while valid)
+367:     //   The bank-local request is copied and ONLY `.bank` is overwritten, so
+368:     //   every other header field (iova/did/pid/ttype/...) is preserved bit-exact.
+369:     //=========================================================================
+370:     trans_req_data_t [1:0] bank_req_data;
+371: 
+372:     always_comb begin : bank_req_tag
+373:         bank_req_data[0]       = bank_trans_req_data[0];
+374:         bank_req_data[0].bank  = 1'b0;
+375:         bank_req_data[1]       = bank_trans_req_data[1];
+376:         bank_req_data[1].bank  = 1'b1;
+377:     end
+378: 
+379:     stream_arbiter #(
+380:         .DATA_T  (trans_req_data_t),
+381:         .N_INP   (2),
+382:         .ARBITER ("rr")
+383:     ) i_trans_req_arb (
+384:         .clk_i,
+385:         .rst_ni,
+386:         .inp_data_i  (bank_req_data),
+387:         .inp_valid_i (bank_trans_req_valid),
+388:         .inp_ready_o (bank_trans_req_ready),
+389:         .oup_data_o  (trans_req_data_o),
+390:         .oup_valid_o (trans_req_valid_o),
+391:         .oup_ready_i (trans_req_ready_i)
+392:     );
+393: 
+394:     //=========================================================================
+395:     // Translation response routing by `.bank`
+396:     //   Both banks see the same response payload (the existing controller
+397:     //   ignores the bank field); only the matching bank sees `valid`.
+398:     //   `trans_resp_ready_o` is the ready of that same bank.
+399:     //=========================================================================
+400:     always_comb begin : bank_resp_route
+401:         bank_trans_resp_data[0] = trans_resp_data_i;
+402:         bank_trans_resp_data[1] = trans_resp_data_i;
+403:         bank_trans_resp_valid[0] = trans_resp_valid_i && (trans_resp_data_i.bank == 1'b0);
+404:         bank_trans_resp_valid[1] = trans_resp_valid_i && (trans_resp_data_i.bank == 1'b1);
+405:     end
+406: 
+407:     assign trans_resp_ready_o = trans_resp_data_i.bank ? bank_trans_resp_ready[1]
+408:                                                        : bank_trans_resp_ready[0];
+409: 
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv ORIGINAL LINES 600-749
+600:     //---------------------
+601:     // Transaction Control
+602:     //---------------------
+603:     always_comb begin : transaction_ctl_comb
+604: 
+605:         // Default values
+606:         trans_req_valid_o   = 1'b0;
+607:         trans_req_data_o    = trans_req_data_q;
+608:         trans_resp_ready_o  = 1'b0;
+609: 
+610:         state_n           = state_q;
+611:         trans_req_data_n  = trans_req_data_q;
+612:         trans_resp_data_n = trans_resp_data_q;
+613: 
+614:         aw_ready            = 1'b0;
+615:         ar_ready            = 1'b0;
+616:         complete_read       = 1'b0;
+617:         complete_write      = 1'b0;
+618:         mrif_req_valid_d    = 1'b0;
+619: 
+620:         unique case (state_q)
+621: 
+622:             // Monitor incoming requests
+623:             // Forward AW before AR so read-to-write DMA can open the W drain
+624:             // before source read data fills the write-data FIFO.
+625:             IDLE: begin
+626:                 // Write request received
+627:                 // Stall writes if W FIFO is full
+628:                 if (aw_valid && !w_cnt_ovf) begin
+629: 
+630:                     // Tags
+631:                     trans_req_data_n.iova       = aw_data.addr;
+632:                     trans_req_data_n.did        = aw_data.stream_id;
+633:                     trans_req_data_n.pid_valid  = aw_data.ss_id_valid;
+634:                     trans_req_data_n.pid        = aw_data.substream_id;
+635:                     trans_req_data_n.ttype      = aw_data.mmu_atst && !aw_data.mmu_valid ?
+636:                                                   rv_iommu::TRANSLATED_W :
+637:                                                   rv_iommu::UNTRANSLATED_W;
+638:                     // AxPROT[0] indicates privileged transaction when set
+639:                     trans_req_data_n.priv       = aw_data.prot[0];
+640:                     trans_req_data_n.is_debug   = 1'b0;
+641: 
+642:                     state_n = REQ_TRANS;
+643:                 end
+644: 
+645:                 // Read request received
+646:                 else if (ar_valid && (!ReadAdmissionEnable || read_admit_i ||
+647:                          (fullbuffer_job_i && ar_data.stream_id == FullBufferDID))) begin
+648:                     // Tags
+649:                     trans_req_data_n.iova       = ar_data.addr;
+650:                     trans_req_data_n.did        = ar_data.stream_id;
+651:                     trans_req_data_n.pid_valid  = ar_data.ss_id_valid;
+652:                     trans_req_data_n.pid        = ar_data.substream_id;
+653:                     if(ar_data.mmu_atst && !ar_data.mmu_valid) begin
+654:                        // ARPROT[2] indicates data access (r) when LOW, instruction access (rx) when HIGH
+655:                        trans_req_data_n.ttype   = (ar_data.prot[2]) ?
+656:                                                   (rv_iommu::TRANSLATED_RX) :
+657:                                                   (rv_iommu::TRANSLATED_R);
+658:                     end else begin
+659:                        // ARPROT[2] indicates data access (r) when LOW, instruction access (rx) when HIGH
+660:                        trans_req_data_n.ttype   = (ar_data.prot[2]) ?
+661:                                                   (rv_iommu::UNTRANSLATED_RX) :
+662:                                                   (rv_iommu::UNTRANSLATED_R);
+663:                     end
+664:                     // AxPROT[0] indicates privileged transaction when set
+665:                     trans_req_data_n.priv       = ar_data.prot[0];
+666:                     trans_req_data_n.is_debug   = 1'b0;
+667: 
+668:                     state_n = REQ_TRANS;
+669:                 end
+670:             end
+671: 
+672:             // Perform BC check
+673:             // Request translation
+674:             REQ_TRANS: begin
+675: 
+676:                 if (check_valid) begin
+677: 
+678:                     trans_req_valid_o = 1'b1;
+679: 
+680:                     if (trans_req_ready_i) begin
+681:                         state_n     = AWAIT_RESP;
+682:                     end
+683:                 end
+684: 
+685:                 // Boundary violation
+686:                 else begin
+687:                     state_n = COMPLETE;
+688:                     trans_resp_data_n.error = 1'b1;
+689:                 end
+690:             end
+691: 
+692:             // Await for a translation response
+693:             AWAIT_RESP: begin
+694: 
+695:                 trans_resp_ready_o = 1'b1;
+696: 
+697:                 // Translation finished
+698:                 if (trans_resp_valid_i) begin
+699:                     trans_resp_data_n   = trans_resp_data_i;
+700:                     state_n             = (trans_resp_data_i.is_mrif &&
+701:                                            !trans_resp_data_i.error) ? (MRIF) : (COMPLETE);
+702:                 end
+703:             end
+704: 
+705:             // Trigger MRIF Handler
+706:             MRIF: begin
+707: 
+708:                 mrif_req_valid_d = 1'b1;
+709:                 if (mrif_req_ready_q) begin
+710:                     state_n = COMPLETE;
+711:                 end
+712:             end
+713: 
+714:             // Complete transaction
+715:             // Select slave
+716:             COMPLETE: begin
+717: 
+718:                 complete_read = is_read;
+719:                 complete_write = is_write;
+720: 
+721:                 if ((axi_comp_resp.ar_ready && is_read) ||
+722:                     (axi_comp_resp.aw_ready && is_write)) begin
+723:                     aw_ready    = is_write;
+724:                     ar_ready    = is_read;
+725:                     state_n     = IDLE;
+726:                 end
+727:             end
+728: 
+729:             default: begin
+730:                 state_n = IDLE;
+731:             end
+732:         endcase
+733:     end
+734: 
+735:     always_ff @(posedge clk_i or negedge rst_ni) begin : transaction_ctl_seq
+736:         if (!rst_ni) begin
+737:             state_q             <= IDLE;
+738:             trans_req_data_q    <= '0;
+739:             trans_resp_data_q   <= '0;
+740:         end
+741: 
+742:         else begin
+743:             state_q             <= state_n;
+744:             trans_req_data_q    <= trans_req_data_n;
+745:             trans_resp_data_q   <= trans_resp_data_n;
+746:         end
+747:     end
+748: 
+749: endmodule
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ptw.sv ORIGINAL LINES 80-102
+80:     
+81:     // Memory interface
+82:     input  axi_resp_t                   mem_resp_i,
+83:     output axi_req_t                    mem_req_o,
+84:     output logic [1:0]                  e3_level_o
+85: );
+86: 
+87:     localparam int unsigned PLEN = RVIOMMUCfg.PAddrWidth;
+88:     localparam int unsigned PPNW = PLEN-12;
+89: 
+90:     // PTW states
+91:     typedef enum logic[1:0] {
+92:       IDLE          = 2'b00,
+93:       MEM_ACCESS    = 2'b01,
+94:       PROC_PTE      = 2'b10,
+95:       ERROR         = 2'b11
+96:     } ptw_state_t;
+97:     ptw_state_t state_q, state_n;
+98: 
+99:     // PTW walking
+100:     assign active_o = (state_q != IDLE);
+101:     
+102:     // Page levels
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ptw.sv ORIGINAL LINES 150-158
+150:     // Edge-triggered init control
+151:     logic edge_trigger_q, edge_trigger_n;
+152:     always_comb begin : ptw_init_control
+153:         edge_trigger_n = edge_trigger_q;
+154:         if (!edge_trigger_q && init_ptw_i)
+155:             edge_trigger_n = 1'b1;
+156:         if (edge_trigger_q && !init_ptw_i)
+157:             edge_trigger_n = 1'b0;
+158:     end
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ptw.sv ORIGINAL LINES 310-350
+310:         pf_excep_n              = pf_excep_q;
+311:         pt_data_corrupt_n       = pt_data_corrupt_q;
+312: 
+313:         unique case (state_q)
+314: 
+315:             // Check for possible misses to trigger PTW
+316:             IDLE: begin
+317:                 main_lvl_n          = LVL1;
+318:                 s1_lvl_n            = LVL1;
+319:                 global_mapping_n    = 1'b0;
+320:                 gpaddr_n            = '0;
+321:                 leaf_1Spte_n        = '0;
+322:                 pf_excep_n          = 1'b0;
+323:                 pt_data_corrupt_n   = 1'b0;
+324: 
+325:                 if (init_ptw_i && !edge_trigger_q) begin
+326: 
+327:                     state_n = MEM_ACCESS;
+328:                     iova_n = (imp_init_i) ? 
+329:                              (addr_t'({pdt_gppn_i, 12'b0})) : 
+330:                              (iova_i);
+331:                     implicit_trans_n = imp_init_i;
+332: 
+333:                     unique case ({en_1S_i, en_2S_i})
+334: 
+335:                         // Second stage only
+336:                         2'b01: begin
+337:                             
+338:                             ptw_stage_n = STAGE_2_FINAL;
+339:                         
+340:                             // Normal second-stage translation
+341:                             if (!imp_init_i) begin
+342:                                 gpaddr_n = iova_i[rv_iommu::GPLEN39-1:0];
+343:                                 ptw_pptr_n = {iohgatp_ppn_i[PPNW-1:2], iova_i[rv_iommu::GPLEN39-1:30], 3'b0};
+344: 
+345:                                 // From Spec:
+346:                                 // For G-stage translation Address bits 63:41 must all be zeros, or else a guest-page-fault exception occurs."
+347:                                 if (|iova_i[RVIOMMUCfg.AxiAddrWidth-1:rv_iommu::GPLEN39] != 1'b0) begin
+348:                                     pf_excep_n  = 1'b1;
+349:                                     state_n     = ERROR;
+350:                                 end
+
+SOURCE cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ptw.sv ORIGINAL LINES 442-495
+442:                                         s1_lvl_n = main_lvl_q;
+443:                                         main_lvl_n = LVL1;
+444:                                         gpaddr_n = final_gpa;
+445:                                         ptw_pptr_n = {iohgatp_ppn_i[PPNW-1:2], final_gpa[rv_iommu::GPLEN39-1:30], 3'b0};
+446: 
+447:                                         // GPA is an MSI address
+448:                                         if (gpaddr_is_msi) begin
+449:                                             gpaddr_is_msi_o = 1'b1;
+450:                                             state_n         = IDLE;
+451:                                         end
+452:                                     end
+453:                                 end
+454: 
+455:                                 // Leaf intermediate second-stage PTE
+456:                                 STAGE_2_INTERMED: begin
+457:                                     state_n = MEM_ACCESS;
+458:                                     ptw_stage_n = STAGE_1;
+459:                                     main_lvl_n = s1_lvl_q;
+460:                                     pptr = {pte.ppn[PPNW-1:0], gpa_x_q[11:0]};
+461: 
+462:                                     // superpages
+463:                                     if (main_lvl_q == LVL2)
+464:                                         pptr[20:0] = gpa_x_q[20:0];
+465:                                     else if (main_lvl_q == LVL1)
+466:                                         pptr[29:0] = gpa_x_q[29:0];
+467:                                     // A 4 KiB G-stage leaf also keeps the
+468:                                     // already assembled PPN and page offset.
+469:                                     else if (main_lvl_q != LVL3) begin
+470:                                         pf_excep_n  = 1'b1;
+471:                                         state_n     = ERROR;
+472:                                     end
+473:                                     ptw_pptr_n = pptr;
+474:                                 end
+475:                                 default:;
+476:                             endcase
+477: 
+478:                             /*** Translation completed ***/
+479: 
+480:                             if ((ptw_stage_q == STAGE_2_FINAL) || (!en_2S_i)) begin
+481:                                     if (!implicit_trans_q)
+482:                                         update_o.update = 1'b1;
+483:                                     else
+484:                                         imp_done_o = 1'b1;
+485:                             end
+486: 
+487:                             // From Spec:
+488:                             // (1): If i > 0 and pte.vpn[i − 1 : 0] != 0, this is a misaligned superpage.
+489:                             //      Stop and raise a page-fault exception corresponding to the original access type.
+490:                             // (2): When a virtual page is accessed and the A bit is clear, or is written and the D bit is clear,
+491:                             //      a page-fault exception is raised.
+492:                             // (3): For G-stage address translation, all memory accesses are considered to be user-level accesses,
+493:                             //      as though executed in U-mode.
+494:                             if ((main_lvl_q == LVL1 && |pte.ppn[17:0] != 1'b0   ) ||       // 1G
+495:                                 (main_lvl_q == LVL2 && |pte.ppn[8:0] != 1'b0    ) ||       // 2M
+
+SOURCE cva6/corev_apu/iDMA/src/idma_fullbuffer_certificate.sv ORIGINAL LINES 1-47
+1: // SPDX-License-Identifier: Solderpad-0.51
+2: // Permission for one complete, aligned 4 KiB copy in a sufficiently large
+3: // data buffer. Samples accepted frontend jobs and retired backend jobs only;
+4: // it never changes either handshake. The register frontend serializes jobs.
+5: // Unexpected overlap/retirement revokes this new permission until reset.
+6: module idma_fullbuffer_certificate #(
+7:     parameter int unsigned CapacityBytes = 0
+8: ) (
+9:     input logic clk_i, rst_ni,
+10:     input logic job_fire_i, job_done_i, normal_copy_i,
+11:     input logic [63:0] length_i, src_i, dst_i,
+12:     output logic permit_o
+13: );
+14:     logic pending_q, eligible_q, fault_q;
+15:     logic eligible;
+16:     assign eligible = CapacityBytes >= 4096 && normal_copy_i &&
+17:                       length_i == 64'd4096 && src_i[11:0] == 0 && dst_i[11:0] == 0;
+18:     assign permit_o = pending_q && eligible_q && !fault_q && normal_copy_i;
+19: 
+20:     always_ff @(posedge clk_i or negedge rst_ni) begin
+21:         if (!rst_ni) begin
+22:             pending_q <= 1'b0;
+23:             eligible_q <= 1'b0;
+24:             fault_q <= 1'b0;
+25:         end else begin
+26:             case ({job_fire_i, job_done_i})
+27:                 2'b10: begin
+28:                     if (pending_q) fault_q <= 1'b1;
+29:                     pending_q <= 1'b1;
+30:                     eligible_q <= eligible;
+31:                 end
+32:                 2'b01: begin
+33:                     if (!pending_q) fault_q <= 1'b1;
+34:                     pending_q <= 1'b0;
+35:                     eligible_q <= 1'b0;
+36:                 end
+37:                 2'b11: begin
+38:                     // Replace a completed sole job; an immediately completed
+39:                     // job with no predecessor needs no read permission.
+40:                     pending_q <= pending_q;
+41:                     eligible_q <= pending_q && eligible;
+42:                 end
+43:                 default: ;
+44:             endcase
+45:         end
+46:     end
+47: endmodule
+
+SOURCE cva6/corev_apu/riscv-iommu/vendor/common_cells/src/stream_arbiter_flushable.sv ORIGINAL LINES 1-82
+1: // Copyright 2018 ETH Zurich and University of Bologna.
+2: // Copyright and related rights are licensed under the Solderpad Hardware
+3: // License, Version 0.51 (the "License"); you may not use this file except in
+4: // compliance with the License. You may obtain a copy of the License at
+5: // http://solderpad.org/licenses/SHL-0.51. Unless required by applicable law
+6: // or agreed to in writing, software, hardware and materials distributed under
+7: // this License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+8: // CONDITIONS OF ANY KIND, either express or implied. See the License for the
+9: // specific language governing permissions and limitations under the License.
+10: 
+11: // Stream arbiter: Arbitrates a parametrizable number of input streams (i.e., valid-ready
+12: // handshaking with dependency rules as in AXI4) to a single output stream.  Once `oup_valid_o` is
+13: // asserted, `oup_data_o` remains invariant until the output handshake has occurred.  The
+14: // arbitration scheme is fair round-robin tree, see `rr_arb_tree` for details.
+15: 
+16: module stream_arbiter_flushable #(
+17:     parameter type      DATA_T = logic,   // Vivado requires a default value for type parameters.
+18:     parameter integer   N_INP = -1,       // Synopsys DC requires a default value for parameters.
+19:     parameter           ARBITER = "rr"    // "rr" or "prio"
+20: ) (
+21:     input  logic              clk_i,
+22:     input  logic              rst_ni,
+23:     input  logic              flush_i,
+24: 
+25:     input  DATA_T [N_INP-1:0] inp_data_i,
+26:     input  logic  [N_INP-1:0] inp_valid_i,
+27:     output logic  [N_INP-1:0] inp_ready_o,
+28: 
+29:     output DATA_T             oup_data_o,
+30:     output logic              oup_valid_o,
+31:     input  logic              oup_ready_i
+32: );
+33: 
+34:   if (ARBITER == "rr") begin : gen_rr_arb
+35:     rr_arb_tree #(
+36:       .NumIn      (N_INP),
+37:       .DataType   (DATA_T),
+38:       .ExtPrio    (1'b0),
+39:       .AxiVldRdy  (1'b1),
+40:       .LockIn     (1'b1)
+41:     ) i_arbiter (
+42:       .clk_i,
+43:       .rst_ni,
+44:       .flush_i,
+45:       .rr_i   ('0),
+46:       .req_i  (inp_valid_i),
+47:       .gnt_o  (inp_ready_o),
+48:       .data_i (inp_data_i),
+49:       .gnt_i  (oup_ready_i),
+50:       .req_o  (oup_valid_o),
+51:       .data_o (oup_data_o),
+52:       .idx_o  ()
+53:     );
+54: 
+55:   end else if (ARBITER == "prio") begin : gen_prio_arb
+56:     rr_arb_tree #(
+57:       .NumIn      (N_INP),
+58:       .DataType   (DATA_T),
+59:       .ExtPrio    (1'b1),
+60:       .AxiVldRdy  (1'b1),
+61:       .LockIn     (1'b0)
+62:     ) i_arbiter (
+63:       .clk_i,
+64:       .rst_ni,
+65:       .flush_i,
+66:       .rr_i   ('0),
+67:       .req_i  (inp_valid_i),
+68:       .gnt_o  (inp_ready_o),
+69:       .data_i (inp_data_i),
+70:       .gnt_i  (oup_ready_i),
+71:       .req_o  (oup_valid_o),
+72:       .data_o (oup_data_o),
+73:       .idx_o  ()
+74:     );
+75: 
+76:   end else begin : gen_arb_error
+77:     `ifndef SYNTHESIS
+78:     $fatal(1, "Invalid value for parameter 'ARBITER'!");
+79:     `endif
+80:   end
+81: 
+82: endmodule

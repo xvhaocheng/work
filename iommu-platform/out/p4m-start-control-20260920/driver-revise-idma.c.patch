@@ -1,0 +1,156 @@
+--- linux/drivers/misc/idma.c
++++ linux/drivers/misc/idma.c
+@@ -448,7 +448,12 @@
+ 	idma_submit_config(s);
+ 	id = readq(s->idma->reg + IDMA_NEXT_ID_REG_OFFSET);
+ 	if (!id) {
+-		/* Without a valid ID we cannot prove that buffers are no longer used. */
++		/*
++		 * Without a valid ID we cannot prove that buffers are no longer
++		 * used.  A failed submit must not keep the previous transfer ID,
++		 * because the drain path matches DONE against transfer_id.
++		 */
++		s->transfer_id = 0;
+ 		idma_quarantine(s);
+ 		return -EIO;
+ 	}
+@@ -460,16 +465,27 @@
+ 
+ /*
+  * Bounded software batch start.  Both register sets are configured before any
+- * NEXT_ID trigger.  Only the ordered A-then-V trigger reads, the software
+- * timestamp reads and the per-stream commit bookkeeping run with IRQs and
+- * preemption disabled.  The section is non-sleeping and never covers polling,
+- * drain, quarantine, allocation, logging or cond_resched.
++ * NEXT_ID trigger.  Only the ordered A-then-V trigger reads and their software
++ * timestamps run with IRQs and preemption disabled.  That section is
++ * non-sleeping and never covers commit bookkeeping, polling, drain,
++ * quarantine, allocation, logging or cond_resched.
++ *
++ * The deadline and the pending signal are checked twice: once before the
++ * configuration writes and again inside the protected section before the first
++ * trigger.  A request that expires in between is dropped without triggering
++ * either device, without keeping either untriggered batch_started claim and
++ * without keeping their launch stamps.
+  *
+  * a_triggered/v_triggered mean the corresponding NEXT_ID read was executed,
+  * even when it returned zero.  a_id/v_id carry the raw readback (zero on
+  * failure).  irq_span_ns is the ktime bracket around the protected trigger
+  * reads; the real IRQ-off interval extends a bounded few instructions on both
+  * sides and is not a cycle-accurate or interrupt-latency measurement.
++ *
++ * Failure ownership matches the ordinary batch path: a stream whose trigger
++ * read produced a valid ID is committed even when the other stream failed, so
++ * the caller can still stop and drain it; a stream whose trigger read returned
++ * zero is quarantined, and an untriggered V is released instead.
+  */
+ static int idma_batch_start(struct idma_stream *v, struct idma_stream *a,
+ 			    u64 deadline, u64 *end_ns,
+@@ -504,6 +520,20 @@
+ 	preempt_disable();
+ 	local_irq_save(flags);
+ 
++	/*
++	 * Configuration consumed time: recheck both conditions before the first
++	 * NEXT_ID read so an expired or interrupted request never triggers either
++	 * device.
++	 */
++	if (ktime_get_ns() >= deadline) {
++		ret = -ETIMEDOUT;
++		goto out_untriggered;
++	}
++	if (signal_pending(current)) {
++		ret = -EINTR;
++		goto out_untriggered;
++	}
++
+ 	if (a) {
+ 		start->a_begin_ns = ktime_get_ns();
+ 		a_id = readq(a->idma->reg + IDMA_NEXT_ID_REG_OFFSET);
+@@ -511,9 +541,13 @@
+ 		start->a_triggered = true;
+ 		start->a_id = a_id;
+ 		if (!a_id) {
++			/*
++			 * V was only configured, never triggered: release its
++			 * ownership and stamps, then log A's quarantine with
++			 * interrupts restored.
++			 */
+ 			local_irq_restore(flags);
+ 			preempt_enable();
+-			/* V was only configured, never triggered. */
+ 			v->batch_started = false;
+ 			if (v->diagnostic) {
+ 				v->diagnostic->launch_begin_ns = 0;
+@@ -523,7 +557,6 @@
+ 			ret = -EIO;
+ 			goto out;
+ 		}
+-		idma_submit_commit(a, a_id, false, start->a_end_ns);
+ 	}
+ 
+ 	start->v_begin_ns = ktime_get_ns();
+@@ -531,21 +564,47 @@
+ 	start->v_end_ns = ktime_get_ns();
+ 	start->v_triggered = true;
+ 	start->v_id = v_id;
++
++	/* Commit bookkeeping never runs with IRQs or preemption disabled. */
++	local_irq_restore(flags);
++	preempt_enable();
++
+ 	if (!v_id) {
+-		local_irq_restore(flags);
+-		preempt_enable();
++		/*
++		 * A was triggered with a valid ID: publish it before V is
++		 * quarantined so the caller can still stop and drain A.
++		 */
++		if (a)
++			idma_submit_commit(a, a_id, false, start->a_end_ns);
+ 		idma_quarantine(v);
+ 		ret = -EIO;
+ 		goto out;
+ 	}
++
++	if (a)
++		idma_submit_commit(a, a_id, false, start->a_end_ns);
+ 	idma_submit_commit(v, v_id, false, start->v_end_ns);
+-
+-	local_irq_restore(flags);
+-	preempt_enable();
+ 
+ 	start->irq_span_ns = start->v_end_ns -
+ 		(a ? start->a_begin_ns : start->v_begin_ns);
+ 	return 0;
++
++out_untriggered:
++	/* Nothing was triggered: drop both ownership claims and their stamps. */
++	if (a) {
++		a->batch_started = false;
++		if (a->diagnostic) {
++			a->diagnostic->launch_begin_ns = 0;
++			a->diagnostic->launch_end_ns = 0;
++		}
++	}
++	v->batch_started = false;
++	if (v->diagnostic) {
++		v->diagnostic->launch_begin_ns = 0;
++		v->diagnostic->launch_end_ns = 0;
++	}
++	local_irq_restore(flags);
++	preempt_enable();
+ 
+ out:
+ 	if (start->attempted) {
+@@ -567,7 +626,9 @@
+  * accurate or an interrupt-latency proof.  a_triggered/v_triggered mean the
+  * corresponding NEXT_ID read was attempted; a_id/v_id are the raw readbacks
+  * and may be zero on failure.  a_to_v_ns is valid only when both A and V
+- * trigger reads were attempted.
++ * trigger reads were attempted.  A start that failed after configuration but
++ * before any trigger reports attempted=1 with both trigger flags zero and
++ * irq_span_ns=0.
+  */
+ static void idma_batch_start_log(struct device *dev,
+ 				 const struct idma_batch_start *start,

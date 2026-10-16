@@ -1,0 +1,144 @@
+--- a/scripts/mac_nonblock_pilot.py
++++ b/scripts/mac_nonblock_pilot.py
+@@ -129,6 +129,16 @@
+ READER_MODE_FOR_LABEL = {'banked-serial': 1, 'banked-hit': 2}
+ READER_FAST_WORDS = (6, 7, 8, 9, 10)   # Vread, Vwrite, Aread, Awrite, Other
+ READER_NORMAL_WORDS = (11, 12, 13)     # V, A, Other
++
++# Optional second 16-word read-only diagnostic bank (index 16..31).  It is
++# read only when the helper is invoked with --diagnostics; the frozen 16-word
++# core ABI above is unchanged.
++READER_DIAG_WORDS = 16
++READER_DIAG_MAGIC = 0x49444D414E444701
++READER_DIAG_VERSION = 1
++READER_DIAG_FLAGS_FROZEN = 4
++READER_DIAG_FAST_ACCEPT_WORD = 15
++READER_DIAG_UINT64_MAX = 0xFFFFFFFFFFFFFFFF
+ UPLOAD_CHUNK = 1024
+ # Raw-UART heredoc upload tuning.  At 115200 8N1 one 1024-byte base64 line
+ # costs about 89 ms of wire time, so each payload line is followed by a short
+@@ -498,6 +508,64 @@
+     if previous_seq is not None and window[4] <= previous_seq:
+         problems.append('helper window[4] sequence ' + repr(window[4])
+                         + ' did not increase past ' + repr(previous_seq))
++    return problems
++
++
++def validate_helper_diagnostic(window: Any, diagnostic: Any,
++                               label: str) -> List[str]:
++    '''Validate the optional second 16-word diagnostic bank.
++
++    The helper validates this bank before printing it; this runner repeats the
++    structural checks so a malformed helper.json can never be recorded as a
++    completed case.  The bank is passive: its words are not HPM counters and
++    never replace the frozen 16-word core ABI.  Words must be real uint64
++    values: bool, non-integer, negative and > 2**64 - 1 words are rejected
++    before any arithmetic, so a coerced value can never look valid.
++    '''
++    problems: List[str] = []
++    if not isinstance(window, list) or len(window) != READER_WINDOW_WORDS:
++        return ['diagnostic check needs the core 16-word window']
++    if not isinstance(diagnostic, dict):
++        return ['helper diagnostic is not an object']
++    words = diagnostic.get('words')
++    if not isinstance(words, list) or len(words) != READER_DIAG_WORDS:
++        return ['helper diagnostic.words is not '
++                + str(READER_DIAG_WORDS) + ' words']
++    for value in words:
++        if isinstance(value, bool) or not isinstance(value, int):
++            return ['helper diagnostic.words contains non-integer words']
++        if value < 0 or value > READER_DIAG_UINT64_MAX:
++            return ['helper diagnostic.words contains a word outside uint64: '
++                    + repr(value)]
++    if words[0] != READER_DIAG_MAGIC:
++        problems.append('helper diagnostic[0] magic ' + repr(words[0]))
++    if words[1] != READER_DIAG_VERSION:
++        problems.append('helper diagnostic[1] version ' + repr(words[1]))
++    expected_mode = READER_MODE_FOR_LABEL.get(label)
++    if words[2] != expected_mode:
++        problems.append('helper diagnostic[2] mode ' + repr(words[2])
++                        + ' != ' + repr(expected_mode) + ' for ' + label)
++    if words[3] != READER_DIAG_FLAGS_FROZEN:
++        problems.append('helper diagnostic[3] flags ' + repr(words[3])
++                        + ' != ' + str(READER_DIAG_FLAGS_FROZEN))
++    if words[4] != window[4]:
++        problems.append('helper diagnostic[4] seq ' + repr(words[4])
++                        + ' != core window[4] ' + repr(window[4]))
++    if words[5] != window[5]:
++        problems.append('helper diagnostic[5] cycles ' + repr(words[5])
++                        + ' != core window[5] ' + repr(window[5]))
++    total = 0
++    for index in READER_FAST_WORDS:
++        value = window[index]
++        if isinstance(value, bool) or not isinstance(value, int):
++            return ['diagnostic check needs integer core fast words']
++        total += value
++    if total > READER_DIAG_UINT64_MAX:
++        problems.append('helper diagnostic core fast sum overflows 64 bits')
++    elif words[READER_DIAG_FAST_ACCEPT_WORD] != total:
++        problems.append('helper diagnostic[15] fast_accepts '
++                        + repr(words[READER_DIAG_FAST_ACCEPT_WORD])
++                        + ' != sum(core fast 6..10) ' + repr(total))
+     return problems
+ 
+ 
+@@ -1088,8 +1156,10 @@
+ 
+     def _reader_command(self) -> str:
+         # Assumed helper invocation; align with the ELF once it is compiled.
+-        mode = READER_MODE_FOR_LABEL.get(self.args.label)
+-        return shlex.quote(self._reader_target())
++        command = shlex.quote(self._reader_target())
++        if getattr(self.args, 'diagnostics', False):
++            command += ' --diagnostics'
++        return command
+ 
+     def _upload_reader(self) -> Dict[str, Any]:
+         '''Raw UART upload of the static helper into /tmp.
+@@ -1350,6 +1420,22 @@
+                 'window': window,
+                 'note': 'full frozen 16-word window saved verbatim; not HPM',
+             })
++            if getattr(self.args, 'diagnostics', False):
++                diagnostic = (helper_doc.get('diagnostic')
++                              if isinstance(helper_doc, dict) else None)
++                problems.extend(validate_helper_diagnostic(
++                    window, diagnostic, self.args.label))
++                if isinstance(diagnostic, dict):
++                    self._write_json('cases/' + cid + '/diag-window.json', {
++                        'schema': 'nonblock-pilot-diag-window-v1',
++                        'id': cid,
++                        'label': self.args.label,
++                        'abi': READER_ABI,
++                        'mode': READER_MODE_FOR_LABEL.get(self.args.label),
++                        'diagnostic': diagnostic,
++                        'note': ('second 16-word diagnostic bank saved '
++                                 'verbatim; passive only, not HPM'),
++                    })
+         return problems, window
+ 
+     # ---- one case ----------------------------------------------------------
+@@ -1664,6 +1750,10 @@
+     parser.add_argument('--reader', default=None,
+                         help='static RISC-V ELF helper; required for '
+                              'banked-serial/banked-hit, forbidden for original-serial')
++    parser.add_argument('--diagnostics', action='store_true',
++                        help='read the optional second 16-word diagnostic bank '
++                             'through the uploaded reader; requires a banked '
++                             'label and --reader')
+     parser.add_argument('--upload-timeout', type=float, default=DEFAULT_UPLOAD_TIMEOUT)
+     parser.add_argument('--pre-flash-boot-id', action='store_true',
+                         help='best effort: read the running boot_id over the UART '
+@@ -1697,6 +1787,12 @@
+                              + ' (no RO hardware on that bitstream)')
+         if not pathlib.Path(args.reader).is_file():
+             raise SystemExit('--reader not found: ' + args.reader)
++    if getattr(args, 'diagnostics', False):
++        if args.label not in READER_REQUIRED_LABELS:
++            raise SystemExit('--diagnostics requires a banked label with RO '
++                             'hardware: ' + ', '.join(READER_REQUIRED_LABELS))
++        if not args.reader:
++            raise SystemExit('--diagnostics requires --reader')
+     if args.recover_startup_from:
+         if args.interrupt_stalled_seed:
+             raise SystemExit('--interrupt-stalled-seed does not apply with '

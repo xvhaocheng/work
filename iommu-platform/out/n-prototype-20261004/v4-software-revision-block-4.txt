@@ -1,0 +1,318 @@
+## FILE: tests/nonblock_observer_test.cpp
+```cpp
+// SPDX-License-Identifier: Solderpad-0.51
+//
+// Verilator 4.038 harness for dma_nonblock_observer. Simple manual clock, no SV
+// timing. Mode-agnostic: reads word 2 to learn the configured Mode.
+//
+#include <cstdint>
+#include <cstdio>
+#include "Vnonblock_observer_top.h"
+#include "verilated.h"
+
+static Vnonblock_observer_top *dut;
+static int g_fail = 0;
+
+static void tick() {
+    dut->clk = 0; dut->eval();   // settle inputs before posedge
+    dut->clk = 1; dut->eval();   // posedge captures inputs
+    dut->clk = 0; dut->eval();
+}
+
+static void idle() {
+    dut->arm = 0; dut->open = 0; dut->close = 0;
+    dut->accept = 0; dut->fast = 0;
+    dut->did = 0; dut->ttype = 0; dut->diag_events = 0;
+}
+
+static uint64_t rd(int idx) {
+    dut->index = (uint8_t)idx;
+    dut->eval();
+    return (uint64_t)dut->rdata;
+}
+
+static void check(const char *what, uint64_t got, uint64_t want) {
+    if (got != want) {
+        std::fprintf(stderr,
+                     "FAIL %s: got %llu (0x%llx) want %llu (0x%llx)\n",
+                     what,
+                     (unsigned long long)got, (unsigned long long)got,
+                     (unsigned long long)want, (unsigned long long)want);
+        g_fail++;
+    }
+}
+
+int main(int argc, char **argv) {
+    Verilated::commandArgs(argc, argv);
+    dut = new Vnonblock_observer_top;
+
+    idle();
+    dut->rst = 0; dut->index = 0; dut->clk = 0; dut->eval();
+
+    // ---- reset ----
+    dut->rst = 1; idle(); tick();
+    dut->rst = 0; idle(); dut->eval();
+    check("magic",       rd(0),  0x49444D414E424C01ULL);
+    check("version",     rd(1),  1);
+    uint64_t mode = rd(2);
+    if (mode != 1 && mode != 2) {
+        std::fprintf(stderr, "FAIL mode=%llu\n", (unsigned long long)mode);
+        g_fail++;
+    }
+    check("rst flags",  rd(3),  0);
+    check("rst seq",    rd(4),  0);
+    check("rst cycles", rd(5),  0);
+    check("rst err",    rd(15), 0);
+
+    // ---- ARM ----
+    idle(); dut->arm = 1; tick();
+    idle(); dut->eval();
+    check("armed", rd(3), 0x1);
+    check("seq1",  rd(4), 1);
+
+    // ---- pre-open accepted event must be excluded (still ARMED) ----
+    idle(); dut->accept = 1; dut->fast = 0; dut->did = 10; dut->ttype = 0x2; tick();
+    idle(); dut->eval();
+    check("pre-open excluded", rd(14), 0);
+
+    // ---- open edge with a coincident accept: excluded, opens the window ----
+    idle();
+    dut->open = 1; dut->accept = 1; dut->fast = 0; dut->did = 10; dut->ttype = 0x2;
+    tick();
+    idle(); dut->eval();
+    check("active",            rd(3),  0x2);
+    check("open-edge excl 14", rd(14), 0);
+    check("open-edge excl 11", rd(11), 0);
+
+    // ---- active window ----
+    // A: fast DID10 write
+    idle(); dut->accept = 1; dut->fast = 1; dut->did = 10; dut->ttype = 0x3; tick();
+    // B: normal DID11
+    idle(); dut->accept = 1; dut->fast = 0; dut->did = 11; dut->ttype = 0x3; tick();
+    // C: fast other (DID 12)
+    idle(); dut->accept = 1; dut->fast = 1; dut->did = 12; dut->ttype = 0x2; tick();
+    // D: idle cycle (cycles++ only)
+    idle(); tick();
+    // E: close edge with fast DID11 read, included
+    idle();
+    dut->accept = 1; dut->fast = 1; dut->did = 11; dut->ttype = 0x2; dut->close = 1;
+    tick();
+    idle(); dut->eval();
+
+    check("frozen", rd(3),  0x4);
+    check("w6",     rd(6),  0);
+    check("w7",     rd(7),  1);
+    check("w8",     rd(8),  1);
+    check("w9",     rd(9),  0);
+    check("w10",    rd(10), 1);
+    check("w11",    rd(11), 0);
+    check("w12",    rd(12), 1);
+    check("w13",    rd(13), 0);
+    check("w14",    rd(14), 4);
+    check("cycles", rd(5),  5);
+
+    // ---- conservation, overflow-safe ----
+    uint64_t sum = 0, tmp = 0;
+    int ovf = 0;
+    for (int i = 6; i <= 13; i++) {
+        if (__builtin_add_overflow(sum, rd(i), &tmp)) { ovf = 1; break; }
+        sum = tmp;
+    }
+    check("conserve overflow", ovf, 0);
+    check("conserve sum",      sum, rd(14));
+
+    // ---- frozen read stability ----
+    uint64_t a[16], b[16];
+    for (int i = 0; i < 16; i++) a[i] = rd(i);
+    for (int i = 0; i < 16; i++) b[i] = rd(i);
+    for (int i = 0; i < 16; i++) check("stable", a[i], b[i]);
+
+    // ---- ignored unknown index reads 0 ----
+    check("unknown idx -> 0", rd(200), 0);
+
+    // ---- new ARM resets seq++ and clears the window ----
+    idle(); dut->arm = 1; tick();
+    idle(); dut->eval();
+    check("seq2",           rd(4),  2);
+    check("armed2",         rd(3),  0x1);
+    check("cycles cleared", rd(5),  0);
+    check("errors cleared", rd(15), 0);
+
+    // ---- invalid close (not active) -> bit1 ----
+    idle(); dut->close = 1; tick();
+    idle(); dut->eval();
+    check("close-no-active", (rd(15) >> 1) & 1, 1);
+
+    // ---- invalid fast without accept -> bit4 (+ Mode1 bit5) ----
+    idle(); dut->fast = 1; dut->accept = 0; dut->did = 10; dut->ttype = 0x2; tick();
+    idle(); dut->eval();
+    check("fast-no-accept", (rd(15) >> 4) & 1, 1);
+    if (mode == 1)
+        check("mode1 fast err", (rd(15) >> 5) & 1, 1);
+    else
+        check("mode2 no mode1", (rd(15) >> 5) & 1, 0);
+
+    // ---- focused reset + ARM/OPEN overlap contract ----
+    dut->rst = 1; idle(); tick();
+    dut->rst = 0; idle(); dut->eval();
+    check("overlap-reset flags",  rd(3),  0);
+    check("overlap-reset seq",    rd(4),  0);
+    check("overlap-reset cycles", rd(5),  0);
+    check("overlap-reset err",    rd(15), 0);
+
+    // ARM and OPEN asserted together is invalid: overlap error, no window.
+    idle(); dut->arm = 1; dut->open = 1; tick();
+    idle(); dut->eval();
+    check("arm+open overlap err", (rd(15) >> 2) & 1, 1);
+    check("arm+open not active",  (rd(3) >> 1) & 1, 0);
+    check("arm+open not armed",   (rd(3) >> 0) & 1, 0);
+    check("arm+open seq held",    rd(4), 0);
+
+    // A clean ARM after the overlap is accepted and clears the error.
+    idle(); dut->arm = 1; tick();
+    idle(); dut->eval();
+    check("clean-arm err clear", (rd(15) >> 2) & 1, 0);
+    check("clean-arm armed",     rd(3), 0x1);
+    check("clean-arm seq",       rd(4), 1);
+
+    // The open edge remains excluded and the close edge remains counted.
+    idle(); dut->open = 1; tick();
+    idle(); dut->eval();
+    check("close-edge open active", (rd(3) >> 1) & 1, 1);
+    check("close-edge open cycles", rd(5), 0);
+
+    idle(); dut->close = 1; tick();
+    idle(); dut->eval();
+    check("close-edge frozen", (rd(3) >> 2) & 1, 1);
+    check("close-edge cycles", rd(5), 1);
+
+    // ---- optional second diagnostic bank (index 16..31) --------------------
+    // Fresh reset/ARM/open/close for one bounded diagnostic window.  The core
+    // 16-word checks above are untouched; this section reads only the separate
+    // passive bank.  No ordering relation between the probe counters is
+    // asserted: a probe can legitimately cross the window boundary.
+    //
+    // Mode handling: only Mode 2 drives the core fast path here.  In Mode 1
+    // fast is a protocol error, so a *valid* diagnostic window must not drive
+    // fast at all; the core fast counters then stay 0 and so does the mirrored
+    // diagnostic event bit 11 (diag word 31).  Both modes spend exactly the
+    // same number of active cycles, so the cycle checks stay mode-agnostic.
+    dut->rst = 1; idle(); tick();
+    dut->rst = 0; idle(); dut->eval();
+
+    idle(); dut->arm = 1; tick();
+    idle(); dut->eval();
+    check("diag magic",      rd(16), 0x49444D414E444701ULL);
+    check("diag version",    rd(17), 1);
+    check("diag mode",       rd(18), mode);
+    check("diag arm flags",  rd(19), 0x1);
+    check("diag arm seq",    rd(20), 1);
+    check("diag arm cycles", rd(21), 0);
+    check("diag arm seen",   rd(22), 0);
+    for (int i = 23; i <= 31; i++)
+        check("diag arm counter", rd(i), 0);
+
+    idle(); dut->open = 1; tick();
+    idle(); dut->eval();
+    check("diag open flags",  rd(19), 0x2);
+    check("diag open cycles", rd(21), 0);
+    check("diag open seen",   rd(22), 0);
+    for (int i = 23; i <= 31; i++)
+        check("diag open counter", rd(i), 0);
+
+    // Probe-stage seen bits 3..10 and their counters.  Bit 11 is deliberately
+    // not set here: it mirrors the core fast path and is driven only in Mode 2.
+    idle(); dut->diag_events = (1u << 3) | (1u << 4) | (1u << 5); tick();
+    idle(); dut->diag_events = (1u << 6) | (1u << 7); tick();
+    idle(); dut->diag_events = (1u << 8) | (1u << 9) | (1u << 10); tick();
+
+    // One real fast accept: the core fast event and its diagnostic mirror are
+    // driven together.  Mode 1 must not drive fast; the cycle is spent either
+    // way so both modes keep the same cycle count.
+    idle();
+    if (mode == 2) {
+        dut->accept = 1; dut->fast = 1; dut->did = 10; dut->ttype = 0x2;
+        dut->diag_events = (1u << 11);
+    }
+    tick();
+
+    // Remaining seen-only bits: no core fast count and no probe counter.
+    idle();
+    dut->diag_events = (1u << 0) | (1u << 1) | (1u << 2) |
+                       (1u << 12) | (1u << 13) | (1u << 14) | (1u << 15);
+    tick();
+
+    // Closing edge: state is still ACTIVE at the edge, so both the core fast
+    // event and its diagnostic mirror are counted (same rule as the legacy
+    // section above).
+    idle();
+    if (mode == 2) {
+        dut->accept = 1; dut->fast = 1; dut->did = 11; dut->ttype = 0x2;
+        dut->diag_events = (1u << 11);
+    }
+    dut->close = 1;
+    tick();
+    idle(); dut->eval();
+
+    check("diag frozen flags",     rd(19), 0x4);
+    check("diag window core err",  rd(15), 0);
+    check("diag seen mask",        rd(22), (mode == 2) ? 0xFFFFULL : 0xF7FFULL);
+    check("diag start",            rd(23), 1);
+    check("diag dc eval",          rd(24), 1);
+    check("diag dc good",          rd(25), 1);
+    check("diag leaf eval",        rd(26), 1);
+    check("diag leaf good",        rd(27), 1);
+    check("diag dc msi rej",       rd(28), 1);
+    check("diag leaf msi rej",     rd(29), 1);
+    check("diag leaf miss",        rd(30), 1);
+    check("diag fast accepts",     rd(31), (mode == 2) ? 2 : 0);
+    check("diag cycles",           rd(21), 6);
+    check("diag seq same",         rd(20), rd(4));
+    check("diag cycles same",      rd(21), rd(5));
+
+    // Diagnostic word 31 must equal the core fast sum in the same window.
+    uint64_t core_fast_sum = 0, core_fast_tmp = 0;
+    int core_fast_ovf = 0;
+    for (int i = 6; i <= 10; i++) {
+        if (__builtin_add_overflow(core_fast_sum, rd(i), &core_fast_tmp)) {
+            core_fast_ovf = 1;
+            break;
+        }
+        core_fast_sum = core_fast_tmp;
+    }
+    check("diag core fast sum overflow", core_fast_ovf, 0);
+    check("diag fast accepts == core fast sum", rd(31), core_fast_sum);
+    check("diag overflow bit", (rd(19) >> 63) & 1, 0);
+
+    // ---- a frozen window ignores further diagnostic events ----
+    uint64_t seen_frozen = rd(22);
+    uint64_t frozen_counters[9];
+    for (int i = 0; i < 9; i++) frozen_counters[i] = rd(23 + i);
+    idle(); dut->diag_events = 0xFFFF; tick();
+    idle(); dut->eval();
+    check("diag frozen ignores seen", rd(22), seen_frozen);
+    for (int i = 0; i < 9; i++)
+        check("diag frozen ignores counter", rd(23 + i), frozen_counters[i]);
+    check("diag frozen flags stay", rd(19), 0x4);
+
+    // ---- the next ARM clears seen/counters and increments seq ----
+    uint64_t seq_before = rd(20);
+    idle(); dut->arm = 1; tick();
+    idle(); dut->eval();
+    check("diag rearm seq",         rd(20), seq_before + 1);
+    check("diag rearm seq == core", rd(20), rd(4));
+    check("diag rearm flags",       rd(19), 0x1);
+    check("diag rearm cycles",      rd(21), 0);
+    check("diag rearm seen",        rd(22), 0);
+    for (int i = 23; i <= 31; i++)
+        check("diag rearm counter", rd(i), 0);
+
+    delete dut;
+    if (g_fail) {
+        std::fprintf(stderr, "%d check(s) failed\n", g_fail);
+        return 1;
+    }
+    std::printf("PASS (mode=%llu)\n", (unsigned long long)mode);
+    return 0;
+}
+```

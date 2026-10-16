@@ -1,0 +1,1 @@
+( /tmp/r107-stage111/idma-finite --run --device /dev/idma0 --data-dir /tmp/r107-stage111/data --output-dir /tmp/r107-stage111/finite-result; task_pilot_rc=$?; printf "R111_FINITE_CLI_RETURN=%s\n" "$task_pilot_rc"; exit "$task_pilot_rc" )

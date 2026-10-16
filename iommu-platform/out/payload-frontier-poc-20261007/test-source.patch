@@ -1,0 +1,416 @@
+--- a/tests/nonblock_actual_dma_test.cpp
++++ b/tests/nonblock_actual_dma_test.cpp
+@@ -183,7 +183,10 @@
+     };
+     std::deque<MemRead> mem_q;                 // SINGLE ordered R-return queue
+ 
+-    struct CawEnt { uint32_t id = 0; uint64_t addr = 0; uint8_t len = 0; uint32_t got = 0; };
++    struct CawEnt {
++        uint32_t id = 0; uint64_t addr = 0; uint8_t len = 0; uint32_t got = 0;
++        bool tail_hold_seen = false; long tail_release_cycle = 0;
++    };
+     std::deque<CawEnt>   caw_q;                // completion AWs being written
+     std::deque<uint32_t> cb_q;                 // completion B ids ready
+ 
+@@ -349,6 +352,13 @@
+     bool     win_seen        = false;
+     long     win_open_cycle  = 0;
+     long     win_close_cycle = 0;
++    // Read-only frontier counters increment at the rising edge. Snapshot
++    // AFTER the opening and closing edges to match pre-edge event counts
++    // from cycles (open,close]. No stimulus depends on these snapshots.
++    uint32_t fg_raw_open     = 0;
++    uint32_t fg_raw_close    = 0;
++    uint32_t fw_raw_open     = 0;
++    uint32_t fw_raw_close    = 0;
+     uint64_t w_cycles        = 0;
+     uint64_t w_v_done        = 0;   // dbg_dma_done bit0 pulses in window
+     uint64_t w_a_done        = 0;   // dbg_dma_done bit1 pulses in window
+@@ -378,6 +388,8 @@
+     uint64_t w_fill[2] = {0, 0}, w_ptw_bank_cycles[2] = {0, 0};
+     uint64_t w_ds_behind_comp_cycles = 0;
+     bool ds_priority = false;  // model-only causal intervention, window only
++    uint32_t write_tail_pause = 0; // finite WREADY backpressure at last 8 DMA beats
++    uint64_t write_tail_holds = 0, write_tail_hold_cycles = 0;
+     bool ddr_r_held = false;
+     FILE* event_trace = nullptr;
+     bool trace_ptw_active = false;
+@@ -555,6 +567,19 @@
+     void drive_ddr() {
+         top->ddr_aw_ready = 1;
+         top->ddr_w_ready  = 1;
++        if (write_tail_pause != 0 && !caw_q.empty()) {
++            CawEnt& c = caw_q.front();
++            if (((c.id >> 4) & 3u) == 2u && c.len == 255 && c.got == 248 && !c.tail_hold_seen) {
++                c.tail_hold_seen = true;
++                c.tail_release_cycle = g_cycle + write_tail_pause;
++                ++write_tail_holds;
++                trace_event("ddr_w_tail_hold", c.id, c.addr, write_tail_pause);
++            }
++            if (c.tail_hold_seen && g_cycle < c.tail_release_cycle) {
++                top->ddr_w_ready = 0;
++                ++write_tail_hold_cycles;
++            }
++        }
+         top->ddr_ar_ready = (mem_q.size() < 16) ? 1 : 0;
+         if (!cb_q.empty()) {
+             top->ddr_b_valid = 1;
+@@ -1018,6 +1043,14 @@
+         // ================= rising edge ====================================
+         top->clk_i = 1;
+         top->eval();
++        if (opening) {
++            fg_raw_open = (uint32_t)top->dbg_frontier_grant;
++            fw_raw_open = (uint32_t)top->dbg_frontier_wait;
++        }
++        if (win_seen && !win_open && win_close_cycle == g_cycle) {
++            fg_raw_close = (uint32_t)top->dbg_frontier_grant;
++            fw_raw_close = (uint32_t)top->dbg_frontier_wait;
++        }
+ 
+ #ifdef ACTUAL_DMA_SYSTEM
+         ddr_r_held = s_ddr_r_held;
+@@ -1220,6 +1253,10 @@
+         win_seen        = false;
+         win_open_cycle  = 0;
+         win_close_cycle = 0;
++        fg_raw_open  = 0;
++        fg_raw_close = 0;
++        fw_raw_open  = 0;
++        fw_raw_close = 0;
+         w_cycles        = 0;
+         w_v_done        = 0;
+         w_a_done        = 0;
+@@ -1288,6 +1325,7 @@
+         w_ds_behind_comp_cycles = 0;
+         w_ds_latency_sum = w_ds_latency_n = w_ds_latency_max = 0;
+         ddr_r_held = false;
++        write_tail_holds = write_tail_hold_cycles = 0;
+         trace_ptw_active = false;
+         trace_aw_flags = 0;
+         cpu_progress_cycle = g_cycle;
+@@ -2285,6 +2323,30 @@
+                     (unsigned)e2_meta_accepted, (unsigned)e2_meta_early,
+                     (unsigned)e2_meta_highwater, (unsigned)e2_queued);
+ 
++        // Read-only frontier observation at the terminal.  `raw` is the
++        // cumulative top-level counter sampled here; `window` is the post-edge
++        // snapshot delta over (win_open_cycle, win_close_cycle].  Modes 0-3
++        // drive both counters to 0, so all four fields are 0 there.  No
++        // non-zero assertion is made: a legitimate run may legitimately take
++        // zero frontier grants.
++        const uint32_t fg_raw = (uint32_t)top->dbg_frontier_grant;
++        const uint32_t fw_raw = (uint32_t)top->dbg_frontier_wait;
++        const uint32_t fg_win = (win_seen && !win_open) ?
++            (fg_raw_close - fg_raw_open) : 0u;
++        const uint32_t fw_win = (win_seen && !win_open) ?
++            (fw_raw_close - fw_raw_open) : 0u;
++        std::printf("WRITE-TAIL-TERMINAL-JSON {\"pause_cycles\":%u,\"holds\":%llu,\"hold_cycles\":%llu}\n",
++                    (unsigned)write_tail_pause, (unsigned long long)write_tail_holds,
++                    (unsigned long long)write_tail_hold_cycles);
++        std::printf("FRONTIER-TERMINAL-JSON {"
++                    "\"schema\":\"actual-dma-frontier-terminal-v1\","
++                    "\"mode\":\"%s\",\"e2_mode\":%u,"
++                    "\"window_scope\":\"pre_edge_(open,close]\","
++                    "\"frontier_grant_raw\":%u,\"frontier_grant_window\":%u,"
++                    "\"frontier_wait_raw\":%u,\"frontier_wait_window\":%u}\n",
++                    name, (unsigned)e2_mode,
++                    (unsigned)fg_raw, (unsigned)fg_win,
++                    (unsigned)fw_raw, (unsigned)fw_win);
+     }
+ };
+ 
+@@ -2304,6 +2366,7 @@
+ #ifdef ACTUAL_DMA_SYSTEM
+     bool        cpu_writes = false;
+     bool        ds_priority = false;
++    uint32_t    write_tail_pause = 0;
+     std::string trace_path;
+     std::string read_admit = "none";
+     uint32_t    read_budget = 256;
+@@ -2348,6 +2411,7 @@
+ #ifdef ACTUAL_DMA_SYSTEM
+         if (const char* v = val("cpu-writes")) cpu_writes = (std::strtoul(v, nullptr, 0) != 0);
+         if (const char* v = val("ds-priority")) ds_priority = (std::strtoul(v, nullptr, 0) != 0);
++        if (const char* v = val("write-tail-pause")) write_tail_pause = (uint32_t)std::strtoul(v, nullptr, 0);
+         if (const char* v = val("event-trace")) trace_path = v;
+         if (const char* v = val("read-admit"))  read_admit = v;
+         if (const char* v = val("read-budget")) read_budget = (uint32_t)std::strtoul(v, nullptr, 0);
+@@ -2452,6 +2516,7 @@
+ #ifdef ACTUAL_DMA_SYSTEM
+         tb.cpu_writes      = cpu_writes;
+         tb.ds_priority     = ds_priority;
++        tb.write_tail_pause = write_tail_pause;
+         tb.read_admit_mode_str = read_admit;
+         tb.read_admit_mode_val = read_admit_val;
+         tb.read_admit_measure_only = read_admit_measure_only;
+--- a/tests/nonblock_completion_pool_late.sv
++++ b/tests/nonblock_completion_pool_late.sv
+@@ -7,6 +7,8 @@
+     parameter bit InterleaveAwEnable = 1'b0,
+     parameter int unsigned InterleaveAwDelay = 64,
+     parameter bit SourceReadGateEnable = 1'b0,
++    parameter bit FrontierEnable = 1'b0,
++    parameter bit FrontierScanEnable = 1'b1,
+     parameter type req_t = logic,
+     parameter type rsp_t = logic,
+     parameter type ar_t = logic,
+@@ -35,6 +37,8 @@
+     output logic [1:0] completion_ar_admit_o,
+     output logic [31:0] occupancy_o, reserved_o, busy_o, fault_o,
+     output logic [31:0] grant_pool_o, grant_stream_o,
++    output logic [31:0] grant_frontier_o,
++    output logic [31:0] frontier_wait_o,
+     output logic [31:0] received_o, replayed_o, highwater_o,
+     output logic [31:0] meta_accepted_o, meta_early_o, meta_highwater_o, queued_o,
+     output logic [31:0] grant_future_o, aw_fixture_stall_o
+@@ -61,6 +65,9 @@
+     logic rr_q;
+     logic [1:0] meta_in, grant, grant_stream, can_stream, r_in, r_out;
+     logic [1:0] can_future, grant_future;
++    logic [1:0] can_frontier, grant_frontier;
++    logic [1:0] frontier_wait_next;
++    logic frontier_q [2][Depth];
+     logic [31:0] front_aw_count_q [2];
+     logic [31:0] front_age_q [2];
+     logic [1:0] aw_released_q, aw_front_fire, aw_fixture_block, aw_wait_q;
+@@ -79,6 +86,7 @@
+     initial begin
+         if (!((Mode == 4 || Mode == 6 || Mode == 7) && Slots == 1 || Mode == 5 && Slots == 2))
+             $fatal(1, "late pool supports Mode4,6,7/1slot or Mode5/2slots only");
++        if (FrontierEnable && Mode != 7) $fatal(1, "frontier PoC supports ordinary no-pool Mode7 only");
+         // Mode7 ordinary write-prefix gate never reserves or accesses a slot.
+         // Slots=1 is only an inactive array dimension; report active slots=0.
+     end
+@@ -119,6 +127,8 @@
+         logic [31:0] target;
+         target = target_wseq_q[b][n];
+         stream_safe = can_drain(b, metadata[b][n]);
++        if (frontier_q[b][n])
++            stream_safe = frontier_drain(b, metadata[b][n], FrontierScanEnable);
+         if (future_q[b][n])
+             stream_safe = target > 0 && job_active_q[b] &&
+                 v_whead_valid_i && v_whead_bank_i == 1'(b) &&
+@@ -126,6 +136,36 @@
+                 (vw_done_q[b] == target - 1 || vw_done_q[b] == target) &&
+                 (pw_done_q[b] == target - 1 || pw_done_q[b] == target) &&
+                 paw_count_q[b] > target;
++    endfunction
++
++    // Test-only independent condition: every physical W predecessor of the
++    // target has received its entire payload at virtual WLAST. Such writes
++    // can drain without any further source R, even while they own physical W.
++    // Counters belong to the one active normal job per source. The original
++    // FIFO and prepared-AW observations retain their actual handshake order.
++    function automatic logic frontier_drain(input integer b, input ar_t ar, input logic check_prefix);
++        integer n, d;
++        logic prefix_ready, found;
++        logic [31:0] seq [2];
++        n = integer'(vw_done_q[b]);
++        frontier_drain = 1'b0;
++        prefix_ready = 1'b1; found = 1'b0;
++        seq[0] = pw_done_q[0]; seq[1] = pw_done_q[1];
++        for (int k = 0; k < Depth; k++) begin
++            if (k < integer'(p_count_q) && !found) begin
++                d = integer'(p_order_q[3'(p_rd_q + k)]);
++                if (d == b && seq[d] == vw_done_q[b]) found = 1'b1;
++                else if (vw_done_q[d] <= seq[d]) prefix_ready = 1'b0;
++                seq[d]++;
++            end
++        end
++        if (Mode == 7 && job_active_q[b] && n < Depth &&
++            aw_count_q[b] > vw_done_q[b] && paw_count_q[b] > vw_done_q[b] &&
++            v_whead_valid_i && v_whead_bank_i == 1'(b) && (!check_prefix || (found && prefix_ready)) &&
++            ar.addr >= src_q[b] && aw_addr_q[b][n] >= dst_q[b])
++            frontier_drain = (ar.addr - src_q[b]) == (aw_addr_q[b][n] - dst_q[b]) &&
++                ar.len == aw_len_q[b][n] && ar.size == aw_size_q[b][n] &&
++                ar.burst == 2'b01 && ar.size == 3'd3;
+     endfunction
+ 
+     always_comb begin
+@@ -144,6 +184,8 @@
+             can_stream[b] = launch_seq_q[b] == tx_seq_q[b] &&
+                 can_drain(b, metadata[b][li[b]]);
+             can_future[b] = future_drain(b, metadata[b][li[b]]);
++            can_frontier[b] = launch_seq_q[b] == tx_seq_q[b] &&
++                frontier_drain(b, metadata[b][li[b]], FrontierScanEnable);
+             for (int n = 0; n < Depth; n++) begin
+                 if (valid_q[b][n] && pool_q[b][n]) begin
+                     used[slot_q[b][n]] = 1'b1;
+@@ -155,16 +197,18 @@
+         grant = '0;
+         grant_stream = '0;
+         grant_future = '0;
++        grant_frontier = '0;
+         grant_slot[0] = 0;
+         grant_slot[1] = 0;
+         for (int k = 0; k < 2; k++) begin
+             int b;
+             b = (integer'(rr_q) + k) % 2;
+             if (!armed_q[b] && completion_ar_valid_i[b] && req_seq_q[b] > launch_seq_q[b]) begin
+-                if (Mode != 5 && (can_stream[b] || can_future[b])) begin
++                if (Mode != 5 && (can_stream[b] || can_future[b] || (FrontierEnable && can_frontier[b]))) begin
+                     grant[b] = 1'b1;
+                     grant_stream[b] = 1'b1;
+                     grant_future[b] = can_future[b];
++                    grant_frontier[b] = FrontierEnable && can_frontier[b] && !can_stream[b] && !can_future[b];
+                 end else if (Mode == 5) begin
+                     // Safe ordinary full-response baseline: one slot/DMA.
+                     if (!used[b]) begin
+@@ -182,6 +226,15 @@
+                     end
+                 end
+             end
++        end
++        // Count the additional eligible set even when FrontierEnable=0.
++        // Admission and the counter do not depend on one another.
++        frontier_wait_next = '0;
++        for (int fb = 0; fb < 2; fb++) begin
++            if (can_frontier[fb] &&
++                !can_stream[fb] && !can_future[fb] && !armed_q[fb] &&
++                completion_ar_valid_i[fb] && req_seq_q[fb] > launch_seq_q[fb])
++                frontier_wait_next[fb] = 1'b1;
+         end
+     end
+ 
+@@ -252,6 +305,8 @@
+             rr_q <= 1'b0;
+             fault_o <= 0;
+             grant_pool_o <= 0;
++            grant_frontier_o <= 0;
++            frontier_wait_o <= 0;
+             grant_stream_o <= 0;
+             received_o <= 0;
+             replayed_o <= 0;
+@@ -284,6 +339,7 @@
+                     valid_q[b][n] <= 1'b0; pool_q[b][n] <= 1'b0;
+                     replay_started_q[b][n] <= 1'b0;
+                     future_q[b][n] <= 1'b0; target_wseq_q[b][n] <= 0;
++                    frontier_q[b][n] <= 1'b0;
+                     slot_q[b][n] <= 0;
+                     rx_q[b][n] <= 0; tx_q[b][n] <= 0; count_q[b][n] <= 0;
+                     wr_q[b][n] <= 0; rd_q[b][n] <= 0;
+@@ -291,6 +347,8 @@
+                 end
+             end
+         end else begin
++            grant_frontier_o <= grant_frontier_o + 32'(grant_frontier[0]) + 32'(grant_frontier[1]);
++            frontier_wait_o <= frontier_wait_o + 32'(frontier_wait_next[0]) + 32'(frontier_wait_next[1]);
+             aw_fixture_stall_o <= aw_fixture_stall_o +
+                 32'(aw_fixture_block[0] && s_req_i[0].aw_valid) +
+                 32'(aw_fixture_block[1] && s_req_i[1].aw_valid);
+@@ -377,6 +435,7 @@
+                     pool_q[b][req_seq_q[b][2:0]] <= 1'b0;
+                     replay_started_q[b][req_seq_q[b][2:0]] <= 1'b0;
+                     future_q[b][req_seq_q[b][2:0]] <= 1'b0;
++                    frontier_q[b][req_seq_q[b][2:0]] <= 1'b0;
+                     count_q[b][req_seq_q[b][2:0]] <= 0;
+                     rx_q[b][req_seq_q[b][2:0]] <= 0; tx_q[b][req_seq_q[b][2:0]] <= 0;
+                     wr_q[b][req_seq_q[b][2:0]] <= 0; rd_q[b][req_seq_q[b][2:0]] <= 0;
+@@ -387,9 +446,12 @@
+                         fault_o[11] <= 1'b1;
+                 end
+                 if (grant[b]) begin
++                    if (grant_frontier[b] && !frontier_drain(b, metadata[b][li[b]], 1'b1))
++                        fault_o[16] <= 1'b1; // Simple rule must still have the full-prefix witness.
+                     armed_q[b] <= 1'b1;
+                     pool_q[b][li[b]] <= !grant_stream[b];
+                     future_q[b][li[b]] <= grant_future[b];
++                    frontier_q[b][li[b]] <= grant_frontier[b];
+                     target_wseq_q[b][li[b]] <= launch_seq_q[b];
+                     slot_q[b][li[b]] <= grant_slot[b];
+                     physical_ar_addr_q[b] <= completion_ar_addr_i[b];
+--- a/tests/nonblock_actual_dma_top.sv
++++ b/tests/nonblock_actual_dma_top.sv
+@@ -52,6 +52,8 @@
+     parameter bit SameBankDmasEnable = 0,
+     parameter bit ReverseReadOrderEnable = 0,
+     parameter bit SourceReadGateEnable = 0,
++    parameter bit FrontierEnable = 0,
++    parameter bit FrontierScanEnable = 1,
+     parameter int unsigned HeaderParkMode = 0,
+     parameter int unsigned HeaderParkDepth = 2,
+     parameter bit HeaderDirectEnable = 1,
+@@ -213,6 +215,8 @@
+     output logic [31:0] dbg_hp_parked, dbg_hp_bypassed, dbg_hp_full_bypass,
+     output logic [31:0] dbg_hp_highwater, dbg_hp_queued, dbg_hp_dispatched,
+     output logic [31:0] dbg_e2_ar_fixture_stall,
++    output logic [31:0] dbg_frontier_grant,
++    output logic [31:0] dbg_frontier_wait,
+     output logic [31:0] dbg_e2_meta_accepted,
+     output logic [31:0] dbg_e2_meta_early,
+     output logic [31:0] dbg_e2_meta_highwater,
+@@ -564,6 +568,8 @@
+         assign dbg_e2_highwater = 0;
+         assign late_comp_ar_admit = '0;
+         assign dbg_e2_aw_fixture_stall = 0;
++        assign dbg_frontier_grant = 0;
++        assign dbg_frontier_wait = 0;
+         assign dbg_e2_grant_future = 0;
+         assign dbg_e2_meta_accepted = 0;
+         assign dbg_e2_meta_early = 0;
+@@ -572,6 +578,8 @@
+     end else if (SharedPoolMode < 4) begin : gen_pool
+         assign late_comp_ar_admit = '0;
+         assign dbg_e2_aw_fixture_stall = 0;
++        assign dbg_frontier_grant = 0;
++        assign dbg_frontier_wait = 0;
+         assign dbg_e2_grant_future = 0;
+         assign dbg_e2_meta_accepted = 0;
+         assign dbg_e2_meta_early = 0;
+@@ -619,6 +627,8 @@
+             .InterleaveAwEnable(InterleaveAwEnable),
+             .InterleaveAwDelay(InterleaveAwDelay),
+             .SourceReadGateEnable(SourceReadGateEnable),
++            .FrontierEnable(FrontierEnable),
++            .FrontierScanEnable(FrontierScanEnable),
+             .req_t(axi_tr2_req_t), .rsp_t(axi_tr2_resp_t),
+             .ar_t(axi_tr2_ar_chan_t), .r_t(axi_tr2_r_chan_t)
+         ) i_pool (
+@@ -659,6 +669,8 @@
+             .received_o(dbg_e2_received), .replayed_o(dbg_e2_replayed),
+             .highwater_o(dbg_e2_highwater),
+             .grant_future_o(dbg_e2_grant_future), .aw_fixture_stall_o(dbg_e2_aw_fixture_stall),
++            .grant_frontier_o(dbg_frontier_grant),
++            .frontier_wait_o(dbg_frontier_wait),
+             .meta_accepted_o(dbg_e2_meta_accepted), .meta_early_o(dbg_e2_meta_early),
+             .meta_highwater_o(dbg_e2_meta_highwater), .queued_o(dbg_e2_queued)
+         );
+--- a/tests/nonblock_actual_dma_system_top.sv
++++ b/tests/nonblock_actual_dma_system_top.sv
+@@ -83,6 +83,8 @@
+     parameter bit SameBankDmasEnable = 0,
+     parameter bit ReverseReadOrderEnable = 0,
+     parameter bit SourceReadGateEnable = 0,
++    parameter bit FrontierEnable = 0,
++    parameter bit FrontierScanEnable = 1,
+     parameter int unsigned HeaderParkMode = 0,
+     parameter int unsigned HeaderParkDepth = 2,
+     parameter bit HeaderDirectEnable = 1,
+@@ -204,6 +206,8 @@
+     output logic [31:0] dbg_hp_parked, dbg_hp_bypassed, dbg_hp_full_bypass,
+     output logic [31:0] dbg_hp_highwater, dbg_hp_queued, dbg_hp_dispatched,
+     output logic [31:0] dbg_e2_ar_fixture_stall,
++    output logic [31:0] dbg_frontier_grant,
++    output logic [31:0] dbg_frontier_wait,
+     output logic [31:0] dbg_e2_meta_accepted,
+     output logic [31:0] dbg_e2_meta_early,
+     output logic [31:0] dbg_e2_meta_highwater,
+@@ -1101,6 +1105,8 @@
+         .SameBankDmasEnable(SameBankDmasEnable),
+         .ReverseReadOrderEnable(ReverseReadOrderEnable),
+         .SourceReadGateEnable(SourceReadGateEnable),
++        .FrontierEnable(FrontierEnable),
++        .FrontierScanEnable(FrontierScanEnable),
+         .HeaderParkMode(HeaderParkMode), .HeaderParkDepth(HeaderParkDepth),
+         .HeaderDirectEnable(HeaderDirectEnable),
+         .PoolSlots           (PoolSlots)
+@@ -1133,6 +1139,8 @@
+         .dbg_hp_full_bypass(dbg_hp_full_bypass), .dbg_hp_highwater(dbg_hp_highwater),
+         .dbg_hp_queued(dbg_hp_queued), .dbg_hp_dispatched(dbg_hp_dispatched),
+         .dbg_e2_ar_fixture_stall(dbg_e2_ar_fixture_stall),
++        .dbg_frontier_grant(dbg_frontier_grant),
++        .dbg_frontier_wait(dbg_frontier_wait),
+         .dbg_e2_meta_accepted (dbg_e2_meta_accepted),
+         .dbg_e2_meta_early (dbg_e2_meta_early),
+         .dbg_e2_meta_highwater (dbg_e2_meta_highwater),

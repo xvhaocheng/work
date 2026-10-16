@@ -1,0 +1,433 @@
+# Round 3 重构：DeepSeek 回应、砍方向与可执行最小实现
+
+> 说明：以下所有实现、寄存器、ioctl、RTL 连接均为**未编译、未上板的提案**，不是已通过测试的结果。定向检索提示中 rIOMMU、Price of Safety 2007、Overcoming IOTLB wall 2023、ShareMMU、SP-IMPact 均未全文核查，只作“待查/削弱新颖性”使用。本文不新增无限路线，只保留 **1 主 + 1 后备**。
+
+---
+
+## 0. 导航摘要
+
+| 类别 | 方案 | 一句话 RQ | 下一步定位 | 失败即停条件 |
+|---|---|---|---|---|
+| **主 A** | 同 BIT 四模式 S/N/P/P+N：缓存保护 × 命中先服务 | 连续热 V 是否掩盖了容量保护/替换风险？P 与 N 各自解决什么等待，P+N 在何种 V 节奏下才有增量？ | **廉价可行性证据，不是论文许诺**。先证明同 BIT 模式切换、P 真实减少首次 miss、N 真实推进合法 hit；若只复述缓存常识则停方法主张 | 不能同 BIT 安全切换；P 不改变首次 miss/替换来源；N 不改变真实 fast 服务；P+N 无超出配对散度的增量；只在一个方向/场景复现 |
+| **后备 B** | 选择性 A 域失效的跨域服务影响 | 在 V 映射保持有效时，合法 A 域选择性失效/排空是否独立造成 V 服务暂停，而不是空命令软件开销或诱发 walk？ | **仅作后备，先只读确认接口**。已有 invalidation 成本研究，新颖性弱，只能争负面边界 | 无选择性失效接口、必须全局失效、空命令复现同量延迟、只能看到 ioctl 开销、无法观测 quiet/outstanding |
+
+**立即实现顺序：**
+1. 只读确认实际 RTL/Linux 接口：`nonblock_enable_i`、`banked_ctl in_flight_o/e3.quiet`、`TL ptw_active`、DMA quiet、IOTLB 容量、当前失效 ABI。
+2. 实现主 A 的单 BIT 四模式寄存器、静止边界切换、合法 flush、generation、最小计数器。
+3. 编译 BIT + Linux 驱动/工具，上板做正确性和 E2 式前缀+探测。
+4. 只有 P 能改变首次 miss/替换来源、N 能改变真实 fast 服务，才进入配对 ABAB 性能比较。
+5. 主 A 过不了机制验收，就不进入大性能表；后备 B 只做 Linux 只读/空命令对照。
+
+**明确删除：** C2 epoch 映射生命周期、C3 独立可观测性论文、C4 有界翻译服务、R2 上游仲裁主线、R3 共享匹配域独立路线、R4 前端 vs 出口反压、七臂 baseline 矩阵、任意 2%/5%/10% 统计阈值、无限增加仪器。
+
+---
+
+## 1. 对 Codex Round3 纠错的审查
+
+Codex Round3 的多数纠错合理，但需要加“门禁”而非直接当结论。
+
+| Codex 纠错 | 裁决 | 理由 |
+|---|---|---|
+| “尚未实现同 BIT 开关是要实现的前置，不是实验设计自相矛盾” | **合理，但必须是 gate** | Round2 把它写成“阻断/自相矛盾”过强；但“存在 `nonblock_enable_i`”不等于同一 BIT 内行为等价于 S、资源不变、切换安全。必须先编译验证。依据：`round3-codex-reconstruction.md:6,29` |
+| “V 小工作集仍可被 A 替换，E2 已有直接证据” | **合理，撤回 B2 的过强措辞** | Round2 说“结构性不可能”错误。E2 已有 128 target 中 62 替换后 firstmiss、66 保持 hit。依据：`round2-deepseek.md:18`；`out/method88-execution-20261004/RESULTS.md:94`。应改为：小工作集是否非退化必须由 E2 式前缀+探测和条目状态证明，不能假设。 |
+| “三个样本极差不是噪声下界或 MDE，不能把 2%/5%/10% 定为论文判据” | **合理，撤回任意阈值** | A8 三轮 104.263/92.987/93.048 MiB/s 是变异警告，不是噪声底。依据：`round2-deepseek.md:19`；`out/n-prototype-20261004/analysis-v5-pilot/RESULTS_REVIEW.md:151`。正确做法是先测配对 S/S 散度，再冻结 MDE；不能编造统计阈值。 |
+| “专利隐含研究交互不能替代实验文献证据；SP-IMPact 示例排除 MBR” | **合理** | 不能用“专利已披露要素”推“交互已被实验研究”。SP-IMPact 提供组合框架但示例评价排除 MBR，不能宣称空白。依据：`round2-deepseek.md:65-69`；`round3-codex-reconstruction.md:9` |
+| “每路线最多一个因子两水平是人为规则；2×2 需两个因子” | **合理** | Round2 自罚过度。主 A 的 P×N 就是 2×2，两个因子两水平。关键是每格问题明确，且矩阵不膨胀。依据：`round3-codex-reconstruction.md:10` |
+| “`nonblock_enable_i` 已存在，外围连 `IOMMUNonblockMode==2`” | **部分合理** | 信号存在可减少重造 N 的工作，但不能证明同 BIT 行为等价、资源不变、可安全切换。必须做模式读回、flush 后无跨区污染、S/N 机制计数验收。依据：`round3-codex-reconstruction.md:6,29` |
+| “rIOMMU/Price of Safety/Overcoming IOTLB wall 已涉失效成本” | **进一步削弱后备 B** | 失效成本本身不能当新。B 只能争“合法 A 域选择性失效在 V 映射不变时仍造成跨域服务暂停”的边界，且必须先过空命令对照。 |
+
+**对 Codex 主 A 的直接审查：**  
+主 A 的机制组件 P 和 N 本身都是已知技术：P 是 cache partition/coloring，N 是 hit-under-miss/non-blocking。把二者组合，只有在给出**非平凡、可预注册、带条目级证据的交互边界**时才有贡献。按当前写法，主 A 有很大概率只是在 IOMMU 上复述缓存常识。因此下一步必须定位为“廉价可行性证据 + kill/continue 门禁”，不能许诺论文。
+
+---
+
+## 2. 主方案 A：同 BIT 四模式 S/N/P/P+N
+
+### 2.1 具体可检验问题
+
+在四 DMA 共享 RISC-V IOMMU 的同一 BIT、同一 boot、同一固定硬件工作量下：
+
+1. **替换问题：** 静态 8/8 保护 P 是否真实减少 V 的首次 miss/替换来源，而不只是改变 lookup 路径？
+2. **命中服务问题：** N 是否真实让合法 hit 在 A miss/PTW 未完成时前进，表现为真实 fast accepted service，而非仅计数增加？
+3. **组合问题：** P+N 是否优于 max(P,N)？如果 P 保护 V 条目、N 让 hit 前进，二者是否互补，还是把等待移动到同一单 FSM/单响应口？
+4. **节奏问题：** 连续热 V 下的阴性是否外推到间歇 V？V 两次访问之间 A 插入的翻译工作集是否决定 P 的收益？
+
+### 2.2 假设
+
+- **H1（可证伪）：** P 的收益取决于 V 两次访问之间 A 插入的翻译工作集，而不只是 V/A 静态页数；连续热 V 会降低首次 miss 的可观察性，但不等于替换不存在。
+- **H2（可证伪）：** 同 BIT 下 N 让 hit 前进，P 减少替换；对自然间歇 V，若 P+N 优于单项，必须同时看到 V 条目存活改善和真实快速服务事件；若无增量，保留阴性。
+- **H0：** P 和 N 的效应可由总容量、PLRU、普通缓存竞争和已知 hit-under-miss 完全解释；无 IOMMU 特定交互边界。
+
+### 2.3 真正可能的新贡献 vs 已知机制
+
+**已知，不能称新：**
+- hit-under-miss、non-blocking cache/MSHR、fast hit 服务；
+- cache partition/coloring、静态容量分配、PLRU 替换；
+- token bucket、QoS 优先级、老化、分区；
+- IOTLB 失效成本、TLB shootdown、IOMMU invalidation 开销；
+- 预取、驻留、映射生命周期管理。
+
+**唯一可能的新贡献候选，且很弱：**
+- 不是 P/N 机制本身，而是：在 RISC-V IOMMU 的 IOTLB tag 实际按 PSCID/GSCID/global/stage 匹配、update 不含 DID 的结构下，**按稳定 DID 做 8/8 分配是否真的保护了实际匹配域**；以及 **N 的 hit 服务与 P 的替换保护是否在同一单 FSM/单响应口下互补**。
+- 但 ShareMMU 已研究跨不可信加速器共享翻译/TLB 侧信道，SP-IMPact 已组合 cache coloring 与带宽预留；所以这最多是设计空间/表征/负面边界，不是新机制。依据：`round2-codex-attack.md:13,19`；`round3-codex-reconstruction.md:9`。
+- **结论：主 A 默认按“缓存常识复述”处理。** 若实验结果只说明“冲突时保护有用、hit-under-miss 有用、组合最好”，则停止论文方法主张，只留工程表征或阴性。
+
+### 2.4 必要最小实现
+
+#### RTL 最小改动
+
+**模式定义：**
+- `00` = S：现有串行，N off，P off；
+- `01` = N：N on，P off；
+- `10` = P：N off，P on，8/8 静态；
+- `11` = P+N：N on，P on。
+
+**关键接口提案：**
+
+```verilog
+// rv_iommu_top.sv / 外围顶层
+input  [1:0] iommu_mode_i,        // 0 S, 1 N, 2 P, 3 P+N
+input  [7:0] part_did_i,          // 最小实验只用两个 DID：DID0=A, DID1=V
+output [1:0] iommu_mode_o,
+output [7:0] iommu_mode_generation_o
+```
+
+```verilog
+// rv_iommu_iotlb.sv
+input  [1:0] iommu_mode_i,
+input  [7:0] alloc_owner_did_i,   // 必须来自真实主查表请求的稳定 did，不能拿 TL 当拍探测 did
+input       alloc_owner_valid_i
+```
+
+**N 门控：**
+- 把新模式的 bit0 独立接到现有 `nonblock_enable_i`；
+- 不能伪装旧 role2，不能放宽旧 validator。依据：`round3-codex-reconstruction.md:29`。
+
+```verilog
+wire nonblock_enable = iommu_mode_i[0]; // 新控制 ABI 独立识别
+```
+
+**P 的 8/8 最小分配：**
+- 只在 PLRU 选择根处限制到对应半树，子树 PLRU 保留；
+- 共享模式仍原树；
+- 最小实验只支持 DID0/DID1 两个活跃 DID；若有其他 DID 活跃，P 必须禁用或扩成显式 `part_did_i`；
+- 不得改变权限匹配、PSCID/GSCID/global/stage 匹配、失效语义。
+
+```verilog
+wire part_en   = iommu_mode_i[1];
+wire owner_part = alloc_owner_did_i[0]; // 仅当实验保证只有 DID0/DID1 活跃
+// part_en 时，victim/allocate 搜索限制到 owner_part 对应的 8 项半树
+// part_en=0 时，使用原 16 项全相联 PLRU
+```
+
+**静止切换与合法 flush：**
+- 模式只能在 DMA 与翻译全静止时改变；
+- 不能只信 CPU idle；必须检查 `banked_ctl in_flight_o/e3.quiet`、`TL ptw_active`、`research_dma_quiet`，并完整检查 fast pending/response/backpressure。依据：`round3-codex-reconstruction.md:28`。
+
+```verilog
+wire fast_quiescent = (fast_pending == 0) &&
+                      (fast_resp_pending == 0) &&
+                      !fast_backpressure;
+
+wire mode_switch_ok = (banked_ctl_in_flight_o == 0) &&
+                      e3_quiet &&
+                      (tl_ptw_active == 0) &&
+                      research_dma_quiet &&
+                      fast_quiescent;
+
+always @(posedge clk) begin
+  if (mode_write_req && mode_switch_ok) begin
+    iommu_mode_q            <= next_mode;
+    iommu_mode_generation_q <= iommu_mode_generation_q + 1;
+    iotlb_flush_req         <= 1'b1; // 合法 flush；不改变权限匹配
+  end
+end
+```
+
+**最小观测，不再无限加仪器：**
+- 真实翻译身份归属的 lookup、首次 miss、PTW 事件；
+- fast accepted service 事件，不是 hit rate；
+- V 总完成时间、同窗 A 有效字节；
+- mode、generation、switch 成功/失败；
+- 旧无效 HPM 不复用。依据：`round3-codex-reconstruction.md:19`。
+
+```verilog
+// dma_nonblock_observer.sv 最小扩展
+// identity 来自真实主查表请求：{did, pscid/gscid, iova, stage}
+if (lookup_valid && lookup_by_identity) begin
+  lookup_cnt        <= lookup_cnt + 1;
+  if (lookup_first_miss) first_miss_cnt <= first_miss_cnt + 1;
+end
+if (ptw_req_valid)        ptw_cnt        <= ptw_cnt + 1;
+if (fast_accept)          fast_accept_cnt <= fast_accept_cnt + 1;
+```
+
+#### Linux 最小改动
+
+**头文件提案：**
+
+```c
+/* linux/drivers/misc/idma_research.h */
+#define IDMA_IOMMU_MODE_S   0u
+#define IDMA_IOMMU_MODE_N   1u
+#define IDMA_IOMMU_MODE_P   2u
+#define IDMA_IOMMU_MODE_PN  3u
+
+struct idma_iommu_mode_req {
+    __u32 mode;
+    __u32 flags;
+    __u64 generation;
+};
+
+#define IDMA_IOCTL_IOMMU_MODE _IOWR('i', 0x21, struct idma_iommu_mode_req)
+```
+
+**ioctl 处理提案：**
+
+```c
+/* linux/drivers/misc/idma.c */
+static long idma_ioctl_iommu_mode(struct idma_file *f, void __user *arg)
+{
+    struct idma_iommu_mode_req req;
+
+    if (copy_from_user(&req, arg, sizeof(req)))
+        return -EFAULT;
+    if (req.mode > IDMA_IOMMU_MODE_PN)
+        return -EINVAL;
+
+    if (idma_iommu_wait_hw_quiescent(f))  /* 读 RTL quiet，不是 CPU idle */
+        return -EBUSY;
+
+    idma_iommu_write_mode(f, req.mode);
+    idma_iommu_legal_flush(f);            /* 合法失效旧缓存 */
+    req.generation = idma_iommu_read_generation(f);
+
+    if (copy_to_user(arg, &req, sizeof(req)))
+        return -EFAULT;
+    return 0;
+}
+```
+
+**编译/部署交付物：**
+- 新 BIT：含四模式、P 半树限制、N 独立门控、最小观测；
+- 新 Linux 驱动/工具：模式设置、静止等待、合法 flush、generation 读回；
+- 一次 SD 更新装入新驱动/工具/冻结计划是可接受的，但必须实际完成编译并提供可执行产物。依据：`round3-codex-reconstruction.md:30`；
+- 保留当前读接纳 4 KiB 限定，不扩展安全证明。依据：`round3-codex-reconstruction.md:17`。
+
+### 2.5 最少对照
+
+**主表只保留四模式：S / N / P / P+N。** 原版只列整体开销锚，暂不加七种策略、限速、Pareto。依据：`round3-codex-reconstruction.md:20`。
+
+**场景：**
+- 连续热 V：V 反复访问同一对源/目的页；
+- 间歇 V：预注册的硬件 gap；若现有硬件 gap 不能安全复用，则先做 E2 式前缀+探测，不用软件睡眠伪造硬件到达规律。依据：`round3-codex-reconstruction.md:18`。
+
+**控制：**
+- 同一 BIT、同一 boot、同一仪器、同一时钟、同一完整 4 KiB copy 动点；
+- A 工作集、A 总完成工作、V 固定工作量固定；
+- 不用“不同 V 窗口 A 字节”直接比较；A 进度用同一 V 硬件窗口内有效完成字节。依据：`round2-deepseek.md:299`；`RESULTS_REVIEW.md:115,136`；
+- 双 DMA 方向作为验证条件，不作新因子；
+- CPU-only 不进入主表。
+
+### 2.6 指标
+
+- **主：** V 端到端固定工作完成时间，包括准入等待；
+- **A：** 同一 V 硬件窗口内有效完成字节、总 A 完成时间；
+- **机制：** 按真实翻译身份归属的首次 miss、PTW、条目存活/替换来源、fast accepted service 事件；
+- **资源：** LUT/FF/BRAM/Fmax，boot id，Linux 版本；
+- fast 计数不是 hit rate，旧 HPM 不作证据。依据：`RESULTS_REVIEW.md:170-181,214-224`。
+
+### 2.7 预注册条件
+
+1. **主比较：P+N vs max(P,N)。** 若 P+N 不超过配对散度，停止“组合必要”主张。
+2. **机制门禁：** P 必须改变 V 首次 miss/替换来源；N 必须改变真实 fast 服务；否则不进入性能论文主张。
+3. **重复设计：** 单 BIT、单 boot 内配对 ABAB；预注册至少 5 个配对块作为工程重复，全样本保留；分别报告启动内/启动间变化。n≥5 不是显著性，是工程最小重复；若配对 S/S 散度更大，先增块再比较。
+4. **MDE 冻结：** 先测同条件 S/S 配对散度，冻结数值后再比较 P/N。**不预设 2%/5%/10% 为论文判据。**
+5. **场景预注册：** 连续热 V 与间歇 V 都预先指定；若只在一种场景有效，不得外推“连续热 V 掩盖风险”。
+6. **安全预注册：** 模式只在硬件静止边界切换；切换后合法 flush；若跨区旧条目残留或权限匹配改变，立即停。
+
+### 2.8 停止条件
+
+- 不能实现同 BIT 安全切换，或切换必须重建 BIT；
+- flush 后仍有跨区污染，或模式切换改变权限/匹配语义；
+- P 不改变首次 miss/替换来源，N 不改变真实 fast 服务；
+- P+N 无超出配对散度的增量；
+- 只在单一方向/单一场景复现；
+- 结论只复述“冲突时缓存保护有用、hit-under-miss 有用”的缓存常识；
+- 任何一项成立，停止主 A 论文方法主张，不继续加仪器。
+
+### 2.9 验收检查
+
+- 编译产出 bitstream 和 Linux 模块，记录 hash、boot id、Linux 版本；
+- `IDMA_IOCTL_IOMMU_MODE` 读回 mode/generation；
+- 四模式各自通过正确性/保护条目验收；
+- P 模式下预热 V、A 填充、完全排空、V 首次探测，能看到条目存活/首次 miss 与共享模式不同；
+- N 模式下 A long PTW 期间 V 合法 hit 有真实 fast 服务事件；
+- 保留 4 KiB 读接纳限定；
+- 所有原始日志、配对块、失败样本保留。
+
+---
+
+## 3. 后备方案 B：选择性 A 域失效的跨域服务影响
+
+### 3.1 具体可检验问题
+
+在 V 映射始终有效的条件下，合法 A 域选择性失效/fence 是否独立增加 V 的完成时间或服务暂停？该暂停来自：
+- 空命令/ioctl 软件路径；
+- CQ/fence 排空与 outstanding；
+- 失效诱发的 A walk 间接竞争；
+- 还是单 FSM/单响应口的跨域传播？
+
+### 3.2 假设
+
+- **H1：** 同等次数空命令不产生同量 V 暂停；
+- **H2：** 合法 A 域选择性失效的 V 暂停随失效范围/outstanding 排空变化，且 V 映射未被失效；
+- **H3：** 若暂停与诱发 walk 计数同步，则属间接竞争，不是失效生命周期独立效应；
+- **H0：** 效应等于 Linux 软件/ioctl 开销，或必须全局失效才能看到；B 死。
+
+### 3.3 新颖性边界
+
+**已知，不能称新：**
+- IOTLB invalidation 成本；
+- CPU TLB shootdown 与 IOMMU shootdown 类比；
+- rIOMMU 已按环形 buffer 用 flat 表/隐式失效减少显式失效；
+- Overcoming IOTLB wall 2023 已研究 IOTLB invalidation 成本；
+- Price of Safety 2007 已涉安全/性能代价。
+
+因此 B 不能把“失效会慢”当新。唯一可能边界是：**合法 A 域选择性失效、V 映射不变时，仍因单 FSM/outstanding 排空造成 V 服务暂停，且空命令不能复现。** 这仍是负面/设计空间候选，不是新机制。依据：`round3-codex-reconstruction.md:23`；`round2-deepseek.md:197,200`。
+
+### 3.4 最小实现
+
+**第一步只读确认：**
+- 当前 Linux 驱动是否有可控、合法的 A 域选择性 invalidation/fence/context update；
+- 若只有全局 flush，B 立即停，因为会破坏 V 映射。依据：`round1-deepseek.md:327`。
+
+**Linux-only 最小实现：**
+- 在 `linux/drivers/misc/idma.c`、`idma_research.h` 增加两个等路径 ioctl：
+  - no-op/空命令，同次数、同 CPU 路径；
+  - 合法 A 域选择性失效；
+- 记录命令类型、范围、quiet、outstanding、诱发 walk、V 首次 miss/hit、V 完成时间、ioctl 软件时间。
+
+**仅当观测不足才加 RTL：**
+- `rv_iommu_iotlb.sv`、`rv_iommu_trans_ctl_wrap.sv`、`dma_nonblock_observer.sv` 导出失效命令类型/范围、quiet、outstanding、诱发 walk；
+- 不新造第二条大硬件机制。依据：`round3-codex-reconstruction.md:23`。
+
+### 3.5 最少对照
+
+- 无命令；
+- 空命令，同次数；
+- 合法 A 域选择性失效，V 映射不变；
+- 全局 flush 只作非法对照，不作基线；
+- A 同窗有效字节、V 固定工作量；
+- CPU-only 软件开销单独测。
+
+### 3.6 预注册与停止
+
+**预注册：**
+- 先过“选择性接口存在”门禁；
+- 空命令若复现同量 V 暂停，停止，判纯软件开销；
+- 若只有 ioctl 时间变化，停止；
+- 若真实失效有效应，预注册范围/outstanding 单调性；
+- 所有命令次数、顺序、CPU 负载记录。
+
+**停止：**
+- 无选择性失效接口；
+- 必须全局失效；
+- 空命令复现；
+- 无法把软件发起与硬件 quiet 分开；
+- 效应只在诱发 walk 上，说明是普通竞争；
+- 跨 boot/BIT 不可复现；
+- 任何一项成立，B 停，不进入下一批 RTL。
+
+---
+
+## 4. 明确删除及理由
+
+| 删除项 | 理由 |
+|---|---|
+| **C2 epoch 映射生命周期/驻留保护** | 机制组件按设备分配、优先级、老化、预取、驻留均已公开；epoch 到期/失效屏障安全性依赖当前不可观测的失效语义；T_drain 可能大于 V 窗口。成本/新颖度最差。依据：`round2-deepseek.md:90-117` |
+| **C3 独立可观测性论文** | “计数不足”已被本仓库数据证明；无第二实现/模型时只能算仪器，不能独立成文。只保留主 A/B 的最小计数器。依据：`round2-deepseek.md:121-147` |
+| **C4 不可信设备有界翻译服务** | QoS/优先级/老化/分区均已知；四 DMA 有 512 vs 3 缓冲不对称；“多设备”威胁模型未证独立。降为任何机制都应通过的鲁棒性检查。依据：`round2-deepseek.md:151-173` |
+| **R2 上游 DMA 仲裁主线** | DMA0/1 512 拍缓冲会把到达相位与 IOMMU 解耦；同 BIT 仲裁切换未证；会变成“测自己的 FIFO 深度”。只作主 A 的记录变量。依据：`round2-deepseek.md:208-226` |
+| **R3 共享匹配域独立路线** | 当前 IOTLB tag 不含 DID，按页号/PSCID/GSCID/global/stage 匹配；硬件已按放宽匹配域工作，H1 近同义反复。只作主 A 的失败诊断。依据：`round2-deepseek.md:228-246` |
+| **R4 前端 HOL vs 出口反压** | “出口堵时上游长度无关”是排队论平凡结论；出口反压因子可能不能独立施加；与 R2 重合。依据：`round2-deepseek.md:248-265` |
+| **C1“多边界必要条件”作为贡献** | “移除一个串行点后瓶颈移动”是共享串行资源定义性结论，不构成新规律。主 A 只保留其可执行残片：P×N 2×2。依据：`round2-deepseek.md:60-86` |
+| **七臂 baseline 矩阵** | 改为主 A 的 S/N/P/P+N 四模式；B 的 无命令/空命令/真实选择性失效 三臂。依据：`round2-deepseek.md:284-301`；`round3-codex-reconstruction.md:20` |
+| **任意 2%/5%/10% 统计阈值** | 三个样本极差不是 MDE；必须先测配对 S/S 散度后冻结。依据：`round3-codex-reconstruction.md:8` |
+| **无限增加仪器** | 只保留能改变判定结论的计数：首次 miss、PTW、fast 服务、mode/generation、quiet/outstanding。依据：`round3-codex-reconstruction.md:19` |
+
+---
+
+## 5. 给 Round4 三类 reviewer 的最强攻击点
+
+### 5.1 机制新颖性/体系结构 reviewer
+
+**最强攻击：**
+1. “P 是 cache coloring/静态分区，N 是 hit-under-miss。P+N 是已知组合。你的 RQ 只问‘冲突时保护有没有用’，这是缓存常识。”
+2. “你用 DID 做 8/8 分区，但当前 IOTLB tag 不含 DID，按 PSCID/GSCID/global/stage 匹配。你测试的是一个真实硬件里不存在的 DID 分区；若它有效，是因为你改了分配身份，不是 IOMMU 原有保护边界。”
+3. “连续热 V vs 间歇 V 可能只是工作集调参。若只在间歇 V 有效，审稿人会说你在找有利参数，不是发现结构边界。”
+4. “ShareMMU 已研究跨不可信加速器共享翻译/TLB 侧信道；你不能把共享域保护当空白。”
+
+**需要预答：**
+- 明确承认 P/N 是已知机制；
+- 给出唯一可能的 IOMMU 特定问题：分配身份与实际匹配域分离，但只作诊断；
+- 若结果只复述缓存常识，直接停方法主张。
+
+### 5.2 实验/统计/artifact reviewer
+
+**最强攻击：**
+1. “同 BIT 开关还没实现；模式切换可能改变时序、资源、状态污染。你不能用‘将来会有’当控制条件。”
+2. “n=3，A8 同条件极差 ≈12%，你们自己承认被检验效应小于散度；现在又用未测 MDE 支撑 P×N 交互项。”
+3. “fast accept 不是 hit rate，first miss 不是替换来源；没有 per-entry ownership/替换快照，无法区分‘P 保护了条目’和‘lookup 路径变了’。”
+4. “A 同窗有效字节会随 V 完成时间变化，可能产生窗口偏差。”
+5. “2%/5%/10% 是编造阈值，不能当预注册显著性。”
+
+**需要预答：**
+- 先编译同 BIT 四模式并做读回/污染验收；
+- 先测配对 S/S 散度并冻结 MDE；
+- 只保留最小计数器：首次 miss、PTW、fast 服务、mode/generation；
+- 所有块、失败样本、boot id、bitstream hash 全保留。
+
+### 5.3 系统安全/QoS/威胁模型 reviewer
+
+**最强攻击：**
+1. “后备 B 的失效成本是已知 IOMMU invalidation/shootdown 问题；rIOMMU、Price of Safety、Overcoming IOTLB wall 已涉。没有新安全威胁。”
+2. “如果 A 域合法选择性失效造成 V 服务暂停，这是 QoS/性能隔离问题，不是漏洞；空命令对照很可能把它打成软件开销。”
+3. “全局 flush 会失效 V 映射；若平台只支持全局 flush，你的实验前提不成立。”
+4. “C4/QoS 机制全部已知；512 vs 3 缓冲不对称压倒 IOMMU 内部调度；所谓多设备流量不是独立设备。”
+5. “你们不能把普通 DMA 竞争包装成跨域安全隔离失败。”
+
+**需要预答：**
+- B 只作后备，先只读确认选择性失效接口；
+- 空命令同次数、同 CPU 路径；
+- 不把合法 QoS 降级说成漏洞；
+- 主 A 不宣称安全机制，只测保护/服务边界。
+
+---
+
+## 6. 证据与行号索引
+
+- method88 终止、E2/E3、p5 边界：`out/method88-execution-20261004/RESULTS.md:17-20,29-38,94-95,100-102`
+- v5 机制非零但性能未证、不同 BIT/boot：`docs/research-overnight-progress-20261004.md:58,60-81,94,105-110`；`out/n-prototype-20261004/analysis-v5-pilot/RESULTS_REVIEW.md:27,43-45,75-82,115,136,140-164,170-181,201-224`
+- 已知文献边界：`docs/research-literature-review-20261004.md:15-26,30-42,69-75,79`
+- 当前 RTL 结构线索：`docs/paper-logic.md:170,224-231,433`；`docs/research-n-prototype-spec-20261004.md:16-24,49-61,99-137,158-183`
+- Round1 DeepSeek 四路线：`round1-deepseek.md:23-26,44-92,96-142,145-190,194-240,327-334`
+- Round2 Codex 攻击：`round2-codex-attack.md:4-23`
+- Round2 DeepSeek 攻击与自砍：`round2-deepseek.md:13-40,189-206,208-226,228-246,248-265,269-280,284-301`
+- Round3 Codex 重构：`round3-codex-reconstruction.md:3-10,12-20,22-23,25-32`
+- 定向检索提示（未全文核查，仅作待查）：rIOMMU 作者页关于 ring buffer/flat 表/隐式失效；Price of Safety 2007；Overcoming IOTLB wall 2023；ShareMMU；SP-IMPact。这些只削弱 B/C1/R3 的新颖性，不提供新的可引用结论。
+
+---
+
+## 7. 未决与需 Codex 确认
+
+1. 实际 RTL 中 `nonblock_enable_i`、`banked_ctl in_flight_o/e3.quiet`、`TL ptw_active`、`research_dma_quiet`、fast pending/response/backpressure 的精确层次和宽度；
+2. IOTLB 16 项 PLRU 根限制半树的具体代码路径；
+3. Linux `idma.c` 现有 ioctl 基址、MMIO 映射、是否有失效接口；
+4. 是否只允许 DID0/DID1 两个活跃 DID；若有其他 DID，P 需要显式 `part_did_i`；
+5. 间歇 V 的硬件 gap 是否可安全复用；若不能，是否接受 E2 式前缀+探测作为唯一硬件节奏；
+6. 失效 ABI 是否存在合法 A 域选择性失效；若只有全局 flush，B 停；
+7. 编译环境与 SD 更新流程；
+8. 配对 S/S 散度测量后再冻结 MDE，不预设数值阈值。
+
+**最终立场：** 主 A 默认不是论文新机制，而是**廉价可行性门禁**：先证明同 BIT 四模式可安全切换、P 真实减少替换、N 真实推进 hit，再决定是否值得写。若只得到缓存常识，停止方法主张。后备 B 只做只读/空命令对照，新颖性弱，不作主线。

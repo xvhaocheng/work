@@ -1,0 +1,141 @@
+# 定向修订：Nonblock/PN 归因、测试合法性与 52 场景结论边界
+
+> 以下为对首轮审核的**定向修订**，只处理你列出的 4 个纠正点 + 52 场景结论核查，不重做全仓分析。全部为分析/提案；我未执行任何命令或测试，也未修改文件。凡涉及"实测"，均引自你提供的 `late-probe-summary.json` 与 Codex 笔记，不当作我方执行结果。
+
+---
+
+## 0. 修订后一句话结论
+
+在**已编译、未改动的 TL 模型**上，fast/slow 交错只产生有界的局部差异（A 响应 ≤1 cycle 晚、hot V ≤8 cycle 早、cold V 单相位晚 1 cycle），且无重复响应/填充、无丢请求（`late-probe-summary.json:239-244`）。这类 TL 内部气泡量级远小于 ~0.90M/896k cycles，**不能单独归因**。在合法生产连接下，下一定位点最可能是 **banked 事务控制器的 AW/AR 服务顺序 + 共享 completion/DDR 读写周转**，而非 TL 本身。缺少完整 DMA/DDR 时序，根因无法在本模型上定论。
+
+---
+
+## 1. 保留 / 撤回 / 需补证
+
+| # | 首轮条目 | 处置 | 依据 |
+|---|---|---|---|
+| 1 | "PN 独有关闭 spill lookahead（normal_gate）" | **撤回** | `rv_iommu_tl_wrap.sv:284-285`；NonblockEnable 为编译参数（`:309,:658`），静态项对所有 composition 模式一致 |
+| 2 | "fast 响应持续反压完全未覆盖" | **撤回** | `tests/composition_tl_test.cpp:605-636` 已做 100 拍 sustained 反压 |
+| 3 | "fast 抢占 IOTLB/DDTC lookup 端口延迟主 TL" | **保留，重定界** | `rv_iommu_tl_wrap.sv:249-252,271-277`；量化为 ≤1 cycle（52 场景） |
+| 4 | "响应 rr 仲裁可能让 fast 等 / 重排" | **保留** | `rv_iommu_tl_wrap.sv:346-353`；无饥饿证据 |
+| 5 | "N 是多周期 time-shared probe，非免费端口" | **保留**（Codex） | `rv_iommu_nonblock_hit.sv:47-55,100-112,142-172` |
+| 6 | "fast 无限反压可阻塞 normal" | **撤销前提** | AWAIT_RESP 无条件 ready，见 §3（合法序列） |
+| 7 | 窗口内/外时间定位（首轮验证 3） | **保留**为低成本验证 | 见 §7 验证 1 |
+| 8 | "P vs PN 差异来自 normal_gate" | **需补证/改口径** | 只能来自运行期 n_intercept，见 §2 |
+| 9 | 同拍 slow+fast 仲裁覆盖 | **需补** | 测试未覆盖 `slow_resp_valid && fast_resp_valid` 同拍 + 反压 |
+
+---
+
+## 2. 纠正点 1：normal_gate 不能作 PN 独有归因
+
+`normal_gate = !NonblockEnable || (state_q == IDLE && !req_valid && !n_intercept)`（`rv_iommu_tl_wrap.sv:284-285`）。
+
+- `NonblockEnable` 是**编译参数**：决定模块是否实例化（`:309` `if (NonblockEnable) ... gen_nonblock_hit` / `:331 else`）与 IOTLB `TouchEnable`（`:658`）。运行期使能走端口 `enable_i(nonblock_enable_i)`（`:316`）。
+- 在 composition 构建（与 BIT 同一份被观测模型）中 `NonblockEnable=1`，故静态项 `!NonblockEnable = 0`，对 S/N/P/PN **全部相同**。
+- 于是 P 与 PN 的 `normal_gate` 差异**只剩运行期 `n_intercept`**（P：`nonblock_enable_i=0 → n_intercept=0`；PN：可非 0）。
+- **撤回**"PN 独有关闭 spill lookahead"。更准确口径：该门控在 composition 构建里对所有模式都生效（S/P 因 `n_intercept=0` 退化为 `state_q==IDLE && !req_valid`），是**共享因子**，不能当作 PN 的独有效应；P vs PN 的差异恰好等于**预期的 fast 拦截本身**，不构成额外"lookahead 被取消"的性能罪名。
+
+补充边界（需你确认，我不臆断）：composition 测试台是**运行期**选模式（`reset(nonblock_enable, policy_partition, policy_did)`，`tests/composition_tl_test.cpp:225-234`），而生产是**编译期** `NonblockEnable`。两者若不一致，会改变 `normal_gate` 的静态基线，解读任何 S/P vs N/PN 计数差异时必须先对齐这一点。
+
+---
+
+## 3. 纠正点 2：撤回"完全未覆盖 fast 反压"
+
+`tests/composition_tl_test.cpp:605-636` 已覆盖 fast 响应持续反压，是**真实**覆盖：
+
+- `:610` `top->trans_resp_ready_i = 0;`
+- `:612-614` 冷 A hold 下发起 V fast 命中，检查 `req_fire_fast`；
+- `:615` `CHECK_AT(req_busy_s, ...)`，`:616` `CHECK_AT(!quiet_s, ...)`；
+- `:621-623` 连续 **100 拍**持续检查 `!quiet_s`（sustained 反压窗口）；
+- `:626-633` 先放行 fast，再释放 A。
+
+**撤回**"完全未覆盖"。但仍可指出**未覆盖**点：
+
+- 该反压窗口内 **A 被 hold、slow 响应不 valid**，因此没有覆盖"`slow_resp_valid && fast_resp_valid` 同拍 + 反压"下的 rr 仲裁组合；
+- 未覆盖 fast reject/retry 长序列、以及多轮 A/V fill/evict 下含反压的持续序列。
+- 说明：按 §4，生产 bank 侧基本不会长时间拉低 ready，所以这一缺口对**功能**风险很低，仅对**仲裁同拍**语义有覆盖价值。
+
+---
+
+## 4. 纠正点 3：bank AWAIT_RESP 无条件 ready；给出合法序列
+
+证据：
+
+- `rv_iommu_trans_ctl_wrap.sv:693-702`：`AWAIT_RESP` 中 `trans_resp_ready_o = 1'b1;`（`:695`）**无条件**。
+- 响应路由：`rv_iommu_banked_ctl.sv:400-408`，TL 侧 `trans_resp_ready_i = 匹配 data.bank 的 bank_trans_resp_ready`，而 `bank_trans_resp_ready[b]` 即该 bank `trans_ctl` 的 `trans_resp_ready_o`。
+- TL→bank 请求握手：`rv_iommu_tl_wrap.sv:286` `trans_req_ready_o = n_intercept ? n_accept : ...`，`:319` `normal_fire_i = trans_req_valid_i && normal_trans_ready && normal_gate`。
+
+**合法生产序列**（V=bank0、A=bank1，均为 banked 合并后的请求）：
+
+| cycle | V-bank (`trans_ctl`) | nonblock FSM | TL ready / 结果 |
+|---|---|---|---|
+| T0 | `REQ_TRANS`，`trans_req_valid_o=1` | `LEAF`，`accept_o=1` | `trans_req_ready_o=n_accept=1` → V-bank 下拍进 `AWAIT_RESP`；FSM→`OUT` 寄存 `resp_q` |
+| T1 | `AWAIT_RESP`（`trans_resp_ready_o=1`） | `OUT`，`response_valid_o=1`，`data.bank=0` | `trans_resp_ready_i = bank0 ready = 1` → **同拍握手** |
+
+结论：
+- 只要 fast 响应所属 bank 处于 `AWAIT_RESP`，TL 侧 `trans_resp_ready_i` 即为 1，**fast 响应即时被消费**，不存在持续反压。
+- 单元 TB 的 `trans_resp_ready_i=0` 持续反压（`composition_tl_test.cpp:610`）**不是合法生产连接**（bank 在等响应时始终 ready）。Codex 的假设"任意 hold 的 fast 响应不是可达的生产 bank 条件"成立。
+- 残余不可达情形：仅当 `data.bank` 指向一个不在 `AWAIT_RESP` 的 bank 才会反压——但 ready（=`n_accept`）早于 `OUT` valid 一拍出现，接受请求的 bank 必在 `AWAIT_RESP`，故不可达。
+- **因此**，首轮/Codex 假设中"fast `OUT` 长期反压阻塞 normal"不能作为生产性能路径；撤销该前提。
+
+---
+
+## 5. 纠正点 4：PTW edge-trigger 抑制重复 init；late LEAF 碰撞有界
+
+**edge-trigger：**
+- `rv_iommu_ptw.sv:150-158`：`edge_trigger_q` 在 `init_ptw_i` 上升沿置位，下降沿清除；`:325` 仅 `init_ptw_i && !edge_trigger_q` 时 `IDLE→MEM_ACCESS`。
+- 故即便主 TL 因 fast 短暂掩蔽自身 hit 而继续拉高 `init_ptw_i`，也不会重复启动 walk。**抑制重复 init 成立**。
+
+**late LEAF 碰撞对主 TL 的影响（评估）：**
+- 掩蔽：`n_iotlb_lu=1` 时 `iotlb_lu_hit = cache_iotlb_hit && !n_iotlb_lu = 0`（`rv_iommu_tl_wrap.sv:277`），主 TL 在该拍看不到自己的 fill → 最坏使 `PT→COMPLETE`（`:1330-1331`）推迟 **+1 拍**。
+- 无假命中/假接受：fast LEAF 的 lookup VPN 取 `n_iotlb_vpn`=V（`:272`），主 A fill 的 VPN 不同（`rv_iommu_iotlb.sv:129-136` 全匹配才 hit）；`accept_o` 还要求 `candidate_i==req_q && ddtc_dc_i==dc_q && ddtp_i==ddtp_q`（`rv_iommu_nonblock_hit.sv:100-103`）。
+- 与实测一致：52 场景中 A 响应相对 P 最多晚 1 拍（`late-probe-summary.json:241-242`），无重复 fill/response。
+- 结论：late LEAF 碰撞**有界（≤1 拍）**，不构成独立根因。
+
+---
+
+## 6. 52 场景测试合法性 & 结论边界
+
+**合法性（成立）：**
+- `late_probe.cpp` 复用**未改动的已编译 TL 模型**（`#define main ...` 包 `composition_tl_test.cpp`，`:2-4`）。
+- `reset(n, true, 10)`（`:14`）：policy 始终 on、`policy_did=10` → 比较 **P(n=0) vs PN(n=1)**；`n` 即运行期 `nonblock_enable_i`。
+- 维度：`cold_v∈{0,1}`（hot/cold V）× `offer∈[0,12]`（相对 A 终级 PTE 的到达相位）× `n∈{0,1}` = 52（`:9-11`）。
+- 断言：恰好 1 次接受（`:63`）、无重复/错误响应（`:48,:52`）、fill 计数匹配（`:64-65`）→ 功能层面**覆盖 fast/slow 交错不产生死锁/重复**，这一结论有效。
+
+**结论边界（必须随结论一并声明）：**
+1. **单 A + 单 V**，非批量：不能测 2048 次 A fill 的累计效应，不能由单事件 ≤1 拍外推到窗口时长。
+2. **绕过 banked_ctl / trans_ctl / merge arbiter**：直接驱动 `trans_req`，bank 手工置位（`:35` V=0、`:16` A=1），未测 bank 响应路由、AW/AR 顺序、read-admission。
+3. `trans_resp_ready_i` 恒 1（`composition_tl_test.cpp:234`）→ 与生产一致（见 §4），但因此本 sweep 不检验任何反压语义。
+4. **固定测试内存延迟**：A 终级 PTE 用 `hold_ptw_r = cycle<4` 人为 hold（`:33`），"cycle 4"是合成值，不是真实 DDR 延迟。
+5. 响应 rr arbiter 起始 `rr_q=0`，index0=fast（`rv_iommu_tl_wrap.sv:348`）→ 同拍时 fast 固定优先，属**固定偏置**，非 P/PN 变量。
+6. 故本测试的结论边界是：**TL 内 fast/slow 在给定相位下的有界局部差异**（A ≤1 拍晚；hot V ≤8 拍早、且不更晚；cold V 单相位晚 1 拍），**不证明吞吐或板级根因**（`late-probe-summary.json:240` scope 亦如此声明）。
+
+---
+
+## 7. 下一定位点（不指定根因）+ ≤2 个定向验证
+
+**最可能的下一定位点：banked 事务控制器的 AW/AR 服务顺序与共享 completion/DDR 读写周转。**
+理由：A fill 数相同、TL 内气泡有界，而窗口时长差 ~0.90M → 差额只能落在**TL 之外**的 bank 服务/DDR 周转。具体候选（均有源可指）：
+- `IDLE` 中 **AW 先于 AR** 的顺序（`rv_iommu_trans_ctl_wrap.sv:623-668`）；
+- W-owner 读准入限制（`rv_iommu_banked_ctl.sv:246-268`，`ReadAdmissionEnable`）；
+- 非 N 与 PN 下 fast 响应改变 bank 完成时刻 → 改变两 bank 向 DDR 的 AW/AR 交错（Codex 假设，`rv_iommu_trans_ctl_wrap.sv:623-668` + `rv_iommu_banked_ctl.sv:246-268`）。
+
+**验证 1（低成本，纯数据归约，用已有板级记录）：**
+对 P 与 PN 各一条 A8/Vgap0 记录做**窗口内相位分解**：`victim_elapsed_ns`、`window[1]`、`p4m.window[3]` 的窗口内 A-done 到达间隔、`drain_ns`、`snapshot_*`。若 A-done 数相同而窗口长 0.90M，则差额必是**窗口内 A 事件之间的额外延迟**（即 A 内存/服务延迟），据此把 0.90M 定位到窗口内而非 drain/snapshot。低成本、无新硬件。
+
+**验证 2（有界仿真，补齐 banked 路径）：**
+在现有 TB 上增加 `rv_iommu_banked_ctl` 两 bank 合并 + 响应路由 + `rv_iommu_trans_ctl_wrap` 的 AW/AR 顺序（含 `ReadAdmissionEnable`、W FIFO）模型，跑**有限**的 A+V 序列（N on/off 各一次），逐拍记录 bank state、AW/AR `valid/ready` 与握手顺序、`read_admit`、`w_unfilled_q`，二选一对比是否 N **一致地**改变 AW/AR 顺序或引入读准入气泡。边界：不引入 DDR 时序，只能证/否证"bank 顺序被 N 改变"，**不能**单独证明 DDR 根因。
+
+不提出无证据的 RTL 改动；上述两条若为否证或弱效应，应转向验证 1 得出的 A 延迟方向。
+
+---
+
+## 8. 缺失证据 / 声明（必读）
+
+- **缺少完整 DMA/DDR 时序**：真实 AW/AR/R/B 延迟、DDR 读写周转、iDMA backend/batch engine、`dma_core_wrap.sv` 均未提供；52 场景**不能**替代，也**不证明**完整 DMA/DDR 根因。
+- 缺 top-level composition 集成（`mode_o → nonblock_enable_i / policy_partition_i / policy_did_i` 的实际驱动），无法确认生产是编译期还是运行期定型。
+- 缺 3 次重复的板级 record / 原始 UART；A-done 结论仅对**被观测窗口**有效，非峰值/独立吞吐。
+- `stream_arbiter`、`rr_arb_tree`、`trans_ctl_wrap`、`fullbuffer_certificate` 现已补入，首轮"缺文件"清单相应缩减；仍缺 DMA/DDR 侧与顶层集成。
+- 本文所有"实测"数字均转引自你的执行结果与 Codex 笔记；我未执行任何命令、未运行测试、未修改文件，不声称任何测试通过。
+
+若要我把 §7 验证 1 写成可直接跑的数据归约脚本骨架（读取 `victim_elapsed_ns/window[1]/p4m.window[3]/drain_ns/snapshot_*` 字段并输出窗口内外占比），或把验证 2 的 TB 扩展点列成最小改动清单，告诉我选哪一个，我按同一小批次交付。

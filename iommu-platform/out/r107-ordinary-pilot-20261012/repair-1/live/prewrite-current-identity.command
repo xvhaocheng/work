@@ -1,0 +1,1 @@
+printf 'R111_UNAME='; uname -r; printf 'R111_BOOT_ID='; cat /proc/sys/kernel/random/boot_id; printf 'R111_R1_BYTES='; wc -c < /tmp/r107-stage111/fw_payload-stage111-r1.bin; printf 'R111_PARTITION_SIZE='; cat /sys/class/block/mmcblk0p1/size; printf 'R111_PARTITION_START='; cat /sys/class/block/mmcblk0p1/start

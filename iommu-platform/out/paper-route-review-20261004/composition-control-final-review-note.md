@@ -1,0 +1,1 @@
+Codex审查修订：新legal_modes草案将DID11填充误标Other/word28，按已冻结接口机械修正为A/word27；其余采用DeepSeek提案。前三次实际替换均保留，PLRU测试在idle后设置。待实际运行，不声称先通过。

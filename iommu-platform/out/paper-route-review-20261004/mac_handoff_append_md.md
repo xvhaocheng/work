@@ -1,0 +1,5 @@
+**交付补充（实际状态）** tools/composition-v1-20261004 的 README/SPEC/RESEARCH_REVIEW/DELIVERY 已实际 SCP 成功；新 scripts/sd_card.py（composition-v1 release）已安装，原文件备份为 `tools/.../sd_card.before-composition.py`。本批未写 SD、未加载新 BIT、未跑 172：写卡（第 1 节）与上板运行（第 3 节）仍待执行；runner 仍只 attach，不写 BIT/SD、不重启（docs/composition-v1-mac-20261004.md:88）。
+
+与旧版说明的差异：新 profile 与旧版同 BIT，4 模式 S/N/P/PN（mode 0/1/2/3）仍在同一次 boot、同一个 BIT 内由驱动 ioctl 0x11 写 live config（offset 2）运行时切换，不重写 SD、不重载 BIT、不重启（mac:3；spec:10、40）。用例总数仍为 172，构成 16(short) + 12(S/S 6 对) + 144(explore)，一次 `--through-phase explore` 跑完；`--out` 必须不存在，技术失败写 STOPPED.txt 即停、不自动重跑、不 resume（mac:77–88；spec:46）。
+
+待办与授权：BIT 首次构建在布线期间原进程停止、原因未知，现从同 source physopt DCP 在 out/paper-route-review-20261004/recovery-v1/recovery-state.json 恢复，尚未完成；构建产物/时序由 Codex 完成后机械补充并更新本文第 5 节状态（当前：Linux 已完成、BIT 待完成、尚未上板，mac:102）。本次用户已授权 Linux/SD 修改；仍先人工写 SD，再断电板卡上电、串口采集、加载一次 BIT，最后由 Codex 跑 172 并回传 Dell，Linux 保持运行（mac:23–56、57–98）。

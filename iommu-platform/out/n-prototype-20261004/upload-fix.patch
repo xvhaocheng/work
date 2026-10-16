@@ -1,0 +1,223 @@
+--- a/scripts/mac_nonblock_pilot.py
++++ b/scripts/mac_nonblock_pilot.py
+@@ -130,6 +130,12 @@
+ READER_FAST_WORDS = (6, 7, 8, 9, 10)   # Vread, Vwrite, Aread, Awrite, Other
+ READER_NORMAL_WORDS = (11, 12, 13)     # V, A, Other
+ UPLOAD_CHUNK = 1024
++# Raw-UART heredoc upload tuning.  At 115200 8N1 one 1024-byte base64 line
++# costs about 89 ms of wire time, so each payload line is followed by a short
++# pause to keep the host write queue drained.  The write timeout is raised only
++# for this upload and is always restored; read_timeout is never touched.
++UPLOAD_WRITE_TIMEOUT = 5.0
++UPLOAD_LINE_DELAY = 0.15
+ HELPER_FILES = ('helper.json', 'helper.stderr.txt', 'helper.exit.txt')
+ 
+ SHORT_TRANSFERS = 64
+@@ -1044,83 +1050,175 @@
+         mode = READER_MODE_FOR_LABEL.get(self.args.label)
+         return shlex.quote(self._reader_target())
+ 
+     def _upload_reader(self) -> Dict[str, Any]:
+-        '''Raw UART upload of the static helper into /tmp.
+-
+-        The ELF is base64 encoded on the host and typed to the board as a shell
+-        here-document through the raw writer (run_shell forbids newlines).  The
+-        begin/end markers are built from shell parts so an echoed line can never
+-        be mistaken for a marker.  There is no automatic retry: the end marker
+-        is expected exactly once and the final check is one framed command.
+-        '''
++        '''Raw UART upload of the static helper into /tmp.
++
++        The ELF is base64 encoded on the host and typed to the board as a shell
++        here-document through the raw writer (run_shell forbids newlines).  The
++        begin/end markers are built from shell parts so an echoed line can never
++        be mistaken for a marker.
++
++        The write timeout is raised only for this transfer and restored in a
++        finally block; read_timeout is never changed.  The payload is paced one
++        line at a time (UPLOAD_LINE_DELAY): 1024 base64 bytes cost about 89 ms
++        of wire time at 115200 8N1, so without pacing the host write queue fills
++        and pyserial raises SerialTimeoutException.  PS2 is cleared for the
++        heredoc (to suppress the secondary prompt on every payload line) and
++        restored afterwards.  The whole transfer is bounded by one
++        --upload-timeout; the header is confirmed by reading the real begin
++        marker before any payload byte is sent, and exactly one begin/end marker
++        pair is used.  On any failure the transfer stops immediately (no retry,
++        no resume, no partial helper run) and bounded metadata (bytes/lines
++        attempted, phase, error) is written to upload-failure.json; the ELF and
++        its base64 are never stored there.
++        '''
+         source = pathlib.Path(self.args.reader).resolve()
+         if not source.is_file():
+             raise NonblockError('--reader ELF not found: ' + str(source))
+         data = source.read_bytes()
+         encoded = base64.b64encode(data)
+         lines = [encoded[i:i + UPLOAD_CHUNK].decode('ascii')
+                  for i in range(0, len(encoded), UPLOAD_CHUNK)]
+         target = self._reader_target()
+         n1 = secrets.token_hex(8)
+         n2 = secrets.token_hex(8)
+         begin = 'NBB_' + n1 + '_' + n2 + '__'
+         end = 'NBE_' + n1 + '_' + n2 + '__'
+         delim = 'NBD_' + n1 + '_' + n2 + '__'
+         nl = chr(92) + 'n'
+ 
+-        script: List[str] = [
++        # Header through the heredoc opener.  The begin marker is printed before
++        # the heredoc, so reading it proves the header ran before any payload
++        # byte is sent.  PS2 is saved and cleared so the heredoc does not echo
++        # '> ' for every payload line; it is restored once the upload finishes.
++        header: List[str] = [
+             'stty -echo 2>/dev/null',
+             'mkdir -p ' + shlex.quote(self.board_root),
++            '__nb_ps2="${PS2-}"; PS2=',
+             'b0=NBB; e0=NBE; m1=' + n1 + '; m2=' + n2
+             + '; bm="${b0}_${m1}_${m2}__"; em="${e0}_${m1}_${m2}__"',
+             "printf '%s" + nl + "' " + _DQUOTE + '$bm' + _DQUOTE,
+             '{ base64 -d > ' + shlex.quote(target) + '; __nb_rc=$?; printf '
+             + "'%s %s" + nl + "' " + _DQUOTE + '$em' + _DQUOTE + ' '
+             + _DQUOTE + '$__nb_rc' + _DQUOTE + '; } <<' + "'" + delim + "'",
+         ]
+-        script.extend(lines)
+-        script.append(delim)
+ 
+-        for line in script:
+-            self.console._write((line + chr(10)).encode('utf-8'))
++        old_write_timeout: Optional[float] = None
++        try:
++            old_write_timeout = self.console._ser.write_timeout
++            self.console._ser.write_timeout = UPLOAD_WRITE_TIMEOUT
++        except Exception as exc:
++            old_write_timeout = None
++            self._log('reader upload: cannot raise write_timeout: ' + repr(exc))
+ 
+-        try:
+-            self.console.read_until(begin.encode('ascii'),
+-                                    self.args.upload_timeout)
+-            self.console.read_until(end.encode('ascii'),
+-                                    self.args.upload_timeout)
+-            raw_rc = self.console.read_line(self.args.upload_timeout)
++        deadline = time.monotonic() + self.args.upload_timeout
++        lines_attempted = 0
++        bytes_attempted = 0
++        phase = 'write-header'
++        upload_error: Optional[BaseException] = None
++        try:
++            for line in header:
++                self.console._write((line + chr(10)).encode('utf-8'))
++
++            phase = 'await-begin'
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise NonblockError('reader upload header timed out')
++            self.console.read_until(begin.encode('ascii'), remaining)
++
++            phase = 'write-payload'
++            for line in lines:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise NonblockError(
++                        'reader upload payload timed out after '
++                        + str(lines_attempted) + ' lines')
++                self.console._write((line + chr(10)).encode('utf-8'))
++                lines_attempted += 1
++                bytes_attempted += len(line)
++                time.sleep(UPLOAD_LINE_DELAY)
++            self.console._write((delim + chr(10)).encode('utf-8'))
++
++            phase = 'await-end'
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise NonblockError('reader upload end marker timed out')
++            self.console.read_until(end.encode('ascii'), remaining)
++
++            phase = 'check-exit'
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise NonblockError('reader upload exit marker timed out')
++            raw_rc = self.console.read_line(remaining)
++            rc_text = text_of(raw_rc).strip()
++            if not _INT_RE.fullmatch(rc_text):
++                raise NonblockError(
++                    'reader upload exit marker is not an integer: '
++                    + repr(raw_rc))
++            if int(rc_text) != 0:
++                raise NonblockError('reader base64 decode exit=' + rc_text)
++
++            phase = 'verify'
++            check = self.console.run_shell(
++                'PS2="${__nb_ps2-}"; chmod 700 ' + shlex.quote(target)
++                + ' && test -s ' + shlex.quote(target),
++                timeout=self.args.command_timeout)
++            if check.exit_code != 0:
++                raise NonblockError('reader chmod/verify exit='
++                                    + str(check.exit_code))
+         except Exception as exc:
+-            raise NonblockError('reader upload framing failed: ' + repr(exc))
+-        rc_text = text_of(raw_rc).strip()
+-        if not _INT_RE.fullmatch(rc_text):
+-            raise NonblockError('reader upload exit marker is not an integer: '
+-                                + repr(raw_rc))
+-        if int(rc_text) != 0:
+-            raise NonblockError('reader base64 decode exit=' + rc_text)
+-
+-        check = self.console.run_shell(
+-            'chmod 700 ' + shlex.quote(target) + ' && test -s '
+-            + shlex.quote(target), timeout=self.args.command_timeout)
+-        if check.exit_code != 0:
+-            raise NonblockError('reader chmod/verify exit=' + str(check.exit_code))
++            upload_error = exc
++            failure = {
++                'schema': 'nonblock-pilot-reader-upload-failure-v1',
++                'reader_path': target,
++                'reader_mode': READER_MODE_FOR_LABEL.get(self.args.label),
++                'elf_bytes': len(data),
++                'transfer_bytes': len(encoded),
++                'chunk_bytes': UPLOAD_CHUNK,
++                'chunk_count': len(lines),
++                'lines_attempted': lines_attempted,
++                'bytes_attempted': bytes_attempted,
++                'phase': phase,
++                'error': repr(exc),
++                'auto_retry': False,
++                'resumed': False,
++                'failed_at': utc_now(),
++            }
++            try:
++                self._write_json('upload-failure.json', failure)
++            except OSError as write_exc:
++                self._log('cannot write upload-failure.json: '
++                          + repr(write_exc))
++        finally:
++            if old_write_timeout is not None:
++                try:
++                    self.console._ser.write_timeout = old_write_timeout
++                except Exception as exc:
++                    self._log('reader upload: cannot restore write_timeout: '
++                              + repr(exc))
++
++        if upload_error is not None:
++            self._log('reader upload failed in phase ' + phase + ': '
++                      + repr(upload_error) + ' lines=' + str(lines_attempted)
++                      + ' bytes=' + str(bytes_attempted))
++            raise NonblockError('reader upload failed: ' + repr(upload_error))
+ 
+         record = {
+             'schema': 'nonblock-pilot-reader-upload-v1',
+             'reader_path': target,
+             'reader_mode': READER_MODE_FOR_LABEL.get(self.args.label),
+             'elf_bytes': len(data),
+             'transfer_bytes': len(encoded),
+             'chunk_bytes': UPLOAD_CHUNK,
+             'chunk_count': len(lines),
+             'mode': '700',
+             'hash_readback': False,
+             'uploaded_at': utc_now(),
+         }
+         self._write_json('reader-upload.json', record)
+         self._log('reader uploaded: ' + target + ' bytes=' + str(len(encoded))
+                   + ' mode=' + str(record['reader_mode']))
+         return record
+ 
+     def _run_helper_case(self, cid: str, board_dir: str, local_dir: pathlib.Path,
+                          record: Any) -> Tuple[List[str], Optional[List[int]]]:

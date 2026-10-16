@@ -1,0 +1,367 @@
+--- a/out/pte-progress-poc-20261007/summarize.py
++++ b/out/pte-progress-poc-20261007/summarize.py
+@@ -99,28 +99,44 @@
+     if not required and not ok:
+         res['warnings'].append(name + ': ' + detail)
+ 
+-def check_progress_phases(rows, win, admission, res, len_col):
+-    if len_col is None:
+-        res['warnings'].append('progress phase budget check skipped: no len column in trace')
++def check_progress_phases(rows, win, admission, res, value_col):
++    """Check complete-phase fastgated budget using trace value column as AxLEN."""
++    if value_col is None:
++        add_check(res, 'progress_phase_value_column', False, 'no value column in exact trace schema')
+         return
+     resets = sorted({cyc for cyc, ev, row in rows if ev == 'phase_reset'})
+     if not resets:
+-        res['warnings'].append('progress phase budget check skipped: no phase_reset in window')
++        add_check(res, 'progress_phase_reset_present', False, 'no phase_reset in window')
+         return
+     by_cycle = defaultdict(list)
+     for cyc, ev, row in rows:
+         by_cycle[cyc].append((ev, row))
+     budget = admission.get('budget', 256)
++    bad_same_cycle = []
++    for cyc, evs in by_cycle.items():
++        ev_names = [ev for ev, _ in evs]
++        if 'phase_reset' in ev_names and 'firstoffer' in ev_names:
++            bad_same_cycle.append(cyc)
++    add_check(res, 'progress_reset_firstoffer_same_cycle_forbidden', not bad_same_cycle,
++              'cycles=%s' % sorted(bad_same_cycle) if bad_same_cycle else '')
+     phases = []
+     for i, r in enumerate(resets):
+         end = resets[i+1] if i+1 < len(resets) else None
+         phases.append((r, end))
+     initial_cycles = [c for c in by_cycle if c <= resets[0]]
+-    res['warnings'].append('progress initial partial before first reset: %d cycles (not checked as full phase)' % len(initial_cycles))
++    res['progress_phase_initial_partial_cycles'] = sorted(initial_cycles)
++    res['warnings'].append('progress initial partial before first reset: %d cycles explicitly skipped (not a full phase)' % len(initial_cycles))
++    full_phases = 0
++    charged_phases = 0
++    skipped_last_partial = False
+     for start, end in phases:
+         if end is None:
++            skipped_last_partial = True
+             continue
++        full_phases += 1
+         total = 0
++        charged = False
++        missing_value = []
+         for cyc in sorted(by_cycle.keys()):
+             if not (start < cyc <= end):
+                 continue
+@@ -130,53 +146,62 @@
+             if has_fastgated and not has_exempt:
+                 beats = None
+                 for ev, row in evs:
+-                    if ev in ('fastgated', 'firstoffer', 'newcaptured'):
+-                        v = parse_int(row.get(len_col))
++                    if ev == 'fastgated':
++                        v = parse_int(row.get(value_col))
+                         if v is not None:
+                             beats = v + 1
+                             break
+                 if beats is None:
+-                    for ev, row in evs:
+-                        v = parse_int(row.get(len_col))
+-                        if v is not None:
+-                            beats = v + 1
+-                            break
+-                if beats is None:
+-                    res['warnings'].append('progress phase [%s,%s] cycle %s fastgated non-exempt without len; skipped' % (start, end, cyc))
+-                else:
+-                    total += beats
++                    missing_value.append(cyc)
++                    continue
++                charged = True
++                total += beats
++        if missing_value:
++            add_check(res, 'progress_phase_budget_%s_%s' % (start, end), False,
++                      'fastgated non-exempt without value at cycles=%s' % missing_value)
++            continue
++        if charged:
++            charged_phases += 1
+         if total > budget:
+-            add_check(res, 'progress_phase_budget_%s_%s' % (start, end), False, 'sum_beats=%s budget=%s' % (total, budget))
+-        else:
+-            add_check(res, 'progress_phase_budget_%s_%s' % (start, end), True, 'sum_beats=%s budget=%s' % (total, budget))
++            add_check(res, 'progress_phase_budget_%s_%s' % (start, end), False,
++                      'sum_beats=%s budget=%s charged=%s' % (total, budget, charged))
++        else:
++            add_check(res, 'progress_phase_budget_%s_%s' % (start, end), True,
++                      'sum_beats=%s budget=%s charged=%s' % (total, budget, charged))
++    res['progress_phase_full_count'] = full_phases
++    res['progress_phase_charged_count'] = charged_phases
++    res['progress_phase_last_partial_skipped'] = skipped_last_partial
++    if skipped_last_partial:
++        res['warnings'].append('progress last partial after final reset explicitly skipped (not a full phase)')
++    if charged_phases == 0:
++        res['warnings'].append('progress phase budget: no full phase had charged fastgated non-exempt offers; nonvacuous budget coverage not demonstrated')
+ 
+ def check_trace(trace_abs, win, win_inner, admission, terminal, res):
+-    open_c = win.get('win_open_cycle')
+-    close_c = win.get('win_close_cycle')
+-    if open_c is None or close_c is None:
+-        add_check(res, 'trace_window_bounds', False, 'missing window bounds')
++    W = win.get('W_cycles') if isinstance(win, dict) else None
++    if W is None:
++        add_check(res, 'trace_window_W', False, 'missing W_cycles for relative window filter')
+         return
++    expected_fields = ['cycle', 'event', 'tag', 'address', 'value']
+     try:
+         with open(trace_abs, 'r', encoding='utf-8', errors='replace', newline='') as f:
+             reader = csv.DictReader(f)
+-            fieldnames = reader.fieldnames or []
+-            if not fieldnames:
+-                add_check(res, 'trace_header', False, 'no CSV header')
++            fieldnames = [str(x).strip() for x in (reader.fieldnames or [])]
++            if fieldnames != expected_fields:
++                add_check(res, 'trace_header_schema', False,
++                          'expected=%s actual=%s' % (expected_fields, fieldnames))
+                 return
+-            cycle_col = pick_col(fieldnames, ['cycle', 'time', 'timestamp', 'clk', 't'])
+-            event_col = pick_col(fieldnames, ['event', 'type', 'kind', 'name', 'evt'])
+-            id_col = pick_col(fieldnames, ['id', 'tag', 'ar_id', 'arid', 'transaction', 'txn'])
+-            len_col = pick_col(fieldnames, ['len', 'length', 'beats', 'burst', 'size'])
+-            fast_col = pick_col(fieldnames, ['fast', 'is_fast', 'fast_flag', 'fastread', 'fast_read'])
+-            if cycle_col is None or event_col is None:
+-                add_check(res, 'trace_required_columns', False, 'cycle_col=%s event_col=%s fieldnames=%s' % (cycle_col, event_col, fieldnames))
+-                return
++            add_check(res, 'trace_header_schema', True, 'schema=%s' % (expected_fields,))
++            cycle_col = 'cycle'
++            event_col = 'event'
++            id_col = 'tag'
++            value_col = 'value'
+             rows = []
+             for row in reader:
+                 cyc = parse_int(row.get(cycle_col))
+                 if cyc is None:
+                     continue
+-                if not (open_c < cyc <= close_c):
++                # cycle is printed as g_cycle-win_open_cycle, so it is window-relative.
++                if not (0 < cyc <= W):
+                     continue
+                 ev = canonical_event(row.get(event_col, ''))
+                 rows.append((cyc, ev, row))
+@@ -191,10 +216,6 @@
+             tag = parse_int(row.get(id_col)) if id_col is not None else None
+             if tag is not None and ((tag >> 5) & 1):
+                 newcaptured_tagbit5 += 1
+-            elif fast_col is not None:
+-                fv = str(row.get(fast_col, '')).strip().lower()
+-                if fv in ('1', 'true', 'yes', 'y', 't'):
+-                    newcaptured_tagbit5 += 1
+     def cmp_count(name, ev_key, expected):
+         actual = counts.get(ev_key, 0)
+         add_check(res, 'trace_%s_count' % name, actual == expected, 'trace=%s json=%s' % (actual, expected))
+@@ -210,6 +231,11 @@
+     add_check(res, 'trace_newcaptured_tagbit5_eq_fastread', newcaptured_tagbit5 == fastread, 'tagbit5=%s fastread_captures=%s' % (newcaptured_tagbit5, fastread))
+     arfire = counts.get('arfire', 0)
+     res['trace_arfire_count'] = arfire
++    offer_handshakes = admission.get('offer_handshakes')
++    if offer_handshakes is None:
++        add_check(res, 'trace_arfire_eq_offer_handshakes', False, 'arfire=%s admission.offer_handshakes missing' % arfire)
++    else:
++        add_check(res, 'trace_arfire_eq_offer_handshakes', arfire == offer_handshakes, 'arfire=%s offer_handshakes=%s' % (arfire, offer_handshakes))
+     comp_ar_fire = win_inner.get('comp_ar_fire') if isinstance(win_inner, dict) else None
+     if comp_ar_fire is not None:
+         add_check(res, 'trace_arfire_le_comp_ar_fire', arfire <= comp_ar_fire, 'arfire=%s comp_ar_fire=%s' % (arfire, comp_ar_fire), required=False)
+@@ -219,7 +245,7 @@
+         add_check(res, 'trace_none_arfire_nonzero', arfire > 0, 'arfire=%s' % arfire)
+         add_check(res, 'trace_none_newcaptured_zero', counts.get('newcaptured', 0) == 0, 'newcaptured=%s' % counts.get('newcaptured', 0))
+     if admission.get('read_admit') == 'progress':
+-        check_progress_phases(rows, win, admission, res, len_col)
++        check_progress_phases(rows, win, admission, res, value_col)
+ 
+ def main():
+     if not os.path.exists(MEASUREMENTS_PATH):
+@@ -235,6 +261,9 @@
+     case_results = []
+     if case_count != 21:
+         required_failures.append('expected 21 cases, found %d' % case_count)
++    case_names = [c.get('case', 'case#%d' % idx) for idx, c in enumerate(measurements)]
++    if len(set(case_names)) != case_count:
++        required_failures.append('case names not unique: count=%d unique=%d names=%r' % (case_count, len(set(case_names)), case_names))
+     for idx, c in enumerate(measurements):
+         case_name = c.get('case', 'case#%d' % idx)
+         res = {'case': case_name, 'checks': [], 'failures': [], 'warnings': []}
+@@ -249,7 +278,7 @@
+             with open(log_path, 'r', encoding='utf-8', errors='replace') as lf:
+                 log_text = lf.read()
+             last_lines = [l for l in log_text.splitlines() if l.strip()][-5:]
+-            pass_at_end = any('PASS' in l for l in last_lines)
++            pass_at_end = any('nonblock_actual_dma_test: PASS' in l for l in last_lines)
+             scenario_fail = 'SCENARIO-FAIL' in log_text
+             add_check(res, 'log_pass_at_end', pass_at_end, 'last_lines=%r' % (last_lines,))
+             add_check(res, 'log_no_scenario_fail', not scenario_fail, 'SCENARIO-FAIL present' if scenario_fail else '')
+@@ -304,9 +333,9 @@
+         add_check(res, 'oversizeescape_zero', oversize == 0, 'oversizeescape=%s' % oversize)
+         exemptoffers = admission.get('exemptoffers')
+         if exemptoffers != 0:
+-            res['warnings'].append('exemptoffers=%s (zero-exempt path not covered by this PoC)' % exemptoffers)
+-        else:
+-            res['warnings'].append('exemptoffers=0: zero-exempt path not covered')
++            res['warnings'].append('exemptoffers=%s: 豁免路径有覆盖' % exemptoffers)
++        else:
++            res['warnings'].append('exemptoffers=0: 豁免路径未覆盖')
+         read_admit = admission.get('read_admit')
+         proxy = read_admit != 'none'
+         term_captures = terminal.get('captures')
+@@ -328,11 +357,12 @@
+         fastread = admission.get('fastread_captures')
+         if proxy:
+             if read_admit in ('buffer', 'ingress', 'progress', 'walk', 'outstanding', 'period') and win.get('mode') in ('n', 'pn'):
+-                if fastread is not None and fastread <= 0:
+-                    res['warnings'].append('fastread_captures=%s for %s mode %s expected >0' % (fastread, read_admit, win.get('mode')))
++                add_check(res, 'fastread_captures_gt0_proxy_%s_%s' % (win.get('mode'), read_admit),
++                          fastread is not None and fastread > 0,
++                          'fastread_captures=%s for %s mode %s expected >0' % (fastread, read_admit, win.get('mode')))
+             if win.get('mode') == 'p' and not win.get('runtime_N'):
+-                if fastread not in (0, None):
+-                    res['warnings'].append('fastread_captures=%s for mode p expected 0' % fastread)
++                add_check(res, 'fastread_captures_eq0_mode_p', fastread == 0,
++                          'fastread_captures=%s for mode p expected 0' % fastread)
+         trace_path = None
+         for arg in cmd:
+             if isinstance(arg, str) and arg.startswith('+event-trace='):
+@@ -353,22 +383,85 @@
+     groups = defaultdict(list)
+     for res in case_results:
+         groups[(res.get('mode'), res.get('ds_priority', 0))].append(res)
++
++    def find_case(mode, read_admit, ds_priority=0, runtime_N=None):
++        for r in case_results:
++            if r.get('mode') != mode or r.get('ds_priority', 0) != ds_priority:
++                continue
++            if r.get('read_admit') != read_admit:
++                continue
++            if runtime_N is not None and parse_int(r.get('runtime_N')) != runtime_N:
++                continue
++            return r
++        return None
++
++    def compare_case(label, baseline_label, case_r, base_r):
++        if not case_r or not base_r:
++            return {
++                'label': label,
++                'baseline': baseline_label,
++                'case': case_r.get('case') if case_r else None,
++                'baseline_case': base_r.get('case') if base_r else None,
++                'available': False,
++                'delta_W': None,
++                'rel_pct': None,
++                'delta_a_bytes_per_cycle': None,
++                'rel_pct_a_rate': None,
++            }
++        w = case_r.get('W_cycles')
++        bw = base_r.get('W_cycles')
++        rate = case_r.get('a_bytes_per_cycle')
++        brate = base_r.get('a_bytes_per_cycle')
++        return {
++            'label': label,
++            'baseline': baseline_label,
++            'case': case_r.get('case'),
++            'baseline_case': base_r.get('case'),
++            'available': True,
++            'W_cycles': w,
++            'baseline_W_cycles': bw,
++            'delta_W': (w - bw) if (w is not None and bw is not None) else None,
++            'rel_pct': (100.0 * (w - bw) / bw) if (w is not None and bw not in (None, 0)) else None,
++            'a_bytes_per_cycle': rate,
++            'baseline_a_bytes_per_cycle': brate,
++            'delta_a_bytes_per_cycle': (rate - brate) if (rate is not None and brate is not None) else None,
++            'rel_pct_a_rate': (100.0 * (rate - brate) / brate) if (rate is not None and brate not in (None, 0)) else None,
++        }
++
++    progress_pn = find_case('pn', 'progress', 0)
++    explicit_matched = [
++        compare_case('progress PN vs buffer P', 'buffer P 91874', progress_pn, find_case('p', 'buffer', 0)),
++        compare_case('progress PN vs buffer PN', 'buffer PN 93487', progress_pn, find_case('pn', 'buffer', 0)),
++        compare_case('progress PN vs outstanding PN', 'outstanding PN 92362', progress_pn, find_case('pn', 'outstanding', 0)),
++        compare_case('progress PN vs period1024 PN', 'period1024 PN 92227', progress_pn, find_case('pn', 'period', 0, 1024)),
++        compare_case('progress PN vs walk PN', 'walk PN 91091', progress_pn, find_case('pn', 'walk', 0)),
++        compare_case('priority progress PN vs priority buffer PN', 'priority buffer PN 79491', find_case('pn', 'progress', 1), find_case('pn', 'buffer', 1)),
++    ]
++
+     comparison = {
+         'schema': 'pte-progress-poc-comparison-v1',
+         'generated_at': datetime.now(timezone.utc).isoformat(),
+         'measurements': os.path.relpath(MEASUREMENTS_PATH, REPO_ROOT) if MEASUREMENTS_PATH.startswith(REPO_ROOT) else MEASUREMENTS_PATH,
+         'groups': [],
++        'explicit_matched_comparisons': explicit_matched,
+         'innovation_supported': False,
+-        'innovation_note': 'Only 5-cycle (0.0063%) difference between priority buffer PN and priority progress PN; no robust single-condition benefit. Progress PN is ~1.2% faster than buffer PN but still slower than P baseline; period1024 and walk are better; outstanding equals buffer PN. Do not recommend B as main method.',
++        'innovation_note': 'Only 5-cycle (0.0063%) difference between priority buffer PN (W=79491) and priority progress PN (W=79486); no robust single-condition benefit. Progress PN W=92362 is ~1.2% faster than buffer PN W=93487 but still slower than P baseline W=91874; period1024 W=92227 and walk W=91091 are better; outstanding equals progress PN at W=92362, not buffer PN 93487. Do not recommend B as main method. This is one fixed synthetic DDR-model condition, not a board/production result.',
+     }
+     for (mode, ds), items in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
+-        baseline = next((r for r in items if r.get('read_admit') == 'none'), None)
++        buffer_baseline = next((r for r in items if r.get('read_admit') == 'buffer'), None)
++        none_reference = next((r for r in items if r.get('read_admit') == 'none'), None)
++        baseline = buffer_baseline or none_reference
+         base_W = baseline.get('W_cycles') if baseline else None
++        base_rate = baseline.get('a_bytes_per_cycle') if baseline else None
+         group_entry = {
+             'mode': mode,
+             'ds_priority': ds,
+             'baseline_case': baseline['case'] if baseline else None,
++            'baseline_read_admit': baseline.get('read_admit') if baseline else None,
++            'baseline_kind': 'buffer' if buffer_baseline else ('none' if none_reference else None),
+             'baseline_W_cycles': base_W,
++            'none_reference_case': none_reference['case'] if none_reference else None,
++            'none_reference_W_cycles': none_reference.get('W_cycles') if none_reference else None,
+             'cases': [],
+         }
+         for res in sorted(items, key=lambda r: (str(r.get('read_admit')), r['case'])):
+@@ -387,6 +480,7 @@
+                 'budget_stall': res.get('admission', {}).get('budget_stall'),
+                 'delta_W_vs_baseline': (w - base_W) if (w is not None and base_W is not None) else None,
+                 'rel_pct_vs_baseline': (100.0 * (w - base_W) / base_W) if (w is not None and base_W not in (None, 0)) else None,
++                'delta_a_bytes_per_cycle_vs_baseline': (rate - base_rate) if (rate is not None and base_rate is not None) else None,
+             }
+             group_entry['cases'].append(entry)
+         comparison['groups'].append(group_entry)
+@@ -394,10 +488,14 @@
+         json.dump(comparison, f, indent=2, sort_keys=False)
+     with open(COMPARISON_CSV, 'w', newline='', encoding='utf-8') as f:
+         writer = csv.writer(f)
+-        writer.writerow(['group_mode', 'group_ds_priority', 'case', 'read_admit', 'policy_enable', 'runtime_N', 'W_cycles', 'a_bytes_per_cycle', 'baseline_case', 'baseline_W_cycles', 'delta_W', 'rel_pct'])
++        writer.writerow(['group_mode', 'group_ds_priority', 'case', 'read_admit', 'policy_enable', 'runtime_N', 'W_cycles', 'a_bytes_per_cycle', 'baseline_case', 'baseline_read_admit', 'baseline_W_cycles', 'delta_W', 'rel_pct'])
+         for g in comparison['groups']:
+             for c in g['cases']:
+-                writer.writerow([g['mode'], g['ds_priority'], c['case'], c['read_admit'], c['policy_enable'], c['runtime_N'], c['W_cycles'], c['a_bytes_per_cycle'], g['baseline_case'], g['baseline_W_cycles'], c['delta_W_vs_baseline'], c['rel_pct_vs_baseline']])
++                writer.writerow([g['mode'], g['ds_priority'], c['case'], c['read_admit'], c['policy_enable'], c['runtime_N'], c['W_cycles'], c['a_bytes_per_cycle'], g['baseline_case'], g['baseline_read_admit'], g['baseline_W_cycles'], c['delta_W_vs_baseline'], c['rel_pct_vs_baseline']])
++        writer.writerow([])
++        writer.writerow(['explicit_matched_label', 'baseline', 'case', 'baseline_case', 'available', 'W_cycles', 'baseline_W_cycles', 'delta_W', 'rel_pct', 'a_bytes_per_cycle', 'baseline_a_bytes_per_cycle', 'delta_a_bytes_per_cycle', 'rel_pct_a_rate'])
++        for m in comparison.get('explicit_matched_comparisons', []):
++            writer.writerow([m.get('label'), m.get('baseline'), m.get('case'), m.get('baseline_case'), m.get('available'), m.get('W_cycles'), m.get('baseline_W_cycles'), m.get('delta_W'), m.get('rel_pct'), m.get('a_bytes_per_cycle'), m.get('baseline_a_bytes_per_cycle'), m.get('delta_a_bytes_per_cycle'), m.get('rel_pct_a_rate')])
+     acceptance = {
+         'schema': 'pte-progress-poc-acceptance-v1',
+         'generated_at': datetime.now(timezone.utc).isoformat(),
+@@ -411,17 +509,20 @@
+         'innovation_note': comparison['innovation_note'],
+         'cases': case_results,
+         'notes': [
+-            'Original test PASS checks per-8-byte exact source/dest page verification, final CPU/DDR DMA quiet, and new AXI stability monitor; only log presence is checked here.',
++            'Original test PASS check uses exact final marker nonblock_actual_dma_test: PASS; per-8-byte exact source/dest page verification, final CPU/DDR DMA quiet, and new AXI stability monitor are still the original test scope, but this script only checks log marker presence and absence of SCENARIO-FAIL.',
++            '21 case names must be unique; actual case data come from original logs and measurements.json.',
+             'Proxy != none terminal captures == down_ar_fires, buffer_empty == 1, debt == 0; window captures != handshakes may have boundary pending and is not forced equal.',
+             'None: captures 0 / debt 0.',
+-            'Gate = ingress + budget; oversizeescape == 0; zero-exempt path is not covered by this PoC and is recorded as warning, not failure.',
+-            'fastread_captures > 0 for PN buffer/policies (N buffer also positive); false P baseline has 0.',
+-            'Trace CSV: events counted within (open, close]; newcaptured tagbit5 count == fastread_captures; mode none arfire nonzero and newcaptured 0 is normal.',
+-            'Progress phase budget: fastgated non-exempt current phase sum(len+1) <= 256, reset on phase_reset; only complete phases from first reset are checked; initial partial is listed separately.',
+-            'Walk phase check using ptw_start/end is not performed because those events are not in the specified event set.',
++            'Gate = ingress + budget; oversizeescape == 0; exemptoffers=0 means the exempt path was not covered and is recorded as a warning, not a failure; nonzero exemptoffers means the path was covered.',
++            'fastread_captures > 0 is required for proxy N/PN policy cases; fastread_captures == 0 is required for P baseline without runtime_N. These are required failures, not warnings.',
++            'Trace CSV schema is exactly cycle,event,tag,address,value. cycle is relative to win_open_cycle, so events are filtered by 0 < cycle <= W_cycles, not absolute open/close. value is AxLEN for newcaptured/firstoffer/arfire/gate/fastgated/exempt and is used for progress budget LEN.',
++            'Trace arfire count must equal admission.offer_handshakes; comp_ar_fire is only an additional non-required boundary sanity check.',
++            'Progress phase budget: for each complete phase from one phase_reset to the next, non-exempt fastgated sum(value+1) <= 256; same-cycle phase_reset and firstoffer is forbidden. Only the initial partial and final partial may be skipped, and they are explicitly recorded. If no full phase has charged fastgated non-exempt offers, nonvacuous coverage is not claimed.',
++            'Walk phase check using ptw_start/ptw_end is not additionally expanded in this revision; those events exist in the original trace and are not claimed absent.',
+             'No fabricated results/metrics; all data come from original logs and measurements.json; source hashes are in source-sha256.json.',
+             'Acceptance does not use B better as a functional pass condition; function/protocol check passed and innovation_supported=false are reported separately.',
+-            'Comparison groups by mode and DS priority; baseline is matching-buffer none-admit case, so buffered B is not unfairly compared to none P.',
++            'Comparison groups by mode and DS priority; baseline prefers the same-buffer case within the group (buffer P/PN where present), while none is kept only as a same-condition reference and is not used for new-policy attribution when a buffer baseline exists.',
++            'Explicit matched comparisons include progress PN vs buffer P, buffer PN, outstanding PN, period1024 PN, walk PN, and priority progress PN vs priority buffer PN, with delta_W and delta a_bytes_per_cycle rate.',
+         ],
+     }
+     with open(ACCEPTANCE_JSON, 'w', encoding='utf-8') as f:

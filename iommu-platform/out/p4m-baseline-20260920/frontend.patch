@@ -1,0 +1,698 @@
+--- a/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
++++ b/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+@@ -60,12 +60,17 @@
+     localparam logic [7:0] NextIdOffset       = 8'h28;
+     // Launcher register forwarding lives in the upper bank, above the batch window.
+     localparam logic [7:0] LauncherBase       = 8'hb0;
+-
+-    typedef enum logic [1:0] {
+-        IDLE    = 2'b00,
+-        COUNT   = 2'b01,
+-        WAIT    = 2'b10,
+-        HOLD    = 2'b11
++    // P4M gap control/capability live in the batch high bank and are carved
++    // out before the launcher decode so they never alias the launcher window.
++    localparam logic [7:0] GapCyclesOffset    = 8'hd0;
++    localparam logic [7:0] GapCapOffset       = 8'hd8;
++
++    typedef enum logic [2:0] {
++        IDLE    = 3'b000,
++        COUNT   = 3'b001,
++        WAIT    = 3'b010,
++        HOLD    = 3'b011,
++        GAP     = 3'b100
+     } idma_state_t;
+     idma_state_t state_q, state_n;
+ 
+@@ -96,6 +101,10 @@
+     logic [12:0] batch_pages_q;
+     logic [63:0] batch_id_q;
+     logic batch_cfg_ok, batch_task_issue, batch_task_done;
++    logic [31:0] gap_cycles_q;
++    logic [31:0] gap_countdown_q, gap_countdown_n;
++    logic gap_access;
++    logic batch_stop_write;
+ 
+     // Controlled-launch state
+     logic launcher_access;
+@@ -109,9 +118,14 @@
+     logic [DmaRegisterWidth-1:0] launch_id_q, launch_id_n;
+ 
+     assign full_addr = 8'(dma_ctrl_req_i.addr);
++    // The gap slots are exact BatchPort decodes and must be carved out before
++    // the launcher window, otherwise d0/d8 would alias launcher b0..ff.
++    assign gap_access = BatchPort && dma_ctrl_req_i.valid &&
++                        (full_addr == GapCyclesOffset || full_addr == GapCapOffset);
+     // Launcher window is carved out before the batch high-bank decode so 0xb0..0xff
+-    // never aliases the batch bank.
+-    assign launcher_access = LaunchPort && ObserverPort && dma_ctrl_req_i.valid && (full_addr >= LauncherBase);
++    // never aliases the batch bank, except for the exact gap slots above.
++    assign launcher_access = LaunchPort && ObserverPort && dma_ctrl_req_i.valid &&
++                             (full_addr >= LauncherBase) && !gap_access;
+     assign batch_access = BatchPort && dma_ctrl_req_i.valid && full_addr[7] && !launcher_access;
+     assign batch_active_o = BatchPort && batch_enable_q && state_q != IDLE;
+     assign locked_write = batch_active_o && dma_ctrl_req_i.valid &&
+@@ -131,6 +145,7 @@
+             batch_enable_q <= 0; batch_stop_q <= 0; batch_stopped_q <= 0;
+             batch_error_q <= 0; batch_target_q <= 0; batch_pages_q <= 0;
+             batch_issued_q <= 0; batch_completed_q <= 0; batch_id_q <= 0;
++            gap_cycles_q <= 0;
+         end else if (BatchPort) begin
+             if (batch_enable_q && issue) begin
+                 batch_issued_q <= 0; batch_completed_q <= 0;
+@@ -141,6 +156,8 @@
+                 batch_completed_q <= batch_completed_q + 1'b1;
+                 if (batch_stop_q) batch_stopped_q <= 1;
+             end
++            if (batch_enable_q && state_q == GAP && (batch_stop_q || batch_stop_write))
++                batch_stopped_q <= 1;
+             if (locked_write) batch_error_q <= 1;
+             // While a controlled launch job is active the batch bank is read-only:
+             // the write is rejected (AXI error) but must not poison batch_error_q.
+@@ -157,6 +174,7 @@
+                             batch_error_q <= 0;
+                             batch_issued_q <= 0;
+                             batch_completed_q <= 0;
++                            gap_cycles_q <= 0;
+                         end
+                     end else batch_error_q <= 1;
+                     8'h90: if (dma_ctrl_req_i.wdata > 0 && dma_ctrl_req_i.wdata <= 64'h100000000)
+@@ -165,6 +183,10 @@
+                     8'h98: if (dma_ctrl_req_i.wdata > 0 && dma_ctrl_req_i.wdata <= 4096)
+                         batch_pages_q <= dma_ctrl_req_i.wdata[12:0];
+                         else batch_error_q <= 1;
++                    8'hd0: if (dma_ctrl_req_i.wdata[63:32] == 0)
++                        gap_cycles_q <= dma_ctrl_req_i.wdata[31:0];
++                        else batch_error_q <= 1;
++                    8'hd8: batch_error_q <= 1;
+                     default: batch_error_q <= 1;
+                 endcase
+             end
+@@ -198,6 +220,12 @@
+     assign launch_base_write = LaunchPort && dma_ctrl_req_i.valid && dma_ctrl_req_i.write &&
+                                !batch_access && !observer_access && !launcher_access;
+     assign launch_locked_write = launch_busy && launch_base_write;
++
++    // Same-cycle STOP pulse for the GAP state.  This lets STOP win over a
++    // countdown-expiry edge in the same cycle as the 0x88 write.
++    assign batch_stop_write = batch_access && dma_ctrl_req_i.write && !launch_busy &&
++                              dma_ctrl_req_i.wstrb == 8'hff &&
++                              (full_addr == 8'h88) && (dma_ctrl_req_i.wdata == 2);
+ 
+     // Exactly 64-byte, DEFAULT, aligned, batch-disabled, idle-backend transfer with
+     // an all-zero configuration. CONF is compared per reg_pkg field to avoid packed
+@@ -228,7 +256,8 @@
+     // ordinary job, so it is a preflight "frontend busy" indicator. It is
+     // intentionally wider than launch_ctrl_q (the controlled job only); use
+     // launch_held_o / launch_busy to distinguish the controlled job.
+-    assign launch_active_o    = LaunchPort && (state_q == HOLD || state_q == COUNT || state_q == WAIT);
++    assign launch_active_o    = LaunchPort && (state_q == HOLD || state_q == COUNT ||
++                                               state_q == WAIT || state_q == GAP);
+ 
+     assign obs_issue_o = batch_enable_q ? batch_task_issue :
+                          (LaunchPort && (launch_ctrl_q || launch_hold_i)) ?
+@@ -385,6 +414,8 @@
+                     8'h98: dma_ctrl_rsp_o.rdata = 64'(batch_pages_q);
+                     8'ha0: dma_ctrl_rsp_o.rdata = 64'(batch_completed_q);
+                     8'ha8: dma_ctrl_rsp_o.rdata = 64'(batch_issued_q);
++                    8'hd0: dma_ctrl_rsp_o.rdata = {32'd0, gap_cycles_q};
++                    8'hd8: dma_ctrl_rsp_o.rdata = 64'h49444d4147415001;
+                     default: dma_ctrl_rsp_o.error = 1;
+                 endcase
+             end
+@@ -407,6 +438,7 @@
+         transf_counter_n  = transf_counter_q;
+         transf_offset_n   = transf_offset_q;
+         active_cycles_n   = active_cycles_q + DmaRegisterWidth'(!backend_idle_i);
++        gap_countdown_n   = gap_countdown_q;
+         state_n           = state_q;
+ 
+         unique case (state_q)
+@@ -487,11 +519,29 @@
+                         trans_complete = 1'b1;
+                         id_retire      = 1'b1;
+                         state_n = IDLE;
+-                    end
+-
+-                    else begin
++                    end else if (batch_enable_q && gap_cycles_q != '0) begin
++                        // Non-final batch completion: wait before offering the
++                        // next task.  The first task is never delayed.
++                        state_n         = GAP;
++                        gap_countdown_n = gap_cycles_q;
++                    end else begin
+                         state_n = COUNT;
+                     end
++                end
++            end
++
++            GAP: begin
++                // STOP wins over a same-cycle countdown expiry.  All issued
++                // jobs are already complete, so retire the functional batch ID
++                // without creating an extra obs_done.
++                if (batch_stop_q || batch_stop_write) begin
++                    id_retire = 1'b1;
++                    state_n   = IDLE;
++                end else if (gap_countdown_q <= 32'd1) begin
++                    state_n         = COUNT;
++                    gap_countdown_n = '0;
++                end else begin
++                    gap_countdown_n = gap_countdown_q - 32'd1;
+                 end
+             end
+ 
+@@ -530,6 +580,7 @@
+     `FF(transf_counter_q,   transf_counter_n,   '0,     clk_i, rst_ni)
+     `FF(transf_offset_q,    transf_offset_n,    '0,     clk_i, rst_ni)
+     `FF(active_cycles_q,    active_cycles_n,    '0,     clk_i, rst_ni)
++    `FF(gap_countdown_q,    gap_countdown_n,    '0,     clk_i, rst_ni)
+     `FF(launch_ctrl_q,      launch_ctrl_n,      1'b0,   clk_i, rst_ni)
+     `FF(launch_id_q,        launch_id_n,        '0,     clk_i, rst_ni)
+ 
+--- /dev/null
++++ b/tests/idma_p4m_gap_top.sv
+@@ -0,0 +1,97 @@
++`include "common_cells/registers.svh"
++`include "idma/typedef.svh"
++module idma_p4m_gap_top (
++    input logic clk_i, rst_ni,
++    // Production frontend control.
++    input logic prod_valid_i, prod_write_i,
++    input logic [7:0] prod_addr_i,
++    input logic [63:0] prod_wdata_i,
++    input logic [7:0] prod_wstrb_i,
++    input logic prod_ready_i, prod_complete_i,
++    output logic [63:0] prod_rdata_o,
++    output logic prod_ready_o, prod_error_o,
++    output logic prod_request_o,
++    output logic [63:0] prod_length_o,
++    output logic [1:0] prod_type_o,
++    output logic [63:0] prod_src_o, prod_dst_o,
++    output logic prod_issue_o, prod_done_o,
++    output logic [63:0] prod_issue_id_o, prod_done_id_o,
++    output logic prod_batch_active_o,
++    output logic prod_cfg_valid_o, prod_cfg_write_o,
++    output logic [7:0] prod_cfg_addr_o,
++    output logic [63:0] prod_cfg_wdata_o,
++    output logic [7:0] prod_cfg_wstrb_o,
++    // Renamed prechange golden frontend control.
++    input logic gold_valid_i, gold_write_i,
++    input logic [7:0] gold_addr_i,
++    input logic [63:0] gold_wdata_i,
++    input logic gold_ready_i, gold_complete_i,
++    output logic [63:0] gold_rdata_o,
++    output logic gold_ready_o, gold_error_o,
++    output logic gold_request_o,
++    output logic [63:0] gold_length_o,
++    output logic [1:0] gold_type_o,
++    output logic [63:0] gold_src_o, gold_dst_o
++);
++    typedef struct packed {logic valid, write; logic [7:0] addr; logic [63:0] wdata; logic [7:0] wstrb;} req_t;
++    typedef struct packed {logic ready, error; logic [63:0] rdata;} rsp_t;
++    typedef logic [63:0] addr_t;
++    typedef logic [3:0] id_t;
++    `IDMA_TYPEDEF_FULL_REQ_T(burst_t, id_t, addr_t, addr_t)
++
++    req_t prod_req, gold_req;
++    rsp_t prod_rsp, gold_rsp;
++    burst_t prod_burst, gold_burst;
++    logic prod_request, gold_request;
++    logic [1:0] prod_ttype, gold_ttype;
++    logic [63:0] prod_wdata, gold_wdata;
++
++    assign prod_req = {prod_valid_i, prod_write_i, prod_addr_i, prod_wdata_i, prod_wstrb_i};
++    idma_reg64_frontend #(
++        .dma_regs_req_t(req_t), .dma_regs_rsp_t(rsp_t),
++        .burst_req_t(burst_t), .AxiIdWidth(4),
++        .ObserverPort(1'b1), .BatchPort(1'b1), .LaunchPort(1'b1)
++    ) dut (
++        .clk_i, .rst_ni, .dma_ctrl_req_i(prod_req), .dma_ctrl_rsp_o(prod_rsp),
++        .burst_req_o(prod_burst), .valid_o(prod_request), .ready_i(prod_ready_i),
++        .backend_idle_i(!prod_request), .trans_complete_i(prod_complete_i),
++        .ttype_o(prod_ttype), .wdata_o(prod_wdata), .rdata_i('0), .rdata_valid_i(1'b0),
++        .batch_active_o(prod_batch_active_o),
++        .obs_issue_o(prod_issue_o), .obs_done_o(prod_done_o), .obs_poll_o(),
++        .obs_issue_id_o(prod_issue_id_o), .obs_done_id_o(prod_done_id_o), .obs_poll_id_o(),
++        .obs_cfg_valid_o(prod_cfg_valid_o), .obs_cfg_write_o(prod_cfg_write_o),
++        .obs_cfg_addr_o(prod_cfg_addr_o), .obs_cfg_wdata_o(prod_cfg_wdata_o),
++        .obs_cfg_wstrb_o(prod_cfg_wstrb_o), .obs_cfg_rdata_i(64'h49444d414f425301),
++        .launch_hold_i(1'b0), .launch_go_i(1'b0), .launch_cancel_i(1'b0),
++        .launch_held_o(), .launch_active_o(), .launch_cancelled_o(), .launch_error_o()
++    );
++
++    assign gold_req = {gold_valid_i, gold_write_i, gold_addr_i, gold_wdata_i, 8'hff};
++    idma_reg64_frontend_before #(
++        .dma_regs_req_t(req_t), .dma_regs_rsp_t(rsp_t),
++        .burst_req_t(burst_t), .AxiIdWidth(4)
++    ) gold (
++        .clk_i, .rst_ni, .dma_ctrl_req_i(gold_req), .dma_ctrl_rsp_o(gold_rsp),
++        .burst_req_o(gold_burst), .valid_o(gold_request), .ready_i(gold_ready_i),
++        .backend_idle_i(!gold_request), .trans_complete_i(gold_complete_i),
++        .ttype_o(gold_ttype), .wdata_o(gold_wdata), .rdata_i('0), .rdata_valid_i(1'b0)
++    );
++
++    assign prod_rdata_o = prod_rsp.rdata;
++    assign prod_ready_o = prod_rsp.ready;
++    assign prod_error_o = prod_rsp.error;
++    assign prod_request_o = prod_request;
++    assign prod_length_o = prod_burst.length;
++    assign prod_type_o = prod_ttype;
++    assign prod_src_o = prod_burst.src_addr;
++    assign prod_dst_o = prod_burst.dst_addr;
++
++    assign gold_rdata_o = gold_rsp.rdata;
++    assign gold_ready_o = gold_rsp.ready;
++    assign gold_error_o = gold_rsp.error;
++    assign gold_request_o = gold_request;
++    assign gold_length_o = gold_burst.length;
++    assign gold_type_o = gold_ttype;
++    assign gold_src_o = gold_burst.src_addr;
++    assign gold_dst_o = gold_burst.dst_addr;
++endmodule
+--- /dev/null
++++ b/tests/idma_p4m_gap_test.cpp
+@@ -0,0 +1,366 @@
++#include "Vidma_p4m_gap_top.h"
++#include "verilated.h"
++#include <cstdint>
++#include <iostream>
++#include <stdexcept>
++#include <vector>
++#include <algorithm>
++
++static void ck(bool b, const char* s) {
++    if (!b) throw std::runtime_error(s);
++}
++
++struct P4MBench {
++    Vidma_p4m_gap_top d;
++    uint64_t cycle = 0;
++    bool differential = false;
++
++    bool prod_valid = false, prod_write = false;
++    uint8_t prod_addr = 0;
++    uint64_t prod_wdata = 0, prod_wstrb = 0xff;
++    bool prod_stall = false;
++    uint64_t prod_due = 0;
++    std::vector<uint64_t> prod_src;
++    unsigned prod_completions = 0;
++    uint64_t prod_last_done = 0;
++    bool prod_have_done = false;
++    std::vector<uint64_t> prod_gaps;
++
++    bool gold_valid = false, gold_write = false;
++    uint8_t gold_addr = 0;
++    uint64_t gold_wdata = 0;
++    bool gold_stall = false;
++    uint64_t gold_due = 0;
++    std::vector<uint64_t> gold_src;
++    unsigned gold_completions = 0;
++
++    unsigned pages = 1;
++
++    void eval() {
++        d.clk_i = 0;
++        d.prod_valid_i = prod_valid;
++        d.prod_write_i = prod_write;
++        d.prod_addr_i = prod_addr;
++        d.prod_wdata_i = prod_wdata;
++        d.prod_wstrb_i = prod_wstrb;
++        d.prod_ready_i = !prod_stall;
++        d.prod_complete_i = prod_due && cycle == prod_due;
++
++        d.gold_valid_i = gold_valid;
++        d.gold_write_i = gold_write;
++        d.gold_addr_i = gold_addr;
++        d.gold_wdata_i = gold_wdata;
++        d.gold_ready_i = !gold_stall;
++        d.gold_complete_i = gold_due && cycle == gold_due;
++        d.eval();
++    }
++
++    void check_differential() {
++        ck(d.prod_request_o == d.gold_request_o, "differential request");
++        ck(d.prod_length_o == d.gold_length_o, "differential length");
++        ck(d.prod_type_o == d.gold_type_o, "differential type");
++        ck(d.prod_src_o == d.gold_src_o, "differential src");
++        ck(d.prod_dst_o == d.gold_dst_o, "differential dst");
++        ck(d.prod_rdata_o == d.gold_rdata_o, "differential rdata");
++        ck(d.prod_ready_o == d.gold_ready_o, "differential ready");
++        ck(d.prod_error_o == d.gold_error_o, "differential error");
++    }
++
++    void tick() {
++        eval();
++        if (differential) check_differential();
++
++        if (d.rst_ni && d.prod_request_o && d.prod_ready_i) {
++            ck(!prod_due, "one production task outstanding");
++            ck(d.prod_length_o == 4096 && d.prod_type_o == 0, "DEFAULT 4K copies");
++            if (prod_have_done) {
++                prod_gaps.push_back(cycle - prod_last_done - 1);
++            }
++            prod_src.push_back(d.prod_src_o);
++            prod_due = cycle + 7;
++            ck(d.prod_issue_o && d.prod_issue_id_o == prod_src.size() + 1,
++               "per-task production issue event");
++        }
++        if (d.rst_ni && d.gold_request_o && d.gold_ready_i) {
++            ck(!gold_due, "one golden task outstanding");
++            gold_src.push_back(d.gold_src_o);
++            gold_due = cycle + 7;
++        }
++        if (d.prod_complete_i) {
++            ck(d.prod_done_o && d.prod_done_id_o == prod_completions + 1,
++               "per-task production retirement");
++            prod_completions++;
++            prod_last_done = cycle;
++            prod_have_done = true;
++            prod_due = 0;
++        }
++        if (d.gold_complete_i) {
++            gold_completions++;
++            gold_due = 0;
++        }
++
++        if (differential) {
++            ck(prod_due == gold_due, "differential completion scheduling");
++        }
++
++        d.clk_i = 1; d.eval();
++        cycle++;
++        eval();
++    }
++
++    P4MBench() {
++        d.rst_ni = 0;
++        prod_valid = gold_valid = 0;
++        for (int i = 0; i < 2; i++) {
++            eval();
++            d.clk_i = 1; d.eval();
++            d.clk_i = 0; d.eval();
++        }
++        d.rst_ni = 1;
++        eval();
++        d.clk_i = 1; d.eval();
++        d.clk_i = 0; d.eval();
++    }
++
++    uint64_t access(unsigned addr, bool wr = false, uint64_t val = 0, uint8_t strb = 0xff) {
++        prod_valid = 1;
++        prod_write = wr;
++        prod_addr = addr;
++        prod_wdata = val;
++        prod_wstrb = strb;
++        eval();
++        ck(d.prod_ready_o, "MMIO ready");
++        uint64_t r = d.prod_rdata_o;
++        tick();
++        prod_valid = 0;
++        prod_wstrb = 0xff;
++        eval();
++        return r;
++    }
++
++    uint64_t legacy_access(unsigned addr, bool wr = false, uint64_t val = 0) {
++        prod_valid = 1; gold_valid = 1;
++        prod_write = wr; gold_write = wr;
++        prod_addr = addr; gold_addr = addr;
++        prod_wdata = val; gold_wdata = val;
++        prod_wstrb = 0xff;
++        eval();
++        ck(d.prod_ready_o && d.gold_ready_o, "legacy MMIO ready");
++        ck(d.prod_rdata_o == d.gold_rdata_o, "legacy read data");
++        ck(d.prod_error_o == d.gold_error_o, "legacy error");
++        uint64_t r = d.prod_rdata_o;
++        tick();
++        prod_valid = 0; gold_valid = 0;
++        eval();
++        return r;
++    }
++
++    void configure(unsigned n, unsigned w, uint32_t gap) {
++        pages = w;
++        access(0x00, 1, 0x10000);
++        access(0x08, 1, 0x100000);
++        access(0x10, 1, 4096);
++        access(0x18, 1, 0);
++        access(0x88, 1, 0);
++        access(0x90, 1, n);
++        access(0x98, 1, w);
++        access(0xd0, 1, gap);
++        ck(access(0xd8) == 0x49444d4147415001ULL, "gap capability magic");
++        ck(access(0xd0) == gap, "gap readback");
++        access(0x88, 1, 1);
++    }
++
++    void start() {
++        uint64_t id = access(0x28);
++        ck(id == 2, "one functional ID per batch");
++        tick();
++        ck(prod_src.size() == 1, "first job offered without gap");
++    }
++
++    void drain() {
++        for (unsigned i = 0; i < 200000 && (d.prod_batch_active_o || prod_due); i++) {
++            tick();
++        }
++        ck(!d.prod_batch_active_o && !prod_due, "batch eventually idle");
++    }
++};
++
++int main(int argc, char** argv) {
++    Verilated::commandArgs(argc, argv);
++    try {
++        unsigned cases = 0;
++
++        for (uint32_t gap : {0u, 1u, 7u, 1000u}) {
++            P4MBench b;
++            b.configure(4, 1, gap);
++            b.start();
++            while (b.prod_completions < 4) b.tick();
++            ck(b.prod_src.size() == 4, "exact finite count");
++            ck(b.prod_completions == 4, "exact completions");
++            ck(b.prod_gaps.size() == 3, "three inter-job gaps");
++            for (uint64_t g : b.prod_gaps) ck(g == gap, "exact extra gap cycles");
++            ck(!b.d.prod_batch_active_o, "idle after batch");
++            cases++;
++        }
++
++        {
++            P4MBench b;
++            b.configure(4, 1, 1000);
++            b.start();
++            ck(b.prod_src.size() == 1, "firstjob no gap");
++            while (b.prod_completions < 4) b.tick();
++            ck(b.prod_gaps.size() == 3, "firstjob then gaps");
++            for (uint64_t g : b.prod_gaps) ck(g == 1000, "firstjob gap exact");
++            cases++;
++        }
++
++        {
++            P4MBench b;
++            b.configure(1, 1, 1000);
++            b.start();
++            while (b.prod_completions < 1) b.tick();
++            ck(b.prod_gaps.empty(), "target1 no next offer");
++            ck(!b.d.prod_batch_active_o, "target1 no trailing gap");
++            ck(b.prod_completions == 1, "target1 one completion");
++            cases++;
++        }
++
++        {
++            P4MBench b;
++            b.configure(8, 1, 20);
++            b.start();
++            while (b.prod_completions < 1) b.tick();
++            ck(b.d.prod_batch_active_o, "GAP active");
++            b.access(0x88, 1, 2);
++            b.tick();
++            ck(!b.d.prod_batch_active_o, "STOP in GAP returns IDLE");
++            ck(b.prod_src.size() == 1, "STOP in GAP no extra offer");
++            ck(b.prod_completions == 1, "STOP in GAP no extra done");
++            ck((b.access(0x88) & 7) == 5, "STOP in GAP stopped status");
++            cases++;
++        }
++
++        {
++            P4MBench b;
++            b.configure(8, 1, 1);
++            b.start();
++            while (b.prod_completions < 1) b.tick();
++            ck(b.d.prod_batch_active_o, "GAP expiry active");
++            b.access(0x88, 1, 2);
++            b.tick();
++            ck(!b.d.prod_batch_active_o, "STOP expiry returns IDLE");
++            ck(b.prod_src.size() == 1, "STOP expiry no extra offer");
++            ck(b.prod_completions == 1, "STOP expiry no extra done");
++            cases++;
++        }
++
++        {
++            P4MBench b;
++            b.configure(64, 8, 0);
++            b.prod_stall = true;
++            b.access(0x28);
++            b.eval();
++            ck(b.d.prod_request_o, "stalled request valid");
++            uint64_t src0 = b.d.prod_src_o;
++            uint64_t dst0 = b.d.prod_dst_o;
++            uint64_t len0 = b.d.prod_length_o;
++            b.access(0x88, 1, 2);
++            for (int i = 0; i < 8; i++) {
++                b.eval();
++                ck(b.d.prod_request_o, "STOP cannot withdraw stalled valid");
++                ck(b.d.prod_src_o == src0 && b.d.prod_dst_o == dst0 &&
++                   b.d.prod_length_o == len0, "STOP cannot change stalled payload");
++                b.tick();
++            }
++            b.prod_stall = false;
++            b.drain();
++            ck(b.prod_src.size() == 1 && b.prod_completions == 1,
++               "stalled STOP safe completion");
++            cases++;
++        }
++
++        {
++            P4MBench b;
++            b.access(0x88, 1, 0);
++            b.access(0xd0, 1, 0x1234);
++            ck(b.access(0xd0) == 0x1234, "gap programmed");
++            b.access(0xd0, 1, 0x100000000ULL);
++            ck((b.access(0x88) >> 32) != 0, "upper gap bits rejected");
++            b.access(0x88, 1, 0);
++            ck((b.access(0x88) >> 32) == 0, "disable clears error");
++            b.access(0xd0, 1, 0x55);
++            b.access(0xd0, 1, 0x66, 0x0f);
++            ck((b.access(0x88) >> 32) != 0, "partial strobe rejected");
++            ck(b.access(0xd0) == 0x55, "gap unchanged on bad strobe");
++            b.access(0x88, 1, 0);
++            b.configure(8, 1, 0x77);
++            b.start();
++            b.access(0xd0, 1, 0x88);
++            ck((b.access(0x88) >> 32) != 0, "active gap write rejected");
++            ck(b.access(0xd0) == 0x77, "gap unchanged while active");
++            b.drain();
++            b.access(0x88, 1, 0);
++            b.access(0xd8, 1, 0);
++            ck((b.access(0x88) >> 32) != 0, "d8 write rejected");
++            cases++;
++        }
++
++        {
++            P4MBench b;
++            b.access(0x88, 1, 0);
++            b.access(0xd0, 1, 0x1234);
++            ck(b.access(0xd0) == 0x1234, "gap set");
++            b.access(0x88, 1, 0);
++            ck(b.access(0xd0) == 0, "disable zeroes gap");
++            cases++;
++        }
++
++        {
++            P4MBench b;
++            b.prod_valid = 1; b.prod_write = 1; b.prod_addr = 0xb0;
++            b.prod_wdata = 0; b.prod_wstrb = 0xff;
++            b.eval();
++            ck(b.d.prod_cfg_valid_o, "launcher b0 forwarded");
++            ck(b.d.prod_cfg_addr_o == 0xb0, "launcher b0 address");
++            b.tick();
++            b.prod_valid = 0; b.eval();
++
++            b.prod_valid = 1; b.prod_write = 1; b.prod_addr = 0xd0;
++            b.prod_wdata = 1; b.prod_wstrb = 0xff;
++            b.eval();
++            ck(!b.d.prod_cfg_valid_o, "gap d0 not forwarded to launcher");
++            b.tick();
++            b.prod_valid = 0; b.eval();
++            cases++;
++        }
++
++        {
++            P4MBench b;
++            b.differential = true;
++            b.legacy_access(0x00, 1, 0x10000);
++            b.legacy_access(0x08, 1, 0x100000);
++            b.legacy_access(0x10, 1, 4096);
++            b.legacy_access(0x18, 1, 0);
++            for (int t = 0; t < 3; t++) {
++                uint64_t id = b.legacy_access(0x28);
++                ck(id == 2, "legacy id");
++                for (int i = 0; i < 100 && b.prod_completions <= (unsigned)t; i++) {
++                    b.tick();
++                }
++                ck(b.prod_completions == (unsigned)t + 1, "legacy production completion");
++                ck(b.gold_completions == (unsigned)t + 1, "legacy golden completion");
++            }
++            ck(b.prod_src.size() == 3 && b.gold_src.size() == 3, "legacy count");
++            for (size_t i = 0; i < b.prod_src.size(); i++) {
++                ck(b.prod_src[i] == b.gold_src[i], "legacy source sequence");
++            }
++            cases++;
++        }
++
++        std::cout << "PASS " << cases << " P4M gap scenarios\n";
++        return 0;
++    } catch (const std::exception& e) {
++        std::cerr << "FAIL " << e.what() << "\n";
++        return 1;
++    }
++}
+--- /dev/null
++++ b/tests/test_idma_p4m_gap.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++"""Compile and run the P4M gap frontend test against production RTL and a
++renamed pinned prechange golden module generated with git show."""
++from pathlib import Path
++import subprocess
++
++root = Path(__file__).resolve().parents[1]
++cva6 = root / "cva6"
++out = root / "out/p4m-gap-20260920/frontend-gap"
++out.mkdir(parents=True, exist_ok=True)
++
++pin = "2b04936d2b4fe970bba4c97ab99f0a46a00eec06"
++base = "corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv"
++old = subprocess.check_output(["git", "-C", str(cva6), "show", f"{pin}:{base}"], text=True)
++(out / "before.sv").write_text(
++    old.replace("module idma_reg64_frontend #(", "module idma_reg64_frontend_before #(")
++       .replace("endmodule : idma_reg64_frontend", "endmodule : idma_reg64_frontend_before")
++)
++
++prim = cva6 / "corev_apu/register_interface/vendor/lowrisc_opentitan/src"
++files = [
++    cva6 / "vendor/pulp-platform/common_cells/include/common_cells/registers.svh",
++    cva6 / "vendor/pulp-platform/axi/src/axi_pkg.sv",
++    cva6 / "corev_apu/iDMA/src/idma_pkg.sv",
++    cva6 / "corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend_reg_pkg.sv",
++    prim / "prim_subreg_arb.sv",
++    prim / "prim_subreg.sv",
++    prim / "prim_subreg_ext.sv",
++    cva6 / "corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend_reg_top.sv",
++    cva6 / "corev_apu/iDMA/src/frontends/idma_transfer_id_gen.sv",
++    cva6 / base,
++    out / "before.sv",
++    root / "tests/idma_p4m_gap_top.sv",
++    root / "tests/idma_p4m_gap_test.cpp",
++]
++
++cmd = [
++    "verilator", "--cc", "--exe", "--build", "-Wno-fatal",
++    "--top-module", "idma_p4m_gap_top",
++    "--Mdir", str(out),
++    "-I" + str(cva6 / "vendor/pulp-platform/common_cells/include"),
++    "-I" + str(cva6 / "corev_apu/iDMA/src/include"),
++] + list(map(str, files))
++
++log_path = out / "build.log"
++with log_path.open("w") as log:
++    res = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
++if res.returncode != 0:
++    print(log_path.read_text())
++    raise SystemExit(res.returncode)
++
++res = subprocess.run([str(out / "Vidma_p4m_gap_top")])
++if res.returncode != 0:
++    raise SystemExit(res.returncode)
++print("PASS P4M gap build and run")

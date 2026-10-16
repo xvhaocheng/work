@@ -1,0 +1,458 @@
+--- tests/idma_batch_start_harness.c
++++ tests/idma_batch_start_harness.c
+@@ -62,8 +62,22 @@
+ static struct idma_device idmas[2];
+ static u64 now = 1000;
+ static bool signal_flag;
+-static unsigned irq_disabled_depth, preempt_disabled_depth;
++/*
++ * irq_disabled_depth models the CPU interrupt state, driver_irq_depth models
++ * only this driver's local_irq_save()/local_irq_restore() window.  Keeping them
++ * apart lets a case start with IRQs already disabled by the caller.
++ */
++static unsigned irq_disabled_depth, driver_irq_depth, preempt_disabled_depth;
+ static bool irq_pending, irq_serviced;
++static u64 irq_service_ns, last_restore_ns;
++/* Case knobs. */
++static bool inject_irq_on_a_trigger;
++static bool no_commit_before_v_trigger;
++static struct idma_stream *commit_watch;
++static unsigned stall_after_conf_write, signal_after_conf_write;
++static unsigned conf_writes, log_calls, crit_calls;
++static u64 stall_ns = 2 * NSEC_PER_MSEC;
++static struct idma_e3_diag_lane diag_lane[2];
+ 
+ enum mmio_op { MMIO_WRITE, MMIO_READ };
+ struct mmio_event { enum mmio_op op; int dev; size_t offset; u64 value; };
+@@ -104,8 +118,24 @@
+     size_t offset;
+     struct fake_dma *h = mmio(address, &dev, &offset);
+ 
++    /*
++     * Submission configuration must never be written with IRQs or preemption
++     * disabled; only the trigger reads belong to the protected section.
++     */
++    if (offset == IDMA_SRC_ADDR_REG_OFFSET || offset == IDMA_DST_ADDR_REG_OFFSET ||
++        offset == IDMA_NUM_BYTES_REG_OFFSET || offset == IDMA_CONF_REG_OFFSET)
++        assert(!irq_disabled_depth && !preempt_disabled_depth);
++
+     record_mmio(MMIO_WRITE, dev, offset, value);
+     h->regs[offset / 8] = value;
++
++    if (offset == IDMA_CONF_REG_OFFSET) {
++        conf_writes++;
++        if (stall_after_conf_write && conf_writes == stall_after_conf_write)
++            now += stall_ns;
++        if (signal_after_conf_write && conf_writes == signal_after_conf_write)
++            signal_flag = true;
++    }
+ }
+ 
+ static u64 readq(void *address)
+@@ -116,6 +146,24 @@
+     u64 value;
+ 
+     if (offset == IDMA_NEXT_ID_REG_OFFSET) {
++        /* NEXT_ID is the batch trigger: IRQs and preemption must be off. */
++        assert(irq_disabled_depth && preempt_disabled_depth);
++        if (inject_irq_on_a_trigger && dev == 1) {
++            assert(!irq_serviced);
++            irq_pending = true;
++        }
++        if (inject_irq_on_a_trigger && dev == 0) {
++            /*
++             * V is still inside the protected section with the injected IRQ
++             * pending: it must be neither serviced nor re-enabled yet.
++             */
++            assert(irq_pending && !irq_serviced);
++            assert(irq_disabled_depth && preempt_disabled_depth);
++        }
++        if (no_commit_before_v_trigger && dev == 0)
++            /* A valid A must not be published before the V trigger read. */
++            assert(commit_watch && !commit_watch->transfer_id &&
++                   !commit_watch->in_flight);
+         h->pending = true;
+         value = h->zero_id ? 0 : ++h->next_id;
+     } else {
+@@ -125,13 +173,19 @@
+     return value;
+ }
+ 
+-static u64 ktime_get_ns(void)
+-{
+-    now += 1000;
+-    if (irq_pending && !irq_disabled_depth && !irq_serviced) {
++/* A pending interrupt can only be taken once interrupts are enabled again. */
++static void irq_deliver_if_enabled(void)
++{
++    if (irq_pending && !irq_serviced && !irq_disabled_depth) {
+         irq_serviced = true;
+         irq_pending = false;
+-    }
++        irq_service_ns = now;
++    }
++}
++
++static u64 ktime_get_ns(void)
++{
++    now += 1000;
+     return now;
+ }
+ 
+@@ -141,8 +195,18 @@
+     return signal_flag;
+ }
+ 
+-#define local_irq_save(flags) do { (flags) = irq_disabled_depth++; } while (0)
+-#define local_irq_restore(flags) do { (void)(flags); assert(irq_disabled_depth); irq_disabled_depth--; } while (0)
++#define local_irq_save(flags) do { \
++    (flags) = irq_disabled_depth++; \
++    driver_irq_depth++; \
++} while (0)
++#define local_irq_restore(flags) do { \
++    assert(irq_disabled_depth == (unsigned long)(flags) + 1); \
++    irq_disabled_depth = (unsigned long)(flags); \
++    assert(driver_irq_depth); \
++    driver_irq_depth--; \
++    last_restore_ns = now; \
++    irq_deliver_if_enabled(); \
++} while (0)
+ #define preempt_disable() do { preempt_disabled_depth++; } while (0)
+ #define preempt_enable() do { assert(preempt_disabled_depth); preempt_disabled_depth--; } while (0)
+ 
+@@ -156,16 +220,21 @@
+     va_start(ap, fmt);
+     vsnprintf(log_buffer, sizeof(log_buffer), fmt, ap);
+     va_end(ap);
+-    assert(!irq_disabled_depth);
+-    assert(!preempt_disabled_depth);
++    log_calls++;
++    /* Only outside this driver's own protected trigger section. */
++    assert(!driver_irq_depth && !preempt_disabled_depth);
+ }
+ 
+ static void dev_crit(struct device *dev, const char *fmt, ...)
+ {
+     (void)dev;
+     (void)fmt;
+-    assert(!irq_disabled_depth);
+-    assert(!preempt_disabled_depth);
++    crit_calls++;
++    /*
++     * Quarantine logging is legal with a pre-existing caller IRQ-off state,
++     * but never while this driver still holds its own window open.
++     */
++    assert(!driver_irq_depth && !preempt_disabled_depth);
+ }
+ 
+ /* PRODUCTION_FUNCTIONS */
+@@ -206,12 +275,18 @@
+ {
+     now = 1000;
+     signal_flag = false;
+-    irq_disabled_depth = preempt_disabled_depth = 0;
++    irq_disabled_depth = driver_irq_depth = preempt_disabled_depth = 0;
+     irq_pending = irq_serviced = false;
++    irq_service_ns = last_restore_ns = 0;
++    inject_irq_on_a_trigger = no_commit_before_v_trigger = false;
++    commit_watch = NULL;
++    stall_after_conf_write = signal_after_conf_write = 0;
++    conf_writes = log_calls = crit_calls = 0;
+     mmio_count = 0;
+     log_buffer[0] = 0;
+     memset(hw, 0, sizeof(hw));
+     memset(idmas, 0, sizeof(idmas));
++    memset(diag_lane, 0, sizeof(diag_lane));
+ }
+ 
+ int main(int argc, char **argv)
+@@ -227,9 +302,14 @@
+     reset_state();
+ 
+     if (!strcmp(name, "order_both")) {
+-        unsigned first_trigger, second_trigger, a_conf = 0, v_conf = 0, i;
+-
+-        setup_streams(&v, &a, true);
++        unsigned first_trigger = (unsigned)-1, second_trigger = (unsigned)-1;
++        unsigned a_conf = (unsigned)-1, v_conf = (unsigned)-1, i;
++
++        setup_streams(&v, &a, true);
++        a.diagnostic = &diag_lane[1];
++        v.diagnostic = &diag_lane[0];
++        no_commit_before_v_trigger = true;
++        commit_watch = &a;
+         memset(&start, 0, sizeof(start));
+         start.v_did = 10;
+         start.a_did = 11;
+@@ -245,10 +325,13 @@
+         assert(start.irq_span_ns == start.v_end_ns - start.a_begin_ns);
+         assert(a.in_flight && v.in_flight);
+         assert(a.transfer_id == start.a_id && v.transfer_id == start.v_id);
+-        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        assert(!irq_disabled_depth && !driver_irq_depth && !preempt_disabled_depth);
+         assert(!a.retain && !v.retain);
+-
+-        first_trigger = mmio_count;
++        /* Commit bookkeeping and logging stay outside the trigger section. */
++        assert(!log_calls && !crit_calls);
++        assert(a.diagnostic->launch_end_ns == start.a_end_ns);
++        assert(v.diagnostic->launch_end_ns == start.v_end_ns);
++
+         for (i = 0; i < mmio_count; i++) {
+             if (mmio_events[i].op == MMIO_READ &&
+                 mmio_events[i].offset == IDMA_NEXT_ID_REG_OFFSET) {
+@@ -267,21 +350,18 @@
+                 mmio_events[i].offset == IDMA_SRC_ADDR_REG_OFFSET)
+                 v_conf = i;
+         }
+-        assert(a_conf && v_conf && a_conf < v_conf && v_conf < first_trigger);
++        /* Index 0 is a real A configuration write, never a "not found" value. */
++        assert(a_conf != (unsigned)-1 && v_conf != (unsigned)-1);
++        assert(a_conf == 0 && v_conf == 4 && first_trigger == 8);
++        assert(a_conf < v_conf && v_conf < first_trigger);
++        assert(mmio_events[a_conf].value == a.src_iova);
++        assert(mmio_events[v_conf].value == v.src_iova);
+         assert(mmio_events[first_trigger].dev == 1);
+         second_trigger = first_trigger + 1;
+-        while (second_trigger < mmio_count &&
+-               !(mmio_events[second_trigger].op == MMIO_READ &&
+-                 mmio_events[second_trigger].offset == IDMA_NEXT_ID_REG_OFFSET))
+-            second_trigger++;
+-        assert(second_trigger < mmio_count);
+-        assert(mmio_events[second_trigger].dev == 0);
+-        for (i = first_trigger + 1; i < second_trigger; i++)
+-            assert(mmio_events[i].op != MMIO_WRITE ||
+-                   (mmio_events[i].offset != IDMA_SRC_ADDR_REG_OFFSET &&
+-                    mmio_events[i].offset != IDMA_DST_ADDR_REG_OFFSET &&
+-                    mmio_events[i].offset != IDMA_NUM_BYTES_REG_OFFSET &&
+-                    mmio_events[i].offset != IDMA_CONF_REG_OFFSET));
++        assert(mmio_count == first_trigger + 2);
++        assert(mmio_events[second_trigger].op == MMIO_READ &&
++               mmio_events[second_trigger].offset == IDMA_NEXT_ID_REG_OFFSET &&
++               mmio_events[second_trigger].dev == 0);
+         printf("PASS %s\n", name);
+         return 0;
+     }
+@@ -290,6 +370,8 @@
+         unsigned i;
+ 
+         setup_streams(&v, &a, true);
++        a.diagnostic = &diag_lane[1];
++        v.diagnostic = &diag_lane[0];
+         hw[1].zero_id = true;
+         memset(&start, 0, sizeof(start));
+         start.v_did = 10;
+@@ -299,12 +381,19 @@
+         assert(ret == -EIO);
+         assert(start.attempted && start.a_triggered && !start.v_triggered);
+         assert(start.a_id == 0);
++        assert(start.irq_span_ns == start.a_end_ns - start.a_begin_ns);
+         assert(a.retain && idmas[1].quarantined);
+         assert(!v.retain && !idmas[0].quarantined);
+         assert(a.batch_started);
++        /* The untriggered V claim and its launch stamps are released. */
+         assert(!v.batch_started);
+-        assert(!v.in_flight && !a.in_flight);
+-        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        assert(!v.diagnostic->launch_begin_ns && !v.diagnostic->launch_end_ns);
++        /* A failed trigger publishes no ID and no completion. */
++        assert(!a.transfer_id && !a.in_flight);
++        assert(a.diagnostic->launch_begin_ns && !a.diagnostic->launch_end_ns);
++        /* Quarantine logging only after the protected section has closed. */
++        assert(crit_calls == 1 && !log_calls);
++        assert(!irq_disabled_depth && !driver_irq_depth && !preempt_disabled_depth);
+         for (i = 0; i < mmio_count; i++)
+             assert(!(mmio_events[i].op == MMIO_READ &&
+                      mmio_events[i].dev == 0 &&
+@@ -315,6 +404,8 @@
+ 
+     if (!strcmp(name, "v_zero_after_a")) {
+         setup_streams(&v, &a, true);
++        a.diagnostic = &diag_lane[1];
++        v.diagnostic = &diag_lane[0];
+         hw[0].zero_id = true;
+         memset(&start, 0, sizeof(start));
+         start.v_did = 10;
+@@ -323,11 +414,20 @@
+         ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
+         assert(ret == -EIO);
+         assert(start.attempted && start.a_triggered && start.v_triggered);
+-        assert(start.v_id == 0);
+-        assert(a.in_flight && !a.retain);
++        assert(start.v_id == 0 && start.a_id);
++        /*
++         * A was triggered with a valid ID and is published before V is
++         * retained, so the caller's STOP/drain of A stays safe.
++         */
++        assert(a.in_flight && !a.retain && a.transfer_id == start.a_id);
++        assert(!idmas[1].quarantined);
++        assert(a.diagnostic->launch_end_ns == start.a_end_ns);
++        /* V never produced an ID: retained, unknown, not in flight. */
+         assert(v.retain && idmas[0].quarantined);
+-        assert(v.batch_started);
+-        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        assert(v.batch_started && !v.in_flight && !v.transfer_id);
++        assert(v.diagnostic->launch_begin_ns && !v.diagnostic->launch_end_ns);
++        assert(crit_calls == 1 && !log_calls);
++        assert(!irq_disabled_depth && !driver_irq_depth && !preempt_disabled_depth);
+         printf("PASS %s\n", name);
+         return 0;
+     }
+@@ -373,30 +473,136 @@
+         assert(ret == -EINTR);
+         assert(!start.attempted && !start.a_triggered && !start.v_triggered);
+         assert(!a.batch_started && !v.batch_started);
+-        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        assert(!irq_disabled_depth && !driver_irq_depth && !preempt_disabled_depth);
+         assert(mmio_count == 0);
+         printf("PASS %s\n", name);
+         return 0;
+     }
+ 
++    if (!strcmp(name, "deadline_after_config")) {
++        unsigned i;
++
++        setup_streams(&v, &a, true);
++        v.diagnostic = &diag_lane[0];
++        a.diagnostic = &diag_lane[1];
++        /*
++         * The V configuration CONF write is the last write before the trigger
++         * section; stalling it must expire the rechecked deadline before
++         * either NEXT_ID read happens.
++         */
++        stall_after_conf_write = 2;
++        memset(&start, 0, sizeof(start));
++        start.v_did = 10;
++        start.a_did = 11;
++        start.has_a = true;
++        ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
++        assert(ret == -ETIMEDOUT);
++        assert(start.attempted && !start.a_triggered && !start.v_triggered);
++        assert(!start.a_id && !start.v_id && !start.irq_span_ns);
++        /* Both untriggered claims and their stamps must be released. */
++        assert(!a.batch_started && !v.batch_started);
++        assert(!a.diagnostic->launch_begin_ns && !a.diagnostic->launch_end_ns);
++        assert(!v.diagnostic->launch_begin_ns && !v.diagnostic->launch_end_ns);
++        assert(!a.in_flight && !v.in_flight);
++        assert(!a.retain && !v.retain);
++        assert(!idmas[0].quarantined && !idmas[1].quarantined);
++        assert(!irq_disabled_depth && !driver_irq_depth && !preempt_disabled_depth);
++        assert(!log_calls && !crit_calls);
++        assert(conf_writes == 2);
++        for (i = 0; i < mmio_count; i++)
++            assert(mmio_events[i].offset != IDMA_NEXT_ID_REG_OFFSET);
++        printf("PASS %s\n", name);
++        return 0;
++    }
++
++    if (!strcmp(name, "signal_after_config")) {
++        unsigned i;
++
++        setup_streams(&v, &a, false);
++        v.diagnostic = &diag_lane[0];
++        signal_after_conf_write = 1;
++        memset(&start, 0, sizeof(start));
++        start.v_did = 10;
++        start.a_did = IDMA_EXPERIMENT_NO_AGGRESSOR;
++        start.has_a = false;
++        ret = idma_batch_start(&v, NULL, now + 1000000, &end, &start);
++        assert(ret == -EINTR);
++        assert(start.attempted && !start.a_triggered && !start.v_triggered);
++        assert(!start.v_id && !start.irq_span_ns);
++        assert(!v.batch_started);
++        assert(!v.diagnostic->launch_begin_ns && !v.diagnostic->launch_end_ns);
++        assert(!v.in_flight && !v.retain && !idmas[0].quarantined);
++        assert(!irq_disabled_depth && !driver_irq_depth && !preempt_disabled_depth);
++        assert(!log_calls && !crit_calls);
++        assert(conf_writes == 1);
++        for (i = 0; i < mmio_count; i++)
++            assert(mmio_events[i].offset != IDMA_NEXT_ID_REG_OFFSET);
++        printf("PASS %s\n", name);
++        return 0;
++    }
++
+     if (!strcmp(name, "irq_restore_paths")) {
+-        setup_streams(&v, &a, true);
++        /*
++         * (a) IRQs start enabled and both triggers are valid.  The IRQ injected
++         * during the A trigger read stays pending through the V trigger and is
++         * only taken when interrupts are restored.
++         */
++        setup_streams(&v, &a, true);
++        inject_irq_on_a_trigger = true;
++        memset(&start, 0, sizeof(start));
++        start.v_did = 10;
++        start.a_did = 11;
++        start.has_a = true;
++        ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
++        assert(ret == 0);
++        assert(start.a_id && start.v_id && start.irq_span_ns);
++        assert(!irq_disabled_depth && !driver_irq_depth && !preempt_disabled_depth);
++        assert(irq_serviced && !irq_pending);
++        assert(irq_service_ns == last_restore_ns);
++        assert(a.in_flight && v.in_flight && !a.retain && !v.retain);
++
++        reset_state();
++
++        /*
++         * (b) IRQs start enabled and the A trigger fails: quarantine logging
++         * must happen after the protected section has been restored.
++         */
++        setup_streams(&v, &a, true);
++        inject_irq_on_a_trigger = true;
+         hw[1].zero_id = true;
+-        irq_pending = true;
+-        memset(&start, 0, sizeof(start));
++        memset(&start, 0, sizeof(start));
++        start.v_did = 10;
++        start.a_did = 11;
++        start.has_a = true;
+         ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
+         assert(ret == -EIO);
+-        assert(!irq_disabled_depth && !preempt_disabled_depth);
+-        assert(irq_pending || irq_serviced);
++        assert(a.retain && idmas[1].quarantined && !v.retain);
++        assert(crit_calls == 1 && !log_calls);
++        assert(!irq_disabled_depth && !driver_irq_depth && !preempt_disabled_depth);
++        assert(irq_serviced && !irq_pending);
++        assert(irq_service_ns == last_restore_ns);
+ 
+         reset_state();
+-        setup_streams(&v, &a, true);
+-        irq_pending = true;
+-        memset(&start, 0, sizeof(start));
+-        ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
+-        assert(ret == 0);
+-        assert(!irq_disabled_depth && !preempt_disabled_depth);
+-        assert(irq_pending && !irq_serviced);
++
++        /*
++         * (c) The caller already had IRQs disabled: the exact prior depth must
++         * be restored, the injected IRQ must stay unserviced, and the A
++         * quarantine log must still not run while the driver owns its window.
++         */
++        setup_streams(&v, &a, true);
++        inject_irq_on_a_trigger = true;
++        hw[1].zero_id = true;
++        irq_disabled_depth = 1;
++        memset(&start, 0, sizeof(start));
++        start.v_did = 10;
++        start.a_did = 11;
++        start.has_a = true;
++        ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
++        assert(ret == -EIO);
++        assert(a.retain && idmas[1].quarantined);
++        assert(crit_calls == 1 && !driver_irq_depth && !preempt_disabled_depth);
++        assert(irq_disabled_depth == 1);
++        assert(irq_pending && !irq_serviced && !irq_service_ns);
+         printf("PASS %s\n", name);
+         return 0;
+     }
+@@ -410,6 +616,7 @@
+         ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
+         assert(ret == 0);
+         idma_batch_start_log(&devices[0], &start, 42, 0);
++        assert(log_calls == 1 && !crit_calls);
+         assert(strstr(log_buffer, "idma_batch_start version=1 seq=42 method=irq_pair"));
+         assert(strstr(log_buffer, "v_did=10 a_did=11 attempted=1 has_a=1 a_triggered=1 v_triggered=1"));
+         assert(strstr(log_buffer, "a_id=101 v_id=101"));

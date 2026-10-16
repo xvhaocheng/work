@@ -1,0 +1,166 @@
+diff --git a/bench/idma_nonblock_read.c b/bench/idma_nonblock_read.c
+--- a/bench/idma_nonblock_read.c
++++ b/bench/idma_nonblock_read.c
+@@ -30,6 +30,9 @@
+ #define NB_WORDS     16
+ #define NB_MAGIC     0x49444D414E424C01ULL
+ #define NB_VERSION   1ULL
++#define DIAG_MAGIC   0x49444D414E444701ULL
++#define DIAG_VERSION 1ULL
++#define DIAG_FLAGS_FROZEN 4ULL
+ 
+ /*
+  * Register-block index base of the non-block window bank.
+@@ -38,6 +41,7 @@
+  * Task specification: index = 512 + 0xD00 + i  (== 0xF00 + i).
+  */
+ #define NB_INDEX_BASE (512ULL + 0xD00ULL)
++#define DIAG_INDEX_BASE (NB_INDEX_BASE + 16ULL)
+ 
+ #if defined(__riscv)
+ #define NB_BARRIER() __asm__ __volatile__("fence iorw, iorw" ::: "memory")
+@@ -63,7 +67,9 @@
+     return val;
+ }
+ 
+-static void emit_json(const uint64_t w[NB_WORDS])
++static void emit_json(const uint64_t w[NB_WORDS], int diagnostics,
++                      const uint64_t d[NB_WORDS], uint64_t core_fast_sum)
+ {
+     unsigned i;
+ 
+@@ -79,10 +85,18 @@
+     printf("],\"words\":[");
+     for (i = 0; i < NB_WORDS; i++)
+         printf("%s%" PRIu64, i == 0 ? "" : ",", w[i]);
+-    printf("]}\n");
++    printf("]");
++    if (diagnostics) {
++        printf(",\"diagnostic\":{\"words\":[");
++        for (i = 0; i < NB_WORDS; i++)
++            printf("%s%" PRIu64, i == 0 ? "" : ",", d[i]);
++        printf("],\"core_fast_sum\":%" PRIu64 "}", core_fast_sum);
++    }
++    printf("}\n");
+ }
+ 
+-int main(void)
++static void usage(const char *prog)
++{
++    fprintf(stderr, "usage: %s [--diagnostics]\n", prog);
++}
++
++int main(int argc, char **argv)
+ {
+     uint64_t words[NB_WORDS];
++    uint64_t diag[NB_WORDS];
+     uint64_t orig_index, status, flags, sum, tmp;
++    uint64_t core_fast_sum = 0, core_seq_before, core_seq_after;
++    uint64_t core_flags_before, core_flags_after;
+     void *map;
+-    int fd, rc = 0, ovf;
+-    unsigned i;
++    int fd, rc = 0, ovf, diagnostics = 0;
++    unsigned i, argi;
++
++    for (argi = 1; argi < (unsigned)argc; argi++) {
++        if (strcmp(argv[argi], "--diagnostics") == 0) {
++            diagnostics = 1;
++        } else {
++            usage(argv[0]);
++            return 2;
++        }
++    }
++    memset(diag, 0, sizeof(diag));
+ 
+     fd = open("/dev/mem", O_RDWR | O_SYNC);
+     if (fd < 0) {
+@@ -166,8 +180,76 @@
+         rc = 4;
+     }
+ 
++    if (rc == 0 && diagnostics) {
++        core_seq_before = words[4];
++        core_flags_before = words[3];
++        for (i = 0; i < NB_WORDS; i++) {
++            nb_write(REG_INDEX, DIAG_INDEX_BASE + (uint64_t)i);
++            diag[i] = nb_read(REG_DATA);
++        }
++        nb_write(REG_INDEX, NB_INDEX_BASE + 4ULL);
++        core_seq_after = nb_read(REG_DATA);
++        nb_write(REG_INDEX, NB_INDEX_BASE + 3ULL);
++        core_flags_after = nb_read(REG_DATA);
++
++        if (diag[0] != DIAG_MAGIC) {
++            fprintf(stderr, "bad diagnostic magic: 0x%016" PRIx64 "\n",
++                    diag[0]);
++            rc = 4;
++        }
++        if (diag[1] != DIAG_VERSION) {
++            fprintf(stderr, "bad diagnostic version: %" PRIu64 "\n", diag[1]);
++            rc = 4;
++        }
++        if (diag[2] != words[2]) {
++            fprintf(stderr,
++                    "diagnostic mode %" PRIu64 " != core mode %" PRIu64 "\n",
++                    diag[2], words[2]);
++            rc = 4;
++        }
++        if (diag[3] != DIAG_FLAGS_FROZEN) {
++            fprintf(stderr, "bad diagnostic flags: 0x%016" PRIx64 "\n",
++                    diag[3]);
++            rc = 4;
++        }
++        if (diag[4] != words[4]) {
++            fprintf(stderr,
++                    "diagnostic seq %" PRIu64 " != core seq %" PRIu64 "\n",
++                    diag[4], words[4]);
++            rc = 4;
++        }
++        if (diag[5] != words[5]) {
++            fprintf(stderr,
++                    "diagnostic cycles %" PRIu64 " != core cycles %" PRIu64
++                    "\n", diag[5], words[5]);
++            rc = 4;
++        }
++        if (core_seq_after != core_seq_before) {
++            fprintf(stderr,
++                    "core seq changed during diagnostic read: %" PRIu64
++                    " -> %" PRIu64 "\n", core_seq_before, core_seq_after);
++            rc = 4;
++        }
++        if (core_flags_after != core_flags_before) {
++            fprintf(stderr,
++                    "core flags changed during diagnostic read: 0x%016" PRIx64
++                    " -> 0x%016" PRIx64 "\n",
++                    core_flags_before, core_flags_after);
++            rc = 4;
++        }
++
++        core_fast_sum = 0;
++        ovf = 0;
++        for (i = 6; i <= 10; i++) {
++            if (__builtin_add_overflow(core_fast_sum, words[i], &tmp)) {
++                ovf = 1;
++                break;
++            }
++            core_fast_sum = tmp;
++        }
++        if (ovf) {
++            fprintf(stderr, "diagnostic core fast sum overflows 64 bits\n");
++            rc = 4;
++        } else if (core_fast_sum != diag[15]) {
++            fprintf(stderr,
++                    "diagnostic fast_accepts %" PRIu64
++                    " != sum(core fast 6..10) %" PRIu64 "\n",
++                    diag[15], core_fast_sum);
++            rc = 4;
++        }
++    }
++
+     if (rc == 0)
+-        emit_json(words);
++        emit_json(words, diagnostics, diag, core_fast_sum);
+ 
+ out_restore:
+     nb_write(REG_INDEX, orig_index);

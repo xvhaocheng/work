@@ -1,0 +1,111 @@
+_UNSET: Any = object()   # 哨兵：区分「未提供第四参数」与「显式传入 None」
+
+
+def validate_helper_diagnostic(label: str, diagnostic: Any,
+                               core_window: Any,
+                               core_fast_sum: Any = _UNSET) -> List[str]:
+    """校验可选第二诊断 bank（``helper.json`` 的 ``diagnostic`` 对象）。
+
+    只读传入对象；不导入 runner、不改写任何字段。fast 计数为 0 不是问题。
+
+    ``diagnostic`` 里可选的 ``core_fast_sum`` 字段只要**存在**就必须是整数：
+    显式 ``None`` / bool / 非整数均记为问题；字段缺失（可选）不作要求。
+    可选第四参数默认哨兵 ``_UNSET``，可区分「未提供」与「显式 None」；显式值
+    与 ``diagnostic['core_fast_sum']`` 并存且不一致时会报告，不静默忽略。
+    """
+    problems: List[str] = []
+    if not isinstance(diagnostic, dict):
+        return ['helper diagnostic 不是对象']
+
+    words = diagnostic.get('words')
+    if not isinstance(words, list) or len(words) != DIAG_WORDS:
+        if isinstance(words, list):
+            shape = 'len=%d' % len(words)
+        else:
+            shape = repr(words)[:80]
+        return ['helper diagnostic.words 不是 %d 个整数: %s' % (DIAG_WORDS, shape)]
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in words):
+        return ['helper diagnostic.words 含非整数或 bool（要求 uint64）']
+    if any(v < 0 or v > UINT64_MAX for v in words):
+        return ['helper diagnostic.words 超出 uint64 范围']
+
+    if words[0] != DIAG_MAGIC:
+        problems.append('diagnostic words[0] magic %r != %#x' % (words[0], DIAG_MAGIC))
+    if words[1] != DIAG_VERSION:
+        problems.append('diagnostic words[1] version %r != %d'
+                        % (words[1], DIAG_VERSION))
+
+    expected_mode = HELPER_MODE_FOR_LABEL.get(label)
+    if words[DIAG_MODE_INDEX] != expected_mode:
+        problems.append('diagnostic words[2] mode %r != %r (label=%s)'
+                        % (words[DIAG_MODE_INDEX], expected_mode, label))
+
+    flags = words[DIAG_FLAGS_INDEX]
+    overflow = (flags >> DIAG_OVERFLOW_BIT) & 1
+    low = flags & ((1 << DIAG_OVERFLOW_BIT) - 1)
+    if overflow != 0:
+        problems.append('diagnostic words[3] bit63 overflow=%d != 0' % overflow)
+    if low != DIAG_FLAGS_FROZEN:
+        problems.append('diagnostic words[3] frozen 低位 %r != %d'
+                        % (low, DIAG_FLAGS_FROZEN))
+
+    # --- 可选 core_fast_sum：先做「存在即必须是整数」的类型校验 --------------
+    # 无论 core 窗口是否可用都要拒绝 None / bool / 非整数；字段缺失不要求。
+    doc_has_fast_sum = 'core_fast_sum' in diagnostic
+    doc_fast_sum = diagnostic.get('core_fast_sum')
+    doc_fast_sum_ok = (doc_has_fast_sum and isinstance(doc_fast_sum, int)
+                       and not isinstance(doc_fast_sum, bool))
+    if doc_has_fast_sum and not doc_fast_sum_ok:
+        problems.append('diagnostic.core_fast_sum 不是整数: %r' % (doc_fast_sum,))
+
+    arg_given = core_fast_sum is not _UNSET
+    arg_fast_sum_ok = (arg_given and isinstance(core_fast_sum, int)
+                       and not isinstance(core_fast_sum, bool))
+    if arg_given and not arg_fast_sum_ok:
+        problems.append('diagnostic.core_fast_sum 不是整数: %r' % (core_fast_sum,))
+
+    # 显式参数与文档字段并存且不一致 -> 明确报告，不静默取其一。
+    if doc_fast_sum_ok and arg_fast_sum_ok and doc_fast_sum != core_fast_sum:
+        problems.append('显式 core_fast_sum %r 与 diagnostic.core_fast_sum %r 不一致'
+                        % (core_fast_sum, doc_fast_sum))
+
+    if core_window is None:
+        problems.append('诊断校验缺少 core 窗口，无法核对 seq/cycles/fast')
+        return problems
+    if not (isinstance(core_window, list) and len(core_window) == HELPER_WORDS
+            and all_ints(core_window)):
+        problems.append('core 窗口不是 %d 个整数，无法核对诊断' % HELPER_WORDS)
+        return problems
+
+    if words[DIAG_SEQ_INDEX] != core_window[HELPER_SEQ_INDEX]:
+        problems.append('diagnostic words[4] seq %r != core words[4] %r'
+                        % (words[DIAG_SEQ_INDEX], core_window[HELPER_SEQ_INDEX]))
+    if words[DIAG_CYCLES_INDEX] != core_window[HELPER_CYCLES_INDEX]:
+        problems.append('diagnostic words[5] cycles %r != core words[5] %r'
+                        % (words[DIAG_CYCLES_INDEX], core_window[HELPER_CYCLES_INDEX]))
+
+    total, ovf = sum_uint64([core_window[i] for i in HELPER_FAST_SLICE])
+    if ovf:
+        problems.append('core fast Σ 6..10 溢出 64 位')
+    elif words[DIAG_FAST_ACCEPT_INDEX] != total:
+        problems.append('diagnostic words[15] fast_accept %r != Σ(core 6..10) %r'
+                        % (words[DIAG_FAST_ACCEPT_INDEX], total))
+
+    # --- core_fast_sum 取值核对：文档字段与显式参数都各自核对，去重避免重复 ---
+    candidates: List[int] = []
+    if doc_fast_sum_ok:
+        candidates.append(doc_fast_sum)
+    if arg_fast_sum_ok:
+        candidates.append(core_fast_sum)
+    seen: List[int] = []
+    for value in candidates:
+        if value in seen:
+            continue
+        seen.append(value)
+        if value != total:
+            problems.append('diagnostic.core_fast_sum %r != Σ(core 6..10) %r'
+                            % (value, total))
+        elif value != words[DIAG_FAST_ACCEPT_INDEX]:
+            problems.append('diagnostic.core_fast_sum %r != diagnostic words[15] %r'
+                            % (value, words[DIAG_FAST_ACCEPT_INDEX]))
+    return problems

@@ -1,0 +1,381 @@
+# 有界源码取证（只读对照，不含架构裁决）
+
+**范围与声明**：以下全部来自你提供的 6 个文件的文本；我没有执行任何仿真/编译/测试，不声称任何测试通过。所有“是否能复用”“需要什么 wire”都是基于源码可见接口的取证性判断，实现方案由 Codex 决定。特别地，**TL 请求数减少 ≠ PTW 次数减少**：见 tl_wrap:375 `ptw_init = (state_q == PT) & ~iotlb_lu_hit;` 与 tl_wrap:1330 `if (iotlb_lu_hit) state_n = COMPLETE;`——一次 TL 请求可能命中 IOTLB（0 次 PTW）也可能不命中（≥1 次 PTW），与“是否合并子请求”是两条正交轴，下文不再把二者等同。
+
+---
+
+## 导航摘要
+
+| 问题 | 结论一句话 |
+|---|---|
+| (1) 字段/标签/PA 拼接 | TL 侧事实上只有 `(did, iova, ttype, pid, pid_valid, priv, is_debug, bank)`；**没有 AXI id**。TL 路由标签只有 `bank`。返回 PA 由 TL 内部拼好成 `spaddr`，TC 用 `spaddr` **整体替换**地址。 |
+| (2) TC→completion AR | AR 的 `id/len/size/burst/prot/...` 全部来自被保留在 AR FIFO 头部的原始 header，`addr` 用 TL 返回的 `spaddr`；TL 响应里没有任何 ID，靠“每 bank 单笔在飞 + bank 标签”关联。**bank 标签可跨不同请求复用**（它是 lane 索引，不是事务唯一号）；AXI id 亦可跨请求复用（AXI 语义），但**TL 响应无法用 id 索引**。 |
+| (3) 错误/权限/失效接口 | 有 `trans_resp.error/ignore/fault_code`、TC 的 error slave 分流、TL 内每次 lookup 重做的 W/RX/U/SUM 检查、`iotinval_i`/`iodirinval_i`。本 harness 里 invalidation 被**硬接 0**（非本 harness 可验证语义）。 |
+| (4) 能否辨认同原父的两个子 | **从 TL 侧接口不能**。父子关系只存在于上游 `pretl_owner_fragment` 的内部寄存器里，且 AXI id 在 trans_ctl 拷贝 tag 时被丢弃；缺口位置明确可指。 |
+| (5) 最少 out-only wires | 必需的是三类“上下文 + 响应载荷 + 握手/首子标记”。前两类在 `nonblock_banked_top` 里已是内部 wire，只是没导出；第三类（首子/父子归属性）**在 TL 侧不可能产生**，必须来自 pre-TL 拆分器。 |
+
+---
+
+## (1) trans_req / trans_resp 字段、tag、bank、ttype、读写判别、上下文键、PA 拼接
+
+### 1.1 结构定义（harness 侧类型即 DUT 端口类型）
+
+`tests/nonblock_banked_top.sv:296-305`：
+
+```systemverilog
+typedef struct packed {
+    logic [23:0] did;       // 297
+    logic [63:0] iova;      // 298
+    logic [5:0]  ttype;     // 299
+    logic [19:0] pid;       // 300
+    logic        pid_valid; // 301
+    logic        priv;      // 302
+    logic        is_debug;  // 303
+    logic        bank;      // 304
+} trans_req_data_t;
+```
+
+`tests/nonblock_banked_top.sv:307-324`：
+
+```systemverilog
+typedef struct packed {
+    logic        bank;        // 308
+    logic        error;       // 309
+    logic        ignore;      // 310
+    paddr_t      spaddr;      // 311  paddr_t = logic [55:0]  (:214)
+    logic        is_mrif;     // 312
+    rv_iommu::mrifc_content_t mrif_data; // 313
+    logic [2:0]  range;       // 314
+    logic        bypass;      // 315
+    rv_iommu::cause_t fault_code; // 316
+    logic        w;           // 317
+    logic        r;           // 318
+    logic        x;           // 319
+    logic        sum;         // 320
+    logic        g;           // 321
+    logic        u;           // 322
+    logic        t2gpa;       // 323
+} trans_resp_data_t;
+```
+
+要点：
+- **请求结构里没有任何 ID / sequence / parent / child / offset 字段**（296-305 全列）。
+- **响应结构里也没有 ID**，唯一的“事务级”关联位是 `bank`（308）。
+- `spaddr` 是 56 bit（`paddr_t`，:214），到 completion 时被零扩展成 64 bit（见 1.4）。
+
+### 1.2 上下文键来源（AXI header → tag 拷贝）
+
+AW header 类型 `tr_aw_chan_t`（`:219-237`）与 AR header 类型 `tr_ar_chan_t`（`:239-256`）字段：`id, addr, len, size, burst, lock, cache, prot, qos, region, atop, user, stream_id(24b=did), ss_id_valid, substream_id(20b=pid), mmu_atst, mmu_valid`。
+
+真正把这些填进 `trans_req_data_t` 的是 trans_ctl：
+
+写（`out/natural-write-order-20261008/trans_ctl_write_limit.sv:636-645`）：
+```systemverilog
+trans_req_data_n.iova       = aw_data.addr;
+trans_req_data_n.did        = aw_data.stream_id;
+trans_req_data_n.pid_valid  = aw_data.ss_id_valid;
+trans_req_data_n.pid        = aw_data.substream_id;
+trans_req_data_n.ttype      = aw_data.mmu_atst && !aw_data.mmu_valid ?
+                              rv_iommu::TRANSLATED_W : rv_iommu::UNTRANSLATED_W;
+trans_req_data_n.priv       = aw_data.prot[0];
+trans_req_data_n.is_debug   = 1'b0;
+```
+
+读（`trans_ctl_write_limit.sv:654-671`）：
+```systemverilog
+trans_req_data_n.iova       = ar_data.addr;
+trans_req_data_n.did        = ar_data.stream_id;
+trans_req_data_n.pid_valid  = ar_data.ss_id_valid;
+trans_req_data_n.pid        = ar_data.substream_id;
+if(ar_data.mmu_atst && !ar_data.mmu_valid)
+   trans_req_data_n.ttype   = (ar_data.prot[2]) ? TRANSLATED_RX : TRANSLATED_R;
+else
+   trans_req_data_n.ttype   = (ar_data.prot[2]) ? UNTRANSLATED_RX : UNTRANSLATED_R;
+trans_req_data_n.priv       = ar_data.prot[0];
+trans_req_data_n.is_debug   = 1'b0;
+```
+
+**取证结论（缺口 1）**：这里 `aw_data.id` / `ar_data.id` **完全没有**被拷贝进 `trans_req_data_*`（结构里也没有该字段）。AXI id 只留在 AW/AR FIFO 的 header 里，供 completion 复用（见 (2)）。
+
+**`bank` 不是在 trans_ctl 里设置的**，而是在 banked_ctl 合并两 lane 时覆写：
+
+`cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_banked_ctl.sv:372-377`：
+```systemverilog
+always_comb begin : bank_req_tag
+    bank_req_data[0]       = bank_trans_req_data[0];
+    bank_req_data[0].bank  = 1'b0;
+    bank_req_data[1]       = bank_trans_req_data[1];
+    bank_req_data[1].bank  = 1'b1;
+end
+```
+（注释 :367-368 明确“只覆写 `.bank`，其余 header 字段 bit-exact 保留”。合并用 round-robin `stream_arbiter`，:379-392。）
+
+### 1.3 ttype / 读 / 写判别（TL 内部权威判据）
+
+`cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv:397-419`：
+```systemverilog
+assign is_translated = (!req_data.ttype[3] && req_data.ttype[2]);          // 398
+assign is_store      = ((&req_data.ttype[1:0]) & (~req_data.ttype[3]));   // 416
+assign is_rx         = (!req_data.ttype[3] & !req_data.ttype[1] & req_data.ttype[0]); // 419
+```
+trans_ctl 侧同样的判据（供 BC 与 completion 用）在 `trans_ctl_write_limit.sv:271-278`（`is_read`/`is_write`）。
+
+**取证结论**：TL 请求里**没有独立的 r/w 位**；读写是由 `ttype` 推导的（trans_ctl 生成，TL 再解析）。`priv` 来自 `AxPROT[0]`，`is_rx` 来自 `AxPROT[2]`。
+
+### 1.4 返回 PA 的拼接
+
+TL 侧拼 PA（IOTLB 命中，非超页）：`rv_iommu_tl_wrap.sv:1409-1412`
+```systemverilog
+spaddr_n = {((en_2S_q) ? (iotlb_lu_content.content_2S.ppn[PPNW-1:0])
+                       : (iotlb_lu_content.content_1S.ppn[PPNW-1:0])),
+            req_data.iova[11:0]};
+```
+超页则按 `is_2M/is_1G` 组合 PPN 与 iova 位（`:1415-1448`）。旁路/identity 默认值是 `spaddr_n = paddr_t'(req_data.iova);`（`:1019`）。
+
+响应打包：`rv_iommu_tl_wrap.sv:462-478`（含 `slow_resp_data.bank = req_data.bank;` :462；`slow_resp_data.spaddr = spaddr_q;` :466）。
+
+TC 侧**整体替换**地址：`trans_ctl_write_limit.sv:334-362`
+```systemverilog
+axi_comp_req.aw.addr = addr_t'(trans_resp_data_q.spaddr);   // 338
+...
+axi_comp_req.ar.addr = addr_t'(trans_resp_data_q.spaddr);   // 352
+```
+`trans_resp_data_q.spaddr` 是 56 bit，被 `addr_t'`（64 bit）零扩展。
+
+**关键副产物（复用正确性）**：`spaddr` 含 `iova[11:0]`（:1412）。因此**“把第一个子的 spaddr 原样搬给第二个子”只有在两者页内偏移相同时才等价**；页内偏移不同时必须用缓存的 PPN/基址重新拼 `iova[11:0]`。这直接影响 (5) 的“缓存什么”。
+
+其它从 response 出来的 completion 字段：`aw/ar` 的 `len/size/burst/lock/cache/prot/qos/region/user` 全部来自 **AR/AW FIFO 头部**（`trans_ctl_write_limit.sv:339-348, 353-361`），不是来自 TL。即**一次 TL 翻译结果只对应一条 completion AW/AR**，长度/ID 等仍由被保留的原始 header 决定。
+
+---
+
+## (2) 原 TC 如何把 TL resp 送到 completion AR；tag 能否跨不同请求复用
+
+### 2.1 控制流（单笔在飞）
+
+`trans_ctl_write_limit.sv`：
+- `IDLE`：先 AW 后 AR（:630-675）。AR 入口带 admission 条件：`:651-652`（`!ReadAdmissionEnable || read_admit_i || (fullbuffer_job_i && ar_data.stream_id == FullBufferDID)`），`FullBufferDID = 24'(10 + b)` 由 banked_ctl 传入（banked_ctl:319）。
+- `REQ_TRANS`：`:679-695` 拉 `trans_req_valid_o=1`；`trans_req_ready_i` 后进 `AWAIT_RESP`；BC 失败直接进 COMPLETE 并置 `error`。
+- `AWAIT_RESP`：`:698-708`
+  ```systemverilog
+  trans_resp_ready_o = 1'b1;                                  // 700
+  if (trans_resp_valid_i) begin
+      trans_resp_data_n = trans_resp_data_i;                  // 704  整体锁存
+      state_n = (trans_resp_data_i.is_mrif && !trans_resp_data_i.error)
+                ? (MRIF) : (COMPLETE);                        // 705-706
+  end
+  ```
+- `COMPLETE`：`:721-732`
+  ```systemverilog
+  complete_read  = is_read;   // 723
+  complete_write = is_write;  // 724
+  if ((axi_comp_resp.ar_ready && is_read) ||
+      (axi_comp_resp.aw_ready && is_write)) begin
+      aw_ready = is_write; ar_ready = is_read; state_n = IDLE; // 728-730
+  end
+  ```
+
+### 2.2 AR 通道字段来源
+
+`trans_ctl_write_limit.sv:351-362`：
+```systemverilog
+axi_comp_req.ar.id      = ar_data.id;                    // 351  来自 AR FIFO 头
+axi_comp_req.ar.addr    = addr_t'(trans_resp_data_q.spaddr); // 352  来自 TL
+axi_comp_req.ar.len     = ar_data.len;                   // 353
+axi_comp_req.ar.size    = ar_data.size;                  // 354
+axi_comp_req.ar.burst   = ar_data.burst;                 // 355
+axi_comp_req.ar.lock    = ar_data.lock;                  // 356
+axi_comp_req.ar.cache   = ar_data.cache;                 // 357
+axi_comp_req.ar.prot    = ar_data.prot;                  // 358
+axi_comp_req.ar.qos     = ar_data.qos;                   // 359
+axi_comp_req.ar.region  = ar_data.region;                // 360
+axi_comp_req.ar.user    = ar_data.user;                  // 361
+axi_comp_req.ar_valid   = complete_read;                 // 362
+```
+AR header 保留在 `stream_fifo i_ar_stream_fifo`（:146-164），弹出时机就是 `ar_ready`（:729）。**TL 响应里没有 ID，AR 的 ID 完全是“从 FIFO 头借回来”的。**
+
+错误分流：`trans_ctl_write_limit.sv:532-543`（无 MRIF 时）
+```systemverilog
+if (trans_resp_data_q.error) slv_idx = 1'b0;   // 536  -> error slave
+else                          slv_idx = 1'b1;   // 541  -> comp IF
+```
+error slave 为 `axi_err_slv`，返回 `RESP_SLVERR`（:588-603）。因此**错误响应根本不走 `comp_axi_req_o`**，也就不会用到 `spaddr`。
+
+### 2.3 banked_ctl 侧的 ID 处理与 bank 标签
+
+- 入口用 immutable 原 ID 位选 bank：`rv_iommu_banked_ctl.sv:243-244`
+  ```systemverilog
+  assign aw_sel = tr_axi_req_i.aw.id[BankIdBit];
+  assign ar_sel = tr_axi_req_i.ar.id[BankIdBit];
+  ```
+- 出口 AW/AR **丢掉冗余 MSB bank 位**：`:461`（`aw.id = mux_mst_req.aw.id[AxiIdWidth-1:0]`）、`:483`（ar 同理）。
+- 入口 B/R **从原 ID 重建**该 MSB：`:511`（`b.id = {comp_axi_resp_i.b.id[BankIdBit], ...}`）、`:516`（r 同理）。注释 :26-31 说明“外部 completion slave 必须原样回显 AW/AR ID”。
+- 响应按 bank 路由：`:400-408`
+  ```systemverilog
+  bank_trans_resp_valid[0] = trans_resp_valid_i && (trans_resp_data_i.bank == 1'b0);
+  bank_trans_resp_valid[1] = trans_resp_valid_i && (trans_resp_data_i.bank == 1'b1);
+  assign trans_resp_ready_o = trans_resp_data_i.bank ? bank_trans_resp_ready[1]
+                                                     : bank_trans_resp_ready[0];
+  ```
+- 架构假设写死在头注释里：`rv_iommu_banked_ctl.sv:42-46` —— “下游翻译引擎必须把收到的 `bank` 回显到 `trans_resp_data_i`；每 bank 至多一笔在飞，使 `bank` 成为无歧义的生命周期标签，并保证 bank 局部 header（保留在 bank AW/AR FIFO 头直到 COMPLETE）属于该标签。”
+
+### 2.4 “tag 能否跨不同 request 复用”
+
+分两类，结论不同：
+
+1. **`bank` 标签：可以，而且本来就是复用的。** 它是 lane 索引（0/1），不是事务唯一号；每个新请求都复用同一个 bank 值。安全性由“每 bank 单笔在飞”保证（trans_ctl FSM 状态机 + banked_ctl:42-46；`in_flight_o = (state_q != IDLE)`，`trans_ctl_write_limit.sv:105`）。**约束**：同一 bank 内并发两笔会让 `bank` 不再无歧义——这正是 (5) 要实现“缓存复用”时的直接障碍。
+2. **AXI id：按 AXI 语义可以跨不同请求复用**（id 只在同时在飞集合内唯一）。banked_ctl 保持 bank 内部为原始 ID 宽度并靠 `id[BankIdBit]` 重建 MSB（:511/:516），trans_ctl 用 `ar_data.id` 回填 completion（:351）。**但**：TL 响应中**不含**该 id，所以**不能用 id 去索引/匹配一次 TL 响应**；只能靠 `(bank, 顺序)`。
+
+**取证结论**：若不改动 TL 接口，外部无法从一次 `trans_resp` 反查“它是哪一条 AXI 请求”；反过来，若要让第二个子复用第一个子的翻译结果而不再发 TL 请求，则第二条 completion AR 的 `id/len/prot/...` 必须由缓存者自己重建（因为 `i_ar_stream_fifo` 的头属于**第二个子自己的 AR**，其 header 是真实的，但 `spaddr` 没有对应 TL 响应可拿——只能取缓存）。
+
+---
+
+## (3) 会影响“已有译址结果复用”的真实接口：错误 / 权限 / invalidation
+
+### 3.1 响应里的错误/忽略位
+
+`rv_iommu_tl_wrap.sv:462-478` 打包 `slow_resp_data.{bank,error,ignore,spaddr,is_mrif,mrif_data,range,bypass,fault_code,w,r,x,sum,g,u,t2gpa}`；`ERROR` 态置 `error_n`（:1515-1541）；MSI ignore 路径置 `ignore_n`（:1488-1490）。TC:704 整包锁存，:535 分流到 error slave。
+
+**对复用的含义**：`error`/`ignore` 是**逐请求**产物。缓存命中若绕过 TL，就等于绕过该逐请求判定——除非缓存者自己重放这些位。
+
+### 3.2 权限检查是逐次 lookup 重做（不是一劳永逸）
+
+- DDT 命中后的事务类型/权限 gating：`rv_iommu_tl_wrap.sv:1118-1124`（translated/ATS 且 `!en_ats`；`pid_valid && !pdtv`；`pid_valid && dtf && pid_invalid`；`!pid_valid && !dpe && priv`），可落到 `COMPLETE`（当 `dtf`）或 `ERROR`。
+- PDT 命中：`:1247-1249`（`priv && !ens` → COMPLETE/ERROR）。
+- **IOTLB 命中后的第一级检查**：`:1374-1385`
+  ```systemverilog
+  if (en_1S_q && (
+      (is_store && !content_1S.w) ||
+      (is_rx && !content_1S.r && !content_1S.x) ||
+      (!req_data.priv && !content_1S.u) ||
+      (req_data.priv && content_1S.u && (!pc_q.ta.sum || is_rx))))
+  ```
+- 第二级检查：`:1392-1404`。
+
+**对复用的含义（重要）**：这些检查依赖 **该次请求的** `is_store`/`is_rx`/`req_data.priv`/`pc_q.ta.sum`。因此“同一原父的两个子”若 ttype（load vs store vs rx）或 `priv` 不同，**共享同一份 IOTLB/spaddr 结果并不自动合法**；TL 目前是每次命中都重跑这些检查，缓存者若绕过 TL 就必须自行保证或限制同质性。这是我不能替 Codex 决定的部分，仅指出源码事实。
+
+### 3.3 invalidation 接口
+
+- 端口：`rv_iommu_tl_wrap.sv:100-101`
+  ```systemverilog
+  input rv_iommu::iotlb_inval_t iotinval_i,
+  input rv_iommu::xdtc_inval_t  iodirinval_i,
+  ```
+- 分发：IOTLB `:667`、DDTC `:511`、PDTC `:590`（gen 内）、MRIFC `:905`。
+- 进入 nonblocking 探测器的 invalidate 合并：`:320-321`（`iotinval_vma || iotinval_gvma || iodirinval_ddtc || iodirinval_pdtc`）。
+- 参与 `policy_quiet_o`：`:300-302`。
+- **本 harness 把它们硬接 0**：`tests/nonblock_banked_top.sv:591-597`
+  ```systemverilog
+  rv_iommu::iotlb_inval_t iotinval_i;
+  rv_iommu::xdtc_inval_t  iodirinval_i;
+  ...
+  always_comb begin
+      iotinval_i   = '0;
+      iodirinval_i = '0;
+  end
+  ```
+  （同样 `fctl_i = '0`，:579-582；`capabilities_i` 只置 sv39/pas，:572-577。）
+
+**取证结论/不确定性**：在当前 harness 里**不可能发生任何 invalidation**，因此“缓存结果被 invalidate 后必须失效”这条语义在本 harness 中不可被激励，也就无法用它作为复用正确性的证据。这属于我需要标注的不确定项，而不是可以下结论的地方。
+
+---
+
+## (4) 现有能否明确辨认“两个子属于同一原父”；缺口在哪
+
+**结论：从 TL 侧完全不能；从 harness 端口侧不能；只有 pre-TL 拆分器内部知道，但该信息没有传播。**
+
+逐层证据：
+
+1. **TL 请求里没有可归组字段**。`trans_req_data_t` 全字段见 :296-305；能作为“上下文键”的只有 `did/pid/pid_valid/iova/ttype/priv/is_debug/bank`。两个子若来自同一 DMA、同一 pid、同一 4 KiB 页、同类 ttype，则**除了 `iova` 的页内偏移外完全同形**，TL 也无从知道二者同源。
+2. **AXI id 被丢弃**。trans_ctl 只拷贝 `addr/stream_id/ss_id_valid/substream_id/prot/AxPROT[0]/AxPROT[2]`（:636-671），**从未**把 `aw_data.id`/`ar_data.id` 写进 `trans_req_data_*`；结构里也没有该字段。因此“同一 id 的连续子”这条天然线索在 TL 入口已不可见。
+3. **父子关系只活在上游拆分器内部**。`out/fragment-placement-20261008/pretl_owner_fragment.sv`：
+   - 内部状态：`parent_q[2][ParentDepth]`（:30）、`offset_q`（:31）、`returned_q`（:32）、`done_q`（:33）；
+   - 子 AR 生成：`:90-103`（`remain = parent.len+1 - returned`；`candidate.addr = parent.addr + returned*8`；`candidate.len = capacity-1`）；
+   - 子 AR 合法性/连续性检查：`:166-173`（`s_ar_i.id != (s==0 ? 4'd0 : 4'd4)`、`addr` 相对 `src_q`、`addr[2:0]==0`、`size==3`、页内不跨 4 KiB 等）；
+   - **对外只导出 4 个 32-bit 计数器**：`:26-27`（`parent_count_o, child_count_o, merged_count_o, parent_last_count_o`）。
+   即：模块内部明确知道“这是第几个子、属于哪个 parent slot”，但该信息**没有出现在任何被发送的 AXI 事务或 TL tag 里**。
+4. **同 bank 场景下连 `bank` 都不再能区分两台 DMA**。`out/fragment-placement-20261008/pre_actual_dma_top.sv:480-484` 的注释与实现：
+   ```systemverilog
+   // Independently track DMA identity at the real completion AW first offer.
+   // A shared bank mux port alone no longer identifies its W source stream.
+   assign physical_w_stream = SameBankDmasEnable ?
+       physical_stream_order_q[physical_stream_rd_q] :
+       i_sys.gen_banked.i_banked.i_out_axi_mux.gen_mux.w_fifo_data[0];
+   ```
+   配套 FIFO 在 :485-499。同时 `BankIdBit(SameBankDmasEnable ? 3 : 2)`（:845）——same-bank 实验下 bank 位不再是 DMA 身份。
+5. **上游 id 打包处只加了 bank 位**（不是父子标签）：`pre_actual_dma_top.sv:550-558`
+   ```systemverilog
+   pre_owner = !(pool_m_req[0].ar_valid && pre_flow_ready[0]);   // 551
+   pre_parent_ar = axi_tr4_ar_chan_t'(pool_m_req[pre_owner].ar); // 553
+   pre_parent_ar.id = {1'b0, pre_owner, pool_m_req[pre_owner].ar.id}; // 554
+   ```
+
+**缺口定位（精确）：**
+- 缺口 A：`trans_ctl_write_limit.sv:636-671`（tag 拷贝处）丢弃 `id`；`tests/nonblock_banked_top.sv:296-305`（`trans_req_data_t`）无 id/父子字段。
+- 缺口 B：`pretl_owner_fragment.sv:26-27` 只导出计数器；`parent_q/offset_q/returned_q/done_q` 与“首子/非首子”判定（`:90-103`）全部内藏。
+- 缺口 C：同一 bank 场景下 `bank` 不再是身份（`pre_actual_dma_top.sv:480-484`，`nonblock_banked_top.sv:845`），需要 `did` 才能区分两台 DMA。
+- 结论：**当前不存在任何可被下游消费的“同原父”标记**；关系只能靠“同 did + 同页 + 连续页内偏移 + 同一 bank 次序”间接推测，而这条推测链在 AXI id 被丢弃后是无法在 TL 接口处闭合的。
+
+---
+
+## (5) 为“首子 TL 正常处理后缓存给剩余子”最少需暴露哪些 out-only wires
+
+先给事实基线：`nonblock_banked_top` 里 `trans_req_data/trans_req_valid/trans_req_ready/trans_resp_data/trans_resp_valid/trans_resp_ready` 是**内部 wire**（`:407-412`），目前只导出了它们的 valid/ready/bank 与 4 个 e3_tl 观察位（`:602-611`）：
+
+```systemverilog
+assign dbg_tl_req_valid    = trans_req_valid;      // 602
+assign dbg_tl_req_ready    = trans_req_ready;      // 603
+assign dbg_tl_req_bank     = trans_req_data.bank;  // 604
+assign dbg_tl_resp_valid   = trans_resp_valid;     // 605
+assign dbg_tl_resp_ready   = trans_resp_ready;     // 606
+assign dbg_tl_resp_bank    = trans_resp_data.bank; // 607
+assign dbg_tl_ptw_active   = tl_e3.ptw_active;     // 608
+assign dbg_tl_ptw_r_fire   = tl_e3.ptw_r_fire;     // 609
+assign dbg_tl_iotlb_lookup = tl_e3.lookup;         // 610
+assign dbg_tl_iotlb_hit    = tl_e3.hit;            // 611
+```
+（注：`:599-600` 的注释说字段名来自 “rv_iommu_tl_wrap.sv:689-703”，在你给的该文件里对应赋值实际在 `:724-740`——陈旧行号引用，仅记录，不影响语义。）
+
+在此基础上，“缓存首子结果供剩余子”所需的最小 out-only 集合（按必要性排序）：
+
+**必须 A：响应载荷本身**（否则无法缓存任何东西）。当前只导出 `bank`（:607）。至少需要 `trans_resp_data.{bank, spaddr, error, fault_code, bypass, range, w, r, x, u, g, sum, is_mrif, ignore}`（字段定义 :307-324）。理由：completion 地址只用 `spaddr`（trans_ctl:352），但 `error/fault_code` 决定是否走 error slave（trans_ctl:535）、`ignore` 决定 MSI 路径（trans_ctl:412-413）。
+
+**必须 B：该响应对应的请求上下文**。因为响应里没有 ID（1.1），唯一关联是 `bank` + 次序（2.3/2.4）。至少需要 `trans_req_data.{did, iova, ttype, pid, pid_valid, priv, bank}`（:296-305）。特别是 `iova[11:0]` —— 因为 `spaddr` 含页内偏移（tl_wrap:1412），复用时必须能重建第二个子的偏移；`did` —— 因为 same-bank 下 `bank` 不再区分 DMA（pre_actual_dma_top:480-484）。
+
+**必须 C：两个握手沿**（用于把“哪一笔请求的响应到达了”钉死）。`req_fire = trans_req_valid && trans_req_ready`、`resp_fire = trans_resp_valid && trans_resp_ready`。现有端口可由 A/B 的 valid/ready 组合推导（:602-606），但显式导出可避免组合环路与跨层推断。
+
+**必须 D：“当前子是否为该父的首子”标记（TL 侧无法产生）**。TL 拿不到父子关系（见 (4)），所以这一位**只能由 pre-TL 拆分器提供**，例如从 `pretl_owner_fragment` 暴露 child AR 发起点与“首子”判定。现有唯一可用的对外信号是 4 个计数器（`pretl_owner_fragment.sv:26-27`），不足以逐笔对齐；决定性内部量是 `done_q/returned_q/parent_q`（:30-33）与 `candidate` 生成处（:90-103）。**这一条是整个 (5) 的真缺口：不暴露它，外部无法知道“哪个响应可以留作缓存”。**
+
+**可选 E（避免误用）**：IOTLB 命中的 `lookup/hit` 已导出（:610-611，源自 tl_wrap:716-717, 728-729）。它与“TL 请求是否发生”正交（再次强调：**TL 请求减少不等价于 PTW 减少**；tl_wrap:375 与 :1330）。若要做“是否需要 PTW”的可观测性，这是另一条独立线路，缺 `rv_iommu_ptw` 的 `active_o`（tl_wrap:771 已接到 `e3_ptw_active`，但只在 e3_o 里体现，见 :732）。
+
+**注意（不是 wire 问题，但是复用前提）**：缓存者若绕过 TL，会同时绕过 (3.2) 的逐请求权限检查与 (3.1) 的 error/ignore 判定。最小 out-only wires 能让你**看到**首子结果，但**不足以**证明它对剩余子合法；这一点必须由 Codex 决定如何处理，我不替代决策。
+
+---
+
+## 不确定性与未在给定源码中闭合的点
+
+1. **快路径响应字段不可见**：`fast_resp_data` 由 `rv_iommu_nonblock_hit`（tl_wrap:309-330）产生，本文件集未含该模块，故其 `bank` 及权限位如何填充、是否逐请求重评估，无法取证。相关端口：tl_wrap:317-329。
+2. **IOTLB 内部语义不可见**：lookup key 在 tl_wrap:262-276 可见（`vpn/pscid/gscid/en_1S/en_2S`），但命中粒度、替换、`policy_mask_i`（:670-673）之外的行为需 `rv_iommu_iotlb.sv`。
+3. **header 保留时长的底层保证**：AR/AW header 靠 `stream_fifo`（trans_ctl:121-164）与 `axi_demux/axi_mux` 保持；要断言“直到 COMPLETE 都保留”，需 `stream_fifo` / `axi_demux` 实体源码。
+4. **invalidation 不可激励**：harness 硬接 0（:591-597），因此本轮不能作为复用正确性证据。
+5. **same-bank 实验路径实际走的是 completion-gate 模型**：`SharedPoolMode >= 4` 时 harness 改用 `nonblock_completion_banked_ctl`（pre_actual_dma_top:842；nonblock_banked_top:640-648、:677-680）。该模型的 header park / candidate 逻辑（pre_actual_dma_top:706-733）会改变 completion AR 的取出点，需另读源码才能与 (2) 的结论合并。
+6. **陈旧行号引用**：nonblock_banked_top:599-600 引用 tl_wrap:689-703，实际在 :724-740。
+
+---
+
+## 建议下一批文件（按优先级）
+
+1. `cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_nonblock_hit.sv` —— 快路径 `fast_resp_*` 的字段、`bank` 回填、以及 `intercept/accept/busy/window` 语义。
+2. `cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_iotlb.sv` —— lookup key / content / `update_i` / `inval_i` 语义（决定“缓存了什么”）。
+3. `nonblock_completion_banked_ctl` 与其 header-park/candidate 源文件（`pre_actual_dma_top.sv:642-648, 706-733` 指向的模块）—— same-bank 实验下 completion AR 的真实取出点。
+4. `common_cells` 的 `stream_fifo`（或 `fifo_v3`）—— 确认 AW/AR header 在 TC 内保留到 COMPLETE 的时序保证。
+5. `tests/nonblock_banked_test.cpp` —— 实际激励顺序/比较基线，用于判断 (4) 的“同原父”在测试里是如何被构造和断言的。
+
+---
+
+## 可执行的验收检查建议（供 Codex 检验取证结论，非我执行）
+
+- **A1（tag 丢弃）**：在 `trans_ctl_write_limit.sv:654-671` 断点确认 `trans_req_data_n` 无 id 位；或在 `rv_iommu_banked_ctl.sv:389` 观察 `trans_req_data_o`，确认两条不同 AXI id、同 did 的请求产生**除 iova 外完全相同**的 tag。
+- **A2（bank 复用安全性）**：把 `trans_req_data_t.bank` 与 `bank_trans_resp_valid[*]`（banked_ctl:403-404）在波形上对齐，确认同一 bank 不存在两个同时有效的 `trans_req_valid`（期望：受 `state_q != IDLE` 约束）。
+- **A3（PA 偏移）**：对两个页内偏移不同的子，分别记录 `trans_resp_data.spaddr`，验证其差值与 `iova[11:0]` 差值一致（tl_wrap:1412），以证明“整段 spaddr 直接复用”会在页内偏移不同时出错。
+- **A4（错误不过 completion）**：构造 `spaddr` 无关的 error 响应，确认 completion AR 不出现（trans_ctl:535 + axi_err_slv:588-603）。
+- **A5（invalidation 空转）**：确认 harness 中 `iotinval_i/iodirinval_i` 恒 0（nonblock_banked_top:591-597），从而任何“缓存被 invalidate”验证在本 harness 内均不成立。

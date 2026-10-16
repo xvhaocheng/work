@@ -1,0 +1,13 @@
+# B最小差异判别：Codex关键审定
+
+研究决定：当前单条件不支持把逐PTE补额升级为论文主方法，也不进入生产RTL。它改善FIFO下的PN，但更简单的整walk额度、固定周期额度能达到更好的V耗时与A窗口吞吐；普通在途额度与它耗时相同。页表优先下仅多省5周期，不能当独立价值证据。这是否适用于其他条件尚未知。
+
+实现范围是测试侧completion-AR单entry代理：TC已接收译址并把物理AR交给代理，代理再决定共享xbar侧首次offer。这不是生产TC中完整的PREPARED状态协议；代理本身可引入HOL，已用同buffer对照。none保持原路，P/PN与既有FIFO及DS优先周期数精确一致。新模型同时补S/N，未另外重新编译N。
+
+直接核查banked CTL响应按bank路由、TC is_read与AW/AR COMPLETE、PTW固定ID0和DS响应分流。FAST标签由当前bank响应握手绑定且只标读，非FAST/写响应覆盖旧标签；不能用旧B完成清新标签。代理捕获后保存完整AR，首次offer前注册并预留阶段额度与总债务，VALID与payload一经声明直到READY；PTE阶段改变不撤offer，R只减少债务。首次offer与补额边界互斥，排空豁免按已承诺或当前可见同bank AW。
+
+DeepSeek初稿存在无效diff、B误清FAST及同拍补额吞预留风险；定向修订已采用。Codex额外将修订稿的债务计量从AR接收提前到首次VALID之前。运行期检查包含VALID撤回、payload在握手拍改变、代理最终捕获/发出数量一致及债务归零，原全页数据验证与quiet检查保留。没有因此宣称所有AXI时序、异常/失效或一般活性已证明；本条件排空豁免为0，复杂例外仍未覆盖。
+
+只构建一次Verilator policy/system模型，生产RTL、Linux、BIT与板卡均未操作。原3测试文件存before/，最终applied.patch和source-sha256.json保留实际改动，不覆盖已有工程脏改动。所有21次为同一A8/gap0/V64/warm256/lat31的一轮确定性仿真，synthetic CPU流量会随执行时长变化；不能外推MIG、Linux、实板收益或论文新颖性。
+
+下一研究问题只保留具体完成依赖与普通优先的代价/失效条件。应先给真实地址路径与可推翻的强前作反例，再决定机制；这不是新方案已通过预审，也不是转向安全研究。不自动启动下一矩阵或BIT构建。

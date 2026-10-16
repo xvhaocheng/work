@@ -1,0 +1,355 @@
+# 交付物：修正后的完整 instrument 补丁（针对本次提供的 CURRENT 文件）
+
+补丁文件名建议仍为 `instrument.patch`。它只做三件事：(1) `nonblock_completion_pool_late.sv` 新增只读计数输出 `frontier_wait_o`（不进入任何 grant/predicate/状态）；(2) 两个 top 新增 `dbg_frontier_wait` 端口与连线，SharedPoolMode 0–3 恒 0；(3) C++ 对**已存在**的 `dbg_frontier_grant` 做窗口开/关“前边沿快照”，并在终端打印 raw/window 两个数（另附 `dbg_frontier_wait` 同构的只读观测，见“假设”一节，可按需删除）。
+
+```diff
+diff --git a/tests/nonblock_completion_pool_late.sv b/tests/nonblock_completion_pool_late.sv
+--- a/tests/nonblock_completion_pool_late.sv
++++ b/tests/nonblock_completion_pool_late.sv
+@@ -36,7 +36,8 @@
+     output logic [1:0] completion_ar_admit_o,
+     output logic [31:0] occupancy_o, reserved_o, busy_o, fault_o,
+     output logic [31:0] grant_pool_o, grant_stream_o,
+     output logic [31:0] grant_frontier_o,
++    output logic [31:0] frontier_wait_o,
+     output logic [31:0] received_o, replayed_o, highwater_o,
+     output logic [31:0] meta_accepted_o, meta_early_o, meta_highwater_o, queued_o,
+     output logic [31:0] grant_future_o, aw_fixture_stall_o
+@@ -64,7 +65,8 @@
+     logic [1:0] meta_in, grant, grant_stream, can_stream, r_in, r_out;
+     logic [1:0] can_future, grant_future;
+     logic [1:0] can_frontier, grant_frontier;
++    logic frontier_wait_next;
+     logic frontier_q [2][Depth];
+     logic [31:0] front_aw_count_q [2];
+     logic [31:0] front_age_q [2];
+@@ -223,7 +225,17 @@
+                 end
+             end
+         end
++        // Read-only frontier-wait flag: a bank with an offered, unarmed
++        // metadata replacement that received no grant and could only have
++        // been qualified by the frontier predicate.  Pure observation.
++        frontier_wait_next = 1'b0;
++        for (int fb = 0; fb < 2; fb++) begin
++            if (Mode != 5 && FrontierEnable && !grant[fb] &&
++                !can_stream[fb] && !can_future[fb] && !armed_q[fb] &&
++                completion_ar_valid_i[fb] && req_seq_q[fb] > launch_seq_q[fb])
++                frontier_wait_next = 1'b1;
++        end
+     end
+ 
+     always_comb begin
+@@ -292,7 +304,8 @@
+             rr_q <= 1'b0;
+             fault_o <= 0;
+             grant_pool_o <= 0;
+             grant_frontier_o <= 0;
++            frontier_wait_o <= 0;
+             grant_stream_o <= 0;
+             received_o <= 0;
+@@ -334,7 +347,8 @@
+             end
+         end else begin
+             grant_frontier_o <= grant_frontier_o + 32'(grant_frontier[0]) + 32'(grant_frontier[1]);
++            frontier_wait_o <= frontier_wait_o + 32'(frontier_wait_next);
+             aw_fixture_stall_o <= aw_fixture_stall_o +
+                 32'(aw_fixture_block[0] && s_req_i[0].aw_valid) +
+                 32'(aw_fixture_block[1] && s_req_i[1].aw_valid);
+diff --git a/tests/nonblock_actual_dma_top.sv b/tests/nonblock_actual_dma_top.sv
+--- a/tests/nonblock_actual_dma_top.sv
++++ b/tests/nonblock_actual_dma_top.sv
+@@ -214,7 +214,8 @@
+     output logic [31:0] dbg_hp_parked, dbg_hp_bypassed, dbg_hp_full_bypass,
+     output logic [31:0] dbg_hp_highwater, dbg_hp_queued, dbg_hp_dispatched,
+     output logic [31:0] dbg_e2_ar_fixture_stall,
+     output logic [31:0] dbg_frontier_grant,
++    output logic [31:0] dbg_frontier_wait,
+     output logic [31:0] dbg_e2_meta_accepted,
+     output logic [31:0] dbg_e2_meta_early,
+     output logic [31:0] dbg_e2_meta_highwater,
+@@ -566,7 +567,8 @@
+         assign dbg_e2_highwater = 0;
+         assign late_comp_ar_admit = '0;
+         assign dbg_e2_aw_fixture_stall = 0;
+         assign dbg_frontier_grant = 0;
++        assign dbg_frontier_wait = 0;
+         assign dbg_e2_grant_future = 0;
+         assign dbg_e2_meta_accepted = 0;
+         assign dbg_e2_meta_early = 0;
+@@ -575,7 +577,8 @@
+     end else if (SharedPoolMode < 4) begin : gen_pool
+         assign late_comp_ar_admit = '0;
+         assign dbg_e2_aw_fixture_stall = 0;
+         assign dbg_frontier_grant = 0;
++        assign dbg_frontier_wait = 0;
+         assign dbg_e2_grant_future = 0;
+         assign dbg_e2_meta_accepted = 0;
+         assign dbg_e2_meta_early = 0;
+@@ -664,7 +667,8 @@
+             .received_o(dbg_e2_received), .replayed_o(dbg_e2_replayed),
+             .highwater_o(dbg_e2_highwater),
+             .grant_future_o(dbg_e2_grant_future), .aw_fixture_stall_o(dbg_e2_aw_fixture_stall),
+             .grant_frontier_o(dbg_frontier_grant),
++            .frontier_wait_o(dbg_frontier_wait),
+             .meta_accepted_o(dbg_e2_meta_accepted), .meta_early_o(dbg_e2_meta_early),
+             .meta_highwater_o(dbg_e2_meta_highwater), .queued_o(dbg_e2_queued)
+         );
+diff --git a/tests/nonblock_actual_dma_system_top.sv b/tests/nonblock_actual_dma_system_top.sv
+--- a/tests/nonblock_actual_dma_system_top.sv
++++ b/tests/nonblock_actual_dma_system_top.sv
+@@ -205,7 +205,8 @@
+     output logic [31:0] dbg_hp_parked, dbg_hp_bypassed, dbg_hp_full_bypass,
+     output logic [31:0] dbg_hp_highwater, dbg_hp_queued, dbg_hp_dispatched,
+     output logic [31:0] dbg_e2_ar_fixture_stall,
+     output logic [31:0] dbg_frontier_grant,
++    output logic [31:0] dbg_frontier_wait,
+     output logic [31:0] dbg_e2_meta_accepted,
+     output logic [31:0] dbg_e2_meta_early,
+     output logic [31:0] dbg_e2_meta_highwater,
+@@ -1136,7 +1137,8 @@
+         .dbg_hp_full_bypass(dbg_hp_full_bypass), .dbg_hp_highwater(dbg_hp_highwater),
+         .dbg_hp_queued(dbg_hp_queued), .dbg_hp_dispatched(dbg_hp_dispatched),
+         .dbg_e2_ar_fixture_stall(dbg_e2_ar_fixture_stall),
+         .dbg_frontier_grant(dbg_frontier_grant),
++        .dbg_frontier_wait(dbg_frontier_wait),
+         .dbg_e2_meta_accepted (dbg_e2_meta_accepted),
+         .dbg_e2_meta_early (dbg_e2_meta_early),
+         .dbg_e2_meta_highwater (dbg_e2_meta_highwater),
+diff --git a/tests/nonblock_actual_dma_test.cpp b/tests/nonblock_actual_dma_test.cpp
+--- a/tests/nonblock_actual_dma_test.cpp
++++ b/tests/nonblock_actual_dma_test.cpp
+@@ -347,7 +347,16 @@
+     bool     win_open        = false;
+     bool     win_armed       = false;
+     bool     win_seen        = false;
+     long     win_open_cycle  = 0;
+     long     win_close_cycle = 0;
++    // Read-only frontier observation.  Both snapshots are PRE-EDGE samples of
++    // the same top-level counters, taken in the exact pre-edge samples that
++    // set win_open_cycle / win_close_cycle; (close - open) therefore counts
++    // the posesges inside (win_open_cycle, win_close_cycle].  These samples
++    // drive no stimulus, no admission and no grant.
++    uint32_t fg_raw_open     = 0;
++    uint32_t fg_raw_close    = 0;
++    uint32_t fw_raw_open     = 0;
++    uint32_t fw_raw_close    = 0;
+     uint64_t w_cycles        = 0;
+     uint64_t w_v_done        = 0;   // dbg_dma_done bit0 pulses in window
+     uint64_t w_a_done        = 0;   // dbg_dma_done bit1 pulses in window
+@@ -808,14 +817,19 @@
+         // Track actual job occupancy from before the trigger sequence. This
+         // includes A's first issue even when it precedes the window opening.
+         const uint32_t measure_issue = (uint32_t)top->dbg_dma_issue & 3u;
+         const uint32_t measure_done = (uint32_t)top->dbg_dma_done & 3u;
+         const bool opening = win_armed && !win_seen && (measure_issue & 1u);
+         if (opening) {
+             win_open = true;
+             win_seen = true;
+             win_open_cycle = g_cycle;
++            // PRE-EDGE "open" marker of the read-only frontier counters: the
++            // value read here is the counter state before the first counted
++            // posedge, so the delta at the close marker is exactly (open,close].
++            fg_raw_open = (uint32_t)top->dbg_frontier_grant;
++            fw_raw_open = (uint32_t)top->dbg_frontier_wait;
+         }
+         if (win_open && !opening) {
+             ++w_cycles;
+ 
+ #ifdef ACTUAL_DMA_SYSTEM
+@@ -968,13 +982,18 @@
+                 }
+             }
+ #endif
+             if (w_v_done == v_transfers) {
+                 win_open = false;
+                 win_armed = false;
+                 win_close_cycle = g_cycle;
++                // PRE-EDGE "close" marker: taken in the same pre-edge sample
++                // that clears win_open, so the snapshot delta covers exactly
++                // the window's posedge set and nothing after it.
++                fg_raw_close = (uint32_t)top->dbg_frontier_grant;
++                fw_raw_close = (uint32_t)top->dbg_frontier_wait;
+             }
+         }
+         if (win_armed || opening || win_close_cycle == g_cycle) {
+             if (measure_done & 1u) w_v_busy = false;
+             if (measure_issue & 1u) w_v_busy = true;
+@@ -1216,8 +1235,12 @@
+         // Measurement window starts CLOSED; run_scenario() opens it only for
+         // the A/V trigger -> V-complete interval.
+         win_open        = false;
+         win_armed       = false;
+         win_seen        = false;
+         win_open_cycle  = 0;
+         win_close_cycle = 0;
++        fg_raw_open  = 0;
++        fg_raw_close = 0;
++        fw_raw_open  = 0;
++        fw_raw_close = 0;
+         w_cycles        = 0;
+         w_v_done        = 0;
+         w_a_done        = 0;
+@@ -2283,7 +2306,28 @@
+                     (unsigned)e2_highwater,
+                     (unsigned)e2_grant_future,
+                     (unsigned)e2_meta_accepted, (unsigned)e2_meta_early,
+                     (unsigned)e2_meta_highwater, (unsigned)e2_queued);
+ 
++        // Read-only frontier observation at the terminal.  `raw` is the
++        // cumulative top-level counter sampled here; `window` is the pre-edge
++        // snapshot delta over (win_open_cycle, win_close_cycle].  Modes 0-3
++        // drive both counters to 0, so all four fields are 0 there.  No
++        // non-zero assertion is made: a legitimate run may legitimately take
++        // zero frontier grants.
++        const uint32_t fg_raw = (uint32_t)top->dbg_frontier_grant;
++        const uint32_t fw_raw = (uint32_t)top->dbg_frontier_wait;
++        const uint32_t fg_win = (win_seen && !win_open) ?
++            (fg_raw_close - fg_raw_open) : 0u;
++        const uint32_t fw_win = (win_seen && !win_open) ?
++            (fw_raw_close - fw_raw_open) : 0u;
++        std::printf("FRONTIER-TERMINAL-JSON {"
++                    "\"schema\":\"actual-dma-frontier-terminal-v1\","
++                    "\"mode\":\"%s\",\"e2_mode\":%u,"
++                    "\"window_scope\":\"pre_edge_(open,close]\","
++                    "\"frontier_grant_raw\":%u,\"frontier_grant_window\":%u,"
++                    "\"frontier_wait_raw\":%u,\"frontier_wait_window\":%u}\n",
++                    name, (unsigned)e2_mode,
++                    (unsigned)fg_raw, (unsigned)fg_win,
++                    (unsigned)fw_raw, (unsigned)fw_win);
+     }
+ };
+```
+
+---
+
+# 一、为什么旧补丁会失败，以及本次锚点（file:line 支撑）
+
+旧补丁的三个失败点都是**新旧代码错位**，不是语义冲突：
+
+| 旧失败点 | 真实原因（对照 current 文件） | 本次锚点 |
+|---|---|---|
+| `poollate:35` | 池模块 36–42 行是**端口列表**；Codex 已在 39 行插入 `grant_frontier_o`，旧 hunk 的上下文与现文件不一致 | 以 36–42 行现文为上下文，在 39 后单行插入 `frontier_wait_o`（`tests/nonblock_completion_pool_late.sv:39`） |
+| `actual_dma_top:565` | `assign dbg_e2_aw_fixture_stall = 0;` / `assign dbg_frontier_grant = 0;` 在 `gen_no_pool`(568/569) 与 `gen_pool`(577/578) 出现两次，Codex 插入 `grant_frontier` 后旧上下文偏移 | 两个 hunk 分别用**唯一前置行**定位：566–572（含 `dbg_e2_highwater`）与 575–581（含 `end else if (SharedPoolMode < 4) begin : gen_pool`） |
+| `C++:818` | “tick 开口 hunk（812–817）”与“紧随的窗口计数 hunk（818…）”**上下文重叠**，`git apply` 将其判为同一区域冲突 | 合并为**一个** hunk：old 808–821；关闭处另起一个 **不重叠** 的 hunk：old 968–980（其后还有 1216–1223、2283–2289，均互不相交，按行号升序） |
+
+已按 unified diff 规则同步了 **+ 侧起始行号**（旧 +start 需累加前面 hunk 的新增行）：池文件 `36/65/225/304/347`，DMA top `214/567/577/667`，system top `205/1137`，C++ `347/817/982/1235/2306`。所有 hunk 的 `-` 侧行号与本次提供的 current 文件逐行一致。
+
+---
+
+# 二、tick 前边沿 / 后边沿与 `(open, close]` 的显式验证
+
+`tests/nonblock_actual_dma_test.cpp` 的 `tick()` 结构（行号为 current 文件）：
+
+1. 前边沿采样区：**691–764**（`#ifdef ACTUAL_DMA_SYSTEM` 的 695–710 / `#else` 的 712–763），全部是 `top->...` 的**寄存器值读取**，发生在任何时钟沿之前；
+2. 窗口判定与计数区：**804–982**，其中
+   - 开口：**812–817**（`const bool opening = win_armed && !win_seen && (measure_issue & 1u);` → `win_open_cycle = g_cycle;`）
+   - 计数入口：**818–819**（`if (win_open && !opening) { ++w_cycles; ... }`）
+   - 关闭：**971–975**（`if (w_v_done == v_transfers) { win_open=false; ... win_close_cycle = g_cycle; }`）
+3. 上升沿：**1019–1020** `top->clk_i = 1; top->eval();`
+4. 落沿与周期递增：**1115–1117** `top->clk_i = 0; top->eval(); ++g_cycle;`
+
+设窗口开口标记在周期 A、关闭标记在周期 B（`win_open_cycle=A`、`win_close_cycle=B`），已存在的不变式是 `w_cycles == B - A`（**1497 行**的 CHECK）与 JSON 里的 `"window_definition":"hardware_first_V_issue_to_final_V_done_(open,close]"`（**1561 行**）。
+
+计数器的前边沿采样语义推导：
+
+- 在周期 n 的前边沿读到的是“**上一拍上升沿之后**”的寄存器值，即时刻 `n⁻` 的值；
+- 因此 `fg_raw_open = FG(A⁻)`、`fg_raw_close = FG(B⁻)`，两者相减 = 上升沿 `A⁺ … (B-1)⁺` 上的增量，也就是**时间区间 (A⁻, B⁻]**；
+- 而被计数的采样是周期 `A+1 … B` 共 `B - A` 个，每个采样 n 反映的是第 `n-1` 拍上升沿的效果，效果集合正好是 `A⁺ … (B-1)⁺` —— 与快照差**逐沿一一对应、数量相等**（都等于 `B - A`）。
+
+结论：**delta 恰为 (open, close]**；开口周期自身的沿不被计入（与 `!opening` 抑制一致），关闭周期之后的沿也不被计入（快照在 `win_open` 清零的**同一前边沿样本**内完成，见新增的 971–975 hunk）。这也正是“必须在**前边沿**取快照、不能在 1019–1020 之后取”的原因：若把关闭快照放到上升沿之后，就会把 `B⁺` 也吞进去，超出窗口。
+
+终端侧一致性：`(win_seen && !win_open)` 才输出窗口差值，否则为 0（**1235–1246 hunk** 里三目表达式），不会把“窗口尚未关闭”误报成负值或巨值；`report_window()` 的 1499 行 CHECK 仍然保证窗口关闭且 `w_v_done == v_transfers`。
+
+---
+
+# 三、源码证据链（按要求对 idma/primitives 逐条给出行号）
+
+## 3.1 `job_done_i` 到底对应哪个握手（可确认）
+
+- `cva6/corev_apu/iDMA/src/idma_axi_transport_layer.sv:451`
+  `assign w_dp_valid_o = axi_rsp_i.b_valid;` —— 写数据通路的“响应 valid”**就是 B valid**；
+  配套：`:447-448` `w_dp_rsp_o.resp/user` 取自 `axi_rsp_i.b`；`:455` `assign axi_req_o.b_ready = w_dp_ready_i;`（B 被接受的时刻就是消费者 ready 的时刻）。
+- `idma_backend.sv:519-526`（`ErrorCap == NO_ERROR_HANDLING` 分支）：
+  `assign rsp_valid = (ttype_i == idma_pkg::READ) ? (r_dp_rsp_valid) : (w_dp_rsp_valid & w_last_burst);`
+  即“整笔 job 完成”= **最后一次 burst 的 B**（DEFAULT 普通拷贝走 `w_dp_rsp_valid & w_last_burst`）。
+- `idma_backend.sv:632-649`（`i_w_last` 的 `(super_last,last)` FIFO）：
+  入队 `:644` `valid_i ( w_valid & w_ready )`，出队 `:648` `ready_i ( w_dp_rsp_valid & w_dp_rsp_ready )`，头部 `:646` `data_o {w_super_last, w_last_burst}`。
+  严格 FIFO 意味着：第 N 个 B 弹出第 N 个条目，因此 `w_last_burst` 有效的那个 B 出现时，**该 job 之前所有 burst 的 B 都已握手完毕**。
+- `dma_core_wrap.sv:206-207` `assign be_trans_complete = idma_rsp_valid; assign idma_rsp_ready = 1'b1;`，配合 `:337-339` `.idma_rsp_o(idma_rsp) / .rsp_valid_o(idma_rsp_valid) / .rsp_ready_i(idma_rsp_ready)`。
+- 测试侧映射：`tests/nonblock_actual_dma_top.sv:595-596`（late 池）与 `:635-636`（system 顶层透传）
+  `.job_done_i({i_dma1.idma_rsp_valid && i_dma1.idma_rsp_ready, i_dma0...})`。
+
+**结论（可确认）**：`job_done_i[b]` ⟺ 该 DMA 该 job 最后一拍 B 的握手；由 `rsp_ready=1`，`idma_rsp_valid && idma_rsp_ready` 与 `idma_rsp_valid` 等价。在本测试台里更强一点：B 只可能在最后一个 W beat 握手（`C++:1090-1104` 用 W 握手写内存、WLAST 时 `cb_q.push_back`）之后由 `C++:506-514 / 559-568` 驱动，所以 `job_done` ⇒ 该 job 的 W 数据已进入模型内存。
+
+## 3.2 撤回并修正“下一个 job_fire 可以早于上一个 job 的 B”这一断言（**限定，不可确认**）
+
+- `job_fire_i` 的真实含义：`nonblock_actual_dma_top.sv:593-594`
+  `.job_fire_i({i_dma1.be_valid_d && i_dma1.be_ready_d, i_dma0...})`；
+  而 `dma_core_wrap.sv:177` 自己就是这么定义的：`.job_fire_i (be_valid_d && be_ready_d)`；
+  `:186-203` 中 `be_valid_d/be_ready_d` 是 **`i_stream_fifo_jobs_oned` 的入队握手**（`DEPTH = JobFifoDepth = 8`，`FALL_THROUGH = 1'b0`，参数见 `nonblock_actual_dma_top.sv:358`）。
+- 也就是说：`job_fire` 是**前端→JobFifo 的入队**，它在结构上与任何 AXI B 无关；`job_done` 是**后端最后一拍 B**。二者之间隔着深度 8 的 job FIFO。
+- **但**：`dma_core_wrap.sv:164-165` 把 `backend_idle_i (~|idma_busy)` 和 `trans_complete_i (be_trans_complete = idma_rsp_valid)` 明确送进了 `idma_reg64_frontend`。这强烈提示前端**会等待**完成/空闲才推下一笔 job。
+- `idma_reg64_frontend.sv` **未在本批提供**，因此“前端是否允许在前一笔 B 之前 push 下一笔”**无法判定**。
+
+**修正后的表述**：先前“下一个 `job_fire` 可以早于上一笔 job 的外部 B”**证据不足**，仅凭“池不跟 B”不能推出；现有源码只能证明“两个事件不是同一个握手、中间隔着 8 深 job FIFO”，且 wrap 把 `trans_complete/backend_idle` 交给了前端，因此该情形**很可能不成立**。要定论必须补 `idma_reg64_frontend.sv`。池侧 `job_active_q[b]` 的语义（`nonblock_completion_pool_late.sv:387-391`：`job_fire` 置位、`job_done` 清零、重复 fire 置 `fault_o[1]`）应当被理解为“**前端已受理 → 最后一拍 B**”的观测窗口，而不是“后端正在执行”的精确窗口。
+
+## 3.3 复位契约（部分确认、部分必须限定）
+
+- 传输层状态同步复位：`idma_axi_transport_layer.sv:498-501`
+  `\`FF(first_r_q,first_r_d,'1,clk_i,rst_ni)` / `\`FF(w_cnt_valid_q,...,'0,...)` / `\`FF(w_num_beats_q,...,'0,...)` / `\`FF(write_q,...,'0,...)`。
+  这些是 `common_cells/registers.svh` 的**同步**复位（`always_ff @(posedge clk)` 内判 `rst_ni`），所以 C++ `reset()` 先打 8 拍 `rst_ni=0`、再 4 拍 `rst_ni=1`（`nonblock_actual_dma_test.cpp:1258-1260`）**满足**同步复位所需的边沿数。
+- 传输层 W 的输出门：`idma_axi_transport_layer.sv:360` `assign axi_req_o.w_valid = (ready_to_write | write_q);`，`:393` `w_last`、`:396` `w_dp_ready_o`。`write_q` 复位后为 0，`ready_to_write`（`:343`）依赖 `buffer_out_valid`（`i_idma_buffer`，`:468-484` 实例化）。
+- 上游解耦：`idma_backend.sv:590-608`（`i_w_dp_req`）、`:612-625`（`i_ar_fall_through_register`）、`:632-649`（`i_w_last`）、`:820-836`（`i_idma_channel_coupler`，本工程 `RAWCouplingAvail=0` → 走 `:837-858` 的 `i_aw_fall_through_register`）。这些原语均以 `rst_ni` 复位。
+- `dma_core_wrap.sv:186-203` 的 JobFifo 同样以 `rst_ni` 复位；`axi_to_reg`（`:111-128`）也是。
+
+**确认部分**：DMA **内部**写路径（transport 层计数/写入态、AW 与 W 的各级 FIFO/寄存器）在一次有效 `rst_ni` 低-高之后不再保留旧 job 的状态；`axi_mst_req_o` 由这些寄存器组合产生，`rst_ni=0` 期间 WVALID 会下落，因此“复位后 DMA 内部不再发出旧物理 W”有源码支撑。
+
+**必须限定部分**：`nonblock_banked_top` / `axi_mux` 内 completion 侧写 FIFO（`nonblock_actual_dma_top.sv:489-491, 609-610, 649-653` 所引用的 `i_sys.gen_banked.i_banked.i_out_axi_mux.gen_mux.w_fifo_*`）**未在本批提供**，其复位行为无法据此确认；同时“复位前已被下游接受的物理 W/B”在 fabric 侧是否可能残留，也无源码可证。
+**可用的旁证（测试台级）**：`run_scenario()` 先 `setup_memory()` 再 `reset()`（`:1896-1902`），`reset()` 会清空 `mem_q/caw_q/cb_q`（`:1206`），因此**模型侧**不会跨复位保留旧 AW/W/B 记账；`reset()` 也把池侧的 `physical_ar_*_q / paw_count_q / pw_done_q`（`nonblock_completion_pool_late.sv:319-321, 412-413, 440-443`）同步清零。这两边同沿清零，是“复位后无旧物理 W”这一假设**在本测试台范围内**成立的主要依据。
+
+## 3.4 “normal job 每流同时只有一个 active”的根假设
+
+- 池只维护 `job_active_q[b]` 一位（`:54`），`job_fire` 置位、`job_done` 清零，并对“未 done 又 fire”或“req/tx 未配平”置 `fault_o[1]`（`:383-391`）。
+- 因此“每流同一时刻只有一个 normal job”在池里是**被假定的前提 + 被故障标记监控的约束**，**不是硬件保证**；结合 3.2 的限定（fire 是前端入队握手），该假设要成立，还需要 `idma_reg64_frontend` 对 `backend_idle_i/trans_complete_i` 的使用方式作证。
+- `job_normal_i` 来自 `i_dma0.ttype == idma_pkg::DEFAULT`（`nonblock_actual_dma_top.sv:597-598, 637-638`），与 `dma_core_wrap.sv:179` 的 `normal_copy_i (ttype == idma_pkg::DEFAULT)` 同源；`ttype` 由后端 `idma_axi_transport_layer.sv:261` `indep_read = (ttype_i != DEFAULT)` / `:324` `use_wdata` 消费。也就是说“普通拷贝”这条路径本身是 REAL 的，但“每流一笔”仍是待证假设。
+
+---
+
+# 四、只读性与 “modes 0-3 恒 0” 的落点
+
+- `frontier_wait_next` 只在 `nonblock_completion_pool_late.sv` 的 grant `always_comb` 末尾被赋值，只被 `always_ff` 里的 `frontier_wait_o` 累加消费；它**不参与** `grant / grant_stream / grant_future / grant_frontier / pool_q / future_q / frontier_q / target_wseq_q / slot_q / armed_q` 的任何判定（这些都在 193–225 与 433–448，未改动）。
+- `frontier_wait_o` 是**寄存器输出**（`:347` 新增的累加行），复位清零（`:304` 新增行），不驱动任何内部逻辑。
+- modes 0–3 恒 0：
+  - `SharedPoolMode == 0` → `gen_no_pool`（`nonblock_actual_dma_top.sv:554-574`），新增 `assign dbg_frontier_wait = 0;`（插在现 569 之后）；
+  - `SharedPoolMode ∈ {1,2,3}` → `gen_pool`（`:575-583`），新增 `assign dbg_frontier_wait = 0;`（插在现 578 之后）；
+  - `SharedPoolMode >= 4` → `gen_late_pool`（`:619-671`）才连到池的 `frontier_wait_o`（插在现 667 之后）。
+  与 Codex 已有的 `dbg_frontier_grant` 完全同构（`:569/:578/:667`），所以 C++ 终端打印在 modes 0–3 下四个字段必然全 0。
+- `dbg_e2_mode = SharedPoolMode`（`:547`），因此 C++ 里用 `(unsigned)e2_mode` 自证模式，无需额外断言。
+
+---
+
+# 五、假设与未决问题（请 Codex 裁决）
+
+1. **`frontier_wait` 的判定语义是我定的**（因为旧补丁正文未随本批提供）：`Mode != 5 && FrontierEnable && !grant[fb] && !can_stream[fb] && !can_future[fb] && !armed_q[fb] && completion_ar_valid_i[fb] && req_seq_q[fb] > launch_seq_q[fb]`，即“有可授予的 metadata 替换、本拍没授、且唯一可能成立的限定只剩 frontier 谓词”。若预期的定义是别的（例如“`can_frontier` 为真却因轮转优先级未授予”的拍数），只需替换该 5 行 if 条件，端口与连线不变。
+2. **C++ 是否也要读 `dbg_frontier_wait`**：你只明确要求 C++ 读 `dbg_frontier_grant`。我让 C++ 对两个计数器做了**同构**的 open/close 快照与终端打印，避免新端口成为死线。若你想严格最小化，**删掉 C++ 中 `fw_raw_open/fw_raw_close` 四个成员、两处快照、终端两行与 `frontier_wait_*` 两个字段即可**，RTL 侧不受影响。
+3. **新增 `FRONTIER-TERMINAL-JSON` 一行**：沿用本文件既有的“一行一 schema”风格（对比 `AW-FIXTURE-TERMINAL-JSON`/`HEADER-PARK-TERMINAL-JSON`/`E2-TERMINAL-JSON`）。我没有改动任何既有 JSON 行/字段，以免破坏未提供的 `tests/test_nonblock_actual_dma.py` 的解析；若它按“行前缀白名单”解析，需要把新前缀加入白名单。
+4. **未加 `count > 0` 断言**（按你的要求）；也没有加“modes 0–3 必须为 0”的 CHECK——作为可选验收项列在下面。
+5. **未决**：`idma_reg64_frontend.sv`、`idma_buffer.sv`、`nonblock_banked_top.sv`/`axi_mux`（completion 侧 w_fifo）未在本批提供，因此 3.2 的“前端可提前入队”、3.3 的“fabric 侧复位后无旧物理 W”只能给到“限定/待证”。
+
+---
+
+# 六、建议验收检查（我**未运行**任何测试，以下仅为建议）
+
+1. `git apply --recount --check instrument.patch` 通过；system 与非 system 两种 Verilator 构建均通过（新增端口无悬空/未驱动）。
+2. 编译后 modes 0–3 运行：`FRONTIER-TERMINAL-JSON` 的 `e2_mode <= 3` 且四个计数字段全 0。
+3. modes 4–7 运行：`frontier_grant_window <= frontier_grant_raw`、`frontier_wait_window <= frontier_wait_raw`，且窗口字段仅在 `win_seen && !win_open` 时非 0。
+4. 与现有一致性 CHECK（`C++:1497,1499`）联合看：`w_cycles == win_close_cycle - win_open_cycle` 仍成立，说明窗口定义未被我改动。
+5. **零行为回归**：打补丁前后逐拍比对 `dbg_e2_fault / dbg_e2_grant_pool / dbg_e2_grant_stream / dbg_e2_grant_future / dbg_frontier_grant / dbg_e2_reserved / dbg_e2_occupancy / dbg_e2_received / dbg_e2_replayed`，应完全一致（本补丁不改变任何 grant/predicate/状态）。
+
+---
+
+# 七、声明
+
+- 本回复**未运行任何测试**，也**未修改任何生产 RTL**；它只对 `tests/` 下的诊断包装与 C++ 测试台提出补丁，生产路径（`cva6/corev_apu/iDMA/**`）仅作**只读**源码引用，行号来自本次提供的文件内容。
+- 所有 `file:line` 引用均对应“本次提供的 CURRENT 文件”；补丁的 `-` 侧上下文逐行比对该内容得出，新增行的 `+` 侧起始行号已按前序 hunk 增量同步。

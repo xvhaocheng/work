@@ -1,0 +1,7 @@
+# Codex普通提前译址对照规格
+
+保留late普通parent reuse和原preTL分片/双W owner调度。开启early时，真实raw父已经由pre模块接受并正常页内、数据读、len255、size3、INCR、非exclusive、普通未译址，立即允许通过同一个真实TL提交一次源译址准备。优先正常TC请求，仅在其不valid、无TL在途/缓存响应时准备。每父只尝试一次；成功映射供两1KiB child复用，错误不缓存并让TC真实请求走普通路径。准备响应由helper自身消耗，不送给没有提出请求的TC；每次bank和父seq严格核对应。运行只正常静态映射，不能以此声称通用fault/invalidations可投产。
+
+不得从DID猜PA，不缩短行为DDR读，不改AW几何、physical child、payload容量、W服务或原父RLAST。req上下文完整匹配，PA使用真实成功spaddr+页内差额。两条parent prepared标志可共用现有seq寄存器，切换父/flush清除，不能重复背景重试。slow_prepare单bit区分当前真实TL响应归属TC还是准备器；必须保留VALID/响应直到各自握手。
+
+统计分别记录真实TL调用66/准备请求数量/TC缓存返回数量以及真实DONE，不将准备应答计为TC请求应答。费用计算包括全部helper状态；仍承认post有不同逻辑入口队列，声明位数不是同总面积。

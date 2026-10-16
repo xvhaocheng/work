@@ -1,0 +1,353 @@
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+#ifndef _UAPI_LINUX_IDMA_H
+#define _UAPI_LINUX_IDMA_H
+
+#include <linux/ioctl.h>
+#include <linux/types.h>
+
+#define IDMA_EXPERIMENT_ABI 1U
+#define IDMA_EXPERIMENT_MAX_TRANSFERS (1ULL << 32)
+#define IDMA_EXPERIMENT_NO_AGGRESSOR ((__u32)~0U)
+#define IDMA_EXPERIMENT_CAP_DID_HPM (1U << 0)
+#define IDMA_EXPERIMENT_CAP_SW_REFILL (1U << 1)
+#define IDMA_EXPERIMENT_CAP_HW_BATCH (1U << 2)
+#define IDMA_EXPERIMENT_CAP_E3_PAIR (1U << 3)
+#define IDMA_EXPERIMENT_CAP_E3_DIAG (1U << 4)
+#define IDMA_EXPERIMENT_CAP_E3_QUEUE_PAIR (1U << 5)
+#define IDMA_EXPERIMENT_CAP_E3_CONTROLLED (1U << 6)
+#define IDMA_EXPERIMENT_CAP_P4M (1U << 7)
+#define IDMA_EXPERIMENT_CAP_RESEARCH (1U << 8)
+#define IDMA_BATCH_MAX_TRANSFERS (1ULL << 20)
+/* HPM capability is preliminary; acquire checks slots/filter readback too. */
+/* Neither capability nor configuration establishes board calibration. */
+struct idma_experiment_caps {
+	__u32 abi_version;
+	__u32 struct_size;
+	__u32 capabilities;
+	__u32 device_id;
+	__u32 did;
+	__u32 max_pages;
+	__u32 page_bytes;
+	__u32 max_run_timeout_ms;
+	__u32 reserved[8];
+};
+
+struct idma_experiment_stats {
+	__u64 submitted;
+	__u64 completed;
+	__u64 completed_bytes;
+	__u64 active_cycles;
+	__u64 iotlb_miss;
+	__u64 s1_ptw;
+	__u64 s2_ptw;
+	/* Observed completion to observed resubmission, incl. MMIO; not HW idle. */
+	__u64 refill_gap_ns_sum;
+	__u64 refill_gap_ns_max;
+	__u64 refill_gap_samples;
+	/* Submitted but not yet observed complete in software; not HW overlap. */
+	__u32 in_flight_at_start;
+	__u32 in_flight_at_end;
+	__u32 data_errors;
+	__u32 quarantined;
+};
+
+struct idma_experiment {
+	/* Input: all reserved words and flags must be zero in ABI 1. */
+	__u32 abi_version;
+	__u32 struct_size;
+	__u32 flags;
+	__u32 aggressor_id;
+	__u32 victim_pages;
+	__u32 aggressor_pages;
+	__u32 chunk_bytes;
+	__u32 run_timeout_ms;
+	__u64 victim_transfers;
+	__u64 warmup_transfers;
+	__u32 reserved[8];
+	/* Output: status is a negative errno or zero, even when ioctl fails. */
+	__s32 status;
+	__u32 victim_did;
+	__u32 aggressor_did;
+	__u32 hpm_configured;
+	__u32 measurement_started;
+	__u32 measurement_complete;
+	__u64 victim_elapsed_ns;
+	/* Snapshot intervals bracket V's window; HPM is not an atomic snapshot. */
+	__u64 snapshot_before_ns;
+	__u64 snapshot_after_ns;
+	__u64 drain_ns;
+	struct idma_experiment_stats victim;
+	struct idma_experiment_stats aggressor;
+};
+
+/* Old commands 0x01..0x05 are retired and return ENOTTY. */
+#define IDMA_IOC_EXPERIMENT_CAPS _IOR('i', 0x06, struct idma_experiment_caps)
+#define IDMA_IOC_RUN_EXPERIMENT _IOWR('i', 0x07, struct idma_experiment)
+
+/* Separate operation/JSON semantics, same validated input layout; reserved=0.
+ * Batch stats count hardware tasks; refill gaps are not sampled. A counts include
+ * its startup and final drain, rather than just the V hardware window.
+ */
+#define IDMA_IOC_RUN_BATCH _IOWR('i', 0x08, struct idma_experiment)
+
+#define IDMA_E3_WORDS 256U
+/* One allocation/mapping lifetime, two separately warmed/drained/verified rounds.
+ * first_delay is 0 or 128; the other value is used for the second round.
+ * Raw words are versioned observer-v4 bank indices 192..447, read after drain.
+ */
+struct idma_e3_pair {
+	__u32 abi_version, struct_size;
+	__u32 first_delay, reserved;
+	struct idma_experiment request;
+	__s32 status;
+	__u32 rounds_attempted, rounds_completed, reserved_output;
+	__u64 sequence[2];
+	/* V src/dst IOVA, V src/dst PA, A src/dst IOVA, A src/dst PA. */
+	__u64 mapping[8];
+	struct idma_experiment result[2];
+	__u64 observation[2][IDMA_E3_WORDS];
+};
+#define IDMA_IOC_RUN_E3_PAIR _IOWR('i', 0x09, struct idma_e3_pair)
+
+/* Diagnostic-only D0/D0. Old pair ABI and complementary delays stay unchanged.
+ * All timestamps are software CLOCK_MONOTONIC ns, not hardware acceptance.
+ * Warm HPM includes the final A drain; counts are software observed tasks.
+ * Zero timestamps mean that the corresponding stage was not reached.
+ */
+struct idma_e3_diag_lane {
+	__u64 warm_submitted, warm_completed, warm_drained;
+	__u64 warm_last_offset, warm_next_offset;
+	__u64 launch_begin_ns, launch_end_ns;
+	__u32 warm_in_flight, reserved;
+	struct idma_experiment_stats warm_hpm;
+};
+struct idma_e3_diag_round {
+	__u64 warm_begin_ns, warm_end_ns, warm_drained_ns;
+	__u64 arm_begin_ns, arm_end_ns;
+	/* V then A. HPM snapshot complete and both warm streams drained. */
+	__u32 warm_complete, reserved;
+	struct idma_e3_diag_lane lane[2];
+};
+struct idma_e3_diag {
+	/* Input uses the unchanged pair size; first_delay must be zero. */
+	struct idma_e3_pair pair;
+	/* Output only, cleared by the kernel before validation. */
+	struct idma_e3_diag_round diagnostic[2];
+};
+#define IDMA_IOC_RUN_E3_DIAG _IOWR('i', 0x0a, struct idma_e3_diag)
+
+/* Same diagnostic layout; complementary D0/D128 and first_delay 0 or 128.
+ * Requires observer v5 / E3 bank v2 with full waiting-queue trigger coverage.
+ * Old D0/D0 operation above is unchanged. */
+#define IDMA_IOC_RUN_E3_QUEUE_PAIR _IOWR('i', 0x0b, struct idma_e3_diag)
+
+#define IDMA_E3_CONTROLLED_WORDS 32U
+
+/*
+ * Controlled finite E3 round.  Inputs are carried in the embedded pair and
+ * prep_mode/pair_mode; all other fields are outputs cleared by the kernel.
+ *
+ * prep_mode: 0 cold (no A prime), 1 hot (one A prime).
+ * pair_mode: 0 complementary D0/D128 (first_delay 0 or 128), 1 D0/D0.
+ *
+ * flush_status is -EINPROGRESS until the mandatory global S1 flush returns.
+ * stage follows 1..8 (flush, A prime, V prime, V probe, prepare, running,
+ * drain, complete) and is only 8 when the whole round succeeded.
+ * prime[0]/prime[1]/probe carry independent per-phase statistics.
+ * launcher[] is the raw 32-word launcher record copied on every reachable
+ * path.  v_hw_cycles is observer bank index 0, not the HPM/MMIO span.
+ */
+struct idma_e3_controlled_round {
+	__s32 flush_status;
+	__u32 prep_complete;
+	__u32 stage;
+	__u32 reserved;
+	struct idma_experiment_stats prime[2];
+	struct idma_experiment_stats probe;
+	__u64 launcher[IDMA_E3_CONTROLLED_WORDS];
+	__u64 observer_magic;
+	__u64 v_hw_cycles;
+};
+
+struct idma_e3_controlled {
+	struct idma_e3_pair pair;
+	__u32 prep_mode;
+	__u32 pair_mode;
+	__u32 reserved[6];
+	struct idma_e3_controlled_round controlled[2];
+};
+
+#define IDMA_IOC_RUN_E3_CONTROLLED _IOWR('i', 0x0c, struct idma_e3_controlled)
+
+#define IDMA_P4M_WORDS 16U
+#define IDMA_P4M_OBS_WORDS 35U
+
+/*
+ * P4M: one legacy batch experiment plus one observer-v7 gap window.
+ * Input: experiment fields, aggressor_gap_cycles, reserved must be zero.
+ * Output: all fields after reserved are cleared by the kernel before use.
+ * Capability alone does not confirm FPGA P4M support.
+ */
+struct idma_p4m {
+	struct idma_experiment experiment;
+	__u32 aggressor_gap_cycles;
+	__u32 reserved[7];
+	__u64 sequence;
+	__u64 observer_status;
+	__u64 observation[IDMA_P4M_OBS_WORDS];
+	__u64 window[IDMA_P4M_WORDS];
+};
+
+#define IDMA_IOC_RUN_P4M _IOWR('i', 0x0d, struct idma_p4m)
+
+/* Passive E2 / natural-cost diagnostics, observer v8 only. No M policy.
+ * raw_user is a userspace pointer to exactly RAW_WORDS __u64 values; it is
+ * copied while holding the experiment mutex, before mappings are released.
+ * Input ends before status; all later fields are kernel-cleared outputs.
+ * phase_stats: V warm, finite A phase, V first probe. HPM samples bracket
+ * each software phase (including MMIO); they are NOT exact hardware windows.
+ * Cost uses p4m's unchanged (open, close] common hardware window.
+ */
+#define IDMA_RESEARCH_ABI 1U
+#define IDMA_RESEARCH_E2 1U
+#define IDMA_RESEARCH_COST 2U
+#define IDMA_RESEARCH_RAW_WORDS 4096U
+struct idma_research {
+	__u32 abi_version, struct_size;
+	__u32 mode, a_pages, a_transfers, window_cycles;
+	__u32 warmup, transfers, gap_cycles, timeout_ms;
+	__u32 raw_words, reserved[5];
+	__aligned_u64 raw_user;
+	__s32 status, flush_status;
+	__u32 stage, raw_captured;
+	__u64 observer_magic;
+	/* V src/dst then A src/dst IOVA. */
+	__u64 mapping[4];
+	struct idma_experiment_stats phase_stats[3];
+	struct idma_p4m p4m;
+};
+#define IDMA_IOC_RUN_RESEARCH _IOWR('i', 0x0e, struct idma_research)
+
+/* Additive v2: the original 0x0e layout and validation contract stay intact. */
+#define IDMA_RESEARCH2_ABI 1U
+#define IDMA_RESEARCH2_CAP_MAGIC 0x49444d4132434150ULL
+#define IDMA_RESEARCH2_E2_ROLE 1U
+#define IDMA_RESEARCH2_METHOD_ROLE 2U
+#define IDMA_RESEARCH2_E2_TIMING_MAGIC 0x49444d4145325431ULL
+#define IDMA_RESEARCH2_POLICY_MAGIC 0x49444d414d435431ULL
+struct idma_research2_config {
+	__u32 abi_version, struct_size, required_role, reverse;
+	__u32 policy_mode, window_cycles, target_bytes, deadband_bytes;
+	__u32 initial_budget, min_budget, max_budget, budget_step;
+	__u32 credit_cap, hit_weight, miss_weight, ptw_weight;
+	__u32 reserved[4];
+};
+struct idma_research2 {
+	struct idma_research base;
+	struct idma_research2_config config;
+};
+struct idma_research2_caps {
+	__u32 abi_version, struct_size;
+	__u64 magic, version, role, features, observer_magic;
+};
+#define IDMA_IOC_RUN_RESEARCH2 _IOWR('i', 0x0f, struct idma_research2)
+#define IDMA_IOC_RESEARCH2_CAPS _IOWR('i', 0x10, struct idma_research2_caps)
+
+/* Same-BIT composition experiment. This is independent of RESEARCH2 roles.
+ * Inputs: first eight u32s and the existing p4m inputs. Outputs start at status.
+ * Four logical modes: 0 S, 1 N, 2 P, 3 PN. P reserves entries 0..1 for DID.
+ * Old HPM fields remain raw observations, not validated banked-mode metrics.
+ */
+#define IDMA_COMPOSITION_ABI 1U
+#define IDMA_COMPOSITION_WORDS 128U
+#define IDMA_COMPOSITION_MAGIC 0x49444d4143504e01ULL
+struct idma_composition {
+	__u32 abi_version, struct_size, mode, protected_did;
+	__u32 victim_gap_cycles, reserved[3];
+	struct idma_p4m p4m;
+	__s32 status, restore_status;
+	__u32 configured, raw_captured;
+	__u64 generation, restored_generation;
+	__u64 raw[IDMA_COMPOSITION_WORDS];
+};
+#define IDMA_IOC_RUN_COMPOSITION _IOWR('i', 0x11, struct idma_composition)
+
+/* Additive finite ordinary replay. No legacy request layout changes.
+ * Inputs are fixed, complete R107 pools; no user physical addresses.
+ * A run owns prepare -> swapout -> restore -> verify -> checked release.
+ * CPU/time counters are raw. nominal_ns uses the configured kernel clock.
+ */
+#define IDMA_FINITE_ABI 1U
+#define IDMA_FINITE_MAGIC 0x49444d4146494e01ULL
+#define IDMA_FINITE_POOL_BYTES 2359296U
+#define IDMA_FINITE_BACKING_BYTES 16777216U
+#define IDMA_FINITE_MAX_BATCHES 192U
+#define IDMA_FINITE_MAX_LEAVES 4096U
+#define IDMA_FINITE_STAGES 12U
+#define IDMA_FINITE_LAYERS 24U
+
+struct idma_finite_stamp {
+	__u64 cpu_cycles, time_ticks, nominal_ns;
+};
+
+struct idma_finite_stage {
+	struct idma_finite_stamp begin, end;
+	__s32 status;
+	__u32 reached;
+};
+
+struct idma_finite_caps {
+	__u32 abi_version, struct_size;
+	__u64 magic, observer_magic, composition_magic, composition_abi;
+	__u64 composition_config, composition_idle, batch_magic;
+	__u32 device_id, did, quarantined, online_cpus;
+	struct idma_finite_stamp sample;
+};
+
+struct idma_finite_leaf {
+	__u64 iova, pa, bytes, pte, table_pa[5];
+	__u32 pool, extent, table_count, reserved;
+};
+
+struct idma_finite_batch {
+	__u32 phase, worker, layer, component;
+	__u64 source_offset, destination_offset, bytes;
+	__u64 first_id, observed_done, issued, completed, control;
+	struct idma_finite_stamp begin, end;
+	__s32 status;
+	__u32 quiet;
+};
+
+struct idma_finite_layer {
+	__u32 worker, layer;
+	struct idma_finite_stamp ready;
+};
+
+struct idma_finite_run {
+	/* Input: flags/reserved=0, timeout is a fault guard, not an app deadline.
+	 * GPU seeds are two exact POOL_BYTES images. Returned pools are ordered
+	 * CPU0,GPU0,CPU1,GPU1 and each hold POOL_BYTES, including every guard.
+	 */
+	__u32 abi_version, struct_size, flags, timeout_ms;
+	__u32 batch_capacity, leaf_capacity, reserved[2];
+	__aligned_u64 gpu_seed_user[2], pool_user[4], batches_user, leaves_user;
+	/* Output; zeroed by kernel before validation. */
+	__s32 status, release_status;
+	__u32 stage, quarantined, allocation_kind, extent_count;
+	__u32 batch_count, leaf_count, worker_layers, joint_layers;
+	__u64 backing_bytes, reference_bytes, source_bytes_verified;
+	__u64 destination_bytes_verified, guard_bytes_verified, data_errors;
+	__u64 swapout_bytes, restore_bytes, swapout_tasks, restore_tasks;
+	__u64 swapout_logical_runs, restore_logical_runs;
+	struct idma_finite_stage stages[IDMA_FINITE_STAGES];
+	struct idma_finite_layer layers[IDMA_FINITE_LAYERS];
+	/* Phase0 swapout, phase1 restore; sequential raw snapshots, not atomic. */
+	__u64 hpm_before[2][7], hpm_after[2][7];
+	__u64 observer[2][35], observer_status[2];
+	__u64 composition[2][IDMA_COMPOSITION_WORDS];
+};
+
+#define IDMA_IOC_FINITE_CAPS _IOWR('i', 0x12, struct idma_finite_caps)
+#define IDMA_IOC_RUN_FINITE _IOWR('i', 0x13, struct idma_finite_run)
+
+#endif

@@ -1,0 +1,320 @@
+--- a/linux/drivers/misc/idma.c
++++ b/linux/drivers/misc/idma.c
+@@ -1133,6 +1133,9 @@
+ 	readback = readq(base + IDMA_BATCH_GAP_OFFSET);
+ 	if (readback != gap)
+ 		return -EIO;
++	/* A sticky backend error latched before launch must stop the run. */
++	if (readq(base + IDMA_BATCH_CONTROL_OFFSET) >> 32)
++		return -EIO;
+ 	return 0;
+ }
+ 
+@@ -1140,31 +1143,35 @@
+ 			   const struct idma_experiment *e,
+ 			   struct idma_p4m *p, int run_error)
+ {
+-	u64 flags;
++	u64 flags, done, first, last, start_id, end_id;
+ 	bool has_a = e->aggressor_did != IDMA_EXPERIMENT_NO_AGGRESSOR;
+ 	bool valid = !run_error;
+ 	unsigned int i;
+ 
+ 	if (!o->control || !o->armed)
+-		return 0;
++		return run_error ? run_error : -EIO;
+ 	p->sequence = o->sequence;
+ 	p->observer_status = readq(o->control->reg + IDMA_OBS_CONTROL_OFFSET);
+ 	for (i = 0; i < IDMA_P4M_OBS_WORDS; i++)
+ 		p->observation[i] = idma_observer_indexed(o, i);
+ 	for (i = 0; i < IDMA_P4M_WORDS; i++)
+ 		p->window[i] = idma_observer_indexed(o, IDMA_P4M_BANK_BASE + i);
++
++	/* Frozen record: owned sequence, exact frozen status, live counter. */
++	if (!p->sequence || p->observer_status != 4)
++		valid = false;
+ 	if (p->window[0] != IDMA_P4M_BANK_MAGIC)
++		valid = false;
++	if (!p->window[1] || p->window[1] != p->observation[0])
+ 		valid = false;
+ 	flags = p->window[15];
+ 	if (!(flags & BIT_ULL(1)))
+ 		valid = false;
++	if (flags & ~(BIT_ULL(0) | BIT_ULL(1) | BIT_ULL(2)))
++		valid = false;
+ 	if (!!(flags & BIT_ULL(0)) != has_a)
+ 		valid = false;
+-	if (p->observer_status & BIT_ULL(40))
+-		valid = false;
+ 	if (p->window[12])
+-		valid = false;
+-	if (p->window[1] != p->observation[0])
+ 		valid = false;
+ 	if (p->observation[7] != e->victim_transfers ||
+ 	    p->observation[8] != e->victim_transfers)
+@@ -1172,6 +1179,21 @@
+ 	if (p->window[13] != e->victim_transfers ||
+ 	    p->window[14] != e->victim_transfers)
+ 		valid = false;
++
++	/* Every batch identifier must stay inside the encodable range. */
++	done = p->window[3];
++	first = p->window[10];
++	last = p->window[11];
++	start_id = p->window[8];
++	end_id = p->window[9];
++	if (p->window[2] > IDMA_EXPERIMENT_MAX_TRANSFERS ||
++	    done > IDMA_EXPERIMENT_MAX_TRANSFERS ||
++	    start_id > IDMA_EXPERIMENT_MAX_TRANSFERS ||
++	    end_id > IDMA_EXPERIMENT_MAX_TRANSFERS ||
++	    first > IDMA_EXPERIMENT_MAX_TRANSFERS ||
++	    last > IDMA_EXPERIMENT_MAX_TRANSFERS)
++		valid = false;
++
+ 	if (!has_a) {
+ 		for (i = 2; i <= 12; i++)
+ 			if (p->window[i])
+@@ -1191,17 +1213,34 @@
+ 		if (!!(flags & BIT_ULL(2)) !=
+ 		    (p->window[4] && !p->window[7]))
+ 			valid = false;
++		/* An opening edge issue hands off a single stock entry. */
++		if (p->window[7] && p->window[4] != 1)
++			valid = false;
++		/* Strict carry retires a carried entry only when work was done. */
++		if (!!p->window[6] !=
++		    (!!(flags & BIT_ULL(2)) && done > 0))
++			valid = false;
+ 		if (!!p->window[4] != !!p->window[8])
+ 			valid = false;
+ 		if (!!p->window[5] != !!p->window[9])
+ 			valid = false;
+-		if (p->window[3]) {
+-			if (!p->window[10] || !p->window[11])
++		if (done) {
++			if (!first || !last)
+ 				valid = false;
+-			if (p->window[3] == 1 &&
+-			    p->window[10] != p->window[11])
++			if (last != first + done - 1)
+ 				valid = false;
+-		} else if (p->window[10] || p->window[11]) {
++			/* The batch opens on the opening stock's first ID. */
++			if (p->window[4] && first != start_id)
++				valid = false;
++			/* The closing stock continues past the last retired ID. */
++			if (p->window[5] && end_id != last + 1)
++				valid = false;
++		} else if (p->window[4]) {
++			/* Nothing retired: the carried entry closes unchanged. */
++			if (p->window[5] != 1 || end_id != start_id ||
++			    first || last)
++				valid = false;
++		} else if (first || last) {
+ 			valid = false;
+ 		}
+ 	}
+--- a/tests/idma_scheduler_harness.c
++++ b/tests/idma_scheduler_harness.c
+@@ -63,6 +63,7 @@
+ static bool idma_path_observe, path_bad, path_carry, path_stock, path_count;
+ static bool p4m_mode, p4m_bad_bank, p4m_bad_flags, p4m_bad_conservation;
+ static bool p4m_bad_counts, p4m_bad_status, p4m_bad_readback, p4m_cap_missing;
++static bool p4m_sticky_error, p4m_gap_written;
+ static u64 p4m_window[16];
+ static u64 idma_observation_sequence;
+ static unsigned obs_arms, obs_reports, obs_mmio;
+@@ -232,6 +233,8 @@
+             return;
+         }
+         assert(!h->pending);
++        if (offset == IDMA_BATCH_GAP_OFFSET)
++            p4m_gap_written = true;
+         h->regs[offset / 8] = value;
+         return;
+     }
+@@ -259,6 +262,9 @@
+ 			return 0;
+ 		if (offset == IDMA_BATCH_GAP_OFFSET && p4m_bad_readback)
+ 			return h->regs[offset / 8] + 1;
++		if (offset == IDMA_BATCH_CONTROL_OFFSET && p4m_sticky_error &&
++		    p4m_gap_written)
++			return h->regs[offset / 8] | (1ULL << 32);
+ 		return h->regs[offset / 8];
+ 	}
+     if (offset >= IDMA_OBS_MAGIC_OFFSET) {
+@@ -718,10 +724,32 @@
+         bool bad_conservation = !strcmp(name, "p4m_bad_conservation");
+         bool bad_carry = !strcmp(name, "p4m_bad_carry");
+         bool bad_ids = !strcmp(name, "p4m_bad_ids");
++        bool bad_unknown_flag = !strcmp(name, "p4m_bad_unknown_flag");
++        bool zero_cycles = !strcmp(name, "p4m_bad_zero_cycles");
++        bool id_sequence = !strcmp(name, "p4m_bad_id_sequence");
++        bool id_overflow = !strcmp(name, "p4m_bad_id_overflow");
++        bool zero_drained = !strcmp(name, "p4m_zero_a_progress_drained");
++        bool zero_pending = !strcmp(name, "p4m_zero_a_progress_pending");
++        bool strict_carry = !strcmp(name, "p4m_strict_carry_ok");
++        bool open_edge = !strcmp(name, "p4m_open_edge_ok");
++        bool sticky = !strcmp(name, "p4m_sticky_error");
++        bool direct = !strcmp(name, "p4m_direct_finish_not_armed");
+         bool has_a = !solo && !solo_gap && !wrong_roles;
+         bool expect_invalid = bad_reserved || bad_counts || bad_status ||
+                               bad_bank || bad_flags || bad_conservation ||
+-                              bad_carry || bad_ids;
++                              bad_carry || bad_ids || bad_unknown_flag ||
++                              zero_cycles || id_sequence || id_overflow;
++
++        if (direct) {
++            struct idma_observation o = {};
++            struct idma_p4m q = {};
++            struct idma_experiment req = e;
++
++            assert(idma_p4m_finish(&o, &req, &q, 0) == -EIO);
++            assert(idma_p4m_finish(&o, &req, &q, -ETIMEDOUT) == -ETIMEDOUT);
++            printf("PASS %s (unarmed finish cannot report success)\n", name);
++            return 0;
++        }
+ 
+         memset(&p, 0, sizeof(p));
+         p.experiment = e;
+@@ -752,6 +780,7 @@
+         p4m_bad_status = bad_status;
+         p4m_bad_readback = readback_bad;
+         p4m_cap_missing = cap_missing;
++        p4m_sticky_error = sticky;
+ 
+         hw[0].regs[IDMA_OBS_MAGIC_OFFSET / 8] = old_hw ? IDMA_OBS_MAGIC_V6 : IDMA_OBS_MAGIC_V7;
+         hw[0].regs[IDMA_BATCH_GAP_MAGIC_OFFSET / 8] = IDMA_BATCH_GAP_MAGIC;
+@@ -769,9 +798,40 @@
+             p4m_window[2] = 2;
+             p4m_window[3] = 1;
+             p4m_window[5] = 1;
+-            p4m_window[9] = 0x1234;
++            /* Coherent batch IDs: endID = last retired ID + 1. */
++            p4m_window[9] = 0x101;
+             p4m_window[10] = 0x100;
+             p4m_window[11] = 0x100;
++        }
++        if (zero_drained) {
++            /* Nothing outstanding at freeze: no closing stock or end ID. */
++            p4m_window[2] = 1;
++            p4m_window[5] = 0;
++            p4m_window[9] = 0;
++        }
++        if (strict_carry) {
++            p4m_window[2] = 2;
++            p4m_window[3] = 2;
++            p4m_window[4] = 1;
++            p4m_window[5] = 1;
++            p4m_window[6] = 1;
++            p4m_window[8] = 0x100;
++            p4m_window[9] = 0x102;
++            p4m_window[10] = 0x100;
++            p4m_window[11] = 0x101;
++            p4m_window[15] |= BIT_ULL(2);
++        }
++        if (open_edge) {
++            p4m_window[2] = 2;
++            p4m_window[3] = 2;
++            p4m_window[4] = 1;
++            p4m_window[5] = 1;
++            p4m_window[6] = 0;
++            p4m_window[7] = 1;
++            p4m_window[8] = 0x100;
++            p4m_window[9] = 0x102;
++            p4m_window[10] = 0x100;
++            p4m_window[11] = 0x101;
+         }
+         if (bad_bank)
+             p4m_window[0] = 0;
+@@ -785,6 +845,23 @@
+             p4m_window[10] = 0;
+         if (bad_counts)
+             p4m_window[13] -= 1;
++        if (bad_unknown_flag)
++            p4m_window[15] |= BIT_ULL(3);
++        if (zero_cycles)
++            p4m_window[1] = 0;
++        if (id_sequence) {
++            /* done=2 but last still equals first: not contiguous. */
++            p4m_window[2] = 3;
++            p4m_window[3] = 2;
++        }
++        if (id_overflow) {
++            /* Conservation and contiguity hold; only endID wraps the range. */
++            p4m_window[2] = 2;
++            p4m_window[3] = 1;
++            p4m_window[10] = IDMA_EXPERIMENT_MAX_TRANSFERS;
++            p4m_window[11] = IDMA_EXPERIMENT_MAX_TRANSFERS;
++            p4m_window[9] = IDMA_EXPERIMENT_MAX_TRANSFERS + 1;
++        }
+ 
+         if (timeout || interrupt) {
+             hw[0].latency = UINT64_MAX;
+@@ -812,6 +889,10 @@
+             assert(p.experiment.status == ret);
+             assert(idmas[0].quarantined);
+             assert(allocations > frees);
++        } else if (sticky) {
++            assert(ret == -EIO);
++            assert(p.experiment.status == -EIO);
++            assert(allocations == frees && !hw[0].pending && !hw[1].pending);
+         } else if (expect_invalid) {
+             assert(ret == -EIO);
+             assert(p.experiment.status == -EIO);
+@@ -830,15 +911,37 @@
+                 assert(p.window[10] == 0);
+             if (bad_counts)
+                 assert(p.window[13] != p.experiment.victim_transfers);
++            if (bad_unknown_flag)
++                assert(p.window[15] & BIT_ULL(3));
++            if (zero_cycles)
++                assert(!p.window[1]);
++            if (id_overflow)
++                assert(p.window[9] > IDMA_EXPERIMENT_MAX_TRANSFERS);
+         } else {
+             assert(ret == 0);
+             assert(p.experiment.status == 0);
+-            assert(p.sequence);
++            assert(p.sequence && p.observer_status == 4);
+             assert(p.window[0] == IDMA_P4M_BANK_MAGIC);
++            assert(p.window[1]);
++            assert(p.window[15] & BIT_ULL(1));
++            if (zero_pending)
++                assert(p.window[5] == 1 && p.window[9] == p.window[11] + 1);
++            if (strict_carry) {
++                assert(p.window[4] == 1 && p.window[6] == 1);
++                assert(p.window[15] & BIT_ULL(2));
++            }
++            if (open_edge) {
++                assert(p.window[4] == 1 && p.window[7] == 1);
++                assert(!(p.window[15] & BIT_ULL(2)));
++            }
++            if (zero_drained)
++                assert(!p.window[5] && !p.window[9]);
+             if (has_a) {
+-                assert(p.window[2] == 2 && p.window[3] == 1);
+-                assert(p.experiment.aggressor.submitted >=
+-                       p.experiment.aggressor.completed);
++                if (!strcmp(name, "p4m_ok")) {
++                    assert(p.window[2] == 2 && p.window[3] == 1);
++                    assert(p.experiment.aggressor.submitted >=
++                           p.experiment.aggressor.completed);
++                }
+             } else {
+                 for (unsigned int i = 2; i <= 12; i++)
+                     assert(!p.window[i]);
+--- a/tests/test_idma_scheduler.py
++++ b/tests/test_idma_scheduler.py
+@@ -41,7 +41,10 @@
+     'p4m_cap_missing', 'p4m_readback_mismatch', 'p4m_solo_gap_nonzero',
+     'p4m_wrong_roles', 'p4m_bad_reserved', 'p4m_bad_counts', 'p4m_bad_status',
+     'p4m_bad_bank', 'p4m_bad_flags', 'p4m_bad_conservation', 'p4m_bad_carry',
+-    'p4m_bad_ids',
++    'p4m_bad_ids', 'p4m_zero_a_progress_drained', 'p4m_zero_a_progress_pending',
++    'p4m_strict_carry_ok', 'p4m_open_edge_ok', 'p4m_bad_unknown_flag',
++    'p4m_bad_zero_cycles', 'p4m_bad_id_sequence', 'p4m_bad_id_overflow',
++    'p4m_sticky_error', 'p4m_direct_finish_not_armed',
+     'victim_finishes_first', 'both_ready_no_aggressor_refill', 'aggressor_refills',
+     'warmup_not_counted', 'expired_before_submit', 'interrupted_before_submit',
+     'timeout_then_safe_drain', 'interrupt_then_safe_drain',

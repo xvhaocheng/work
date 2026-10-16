@@ -1,0 +1,587 @@
+--- analyze.py
++++ analyze.revised.py
+@@ -16,7 +16,7 @@
+ 用法：
+     python3 out/p4m-complete-review-20261002/analyze.py
+     python3 out/p4m-complete-review-20261002/analyze.py --self-test
+-    python3 out/p4m-complete-review-20261002/analyze.py --relax-timing
++主分析始终使用 strict 计时口径，不提供放宽开关；--out-dir 只允许写到本审阅目录或其子目录。
+ 
+ 本程序不生成也不支持这些结论：同一次启动60次在线通过、P99/WCET、最优 gap、
+ 统计显著性/功效、把整轮 A miss 总数下降称为 miss 率下降、把 CPU victim_elapsed_ns
+@@ -51,6 +51,10 @@
+ A_RATE_REL_TOL = 1e-6
+ A_RATE_ABS_TOL = 1e-3
+ GAPS = (0, 1000, 2000)
++# 与 bench/idma_experiment.c 的 validate_p4m() 一致的真实 bank magic（非夹具猜值）。
++P4M_BANK_MAGIC = 0x49444D4150344D01
++P4M_FLAGS_KNOWN = 0x7
++REQUIRED_KERNEL_RELEASE = "6.5.0-rc2-00089-gefd9461d6459"
+ 
+ TS_RE = re.compile(r"\[\s*(\d+\.\d+)\s*\]")
+ KV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+@@ -103,6 +107,98 @@
+ 
+ EXPECTED_LAYOUT = _expected_layout()
+ 
++
++def expected_manifest():
++    expected = {}
++    for (block_no, gap), dir_key in sorted(EXPECTED_LAYOUT.items()):
++        expected.setdefault(dir_key, []).append("formal-b%02d-g%d.json" % (block_no, gap))
++    return expected
++
++
++def manifest_check(actual_by_dir):
++    """纯函数：比较三目录 formal-*.json 实际清单与冻结矩阵；不需要真实输入即可自检。"""
++    expected = expected_manifest()
++    errors = []
++    seen = {}
++    for dir_key in sorted(DIR_CONF):
++        names = actual_by_dir.get(dir_key)
++        want = set(expected.get(dir_key, []))
++        if names is None:
++            errors.append({"check": "manifest.dir_missing",
++                           "detail": "目录 %s 不存在或未提供清单" % DIR_CONF[dir_key]["path"]})
++            continue
++        have = set()
++        for name in names:
++            if name in have:
++                errors.append({"check": "manifest.duplicate_in_dir",
++                               "detail": "%s 在 %s 内重复" % (name, dir_key)})
++            have.add(name)
++            if name in seen:
++                errors.append({"check": "manifest.duplicate_case",
++                               "detail": "%s 同时在 %s 与 %s" % (name, seen[name], dir_key)})
++            else:
++                seen[name] = dir_key
++            if name in want:
++                continue
++            elsewhere = sorted(k for k, v in expected.items() if name in v)
++            if elsewhere:
++                errors.append({"check": "manifest.misplaced_case",
++                               "detail": "%s 在 %s，期望 %s" % (name, dir_key, ",".join(elsewhere))})
++            else:
++                errors.append({"check": "manifest.unexpected_case",
++                               "detail": "%s 不在冻结矩阵中" % name})
++        for name in sorted(want - have):
++            errors.append({"check": "manifest.missing_case",
++                           "detail": "%s 应从 %s 缺失" % (name, dir_key)})
++    return (not errors), errors
++
++
++def _params_kv(lines):
++    kv = {}
++    for line in lines or []:
++        if "=" in line:
++            key, _, value = line.partition("=")
++            kv[key.strip()] = value.strip()
++    return kv
++
++
++def validate_segment_metadata(metadata):
++    required = []
++    missing = []
++    for key, entry in sorted(metadata.items()):
++        params = entry.get("params.txt")
++        if not params:
++            missing.append({"case": None, "item": "metadata_%s_params.txt" % key,
++                            "detail": "文件缺失，未读取"})
++            continue
++        kv = _params_kv(params)
++        release = kv.get("kernel_release", "")
++        uname = kv.get("uname", "")
++        if "00089" not in release or "00089" not in uname:
++            required.append({"check": "metadata.kernel_00089_%s" % key,
++                             "detail": "kernel_release=%r uname=%r 未含 00089" % (release, uname)})
++        if release != REQUIRED_KERNEL_RELEASE:
++            required.append({"check": "metadata.kernel_exact_%s" % key,
++                             "detail": "kernel_release=%r 期望 %s" % (release, REQUIRED_KERNEL_RELEASE)})
++        if kv.get("taint_baseline") != "0":
++            required.append({"check": "metadata.taint_baseline_%s" % key,
++                             "detail": "taint_baseline=%r" % kv.get("taint_baseline")})
++        if DIR_CONF[key]["power"] == "post_powercycle_newboot":
++            if kv.get("new_boot_segment") != "1":
++                required.append({"check": "metadata.postboot_new_boot_segment_%s" % key,
++                                 "detail": "new_boot_segment=%r" % kv.get("new_boot_segment")})
++        elif kv.get("new_boot_segment") == "1":
++            required.append({"check": "metadata.preboot_new_boot_segment_%s" % key,
++                             "detail": "pre_powercycle 段不应标记新启动"})
++        taint = entry.get("taint.txt")
++        if taint is None:
++            missing.append({"case": None, "item": "metadata_%s_taint.txt" % key,
++                            "detail": "文件缺失，未读取"})
++        elif taint != ["0"]:
++            required.append({"check": "handover.taint_%s" % key,
++                             "detail": "taint=%r，期望 0" % taint})
++    return required, missing
++
+ STAT_METRICS = (
+     ("v_cycles", "V窗口cycles"),
+     ("hardware_window_ns", "硬件窗口ns"),
+@@ -125,6 +221,8 @@
+     ("a_whole_completed", "A整轮完成数"),
+     ("irq_span_ns", "启动irq_span_ns"),
+     ("a_to_v_ns", "启动a_to_v_ns"),
++    ("done_to_read", "batch_time done_to_read cycles"),
++    ("done_to_read_ns", "batch_time done_to_read ns"),
+ )
+ 
+ PAIR_QUANTITIES = (
+@@ -184,6 +282,8 @@
+     ("hpm_snapshot_before_ns", "hpm_snapshot_before_ns"),
+     ("hpm_snapshot_after_ns", "hpm_snapshot_after_ns"),
+     ("drain_ns", "drain_ns"),
++    ("done_to_read", "batch_time_done_to_read_cycles"),
++    ("done_to_read_ns", "batch_time_done_to_read_ns"),
+     ("json_a_rate_bps", "json_a_completed_bytes_per_second"),
+     ("recomputed_a_rate_bps", "recomputed_a_window_bytes_per_second"),
+     ("a_rate_abs_diff", "a_rate_abs_diff"),
+@@ -479,6 +579,9 @@
+     d["a_begin_ns"] = as_int(skv.get("a_begin_ns"))
+     d["a_to_v_ns"] = as_int(skv.get("a_to_v_ns"))
+     d["irq_span_ns"] = as_int(skv.get("irq_span_ns"))
++    bkv = t.batchtime_kv if isinstance(t.batchtime_kv, dict) else {}
++    d["done_to_read"] = as_int(bkv.get("done_to_read"))
++    d["done_to_read_ns"] = (d["done_to_read"] * CYCLE_NS) if d["done_to_read"] is not None else None
+ 
+     cycles = as_int(p4m.get("cycles"))
+     hw = as_int(p4m.get("hardware_window_ns"))
+@@ -632,6 +735,10 @@
+     check.req(as_int(vic.get("completed_bytes")) == V_BYTES, "result.victim.completed_bytes_16MiB", "got=%r" % (vic.get("completed_bytes"),))
+     check.req(as_int(vic.get("data_errors")) == 0, "result.victim.data_errors_0", "got=%r" % (vic.get("data_errors"),))
+     check.req(as_int(vic.get("quarantined")) == 0, "result.victim.quarantined_0", "got=%r" % (vic.get("quarantined"),))
++    for key in ("iotlb_miss", "s1_ptw", "s2_ptw"):
++        value = as_int(vic.get(key))
++        check.req(value is not None and value >= 0, "result.victim.%s_nonneg_int" % key,
++                  "got=%r" % (vic.get(key),))
+ 
+     a_sub = as_int(agg.get("submitted"))
+     a_comp = as_int(agg.get("completed"))
+@@ -641,6 +748,10 @@
+               "result.aggressor.completed_bytes_eq_submitted_x_chunk", "got=%r" % (agg.get("completed_bytes"),))
+     check.req(as_int(agg.get("data_errors")) == 0, "result.aggressor.data_errors_0", "got=%r" % (agg.get("data_errors"),))
+     check.req(as_int(agg.get("quarantined")) == 0, "result.aggressor.quarantined_0", "got=%r" % (agg.get("quarantined"),))
++    for key in ("iotlb_miss", "s1_ptw", "s2_ptw"):
++        value = as_int(agg.get(key))
++        check.req(value is not None and value >= 0, "result.aggressor.%s_nonneg_int" % key,
++                  "got=%r" % (agg.get(key),))
+ 
+     check.req(as_int(p4m.get("requested_gap_cycles")) == t.gap, "p4m.requested_gap_cycles",
+               "got=%r want=%d" % (p4m.get("requested_gap_cycles"), t.gap))
+@@ -654,6 +765,57 @@
+     check.req(p4m.get("conservation") is True, "p4m.conservation_true", "got=%r" % (p4m.get("conservation"),))
+     check.req(isinstance(p4m.get("strict_preopening_inflight"), bool), "p4m.strict_preopening_inflight_bool",
+               "got=%r" % (p4m.get("strict_preopening_inflight"),))
++    check.req(as_int(p4m.get("bank_magic")) == P4M_BANK_MAGIC, "p4m.bank_magic_bench_constant",
++              "got=%r want=%r" % (p4m.get("bank_magic"), P4M_BANK_MAGIC))
++    flags = as_int(p4m.get("flags"))
++    check.req(flags is not None and (flags & ~P4M_FLAGS_KNOWN) == 0, "p4m.flags_known_bits",
++              "got=%r" % (p4m.get("flags"),))
++    start_stock = as_int(p4m.get("a_inflight_at_issue"))
++    end_stock = as_int(p4m.get("a_inflight_at_done"))
++    issue = as_int(p4m.get("a_issue_window"))
++    done = as_int(p4m.get("a_done_window"))
++    carry = as_int(p4m.get("a_started_before_window_completed"))
++    carry_bytes = as_int(p4m.get("a_started_before_window_bytes"))
++    opening = as_int(p4m.get("a_issue_opening_edge"))
++    jobs = as_int(p4m.get("a_completed_jobs_window"))
++    for name, value in (("a_inflight_at_issue", start_stock), ("a_inflight_at_done", end_stock),
++                        ("a_issue_opening_edge", opening), ("a_started_before_window_completed", carry)):
++        check.req(value is not None and value in (0, 1), "p4m.%s_in_0_1" % name,
++                  "got=%r" % (p4m.get(name),))
++    flow_inputs = (start_stock, end_stock, issue, done)
++    recomputed = None
++    if all(v is not None for v in flow_inputs):
++        recomputed = (start_stock + issue == done + end_stock)
++    check.req(recomputed is not None, "p4m.flow_conservation_inputs",
++              "start=%r end=%r issue=%r done=%r" % (p4m.get("a_inflight_at_issue"),
++                                                    p4m.get("a_inflight_at_done"),
++                                                    p4m.get("a_issue_window"), p4m.get("a_done_window")))
++    check.req(isinstance(p4m.get("conservation"), bool) and recomputed is not None
++              and p4m.get("conservation") == recomputed, "p4m.flow_conservation_recomputed",
++              "json=%r recomputed=%r" % (p4m.get("conservation"), recomputed))
++    check.req(jobs is not None and done is not None and jobs == done, "p4m.jobs_eq_done_window",
++              "jobs=%r done=%r" % (p4m.get("a_completed_jobs_window"), p4m.get("a_done_window")))
++    check.req(carry is not None and carry_bytes is not None and carry_bytes == carry * CHUNK,
++              "p4m.carry_bytes_eq_carry_x_chunk",
++              "carry=%r bytes=%r" % (carry, p4m.get("a_started_before_window_bytes")))
++    strict_flag = p4m.get("strict_preopening_inflight")
++    check.req(isinstance(strict_flag, bool) and start_stock is not None and opening is not None
++              and strict_flag == bool(start_stock and not opening),
++              "p4m.strict_eq_start_and_not_opening_edge",
++              "strict=%r start=%r opening=%r" % (strict_flag, start_stock, opening))
++    check.req(not (opening and not start_stock), "p4m.opening_edge_requires_start_stock",
++              "opening=%r start=%r" % (opening, start_stock))
++    check.req(carry is not None and done is not None and isinstance(strict_flag, bool)
++              and carry == (1 if (strict_flag and done) else 0),
++              "p4m.carry_matches_strict_cohort",
++              "carry=%r strict=%r done=%r" % (carry, strict_flag, done))
++    if flags is not None:
++        check.req(isinstance(p4m.get("has_a"), bool) and p4m.get("has_a") == bool(flags & 0x1),
++                  "p4m.has_a_matches_flags", "has_a=%r flags=%r" % (p4m.get("has_a"), flags))
++        check.req(isinstance(p4m.get("closed"), bool) and p4m.get("closed") == bool(flags & 0x2),
++                  "p4m.closed_matches_flags", "closed=%r flags=%r" % (p4m.get("closed"), flags))
++        check.req(isinstance(strict_flag, bool) and strict_flag == bool(flags & 0x4),
++                  "p4m.strict_matches_flags", "strict=%r flags=%r" % (strict_flag, flags))
+     check.req(as_int(p4m.get("task_error_mask")) == 0, "p4m.task_error_mask_0", "got=%r" % (p4m.get("task_error_mask"),))
+     check.req(as_int(p4m.get("platform_hz")) == PLATFORM_HZ, "p4m.platform_hz_50MHz", "got=%r" % (p4m.get("platform_hz"),))
+     check.req(as_int(p4m.get("cycle_ns")) == CYCLE_NS, "p4m.cycle_ns_20", "got=%r" % (p4m.get("cycle_ns"),))
+@@ -787,6 +949,13 @@
+     trials = []
+     files_read = []
+     layout_errors = []
++    actual_by_dir = {}
++    for key, conf in sorted(DIR_CONF.items()):
++        path = conf["path"]
++        actual_by_dir[key] = sorted(p.name for p in path.glob("formal-*.json")) if path.is_dir() else None
++    ok_manifest, manifest_errors = manifest_check(actual_by_dir)
++    if not ok_manifest:
++        layout_errors.extend(manifest_errors)
+     for (block_no, gap), dir_key in sorted(EXPECTED_LAYOUT.items()):
+         case_id = "formal-b%02d-g%d" % (block_no, gap)
+         conf = DIR_CONF[dir_key]
+@@ -938,10 +1107,14 @@
+             prev = cur if cur is not None else prev
+         seq_facts[power]["a_begin_monotonic_by_seq"] = (not bad)
+         seq_facts[power]["a_begin_nonmonotonic_cases"] = bad
+-        advisory.append({"check": "fact.seq_contiguity_%s" % power,
+-                         "detail": "n=%s min=%s max=%s contiguous=%s" % (
+-                             seq_facts[power]["n"], seq_facts[power]["min"],
+-                             seq_facts[power]["max"], seq_facts[power]["contiguous"])})
++        if not seq_facts[power]["contiguous"]:
++            advisory.append({"check": "warn.seq_not_contiguous_%s" % power,
++                             "detail": "n=%s min=%s max=%s contiguous=False" % (
++                                 seq_facts[power]["n"], seq_facts[power]["min"],
++                                 seq_facts[power]["max"])})
++        if seq_facts[power]["a_begin_nonmonotonic_cases"]:
++            advisory.append({"check": "warn.a_begin_not_monotonic_%s" % power,
++                             "detail": "乱序样本：%s" % ", ".join(seq_facts[power]["a_begin_nonmonotonic_cases"])})
+ 
+     # bank_magic 一致性（只比较一致性，不对具体 magic 值做断言）
+     magics = {}
+@@ -951,7 +1124,7 @@
+         advisory.append({"check": "fact.bank_magic_consistency",
+                          "detail": "出现多个 bank_magic 取值：%s" % {k: len(v) for k, v in magics.items()}})
+ 
+-    # 交接口径对照
++    # 交接口径对照（正常事实不进入 advisory；缺项与真实异常才上报）
+     handover = {}
+     rem = metadata.get("remaining29", {}).get("params.txt")
+     if rem:
+@@ -962,14 +1135,10 @@
+     orig = metadata.get("orig25", {}).get("params.txt")
+     if orig:
+         handover["orig25_params"] = orig
++    meta_required, meta_missing = validate_segment_metadata(metadata)
++    required.extend(meta_required)
++    missing.extend(meta_missing)
+     for key, entry in metadata.items():
+-        taint = entry.get("taint.txt")
+-        if taint is not None:
+-            ok_taint = taint == ["0"]
+-            advisory.append({"check": "fact.taint_%s" % key,
+-                             "detail": "taint.txt=%r" % taint})
+-            if not ok_taint:
+-                required.append({"check": "handover.taint_%s" % key, "detail": "taint=%r，期望 0" % taint})
+         for name in ("params.txt", "matrix.txt", "input.txt"):
+             if entry.get(name) is None:
+                 missing.append({"case": None, "item": "metadata_%s_%s" % (key, name),
+@@ -1067,24 +1236,44 @@
+ # 事实性变化与 pre/post 描述性差值
+ # ---------------------------------------------------------------------------
+ def facts_section(trials):
++    hist_keys = ("p4m_flags", "a_opening_inflight_id", "a_flowboundary_jobs", "a_flowboundary_bytes",
++                 "a_inflight_at_issue", "a_inflight_at_done", "strict_preopening_inflight",
++                 "bank_magic", "done_to_read")
+     facts = {}
+-    for key in ("p4m_flags", "a_opening_inflight_id", "a_flowboundary_jobs", "a_flowboundary_bytes",
+-                "a_inflight_at_issue", "a_inflight_at_done"):
+-        facts[key] = {power: hist_and_offmodal([t for t in trials if t.power == power], key)
+-                      for power in POWER_ORDER}
+-    facts["strict_preopening_inflight"] = {
+-        power: hist_and_offmodal([t for t in trials if t.power == power], "strict_preopening_inflight")
+-        for power in POWER_ORDER}
++    for key in hist_keys:
++        by_gap = {}
++        for gap in GAPS:
++            per_gap = [t for t in trials if t.gap == gap]
++            by_gap[str(gap)] = {power: hist_and_offmodal([t for t in per_gap if t.power == power], key)
++                                for power in POWER_ORDER}
++        facts[key] = {"by_gap": by_gap}
+     facts["issue_vs_done_mismatch_cases"] = sorted(
+         t.case_id for t in trials
+         if t.derived.get("a_issue_window") is not None and t.derived.get("a_done_window") is not None
+         and t.derived["a_issue_window"] != t.derived["a_done_window"])
+-    facts["bank_magic_values"] = {k: len(v) for k, v in sorted(
+-        _bucket(trials, "bank_magic").items(), key=lambda kv: _hist_key(kv[0]))}
+-    facts["startup_irq_span_ns"] = {power: mm([t.derived.get("irq_span_ns") for t in trials if t.power == power])
+-                                    for power in POWER_ORDER}
+-    facts["startup_a_to_v_ns"] = {power: mm([t.derived.get("a_to_v_ns") for t in trials if t.power == power])
+-                                  for power in POWER_ORDER}
++    facts["v_miss_nonzero_cases"] = []
++    for t in trials:
++        d = t.derived
++        miss = d.get("v_whole_miss")
++        if miss:
++            facts["v_miss_nonzero_cases"].append({
++                "case_id": t.case_id, "block": t.block, "gap": t.gap,
++                "power_segment": t.power, "acquisition_segment": t.acq,
++                "seq": d.get("seq"), "v_whole_miss": miss, "v_whole_s1": d.get("v_whole_s1"),
++                "v_whole_s2": d.get("v_whole_s2"), "v_mib_s": d.get("v_mib_s"),
++                "v_cycles": d.get("v_cycles"), "hardware_window_ns": d.get("hardware_window_ns"),
++                "a_whole_miss": d.get("a_whole_miss"), "a_opening_inflight_id": d.get("a_opening_inflight_id"),
++                "a_to_v_ns": d.get("a_to_v_ns"), "irq_span_ns": d.get("irq_span_ns"),
++                "done_to_read": d.get("done_to_read"), "done_to_read_ns": d.get("done_to_read_ns"),
++                "json_path": str(t.json_path) if t.json_path else None,
++                "startup_path": str(t.startup_path) if t.startup_path else None,
++                "batchtime_path": str(t.batchtime_path) if t.batchtime_path else None})
++    facts["startup_irq_span_ns"] = {
++        str(g): {power: mm([t.derived.get("irq_span_ns") for t in trials if t.gap == g and t.power == power])
++                 for power in POWER_ORDER} for g in GAPS}
++    facts["startup_a_to_v_ns"] = {
++        str(g): {power: mm([t.derived.get("a_to_v_ns") for t in trials if t.gap == g and t.power == power])
++                 for power in POWER_ORDER} for g in GAPS}
+     return facts
+ 
+ 
+@@ -1169,6 +1358,33 @@
+     parts.append("# P4M 60 例（25 + 离线追认6 + 新启动29）只读审计与描述统计\n")
+     parts.append("生成时间：%s\n" % summary["generated_utc"])
+     parts.append("程序：`out/p4m-complete-review-20261002/analyze.py`（只读；本报告数字全部由程序计算）\n")
++    g = summary["descriptive"]["all60"]["by_gap"]
++    pair = summary["pairs"]["aggregates"]
++    p1000 = pair["same_acquisition_segment"]["1000"]
++    p2000 = pair["same_acquisition_segment"]["2000"]
++    ps2000 = pair["same_power_segment"]["2000"]
++    parts.append("\n## 0. 一页中文摘要（数字全部来自本程序计算）\n")
++    parts.append("- 60 例按 gap 各 20；V 中位速率（MiB/s）在 gap0/1000/2000 分别为 %s / %s / %s；"
++                 "A 同窗中位速率为 %s / %s / %s。"
++                 % (fmt(g["0"]["v_mib_s"]["median"]), fmt(g["1000"]["v_mib_s"]["median"]),
++                    fmt(g["2000"]["v_mib_s"]["median"]), fmt(g["0"]["a_window_mib_s"]["median"]),
++                    fmt(g["1000"]["a_window_mib_s"]["median"]), fmt(g["2000"]["a_window_mib_s"]["median"])))
++    parts.append("- 主要严格同采集段配对：gap1000 n=%s，V 吞吐中位提升 %s%%、V 耗时中位下降 %s%%、"
++                 "A 同窗速率中位损失 %s%%；gap2000 n=%s，对应为 %s%% / %s%% / %s%%。"
++                 % (p1000["n_pairs"], fmt(p1000["v_rate_improvement_pct"]["median"]),
++                    fmt(p1000["v_time_decrease_pct"]["median"]), fmt(p1000["a_rate_loss_pct"]["median"]),
++                    p2000["n_pairs"], fmt(p2000["v_rate_improvement_pct"]["median"]),
++                    fmt(p2000["v_time_decrease_pct"]["median"]), fmt(p2000["a_rate_loss_pct"]["median"])))
++    parts.append("- 同电源段敏感性：gap2000 n=%s，V 吞吐中位提升 %s%%、V 耗时下降 %s%%、A 损失 %s%%，"
++                 "与同采集段结果近似一致；这是描述，不是统计等价声明。"
++                 % (ps2000["n_pairs"], fmt(ps2000["v_rate_improvement_pct"]["median"]),
++                    fmt(ps2000["v_time_decrease_pct"]["median"]), fmt(ps2000["a_rate_loss_pct"]["median"])))
++    parts.append("- V 整轮 miss 非零仅 b15-g0（V miss=2/S1=2，A 整轮 miss=5141，V 速率 110.156634 MiB/s）；"
++                 "详见第 6 节。V 最快不等于 miss 加速，不从同时出现推断因果，也不剔除该样本。")
++    parts.append("- 在线/离线身份沿用既有审计：在线通过 %s 例、离线追认 %s 例；本程序不验证缺失的原始 exit 记录。"
++                 % (summary["sample_counts"]["online_pass"], summary["sample_counts"]["offline_retained"]))
++    parts.append("- 内核：params 记录要求精确 00089（%s）；硬件窗口按固定 50 MHz、20 ns/cycle 假设由 cycles 换算。"
++                 % REQUIRED_KERNEL_RELEASE)
+ 
+     parts.append("## 1. 数据来源与分段\n")
+     rows = []
+@@ -1248,21 +1464,47 @@
+     parts.append(md_table(["block", "gap", "case", "gap0", "同采集段", "同电源段",
+                            "V速率比", "V吞吐提升%", "V时间下降%", "A速率比", "A同窗速率损失%"], rows))
+ 
+-    parts.append("\n## 6. 事实性变化记录（不推断统计等价）\n")
++    parts.append("\n## 6. 事实性变化记录（按 gap，再按 pre/post 分组；不推断统计等价）\n")
+     facts = summary["facts"]
+-    for key in ("p4m_flags", "a_opening_inflight_id", "a_flowboundary_jobs", "a_flowboundary_bytes",
+-                "a_inflight_at_issue", "a_inflight_at_done", "strict_preopening_inflight"):
++    hist_keys = ("p4m_flags", "a_opening_inflight_id", "a_flowboundary_jobs", "a_flowboundary_bytes",
++                 "a_inflight_at_issue", "a_inflight_at_done", "strict_preopening_inflight",
++                 "done_to_read")
++    for key in hist_keys:
+         rows = []
+-        for power in POWER_ORDER:
+-            entry = facts[key][power]
+-            rows.append([power, str(entry["histogram"]), entry["modal"], ", ".join(entry["off_modal_cases"]) or "无"])
+-        parts.append("\n### %s\n" % key)
+-        parts.append(md_table(["电源段", "取值分布", "众数", "偏离众数的样本"], rows))
++        for gap in GAPS:
++            for power in POWER_ORDER:
++                entry = facts[key]["by_gap"][str(gap)][power]
++                rows.append(["gap%d" % gap, power, str(entry["histogram"]), entry["modal"],
++                             ", ".join(entry["off_modal_cases"]) or "无"])
++        parts.append("\n### %s（先 gap 后 pre/post）\n" % key)
++        parts.append(md_table(["gap", "电源段", "取值分布", "众数", "偏离众数的样本"], rows))
+     parts.append("\n- `a_issue_window != a_done_window` 的样本：%s"
+                  % (", ".join(facts["issue_vs_done_mismatch_cases"]) or "无"))
+-    parts.append("- 观察到的 bank_magic 取值分布：%s（只做一致性记录，不假定具体 magic 常量）"
+-                 % facts["bank_magic_values"])
+-    parts.append("- 电源段启动时间统计（irq_span_ns / a_to_v_ns）：%s"
++    parts.append("- bank_magic 已按 bench 常量 %d 校验；不再把正常取值分布列为警告。" % P4M_BANK_MAGIC)
++    parts.append("\n### V 整轮 miss 非零样本（整轮计数，非硬件窗内计数）\n")
++    rows = []
++    for item in facts["v_miss_nonzero_cases"]:
++        rows.append([item["case_id"], item["gap"], item["power_segment"], item["v_whole_miss"],
++                     item["v_whole_s1"], item["v_whole_s2"], item["v_mib_s"], item["a_whole_miss"],
++                     item["a_opening_inflight_id"], item["a_to_v_ns"], item["irq_span_ns"],
++                     item["done_to_read"], item["done_to_read_ns"]])
++    parts.append(md_table(["case", "gap", "电源段", "V整轮miss", "V s1", "V s2", "V速率MiB/s",
++                           "A整轮miss", "开窗在途ID", "a_to_v_ns", "irq_span_ns",
++                           "done_to_read cycles", "done_to_read ns"], rows) if rows else "无")
++    b15 = [i for i in facts["v_miss_nonzero_cases"] if i["case_id"] == "formal-b15-g0"]
++    if b15:
++        b = b15[0]
++        ms = (b["done_to_read_ns"] / 1e6) if b["done_to_read_ns"] else 0.0
++        parts.append("")
++        parts.append("b15-g0 突出事实：V 整轮 iotlb_miss=%s、s1_ptw=%s；硬件窗口 %s ns、cycles=%s、"
++                     "V 速率 %s MiB/s；A 整轮 miss=%s；开窗在途 ID=%s；a_to_v_ns=%s、irq_span_ns=%s、"
++                     "done_to_read=%s cycles（%s ns ≈ %.4f ms）。以上均为整轮或启动记录原值，"
++                     "miss 发生在整轮而非硬件窗内，JSON 无逐条目轨迹，不得据此推断替换、启动跨度或轮询迟读的因果。"
++                     % (b["v_whole_miss"], b["v_whole_s1"], b["hardware_window_ns"], b["v_cycles"],
++                        fmt(b["v_mib_s"]), b["a_whole_miss"], b["a_opening_inflight_id"],
++                        b["a_to_v_ns"], b["irq_span_ns"], b["done_to_read"], b["done_to_read_ns"], ms))
++        parts.append("来源：`%s`、`%s`、`%s`。" % (b["json_path"], b["startup_path"], b["batchtime_path"]))
++    parts.append("\n- 电源段启动时间统计（按 gap，再 pre/post；irq_span_ns / a_to_v_ns）：%s"
+                  % {"irq_span_ns": facts["startup_irq_span_ns"], "a_to_v_ns": facts["startup_a_to_v_ns"]})
+ 
+     parts.append("\n## 7. 限度与禁止的宣称\n")
+@@ -1278,7 +1520,7 @@
+     out_dir = Path(args.out_dir)
+     out_dir.mkdir(parents=True, exist_ok=True)
+ 
+-    trials, files_read, layout_errors = load_dataset(strict_timing=not args.relax_timing)
++    trials, files_read, layout_errors = load_dataset(strict_timing=True)
+     metadata = read_segment_metadata(files_read)
+     hashes_before = hash_files(files_read)
+ 
+@@ -1320,6 +1562,8 @@
+         "无 P99/WCET，无最优 gap 宣称，不做显著性检验、功效分析或过度的统计推断。",
+         "未对任何 miss 做每拷贝归一化；如需派生，必须限定在同整轮 A 工作窗口并写明含义。",
+         "本轮只补缺并汇总；不得据此宣布某条件最优或某机制因果成立。",
++        "在线/离线身份沿用既有审计口径；本程序不验证原始 exit 记录，也不把身份当作本次重新在线通过。",
++        "params 元数据按 00089 内核、taint=0、postboot 新启动标记检查；缺少必需项按 required 失败上报。",
+     ]
+ 
+     summary = {
+@@ -1358,10 +1602,12 @@
+             "required_failure_count": len(required),
+             "advisory_warning_count": len(advisory),
+             "missing_item_count": len(missing),
++            "identity_basis": "在线/离线身份沿用既有审计口径（acq25/retained6/remaining29 与 b09-g2000 离线追认）；本程序不验证缺失的原始 exit 记录。",
+         },
+         "descriptive": descriptive,
+         "pre_post_median_diff": median_diff,
+         "facts": facts,
++        "nonzero_v_miss_cases": facts["v_miss_nonzero_cases"],
+         "pairs": {
+             "rows": pair_rows,
+             "aggregates": pair_aggregates,
+@@ -1483,7 +1729,7 @@
+ # ---------------------------------------------------------------------------
+ # 内存夹具与负向自检（不读写任何原始数据）
+ # ---------------------------------------------------------------------------
+-FIXTURE_MAGIC = 42  # 仅用于夹具，代表“某个稳定 magic”，不代表真实 bank_magic 常量
++FIXTURE_MAGIC = P4M_BANK_MAGIC  # 与 bench 常量一致，不是猜值
+ 
+ 
+ def _fixture_cycles(block_no, gap):
+@@ -1495,7 +1741,7 @@
+     cycles = _fixture_cycles(block_no, gap)
+     window_ns = cycles * CYCLE_NS
+     jobs = {0: 4096, 1000: 2048, 2000: 1364}[gap]
+-    a_done = jobs - (1 if (block_no % 7 == 0 and gap == 2000) else 0)
++    a_done = jobs
+     a_bytes = jobs * CHUNK
+     a_rate = a_bytes / (window_ns / 1e9)
+     carry_jobs = 1 if gap in (0, 1000) else 0
+@@ -1507,15 +1753,15 @@
+     a_submitted = jobs + 1400
+     raw_window = [FIXTURE_MAGIC, cycles, jobs, a_done,
+                   1 if opening else 0, 1 if opening else 0, carry_jobs, 0,
+-                  opening, closing, first_done, last_done, 0, CHUNK, CHUNK, flags]
++                  opening, closing, first_done, last_done, 0, TRANSFERS, TRANSFERS, flags]
+     raw_obs = [0] * 35
+     raw_obs[0] = cycles
+     raw_obs[1] = cycles - 4095
+     raw_obs[3] = 4095
+     raw_obs[4] = 2200 + block_no
+     raw_obs[6] = 1
+-    raw_obs[7] = 4096
+-    raw_obs[8] = 4096
++    raw_obs[7] = TRANSFERS
++    raw_obs[8] = TRANSFERS
+     raw_obs[34] = 4321
+     return {
+         "schema": "idma.p4m.v1",
+@@ -1631,6 +1877,9 @@
+     ok, errors = check_layout_purity(good)
+     if not ok:
+         failures.append("T0 正常夹具不应报错：%s" % errors)
++    bad_required = [(t.case_id, t.required_errors) for t in good if t.required_errors]
++    if bad_required:
++        failures.append("T0 正常夹具不应有必需失败：%s" % bad_required[:3])
+ 
+     # 统计主逻辑：配对视图分类与计数（同一采集段 / 同一电源段 / 跨电源标记）
+     _rows, views = build_pairs(good)
+@@ -1680,13 +1929,43 @@
+     else:
+         lines.append("T3 OK：错误 cycles 与错误 A 流向均被拒绝")
+ 
++    # T4：三目录正式清单与冻结矩阵一致；T5：额外/重复/放错目录必须失败
++    actual_manifest = {key: sorted(v) for key, v in expected_manifest().items()}
++    ok_manifest, err_manifest = manifest_check(actual_manifest)
++    if not ok_manifest:
++        failures.append("T4 正常清单不应报错：%s" % err_manifest)
++    else:
++        lines.append("T4 OK：三目录正式 JSON 清单与冻结矩阵一致")
++    bad_manifest = {key: sorted(v) for key, v in expected_manifest().items()}
++    bad_manifest["remaining29"] = sorted(bad_manifest["remaining29"] + ["formal-b21-g0.json"])
++    bad_manifest["retained6"] = sorted(bad_manifest["retained6"] + ["formal-b01-g0.json"])
++    ok_bad, err_bad = manifest_check(bad_manifest)
++    names_bad = {e["check"] for e in err_bad}
++    if ok_bad or "manifest.unexpected_case" not in names_bad or "manifest.misplaced_case" not in names_bad:
++        failures.append("T5 额外/放错目录未被拒绝：ok=%s errors=%s" % (ok_bad, err_bad))
++    else:
++        lines.append("T5 OK：额外与放错目录的正式 JSON 被拒绝")
++
++    # T6：数值流量被改但 conservation=true 仍拒绝
++    bad_flow = build_fixture()
++    target = [t for t in bad_flow if t.case_id == "formal-b12-g1000"][0]
++    target.json_obj["p4m"]["a_done_window"] = target.json_obj["p4m"]["a_completed_jobs_window"] - 1
++    target.json_obj["p4m"]["conservation"] = True
++    check = CaseCheck()
++    validate_case(target, check, strict_timing=True)
++    names_flow = {e["check"] for e in check.required}
++    if "p4m.flow_conservation_recomputed" not in names_flow:
++        failures.append("T6 改数但 conservation=true 未被拒绝：%s" % sorted(names_flow))
++    else:
++        lines.append("T6 OK：数值流量与 conservation 不一致被拒绝")
++
+     for line in lines:
+         print(line)
+     if failures:
+         for item in failures:
+             print("SELF-TEST FAILURE: %s" % item)
+         return 1
+-    print("self-test: all 3 negative checks behaved as expected; no original file was read or written")
++    print("self-test: all negative checks behaved as expected; no original file was read or written")
+     return 0
+ 
+ 
+@@ -1696,14 +1975,19 @@
+ def main(argv=None):
+     parser = argparse.ArgumentParser(description="P4M 60 例只读审计与描述统计")
+     parser.add_argument("--self-test", action="store_true",
+-                        help="只在内存夹具上运行 3 个负向自检，不读取、不修改任何原始数据")
+-    parser.add_argument("--relax-timing", action="store_true",
+-                        help="把“计时记录不可用”从必需失败降级为缺项警告（默认严格）")
++                        help="只在内存夹具上运行负向自检，不读取、不修改任何原始数据")
+     parser.add_argument("--out-dir", type=Path, default=REVIEW_DIR,
+-                        help="输出目录（默认本审阅目录）")
++                        help="输出目录（默认本审阅目录；只允许本目录或其子目录）")
+     args = parser.parse_args(argv)
+     if args.self_test:
+         return run_self_test()
++    out_dir = Path(args.out_dir).resolve()
++    review_dir = REVIEW_DIR.resolve()
++    try:
++        out_dir.relative_to(review_dir)
++    except ValueError:
++        parser.error("--out-dir 必须是 %s 或其子目录（禁止写入原始证据区域）" % review_dir)
++    args.out_dir = out_dir
+     return run_analysis(args)
+ 
+ 

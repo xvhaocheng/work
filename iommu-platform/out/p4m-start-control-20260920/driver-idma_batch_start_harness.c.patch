@@ -1,0 +1,428 @@
+--- tests/idma_batch_start_harness.c
++++ tests/idma_batch_start_harness.c
+@@ -0,0 +1,425 @@
++/*
++ * Host model for the bounded software batch-start control in
++ * linux/drivers/misc/idma.c.
++ *
++ * Production helpers are inserted verbatim at the PRODUCTION_TYPES /
++ * PRODUCTION_FUNCTIONS markers.  Everything else is a host stub: kernel MMIO,
++ * ktime, signal, IRQ/preempt flags and logging.  This proves software control
++ * flow only; it is not FPGA, RTL, IOTLB, cache or timing acceptance data.
++ */
++#include <assert.h>
++#include <errno.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <linux/idma.h>
++
++typedef __u64 u64;
++typedef uint32_t u32;
++typedef uint8_t u8;
++typedef uintptr_t dma_addr_t;
++typedef uintptr_t phys_addr_t;
++
++struct device { int index; };
++struct page { int unused; };
++struct miscdevice { struct device *parent; };
++struct mutex { int unused; };
++struct iommu_domain { int unused; };
++
++#define BIT_ULL(n) (1ULL << (n))
++#define __iomem
++#define __user
++#define WRITE_ONCE(dst, src) ((dst) = (src))
++#define READ_ONCE(src) (*(volatile __typeof__(src) *)&(src))
++#define min(a, b) ((a) < (b) ? (a) : (b))
++#define max(a, b) ((a) > (b) ? (a) : (b))
++#define NSEC_PER_USEC 1000ULL
++#define NSEC_PER_MSEC 1000000ULL
++#define PAGE_SIZE 4096U
++#define offset_in_page(ptr) ((uintptr_t)(ptr) & (PAGE_SIZE - 1))
++#define SZ_4K 4096U
++#define DMA_ATTR_FORCE_CONTIGUOUS 0
++#define current NULL
++#define GFP_KERNEL 0
++#define kzalloc(n, flags) calloc(1, (n))
++#define kfree(ptr) free(ptr)
++
++/* PRODUCTION_TYPES */
++
++struct fake_dma {
++    u64 regs[32];
++    u64 next_id;
++    bool zero_id;
++    bool pending;
++};
++
++static struct fake_dma hw[2];
++static struct device devices[2] = {{0}, {1}};
++static struct idma_device idmas[2];
++static u64 now = 1000;
++static bool signal_flag;
++static unsigned irq_disabled_depth, preempt_disabled_depth;
++static bool irq_pending, irq_serviced;
++
++enum mmio_op { MMIO_WRITE, MMIO_READ };
++struct mmio_event { enum mmio_op op; int dev; size_t offset; u64 value; };
++static struct mmio_event mmio_events[256];
++static unsigned mmio_count;
++
++static void record_mmio(enum mmio_op op, int dev, size_t offset, u64 value)
++{
++    assert(mmio_count < 256);
++    mmio_events[mmio_count].op = op;
++    mmio_events[mmio_count].dev = dev;
++    mmio_events[mmio_count].offset = offset;
++    mmio_events[mmio_count].value = value;
++    mmio_count++;
++}
++
++static struct fake_dma *mmio(void *address, int *dev, size_t *offset)
++{
++    int i;
++
++    for (i = 0; i < 2; i++) {
++        uintptr_t p = (uintptr_t)address;
++        uintptr_t base = (uintptr_t)hw[i].regs;
++
++        if (p >= base && p < base + sizeof(hw[i].regs)) {
++            *dev = i;
++            *offset = p - base;
++            return &hw[i];
++        }
++    }
++    assert(!"invalid MMIO address");
++    return NULL;
++}
++
++static void writeq(u64 value, void *address)
++{
++    int dev;
++    size_t offset;
++    struct fake_dma *h = mmio(address, &dev, &offset);
++
++    record_mmio(MMIO_WRITE, dev, offset, value);
++    h->regs[offset / 8] = value;
++}
++
++static u64 readq(void *address)
++{
++    int dev;
++    size_t offset;
++    struct fake_dma *h = mmio(address, &dev, &offset);
++    u64 value;
++
++    if (offset == IDMA_NEXT_ID_REG_OFFSET) {
++        h->pending = true;
++        value = h->zero_id ? 0 : ++h->next_id;
++    } else {
++        value = h->regs[offset / 8];
++    }
++    record_mmio(MMIO_READ, dev, offset, value);
++    return value;
++}
++
++static u64 ktime_get_ns(void)
++{
++    now += 1000;
++    if (irq_pending && !irq_disabled_depth && !irq_serviced) {
++        irq_serviced = true;
++        irq_pending = false;
++    }
++    return now;
++}
++
++static bool signal_pending(void *task)
++{
++    (void)task;
++    return signal_flag;
++}
++
++#define local_irq_save(flags) do { (flags) = irq_disabled_depth++; } while (0)
++#define local_irq_restore(flags) do { (void)(flags); assert(irq_disabled_depth); irq_disabled_depth--; } while (0)
++#define preempt_disable() do { preempt_disabled_depth++; } while (0)
++#define preempt_enable() do { assert(preempt_disabled_depth); preempt_disabled_depth--; } while (0)
++
++static char log_buffer[1024];
++
++static void dev_info(struct device *dev, const char *fmt, ...)
++{
++    va_list ap;
++
++    (void)dev;
++    va_start(ap, fmt);
++    vsnprintf(log_buffer, sizeof(log_buffer), fmt, ap);
++    va_end(ap);
++    assert(!irq_disabled_depth);
++    assert(!preempt_disabled_depth);
++}
++
++static void dev_crit(struct device *dev, const char *fmt, ...)
++{
++    (void)dev;
++    (void)fmt;
++    assert(!irq_disabled_depth);
++    assert(!preempt_disabled_depth);
++}
++
++/* PRODUCTION_FUNCTIONS */
++
++static void setup_streams(struct idma_stream *v, struct idma_stream *a, bool has_a)
++{
++    int i;
++
++    memset(v, 0, sizeof(*v));
++    memset(a, 0, sizeof(*a));
++    for (i = 0; i < 2; i++) {
++        idmas[i].id = i;
++        idmas[i].did = 10 + i;
++        idmas[i].reg = hw[i].regs;
++        idmas[i].miscdev.parent = &devices[i];
++        idmas[i].quarantined = false;
++        hw[i].next_id = 100;
++        hw[i].zero_id = false;
++        hw[i].pending = false;
++    }
++    v->idma = &idmas[0];
++    v->dev = &devices[0];
++    v->size = 4096;
++    v->chunk = 4096;
++    v->src_iova = 0x1000;
++    v->dst_iova = 0x2000;
++    if (has_a) {
++        a->idma = &idmas[1];
++        a->dev = &devices[1];
++        a->size = 4096;
++        a->chunk = 4096;
++        a->src_iova = 0x3000;
++        a->dst_iova = 0x4000;
++    }
++}
++
++static void reset_state(void)
++{
++    now = 1000;
++    signal_flag = false;
++    irq_disabled_depth = preempt_disabled_depth = 0;
++    irq_pending = irq_serviced = false;
++    mmio_count = 0;
++    log_buffer[0] = 0;
++    memset(hw, 0, sizeof(hw));
++    memset(idmas, 0, sizeof(idmas));
++}
++
++int main(int argc, char **argv)
++{
++    struct idma_stream v, a;
++    struct idma_batch_start start;
++    u64 end = 0;
++    int ret;
++    const char *name;
++
++    assert(argc == 2);
++    name = argv[1];
++    reset_state();
++
++    if (!strcmp(name, "order_both")) {
++        unsigned first_trigger, second_trigger, a_conf = 0, v_conf = 0, i;
++
++        setup_streams(&v, &a, true);
++        memset(&start, 0, sizeof(start));
++        start.v_did = 10;
++        start.a_did = 11;
++        start.has_a = true;
++        ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
++        assert(ret == 0);
++        assert(start.attempted && start.a_triggered && start.v_triggered);
++        assert(start.a_id == 101 && start.v_id == 101);
++        assert(start.a_begin_ns && start.a_end_ns && start.v_begin_ns && start.v_end_ns);
++        assert(start.a_begin_ns <= start.a_end_ns);
++        assert(start.a_end_ns <= start.v_begin_ns);
++        assert(start.v_begin_ns <= start.v_end_ns);
++        assert(start.irq_span_ns == start.v_end_ns - start.a_begin_ns);
++        assert(a.in_flight && v.in_flight);
++        assert(a.transfer_id == start.a_id && v.transfer_id == start.v_id);
++        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        assert(!a.retain && !v.retain);
++
++        first_trigger = mmio_count;
++        for (i = 0; i < mmio_count; i++) {
++            if (mmio_events[i].op == MMIO_READ &&
++                mmio_events[i].offset == IDMA_NEXT_ID_REG_OFFSET) {
++                first_trigger = i;
++                break;
++            }
++        }
++        assert(first_trigger < mmio_count);
++        for (i = 0; i < first_trigger; i++) {
++            if (mmio_events[i].op == MMIO_WRITE &&
++                mmio_events[i].dev == 1 &&
++                mmio_events[i].offset == IDMA_SRC_ADDR_REG_OFFSET)
++                a_conf = i;
++            if (mmio_events[i].op == MMIO_WRITE &&
++                mmio_events[i].dev == 0 &&
++                mmio_events[i].offset == IDMA_SRC_ADDR_REG_OFFSET)
++                v_conf = i;
++        }
++        assert(a_conf && v_conf && a_conf < v_conf && v_conf < first_trigger);
++        assert(mmio_events[first_trigger].dev == 1);
++        second_trigger = first_trigger + 1;
++        while (second_trigger < mmio_count &&
++               !(mmio_events[second_trigger].op == MMIO_READ &&
++                 mmio_events[second_trigger].offset == IDMA_NEXT_ID_REG_OFFSET))
++            second_trigger++;
++        assert(second_trigger < mmio_count);
++        assert(mmio_events[second_trigger].dev == 0);
++        for (i = first_trigger + 1; i < second_trigger; i++)
++            assert(mmio_events[i].op != MMIO_WRITE ||
++                   (mmio_events[i].offset != IDMA_SRC_ADDR_REG_OFFSET &&
++                    mmio_events[i].offset != IDMA_DST_ADDR_REG_OFFSET &&
++                    mmio_events[i].offset != IDMA_NUM_BYTES_REG_OFFSET &&
++                    mmio_events[i].offset != IDMA_CONF_REG_OFFSET));
++        printf("PASS %s\n", name);
++        return 0;
++    }
++
++    if (!strcmp(name, "a_zero_skip_v")) {
++        unsigned i;
++
++        setup_streams(&v, &a, true);
++        hw[1].zero_id = true;
++        memset(&start, 0, sizeof(start));
++        start.v_did = 10;
++        start.a_did = 11;
++        start.has_a = true;
++        ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
++        assert(ret == -EIO);
++        assert(start.attempted && start.a_triggered && !start.v_triggered);
++        assert(start.a_id == 0);
++        assert(a.retain && idmas[1].quarantined);
++        assert(!v.retain && !idmas[0].quarantined);
++        assert(a.batch_started);
++        assert(!v.batch_started);
++        assert(!v.in_flight && !a.in_flight);
++        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        for (i = 0; i < mmio_count; i++)
++            assert(!(mmio_events[i].op == MMIO_READ &&
++                     mmio_events[i].dev == 0 &&
++                     mmio_events[i].offset == IDMA_NEXT_ID_REG_OFFSET));
++        printf("PASS %s\n", name);
++        return 0;
++    }
++
++    if (!strcmp(name, "v_zero_after_a")) {
++        setup_streams(&v, &a, true);
++        hw[0].zero_id = true;
++        memset(&start, 0, sizeof(start));
++        start.v_did = 10;
++        start.a_did = 11;
++        start.has_a = true;
++        ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
++        assert(ret == -EIO);
++        assert(start.attempted && start.a_triggered && start.v_triggered);
++        assert(start.v_id == 0);
++        assert(a.in_flight && !a.retain);
++        assert(v.retain && idmas[0].quarantined);
++        assert(v.batch_started);
++        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        printf("PASS %s\n", name);
++        return 0;
++    }
++
++    if (!strcmp(name, "solo_timestamps")) {
++        setup_streams(&v, &a, false);
++        memset(&start, 0, sizeof(start));
++        start.v_did = 10;
++        start.a_did = IDMA_EXPERIMENT_NO_AGGRESSOR;
++        start.has_a = false;
++        ret = idma_batch_start(&v, NULL, now + 1000000, &end, &start);
++        assert(ret == 0);
++        assert(start.attempted && !start.a_triggered && start.v_triggered);
++        assert(!start.a_begin_ns && !start.a_end_ns);
++        assert(start.v_begin_ns && start.v_end_ns);
++        assert(start.irq_span_ns == start.v_end_ns - start.v_begin_ns);
++        assert(!start.a_id && start.v_id);
++        assert(v.in_flight);
++        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        printf("PASS %s\n", name);
++        return 0;
++    }
++
++    if (!strcmp(name, "deadline_no_trigger")) {
++        setup_streams(&v, &a, true);
++        memset(&start, 0, sizeof(start));
++        ret = idma_batch_start(&v, &a, now - 1, &end, &start);
++        assert(ret == -ETIMEDOUT);
++        assert(!start.attempted && !start.a_triggered && !start.v_triggered);
++        assert(!a.batch_started && !v.batch_started);
++        assert(!a.in_flight && !v.in_flight);
++        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        assert(mmio_count == 0);
++        printf("PASS %s\n", name);
++        return 0;
++    }
++
++    if (!strcmp(name, "signal_no_trigger")) {
++        setup_streams(&v, &a, true);
++        signal_flag = true;
++        memset(&start, 0, sizeof(start));
++        ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
++        assert(ret == -EINTR);
++        assert(!start.attempted && !start.a_triggered && !start.v_triggered);
++        assert(!a.batch_started && !v.batch_started);
++        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        assert(mmio_count == 0);
++        printf("PASS %s\n", name);
++        return 0;
++    }
++
++    if (!strcmp(name, "irq_restore_paths")) {
++        setup_streams(&v, &a, true);
++        hw[1].zero_id = true;
++        irq_pending = true;
++        memset(&start, 0, sizeof(start));
++        ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
++        assert(ret == -EIO);
++        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        assert(irq_pending || irq_serviced);
++
++        reset_state();
++        setup_streams(&v, &a, true);
++        irq_pending = true;
++        memset(&start, 0, sizeof(start));
++        ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
++        assert(ret == 0);
++        assert(!irq_disabled_depth && !preempt_disabled_depth);
++        assert(irq_pending && !irq_serviced);
++        printf("PASS %s\n", name);
++        return 0;
++    }
++
++    if (!strcmp(name, "log_contract")) {
++        setup_streams(&v, &a, true);
++        memset(&start, 0, sizeof(start));
++        start.v_did = 10;
++        start.a_did = 11;
++        start.has_a = true;
++        ret = idma_batch_start(&v, &a, now + 1000000, &end, &start);
++        assert(ret == 0);
++        idma_batch_start_log(&devices[0], &start, 42, 0);
++        assert(strstr(log_buffer, "idma_batch_start version=1 seq=42 method=irq_pair"));
++        assert(strstr(log_buffer, "v_did=10 a_did=11 attempted=1 has_a=1 a_triggered=1 v_triggered=1"));
++        assert(strstr(log_buffer, "a_id=101 v_id=101"));
++        assert(strstr(log_buffer, "irq_span_ns="));
++        assert(strstr(log_buffer, "a_to_v_ns="));
++        assert(strstr(log_buffer, "error=0"));
++        printf("PASS %s\n", name);
++        return 0;
++    }
++
++    assert(!"unknown test");
++    return 1;
++}

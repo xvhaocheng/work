@@ -1,0 +1,65 @@
+# P4M 短验收结果复核（Solo / A1 gap0 / A8 gap0 / A8 gap1000）
+
+**结论：四例短验收在功能层面通过；本报告是短验收复核，不是正式收益结论。** 实际执行：DeepSeek 起草复核/文档，Codex 审阅原始记录、UART、driver/observer 并做科学决策与实际复核。复核脚本正常退出与自检：{{REVIEW_RESULT}}（待实际运行填充）。
+
+## 关键表（n=1，描述性，不代表显著性）
+
+| case | seq | V cycles | hw window ns | V completed bytes | V MiB/s | software victim_elapsed_ns | done_to_read cycles | done_to_read ns | A window jobs | A window bytes | A MiB/s | carry | carry share | whole-run A completed | window/whole | HPM V miss | HPM A miss |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| solo | 1 | 44279 | 885580 | 262144 | 282.300865 | 1959840 | 50032 | 1000640 | 0 | 0 | 0 | 0 | null | null | null | 0 | null |
+| a1-gap0 | 2 | 83938 | 1678760 | 262144 | 148.919441 | 69479280 | 3356413 | 67128260 | 64 | 262144 | 148.919441 | 1 | 0.015625 | 4961 | 0.012901 | 0 | 0 |
+| a8-gap0 | 3 | 120679 | 2413580 | 262144 | 103.580573 | 22188640 | 968383 | 19367660 | 64 | 262144 | 103.580573 | 1 | 0.015625 | 1496 | 0.042781 | 0 | 112 |
+| a8-gap1000 | 4 | 85276 | 1705520 | 262144 | 146.582860 | 2835120 | 49182 | 983640 | 32 | 131072 | 73.291430 | 1 | 0.031250 | 61 | 0.524590 | 0 | 72 |
+
+A8 gap1000 相对 A8 gap0：V 时间 -29.33650428%，A 完成速率 -29.24210798%；A 完成数 32 vs 64，但窗口更短，因此速率不是简单减半。gap1000 的 V 变快/A 完成速率下降是预期取舍，不是本轮异常。
+
+## 已验证事实
+
+- 四例短验收在板上功能通过：records/raw UART/taint 一致；板卡 exit 0、final taint=0、collection_failed=0。
+- P4M-1 与 P4M-3 短验收完成；P4M-2 的 legacy `--batch` 与 `--p4m` gap0 显式对照本轮未做（本轮全为 `--p4m`）；P4M-4 预试为下一步。
+- 不证明正式收益；所有 n=1。
+- 窗口守恒通过；carry=1 在每个 A 例出现，占窗口内完成数 1.56%、1.56%、3.125%，是边界计数效应。
+- HPM 全软件区间：V miss 0；A1 miss 0；A8 gap0 miss 112；A8 gap1000 miss 72；不能当作同一硬件窗口归因。
+- `raw_observation[34]` 是 done_to_read；observer.sv:337 BATCH_READ 递增直到匹配 poll；driver ~902 记录该值。UART 与 records 的 done_to_read 一致：50032 / 3356413 / 968383 / 49182 cycles。
+- UART 中 hrtimer 16.2008 ms 警告是辅助现象；不能证明全部结果由它导致。
+- 硬件功能验收与 artifact identity 分开：SD/readback/hash 未验证只保留为 provenance 警告；raw BOOT Linux 00088 行成功，P4M magic 与 success 支持功能验收，不因陈旧 `hardware_boot_verified=false` 强制重烧/重跑。
+
+## 证明边界
+
+- n=1，不能声称显著性、等价性或正式收益。
+- P4M-2 同 BIT `--batch` vs `--p4m` gap0 未做显式比较。
+- 地址映射/容量仍是未证明背景，不单独断言为干扰原因。
+- done_to_read 证明完成读取延迟，不证明调度/中断是全部根因。
+- artifact identity、SD 回读与 bit/payload 哈希仍有 provenance 缺口；原始 profile/manifest 中 board `not_run` 是历史快照，保持不可变。
+
+## 在论文中的角色
+
+P4M 短验收只支持“共同 V 硬件窗口内 A 完成量/边界在途 + 固定 gap 基线”这一测量路径在板上可运行、可记录、可复核。正式收益与取舍曲线必须由后续预试/正式采样给出，不能由 n=1 短验收推出。
+
+## 精确 21 试次计划（pilot，非正式）
+
+- 3 个确定性交错 block，每 block 7 trials，共 21 trials；pilot 不是正式结论。
+- 固定 4096 V jobs、256 warmup、4 KiB、50 MHz、DS 50/50、V0 DID10、A1 DID11、PTW128 off。
+- 每 block：P4M Solo、P4M A1gap0、legacy `--batch` A8gap0、P4M A8gap0、P4M A8gap500、A8gap1000、A8gap2000。
+- 顺序：
+  - block1: Solo, A1, BatchA8, P4MA8g0, g500, g1000, g2000
+  - block2: Solo, g2000, g1000, g500, P4MA8g0, BatchA8, A1
+  - block3: Solo, g1000, g500, g2000, BatchA8, P4MA8g0, A1
+- 每 block 一次 Solo 基线（共 3 次），同工作量，block 内比较；legacy/P4M 成对相邻并做顺序反转。
+- legacy 比较前要求 `/sys/module/idma/parameters/observe` 与 `path_observe` enabled（源码默认 true）；legacy 使用 UART `idma_batch_obs` 硬件 cycles，不用 software elapsed。
+- legacy 分支 driver 调同一 batch configure/write0 并 reset gap，同一窗口硬件 logging；P4M 只额外加 observer arm bit30 与 gap readback。
+- pilot gap500/1000/2000 覆盖约 1x 观察到的 shared-window A interval 1886 cycles 的分数区间，不是 active cycles/completed whole-run 723 的纯服务时间。
+- 仅 pilot 点，不冻结正式参数。若端点未覆盖取舍，最多后续补一个有针对性的 4000 pilot 点，不自动扩矩阵。
+- n=3 用于重复性与选点，不做等价性证明或显著性；不发明等价阈值；报告 paired ratio 与条件内范围；若 gap0 系统性差异仍在，正式前调查，不因 n=3 宣布等价。
+- 功能错误、timeout、taint、quarantine、无效 bank/raw、record 冲突、缺 final marker 时停止。
+- ZERO A window progress 合法：报告 zero+bounds，不停止、不排除、不当作纯零异常。
+- 所有条件 V issued/done 4096，含 Solo。
+- 软件 poll tail 警告保留，不因慢而拒绝；不做 cherry-picked rerun。
+- 报告 median/min/max 与 paired values，描述性 pilot，无 CI/显著性；保留全部 trials。
+- 用户本轮要求 analysis/plan only：不要在这里起草或安装新 board runner；现有 platform-p4m 只支持 SHORT，不会自动跑 21-trial pilot。后续 pilot runner 可由用户继续授权实施；计划先冻结如下。
+
+## 验收与停止标准
+
+验收：21 trials 完成且无停止条件；每 block 有 Solo 基线；legacy/P4M 成对相邻且顺序反转；所有条件 V issued/done 4096；UART part=time/axi_v 的 valid/status/DIDs/issued/done/batch_polled/h+gap=cycles/occupancy=cycles/obs34 done_to_read 全部一致；复核脚本 normal exit 0、selftest PASS、hash_unchanged true、无 failures。
+
+停止：功能错误、timeout、taint、quarantine、无效 bank/raw、record 冲突、缺 final marker；legacy 比较前 observe/path_observe 未启用；script sourcecopy mismatch；关键 evidence 缺失。

@@ -1,0 +1,957 @@
+diff --git a/tests/nonblock_read_admission.sv b/tests/nonblock_read_admission.sv
+new file mode 100644
+--- /dev/null
++++ b/tests/nonblock_read_admission.sv
+@@ -0,0 +1,360 @@
++// SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
++//
++// tests/nonblock_read_admission.sv
++//
++// TEST-ONLY ingress proxy for the completion AR channel. NOT PRODUCTION RTL.
++// It sits between the inner harness completion AR port and the system-top
++// crossbar slave port 2. AW/W/R/B paths are untouched.
++//
++// Modes (input, runtime):
++//   0 none        : passthrough, no buffer, no policy.
++//   1 buffer      : one-entry registered buffer, no admission policy.
++//   2 ingress     : confirm current PTE passed the shared DDR entry.
++//   3 period      : confirm + Q-beat budget, refilled by a fixed period.
++//   4 progress    : confirm + Q-beat budget, refilled on PTW R fire.
++//   5 walk        : confirm + Q-beat budget, refilled on new walk rising.
++//   6 outstanding : confirm + Q-beat outstanding cap; R returns restore.
++//
++// The proxy only restricts a NEW offer when:
++//   dbg_tl_ptw_active && bufferFast && bufferbank != dbg_main_bank
++// Once an offer is formed, its VALID/payload is held until the downstream
++// ready handshake, independent of later phase changes.
++
++module nonblock_read_admission #(
++    parameter int unsigned BankIdBit = 2,
++    parameter int unsigned IdWidth   = 4,
++    parameter int unsigned AddrWidth = 64,
++    parameter int unsigned LenWidth  = 8,
++    parameter type ar_chan_t = logic
++) (
++    input  logic clk_i,
++    input  logic rst_ni,
++
++    input  logic [2:0]  mode_i,
++    input  logic [31:0] budget_i,
++    input  logic [31:0] period_i,
++
++    // upstream: from inner harness completion AR
++    input  logic        s_ar_valid,
++    output logic        s_ar_ready,
++    input  ar_chan_t    s_ar_chan,
++
++    // downstream: to crossbar slave port 2 AR
++    output logic        m_ar_valid,
++    input  logic        m_ar_ready,
++    output ar_chan_t    m_ar_chan,
++
++    // observation / policy
++    input  logic        ptw_active_i,
++    input  logic        ptw_r_fire_i,
++    input  logic        main_bank_i,
++    input  logic        fast_resp_valid_i,
++    input  logic        fast_resp_ready_i,
++    input  logic        fast_resp_bank_i,
++    input  logic [1:0]  bank_is_read_i,
++    input  logic [1:0]  bank_trans_resp_valid_i,
++    input  logic [1:0]  bank_trans_resp_ready_i,
++
++    input  logic        ddr_ar_valid_i,
++    input  logic        ddr_ar_ready_i,
++    input  logic [5:0]  ddr_ar_id_i,
++
++    // AW exemption / fast-tag clear
++    input  logic [1:0][31:0] aw_pending_i,
++    input  logic        comp_aw_valid_i,
++    input  logic        comp_aw_bank_i,
++    input  logic        comp_b_fire_i,
++    input  logic        comp_b_bank_i,
++
++    // R beat return for debt decrement
++    input  logic        comp_r_fire_i,
++
++    // debug / observation
++    output logic        dbg_captured,
++    output logic        dbg_first_offer,
++    output logic        dbg_ar_fire,
++    output logic        dbg_blocked,
++    output logic [2:0]  dbg_blocked_reason,
++    output logic        dbg_buffer_empty,
++    output logic        dbg_fastread_capture,
++    output logic        dbg_phase_reset,
++    output logic        dbg_payload_fast,
++    output logic        dbg_payload_bank,
++    output logic [IdWidth-1:0]   dbg_payload_id,
++    output logic [AddrWidth-1:0] dbg_payload_addr,
++    output logic [LenWidth-1:0]  dbg_payload_len,
++    output logic [31:0] dbg_phaseused,
++    output logic        dbg_confirm,
++    output logic [31:0] dbg_debt,
++    output logic [31:0] dbg_first_offers,
++    output logic [31:0] dbg_fastread_captures,
++    output logic [31:0] dbg_gate_stall,
++    output logic [31:0] dbg_ingress_stall,
++    output logic [31:0] dbg_budget_stall,
++    output logic [31:0] dbg_phase_resets,
++    output logic [31:0] dbg_exempt_offers,
++    output logic [31:0] dbg_oversize_escape,
++    output logic [31:0] dbg_debt_max,
++    output logic [31:0] dbg_fast_gated_offers,
++    output logic [31:0] dbg_capture_count,
++    output logic [31:0] dbg_offer_handshake_count
++);
++
++    localparam logic [2:0] RA_NONE        = 3'd0;
++    localparam logic [2:0] RA_BUFFER      = 3'd1;
++    localparam logic [2:0] RA_INGRESS     = 3'd2;
++    localparam logic [2:0] RA_PERIOD      = 3'd3;
++    localparam logic [2:0] RA_PROGRESS    = 3'd4;
++    localparam logic [2:0] RA_WALK        = 3'd5;
++    localparam logic [2:0] RA_OUTSTANDING = 3'd6;
++
++    typedef enum logic [1:0] {ST_EMPTY, ST_CAPTURED, ST_OFFER} state_e;
++    state_e state_q;
++
++    ar_chan_t   buf_q;
++    logic       buf_fast_q;
++    logic       buf_bank_q;
++
++    logic       confirm_q;
++    logic       prev_ptw_active_q;
++    logic [31:0] stage_used_q;
++    logic [31:0] debt_q;
++    logic [31:0] period_cnt_q;
++    logic [1:0]  fast_pending_q;
++
++    logic [31:0] first_offers_q;
++    logic [31:0] fastread_captures_q;
++    logic [31:0] gate_stall_q;
++    logic [31:0] ingress_stall_q;
++    logic [31:0] budget_stall_q;
++    logic [31:0] phase_resets_q;
++    logic [31:0] exempt_offers_q;
++    logic [31:0] oversize_escape_q;
++    logic [31:0] debt_max_q;
++    logic [31:0] fast_gated_offers_q;
++    logic [31:0] capture_count_q;
++    logic [31:0] offer_handshake_count_q;
++
++    // ---- fast-read tag set events: only on a real read TC transaction ----
++    wire fast_set_b0 =
++        bank_trans_resp_valid_i[0] && bank_trans_resp_ready_i[0] &&
++        bank_is_read_i[0] &&
++        fast_resp_valid_i && fast_resp_ready_i &&
++        (fast_resp_bank_i == 1'b0);
++
++    wire fast_set_b1 =
++        bank_trans_resp_valid_i[1] && bank_trans_resp_ready_i[1] &&
++        bank_is_read_i[1] &&
++        fast_resp_valid_i && fast_resp_ready_i &&
++        (fast_resp_bank_i == 1'b1);
++
++    // ---- capture event ----
++    wire capture_bank = s_ar_chan.id[BankIdBit];
++    wire capture_fast = fast_pending_q[capture_bank];
++    wire capture_fire = (mode_i != RA_NONE) &&
++                        (state_q == ST_EMPTY) &&
++                        s_ar_valid;
++
++    // ---- admission ----
++    wire [31:0] beats = {23'b0, buf_q.len} + 32'd1;
++
++    wire restricted =
++        (mode_i != RA_NONE) && (mode_i != RA_BUFFER) &&
++        ptw_active_i && buf_fast_q && (buf_bank_q != main_bank_i);
++
++    wire exempt =
++        (aw_pending_i[buf_bank_q] != 32'd0) ||
++        (comp_aw_valid_i && (comp_aw_bank_i == buf_bank_q));
++
++    wire oversize =
++        (mode_i inside {RA_PERIOD, RA_PROGRESS, RA_WALK, RA_OUTSTANDING}) &&
++        (beats > budget_i);
++
++    wire confirm_ok = confirm_q;
++    wire period_ok  = (stage_used_q + beats <= budget_i);
++    wire debt_ok    = (debt_q + beats <= budget_i);
++    wire budget_ok  =
++        (mode_i == RA_INGRESS)     ? 1'b1 :
++        (mode_i == RA_OUTSTANDING) ? debt_ok :
++        (mode_i inside {RA_PERIOD, RA_PROGRESS, RA_WALK}) ? period_ok :
++        1'b1;
++
++    wire admit = !restricted || exempt || oversize || (confirm_ok && budget_ok);
++
++    wire first_offer =
++        (mode_i != RA_NONE) && (state_q == ST_CAPTURED) && admit;
++
++    wire ar_fire =
++        (mode_i == RA_NONE) ? (s_ar_valid && m_ar_ready) :
++                              (state_q == ST_OFFER && m_ar_ready);
++
++    wire blocked =
++        (mode_i != RA_NONE) && (mode_i != RA_BUFFER) &&
++        (state_q == ST_CAPTURED) && restricted && !admit;
++
++    // PTW real shared-DDR AR: PTW ID0, DDTW ID1.
++    wire pte_ar_confirm =
++        ddr_ar_valid_i && ddr_ar_ready_i &&
++        (ddr_ar_id_i[5:4] == 2'b11) &&
++        (ddr_ar_id_i[3:0] == 4'd0);
++
++    wire new_walk_rising = ptw_active_i && !prev_ptw_active_q;
++    wire walk_falling    = !ptw_active_i && prev_ptw_active_q;
++    wire phase_reset     = ptw_r_fire_i || new_walk_rising || walk_falling;
++
++    wire period_expire =
++        (mode_i == RA_PERIOD) && (period_i != 32'd0) && (period_cnt_q == 32'd0);
++
++    // ---- outputs ----
++    assign s_ar_ready = (mode_i == RA_NONE) ? m_ar_ready : (state_q == ST_EMPTY);
++    assign m_ar_valid = (mode_i == RA_NONE) ? s_ar_valid : (state_q == ST_OFFER);
++    assign m_ar_chan  = (mode_i == RA_NONE) ? s_ar_chan : buf_q;
++
++    assign dbg_captured       = capture_fire;
++    assign dbg_first_offer    = first_offer;
++    assign dbg_ar_fire        = ar_fire;
++    assign dbg_blocked        = blocked;
++    assign dbg_blocked_reason = { budget_ok ? 1'b0 : 1'b1,
++                                  confirm_ok ? 1'b0 : 1'b1,
++                                  1'b0 };
++    assign dbg_buffer_empty   = (state_q == ST_EMPTY);
++    assign dbg_fastread_capture = capture_fire && capture_fast;
++    assign dbg_phase_reset    = phase_reset;
++    assign dbg_payload_fast   = buf_fast_q;
++    assign dbg_payload_bank   = buf_bank_q;
++    assign dbg_payload_id     = buf_q.id;
++    assign dbg_payload_addr   = buf_q.addr;
++    assign dbg_payload_len    = buf_q.len;
++    assign dbg_phaseused      = stage_used_q;
++    assign dbg_confirm        = confirm_q;
++    assign dbg_debt           = debt_q;
++    assign dbg_first_offers   = first_offers_q;
++    assign dbg_fastread_captures = fastread_captures_q;
++    assign dbg_gate_stall     = gate_stall_q;
++    assign dbg_ingress_stall  = ingress_stall_q;
++    assign dbg_budget_stall   = budget_stall_q;
++    assign dbg_phase_resets   = phase_resets_q;
++    assign dbg_exempt_offers  = exempt_offers_q;
++    assign dbg_oversize_escape= oversize_escape_q;
++    assign dbg_debt_max       = debt_max_q;
++    assign dbg_fast_gated_offers = fast_gated_offers_q;
++    assign dbg_capture_count  = capture_count_q;
++    assign dbg_offer_handshake_count = offer_handshake_count_q;
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin : ra_seq
++        if (!rst_ni) begin
++            state_q <= ST_EMPTY;
++            buf_q <= '0;
++            buf_fast_q <= 1'b0;
++            buf_bank_q <= 1'b0;
++            confirm_q <= 1'b0;
++            prev_ptw_active_q <= 1'b0;
++            stage_used_q <= 32'd0;
++            debt_q <= 32'd0;
++            period_cnt_q <= 32'd0;
++            fast_pending_q <= 2'b00;
++            first_offers_q <= 32'd0;
++            fastread_captures_q <= 32'd0;
++            gate_stall_q <= 32'd0;
++            ingress_stall_q <= 32'd0;
++            budget_stall_q <= 32'd0;
++            phase_resets_q <= 32'd0;
++            exempt_offers_q <= 32'd0;
++            oversize_escape_q <= 32'd0;
++            debt_max_q <= 32'd0;
++            fast_gated_offers_q <= 32'd0;
++            capture_count_q <= 32'd0;
++            offer_handshake_count_q <= 32'd0;
++        end else begin
++            // ---- fast-read tag lifecycle ----
++            // Same-cycle set wins over clear; clear wins over consume.
++            if (fast_set_b0) fast_pending_q[0] <= 1'b1;
++            else if (comp_b_fire_i && (comp_b_bank_i == 1'b0)) fast_pending_q[0] <= 1'b0;
++            else if (capture_fire && (capture_bank == 1'b0) && fast_pending_q[0])
++                fast_pending_q[0] <= 1'b0;
++
++            if (fast_set_b1) fast_pending_q[1] <= 1'b1;
++            else if (comp_b_fire_i && (comp_b_bank_i == 1'b1)) fast_pending_q[1] <= 1'b0;
++            else if (capture_fire && (capture_bank == 1'b1) && fast_pending_q[1])
++                fast_pending_q[1] <= 1'b0;
++
++            // ---- capture upstream AR ----
++            if (capture_fire) begin
++                state_q <= ST_CAPTURED;
++                buf_q <= s_ar_chan;
++                buf_fast_q <= capture_fast;
++                buf_bank_q <= capture_bank;
++                capture_count_q <= capture_count_q + 32'd1;
++            end
++
++            // ---- first downstream offer / reservation ----
++            if (first_offer) begin
++                state_q <= ST_OFFER;
++                first_offers_q <= first_offers_q + 32'd1;
++                if (restricted) fast_gated_offers_q <= fast_gated_offers_q + 32'd1;
++                if (restricted && exempt) exempt_offers_q <= exempt_offers_q + 32'd1;
++                if (oversize) oversize_escape_q <= oversize_escape_q + 32'd1;
++
++                if (mode_i inside {RA_PERIOD, RA_PROGRESS, RA_WALK})
++                    stage_used_q <= stage_used_q + beats;
++
++                if ((debt_q + beats) > debt_max_q) debt_max_q <= debt_q + beats;
++                debt_q <= debt_q + beats - (comp_r_fire_i ? 32'd1 : 32'd0);
++            end else if (comp_r_fire_i) begin
++                if (debt_q != 32'd0) debt_q <= debt_q - 32'd1;
++            end
++
++            // ---- downstream offer handshake ----
++            if (ar_fire && (mode_i != RA_NONE)) begin
++                state_q <= ST_EMPTY;
++                offer_handshake_count_q <= offer_handshake_count_q + 32'd1;
++            end
++
++            // ---- PTE confirm / phase reset ----
++            // Same-cycle confirm is intentionally allowed to survive reset and
++            // become usable next cycle.
++            if (pte_ar_confirm) confirm_q <= 1'b1;
++            else if (ptw_r_fire_i || new_walk_rising || walk_falling)
++                confirm_q <= 1'b0;
++
++            if (phase_reset) phase_resets_q <= phase_resets_q + 32'd1;
++
++            // ---- phase budget reset ----
++            if (mode_i == RA_PERIOD) begin
++                if (period_expire) begin
++                    stage_used_q <= 32'd0;
++                    period_cnt_q <= period_i - 32'd1;
++                end else if (period_cnt_q != 32'd0) begin
++                    period_cnt_q <= period_cnt_q - 32'd1;
++                end
++            end
++            if ((mode_i == RA_PROGRESS) && ptw_r_fire_i) stage_used_q <= 32'd0;
++            if ((mode_i == RA_WALK) && new_walk_rising) stage_used_q <= 32'd0;
++            if (walk_falling) stage_used_q <= 32'd0;
++
++            // ---- blocked counters ----
++            if (blocked) begin
++                gate_stall_q <= gate_stall_q + 32'd1;
++                if (!confirm_ok) ingress_stall_q <= ingress_stall_q + 32'd1;
++                else if (!budget_ok) budget_stall_q <= budget_stall_q + 32'd1;
++            end
++
++            if (capture_fire && capture_fast)
++                fastread_captures_q <= fastread_captures_q + 32'd1;
++
++            prev_ptw_active_q <= ptw_active_i;
++        end
++    end
++
++endmodule
+
+diff --git a/tests/nonblock_actual_dma_system_top.sv b/tests/nonblock_actual_dma_system_top.sv
+--- a/tests/nonblock_actual_dma_system_top.sv
++++ b/tests/nonblock_actual_dma_system_top.sv
+@@ -85,6 +85,11 @@
+     input  logic        nonblock_enable_i,
+     input  logic        policy_partition_i,
+ 
++    // Test-only read-admission proxy controls (SYSTEM build only).
++    input  logic [2:0]  read_admit_mode_i,
++    input  logic [31:0] read_budget_i,
++    input  logic [31:0] read_period_i,
++
+     // ---------------- shared DDR master port (6-bit master-side ID) ---------
+     output logic        ddr_aw_valid,
+     output logic [5:0]  ddr_aw_id,
+@@ -210,6 +215,36 @@
+     output logic        dbg_cpu_wr_quiet,
+     output logic        dbg_cpu_amo_r_fire,
+-    output logic [63:0] dbg_cpu_amo_r_data
++    output logic [63:0] dbg_cpu_amo_r_data,
++
++    // ---------------- test-only read-admission proxy observation ----------
++    output logic        dbg_ra_captured,
++    output logic        dbg_ra_first_offer,
++    output logic        dbg_ra_ar_fire,
++    output logic        dbg_ra_blocked,
++    output logic [2:0]  dbg_ra_blocked_reason,
++    output logic        dbg_ra_buffer_empty,
++    output logic        dbg_ra_fastread_capture,
++    output logic        dbg_ra_phase_reset,
++    output logic        dbg_ra_payload_fast,
++    output logic        dbg_ra_payload_bank,
++    output logic [3:0]  dbg_ra_payload_id,
++    output logic [63:0] dbg_ra_payload_addr,
++    output logic [7:0]  dbg_ra_payload_len,
++    output logic [31:0] dbg_ra_phaseused,
++    output logic        dbg_ra_confirm,
++    output logic [31:0] dbg_ra_debt,
++    output logic [31:0] dbg_ra_first_offers,
++    output logic [31:0] dbg_ra_fastread_captures,
++    output logic [31:0] dbg_ra_gate_stall,
++    output logic [31:0] dbg_ra_ingress_stall,
++    output logic [31:0] dbg_ra_budget_stall,
++    output logic [31:0] dbg_ra_phase_resets,
++    output logic [31:0] dbg_ra_exempt_offers,
++    output logic [31:0] dbg_ra_oversize_escape,
++    output logic [31:0] dbg_ra_debt_max,
++    output logic [31:0] dbg_ra_fast_gated_offers,
++    output logic [31:0] dbg_ra_capture_count,
++    output logic [31:0] dbg_ra_offer_handshake_count,
++    output logic        dbg_ra_upstream_valid,
++    output logic        dbg_ra_upstream_ready,
++    output logic [3:0]  dbg_ra_upstream_id,
++    output logic [63:0] dbg_ra_upstream_addr,
++    output logic [7:0]  dbg_ra_upstream_len,
++    output logic        dbg_ra_downstream_valid,
++    output logic        dbg_ra_downstream_ready
+ );
+@@ -260,6 +295,17 @@
+     logic [2:0]  u_comp_ar_prot;
+     logic [0:0]  u_comp_ar_user;
+ 
++    logic        u_comp_ar_ready;
++    slv_ar_chan_t u_comp_ar_chan;
++    logic        proxy_ar_valid;
++    logic        proxy_ar_ready;
++    slv_ar_chan_t proxy_ar_chan;
++
++    logic [1:0][31:0] comp_aw_pending_q;
++    logic        comp_aw_fire, comp_b_fire;
++    logic        comp_aw_bank, comp_b_bank;
++
+     logic        u_comp_w_valid;
+     logic [63:0] u_comp_w_data;
+     logic [7:0]  u_comp_w_strb;
+@@ -398,18 +444,31 @@
+         comp_req.aw.prot  = u_comp_aw_prot;
+         comp_req.aw.user  = u_comp_aw_user;
+-        comp_req.ar_valid = u_comp_ar_valid;
+-        comp_req.ar.id    = u_comp_ar_id;
+-        comp_req.ar.addr  = u_comp_ar_addr;
+-        comp_req.ar.len   = u_comp_ar_len;
+-        comp_req.ar.size  = u_comp_ar_size;
+-        comp_req.ar.burst = u_comp_ar_burst;
+-        comp_req.ar.prot  = u_comp_ar_prot;
+-        comp_req.ar.user  = u_comp_ar_user;
++        comp_req.ar_valid = proxy_ar_valid;
++        comp_req.ar.id    = proxy_ar_chan.id;
++        comp_req.ar.addr  = proxy_ar_chan.addr;
++        comp_req.ar.len   = proxy_ar_chan.len;
++        comp_req.ar.size  = proxy_ar_chan.size;
++        comp_req.ar.burst = proxy_ar_chan.burst;
++        comp_req.ar.prot  = proxy_ar_chan.prot;
++        comp_req.ar.user  = proxy_ar_chan.user;
+         comp_req.w_valid  = u_comp_w_valid;
+         comp_req.w.data   = u_comp_w_data;
+         comp_req.w.strb   = u_comp_w_strb;
+         comp_req.w.last   = u_comp_w_last;
+         comp_req.b_ready  = u_comp_b_ready;
+         comp_req.r_ready  = u_comp_r_ready;
+     }
++
++    always_comb begin : comp_ar_in_pack
++        u_comp_ar_chan = '0;
++        u_comp_ar_chan.id    = u_comp_ar_id;
++        u_comp_ar_chan.addr  = u_comp_ar_addr;
++        u_comp_ar_chan.len   = u_comp_ar_len;
++        u_comp_ar_chan.size  = u_comp_ar_size;
++        u_comp_ar_chan.burst = u_comp_ar_burst;
++        u_comp_ar_chan.prot  = u_comp_ar_prot;
++        u_comp_ar_chan.user  = u_comp_ar_user;
++    end
+     assign slv_reqs[2] = comp_req;
+@@ -1025,7 +1084,7 @@
+         .comp_b_ready  (u_comp_b_ready),
+         .comp_r_ready  (u_comp_r_ready),
+         .comp_aw_ready (slv_resps[2].aw_ready),
+-        .comp_ar_ready (slv_resps[2].ar_ready),
++        .comp_ar_ready (u_comp_ar_ready),
+         .comp_w_ready  (slv_resps[2].w_ready),
+         .comp_b_valid  (slv_resps[2].b_valid),
+         .comp_b_id     (slv_resps[2].b.id),
+@@ -1105,6 +1164,78 @@
+         .dbg_cfg_state        (dbg_cfg_state)
+     );
+ 
++    // ========================================================================
++    // Test-only completion-AR ingress proxy.  AW/W/R/B are untouched.
++    // ========================================================================
++    nonblock_read_admission #(
++        .BankIdBit (2),
++        .IdWidth   (4),
++        .AddrWidth (64),
++        .LenWidth  (8),
++        .ar_chan_t (slv_ar_chan_t)
++    ) i_read_admission (
++        .clk_i,
++        .rst_ni,
++        .mode_i   (read_admit_mode_i),
++        .budget_i (read_budget_i),
++        .period_i (read_period_i),
++
++        .s_ar_valid (u_comp_ar_valid),
++        .s_ar_ready (u_comp_ar_ready),
++        .s_ar_chan  (u_comp_ar_chan),
++        .m_ar_valid (proxy_ar_valid),
++        .m_ar_ready (slv_resps[2].ar_ready),
++        .m_ar_chan  (proxy_ar_chan),
++
++        .ptw_active_i   (dbg_tl_ptw_active),
++        .ptw_r_fire_i   (dbg_tl_ptw_r_fire),
++        .main_bank_i    (dbg_main_bank),
++        .fast_resp_valid_i (dbg_fast_resp_valid),
++        .fast_resp_ready_i (dbg_fast_resp_ready),
++        .fast_resp_bank_i  (dbg_fast_resp_bank),
++        .bank_is_read_i ({
++            i_dma.i_sys.gen_banked.i_banked.gen_bank[1].i_bank.is_read,
++            i_dma.i_sys.gen_banked.i_banked.gen_bank[0].i_bank.is_read
++        }),
++        .bank_trans_resp_valid_i (i_dma.i_sys.gen_banked.i_banked.bank_trans_resp_valid),
++        .bank_trans_resp_ready_i (i_dma.i_sys.gen_banked.i_banked.bank_trans_resp_ready),
++
++        .ddr_ar_valid_i (ddr_ar_valid),
++        .ddr_ar_ready_i (ddr_ar_ready),
++        .ddr_ar_id_i    (ddr_ar_id),
++
++        .aw_pending_i   (comp_aw_pending_q),
++        .comp_aw_valid_i (u_comp_aw_valid),
++        .comp_aw_bank_i  (comp_aw_bank),
++        .comp_b_fire_i   (comp_b_fire),
++        .comp_b_bank_i   (comp_b_bank),
++        .comp_r_fire_i   (slv_resps[2].r_valid && u_comp_r_ready),
++
++        .dbg_captured (dbg_ra_captured),
++        .dbg_first_offer (dbg_ra_first_offer),
++        .dbg_ar_fire (dbg_ra_ar_fire),
++        .dbg_blocked (dbg_ra_blocked),
++        .dbg_blocked_reason (dbg_ra_blocked_reason),
++        .dbg_buffer_empty (dbg_ra_buffer_empty),
++        .dbg_fastread_capture (dbg_ra_fastread_capture),
++        .dbg_phase_reset (dbg_ra_phase_reset),
++        .dbg_payload_fast (dbg_ra_payload_fast),
++        .dbg_payload_bank (dbg_ra_payload_bank),
++        .dbg_payload_id (dbg_ra_payload_id),
++        .dbg_payload_addr (dbg_ra_payload_addr),
++        .dbg_payload_len (dbg_ra_payload_len),
++        .dbg_phaseused (dbg_ra_phaseused),
++        .dbg_confirm (dbg_ra_confirm),
++        .dbg_debt (dbg_ra_debt),
++        .dbg_first_offers (dbg_ra_first_offers),
++        .dbg_fastread_captures (dbg_ra_fastread_captures),
++        .dbg_gate_stall (dbg_ra_gate_stall),
++        .dbg_ingress_stall (dbg_ra_ingress_stall),
++        .dbg_budget_stall (dbg_ra_budget_stall),
++        .dbg_phase_resets (dbg_ra_phase_resets),
++        .dbg_exempt_offers (dbg_ra_exempt_offers),
++        .dbg_oversize_escape (dbg_ra_oversize_escape),
++        .dbg_debt_max (dbg_ra_debt_max),
++        .dbg_fast_gated_offers (dbg_ra_fast_gated_offers),
++        .dbg_capture_count (dbg_ra_capture_count),
++        .dbg_offer_handshake_count (dbg_ra_offer_handshake_count)
++    );
++
++    // AW/B exemption tracking: physical comp AW/B handshakes, per bank.
++    assign comp_aw_fire = u_comp_aw_valid && slv_resps[2].aw_ready;
++    assign comp_b_fire  = slv_resps[2].b_valid && u_comp_b_ready;
++    assign comp_aw_bank = u_comp_aw_id[2];
++    assign comp_b_bank  = slv_resps[2].b.id[2];
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin : comp_aw_pending_fsm
++        if (!rst_ni) begin
++            comp_aw_pending_q <= '0;
++        end else begin
++            if (comp_aw_fire && (comp_aw_bank == 1'b0)) begin
++                if (comp_b_fire && (comp_b_bank == 1'b0))
++                    comp_aw_pending_q[0] <= comp_aw_pending_q[0];
++                else
++                    comp_aw_pending_q[0] <= comp_aw_pending_q[0] + 32'd1;
++            end else if (comp_b_fire && (comp_b_bank == 1'b0)) begin
++                if (comp_aw_pending_q[0] != 32'd0)
++                    comp_aw_pending_q[0] <= comp_aw_pending_q[0] - 32'd1;
++            end
++
++            if (comp_aw_fire && (comp_aw_bank == 1'b1)) begin
++                if (comp_b_fire && (comp_b_bank == 1'b1))
++                    comp_aw_pending_q[1] <= comp_aw_pending_q[1];
++                else
++                    comp_aw_pending_q[1] <= comp_aw_pending_q[1] + 32'd1;
++            end else if (comp_b_fire && (comp_b_bank == 1'b1)) begin
++                if (comp_aw_pending_q[1] != 32'd0)
++                    comp_aw_pending_q[1] <= comp_aw_pending_q[1] - 32'd1;
++            end
++        end
++    end
++
+     // ========================================================================
+     // Test-only observation taps
+     // ========================================================================
+-    assign dbg_comp_ar_fire = u_comp_ar_valid & slv_resps[2].ar_ready;
++    assign dbg_comp_ar_fire = u_comp_ar_valid & u_comp_ar_ready;
+     assign dbg_comp_aw_fire = u_comp_aw_valid & slv_resps[2].aw_ready;
+@@ -1110,6 +1241,14 @@
+     assign dbg_short = 0;
+*** End Patch
+
+@@ -1118,6 +1257,14 @@
+     assign dbg_comp_ar_fire = u_comp_ar_valid & u_comp_ar_ready;
+     assign dbg_comp_aw_fire = u_comp_aw_valid & slv_resps[2].aw_ready;
+     assign dbg_comp_w_fire  = u_comp_w_valid  & slv_resps[2].w_ready;
+     assign dbg_ddtw_ar_fire = u_ddtw_ar_valid & ddtw_resp.ar_ready;
+     assign dbg_ptw_ar_fire  = u_ptw_ar_valid  & ptw_resp.ar_ready;
++
++    assign dbg_ra_upstream_valid   = u_comp_ar_valid;
++    assign dbg_ra_upstream_ready   = u_comp_ar_ready;
++    assign dbg_ra_upstream_id      = u_comp_ar_id;
++    assign dbg_ra_upstream_addr    = u_comp_ar_addr;
++    assign dbg_ra_upstream_len     = u_comp_ar_len;
++    assign dbg_ra_downstream_valid = proxy_ar_valid;
++    assign dbg_ra_downstream_ready = slv_resps[2].ar_ready;
+
+diff --git a/tests/nonblock_actual_dma_test.cpp b/tests/nonblock_actual_dma_test.cpp
+--- a/tests/nonblock_actual_dma_test.cpp
++++ b/tests/nonblock_actual_dma_test.cpp
+@@ -237,6 +237,37 @@
+     uint64_t warm_hw_a_done     = 0;
+ #ifdef ACTUAL_DMA_SYSTEM
++    // Read-admission proxy controls / window counters.
++    std::string read_admit_mode_str = "none";
++    uint32_t    read_admit_mode_val = 0;
++    uint32_t    read_budget         = 256;
++    uint32_t    read_period         = 256;
++
++    uint64_t ra_open_capture      = 0;
++    uint64_t ra_open_offer        = 0;
++    uint64_t ra_open_firstoffers  = 0;
++    uint64_t ra_open_fastread     = 0;
++    uint64_t ra_open_gate         = 0;
++    uint64_t ra_open_ingress      = 0;
++    uint64_t ra_open_budget       = 0;
++    uint64_t ra_open_phase_resets = 0;
++    uint64_t ra_open_exempt       = 0;
++    uint64_t ra_open_oversize     = 0;
++    uint64_t ra_open_fastgated    = 0;
++
++    uint64_t w_ra_captures        = 0;
++    uint64_t w_ra_offer_handshakes= 0;
++    uint64_t w_ra_firstoffers     = 0;
++    uint64_t w_ra_fastread        = 0;
++    uint64_t w_ra_gate            = 0;
++    uint64_t w_ra_ingress         = 0;
++    uint64_t w_ra_budget          = 0;
++    uint64_t w_ra_phase_resets    = 0;
++    uint64_t w_ra_exempt          = 0;
++    uint64_t w_ra_oversize        = 0;
++    uint64_t w_ra_debtmax         = 0;
++    uint64_t w_ra_fastgated       = 0;
++    uint64_t n_ra_captured        = 0;
++    uint64_t n_ra_ar_fire         = 0;
++    bool     ra_up_valid_q        = false;
++    uint32_t ra_up_id_q           = 0;
++    uint64_t ra_up_addr_q         = 0;
++    uint8_t  ra_up_len_q          = 0;
++    bool     ra_down_valid_q      = false;
++    uint32_t ra_down_id_q         = 0;
++    uint64_t ra_down_addr_q       = 0;
++    uint8_t  ra_down_len_q        = 0;
++
+     // Synthetic-CPU independent progress baseline (refreshed only by the CPU
+     // lifecycle counters, never by DMA handshakes).
+     long     cpu_progress_cycle  = 0;
+@@ -1096,6 +1127,24 @@
+         w_ds_latency_sum = w_ds_latency_n = w_ds_latency_max = 0;
+         ddr_r_held = false;
+         trace_ptw_active = false;
+         trace_aw_flags = 0;
++        n_ra_captured = n_ra_ar_fire = 0;
++        ra_up_valid_q = ra_down_valid_q = false;
++        w_ra_captures = w_ra_offer_handshakes = 0;
++        w_ra_firstoffers = w_ra_fastread = 0;
++        w_ra_gate = w_ra_ingress = w_ra_budget = 0;
++        w_ra_phase_resets = w_ra_exempt = w_ra_oversize = 0;
++        w_ra_debtmax = w_ra_fastgated = 0;
+         cpu_progress_cycle = g_cycle;
+         last_cpu_issued    = 0;
+@@ -1155,6 +1204,71 @@
+         top->cfg_wdata = cfg_wdata;
+         top->cfg_wstrb = cfg_wstrb;
+ 
++#ifdef ACTUAL_DMA_SYSTEM
++        top->read_admit_mode_i = read_admit_mode_val;
++        top->read_budget_i     = read_budget;
++        top->read_period_i     = read_period;
++#endif
++
+         top->clk_i = 0;
+@@
+ #ifdef ACTUAL_DMA_SYSTEM
++        // ---- read-admission proxy payload stability / lifecycle ----
++        if (top->dbg_ra_upstream_valid && !top->dbg_ra_upstream_ready) {
++            if (ra_up_valid_q) {
++                CHECK(top->dbg_ra_upstream_id   == ra_up_id_q &&
++                      top->dbg_ra_upstream_addr == ra_up_addr_q &&
++                      top->dbg_ra_upstream_len  == ra_up_len_q,
++                      "upstream completion AR payload changed while held VALID");
++            }
++            ra_up_valid_q = true;
++            ra_up_id_q    = top->dbg_ra_upstream_id;
++            ra_up_addr_q  = top->dbg_ra_upstream_addr;
++            ra_up_len_q   = top->dbg_ra_upstream_len;
++        } else {
++            ra_up_valid_q = false;
++        }
++
++        if (top->dbg_ra_downstream_valid && !top->dbg_ra_downstream_ready) {
++            if (ra_down_valid_q) {
++                CHECK(top->dbg_ra_payload_id   == ra_down_id_q &&
++                      top->dbg_ra_payload_addr == ra_down_addr_q &&
++                      top->dbg_ra_payload_len  == ra_down_len_q,
++                      "proxy downstream AR payload changed while held VALID");
++            }
++            ra_down_valid_q = true;
++            ra_down_id_q    = top->dbg_ra_payload_id;
++            ra_down_addr_q  = top->dbg_ra_payload_addr;
++            ra_down_len_q   = top->dbg_ra_payload_len;
++        } else {
++            ra_down_valid_q = false;
++        }
++
++        if (top->dbg_ra_captured) ++n_ra_captured;
++        if (top->dbg_ra_ar_fire)  ++n_ra_ar_fire;
++
+         const bool     f_ddr_ar   = top->ddr_ar_valid && top->ddr_ar_ready;
+@@ -1282,6 +1396,18 @@
+         if (opening) {
+             win_open = true;
+             win_seen = true;
+             win_open_cycle = g_cycle;
++#ifdef ACTUAL_DMA_SYSTEM
++            ra_open_capture      = top->dbg_ra_capture_count;
++            ra_open_offer        = top->dbg_ra_offer_handshake_count;
++            ra_open_firstoffers  = top->dbg_ra_first_offers;
++            ra_open_fastread     = top->dbg_ra_fastread_captures;
++            ra_open_gate         = top->dbg_ra_gate_stall;
++            ra_open_ingress      = top->dbg_ra_ingress_stall;
++            ra_open_budget       = top->dbg_ra_budget_stall;
++            ra_open_phase_resets = top->dbg_ra_phase_resets;
++            ra_open_exempt       = top->dbg_ra_exempt_offers;
++            ra_open_oversize     = top->dbg_ra_oversize_escape;
++            ra_open_fastgated    = top->dbg_ra_fast_gated_offers;
++#endif
+         }
+         if (win_open && !opening) {
+             ++w_cycles;
+@@
+ #ifdef ACTUAL_DMA_SYSTEM
++            w_ra_captures         = top->dbg_ra_capture_count - ra_open_capture;
++            w_ra_offer_handshakes = top->dbg_ra_offer_handshake_count - ra_open_offer;
++            w_ra_firstoffers      = top->dbg_ra_first_offers - ra_open_firstoffers;
++            w_ra_fastread         = top->dbg_ra_fastread_captures - ra_open_fastread;
++            w_ra_gate             = top->dbg_ra_gate_stall - ra_open_gate;
++            w_ra_ingress          = top->dbg_ra_ingress_stall - ra_open_ingress;
++            w_ra_budget           = top->dbg_ra_budget_stall - ra_open_budget;
++            w_ra_phase_resets     = top->dbg_ra_phase_resets - ra_open_phase_resets;
++            w_ra_exempt           = top->dbg_ra_exempt_offers - ra_open_exempt;
++            w_ra_oversize         = top->dbg_ra_oversize_escape - ra_open_oversize;
++            w_ra_fastgated        = top->dbg_ra_fast_gated_offers - ra_open_fastgated;
++            if ((uint64_t)top->dbg_ra_debt > w_ra_debtmax)
++                w_ra_debtmax = (uint64_t)top->dbg_ra_debt;
++
+             if (top->dbg_tl_ptw_active != trace_ptw_active)
+                 trace_event(top->dbg_tl_ptw_active ? "ptw_start" : "ptw_end",
+                             top->dbg_main_bank, 0, 0);
+@@ -1299,6 +1425,17 @@
+             if (top->dbg_tl_ptw_r_fire) trace_event("ptw_r", top->dbg_main_bank, 0, 0);
++            if (top->dbg_ra_fastread_capture)
++                trace_event("fastreadcapture", top->dbg_ra_payload_bank,
++                            top->dbg_ra_payload_addr, top->dbg_ra_payload_len);
++            if (top->dbg_ra_first_offer)
++                trace_event("proxyfirstoffer", top->dbg_ra_payload_bank,
++                            top->dbg_ra_payload_addr, top->dbg_ra_payload_len);
++            if (top->dbg_ra_ar_fire)
++                trace_event("proxyarfire", top->dbg_ra_payload_bank,
++                            top->dbg_ra_payload_addr, top->dbg_ra_payload_len);
++            if (top->dbg_ra_phase_reset)
++                trace_event("phase_reset", top->dbg_ra_payload_bank, 0, 0);
++            if (top->dbg_ra_blocked)
++                trace_event("gate_block", top->dbg_ra_blocked_reason,
++                            top->dbg_ra_payload_addr, top->dbg_ra_payload_len);
+             if (f_ddr_ar) trace_event("ddr_ar", s_ddr_ar_i, s_ddr_ar_a, s_ddr_ar_l);
+@@ -1356,6 +1493,32 @@
+             "window_definition":"hardware_first_V_issue_to_final_V_done_(open,close]",
+             "unavailable":["comp_aw_stall","comp_ar_stall"]}\n",
+@@
+             (unsigned long long)w_ds_ar_stall, (unsigned long long)w_ds_r_stall);
++
++        std::printf("READ-ADMIT-WINDOW-JSON {"
++            "\"schema\":\"read-admit-window-v1\","
++            "\"mode\":\"%s\",\"read_admit\":\"%s\",\"budget\":%u,\"period\":%u,"
++            "\"captures\":%llu,\"offer_handshakes\":%llu,\"firstoffers\":%llu,"
++            "\"fastread_captures\":%llu,"
++            "\"gate_stall\":%llu,\"ingress_stall\":%llu,\"budget_stall\":%llu,"
++            "\"phase_resets\":%llu,\"exemptoffers\":%llu,"
++            "\"oversizeescape\":%llu,\"debtmax\":%llu,"
++            "\"fast_gated_offers\":%llu}\n",
++            name, read_admit_mode_str.c_str(), read_budget, read_period,
++            (unsigned long long)w_ra_captures,
++            (unsigned long long)w_ra_offer_handshakes,
++            (unsigned long long)w_ra_firstoffers,
++            (unsigned long long)w_ra_fastread,
++            (unsigned long long)w_ra_gate,
++            (unsigned long long)w_ra_ingress,
++            (unsigned long long)w_ra_budget,
++            (unsigned long long)w_ra_phase_resets,
++            (unsigned long long)w_ra_exempt,
++            (unsigned long long)w_ra_oversize,
++            (unsigned long long)w_ra_debtmax,
++            (unsigned long long)w_ra_fastgated);
+ #else
+@@ -1800,6 +1963,18 @@
+         CHECK(top->dbg_cpu_quiet, "synthetic CPU not quiet at terminal");
++        if (read_admit_mode_val != 0) {
++            CHECK(n_ra_captured == n_ra_ar_fire,
++                  "read-admission proxy captures do not match offer handshakes");
++            CHECK(top->dbg_ra_debt == 0,
++                  "read-admission proxy debt is nonzero at terminal");
++            CHECK(top->dbg_ra_buffer_empty,
++                  "read-admission proxy buffer is not empty at terminal");
++        }
+         // The idle debug port must never produce shared-DDR traffic.
+@@ -1894,6 +2069,10 @@
+     uint32_t    warmup   = 256;
+     uint32_t    ptw_lat  = 31;
+     uint64_t    a_target = 1048576ULL;
++    std::string read_admit = "none";
++    uint32_t    read_budget = 256;
++    uint32_t    read_period = 256;
+ #ifdef ACTUAL_DMA_SYSTEM
+     bool        cpu_writes = false;
+@@ -1919,6 +2098,9 @@
+         if (const char* v = val("ptw-latency")) ptw_lat = (uint32_t)std::strtoul(v, nullptr, 0);
+         if (const char* v = val("a-target"))  a_target = std::strtoull(v, nullptr, 0);
++        if (const char* v = val("read-admit"))  read_admit = v;
++        if (const char* v = val("read-budget")) read_budget = (uint32_t)std::strtoul(v, nullptr, 0);
++        if (const char* v = val("read-period")) read_period = (uint32_t)std::strtoul(v, nullptr, 0);
+ #ifdef ACTUAL_DMA_SYSTEM
+@@ -1945,6 +2127,22 @@
+     if (!(ptw_lat == 31 || ptw_lat == 100)) {
+         std::fprintf(stderr, "nonblock_actual_dma_test: +ptw-latency must be 31|100\n");
+         return 2;
+     }
++    if (read_admit != "none" && read_admit != "buffer" &&
++        read_admit != "ingress" && read_admit != "period" &&
++        read_admit != "progress" && read_admit != "walk" &&
++        read_admit != "outstanding") {
++        std::fprintf(stderr, "nonblock_actual_dma_test: invalid +read-admit='%s'\n",
++                     read_admit.c_str());
++        return 2;
++    }
++    if (read_budget < 256) {
++        std::fprintf(stderr, "nonblock_actual_dma_test: +read-budget must be >= 256\n");
++        return 2;
++    }
++    if (read_period == 0) {
++        std::fprintf(stderr, "nonblock_actual_dma_test: +read-period must be > 0\n");
++        return 2;
++    }
++#ifndef ACTUAL_DMA_SYSTEM
++    if (read_admit != "none" || read_budget != 256 || read_period != 256) {
++        std::fprintf(stderr, "nonblock_actual_dma_test: read-admit options require --system build\n");
++        return 2;
++    }
++#endif
++    uint32_t read_admit_val = 0;
++    if (read_admit == "none") read_admit_val = 0;
++    else if (read_admit == "buffer") read_admit_val = 1;
++    else if (read_admit == "ingress") read_admit_val = 2;
++    else if (read_admit == "period") read_admit_val = 3;
++    else if (read_admit == "progress") read_admit_val = 4;
++    else if (read_admit == "walk") read_admit_val = 5;
++    else if (read_admit == "outstanding") read_admit_val = 6;
+ 
+     // The wrapper forwards --mode into the run-time nonblock_enable_i and
+@@ -1965,6 +2163,9 @@
+ #ifdef ACTUAL_DMA_SYSTEM
+     std::printf("nonblock_actual_dma_test: cpu_writes=%d\n", (int)cpu_writes);
++    std::printf("nonblock_actual_dma_test: read_admit=%s budget=%u period=%u\n",
++                read_admit.c_str(), read_budget, read_period);
+ #endif
+@@ -1978,6 +2179,12 @@
+ #ifdef ACTUAL_DMA_SYSTEM
+         tb.cpu_writes      = cpu_writes;
+         tb.ds_priority     = ds_priority;
++        tb.read_admit_mode_str = read_admit;
++        tb.read_admit_mode_val = read_admit_val;
++        tb.read_budget         = read_budget;
++        tb.read_period         = read_period;
+         if (!trace_path.empty()) {
+*** End Patch
+
+diff --git a/tests/test_nonblock_actual_dma.py b/tests/test_nonblock_actual_dma.py
+--- a/tests/test_nonblock_actual_dma.py
++++ b/tests/test_nonblock_actual_dma.py
+@@ -190,6 +190,9 @@
+         axi / "axi_xbar_unmuxed.sv",
+         axi / "axi_xbar.sv",
+         IOMMU / "rtl" / "ext_interfaces" / "rv_iommu_ds_if.sv",
++        ROOT / "tests" / "nonblock_read_admission.sv",
+         ROOT / "tests" / "nonblock_actual_dma_system_top.sv",
+     ]
+@@ -230,6 +233,18 @@
+     ap.add_argument("--system", action="store_true",
+                     help="build the shared-DDR system-integration top "
+                          "(tests/nonblock_actual_dma_system_top.sv) with the "
+                          "production rv_iommu_ds_if / axi_delayer(50/50) / "
+                          "axi_xbar; compiles with -DACTUAL_DMA_SYSTEM and uses "
+                          "the separate object directory out/nonblock-actual-dma/obj-system")
++    ap.add_argument("--read-admit", choices=("none", "buffer", "ingress",
++                                             "period", "progress", "walk",
++                                             "outstanding"),
++                    default=None,
++                    help="system-only completion-AR ingress proxy mode")
++    ap.add_argument("--read-budget", type=int, default=None,
++                    help="system-only read budget Q (default 256, must be >= 256)")
++    ap.add_argument("--read-period", type=int, default=None,
++                    help="system-only period-mode refill period (default 256)")
+     ap.add_argument("--system-atomics", action="store_true",
+                     help="system top with board production DDR atomics adapter; independent build")
+@@ -244,6 +259,17 @@
+     if opts.system_atomics:
+         opts.system = True
+     if opts.cpu_writes and not opts.system_atomics:
+         ap.error("--cpu-writes requires --system-atomics")
++    if not opts.system:
++        if opts.read_admit is not None or opts.read_budget is not None or \
++           opts.read_period is not None:
++            ap.error("--read-admit/--read-budget/--read-period require --system")
++    else:
++        if opts.read_admit is None:
++            opts.read_admit = "none"
++        if opts.read_budget is None:
++            opts.read_budget = 256
++        if opts.read_period is None:
++            opts.read_period = 256
++        if opts.read_budget < 256:
++            ap.error("--read-budget must be >= 256")
++        if opts.read_period == 0:
++            ap.error("--read-period must be > 0")
+ 
+     sibling = load_sibling()
+@@ -343,6 +369,11 @@
+     if opts.system:
+         run_args += ["+system=1"]
+     if opts.cpu_writes:
+         run_args += ["+cpu-writes=1"]
++    if opts.system:
++        run_args += [
++            "+read-admit={}".format(opts.read_admit),
++            "+read-budget={}".format(opts.read_budget),
++            "+read-period={}".format(opts.read_period),
++        ]
+     print("test_nonblock_actual_dma: system={} cpu_writes={} top={} mode={} "
+*** End Patch

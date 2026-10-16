@@ -1,0 +1,1 @@
+mkdir -m 700 /tmp/r107-stage111 && dd if=/dev/mmcblk0p1 of=/tmp/r107-stage111/original-mmcblk0p1.bin bs=1048576 count=32 && wc -c /tmp/r107-stage111/original-mmcblk0p1.bin && sha256sum /tmp/r107-stage111/original-mmcblk0p1.bin; printf 'R111_UPDATER='; command -v platform-sd-update; printf 'R111_HTTPD='; busybox --list | busybox grep '^httpd$'

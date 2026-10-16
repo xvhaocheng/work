@@ -1,0 +1,148 @@
+```diff
+diff --git a/tests/banked_ctl_test.cpp b/tests/banked_ctl_test.cpp
+--- a/tests/banked_ctl_test.cpp
++++ b/tests/banked_ctl_test.cpp
+@@ -164,5 +164,6 @@ struct Sim {
+     bool     aw_ready = true, ar_ready = true, w_ready = true;
+ 
+     bool     b_valid = false; uint32_t b_id = 0; uint32_t b_resp = 0;
+     bool     r_valid = false; uint32_t r_id = 0; uint64_t r_data = 0; bool r_last = false;
++    uint32_t r_resp = 0;
+ };
+@@ -431,6 +431,7 @@ static void service() {
+     if (!sim.r_valid && !sim.r_q.empty()) {
+         sim.r_valid = true;
+         sim.r_id    = sim.r_q.front().id;
+         sim.r_data  = sim.r_q.front().data;
++        sim.r_resp  = sim.r_q.front().resp;
+         sim.r_last  = sim.r_q.front().last;
+     }
+diff --git a/tests/nonblock_tl_test.cpp b/tests/nonblock_tl_test.cpp
+--- a/tests/nonblock_tl_test.cpp
++++ b/tests/nonblock_tl_test.cpp
+@@ -283,6 +283,16 @@ class Tb {
+         }
+         return false;
+     }
+ 
++    bool wait_accept_ptw(bool& saw_ptw, int maxc = 40000) {
++        for (int i = 0; i < maxc; ++i) {
++            tick();
++            if (p_ar_fire_last) saw_ptw = true;
++            if (req_fire) return true;
++        }
++        return false;
++    }
++
+     Resp pop_resp(int maxc = 200000) {
+         for (int i = 0; i < maxc; ++i) {
+             if (!resp_q.empty()) {
+@@ -340,5 +340,6 @@ class Tb {
+         write64(0x50000, 0x00000000200000DFULL); // Vsrc -> phys 0x80000000
+         write64(0x50008, 0x00000000200004DFULL); // Vdst -> phys 0x80001000
+         write64(0x50010, 0x00000000200000D3ULL); // Vro  -> r=1, w=0, x=0
++        write64(0x50018, 0x00000000200008DFULL); // Vcold -> phys 0x80002000 (r/w)
+ 
+         // A page tables: root 0x30000, L1A 0x60000, L0A 0x70000.
+@@ -528,3 +528,81 @@ class Tb {
+     }
+ 
++    void case_fast_write_vdst_while_a_held() {
++        reset(true);
++        warm_v();
++        start_cold_a_and_hold();
++
++        set_req(10, 0x10001000ULL, 0x3 /*UNTRANSLATED_W*/, 0, true);
++        if (!wait_accept()) FAIL_AT("fast-wr: Vdst write was not accepted");
++        CHECK_AT(req_fire_fast, "fast-wr: Vdst write was not accepted by fast path");
++        set_req(10, 0, 0, 0, false);
++
++        Resp rv = pop_resp();
++        CHECK_AT(rv.bank == 0 && !rv.error && rv.spaddr == 0x80001000ULL,
++                 "fast-wr: fast write response mismatch");
++
++        Resp ra = release_a();
++        CHECK_AT(ra.bank == 1 && !ra.error && ra.spaddr == 0x90000000ULL,
++                 "fast-wr: A response mismatch after fast write hit");
++        CHECK_AT(resp_q.empty(), "fast-wr: unexpected duplicate response");
++    }
++
++    void case_invalidation_vma_during_leaf() {
++        reset(true);
++        warm_v();
++        start_cold_a_and_hold();
++
++        set_req(10, 0x10000000ULL, 0x2, 0, true);
++        tick(); // IDLE -> DC
++        CHECK_AT(!req_fire, "inval/VMA: accepted on entry to DC");
++        tick(); // DC -> LEAF
++        CHECK_AT(!req_fire, "inval/VMA: accepted while DC");
++        top->inval_vma = 1;
++        top->inval_gv  = 1;
++        tick(); // LEAF sees VMA invalidation -> REJECT
++        CHECK_AT(!req_fire, "inval/VMA: fast accept during LEAF VMA invalidation");
++        CHECK_AT(!req_fire_fast, "inval/VMA: fast path fired during LEAF VMA invalidation");
++        top->inval_vma = 0;
++        top->inval_gv  = 0;
++
++        Resp ra = release_a();
++        CHECK_AT(ra.bank == 1 && !ra.error, "inval/VMA: A response mismatch");
++
++        bool saw_ptw = false;
++        if (!wait_accept_ptw(saw_ptw)) FAIL_AT("inval/VMA: V never accepted after fallback");
++        CHECK_AT(saw_ptw, "inval/VMA: normal path did not perform a PTW refill");
++        set_req(10, 0, 0, 0, false);
++        Resp rv = pop_resp();
++        CHECK_AT(rv.bank == 0 && !rv.error && rv.spaddr == 0x80000000ULL,
++                 "inval/VMA: V response mismatch after refill");
++        CHECK_AT(resp_q.empty(), "inval/VMA: unexpected duplicate response");
++    }
++
++    void case_unwarmed_v_fallthrough() {
++        reset(true);
++        warm_v();
++        start_cold_a_and_hold();
++
++        set_req(10, 0x10003000ULL, 0x2, 0, true);
++        bool any = false, fast = false;
++        for (int i = 0; i < 60; ++i) {
++            tick();
++            if (req_fire) { any = true; if (req_fire_fast) fast = true; }
++        }
++        CHECK_AT(!fast, "unwarmed: fast path accepted a cold IOTLB entry");
++        CHECK_AT(!any, "unwarmed: V accepted before A finished");
++
++        Resp ra = release_a();
++        CHECK_AT(ra.bank == 1 && !ra.error, "unwarmed: A response mismatch");
++
++        bool saw_ptw = false;
++        if (!wait_accept_ptw(saw_ptw)) FAIL_AT("unwarmed: V never accepted after fallback");
++        CHECK_AT(saw_ptw, "unwarmed: normal path did not perform a PTW refill");
++        set_req(10, 0, 0, 0, false);
++        Resp rv = pop_resp();
++        CHECK_AT(rv.bank == 0 && !rv.error && rv.spaddr == 0x80002000ULL,
++                 "unwarmed: V response mismatch after normal-path PTW");
++        CHECK_AT(resp_q.empty(), "unwarmed: unexpected duplicate response");
++    }
++
+     void case_response_backpressure() {
+@@ -588,5 +588,8 @@ class Tb {
+         }
+         CHECK_AT(fast_cnt == 1, "backpressure: fast response count != 1");
+         CHECK_AT(slow_cnt == 1, "backpressure: A response count != 1");
++        for (int i = 0; i < 20; ++i) tick();
++        CHECK_AT(resp_q.empty(), "backpressure: response queue not empty after drain");
++        CHECK_AT(!top->nonblock_busy_o, "backpressure: nonblock_busy_o still high after drain");
+     }
+ };
+@@ -599,6 +599,9 @@ int main(int argc, char** argv) {
+     tb.case_fast_hit_nonblock_on();
+     tb.case_blocked_nonblock_off();
+     tb.case_invalidation_during_dc_leaf();
+     tb.case_permission_write_denied();
+     tb.case_ddtc_miss_fallthrough();
++    tb.case_fast_write_vdst_while_a_held();
++    tb.case_invalidation_vma_during_leaf();
++    tb.case_unwarmed_v_fallthrough();
+     tb.case_response_backpressure();
+```

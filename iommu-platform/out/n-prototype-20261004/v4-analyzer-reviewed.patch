@@ -1,0 +1,1079 @@
+--- scripts/analyze_nonblock_pilot.py
++++ scripts/analyze_nonblock_pilot.py
+@@ -18,10 +18,34 @@
+ 
+ 每个目录由 runner 写成：``manifest.json`` / ``plan.json`` / ``summary.json`` /
+ ``boot.json`` / ``flash.json`` / ``caps.json`` / ``reader-upload.json`` /
+-``STOPPED.txt``，以及 ``cases/<case-id>/`` 下的 ``case.json`` /
+-``metrics.json`` / ``record.json`` / ``exit.txt`` / ``helper.json`` /
+-``helper.exit.txt`` / ``helper-window.json``。本脚本只按**冻结计划里的 15 个
+-case id**逐个打开这些确切路径，不做目录枚举、不做哈希、不从设备读回。
++``STOPPED.txt``，以及 ``cases/<case-id>/`` 下的 ``case.json`` / ``metrics.json`` /
++``record.json`` / ``exit.txt`` / ``helper.json`` / ``helper.exit.txt`` /
++``helper-window.json``。本脚本只按**冻结计划里的 15 个 case id**逐个打开这些确切
++路径，不做目录枚举、不做哈希、不从设备读回。
++
++第二 16 字诊断 bank（可选 ``--diagnostics``）
++=============================================
++
++``--diagnostics``（默认关闭）要求 banked-serial / banked-hit 每个 case 的
++``helper.json`` 带第二 16 字**只读诊断 bank**（``diagnostic`` 对象）。该 bank 与
++冻结的 16 字 core ABI **并存**，绝不替换 core words 0..15，也不作为 HPM / miss /
++PTW 计数。开关关闭时本脚本行为与旧版完全一致（仅新增只读字段）。
++
++诊断校验（仅 ``--diagnostics``）：
++  * ``diagnostic.words`` 必须是 16 个 uint64（非 bool、0..2**64-1）；
++  * ``words[0]`` magic == 0x49444D414E444701，``words[1]`` version == 1；
++  * ``words[2]`` mode == 该 label 的 mode；
++  * ``words[3]`` frozen 低位 == 4，且 bit63 溢出位为 0；
++  * ``words[4]`` seq、``words[5]`` cycles 与 core 窗口一致；
++  * ``words[15]`` fast_accept == Σ(core fast words 6..10)（64 位不溢出）；
++  * 若 ``diagnostic.core_fast_sum`` 存在，作为额外核对（必须等于同一和）。
++
++诊断语义（只读，不反馈 DMA/AXI）：
++  * 采样窗口与 core 一致，均为 (open, close]；reset / ARM 清零，close 冻结；
++  * 跨窗口的部分 probe 合法：start/eval/leaf 计数之间**不假设完整生命周期关系**；
++  * ``seen`` 是 16 位 sticky mask，位义见 ``DIAG_SEEN_BITS``；
++  * fast 事件数不是命中率，也不是全部 miss 数；fast>0 只表示“本轮观测到真实
++    accept”，不构成 novelty；fast 全 0 是**科学上未触发**，**不是技术失败**。
+ 
+ 输出
+ ====
+@@ -46,20 +70,23 @@
+ * 失败 / 残缺数据逐项保留 raw 并分类，只作诊断；性能汇总与两段效应只有在同一
+   比较条件的三个重复技术上全部合格时才发布，绝不把失败残缺数值与有效样本混合，
+   也不剔除不利但合法的合格样本。
+-* 布局效应 = banked-serial − original-serial；
+-  绕过效应 = banked-hit − banked-serial；
++* 两段对照列已按较弱因果措辞重命名：
++  `S/原版结构+缓冲变化` = banked-serial − original-serial（来源受限于旧 legacy3
++  与 S/N 512 缓冲差异，非纯布局因果）；
++  `N/S变化` = banked-hit − banked-serial（描述性，本轮 fast 全 0 时不构成绕过证据）。
+   original 与 banked-hit 的直接差值不用于归因绕过。
+ * 发布前的技术资格会汇合**该 case 的全部质量 issue**（含 a_jobs / exit_txt /
+-  metrics / helper 交叉核对）以及该 label 的 plan / boot / flash / caps /
+-  summary 必要质量问题；任一存在即该 case（及受影响 label）技术上不合格，
+-  compute_effects 不发布。合法偏低或波动样本不记为 quality failure，不剔除。
+-* 直接按 runner validate_record() 的源逐实际字段复核 record.schema /
+-  success / error / result.status / victim|aggressor.data_errors /
+-  quarantined，以及 p4m.bank_magic / observer_status / raw_window 与
+-  raw_observation 的一致性；不导入 runner、不写设备、不重算哈希。
++  metrics / helper / 诊断 bank 交叉核对）以及该 label 的 plan / boot / flash /
++  caps / summary 必要质量问题；任一存在即该 case（及受影响 label）技术上不合格，
++  compute_effects 不发布。合法偏低 / 波动样本、以及 fast=0，不记为 quality
++  failure，不剔除。
++* 直接按 runner validate_record() 的源逐实际字段复核 record.schema / success /
++  error / result.status / victim|aggressor.data_errors / quarantined，以及
++  p4m.bank_magic / observer_status / raw_window 与 raw_observation 的一致性；
++  不导入 runner、不写设备、不重算哈希。
+ * helper 窗口是 ``idma-nonblock-window-v1``，16 字，计数区间为 (open, close]；
+   序号一律取 ``words[4]``；快速路径事件数不是命中率，也不是全部 miss 数。
+-* 旧 HPM / COST / E3 数据不是 N 机制证据。
++* 旧 HPM / COST / E3 / miss / PTW 数据不是 N 机制证据，也绝不用作有效 metric。
+ 
+ 退出码
+ ======
+@@ -92,6 +119,7 @@
+ 
+ CLOCK_HZ = 50_000_000          # 50 MHz；只用于把 cycle 换算成时间/吞吐
+ CHUNK_BYTES = 4096             # --chunk 4096，真实 V 的工作量单位
++UINT64_MAX = (1 << 64) - 1
+ 
+ # 冻结计划（与 scripts/mac_nonblock_pilot.py 的 build_case_plan() 一致）
+ SHORT_TRANSFERS = 64
+@@ -113,6 +141,7 @@
+ CASE_SCHEMA = 'nonblock-pilot-case-v1'
+ FLASH_SCHEMA = 'nonblock-pilot-flash-v1'
+ HELPER_WINDOW_JSON_SCHEMA = 'nonblock-pilot-helper-window-v1'
++DIAG_WINDOW_JSON_SCHEMA = 'nonblock-pilot-diag-window-v1'
+ 
+ # --- record.p4m.raw_window 字段定位 ---------------------------------------
+ #
+@@ -165,6 +194,56 @@
+ HELPER_MODE_FOR_LABEL: Dict[str, int] = {'banked-serial': 1, 'banked-hit': 2}
+ # 计数窗口语义：(open, close]，即不包含 open 时刻那一次事件。
+ 
++# --- 第二 16 字诊断 bank（index 16..31，与 core ABI 并存）-----------------
++#
++# 与 dma_nonblock_observer.sv 的 index 16..31 对应；本脚本只读 helper.json 里的
++# diagnostic 对象，不做任何改写。core words 0..15 语义完全不变。
++DIAG_MAGIC = 0x49444D414E444701
++DIAG_VERSION = 1
++DIAG_WORDS = 16
++DIAG_MODE_INDEX = 2
++DIAG_FLAGS_INDEX = 3
++DIAG_FLAGS_FROZEN = 4
++DIAG_OVERFLOW_BIT = 63
++DIAG_SEQ_INDEX = 4
++DIAG_CYCLES_INDEX = 5
++DIAG_SEEN_INDEX = 6
++DIAG_FAST_ACCEPT_INDEX = 15
++
++# seen 位义（与 rv_iommu_nonblock_hit.sv 的 diag_o 及 tl_wrap 的 bit0 一致）
++DIAG_SEEN_BITS: Tuple[Tuple[int, str, str], ...] = (
++    (0,  'base_s1_ptw_active',
++         '宽口径 base S1 PTW 活动；可能含 implicit/debug，不等于 fast 候选'),
++    (1,  'full_fast_window', '完整 fast 窗口谓词'),
++    (2,  'candidate_in_window', '窗口内候选有效'),
++    (3,  'probe_start', 'probe start'),
++    (4,  'dc_eval', 'DC 评估'),
++    (5,  'dc_good', 'DC 通过稳定阶段'),
++    (6,  'leaf_eval', 'LEAF 评估'),
++    (7,  'leaf_good', 'LEAF 合格'),
++    (8,  'dc_msi_reject', 'DC MSI 拒绝（DDTC 命中）'),
++    (9,  'leaf_msi_reject', 'LEAF MSI 拒绝（IOTLB 命中）'),
++    (10, 'leaf_lookup_miss', 'LEAF 查找未命中'),
++    (11, 'fast_accept', 'fast accept'),
++    (12, 'dc_lookup_miss', 'DC 查找未命中'),
++    (13, 'dc_other_reject', 'DC 其他拒绝'),
++    (14, 'leaf_other_reject', 'LEAF 其他拒绝'),
++    (15, 'runtime_enable', '运行时 enable'),
++)
++
++# 第二 bank words 7..15 → 阶段计数（word 6 是 seen）；word 15 == fast_accepts
++DIAG_COUNTER_FIELDS: Tuple[Tuple[int, str], ...] = (
++    (7,  'probe_starts'),
++    (8,  'dc_evaluations'),
++    (9,  'dc_good'),
++    (10, 'leaf_evaluations'),
++    (11, 'leaf_good'),
++    (12, 'dc_msi_rejects'),
++    (13, 'leaf_msi_rejects'),
++    (14, 'leaf_lookup_misses'),
++    (15, 'fast_accepts'),
++)
++
+ _INT_TEXT_RE = re.compile(r'-?[0-9]+')
+ 
+ 
+@@ -219,6 +298,22 @@
+ def all_ints(values: Any) -> bool:
+     return isinstance(values, list) and all(
+         isinstance(item, int) and not isinstance(item, bool) for item in values)
++
++
++def all_uint64(values: Any) -> bool:
++    return (isinstance(values, list)
++            and all(isinstance(item, int) and not isinstance(item, bool)
++                    and 0 <= item <= UINT64_MAX for item in values))
++
++
++def sum_uint64(values: Sequence[int]) -> Tuple[int, bool]:
++    """返回 (和, 是否溢出 64 位)。只用于诊断核对。"""
++    total = 0
++    for value in values:
++        total += value
++        if total > UINT64_MAX:
++            return total, True
++    return total, False
+ 
+ 
+ def same_or_within(candidate: pathlib.Path, parent: pathlib.Path) -> bool:
+@@ -384,6 +479,133 @@
+     return problems
+ 
+ 
++# ---------------------------------------------------------------------------
++# 第二 16 字诊断 bank 校验（仅 --diagnostics）
++# ---------------------------------------------------------------------------
++
++def validate_helper_diagnostic(label: str, diagnostic: Any,
++                               core_window: Any,
++                               core_fast_sum: Any = None) -> List[str]:
++    """校验可选第二诊断 bank（``helper.json`` 的 ``diagnostic`` 对象）。
++
++    只读传入对象；不导入 runner、不改写任何字段。fast 计数为 0 不是问题。
++    """
++    problems: List[str] = []
++    if not isinstance(diagnostic, dict):
++        return ['helper diagnostic 不是对象']
++
++    words = diagnostic.get('words')
++    if not isinstance(words, list) or len(words) != DIAG_WORDS:
++        if isinstance(words, list):
++            shape = 'len=%d' % len(words)
++        else:
++            shape = repr(words)[:80]
++        return ['helper diagnostic.words 不是 %d 个整数: %s' % (DIAG_WORDS, shape)]
++    if not all(isinstance(v, int) and not isinstance(v, bool) for v in words):
++        return ['helper diagnostic.words 含非整数或 bool（要求 uint64）']
++    if any(v < 0 or v > UINT64_MAX for v in words):
++        return ['helper diagnostic.words 超出 uint64 范围']
++
++    if words[0] != DIAG_MAGIC:
++        problems.append('diagnostic words[0] magic %r != %#x' % (words[0], DIAG_MAGIC))
++    if words[1] != DIAG_VERSION:
++        problems.append('diagnostic words[1] version %r != %d'
++                        % (words[1], DIAG_VERSION))
++
++    expected_mode = HELPER_MODE_FOR_LABEL.get(label)
++    if words[DIAG_MODE_INDEX] != expected_mode:
++        problems.append('diagnostic words[2] mode %r != %r (label=%s)'
++                        % (words[DIAG_MODE_INDEX], expected_mode, label))
++
++    flags = words[DIAG_FLAGS_INDEX]
++    overflow = (flags >> DIAG_OVERFLOW_BIT) & 1
++    low = flags & ((1 << DIAG_OVERFLOW_BIT) - 1)
++    if overflow != 0:
++        problems.append('diagnostic words[3] bit63 overflow=%d != 0' % overflow)
++    if low != DIAG_FLAGS_FROZEN:
++        problems.append('diagnostic words[3] frozen 低位 %r != %d'
++                        % (low, DIAG_FLAGS_FROZEN))
++
++    if core_window is None:
++        problems.append('诊断校验缺少 core 窗口，无法核对 seq/cycles/fast')
++        return problems
++    if not (isinstance(core_window, list) and len(core_window) == HELPER_WORDS
++            and all_ints(core_window)):
++        problems.append('core 窗口不是 %d 个整数，无法核对诊断' % HELPER_WORDS)
++        return problems
++
++    if words[DIAG_SEQ_INDEX] != core_window[HELPER_SEQ_INDEX]:
++        problems.append('diagnostic words[4] seq %r != core words[4] %r'
++                        % (words[DIAG_SEQ_INDEX], core_window[HELPER_SEQ_INDEX]))
++    if words[DIAG_CYCLES_INDEX] != core_window[HELPER_CYCLES_INDEX]:
++        problems.append('diagnostic words[5] cycles %r != core words[5] %r'
++                        % (words[DIAG_CYCLES_INDEX], core_window[HELPER_CYCLES_INDEX]))
++
++    total, ovf = sum_uint64([core_window[i] for i in HELPER_FAST_SLICE])
++    if ovf:
++        problems.append('core fast Σ 6..10 溢出 64 位')
++    elif words[DIAG_FAST_ACCEPT_INDEX] != total:
++        problems.append('diagnostic words[15] fast_accept %r != Σ(core 6..10) %r'
++                        % (words[DIAG_FAST_ACCEPT_INDEX], total))
++
++    if core_fast_sum is not None:
++        if isinstance(core_fast_sum, bool) or not isinstance(core_fast_sum, int):
++            problems.append('diagnostic.core_fast_sum 不是整数: %r' % (core_fast_sum,))
++        else:
++            if core_fast_sum != total:
++                problems.append('diagnostic.core_fast_sum %r != Σ(core 6..10) %r'
++                                % (core_fast_sum, total))
++            elif core_fast_sum != words[DIAG_FAST_ACCEPT_INDEX]:
++                problems.append('diagnostic.core_fast_sum %r != diagnostic words[15] %r'
++                                % (core_fast_sum, words[DIAG_FAST_ACCEPT_INDEX]))
++    return problems
++
++
++def fast_summary_from_core(words: Any) -> Optional[Dict[str, Any]]:
++    """从 core 16 字快速切片导出 V/A/other 计数。fast 全 0 是合法观察。"""
++    if not all_ints(words) or len(words) != HELPER_WORDS:
++        return None
++    v_total = words[6] + words[7]
++    a_total = words[8] + words[9]
++    other = words[10]
++    total = v_total + a_total + other
++    return {
++        'v_read': words[6],
++        'v_write': words[7],
++        'a_read': words[8],
++        'a_write': words[9],
++        'other': other,
++        'v_total': v_total,
++        'a_total': a_total,
++        'total': total,
++        'all_zero': total == 0,
++    }
++
++
++def diagnostic_summary(words: Any) -> Optional[Dict[str, Any]]:
++    """从诊断 16 字导出 seen 位与阶段计数（不含 words 本身）。"""
++    if not all_uint64(words) or len(words) != DIAG_WORDS:
++        return None
++    seen = words[DIAG_SEEN_INDEX]
++    return {
++        'magic': words[0],
++        'version': words[1],
++        'mode': words[2],
++        'flags': words[3],
++        'overflow': (words[3] >> DIAG_OVERFLOW_BIT) & 1,
++        'seq': words[4],
++        'cycles': words[5],
++        'seen': seen,
++        'seen_bits': [name for bit, name, _ in DIAG_SEEN_BITS if (seen >> bit) & 1],
++        'counts': {name: words[idx] for idx, name in DIAG_COUNTER_FIELDS},
++        'fast_accept': words[DIAG_FAST_ACCEPT_INDEX],
++    }
++
++
++# ---------------------------------------------------------------------------
++# validate_record（源级复刻）
++# ---------------------------------------------------------------------------
++
+ def validate_record_fields(spec: Dict[str, Any],
+                            record: Dict[str, Any]) -> List[str]:
+     """按 runner validate_record() 源逐字段复核必要的 record 值。
+@@ -431,7 +653,8 @@
+ # ---------------------------------------------------------------------------
+ 
+ def analyze_case(an: Analysis, label: str, spec: Dict[str, Any],
+-                 case_dir: pathlib.Path) -> Dict[str, Any]:
++                 case_dir: pathlib.Path,
++                 diagnostics: bool = False) -> Dict[str, Any]:
+     entry: Dict[str, Any] = {
+         'id': spec['id'],
+         'order': spec['order'],
+@@ -465,6 +688,8 @@
+         'p4m_has_a': None,
+         'helper': None,
+         'helper_ok': None,
++        'fast': None,
++        'diagnostic': None,
+         'qualified': False,
+         'qualified_reasons': [],
+     }
+@@ -711,6 +936,28 @@
+     }
+     entry['helper'] = helper_entry
+ 
++    diag_entry: Dict[str, Any] = {
++        'expected': bool(diagnostics and helper_expected),
++        'present': False,
++        'words': None,
++        'magic': None,
++        'version': None,
++        'mode': None,
++        'flags': None,
++        'overflow': None,
++        'seq': None,
++        'cycles': None,
++        'seen': None,
++        'seen_bits': None,
++        'counts': None,
++        'fast_accept': None,
++        'core_fast_sum': None,
++        'core_fast_sum_present': False,
++        'problems': [],
++        'ok': None,
++    }
++    entry['diagnostic'] = diag_entry
++
+     helper_ran_expected = (
+         helper_expected and entry['exit'] == 0 and entry['taint_after'] == '0')
+ 
+@@ -780,6 +1027,27 @@
+                     expect_v_movement=expect_v, expect_a=expect_a))
+                 helper_entry['mechanism_expect_v'] = expect_v
+                 helper_entry['mechanism_expect_a'] = expect_a
++                # core fast V/A 计数（与诊断无关，v3 也适用）
++                entry['fast'] = fast_summary_from_core(w)
++
++            # --- 可选第二 16 字诊断 bank ---------------------------------
++            diagnostic = helper_doc.get('diagnostic')
++            diag_entry['present'] = isinstance(diagnostic, dict)
++            if diagnostics and helper_expected:
++                core_fast_sum = (diagnostic.get('core_fast_sum')
++                                 if isinstance(diagnostic, dict) else None)
++                diag_entry['core_fast_sum_present'] = isinstance(diagnostic, dict) \
++                    and ('core_fast_sum' in diagnostic)
++                diag_entry['problems'].extend(validate_helper_diagnostic(
++                    label, diagnostic, helper_entry['words'], core_fast_sum))
++                if isinstance(diagnostic, dict):
++                    dwords = diagnostic.get('words')
++                    if all_uint64(dwords) and len(dwords) == DIAG_WORDS:
++                        diag_entry['words'] = list(dwords)
++                        derived = diagnostic_summary(dwords)
++                        if derived is not None:
++                            diag_entry.update(derived)
++                    diag_entry['core_fast_sum'] = int_or_none(core_fast_sum)
+ 
+     helper_exit_text, err = load_text_file(case_dir / 'helper.exit.txt')
+     if err is not None:
+@@ -802,6 +1070,8 @@
+ 
+     for problem in helper_entry['problems']:
+         an.q(label, case_id, 'helper_window', problem)
++    for problem in diag_entry['problems']:
++        an.q(label, case_id, 'helper_diagnostic', problem)
+ 
+     helper_ok = None
+     if helper_entry['words'] is not None:
+@@ -809,6 +1079,13 @@
+     elif helper_expected:
+         helper_ok = False
+     entry['helper_ok'] = helper_ok
++
++    diag_ok: Optional[bool] = None
++    if diag_entry['words'] is not None:
++        diag_ok = not diag_entry['problems']
++    elif diagnostics and helper_expected:
++        diag_ok = False
++    diag_entry['ok'] = diag_ok
+ 
+     # --- helper-window.json 交叉核对 ---------------------------------------
+     if helper_ran_expected and helper_entry['words'] is not None:
+@@ -830,6 +1107,29 @@
+                 an.q(label, case_id, 'helper_window_json_schema',
+                      'helper-window.json schema=%r' % (window_doc.get('schema'),))
+ 
++    # --- diag-window.json 交叉核对（可选，仅 --diagnostics）-----------------
++    if diagnostics and helper_expected and diag_entry['words'] is not None:
++        diag_window_path = case_dir / 'diag-window.json'
++        if diag_window_path.is_file():
++            window_doc, err = load_json_file(diag_window_path)
++            if err is not None:
++                an.q(label, case_id, 'diagnostic_window_json_unreadable', err)
++            elif not isinstance(window_doc, dict):
++                an.q(label, case_id, 'diagnostic_window_json_not_object',
++                     'diag-window.json 不是 JSON 对象')
++            else:
++                nested = window_doc.get('diagnostic')
++                stored = nested.get('words') if isinstance(nested, dict) else None
++                if not all_uint64(stored) or len(stored) != DIAG_WORDS:
++                    an.q(label, case_id, 'diagnostic_window_json_shape',
++                         'diag-window.json diagnostic.words 不是 %d 个 uint64' % DIAG_WORDS)
++                elif list(stored) != diag_entry['words']:
++                    an.q(label, case_id, 'diagnostic_window_json_mismatch',
++                         'diag-window.json diagnostic.words != helper.json diagnostic.words')
++                if window_doc.get('schema') != DIAG_WINDOW_JSON_SCHEMA:
++                    an.q(label, case_id, 'diagnostic_window_json_schema',
++                         'diag-window.json schema=%r' % (window_doc.get('schema'),))
++
+     # --- 技术合格判定（决定该轮是否可进入性能汇总/效应）-------------------
+     reasons: List[str] = []
+     if entry['state'] != 'complete':
+@@ -846,6 +1146,8 @@
+         reasons.append('同窗口 A 吞吐不可算')
+     if helper_expected and entry['helper_ok'] is not True:
+         reasons.append('helper 窗口未通过校验')
++    if diagnostics and helper_expected and diag_entry['ok'] is not True:
++        reasons.append('诊断 bank 未通过校验')
+     entry['qualified'] = not reasons
+     entry['qualified_reasons'] = reasons
+ 
+@@ -860,9 +1162,9 @@
+                                  info: Dict[str, Any]) -> None:
+     '''把该 label 的全部质量 issue 折进每个 case 的技术资格与 label 汇总。
+ 
+-    该 case 的任何质量 issue（含 a_jobs/exit_txt/metrics/helper 交叉核对）或
++    该 case 的任何质量 issue（含 a_jobs/exit_txt/metrics/helper/诊断交叉核对）或
+     该 label 的 plan/boot/flash/caps/summary 等必要问题，都使受影响 case 技术上
+-    不合格；合法偏低/波动样本不产生 issue，仍保留并参与汇总。
++    不合格；合法偏低/波动样本与 fast=0 不产生 issue，仍保留并参与汇总。
+     '''
+     label_level = [issue for issue in an.quality
+                    if issue['scope'] == label and issue['case'] is None]
+@@ -887,7 +1189,8 @@
+ 
+ 
+ def summarize_label(an: Analysis, label: str, directory: pathlib.Path,
+-                    plan: List[Dict[str, Any]]) -> Dict[str, Any]:
++                    plan: List[Dict[str, Any]],
++                    diagnostics: bool = False) -> Dict[str, Any]:
+     info: Dict[str, Any] = {
+         'label': label,
+         'path': directory.as_posix(),
+@@ -911,7 +1214,8 @@
+              'runner 输出目录不存在: ' + directory.as_posix())
+         for spec in plan:
+             info['cases'].append(analyze_case(an, label, spec,
+-                                              directory / 'cases' / spec['id']))
++                                              directory / 'cases' / spec['id'],
++                                              diagnostics=diagnostics))
+         finalize_label_qualification(an, label, info)
+         return info
+ 
+@@ -1082,7 +1386,8 @@
+     # --- 逐 case ------------------------------------------------------------
+     for spec in plan:
+         info['cases'].append(analyze_case(
+-            an, label, spec, directory / 'cases' / spec['id']))
++            an, label, spec, directory / 'cases' / spec['id'],
++            diagnostics=diagnostics))
+ 
+     # --- helper 序号（words[4]）在计划顺序上必须严格递增 -------------------
+     sequences: List[Tuple[int, str, int]] = []
+@@ -1155,7 +1460,7 @@
+         rows.sort(key=lambda item: item['id'])
+         per_label[label] = rows
+     return {
+-        'note': '短组只做验收（3 例），不与长组混合，不参与布局/绕过效应比较，不做显著性。'
++        'note': '短组只做验收（3 例），不与长组混合，不参与两段对照比较，不做显著性。'
+                 'A 吞吐为同一窗口内的 A 完成字节速率，不是总线吞吐。',
+         'per_label': per_label,
+     }
+@@ -1221,8 +1526,97 @@
+         'note': 'long 组每条件给出三轮每次原值 + 中位/min/max（描述性，不做显著性）。'
+                 '第 2 轮顺序为反向，请按轮次看。仅当同一条件三个 label 各自三轮'
+                 '全部技术合格时才发布 median/min/max；否则只保留逐轮原值并标为仅诊断。'
+-                'V 吞吐与同窗口 A 吞吐分列，不用不同窗口的 A 完成数比较 A 速度。',
++                'V 吞吐与同窗口 A 吞吐分列，不用不同窗口的 A 完成数比较 A 速度。'
++                'fast 全 0 与 activation 边界并列见第 7 节（fast 全 0 不是技术失败）。',
+         'series_keys': list(series_keys),
++        'per_condition': per_condition,
++    }
++
++
++def compute_fast_diagnostics(labels: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
++    """逐条件（Solo/A1/A8/A16，n=3）汇总 fast V/A 计数、seen 位与阶段计数。
++
++    只读已有逐 case 字段；不做任何因果推断。fast 全 0 记录为事实，不作为失败。
++    """
++    per_condition: Dict[str, Any] = {}
++    banked_labels = [l for l in LABELS if l != 'original-serial']
++    for condition in LONG_CONDITIONS:
++        by_label: Dict[str, Any] = {}
++        for label in LABELS:
++            rounds = [c for c in labels.get(label, {}).get('cases', [])
++                      if c['group'] == 'long' and c['condition'] == condition]
++            rounds.sort(key=lambda item: (item['round'] is None, item['round']))
++            fast_totals: List[Optional[int]] = []
++            fast_v: List[Optional[int]] = []
++            fast_a: List[Optional[int]] = []
++            fast_accepts: List[Optional[int]] = []
++            seen_union = 0
++            seen_any = False
++            stage_totals = {name: 0 for _, name in DIAG_COUNTER_FIELDS}
++            activation = {'base_s1_ptw': 0, 'full_window': 0,
++                          'candidate': 0, 'runtime_enable': 0}
++            diag_rounds = 0
++            for case_entry in rounds:
++                fast = case_entry.get('fast') or {}
++                fast_totals.append(fast.get('total'))
++                fast_v.append(fast.get('v_total'))
++                fast_a.append(fast.get('a_total'))
++                diag = case_entry.get('diagnostic') or {}
++                fast_accepts.append(diag.get('fast_accept'))
++                seen = diag.get('seen')
++                if isinstance(seen, int) and not isinstance(seen, bool):
++                    seen_any = True
++                    diag_rounds += 1
++                    seen_union |= seen
++                    if (seen >> 0) & 1:
++                        activation['base_s1_ptw'] += 1
++                    if (seen >> 1) & 1:
++                        activation['full_window'] += 1
++                    if (seen >> 2) & 1:
++                        activation['candidate'] += 1
++                    if (seen >> 15) & 1:
++                        activation['runtime_enable'] += 1
++                counts = diag.get('counts') or {}
++                for _, name in DIAG_COUNTER_FIELDS:
++                    value = counts.get(name)
++                    if isinstance(value, int) and not isinstance(value, bool):
++                        stage_totals[name] += value
++            defined = [t for t in fast_totals
++                       if isinstance(t, int) and not isinstance(t, bool)]
++            by_label[label] = {
++                'fast_totals': fast_totals,
++                'fast_v_totals': fast_v,
++                'fast_a_totals': fast_a,
++                'fast_accept_totals': fast_accepts,
++                'fast_present': bool(defined),
++                'all_fast_zero': bool(defined) and all(t == 0 for t in defined),
++                'seen_union': seen_union if seen_any else None,
++                'seen_bits': ([name for bit, name, _ in DIAG_SEEN_BITS
++                               if (seen_union >> bit) & 1] if seen_any else None),
++                'stage_totals': {name: stage_totals[name]
++                                 for _, name in DIAG_COUNTER_FIELDS},
++                'diag_rounds': diag_rounds,
++                'activation_rounds': activation,
++            }
++        per_condition[condition] = {
++            'condition': condition,
++            'by_label': by_label,
++            'all_banked_fast_zero': all(
++                by_label[l]['fast_present'] and by_label[l]['all_fast_zero']
++                for l in banked_labels),
++            'any_banked_fast_nonzero': any(
++                by_label[l]['fast_present'] and not by_label[l]['all_fast_zero']
++                for l in banked_labels),
++        }
++    return {
++        'note': ('fast V/A/other 计数来自 core words 6..10（V=w6+w7, A=w8+w9, '
++                 'other=w10）；seen 为 sticky 16 位掩码；阶段计数来自第二 bank '
++                 'words 7..14。fast 事件数不是命中率，也不是全部 miss 数；'
++                 'fast 全 0 = 科学上未行使，不是技术失败。'),
++        'seen_bit_map': [{'bit': bit, 'name': name, 'meaning': meaning}
++                         for bit, name, meaning in DIAG_SEEN_BITS],
++        'stage_fields': [{'word': idx, 'name': name}
++                         for idx, name in DIAG_COUNTER_FIELDS],
+         'per_condition': per_condition,
+     }
+ 
+@@ -1242,8 +1636,8 @@
+         'original_median': None,
+         'serial_median': None,
+         'hit_median': None,
+-        'layout_original_to_serial': _effect_pair(None, None),
+-        'bypass_serial_to_hit': _effect_pair(None, None),
++        's_over_original': _effect_pair(None, None),
++        'n_over_s': _effect_pair(None, None),
+     }
+ 
+ 
+@@ -1270,9 +1664,9 @@
+                 section['original_median'] = medians['original-serial']
+                 section['serial_median'] = medians['banked-serial']
+                 section['hit_median'] = medians['banked-hit']
+-                section['layout_original_to_serial'] = _effect_pair(
++                section['s_over_original'] = _effect_pair(
+                     medians['original-serial'], medians['banked-serial'])
+-                section['bypass_serial_to_hit'] = _effect_pair(
++                section['n_over_s'] = _effect_pair(
+                     medians['banked-serial'], medians['banked-hit'])
+         per_condition[condition] = {
+             'published': not reasons,
+@@ -1282,17 +1676,25 @@
+         }
+     return {
+         'definition': {
+-            'layout': 'banked-serial − original-serial（同串行行为、不同银行布局）：'
+-                      'original -> bankedSerial',
+-            'bypass': 'banked-hit − banked-serial（同布局，仅运行时使能绕过）：'
+-                      'bankedSerial -> bankedHit',
++            's_over_original': ('banked-serial − original-serial（结构+缓冲差异；'
++                                '来源受限于旧 legacy3 vs S/N 512 缓冲，不是纯布局'
++                                '因果）：original -> bankedSerial'),
++            'n_over_s': ('banked-hit − banked-serial（同布局不同 enable 的描述性'
++                         '变化；本轮 fast 全 0 时不构成绕过证据）：'
++                         'bankedSerial -> bankedHit'),
++        },
++        'column_labels': {
++            's_over_original': 'S/原版结构+缓冲变化',
++            'n_over_s': 'N/S变化',
+         },
+         'attribution_warning': (
+             '不允许用 original-serial 与 banked-hit 的直接差值归因绕过效应；'
+-            '绕过效应必须以 banked-serial 为中介。'),
++            'N/S变化必须以 banked-serial 为中介，且在本轮 fast 全 0 时只能作'
++            '描述性窗口周期差保留。'),
+         'metric_note': (
+             'V 吞吐与同窗口 A 吞吐均以 raw_window[1] 为窗口、50 MHz 换算（推导量）；'
+-            'A 速度只用同窗口 A 吞吐评价，不用不同窗口 A 完成数直接比较。'),
++            'A 速度只用同窗口 A 吞吐评价，不用不同窗口 A 完成数直接比较。'
++            '跨 boot / 布局+缓冲差异不得作因果外推。'),
+         'publish_rule': (
+             '同一比较条件在 original-serial/banked-serial/banked-hit 三个 label 各自'
+             '三轮（共 3×3 次）技术上全部合格时才发布；否则只列 reasons，不发布数值。'),
+@@ -1328,6 +1730,12 @@
+     return '%.*f' % (digits, value)
+ 
+ 
++def _seen_bits_text(value: Any) -> str:
++    if not isinstance(value, int) or isinstance(value, bool):
++        return '—'
++    return '0x%04X' % value
++
++
+ def render_markdown(doc: Dict[str, Any]) -> str:
+     lines: List[str] = []
+ 
+@@ -1348,10 +1756,13 @@
+         % (CLOCK_HZ / 1e6, 1e9 / CLOCK_HZ))
+     add('- 真实 V 固定工作量：short = %d B，long = %d B（= transfers × %d）'
+         % (SHORT_TRANSFERS * CHUNK_BYTES, LONG_TRANSFERS * CHUNK_BYTES, CHUNK_BYTES))
++    add('- 诊断 bank：%s' % ('已读取（`--diagnostics`）'
++                             if doc['diagnostics']['enabled']
++                             else '未启用（默认路径，行为与旧版一致）'))
+     add()
+     add('> 本文件由脚本按固定模板生成，是描述性汇总，不是实验结论声明；')
+     add('> 不含显著性统计，不含 novelty 判断，不对未运行/失败项做推测或补值，')
+-    add('> 不修改任何原始文件。')
++    add('> 不修改任何原始文件。fast 事件数不是命中率，也不是全部 miss 数。')
+     add()
+ 
+     # ---- 1. 来源 ---------------------------------------------------------
+@@ -1374,6 +1785,9 @@
+             stopped,
+         ))
+     add()
++    add('> 来源约束：original-serial 来源受限于旧 legacy3，而 S/N 为 512 缓冲；'
++        'S/原版差异同时包含结构与缓冲存储差异，不得作因果外推。')
++    add()
+ 
+     # ---- 2. 完整度 -------------------------------------------------------
+     add('## 2. 完整度矩阵（每 label 冻结 15 例，三 label 共 45 例）')
+@@ -1408,10 +1822,12 @@
+         add('| # | scope | case | code | detail |')
+         add('|---|---|---|---|---|')
+         for index, item in enumerate(doc['quality_issues'], start=1):
+-            detail = str(item['detail']).replace('|', '\\|')
++            detail = str(item['detail']).replace('|', '\\\\|')
+             add('| %d | %s | %s | %s | %s |' % (
+                 index, item['scope'] or '—', item['case'] or '—',
+                 item['code'], detail[:400]))
++    add()
++    add('> fast 计数全 0 **不是**质量问题：它只表示本轮未观测到真实 accept。')
+     add()
+     if doc['observations']:
+         add('### 3.1 观察（不改变退出码）')
+@@ -1419,7 +1835,7 @@
+         add('| # | scope | case | code | detail |')
+         add('|---|---|---|---|---|')
+         for index, item in enumerate(doc['observations'], start=1):
+-            detail = str(item['detail']).replace('|', '\\|')
++            detail = str(item['detail']).replace('|', '\\\\|')
+             add('| %d | %s | %s | %s | %s |' % (
+                 index, item['scope'] or '—', item['case'] or '—',
+                 item['code'], detail[:400]))
+@@ -1494,39 +1910,50 @@
+             % ('是' if block['all_three_qualified'] else '否'))
+         add()
+ 
+-    # ---- 6. 效应分解 -----------------------------------------------------
+-    add('## 6. 布局效应与绕过效应分解（仅 long 组）')
+-    add()
+-    add('- 布局效应：`%s`' % doc['effects']['definition']['layout'])
+-    add('- 绕过效应：`%s`' % doc['effects']['definition']['bypass'])
++    # ---- 6. 两段对照 -----------------------------------------------------
++    add('## 6. 两段对照（仅 long 组，弱因果表述）')
++    add()
++    add('- `S/原版结构+缓冲变化`：`%s`'
++        % doc['effects']['definition']['s_over_original'])
++    add('- `N/S变化`：`%s`' % doc['effects']['definition']['n_over_s'])
+     add('- **%s**' % doc['effects']['attribution_warning'])
+     add('- %s' % doc['effects']['metric_note'])
+     add('- 发布规则：%s' % doc['effects']['publish_rule'])
+     add('- %s' % doc['effects']['statistics'])
+     add()
+ 
++    diag_block = doc['diagnostics']
++    labels_text = doc['effects']['column_labels']
++
+     def effect_table(kind: str, heading: str) -> None:
+         add('### %s' % heading)
+         add()
+         add('| condition | published | orig 中位 | serial 中位 | hit 中位 |'
+-            ' 布局 Δ | 布局 Δ% | 绕过 Δ | 绕过 Δ% |')
++            ' %s Δ | %s Δ%% | %s Δ | %s Δ%% |'
++            % (labels_text['s_over_original'], labels_text['s_over_original'],
++               labels_text['n_over_s'], labels_text['n_over_s']))
+         add('|---|---|---|---|---|---|---|---|---|')
+         for condition in LONG_CONDITIONS:
+             item = doc['effects']['per_condition'][condition]
+             section = item[kind]
+-            layout = section['layout_original_to_serial']
+-            bypass = section['bypass_serial_to_hit']
++            s_pair = section['s_over_original']
++            n_pair = section['n_over_s']
+             add('| %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
+                 condition, '是' if item['published'] else '否',
+                 fmt_num(section['original_median']),
+                 fmt_num(section['serial_median']),
+                 fmt_num(section['hit_median']),
+-                fmt_num(layout['delta']), fmt_pct(layout['delta_pct']),
+-                fmt_num(bypass['delta']), fmt_pct(bypass['delta_pct']),
++                fmt_num(s_pair['delta']), fmt_pct(s_pair['delta_pct']),
++                fmt_num(n_pair['delta']), fmt_pct(n_pair['delta_pct']),
+             ))
+         add()
+         for condition in LONG_CONDITIONS:
+             item = doc['effects']['per_condition'][condition]
++            fast_block = diag_block['per_condition'][condition]
++            add('- 条件 %s：all_fast_zero = %s；any_fast_nonzero = %s'
++                % (condition,
++                   '是' if fast_block['all_banked_fast_zero'] else '否',
++                   '是' if fast_block['any_banked_fast_nonzero'] else '否'))
+             if not item['published']:
+                 add('- 条件 %s 未发布：%s'
+                     % (condition, '；'.join(item['reasons']) or '数据不合格'))
+@@ -1535,10 +1962,111 @@
+     effect_table('v_throughput_mib_s', '6.1 V 吞吐（MiB/s）收益 / 代价')
+     effect_table('a_throughput_mib_s', '6.2 同窗口 A 吞吐（MiB/s）收益 / 代价')
+ 
+-    # ---- 7. 原始字段证据 -------------------------------------------------
+-    add('## 7. 原始字段证据')
+-    add()
+-    add('### 7.1 p4m.raw_window 逐 case（16 字，原样，未做任何解释性替换）')
++    # ---- 7. 诊断 bank ----------------------------------------------------
++    add('## 7. 诊断 bank（可选 `--diagnostics`；只读，不反馈 DMA/AXI）')
++    add()
++    if not diag_block['enabled']:
++        add('本次未启用 `--diagnostics`；未读取第二 16 字诊断 bank。')
++        add('旧 16 字 core ABI 与 v3 raw 兼容性未受影响；默认路径行为不变。')
++        add()
++    else:
++        add('> %s' % diag_block['note'])
++        add()
++        for bit, name, meaning in DIAG_SEEN_BITS:
++            add('- seen bit%d `%s`：%s' % (bit, name, meaning))
++        add()
++        add('解释许可与禁止（固定）')
++        add()
++        for note in diag_block['notes']:
++            add('- %s' % note)
++        add()
++        add('### 7.1 逐 case fast 计数（来自 core words 6..10）')
++        add()
++        add('| label | case | rnd | fast V | fast A | fast other | fast Σ | all0 |')
++        add('|---|---|---|---|---|---|---|---|')
++        for label in LABELS:
++            for case_entry in doc['cases'][label]:
++                fast = case_entry.get('fast') or {}
++                add('| %s | %s | %s | %s | %s | %s | %s | %s |' % (
++                    label, case_entry['id'], fmt_num(case_entry['round']),
++                    fmt_num(fast.get('v_total')), fmt_num(fast.get('a_total')),
++                    fmt_num(fast.get('other')), fmt_num(fast.get('total')),
++                    {True: '是', False: '否', None: '—'}[fast.get('all_zero')],
++                ))
++        add()
++        add('### 7.2 逐 case 诊断 seen 位与阶段计数（第二 bank words 6..15）')
++        add()
++        add('| label | case | seen | 阶段计数（probe/dc_eval/dc_good/leaf_eval/leaf_good/dc_msi_rej/leaf_msi_rej/leaf_miss/fast_acc） | diag_ok |')
++        add('|---|---|---|---|---|')
++        for label in LABELS:
++            for case_entry in doc['cases'][label]:
++                diag = case_entry.get('diagnostic') or {}
++                counts = diag.get('counts') or {}
++                counter_text = '/'.join(
++                    fmt_num(counts.get(name)) for _, name in DIAG_COUNTER_FIELDS)
++                add('| %s | %s | %s | %s | %s |' % (
++                    label, case_entry['id'], _seen_bits_text(diag.get('seen')),
++                    counter_text,
++                    {True: '是', False: '否', None: '不适用'}[diag.get('ok')],
++                ))
++        add()
++        add('### 7.3 长组每条件 fast/activation 汇总（Solo/A1/A8/A16，n=3）')
++        add()
++        for condition in LONG_CONDITIONS:
++            block = diag_block['per_condition'][condition]
++            add('#### 条件 %s（all_fast_zero = %s）'
++                % (condition, '是' if block['all_banked_fast_zero'] else '否'))
++            add()
++            add('| label | fast V r1/r2/r3 | fast A r1/r2/r3 | fast Σ r1/r2/r3 | fast_acc r1/r2/r3 | all0 | seen 并集 | seen bits |')
++            add('|---|---|---|---|---|---|---|---|')
++            for label in LABELS:
++                item = block['by_label'][label]
++                add('| %s | %s | %s | %s | %s | %s | %s | %s |' % (
++                    label,
++                    '/'.join(fmt_num(v) for v in item['fast_v_totals']),
++                    '/'.join(fmt_num(v) for v in item['fast_a_totals']),
++                    '/'.join(fmt_num(v) for v in item['fast_totals']),
++                    '/'.join(fmt_num(v) for v in item['fast_accept_totals']),
++                    {True: '是', False: '否', None: '—'}[item['all_fast_zero']],
++                    _seen_bits_text(item['seen_union']),
++                    ','.join(item['seen_bits'] or []) or '—',
++                ))
++            add()
++            add('| label | base_s1_ptw | full_window | candidate | runtime_enable | probe_starts | dc_eval | dc_good | leaf_eval | leaf_good | dc_msi_rej | leaf_msi_rej | leaf_miss | fast_acc |')
++            add('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
++            for label in LABELS:
++                item = block['by_label'][label]
++                act = item['activation_rounds']
++                stage = item['stage_totals']
++                add('| %s | %d/%d | %d/%d | %d/%d | %d/%d | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
++                    label,
++                    act['base_s1_ptw'], len(item['fast_totals']),
++                    act['full_window'], len(item['fast_totals']),
++                    act['candidate'], len(item['fast_totals']),
++                    act['runtime_enable'], len(item['fast_totals']),
++                    fmt_num(stage.get('probe_starts')),
++                    fmt_num(stage.get('dc_evaluations')),
++                    fmt_num(stage.get('dc_good')),
++                    fmt_num(stage.get('leaf_evaluations')),
++                    fmt_num(stage.get('leaf_good')),
++                    fmt_num(stage.get('dc_msi_rejects')),
++                    fmt_num(stage.get('leaf_msi_rejects')),
++                    fmt_num(stage.get('leaf_lookup_misses')),
++                    fmt_num(stage.get('fast_accepts')),
++                ))
++            add()
++        add('> 计数窗口 (open, close]，跨窗口的部分 probe 合法；start/eval/leaf 之间'
++            '不假设完整生命周期关系。seen bit0 是宽口径 base S1 PTW，可能含 '
++            'implicit/debug。若未见 bit2（candidate）或 probe 为 0，只能说本轮未'
++            '观测到合格窗口候选，不能说明没有 cache 命中。DC good=0 且无显式 MSI '
++            'reject 时不能唯一归因 MSI。fast>0 只表示本轮真实 accept，不是命中率，'
++            '也不是 novelty；fast 全 0 是科学上未行使，不是技术失败。')
++        add()
++
++    # ---- 8. 原始字段证据 -------------------------------------------------
++    add('## 8. 原始字段证据')
++    add()
++    add('### 8.1 p4m.raw_window 逐 case（16 字，原样，未做任何解释性替换）')
+     add()
+     header = '| label | case | ' + ' | '.join('w%d' % i for i in range(P4M_WINDOW_WORDS)) + ' |'
+     add(header)
+@@ -1562,7 +2090,7 @@
+         '同窗口 A 字节 = `w3 × 4096`。')
+     add('- 其余 `w2`、`w4..w12`、`w15` 本脚本只原样保存，不做语义解释。')
+     add()
+-    add('### 7.2 A 窗口内完成数的取值来源（逐 case）')
++    add('### 8.2 A 窗口内完成数的取值来源（逐 case）')
+     add()
+     add('| label | case | A jobs | 字段来源 | 状态 |')
+     add('|---|---|---|---|---|')
+@@ -1576,7 +2104,7 @@
+                 case_entry['a_jobs_field'] or '未取得',
+                 case_entry['state']))
+     add()
+-    add('### 7.3 helper 窗口摘要（完整 16 字见 JSON `cases[*].helper.words`）')
++    add('### 8.3 helper 窗口摘要（完整 16 字见 JSON `cases[*].helper.words`）')
+     add()
+     add('| label | case | mode | seq=words[4] | cycles | flags | errors | Σfast | Σnormal | accepted | 来源 |')
+     add('|---|---|---|---|---|---|---|---|---|---|---|')
+@@ -1593,7 +2121,7 @@
+                 fmt_num(helper.get('normal_total')), fmt_num(helper.get('accepted_total')),
+                 'helper.json'))
+     add()
+-    add('### 7.4 p4m.raw_observation')
++    add('### 8.4 p4m.raw_observation')
+     add()
+     add('`raw_observation` 是旧 HPM 观测数组（本脚本只记录长度，值在 JSON 里原样保留）：')
+     add()
+@@ -1605,12 +2133,13 @@
+                 label, case_entry['id'],
+                 fmt_num(case_entry['raw_observation_len'])))
+     add()
+-    add('> 旧 HPM / COST / E3 数据 **不作为 N 机制证据**；helper 的快速路径事件数')
+-    add('> **不是命中率，也不是全部 miss 数**。')
+-    add()
+-
+-    # ---- 8. 不确定性 -----------------------------------------------------
+-    add('## 8. 不确定性、未运行项与未做的事')
++    add('> 旧 HPM / COST / E3 / miss / PTW 数据 **不作为 N 机制证据，也不作为有效 '
++        'metric**；banked 结构下 `victim/aggressor.iotlb_miss/s1_ptw/s2_ptw` 一律'
++        '不得使用。helper 的快速路径事件数 **不是命中率，也不是全部 miss 数**。')
++    add()
++
++    # ---- 9. 不确定性 -----------------------------------------------------
++    add('## 9. 不确定性、未运行项与未做的事')
+     add()
+     for item in doc['uncertainties']:
+         add('- %s' % item)
+@@ -1623,6 +2152,22 @@
+ # ---------------------------------------------------------------------------
+ # 顶层
+ # ---------------------------------------------------------------------------
++
++def build_diagnostic_notes() -> List[str]:
++    return [
++        'seen bit0 是宽口径 base S1 PTW 活动，可能包含 implicit/debug 触发；'
++        'bit1 才是完整 fast 窗口谓词，bit2 才是窗口内候选有效。',
++        '未出现 bit2（candidate in window）或 probe start = 0 时，只能说明本轮'
++        '未观测到合格窗口候选，不能说明没有 cache 命中。',
++        'DC good 计数为 0 且没有显式 MSI reject 时，不能唯一归因 MSI；只有显式 '
++        'reject 计数才支持该归因。',
++        'fast 计数 > 0 表示本轮真实 accept，不是命中率，也不是 novelty；'
++        'fast 全 0 只表示机制未被触发（科学上未行使），不是技术失败。',
++        '诊断采样跨窗口时 start/eval/leaf 计数之间无需守恒，不假设生命周期完整。',
++        '旧 HPM / miss / PTW 字段在 banked 结构下不是有效 metric，绝不作为机制证据。',
++        'S 来源受限于旧 legacy3 vs S/N 512 缓冲差异：跨 boot 与布局+缓冲差异不得作因果外推。',
++    ]
++
+ 
+ def build_uncertainties() -> List[str]:
+     return [
+@@ -1638,23 +2183,28 @@
+         '短组只用做验收，不与长组混合；长组每条件三轮值 + 中位/min/max 均为描述性，'
+         '不做显著性检验，不能据此外推。',
+         '失败 / 残缺数据逐项保留 raw 并分类，只作诊断；同一比较条件三轮技术上未全部'
+-        '合格时，不发布该条件的性能汇总与两段效应，也不把残缺数值与有效样本混合，'
+-        '更不剔除不利但合法的合格样本。',
++        '合格时，不发布该条件的性能汇总与两段对照，也不把残缺数值与有效样本混合，'
++        '更不剔除不利但合法的合格样本。fast=0 是合法观察，不产生 issue、不剔除。',
+         '每个 label 只对应一次运行、一次新鲜启动；跨 label 的差异同时包含运行间波动，'
+-        '本脚本不做方差分析。',
+-        'banked-hit 相对 banked-serial 的差值才是绕过效应；'
+-        'original-serial 与 banked-hit 的直接差值不用于绕过归因。',
++        '本脚本不做方差分析。S 来源受限于旧 legacy3 与 S/N 512 缓冲差异，'
++        '不得声称因果。',
++        'banked-hit 相对 banked-serial 的差值只是描述性 `N/S变化`；'
++        'original-serial 与 banked-hit 的直接差值不用于绕过归因。'
++        '本轮 fast 计数全 0 时，`N/S变化` 不构成绕过效果证据。',
+         'helper 窗口语义为 (open, close]；序号一律取 `words[4]`（reader emit_json 的 '
+         '`windowseq` 亦等于 `words[4]`，仅在存在时做交叉核对）；脚本只校验 ABI 冻结位、'
+         '计数守恒、与 P4M 相同的 cycles、Mode1 快速项全 0、Mode2 可大于 0、序号严格递增。',
++        '`--diagnostics` 打开时，第二 16 字诊断 bank 从 `helper.json` 的 `diagnostic` '
++        '对象读取（`diag-window.json` 仅在存在时交叉核对）；关闭时行为与旧版一致。',
++        '诊断 bank 的字段语义由 RTL/runner 契约决定；本脚本只做只读交叉核对，不实现硬件。',
+         '只按冻结计划的 15 个 case id 打开确切路径，未枚举目录；'
+         '因此计划外的额外 case 目录不会被发现。',
+         '技术资格（qualified）已汇合该 case 的全部质量 issue 与该 label 的 '
+-        'plan/boot/flash/caps/summary 必要质量问题；合法偏低或波动样本不产生 '
+-        'issue，仍保留并参与汇总，但任一真实 issue 都会阻止效应发布。',
++        'plan/boot/flash/caps/summary 必要质量问题；合法偏低或波动样本与 fast=0 '
++        '不产生 issue，仍保留并参与汇总，但任一真实 issue 都会阻止两段对照发布。',
+         '不做哈希校验、不从设备读回、不重跑、不修改任何原始文件。',
+-        '旧 HPM / COST / E3 数据不是本设计的机制证据；'
+-        'helper 快速路径事件数不是命中率，也不是全部 miss 数。',
++        '旧 HPM / COST / E3 / miss / PTW 数据不是本设计的机制证据；'
++        'helper 快速路径事件数不是命中率，也不是全部 miss 数；不宣称 novelty。',
+     ]
+ 
+ 
+@@ -1670,6 +2220,10 @@
+                         help='banked-hit 的 runner 输出目录')
+     parser.add_argument('--out', required=True, metavar='DIR',
+                         help='汇总输出目录；不得与任何输入目录相同或互相包含')
++    parser.add_argument('--diagnostics', action='store_true',
++                        help='额外要求 banked-serial / banked-hit 每个 case 的 '
++                             'helper.json 带第二 16 字只读诊断 bank（diagnostic.words）'
++                             '并逐项校验；关闭时行为与旧版一致')
+     return parser
+ 
+ 
+@@ -1713,12 +2267,16 @@
+ 
+     labels: Dict[str, Dict[str, Any]] = {}
+     for label in LABELS:
+-        labels[label] = summarize_label(an, label, inputs[label], plan)
++        labels[label] = summarize_label(an, label, inputs[label], plan,
++                                        diagnostics=args.diagnostics)
+ 
+     completeness = compute_completeness(labels, plan)
+     short_summary = compute_short(labels)
+     long_summary = compute_long(labels)
+     effects = compute_effects(long_summary)
++    fast_diagnostics = compute_fast_diagnostics(labels)
++    fast_diagnostics['enabled'] = bool(args.diagnostics)
++    fast_diagnostics['notes'] = build_diagnostic_notes()
+ 
+     quality_ok = not an.quality
+     exit_code = 0 if (completeness['all_cases_complete'] and quality_ok) else 1
+@@ -1729,6 +2287,7 @@
+         'analyzer': {
+             'script': 'scripts/analyze_nonblock_pilot.py',
+             'status': 'executed; see exit_code and quality_issues',
++            'diagnostics_enabled': bool(args.diagnostics),
+             'clock_hz': CLOCK_HZ,
+             'chunk_bytes': CHUNK_BYTES,
+             'cycle_unit': 'raw_window[1]，1 字 = 1 cycle',
+@@ -1744,6 +2303,13 @@
+                 'a_jobs_note': 'index 3 == a_done_window == p4m.a_completed_jobs_window '
+                                '(bench/idma_experiment.c:487); A bytes = w3 * 4096',
+             },
++            'diagnostic_bank': {
++                'magic': DIAG_MAGIC,
++                'version': DIAG_VERSION,
++                'words': DIAG_WORDS,
++                'index_range': '16..31 (NB_INDEX_BASE + 16)',
++                'source': 'helper.json 的 diagnostic 对象（可选 core_fast_sum 作核对）',
++            },
+         },
+         'frozen_plan': plan,
+         'inputs': {label: labels[label] for label in LABELS},
+@@ -1752,6 +2318,7 @@
+         'short_acceptance': short_summary,
+         'long_per_condition': long_summary,
+         'effects': effects,
++        'diagnostics': fast_diagnostics,
+         'quality_issues': an.quality,
+         'observations': an.observations,
+         'uncertainties': build_uncertainties(),
+@@ -1764,9 +2331,12 @@
+             'raw_window/raw_observation 一致性；不导入 runner、不写设备。',
+             'qualified 汇合该 case 全部 quality issue 与该 label 的 plan/boot/'
+             'flash/caps/summary 必要问题；有真实技术问题时 compute_effects 不发布。',
++            'fast 全 0 是科学上未行使，不是技术失败，不产生 quality issue。',
+             '不剔除异常、不自动重跑、不做显著性统计。',
+-            '旧 HPM / COST / E3 不作 N 机制证据。',
++            '旧 HPM / COST / E3 / miss / PTW 不作 N 机制证据，也不作有效 metric。',
+             '快速路径事件数不是命中率，也不是全部 miss 数。',
++            '两段对照列按弱因果措辞重命名：S/原版结构+缓冲变化、N/S变化。',
++            'S 来源受限于旧 legacy3 vs S/N 512 缓冲；跨 boot/布局+缓冲差异不得作因果外推。',
+         ],
+     }
+ 
+@@ -1777,8 +2347,9 @@
+ 
+     print('written: %s' % (out / RESULT_JSON_NAME).as_posix())
+     print('written: %s' % (out / RESULT_MD_NAME).as_posix())
+-    print('complete=%s quality_issues=%d exit=%d'
+-          % (completeness['all_cases_complete'], len(an.quality), exit_code))
++    print('complete=%s quality_issues=%d diagnostics=%s exit=%d'
++          % (completeness['all_cases_complete'], len(an.quality),
++             bool(args.diagnostics), exit_code))
+     return exit_code
+ 
+ 

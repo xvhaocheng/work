@@ -1,0 +1,181 @@
+--- tests/test_board_p4m_start.py
++++ tests/test_board_p4m_start.py
+@@ -16,6 +16,7 @@
+ import os
+ from pathlib import Path
+ import re
++import shutil
+ import stat
+ import subprocess
+ import tempfile
+@@ -25,6 +26,7 @@
+ ROOT = Path(__file__).resolve().parents[1]
+ SCRIPT = ROOT / "tests" / "board-p4m-start.sh"
+ 
++BUSYBOX = Path("/usr/bin/busybox")
+ FIXED_PATH_LINE = "PATH=/sbin:/bin:/usr/sbin:/usr/bin"
+ TAINT_PATH = "/proc/sys/kernel/tainted"
+ OBSERVE_PATH = "/sys/module/idma/parameters/observe"
+@@ -59,6 +61,13 @@
+ def _field(text, key):
+     match = re.search(r"\b%s=([^\s]+)" % re.escape(key), text)
+     return match.group(1) if match else None
++
++
++def _extract_shell_function(text, name):
++    match = re.search(r"(?ms)^%s\(\) \{\n.*?^\}\n" % re.escape(name), text)
++    if not match:
++        raise AssertionError("production function not found: %s" % name)
++    return match.group(0)
+ 
+ 
+ class BoardP4mStartScriptTest(unittest.TestCase):
+@@ -191,7 +200,6 @@
+     version2) version=2 ;;
+     error_nonzero) error=-22 ;;
+     order) a_begin=$((a_end + 500)) ;;
+-    solo_a_id_nonzero) a_id=7 ;;
+     pair_a_id_zero) a_id=0 ;;
+     bad_batch_status) batch_status=0x5 ;;
+     bad_batch_issued) batch_issued=$((transfers - 1)) ;;
+@@ -203,6 +211,7 @@
+     a_id=0
+     a_begin=0
+     a_end=0
++    if [ "$IDMA_TEST_LOG_MODE" = "solo_a_id_nonzero" ]; then a_id=7; fi
+ fi
+ if [ "$has_a" = "1" ]; then
+     span=$((v_end - a_begin))
+@@ -543,6 +552,16 @@
+         self.assertEqual(result.returncode, 5, result.stderr)
+         self.assertIn("verify_failed=batch_time_count", result.stderr)
+ 
++    def test_stale_batch_time_in_before_snapshot_fails_closed(self):
++        self.ring.write_text(
++            "[   11.000001] zdl,idma 50000000.master: idma_batch_obs seq=5 part=time"
++            " valid=1 status=0x4 v_did=10 a_did=4294967295 cycles=1 h=1 gap=1"
++            " hmax=1 gapmax=1 issued=64 done=64 batch_polled=1 done_to_read=1\n")
++        result, out = self.run_simulation("short", seq_base=5, log_mode="missing_batchtime")
++        self.assertEqual(result.returncode, 5, result.stderr)
++        self.assertIn("verify_failed=batch_time_seq_present_before", result.stderr)
++        self.assertEqual(self.recorded_args(), SHORT_ARGS[:1])
++
+     def test_bad_batch_time_status_fails_closed(self):
+         result, out = self.run_simulation("short", log_mode="bad_batch_status")
+         self.assertEqual(result.returncode, 5, result.stderr)
+@@ -638,5 +657,115 @@
+             self.assertIn("platform-timeout 120 idma_experiment", line)
+ 
+ 
++class BoardP4mStartProductionParserTest(unittest.TestCase):
++    """Feed real host CLI JSON through the runner's production JSON checks."""
++
++    @classmethod
++    def setUpClass(cls):
++        cls._temporary = tempfile.TemporaryDirectory(prefix="idma-p4m-parser-")
++        cls.temp = Path(cls._temporary.name)
++        include = cls.temp / "uapi"
++        (include / "linux").mkdir(parents=True)
++        shutil.copy2(ROOT / "linux/include/uapi/linux/idma.h", include / "linux/idma.h")
++        compiler = os.environ.get("HOSTCC", "cc")
++        flags = [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-I", str(include)]
++        cls.binary = cls.temp / "idma_experiment"
++        cls.stub = cls.temp / "ioctl_stub.so"
++        subprocess.run(flags + [str(ROOT / "bench/idma_experiment.c"), "-o", str(cls.binary)], check=True)
++        subprocess.run(flags + ["-shared", "-fPIC", str(ROOT / "tests/experiment_cli_test_stub.c"), "-o", str(cls.stub)], check=True)
++        cls.device = cls.temp / "device"
++        cls.device.touch()
++        cls.calls = cls.temp / "calls.log"
++        cls.script_text = SCRIPT.read_text()
++        cls.harness_prelude = cls._make_harness_prelude()
++        cls.busybox_bin = cls.temp / "busybox-bin"
++        cls.busybox_bin.mkdir()
++        if BUSYBOX.is_file():
++            awk = cls.busybox_bin / "awk"
++            awk.write_text("#!/bin/sh\nexec %s awk \"$@\"\n" % BUSYBOX)
++            awk.chmod(0o755)
++
++    @classmethod
++    def tearDownClass(cls):
++        cls._temporary.cleanup()
++
++    @classmethod
++    def _make_harness_prelude(cls):
++        names = ("unquote", "int_of", "json_get", "json_check", "check_case_json")
++        parts = ["#!/bin/sh\n", "V_DID=10\nA_DID=11\nNO_AGGRESSOR=4294967295\n"]
++        for name in names:
++            parts.append(_extract_shell_function(cls.script_text, name))
++        return "\n".join(parts)
++
++    def _write_json(self, name, row):
++        path = self.temp / name
++        path.write_text(json.dumps(row) + "\n")
++        return path
++
++    def _run_cli(self, args):
++        self.calls.unlink(missing_ok=True)
++        env = os.environ.copy()
++        env.update(LD_PRELOAD=str(self.stub), IDMA_TEST_MODE="ok", IDMA_TEST_LOG=str(self.calls))
++        result = subprocess.run([str(self.binary), "--device", str(self.device), *args],
++                                env=env, text=True, capture_output=True, check=False)
++        self.assertEqual(result.returncode, 0, result)
++        return json.loads(result.stdout)
++
++    def _run_harness(self, call):
++        harness = self.temp / "harness.sh"
++        harness.write_text(self.harness_prelude + "\n" + call + "\n")
++        env = os.environ.copy()
++        if BUSYBOX.is_file():
++            env["PATH"] = str(self.busybox_bin) + ":" + env.get("PATH", "")
++            result = subprocess.run([str(BUSYBOX), "ash", str(harness)], env=env,
++                                    text=True, capture_output=True, check=False)
++        else:
++            result = subprocess.run(["sh", str(harness)], env=env,
++                                    text=True, capture_output=True, check=False)
++        return result
++
++    def test_checks_accept_real_batch_cli_json(self):
++        row = self._run_cli(["--batch", "--aggressor", "1"])
++        path = self._write_json("batch.json", row)
++        result = self._run_harness('check_case_json case-batch "%s" batch 4096 11 0' % path)
++        self.assertEqual(result.returncode, 0, result.stderr)
++
++    def test_checks_accept_real_p4m_solo_cli_json(self):
++        row = self._run_cli(["--p4m"])
++        path = self._write_json("p4m-solo.json", row)
++        result = self._run_harness(
++            'check_case_json case-p4m-solo "%s" p4m 4096 4294967295 1' % path)
++        self.assertEqual(result.returncode, 0, result.stderr)
++
++    def test_checks_accept_real_p4m_pair_cli_json(self):
++        row = self._run_cli(["--p4m", "--aggressor", "1"])
++        path = self._write_json("p4m-pair.json", row)
++        result = self._run_harness(
++            'check_case_json case-p4m-pair "%s" p4m 4096 11 1' % path)
++        self.assertEqual(result.returncode, 0, result.stderr)
++
++    def test_checks_reject_real_cli_json_after_mutation(self):
++        row = self._run_cli(["--batch", "--aggressor", "1"])
++        row["result"]["victim"]["data_errors"] = 1
++        path = self._write_json("batch-bad.json", row)
++        result = self._run_harness('check_case_json case-batch-bad "%s" batch 4096 11 0' % path)
++        self.assertEqual(result.returncode, 1, result.stderr)
++        self.assertIn("verify_failed=json_result.victim.data_errors", result.stderr)
++
++    @unittest.skipUnless(BUSYBOX.is_file(), "busybox not installed")
++    def test_int_of_uses_busybox_awk_without_32bit_clamp(self):
++        harness = self.temp / "int_of_harness.sh"
++        harness.write_text(
++            self.harness_prelude
++            + "\nprintf '%s\\n' \"$(int_of 4294967295)\" \"$(int_of 0xffffffff)\""
++            + " \"$(int_of 64)\" \"$(int_of 0x4)\"\n")
++        env = os.environ.copy()
++        env["PATH"] = str(self.busybox_bin) + ":" + env.get("PATH", "")
++        result = subprocess.run([str(BUSYBOX), "ash", str(harness)], env=env,
++                                text=True, capture_output=True, check=False)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual(result.stdout.splitlines(), ["4294967295", "4294967295", "64", "4"])
++
++
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,0 +1,438 @@
+--- a/cva6/corev_apu/fpga/src/dma_observer.sv
++++ b/cva6/corev_apu/fpga/src/dma_observer.sv
+@@ -51,15 +51,19 @@
+     logic has_a_q, has_a_n, batch_q, batch_n;
+     logic finite_q, finite_n;
+     logic p4m_q, p4m_n;
+-    // P4M per-lane task tracking and window snapshot. Lane state is continuous across
+-    // warmup, window and drain; snapshot words change only up to the closing boundary.
+-    logic a_task_q, a_task_n, v_task_q, v_task_n;
++    // P4M per-lane task tracking and window snapshot. Every port keeps its own in-flight flag,
++    // descriptor id and sticky error evidence, continuous across warmup, window and drain; only
++    // the lanes ARM selects (victim, optional aggressor) are ever sampled.
++    logic [NumPorts-1:0] lane_task_q, lane_task_n;
++    logic [2:0] lane_err_q [NumPorts];
++    logic [2:0] lane_err_n [NumPorts];
++    logic [63:0] lane_id_q [NumPorts];
++    logic [63:0] lane_id_n [NumPorts];
+     logic p4m_open_q, p4m_open_n, p4m_closed_q, p4m_closed_n;
+     logic p4m_carry_q, p4m_carry_n, p4m_carry_done_q, p4m_carry_done_n;
+     logic p4m_start_q, p4m_start_n, p4m_end_q, p4m_end_n;
+     logic p4m_open_issue_q, p4m_open_issue_n;
+-    logic a_issue_evt, a_done_evt, v_issue_evt, v_done_evt, p4m_track_err;
+-    logic [63:0] a_id_q, a_id_n, v_id_q, v_id_n;
++    logic a_issue_evt, a_done_evt, v_issue_evt, v_done_evt;
+     logic [63:0] p4m_open_id_q, p4m_open_id_n, p4m_close_id_q, p4m_close_id_n;
+     logic [63:0] p4m_first_done_id_q, p4m_first_done_id_n;
+     logic [63:0] p4m_last_done_id_q, p4m_last_done_id_n;
+@@ -183,10 +187,11 @@
+         e3_arm = 0;
+         track_bad_n = track_bad_q;
+         p4m_n = p4m_q;
+-        a_task_n = a_task_q;
+-        a_id_n = a_id_q;
+-        v_task_n = v_task_q;
+-        v_id_n = v_id_q;
++        lane_task_n = lane_task_q;
++        for (int i = 0; i < NumPorts; i++) begin
++            lane_id_n[i] = lane_id_q[i];
++            lane_err_n[i] = lane_err_q[i];
++        end
+         p4m_open_n = p4m_open_q;
+         p4m_closed_n = p4m_closed_q;
+         p4m_carry_n = p4m_carry_q;
+@@ -233,45 +238,35 @@
+             if (bad_id_i[i]) track_bad_n[i] = 1'b1;
+         end
+ 
+-        // ---- P4M tracking ----
+-        // Lane state is maintained continuously from reset (warmup, window, drain) so that a job
+-        // issued strictly before the opening edge is visible as a carry cohort. Error evidence is
+-        // only recorded between ARM and the closing boundary, so the frozen bank cannot move.
+-        p4m_track_err = p4m_q && !p4m_closed_q;
++        // ---- P4M per-lane tracking ----
++        // Every port keeps its own in-flight flag, descriptor id and sticky error evidence from
++        // reset (warmup, window, drain), independently of the roles ARM selects; only the selected
++        // victim lane and optional aggressor lane are ever sampled. Retire first, then accept a
++        // replacement, so a prior-job DONE and a new ISSUE in the same cycle is a legal hand-off.
+         v_issue_evt = P4MEnable && issue_i[victim_q];
+         v_done_evt = P4MEnable && done_i[victim_q];
+         a_issue_evt = P4MEnable && has_a_q && issue_i[aggressor_q];
+         a_done_evt = P4MEnable && has_a_q && done_i[aggressor_q];
+         if (P4MEnable) begin
+-            // Retire first, then accept a new descriptor: a prior-job DONE and a new ISSUE in the
+-            // same cycle is a legal hand-off, not an overlap.
+-            if (v_done_evt) begin
+-                if (p4m_track_err && (!v_task_q || done_id_i[victim_q] != v_id_q)) p4m_error_n[1] = 1'b1;
+-                v_task_n = 1'b0;
+-            end
+-            if (v_issue_evt) begin
+-                if (p4m_track_err && issue_id_i[victim_q] == 0) p4m_error_n[0] = 1'b1;
+-                if (p4m_track_err && v_task_n) p4m_error_n[2] = 1'b1;
+-                v_task_n = 1'b1;
+-                v_id_n = issue_id_i[victim_q];
+-            end
+-            if (has_a_q) begin
+-                if (a_done_evt) begin
+-                    if (p4m_track_err && (!a_task_q || done_id_i[aggressor_q] != a_id_q)) p4m_error_n[1] = 1'b1;
+-                    a_task_n = 1'b0;
+-                end
+-                if (a_issue_evt) begin
+-                    if (p4m_track_err && issue_id_i[aggressor_q] == 0) p4m_error_n[0] = 1'b1;
+-                    if (p4m_track_err && a_task_n) p4m_error_n[2] = 1'b1;
+-                    a_task_n = 1'b1;
+-                    a_id_n = issue_id_i[aggressor_q];
++            for (int i = 0; i < NumPorts; i++) begin
++                if (done_i[i]) begin
++                    if (!lane_task_q[i] || done_id_i[i] != lane_id_q[i]) lane_err_n[i][1] = 1'b1;
++                    lane_task_n[i] = 1'b0;
++                end
++                if (issue_i[i]) begin
++                    if (issue_id_i[i] == 0) lane_err_n[i][0] = 1'b1;
++                    if (lane_task_n[i]) lane_err_n[i][2] = 1'b1;
++                    lane_task_n[i] = 1'b1;
++                    lane_id_n[i] = issue_id_i[i];
+                 end
+             end
+         end
+ 
+         // Window accumulation: (open, close]. Opening-edge lane events are excluded because the
+         // window flag is not yet set, closing-edge events are included because it is still clear.
+-        if (P4MEnable && p4m_q && p4m_open_q && !p4m_closed_q) begin
++        // FROZEN and the post-close phases accumulate nothing, so an abort cannot move the bank.
++        if (P4MEnable && p4m_q && p4m_open_q && !p4m_closed_q &&
++            (phase_q == ARMED || active)) begin
+             if (v_issue_evt) begin
+                 if (&p4m_window_issue_q) p4m_error_n[3] = 1'b1;
+                 p4m_window_issue_n = p4m_window_issue_q + 1'b1;
+@@ -289,11 +284,24 @@
+                 if (p4m_a_done_q == 0) p4m_first_done_id_n = done_id_i[aggressor_q];
+                 p4m_last_done_id_n = done_id_i[aggressor_q];
+                 p4m_a_done_n = p4m_a_done_q + 1'b1;
+-                if (p4m_carry_q && done_id_i[aggressor_q] == a_id_q) begin
+-                    p4m_carry_done_n = 1'b1;
+-                    p4m_carry_n = 1'b0;
+-                end
+-            end
++                // The strict pre-opening cohort is the descriptor already in flight at the opening
++                // edge. Its done is recorded at most once and only for that descriptor; the cohort
++                // flag itself is the immutable at-opening snapshot and is never cleared.
++                if (p4m_carry_q && !p4m_carry_done_q && p4m_open_id_q != 64'd0 &&
++                    done_id_i[aggressor_q] == p4m_open_id_q) p4m_carry_done_n = 1'b1;
++            end
++        end
++
++        // Selected-lane error evidence for the frozen bank word 12. Unselected lanes are ignored,
++        // and evidence accumulates only while the observation is ARMED or active, so FROZEN and
++        // drain events (everything after an abort) can never change the bank.
++        if (P4MEnable && p4m_q && !p4m_closed_q && (phase_q == ARMED || active)) begin
++            p4m_error_n[0] = p4m_error_n[0] | lane_err_n[victim_q][0] |
++                (has_a_q && lane_err_n[aggressor_q][0]);
++            p4m_error_n[1] = p4m_error_n[1] | lane_err_n[victim_q][1] |
++                (has_a_q && lane_err_n[aggressor_q][1]);
++            p4m_error_n[2] = p4m_error_n[2] | lane_err_n[victim_q][2] |
++                (has_a_q && lane_err_n[aggressor_q][2]);
+         end
+ 
+         if (phase_q == ARMED && issue_i[victim_q]) begin
+@@ -305,15 +313,18 @@
+             count_n[31] = has_a_q ? CounterWidth'((CounterWidth'(reads_n[aggressor_q]) << 16) | CounterWidth'(writes_n[aggressor_q])) : '0;
+             if (issue_id_i[victim_q] == 0) error_n[1] = 1'b1;
+             if (p4m_q) begin
+-                // Opening edge. This cycle's lane events are excluded from the sums, the stock is
+-                // sampled after them, and a job in flight that was not issued here is the cohort.
++                // Opening edge. This cycle's lane events are excluded from the sums, the selected
++                // lane stock is sampled after them, and a selected job that was not issued here is
++                // the immutable strict pre-opening cohort. The opening job itself counts as the
++                // first V issue of the window, matching legacy count7.
+                 p4m_open_n = 1'b1;
+-                p4m_start_n = a_task_n;
++                p4m_start_n = has_a_q && lane_task_n[aggressor_q];
+                 p4m_end_n = 1'b0;
+-                p4m_open_id_n = a_task_n ? a_id_n : 64'd0;
++                p4m_open_id_n = (has_a_q && lane_task_n[aggressor_q]) ? lane_id_n[aggressor_q] : 64'd0;
+                 p4m_open_issue_n = a_issue_evt;
+-                p4m_carry_n = a_task_n && !a_issue_evt;
++                p4m_carry_n = has_a_q && lane_task_n[aggressor_q] && !a_issue_evt;
+                 p4m_carry_done_n = 1'b0;
++                p4m_window_issue_n = 1'b1;
+             end
+         end
+         if (phase_q == ARMED || active) begin
+@@ -365,10 +376,11 @@
+                                 count_n[33] = has_a_q ? CounterWidth'((CounterWidth'(reads_n[aggressor_q]) << 16) | CounterWidth'(writes_n[aggressor_q])) : '0;
+                                 if (p4m_q) begin
+                                     // Closing boundary: this cycle's lane events were already
+-                                    // accumulated and the cycle count is the frozen count0.
++                                    // accumulated, the cycle count is the frozen count0 and the
++                                    // selected lane stock is sampled after the closing-edge events.
+                                     p4m_closed_n = 1'b1;
+-                                    p4m_end_n = a_task_n;
+-                                    p4m_close_id_n = a_task_n ? a_id_n : 64'd0;
++                                    p4m_end_n = has_a_q && lane_task_n[aggressor_q];
++                                    p4m_close_id_n = (has_a_q && lane_task_n[aggressor_q]) ? lane_id_n[aggressor_q] : 64'd0;
+                                     p4m_cycles_n = count_n[0];
+                                 end
+                             end else phase_n = REFILL;
+@@ -432,6 +444,10 @@
+                             p4m_first_done_id_n = 0; p4m_last_done_id_n = 0;
+                             p4m_cycles_n = 0; p4m_a_issue_n = 0; p4m_a_done_n = 0;
+                             p4m_window_issue_n = 0; p4m_window_done_n = 0; p4m_error_n = 0;
++                            // Drop the lane evidence with the rest of the observation state so a
++                            // cleared run cannot re-assert error_q[8]. Lane in-flight state itself
++                            // stays continuous: it mirrors the DMA, not the observation.
++                            for (int i = 0; i < NumPorts; i++) lane_err_n[i] = 3'b0;
+                         end
+                     end else if ((cfg_wdata_i & ~(64'h000000001f030301 | (ControlledEnable && E3Enable ? 64'h0000000020000000 : 64'h0) | (P4MEnable ? 64'h0000000040000000 : 64'h0))) == 0 && cfg_wdata_i[0] &&
+                                  (!cfg_wdata_i[30] || (P4MEnable && cfg_wdata_i[25] && cfg_wdata_i[9:8] == 0 &&
+@@ -486,15 +502,15 @@
+         end
+ 
+         // P4M violations are sticky and invalidate the bank through error_q[8] (main status
+-        // bit 40). Details stay readable at bank word 12. Nothing here can move the bank after
+-        // the closing boundary.
+-        if (p4m_q) begin
+-            if (error_n[4]) p4m_error_n[4] = 1'b1;   // aborted observation, also after the close
+-        end
++        // bit 40). Details stay readable at bank word 12. Once the observation is closed the bank
++        // (word 12 included) is frozen; a later abort is still reported in the main status and still
++        // invalidates the result, but it cannot rewrite the captured words.
+         if (p4m_q && !p4m_closed_q) begin
++            if (error_n[4]) p4m_error_n[4] = 1'b1;   // aborted observation inside the window
+             if (error_n[2]) p4m_error_n[3] = 1'b1;   // counter overflow inside the session
+             if (error_n[3]) p4m_error_n[7] = 1'b1;   // private AXI identity violation
+         end
++        if (p4m_q && error_n[4] && p4m_closed_q) error_n[8] = 1'b1; // post-close abort: invalid only
+         if (p4m_error_n != 32'd0) error_n[8] = 1'b1;
+     end
+ 
+@@ -516,8 +532,8 @@
+             delay_q <= 0;
+             track_bad_q <= 0;
+             p4m_q <= 0;
+-            a_task_q <= 0; a_id_q <= 0;
+-            v_task_q <= 0; v_id_q <= 0;
++            lane_task_q <= 0;
++            for (int i = 0; i < NumPorts; i++) begin lane_id_q[i] <= 0; lane_err_q[i] <= 0; end
+             p4m_open_q <= 0; p4m_closed_q <= 0; p4m_carry_q <= 0; p4m_carry_done_q <= 0;
+             p4m_start_q <= 0; p4m_end_q <= 0; p4m_open_issue_q <= 0;
+             p4m_open_id_q <= 0; p4m_close_id_q <= 0;
+@@ -543,8 +559,11 @@
+             delay_q <= delay_n;
+             track_bad_q <= track_bad_n;
+             p4m_q <= p4m_n;
+-            a_task_q <= a_task_n; a_id_q <= a_id_n;
+-            v_task_q <= v_task_n; v_id_q <= v_id_n;
++            lane_task_q <= lane_task_n;
++            for (int i = 0; i < NumPorts; i++) begin
++                lane_id_q[i] <= lane_id_n[i];
++                lane_err_q[i] <= lane_err_n[i];
++            end
+             p4m_open_q <= p4m_open_n; p4m_closed_q <= p4m_closed_n;
+             p4m_carry_q <= p4m_carry_n; p4m_carry_done_q <= p4m_carry_done_n;
+             p4m_start_q <= p4m_start_n; p4m_end_q <= p4m_end_n;
+--- a/tests/dma_p4m_observer_test.cpp
++++ b/tests/dma_p4m_observer_test.cpp
+@@ -79,7 +79,8 @@
+         check(b.bank(2)==0&&b.bank(3)==0&&b.bank(4)==0&&b.bank(5)==0,"solo no aggressor flow");
+         check(b.bank(6)==0&&b.bank(7)==0&&b.bank(8)==0&&b.bank(9)==0,"solo no aggressor ids");
+         check(b.bank(10)==0&&b.bank(11)==0&&b.bank(12)==0,"solo clean bank");
+-        check(b.bank(13)==1&&b.bank(14)==2,"solo victim flow");
++        check(b.bank(13)==2&&b.bank(13)==b.count(7),"solo V issued counts the opening job and matches legacy count7");
++        check(b.bank(14)==2&&b.bank(14)==b.count(8),"solo V done matches legacy count8 and the target");
+         check(b.bank(15)==2,"solo flags: closed without aggressor");
+         cases++;
+ 
+@@ -109,8 +110,9 @@
+         check(b.bank(8)==900&&b.bank(9)==0,"opening/closing id");
+         check(b.bank(10)==900&&b.bank(11)==901,"first/last aggressor done id");
+         check(b.bank(12)==0,"carry run clean");
+-        check(b.bank(13)==1&&b.bank(14)==2,"carry victim flow");
+-        check(b.bank(15)==3,"carry cleared, closed, has aggressor");
++        check(b.bank(13)==2&&b.bank(13)==b.count(7),"carry victim flow matches legacy count7");
++        check(b.bank(14)==2&&b.bank(14)==b.count(8),"carry victim done matches legacy count8");
++        check(b.bank(15)==7,"immutable pre-opening cohort flag, closed, has aggressor");
+         check(b.bank(4)+b.bank(2)==b.bank(3)+b.bank(5),"aggressor conservation");
+         check(b.bank(6)<=b.bank(4)&&b.bank(6)<=b.bank(3)&&b.bank(6)<=1,"carry bound");
+         cases++;
+@@ -119,8 +121,8 @@
+         b.reset();
+         b.arm_p4m(0,1,1);
+         b.issue(1,910);
+-        d.issue_i=3; d.issue_id_i[0]=300; d.done_i=2; d.done_id_i[1]=910; d.issue_id_i[1]=911;
+-        b.tick(); d.issue_i=0; d.done_i=0;
++        b.d.issue_i=3; b.d.issue_id_i[0]=300; b.d.done_i=2; b.d.done_id_i[1]=910; b.d.issue_id_i[1]=911;
++        b.tick(); b.d.issue_i=0; b.d.done_i=0;
+         b.tick(4);
+         b.done(1,911);
+         b.tick(2);
+@@ -129,6 +131,7 @@
+         check(b.bank(2)==0&&b.bank(3)==1,"opening-edge aggressor events excluded");
+         check(b.bank(4)==1&&b.bank(7)==1&&b.bank(8)==911,"post-edge opening stock and edge issue");
+         check(b.bank(5)==0&&b.bank(6)==0&&b.bank(9)==0,"retire-and-replace leaves no carry");
++        check((b.bank(15)&4)==0,"opening-edge issue leaves no strict pre-opening cohort flag");
+         check(b.bank(12)==0,"opening-edge run clean");
+         cases++;
+ 
+@@ -139,8 +142,8 @@
+         b.tick(3);
+         b.issue(1,500);
+         b.tick(2);
+-        d.done_i=2; d.done_id_i[1]=500; d.issue_i=2; d.issue_id_i[1]=501;
+-        b.tick(); d.done_i=0; d.issue_i=0;
++        b.d.done_i=2; b.d.done_id_i[1]=500; b.d.issue_i=2; b.d.issue_id_i[1]=501;
++        b.tick(); b.d.done_i=0; b.d.issue_i=0;
+         b.tick(2);
+         b.done(0,400);
+         b.freeze(0,400);
+@@ -158,12 +161,12 @@
+         b.tick(3);
+         b.issue(1,700);
+         b.tick(2);
+-        d.done_i=3; d.done_id_i[0]=600; d.done_id_i[1]=700; d.issue_i=2; d.issue_id_i[1]=701;
+-        b.tick(); d.done_i=0; d.issue_i=0;
++        b.d.done_i=3; b.d.done_id_i[0]=600; b.d.done_id_i[1]=700; b.d.issue_i=2; b.d.issue_id_i[1]=701;
++        b.tick(); b.d.done_i=0; b.d.issue_i=0;
+         b.freeze(0,600);
+         check(b.bank(2)==2&&b.bank(3)==1,"closing-edge aggressor events included");
+         check(b.bank(4)==0&&b.bank(5)==1&&b.bank(9)==701,"closing stock after edge");
+-        check(b.bank(13)==0&&b.bank(14)==1,"closing-edge victim done included");
++        check(b.bank(13)==1&&b.bank(14)==1,"closing-edge victim done included and opening issue counted");
+         check(b.bank(12)==0,"closing-edge run clean");
+         cases++;
+ 
+@@ -186,7 +189,7 @@
+         b.tick(2);
+         b.done(0,3);
+         b.freeze(0,3);
+-        check(b.bank(13)==2&&b.bank(14)==3,"multi-job victim flow across refills");
++        check(b.bank(13)==3&&b.bank(14)==3,"multi-job victim flow across refills counts the opening job");
+         check(b.bank(2)==1&&b.bank(3)==1,"aggressor flow across an idle gap");
+         check(b.bank(4)==0&&b.bank(5)==0&&b.bank(6)==0,"aggressor idle at opening and close");
+         check(b.bank(12)==0,"idle gap run clean");
+@@ -258,6 +261,125 @@
+         check(b.status()==4,"legacy batch frozen");
+         check(((b.status()>>40)&1)==0,"legacy batch leaves P4M validity alone");
+         cases++;
++
++        // An A job issued before ARM on the lane a later arm selects stays tracked: it is the strict
++        // pre-opening cohort and its single done is recorded inside the window.
++        b.reset();
++        b.issue(1,1100);
++        b.arm_p4m(0,1,1);
++        b.issue(0,1101);
++        b.tick(2);
++        b.done(1,1100);
++        b.tick(1);
++        b.done(0,1101);
++        b.freeze(0,1101);
++        check(b.bank(4)==1&&b.bank(8)==1100,"pre-ARM A job is the opening cohort stock");
++        check(b.bank(6)==1&&(b.bank(15)&4)!=0,"cohort done counted once and flag held at close");
++        check(b.bank(12)==0,"pre-ARM cohort run is clean");
++        cases++;
++
++        // Malformed evidence on the lane a later arm selects must still invalidate the run.
++        b.reset();
++        b.issue(1,0);
++        b.arm_p4m(0,1,1);
++        b.issue(0,1200);
++        b.tick(2);
++        b.done(0,1200);
++        b.freeze(0,1200);
++        check((b.bank(12)&1)!=0,"pre-ARM zero id on the selected lane is reported");
++        check(((b.status()>>40)&1)!=0,"selected pre-ARM error invalidates P4M");
++        cases++;
++
++        // Malformed evidence on a lane the arm does not select must be ignored.
++        b.reset();
++        b.issue(2,0);
++        b.arm_p4m(0,-1,1);
++        b.issue(0,1300);
++        b.tick(3);
++        b.done(0,1300);
++        b.freeze(0,1300);
++        check(b.bank(12)==0,"unselected lane error ignored");
++        check(((b.status()>>40)&1)==0,"unselected lane error leaves P4M valid");
++        check(b.bank(15)==2,"solo flags: no aggressor and closed");
++        cases++;
++
++        // Legacy roles first, then a P4M arm: only the newly selected lanes are sampled.
++        b.reset();
++        b.d.batch_active_i=15;
++        b.write(0x68,1);
++        b.write(0x60,1ULL|(1ULL<<25)|(2ULL<<8)|(1ULL<<24)|(3ULL<<16));
++        check(b.status()==1,"legacy V2/A3 batch arm");
++        b.issue(2,50); b.tick(2); b.done(2,50); b.poll(2,50);
++        check(b.status()==4,"legacy V2/A3 run frozen");
++        b.arm_p4m(0,1,1);
++        b.issue(1,60);
++        b.issue(0,61);
++        b.tick(2);
++        b.done(0,61);
++        b.freeze(0,61);
++        check(b.bank(4)==1&&b.bank(8)==60,"P4M samples the newly selected A lane");
++        check(b.bank(2)==0&&b.bank(3)==0&&b.bank(12)==0,"legacy roles leave no P4M window evidence");
++        cases++;
++
++        // Corun then Solo without reset: Solo A fields stay zero even though the A lane still holds
++        // the corun job in flight.
++        b.reset();
++        b.arm_p4m(0,1,1);
++        b.issue(1,1300);
++        b.issue(0,1301);
++        b.tick(2);
++        b.done(0,1301);
++        b.freeze(0,1301);
++        check(b.bank(5)==1&&b.bank(9)==1300,"corun closes with the A job still in flight");
++        b.arm_p4m(0,-1,1);
++        b.issue(0,1310);
++        b.tick(3);
++        b.done(0,1310);
++        b.freeze(0,1310);
++        check(b.bank(2)==0&&b.bank(3)==0&&b.bank(4)==0&&b.bank(5)==0,"solo opening/closing stock zero");
++        check(b.bank(6)==0&&b.bank(7)==0&&b.bank(8)==0&&b.bank(9)==0,"solo id fields zero");
++        check(b.bank(10)==0&&b.bank(11)==0&&b.bank(12)==0,"solo done ids and errors zero");
++        check(b.bank(13)==1&&b.bank(14)==1,"solo V counts one issue and one done");
++        check(b.bank(15)==2,"solo flags: closed without aggressor after corun");
++        cases++;
++
++        // Aborted window: the frozen bank must not move under late events.
++        b.reset();
++        b.arm_p4m(0,1,2);
++        b.issue(1,1400);
++        b.issue(0,1401);
++        b.tick(3);
++        b.done(1,1400);
++        b.write(0x60,2);
++        check(b.status()==(4|(1ULL<<36)|(1ULL<<40)),"aborted corun frozen and invalid");
++        check((b.bank(12)&16)!=0,"abort evidence in bank word 12");
++        std::array<uint64_t,16> aborted;
++        for(unsigned i=0;i<16;i++)aborted[i]=b.bank(i);
++        b.d.issue_i=2; b.d.issue_id_i[1]=1402; b.tick(); b.d.issue_i=0;
++        b.d.done_i=2; b.d.done_id_i[1]=1403; b.tick(); b.d.done_i=0;
++        b.d.issue_i=1; b.d.issue_id_i[0]=1404; b.tick(); b.d.issue_i=0;
++        b.d.ar_valid_i=b.d.aw_valid_i=b.d.ar_ready_i=b.d.aw_ready_i=3; b.tick(3);
++        b.d.ar_valid_i=b.d.aw_valid_i=b.d.ar_ready_i=b.d.aw_ready_i=0;
++        for(unsigned i=0;i<16;i++)check(b.bank(i)==aborted[i],"aborted bank stable under late events");
++        check(((b.status()>>40)&1)!=0,"aborted run stays invalid");
++        cases++;
++
++        // CLEAR drops the P4M error word and error_q[8]; cleared evidence must not re-assert.
++        b.reset();
++        b.arm_p4m(0,1,1);
++        b.issue(0,1500);
++        b.tick(2);
++        b.done(1,1501);
++        check((b.bank(12)&2)!=0,"unmatched A done before the clear");
++        check(((b.status()>>40)&1)!=0,"unmatched A done invalidates before the clear");
++        b.write(0x60,2);
++        b.write(0x60,4);
++        check(b.status()==0,"clear returns the observer to idle");
++        check(((b.status()>>40)&1)==0,"clear drops error_q[8]");
++        check(b.bank(12)==0,"clear drops the P4M error word");
++        b.arm_p4m(0,1,1);
++        check(((b.status()>>40)&1)==0&&b.bank(12)==0,"cleared evidence does not re-assert on the next arm");
++        cases++;
+     }
+     std::cout<<"PASS "<<cases<<" P4M observer scenarios (no board claim)\n";return 0;
+ }catch(const std::exception&e){std::cerr<<"FAIL after "<<cases<<": "<<e.what()<<"\n";return 1;}}

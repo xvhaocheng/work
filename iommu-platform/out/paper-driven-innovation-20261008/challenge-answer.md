@@ -1,0 +1,173 @@
+# 严格反驳：对 Codex A/B/C 的逐条证据对照与自我否证
+
+## 0. 先接受的四条纠错（替换上轮错误表述）
+
+1. **翻译结果的生命周期**：已完成翻译结果**随原 AXI 事务持有**，不会仅因 IOTLB 条目被替换而单独失效；只有真实 invalidation/IOFENCE（例如 PTE 修改触发的 flush）才使其无效。直接证据方向：`mask2018.txt:842-844`——“MASK flushes all contents of the TLB and the TLB bypass cache when a PTE is modified”；`cuptw2026.txt:1328-1342` 迁移时 flush in-flight walk 与 L1 PTE。**因此不能再以“residency 失效 → 必须重走”为默认前提**（我上轮“residency×ownership”的 S2 表述需要降级为“仅在真实 invalidation 发生时才成立”，见 §5）。
+2. **translation result ready ≠ 数据可消费**。`codex-review.md:75` 明确：“本样本 V 地址早就译好，当前写路径仍在等待 A”。把翻译完成当作“可消费”是范畴错误。
+3. **S1（无 owner 匹配）且无 full-payload 空间时直接放 R 可死锁**。这是正确性约束，不是创新点：读准入必须“要么 owner 匹配，要么持有保留的 full-payload proxy slot”。读 proxy buffer 已在最强基线内（`evidence-answer.md:62`），故该项本身不可作为新机制。
+4. **不使用泛化时间戳/epoch/AI 调度**作为论据；下文所有状态都以**可观测的 AXI 事件与信用/所有权位**定义。
+
+---
+
+## 1. 机制 A：延后写顺序承诺（advisory translation before AW VALID）
+
+### 1.1 逐步对照最强前作
+
+| A 的步骤 | 最强前作对应 | 证据 |
+|---|---|---|
+| A-1 在 per-source AW 仲裁首次呈现 VALID 前，先对 src/dst 页做 bounded advisory translation | socdma2018 的“用运行期信息在真正需要前建立 TLB 表项” | `socdma2018.txt:283-289`（PHT “informs the standard TLB miss handlers … that a TLB entry must be set up ahead of the moment when a worker thread actually requires the data”） |
+| A-2 保留成功/权限元数据 | socdma2018 retirement buffer 逐 burst 存元数据（32b vaddr、16b local、3b ID、8b len、3b state） | `socdma2018.txt:404-407`、`:560-567` |
+| A-3 只有 translation-ready burst 才参加真正 AW 仲裁 | MMU-aware DMA：miss 就 **drop + 重试**，未翻译 burst 根本不前送；翻译好后由控制单元重发 | `socdma2018.txt:393-401`（“keep track of bursts that missed and restart them after the miss has been handled”）、`:407-411`（收到响应后按给定 AXI ID 标记成功/失败） |
+| A-4 不撤销已 VALID/已接受 AXI；同 ID/同 device 顺序与 fence 不变 | socdma2018 明确“burst 同 ID 保序、不同 ID 任意完成”，本就是同一约束 | `socdma2018.txt:412-415`（“The retirement buffer must keep the order in which bursts were issued (because AXI bursts with the same ID are ordered) and must be able to complete bursts with different AXI IDs in any order.”） |
+| A-5 smallFIFO R→W 门需区别 | 无文献对照；属本 RTL 局部细节 | — |
+
+**结论**：A 的可执行部分 = “预取翻译（socdma2018 § IV-A）+ MMU-aware 的 miss-retire 重试（§ IV-C）+ 就绪队列”。这三个元素在 `socdma2018.txt` 中已经**作为同一套混合 IOMMU 方案整体落地**，且其元数据成本只有 64 B（`socdma2018.txt:560-569`，对比 16 KiB 数据缓冲）。A 自称“需证明能比同 budget 通用 ready queue 少硬件或不同约束”——**当前确实没有给出证明**，而前作已给出极小元数据的存在性证据。
+
+### 1.2 是否有不可复制的新信息/贡献假设
+
+**没有找到**。唯一可能“不像 ready queue”的措辞是“延后写顺序承诺”——把写顺序点推迟到翻译就绪。但对写而言：
+- 若 AW 未呈现 VALID：所谓“推迟”就是**不呈现**，等于 ready queue 的持有，可复制；
+- 若 AW 已呈现并被 demux 接受：不可撤销（见 §4 的 `four-dma-boundary` 证据），承诺已锁定，A-4 自己承认。两个子情形都不产生新决策信息。
+
+### 1.3 原理性不可行 / 因果不成立点
+
+- **观察到的等待不是翻译就绪造成的**。`codex-review.md:54-75` 的事件表：`2478 V AW 等待 flags17 = stall16 + 跨 bank W 所有权冲突 bit0`；`2483/2489 V 两 burst FAST 翻译返回`；`3524 V AW 等待解除`。V 的翻译在等待开始后 5–11 cycle 就绪，而 AW 直到 3524 才解。**门控 AW 于 translation-ready 不能解除这段等待**。
+- 间接链存在（A 的冷翻译 2933–2934 → A 源读 2944/2951 → A 写 → 跨 bank W 所有权挡 V），但 A 的机制作用在 **AW 的翻译就绪**，而阻塞资源是 **W 数据的所有权/排空**；二者不是同一资源。A 既不缩短 A 的翻译，也不释放 W slot。
+- A-4 的“不撤销已接受 AXI”与 `four-dma-boundary` 的接口核查一致：已接受 AR/AW 的 ID/路由计数在真实 RLAST/响应前不释放，丢弃重放不是透明回退（`four-dma-boundary-20261008/codex-review.md:14-16`）。
+
+### 1.4 最小可推翻验证
+
+1. **同 budget 就绪队列等价性**：在四真实运行轨迹上，把 A 替换为“同深度 ready queue + 预取”（即前作组合），若每 cycle 的 AW VALID 序列逐字相同，则 A 无可区分贡献。
+2. **反事实门控**：仅在“某 burst 的 AW VALID 被推迟且其唯一 blocker 是 translation-not-ready”时计数。若全轨迹此类事件为 0（`codex-review.md:58` 显示 blocker 是 W 所有权），A 对观测无因果贡献。
+3. **元数据对照**：统计 A 的 advisory 元数据条目数与同深度 ready queue 条目数，若相等则“更少硬件”不成立。
+
+### 1.5 决策：**停止（STOP）**
+降级为工程实现选项，不作为创新主张。它可被“2018 MMU-aware DMA + PHT 预取 + ready queue”在相同 budget 下复制，且与观测阻塞资源不对口。
+
+---
+
+## 2. 机制 B：动态阻塞链调度
+
+### 2.1 逐步对照最强前作
+
+| B 的步骤 | 最强前作对应 | 证据 |
+|---|---|---|
+| B-1 每 copy/burst 关联 src/dst 翻译、已译头、源数据、写义务、buffer/tag credits | 把“一条指令的全部 walk 视为一个 job” | `walk_scheduling2018.txt:291-306`（“servicing all page table walks generated due to execution of a single instruction should be treated as a single job”） |
+| B-2 优先服务“能释放当前最早未完成义务之阻塞链”的 PTE/data | SIMT-aware：**先服务与最近一次已调度同 instruction 的请求**，否则最低 score | `walk_scheduling2018.txt:450-454`（“scheduler first attempts to schedule a pending page walk request … issued by the same SIMD instruction as the most recently scheduled page walk. If none exists, … require the least number of memory requests”） |
+| B-3 V blocked 时优先级可继承到 A | 跨 bank W 所有权；普通“当前 W-bank 预留” | `four-dma-boundary-20261008/codex-review.md:39`（“普通当前 W-bank 预留 2 头 36/36 成功 0 停滞”） |
+| B-4 只影响未锁定仲裁，保同 ID/heldVALID | 与前作一致；同 ID 保序不可破 | `socdma2018.txt:412-415` |
+| B-5 真 wait cycle 时优先级不能解，需拒准入/有限 escape | 该结论本身是经典死锁理论，不是新算法 | — |
+
+**结论**：B-2 的“服务能释放义务的链”在语义上等于 `walk_scheduling2018` 的**同 instruction 批处理 + SJF**；B-3 的“优先级继承到 owner”在四 DMA 抽象中已被**普通当前 W-bank 预留**完全覆盖（`four-dma-boundary…:39`）。二者叠加后 B 没有剩余决策维度。
+
+### 2.2 是否有不可复制的新信息/贡献假设
+
+**没有找到合法非循环状态让 owner priority 分不出，而 B 能分。** Codex 要求“找 owner priority 确实分不出的合法非循环状态”——在 `four-dma-boundary` 的固定合同下（每 bank 一个可见完成头，写义务顺序固定，普通预留 2 头即 36/36 成功、0 停滞）**不存在这样的状态**：所有共享头策略的停滞（H2–H5）都由停车/暴露顺序造成，普通属主预留已排除。因此 B 在此模型里退化为 owner priority。
+
+### 2.3 原理性不可行点
+
+- **真循环无法被调度解决**：读数据依赖写 slot、写准备依赖读完成时，任何优先级只能改变谁先等，不改变不可解性。这需要打破依赖（独立 buffer/预约/中止），B 自己承认“需拒准入/有限 escape”——这一步要么是已知死锁处理，要么需要缓冲区，回到最强基线。
+- 经典 priority inheritance/BIS（给定 root context）：B 的“继承到 owner”与该类机制同构；未见 B 提供 root context 之外的新状态量。
+
+### 2.4 最小可推翻验证
+
+在四真实 DMA/两 bank 的可达 RTL 状态图上（不是抽象模型），穷举或采样：找“owner priority + 每 bank 预留”会选出严格更差动作（停滞或更慢）而 B 选出更好动作的状态。若不存在，B 死。抽象模型已给出反面证据（`four-dma-boundary…:39`），但仍需 RTL 侧复核可达性（见 §4）。
+
+### 2.5 决策：**停止（STOP）**
+等价于 owner priority + 同 instruction 批处理/SJF；无剩余信息维度。
+
+---
+
+## 3. 机制 C：提前翻译额度按“可转换成数据服务的窗口”收费
+
+### 3.1 逐步对照最强前作
+
+| C 的步骤 | 最强前作对应 | 证据 |
+|---|---|---|
+| C-1 成功翻译保留 head 时消耗 translation-context credit，但不发数据 | retirement buffer 的 in-flight 计数即“已占用未完成”信用 | `socdma2018.txt:402-403`、`:407-411`（buffer 向控制单元报告“current number of in-flight and failed bursts”） |
+| C-2 归还在 head 转为安全数据 AR/退休时 | 收到最终响应后按 AXI ID 释放/标记成功 | `socdma2018.txt:407-411` |
+| C-3 准入 lookahead 依据完成 head 占有、当前写义务、future 请求 | 按 miss rate 调整 token 数（epoch 内按占用调整准入） | `mask2018.txt:846-861`（“If the miss rate increases … decreases the number of tokens … If the miss rate decreases … increases”） |
+| C-4 有限元数据下避免 FAST 制造头堵 | 元数据条目数 = 最大 in-flight 数 | `socdma2018.txt:378-379` |
+
+**结论**：C 的“信用按未完成数据服务收费、而非按 PTW 结束收费”，正是 retirement buffer/MSHR 式 in-flight credit；MASK 的 token 已是“按占用动态调准入”。C 无新增可观测状态量。
+
+### 3.2 “preparedAW/occupancy 相同而隐含 read-head order 不同”这一构造的问题
+
+若 preparedAW 与 occupancy **完全相同**，则所有**可观测**状态相同；“隐含 read-head order”是**未来信息**，在 RTL 不可观测。
+- 若 credit 依赖该未来信息 → 需要 oracle，**不可实现**；
+- 若用当前可观测代理（例如 oldest 未完成 head 年龄）→ 就退化为按占用/年龄的计数，可被普通计数器复制。
+
+所以该构造要么不可实现，要么可复制，**不构成不可复制的新信息**。
+
+### 3.3 原理性不可行点
+
+“何时 head 转为安全”**依赖于你正在优化的调度本身**（循环定义）。保守版 = 等到数据 AR 才归还 = ready-queue credit（可复制）；预测版 = 需要不可得信息。C 的目标（避免 FAST 头堵同时保有有用预取）与“有界就绪队列/代理缓冲”的目标重合。
+
+### 3.4 最小可推翻验证
+
+构造两组 preparedAW/occupancy 逐字相同、仅未来读序不同的轨迹，检查 C 的 credit 值是否不同且导致不同放行；若 credit = f(当前占用, 年龄) 且同 budget 计数器给出同样放行，则 C 可复制。
+
+### 3.5 决策：**停止（STOP）**
+
+---
+
+## 4. 理论模型 vs 本 RTL 可达性（必须分开说）
+
+- **four-dma 抽象模型**（`four-dma-boundary-20261008/codex-review.md:18-26`）显式假设“对应 AW 可准备且内存/R/W 服务有限返回”，**不建模** TC main/spill/nfast 深度、AXI VALID 周期、PTW/FAST、DDR 拍、job/失效 epoch，也**不证明**该写顺序在生产 RTL 可达。故 B/C 的链/额度推理只是**抽象可达**，不是 RTL 可达。
+- **walk_scheduling2018** 是 gem5 仿真（`walk_scheduling2018.txt:552-556`、`:961-986`），**orchestrated2023** 是 gem5-gpu 仿真（`orchestrated2023.txt:218-222`），都不直接对应 CVA6/iDMA/2-bank 平台。
+- **socdma2018** 是 FPGA 实现（`socdma2018.txt:431-434`），其“64 B 元数据”是真实实现证据，可作为元数据下界的对照。
+- 因此：**任何以“理论调度更优/信用更省”为由的创新主张，都必须先在真实 RTL 事件上证明该状态可达**（见各条的最小验证），否则只是模型内结论。
+
+---
+
+## 5. 我自己唯一提出的替代设计（附自我否证）
+
+### 5.1 具体 rule
+
+对每个 (device, AXI-ID) 定义**“顺序点令牌” T_id**：在第一次 AW VALID 被 demux 接受时消耗。
+- **R1**：advisory 翻译元数据**当且仅当 T_id 未消耗时可撤销**（撤销 = 丢弃元数据，不做 AXI 回滚）；T_id 已消耗则**钉住**翻译，不允许因 W/元数据争用丢弃。
+- **R2**：R VALID 呈现仅允许当“(owner 匹配存在) OR (已为本 ID 预留 full-payload proxy slot)”；slot 按 ID 计费、在 RLAST 消费时释放（对应纠错 3）。
+
+### 5.2 相同观测需不同决策的两状态
+
+观测均为“V 已翻译，等待中”：
+- **S1：V 的 AW 尚未呈现 VALID（T_V 未消耗）** → V 的翻译是**投机、可撤销**；若较早义务争用 W 路径/元数据，直接丢弃 V 的 advisory 条目，稍后重译；**不放行 V 的读越过较早义务**。
+- **S2：V 的 AW 已呈现并被接受（T_V 已消耗）** → V 的顺序点已固定；**钉住翻译**，并必须让 V 自身的读准入优先于任何外来低优先预取（不可越过它重排）。
+
+两状态的区分量是**“顺序点令牌是否消耗”**，而不是时间戳/epoch。
+
+### 5.3 为什么我自我否证它
+
+- `socdma2018.txt:407-411` 的 retirement buffer **在 AXI 接口发出请求时就加入条目**并按 ID 标记——已经把“跟踪”绑定到请求发出（≈ VALID 接受）。因此 S1/S2 的“未跟踪 vs 已跟踪”正是退休缓冲的既有语义，**可复制**。
+- R2 就是读 proxy buffer / owner 匹配，**已在最强基线**（`evidence-answer.md:62`；纠错 3）。
+- 因此该替代设计未能越过“退休缓冲 + 就绪队列 + 读代理”的组合，**不推荐保留**。
+
+**明确结论**：我没有找到真正不可复制的新机制；按任务要求如实说明。
+
+---
+
+## 6. 优先保留 / 停止决策
+
+| 机制 | 最强前作覆盖 | 新信息 | 原理性障碍 | 决策 |
+|---|---|---|---|---|
+| A 延后写顺序承诺 | socdma2018 § IV-A/§ IV-C（预取+MMU-aware 重试），同 ID 保序 | 无（= ready queue） | 观测 blocker 是 W 所有权，非翻译就绪（`codex-review.md:58`） | **停止** |
+| B 动态阻塞链调度 | walk_scheduling2018 同 instruction 批处理+SJF；四 DMA 普通 W-bank 预留 | 无（= owner priority/BIS） | 真循环不可由优先级解；无合法非循环反例 | **停止** |
+| C 窗口计费额度 | socdma2018 in-flight credit；mask2018 token | 无（credit 要么 oracle 不可实现，要么=占用计数） | 循环定义；需未来读序 | **停止** |
+| 我的替代（§5） | retirement buffer + read proxy | 无 | 自我否证 | **停止** |
+
+---
+
+## 7. 汇总最小可推翻验证（供 Codex 执行）
+
+1. **A**：四真实轨迹上，用“同深度 ready queue + 预取”替换 A，比对每 cycle AW VALID 序列；若不逐字相同再谈；并统计“AW VALID 推迟且唯一 blocker=translation-not-ready”的事件数，若为 0 则 A 无因果贡献。
+2. **B**：在真实 RTL 状态图上搜“owner priority + 每 bank 预留选出严格更差动作、B 更好”的状态；抽象模型已给反面（`four-dma-boundary…:39`），只需确认 RTL 可达性。
+3. **C**：构造 preparedAW/occupancy 逐字相同的两组轨迹（仅未来读序不同），检查 credit 是否不同并改变放行；若 credit=f(当前占用, 年龄) 且同 budget 计数器等效，则 C 可复制。
+4. **通用**：以上全部必须在真实 RTL 事件（非四 DMA 抽象、非 gem5）上验证，否则只停留在理论模型。
+
+---
+
+## 8. 不确定性与未读依赖
+
+- **LTI/ATS 预翻译**与“2026 preemptive VC”“2018 helper prefetch”原文**未在本次给定文本中**，无法逐行对照；§1.1 A-1 的“ATS/LTI 复制 A”仅按 context 标注，**未证实**。
+- `orchestrated2023` 关注 TB 调度与 TLB set sharing（`orchestrated2023.txt:24-28`、`:601-635`），与本平台 AW/W 语义不直接对应，只能作为“调度缓解争用”的旁证。
+- 尚未在真实 RTL 上独立验证 `four-dma-boundary` 抽象合同的写顺序可达性；该项属 §4 已标注的缺口。

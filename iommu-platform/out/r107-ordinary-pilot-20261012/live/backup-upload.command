@@ -1,0 +1,1 @@
+wget -Y off -T 60 -q -O /tmp/r107-stage111/backup-transfer-receipt.json --post-file /tmp/r107-stage111/original-mmcblk0p1.bin http://192.168.77.1:18080/backup && cat /tmp/r107-stage111/backup-transfer-receipt.json

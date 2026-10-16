@@ -1,0 +1,120 @@
+# PN 有限审核结论
+
+**引用约定**：行号为摘录中标注的原始行号。文件缩写如下：
+
+| 缩写 | 文件 |
+|---|---|
+| TL | rv_iommu_tl_wrap.sv |
+| NB | rv_iommu_nonblock_hit.sv |
+| IOTLB | rv_iommu_iotlb.sv |
+| BC | rv_iommu_banked_ctl.sv |
+| TC | rv_iommu_trans_ctl_wrap.sv |
+| PTW | rv_iommu_ptw.sv |
+| FBC | idma_fullbuffer_certificate.sv |
+| SAF | stream_arbiter_flushable.sv |
+
+我没有运行任何仿真或测试。以下结论都来自对所给片段的静态阅读，以及你给出的板测数字。
+
+## 摘要
+
+- **【INFERENCE】致命 bug**：在 S1/Sv39/4KiB 的 PN 路径上，所给片段中没有可确认的握手、翻译、生命周期或权限致命 bug。有一个条件性问题（见 1.1），它位于 BC 的写所有权跟踪中，与 PN 运行信号无关。
+- **【INFERENCE】翻译侧不能解释量级**：共享 IOTLB/DDTC 端口、normal_gate 和 RR 响应这三项，每次 probe 最多附加 2–3 周期，全程上界约 41k 周期，约为差值的 4.6%。
+- **【EVIDENCE→算术】差值量级**：7931659.67 − 7035178 = 896481.67 周期。
+  - 平均到每次 A miss：896482 / 2048 ≈ 437.7 周期。
+  - 平均到每次 fast V：896482 / 4096 ≈ 218.9 周期。
+  - 这是突发传输或数据通路尺度的数字，不是翻译状态机尺度的数字。
+- **【INFERENCE】最可能的主因**：数据通路放大（见 2.1）。目前未确认。
+
+---
+
+## (1) 致命问题
+
+### 1.1 条件性缺陷：BC 写所有权只记录队首，跨 bank 排队时 owner 会过时
+
+**代码证据**
+- 【EVIDENCE】BC:276 `if (aw_accept && w_unfilled_q <= 0) w_owner_q <= aw_sel;`：只有余额 ≤0 时才更新 owner。
+- 【EVIDENCE】BC:265/267：余额 >0 时只允许 `read_owner` 所在 bank 准入读。
+
+**最短合法序列**（前提见下）
+1. AW_Y 被 demux 接受，余额 0→1，owner=Y。
+2. AW_X（另一 bank）在余额为 1 时被接受，余额 1→2。owner 仍为 Y（BC:276 条件为假）。
+3. Y 的 W LAST 被接受，余额 2→1。此时尚未完成的 W 属于 X，但 owner 仍为 Y。
+4. bank_read_admit[X]=0（BC:265/267）。X 的 W 数据依赖 X 尚未准入的 AR（读→写 DMA）。若 X 的 AR 也拿不到 fullbuffer 旁路（TC:646-647），X 的 W 永远无法完成，余额不归零，owner 不更新，形成循环等待。
+
+**硬件前提**
+- 【ASSUMPTION/缺文件】demux 在余额 >0 时允许接受另一 bank 的 AW。`aw_accept` 和 `w_last_accept` 的定义不在片段里（BC 片段只有 235-278、339-409）。
+- X 的 AR 当时尚未被准入。
+- X 没有 fullbuffer 许可，或 DID ≠ FullBufferDID。
+
+**判定**：推断，可达性未定。
+- 板子能跑完，说明它要么不可达，要么被 fullbuffer 旁路救回，要么 X 的 AR 恰好先被准入。
+- 若可达但只在作业边界被救回，可能出现几百周期以上的等待。
+
+**能否解释 P/PN 差值**：本身与模式无关。只有在 PN 改变了两路 DMA 的 AW 交错频率时才会造成差异，量级无法从片段估计。
+
+### 1.2 问题 2 的结论：翻译侧没有可达的长等待或重复遍历（附上界）
+
+**probe 对主路径的占用**
+- 【EVIDENCE】主路径被暂时遮蔽：
+  - NB:51/53：DC/LEAF 两拍占用 DDTC/IOTLB 端口。
+  - TL:252、TL:277：在此期间主路径的 `ddtc_lu_hit` / `iotlb_lu_hit` 被强制为 0。
+  - TL:284-285：`n_intercept` 期间关闭 `normal_gate`。
+- 【EVIDENCE】REJECT 不延长等待：
+  - NB:49-50：REJECT 状态下 busy/intercept=0。
+  - NB:172：REJECT 在 `normal_fire_i` 时退出，即与 P 模式下主路径原本接收该请求是同一拍。
+- 【EVIDENCE】每个候选最多被 probe 一次，且 probe 期间候选不变：
+  - SAF:39-40：RR 使用 LockIn=1、AxiVldRdy=1。
+  - TC:678：bank 在 REQ_TRANS 状态保持 valid。
+  - 【ASSUMPTION】`stream_arbiter` 包装器即 `flushable` 且 `flush_i=0`。该文件缺失。
+
+**响应侧没有反压**
+- 【EVIDENCE】TC:695：AWAIT_RESP 状态下 `trans_resp_ready_o=1`。
+- 【EVIDENCE】BC:407-408：响应 ready 按 `.bank` 回送。
+- fast 接受的同一拍，bank 已进入 AWAIT_RESP。因此 OUT 状态约 1 拍，RR 与 `slow_resp` 冲突最多再加 1 拍。
+- 这一点只针对生产 bank，不能用 testbench 的自由反压来类比。
+
+**上界**
+- 【INFERENCE】2 × 16384（全部 V 翻译各 probe 一次）+ 2 × 4096（OUT 加 RR 冲突）≈ 40,960 周期，不超过差值的 4.6%。
+
+**重复 PTW**
+- 【EVIDENCE（板测）】P/PN 的 A miss 和 fill 都是 2048，与"probe 遮蔽命中导致重复遍历"相矛盾。
+- 【INFERENCE】PTW:154-157 的边沿触发在 `init_ptw_i` 持续为高时不会重新启动。`init_ptw_i` 的驱动行不在片段中。
+
+**编译参数造成的基线开销**
+- 【EVIDENCE】TL:284-285：`normal_gate` 由编译参数 NonblockEnable 决定，在 S/N/P/PN 四种模式下相同。它取消了 spill 寄存器的流水，每次翻译约多 2 拍。
+- 【INFERENCE】这是四种模式共有的成本，不能解释 P 与 PN 的差值。
+
+### 1.3 潜在但当前不可达的问题（不是板上主因）
+
+- 【EVIDENCE】TL:275-276 与 IOTLB:326-327：IOTLB 更新写入的 `en_1S`/`en_2S` 标签取自 `cache_iotlb_en1/2`。若 probe 处于 LEAF 的同一拍发生 PTW 更新，标签取的是 probe 的覆盖值 (1,0)，而不是主请求的 `en_1S_q`/`en_2S_q`。
+- 【INFERENCE】当前不可达，原因有两点：
+  - TL:303-304 要求窗口开启时主请求为 `en_1S_q && !en_2S_q`。
+  - probe 期间 `normal_gate` 关闭，主请求无法更换。
+- 该保护条件一旦放宽，就会变成真实的标签错误。
+
+---
+
+## (2) 值得处理的改进 / 待定主因
+
+### 2.1 问题 3：完成返回后进入数据通路的放大（主因候选，推断）
+
+**M1：PTE 读排在 V 数据突发之后**
+- 【EVIDENCE】BC:247-249 注释写明共享内存 R 通道同时承载 source data 和 page-table reads。
+- 【EVIDENCE】TL:303 要求 `n_window` 满足 `e3_ptw_active`。也就是说，fast V 只会在 A 的 PTW 进行中被接受，于是 V 的 AR/AW 被系统性地注入到 A 的 3 级 PTE 读链中间。
+- 【INFERENCE】P 模式下，V 要等 A 的 walk 结束才被翻译，其突发主要与 A 的数据传输竞争。数据传输本来就是带宽受限的。PN 模式下，V 的突发与 A 的 PTE 读竞争，而 PTE 读是延迟关键、串行依赖的链路。总字节数相同，但 A 的关键链被拉长。
+- 【ASSUMPTION】16384 / 4096 = 4，即每份拷贝 4 次翻译。我假设这对应 2 个 AR 和 2 个 AW，每个 2KiB（例如 64-bit 总线、256 拍突发）。
+  - 每个读突发约占 R 通道 256 拍。
+  - 4096 / 2048 = 2，即每次 A walk 平均重叠 2 次 fast V。
+  - 437.7 周期 ≈ 1.7 个读突发，量级吻合，但未确认。
+- 总线位宽、突发长度、PTW 与数据 AXI 汇合处的仲裁器都缺文件。
+
+**M2：读准入与写所有权**
+- 【EVIDENCE】BC:259-268 的行为：
+  - 余额 >0 时，只有 owner bank 可以准入读。
+  - 余额 ≤0 且有可见 AW 时，两个 bank 的读都被阻塞。
+- 【INFERENCE】fast 翻译让 V 的 AW 更早下发，可能缩短 V 持有 W 的时间。但 V 推进更快也可能让它更频繁地成为 owner。这个机制对差值的方向，无法从代码判定，必须实测。
+
+**fullbuffer 的实际作用**
+- 【EVIDENCE】FBC:16-18：仅在有一个待完成、4KiB 对齐、长度 4096、`CapacityBytes≥4096` 的普通拷贝时才给出 `permit_o`。
+- 【EVIDENCE】TC:646-647：仅当该 AR 的 `stream_id == FullBufferDID` 时，许可才让它绕过 `read_admit_i`。
+- 【EVIDENCE】FBC:4 与 BC:246-250：它不改任何握手，只决定读请求何时可以去请求翻译。其理由是整页缓冲能吸收全部读数据，不依
