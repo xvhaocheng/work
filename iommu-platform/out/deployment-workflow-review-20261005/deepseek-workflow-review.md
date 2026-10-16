@@ -1,0 +1,236 @@
+# A. 一页导航摘要（两端 FPGA 拷贝/上板流程审查）
+
+**范围**：仅审查 Dell 真实工作区（`/home/xvhaocheng/work/...`）与 Mac 只读快照（`/Users/jojo/Desktop/在mac链接pfga(codex)`，下称 `snap:`）中"拷贝与上板 FPGA"的既有工作流与脚本。未执行、未改文件、未上板。
+
+## 两端分工（源码事实）
+
+| 侧 | 职责 | 证据 |
+|---|---|---|
+| Mac | JTAG 加载 `.bit`、串口控制台、写 SD 启动分区 | `snap:README.md:62` "Mac 负责 JTAG 下载和串口；dell 负责 FPGA/Linux 编译" |
+| Dell | 源码/Linux/FPGA 编译、产物交付、结果回传接收 | `iommu-platform/docs/software-update-20261004.md:4` "Linux/OpenSBI 已实际构建成功"；`CURRENT_STATUS.md:3` |
+| 板卡 | 从 SD GPT 第一分区启动 Linux | `iommu-platform/docs/board-host-setup.md:18` "从 SD 的 GPT 第一分区读取原始数据到 DDR 后启动" |
+
+## 顶层入口 → 调用 → 作用（现行入口）
+
+| 入口 | 作用 | 关键调用/依赖 | 默认值（易误用） |
+|---|---|---|---|
+| `snap:scripts/fpga.py` | 旧单 BIT 检查/获取/JTAG/串口/new-run | `openFPGALoader` 直接调用；`fetch_*.py` 校验 | `program --profile` 默认 `migration-4dma`（**历史旧 BIT**），`snap:scripts/fpga.py:417-418` |
+| `snap:scripts/sd_card.py` | 登记卡的备份/更新/恢复/回读 | `fetch_*.py` 各 release；磁盘身份校验 | `--release` 默认 `experiment-v1`（2026-09-15），`:342-343` |
+| `snap:scripts/write_research_sd.py` | 简化写卡（无回读），本次实际使用 | `sd_card.identity` / `sd_card.write_and_verify` | `--release` 默认 `next-experiment-20261002`，`:13`；disk 硬编码 `/dev/disk5`，`:11` |
+| `snap:scripts/run_sd_admin.py` / `update_sd_terminal.applescript` | 管理员权限途径 | `osascript ... with administrator privileges`，`:47-49`；Terminal `do script sudo`，`applescript:3` |
+| `iommu-platform/scripts/mac_research2.py` | 双 BIT 顺序跑（role1 E2 64 + role2 method 462） | 自建 `SerialConsole` + `OpenFPGALoaderProgrammer` | BIT/哈希来自 manifest，强制校验，`:264-286` |
+| `snap:tools/composition-v1-20261004/mac_composition.py` | 同 BIT 172 项 attach-only（不写 BIT/SD/重启） | 复用 `mac_research2.SerialConsole`；`composition_plan.py` | `--through-phase` 默认 `short`（只 16 项），`:515` |
+| `snap:tools/nonblock-pilot-20261004/mac_nonblock_pilot.py` | 单 BIT 一次烧录 15 项（非阻塞 pilot） | 自建 `--bit` 任意路径 + `openFPGALoader` | `EXPECTED_UNAME_R` 硬编码 `00093`，`:64` |
+| `iommu-platform/scripts/mac_update_reboot.py` | cpn2 以太网更新后的外置 JTAG 重启 + boot 校验 | `openFPGALoader -b genesys2 --freq 1000000`，`:200` | 默认 dry-run；`--run` 需 `--port/--bit/--expected-kernel/--out`，`:359-381` |
+| `iommu-platform/scripts/mac_method88_attach.py` | 88 项首个 44 attach 现有 boot，后 44 新烧 | 包装 `mac_method88.py` | `EXISTING_BOOT_ID` 硬编码 `93406a68-...`，`:35` |
+
+**获取方式**区分：
+- 旧固定 fetch：`snap:scripts/fpga.py fetch`（`:121-171`，ssh tar，仅 BIT+参考资料）、`snap:scripts/fetch_software.py`（ssh tar，固定 13 文件，`:44-79`）。
+- 最新多版本：`fetch_p4m.py`（**scp**，`:28-29`）、`fetch_e3_controlled.py`（ssh tar，`:37-38`）、`fetch_e3_queue.py` / `fetch_e4_batch.py` / `fetch_e4_observer.py` / `fetch_e4_path.py` / `fetch_cache_sync.py` / `fetch_p4m_start.py` / `fetch_dma_debug.py`（未在快照中逐一列出内容，仅被 `sd_card.py:158-231` 引用）。
+
+---
+
+# B. 按阶段详细证据与可复用命令模板（仅模板，不执行）
+
+## B1. SD 入口精确核对
+
+### B1.1 `sd_card.py`（`snap:scripts/sd_card.py`）
+
+- 硬编码登记卡身份：整卡 7,817,134,080 B（`:21`），第一分区 32 MiB / offset 1 MiB（`:22-23`），分区 UUID `46298C61-...`（`:24`），第二分区 UUID `0AF525DD-...`（`:25`），分区类型 `7412F7D5-...`（`:26`）；默认软件目录 `artifacts/software/20260915T140327Z-7bsjoi_r/experiment-v1`（`:27`）。
+- **可选 release**（`:342`）：`experiment-v1, dma-smoke-debug-20260916, dma-cache-sync-20260916, e4-observer-20260916, e4-batch-20260916, e4-path-20260916, e3-service-20260916, e3-diag-20260918, e3-followup-20260918, e3-controlled-20260918, p4m-baseline-20260920, p4m-start-control-20260920, composition-v1-20261004`。**不含 `software-update-20261004`。**
+- **默认** `experiment-v1`（`:343`），help 原文 "默认保留旧软件；诊断版须显式指定"。
+- **只写第一分区**：`/dev/rdisk5+` 打开分区字符设备，`:280-284`；plan 固定 `"partition2_written": False`，`:257`。
+- **磁盘/分区身份校验**（不可跳过）：`validate_info` 校验整盘 DeviceNode/Internal/WholeDisk/Physical/TotalSize/BlockSize/GPT 类型（`:44-48`）；分区 UUID/大小/偏移/父盘/设备块大小（`:51-56`）；第二分区内容类型（`:57-58`）。`identity()` 还核对分区数量与顺序（`:69-71`）。
+- **GPT/CRC**：`validate_gpt` 主/备签名、头长度、CRC、位置、`128×128` 表、主备条目一致、第一项 UUID 与 LBA `2048–67583`，`:85-113`。
+- **备份**：`boot-before.bin` + `disk-head-1MiB.bin` + `disk-tail-1MiB.bin`，`durable_file` 内 `fsync` 且写后哈希自校，`:126-132, 285-289`。
+- **写入/回读**：`write_and_verify` 若 `verify=True` 完整 32 MiB 回读比对，否则只 `fsync`，`:135-146`；写成功后 `subprocess.run(["/bin/sync"])`（`:298`）；重开设备再回读并比较首尾保护区（`:304-315`）。
+- **可跳过参数**：`--skip-payload-hash`（`:344`）、`--skip-readback`（`:345`）。但 `run()` 第 `150-153` 行强制白名单：**只允许** `dma-cache-sync-20260916, e4-observer-20260916, e4-batch-20260916, e4-path-20260916, e3-service-20260916, e3-diag-20260918, e3-followup-20260918, e3-controlled-20260918, p4m-baseline-20260920, p4m-start-control-20260920, composition-v1-20261004`。`software-update-20261004` 不在其中。
+- **eject**：`sd_card.py` 不做 `diskutil eject`。
+- **`run_sd_admin.py` / applescript 权限途径**：`run_sd_admin.py` 先把 `sd_card.py`、`fetch_software.py`、`fpga.py` 和软件目录 stage 到 `/private/tmp`（`:27-31`），再 `osascript - "do shell script ... with administrator privileges"`（`:47-49`），完成后把 `results/sd/*` 拷回（`:55-63`）；`update_sd_terminal.applescript` 通过 Terminal `do script` 执行 `sudo /opt/homebrew/bin/python3 .../sd_card.py update --disk /dev/disk5`（`:3`）。注意 SD_CARD.md 第 14 行记录：后台管理员方式在本机被 macOS 拒绝过；实际成功的是系统终端 sudo。
+
+### B1.2 `write_research_sd.py`（`snap:scripts/write_research_sd.py`）
+
+- **只接受 `--release`**，无 `--disk`（`:12-14`）。可选 release：`next-experiment-20261002, research-followup-20261002, research-fullstats-20261002, research-two-bit-20261003, software-update-20261004`，**默认 `next-experiment-20261002`**（`:13`）。
+- **盘号硬编码**：`disk = '/dev/disk5'`（`:11`），写入设备 `'/dev/rdisk5s1'` 也硬编码（`:30`）；`identity(disk)`（`:20, 27`）走 `sd_card.identity`（同 sd_card 的容量/UUID/偏移校验）。
+- payload 路径：默认 `artifacts/software/<release>/delivery/fw_payload.bin`；`research-two-bit-20261003` 用 `delivery/artifacts/fw_payload.bin`（`:15`）。
+- **跳过行为等价于 sd_card 的 skip**：`write_and_verify(..., verify=False)`（`:34`），绝不回读；写后 `/bin/sync`（`:37`），`diskutil eject`（`:39`）；状态固定 `written_not_readback_verified`（`:38`）。
+- **不做 payload SHA256**（无此代码分支）。
+
+### B1.3 本次 software-update-20261004 应复用哪个入口
+
+**事实**：`iommu-platform/out/sd-install-20261005/receipt.json:8` 明确 `"script": "scripts/write_research_sd.py"`，`payload` 来自 `artifacts/software/software-update-20261004/delivery/fw_payload.bin`（`:5`），退出码 0（`:15`），已 eject/sync（`:16-17`），`board_boot_verified: false`（`:20`）。
+
+**推荐复用**：`write_research_sd.py`（当前唯一支持该 release 的写卡入口）。
+
+**是否必须显式 `--release`**：是。因为 `write_research_sd.py` 默认写 `next-experiment-20261002`（`:13`），不显式指定会写**旧镜像**。`mac-snapshot/MAC_HANDOFF.md:5` 也记录了"仅在其已有 release 列表增加 software-update-20261004"。
+
+**不能复用 `sd_card.py`（现状）**：`sd_card.py --release` 的 `choices`（`:342`）与 skip 白名单（`:152`）都不含 `software-update-20261004`，直接传会 `argparse` 报错并拒绝。
+
+**模板（仅模板）**：
+```sh
+# 仅模板，不执行
+diskutil list                                   # 先确认整卡编号（不能凭历史假定 disk5）
+# 复用 write_research_sd.py；由于盘号与写入设备硬编码，需要实际整卡就是 /dev/disk5
+sudo /opt/homebrew/bin/python3 scripts/write_research_sd.py --release software-update-20261004
+```
+
+## B2. FPGA 易失 BIT 加载精确核对
+
+### B2.1 通用 `fpga.py`（`snap:scripts/fpga.py`）
+
+- **固定 BIT**：`artifacts/migration-4dma/ariane_xilinx.bit`，14,443,722 B，SHA256 `cd49d4ab...`（`:29-31`）；`verify_bit` 若不符直接停（`:76-82`）。
+- **`program` 已知 profile**（`:185-243`）：`migration-4dma`（真实 SHA256 校验）、`migration-4dma-p4m`、`migration-4dma-e3-queue`、`migration-4dma-e3-controlled`、`migration-4dma-e3`、`migration-4dma-path`、`baseline-4dma-batch`、`migration-4dma-batch`、`migration-4dma-observe`（均为 `sha256=None, hash_verified=False`，仅读元数据）、`migration-4dma-scfix`（真实本地校验）。**未知 profile 直接 `RuntimeError`**（`:241-242`）。
+- **`--profile` choices**（`:417-418`）：上述前 9 个 + `migration-4dma`，**默认 `migration-4dma`**，help 原文 "默认仍为历史 BIT；修复版须显式选择 scfix"。
+- **调用**：`command = ["openFPGALoader", "-b", "genesys2"]`（`:252`）；`--freq` 只有 `1000000, 6000000`，默认 `1000000`（`:419-420`）。
+- **不写 Flash**：命令不加 `-f`；`README.md:187` 原文 "只做易失配置，断电后重新加载"。
+- **状态检查**：`status` 走 `--read-register STAT`（`:255`），解析 DONE/EOS/GWE/CRC/ID（`:174-182`），未就绪把退出码改成 2（`:289-294`）。
+- **是否"当前四模式入口"**：否。`--profile` 不含任何 composition/nonblock 版本；`iommu-platform/docs/composition-v1-mac-20261004.md:64` 直接给出 `openFPGALoader -b genesys2 --freq 1000000 <bit>`，不经 `fpga.py`。
+
+### B2.2 四个最新 runner 接收任意 BIT 的方式
+
+- `mac_research2.py`（`snap:tools/composition-v1-20261004/mac_research2.py`）：
+  - BIT 路径来自 `DELIVERY.json images[role].bit`，逐文件 SHA256 强校验（`:264-286`）。
+  - 加载：`OpenFPGALoaderProgrammer.flash`，命令 `['openFPGALoader', '-b', 'genesys2', '--freq', str(self.freq), bit_path]`（`:529`），`freq` 默认 1,000,000（`:523`）。
+  - 板卡名常量 `BOARD = 'genesys2'`（`:44`）。不写 Flash。
+  - boot 识别：`_collect_boot_info` 检查 `uname -r == manifest.software.kernel_release`（`:812-814`）、板端 CLI SHA256（`:816-827`）、`--caps2`（`:829-838`）、`boot_id`（`:840-846`）；切 BIT 后 `_check_boot_change` 要求 boot_id 变化（`:849-858`）。
+  - 错误停止：`TechnicalFailure` + `_stop` 写 `STOPPED.txt`（`:754-766`）。
+- `mac_composition.py`（attach-only，不写 BIT/不重启/不动 SD）：文件头 `:6-9`。`check_uart_ownership` 用只读 `lsof`（`:111-124`）；`--expected-kernel` 为必填（`:507-508`）。
+- `mac_nonblock_pilot.py`（含 `-v4.py` 变体）：
+  - `flash_once` 命令 `[--openfpgaloader 默认 /opt/homebrew/bin/openFPGALoader, '-b', 'genesys2', '--freq', str(jtag_freq 默认 1000000), str(bit)]`（`:749-781`）。
+  - `--bit` 任意路径，只记录 `bit_sha256`（`:774`），**不比对期望哈希**。
+  - 板卡常量 `BOARD='genesys2'`（`:52`）。
+  - boot 识别：`EXPECTED_UNAME_R` 硬编码 `'6.5.0-rc2-00093-gc0f5e13ea81f'`（`:64, 1096-1100`）；boot_id 必须改变；taint 必须 0。
+  - 保持 Linux：`finally: self.console.close()`（`:1720-1723`）。
+- `mac_update_reboot.py`（Dell 真实 `iommu-platform/scripts/mac_update_reboot.py`）：
+  - `_load_bit` 命令 `['openFPGALoader', '-b', 'genesys2', '--freq', '1000000', str(bit)]`（`:200`）。
+  - 不写 Flash（`:26-27`）；默认 dry-run，无 `--run` 不开串口（`:22-25`）。
+  - 语义：pre-reboot boot_id 允许旧版本；post-reboot `uname -r` 必须等于 `--expected-kernel`（`:305-307`）；boot_id 必须变化（`:309-310`）。
+- `mac_method88_attach.py`：包装 delivered `mac_method88.py`；boot 1 attach 现有（`EXISTING_BOOT_ID = "93406a68-fc8a-4040-9dc6-ae4e4a670d36"`，`:35`），boot 2 用 `mac2.OpenFPGALoaderProgrammer(freq=args.jtag_freq)`（`:186`）新烧。
+
+**模板（仅模板）**：
+```sh
+# 仅模板，不执行
+# A) 旧 profile 经 fpga.py（仅适用于它在 --profile 白名单内的历史 profile）
+python3 scripts/fpga.py program --profile migration-4dma-scfix        # 唯一显式校验 SHA256 的新 profile 之一
+# B) 直接 openFPGALoader（composition-v1 / 任意新 BIT）
+/opt/homebrew/bin/openFPGALoader -b genesys2 --freq 1000000 tools/composition-v1-20261004/ariane_xilinx.bit
+# C) 单 BIT 一次烧录 runner
+tools/method88-venv/bin/python tools/nonblock-pilot-20261004/mac_nonblock_pilot.py --label <label> --bit <bit> --out <new_dir>
+# D) 外置 JTAG 重启（cpn2-net1）
+python3 mac_update_reboot.py --run --bit <sameBIT> --port /dev/cu.usbserial-XXXX \
+  --expected-kernel "$(cat kernel-release)" --boot-timeout 300 --out fresh_reboot
+```
+
+## B3. 串口独占 / 115200 / 回传入口
+
+**真正存在的互斥**：
+- `fpga.py console` 使用 `fcntl.ioctl(fd, termios.TIOCEXCL)`（`:331`）——**内核级独占**；`configure_serial` 固定 `B115200`、8N1、无 XON/XOFF/RTS/CTS（`:304-313`）；`Ctrl+]` 退出（`:361-366`）。
+- `mac_composition.py` / `mac_nonblock_pilot.py`：只读 `lsof` 检查占用并拒绝（`mac_composition.py:111-124`；`mac_nonblock_pilot.py:318-331`），**不杀进程，也不是内核独占**。
+- `mac_research2.py` preflight 里短时 `serial.Serial(...).close()` 探活（`:301-302`），非独占。
+- `mac_update_reboot.py`：**没有** `lsof` 检查，也没有 file lock；docstring 声称"a single serial owner at a time"（`:28`）但代码未实现独占。
+
+**串口参数**（统一 115200）：
+- `fpga.py:310`，`mac_research2.py:62`（pyserial 8N1 无流控，`:322-332`），`mac_nonblock_pilot.py:59`，`mac_update_reboot.py:47`。
+
+**锁**：代码中未见文件名锁 / `flock`。仅 `platform-sd-update`（板端工具，`software-update-20261004.md:18`）提到 `flock` 独占。
+
+**回传入口**（Mac → Dell，base64 over ssh stdin，不覆盖远端目录）：
+- `snap:scripts/return_e3_controlled.py`（`:83-103`，远端 `dest.mkdir(exist_ok=False)`）、`return_p4m_resume35.py`（`:119-132`）、`transfer_p4m_board_dir.py`（串口 tar 流 + md5 校验）。
+
+**输入板端路径 ≠ Mac 主机路径**（源码常量）：
+- 板端：`/usr/bin/idma_research`（`mac_research2.py:56`）、`/usr/bin/idma_composition`（`mac_composition.py:34`）、`/usr/bin/idma_experiment`（`mac_nonblock_pilot.py:53`）、`/dev/idma0`、`/dev/mem`、`/proc/sys/kernel/random/boot_id`、`/proc/sys/kernel/tainted`。
+- Mac 本地：`/dev/cu.usbserial-AV0KRCHT`（多个 runner）、`/opt/homebrew/bin/openFPGALoader`、`ROOT`。
+
+## B4. 与速度偏好兼容性审查
+
+**用户已允许跳过（且实现支持）**：
+- `sd_card.py --skip-payload-hash` / `--skip-readback`（限白名单 release，`:150-153`）。
+- `write_research_sd.py` 无条件跳过 payload hash 与回读（`:34`）。
+
+**用户允许跳过但实现无 skip 参数（只能整段跑或改代码）**：
+- `fpga.py program` BIT 哈希（`verify_bit`，`:76-82`）——对 `migration-4dma` / `migration-4dma-scfix` 是**真实 SHA256 校验，无 skip 参数**。
+- `fpga.py status` 未就绪返回 2（`:289-294`）。
+- `mac_research2.py`：manifest/image/scripts/SHA256（`:264-286`）、kernel/CLI/caps/boot_id-change/taint（`:806-858, 1107-1121`）——**无 skip**。
+- `mac_composition.py`：`--expected-kernel`/boot_id/taint/ABI/每例 `validate_case`——**无 skip**（`:201-238, 335-356`）。
+- `mac_nonblock_pilot.py`：`EXPECTED_UNAME_R`/taint/caps/`validate_record`——**无 skip**（`:1090-1124, 508-575, 338-415`）。
+- `mac_update_reboot.py`：`post uname == expected_kernel`、boot_id 变化——**无 skip**（`:305-310`）。
+- 磁盘身份/UUID/容量/GPT CRC/备份在 `sd_card.py` 内**无 skip**。
+
+**结论**：当前速度偏好能"少做"的部分已由实现提供选项，其余为程序内置正确性/身份/退出码/首错停止，**不应删除**；如要缩短，只能选择更"快"的入口（例如 `write_research_sd.py` 相比 `sd_card.py` 天然少回读），不能靠删校验。
+
+## B5. 新 SD 常驻以太网更新 → sync → JTAG 重载同 BIT 流程
+
+**现有新增工具**（`iommu-platform/docs/software-update-20261004.md:4`）：
+- 板端：`platform-sd-update`（只写 `/dev/mmcblk0p1`，32 MiB，`fsync`，不自动重启，`:18`）、`platform-net-up`/`tests/board-net-up.sh`（默认 dry-run，`--apply` 才改状态，`:19`）、`tests/board-fetch-update.sh`（只接受 `http://`，先下载 `.partial`，默认 dry-run，`:20`）。
+- Mac 端：`scripts/mac_update_reboot.py`（`:21`）；流程：Mac `python3 -m http.server`（`:60-64`）→ 板子下载（`:67-73`）→ 板端写卡 + `PASS`（`:81-85`）→ 外部 JTAG 重载同 BIT（`:87-98`）。
+
+**仍待板端确认项**（源码/文档明示）：
+- `software-update-20261004.md:6` "SD、网口和重启链路尚未上板验收"。
+- `:12` "这些目前是软件/mock 测试结论，上板未验证"。
+- `:48` "`ip -o` 兼容性……尚未上板运行"。
+- `:113` "只有真实 PASS 后，AI 远程更新才可考虑投入运行"。
+- 重启仍依赖外置 JTAG，`reboot` 未成为已交付能力（`:27-30`）。
+- `CURRENT_STATUS.md:19-20` "65 项主机测试/RTL 接收仿真通过；这些不代替真实 SD/PHY/中断验证"。
+
+**当前事实**：`receipt.json` 显示 cpn2-net1 已写卡（`written_not_readback_verified`，exit 0，ejected），但 `board_boot_verified: false`（`:20`），**没有当前板端启动证据**。
+
+---
+
+# C. 当前软件 / 硬件事实与未确立事项
+
+**已确立（有源码/回执证据）**
+- Mac 侧写卡入口现状：`sd_card.py` 支持 13 个 release；`write_research_sd.py` 支持 5 个 release，含 `software-update-20261004`（`write_research_sd.py:13`）。
+- 本次 cpn2-net1 SD 已写卡完成：`receipt.json:1-21`（exit 0 / ejected / synced / `written_not_readback_verified` / `board_boot_verified: false` / `rtl_modified: false`）。
+- 通用 `fpga.py` 的 `program` 不支持 composition / nonblock 系列 profile（`:417-418, 185-243`）。
+- `sd_card.py` 的 `--release software-update-20261004` 现在**不被接受**（`:342`）。
+- `write_research_sd.py` 的盘号/分区设备**硬编码 `/dev/disk5` 与 `/dev/rdisk5s1`**（`:11, 30`），无 `--disk` 参数。
+- `mac_update_reboot.py` 的 BIT 加载是易失（不加 `-f`），频率固定 1 MHz（`:200`）。
+
+**未确立 / 未给文件或代码不能证明**
+- 板端 SD/网口/中断/`platform-sd-update`/`platform-net-up`/`platform-fetch-update` 的实际运行结果：无板端证据（`software-update-20261004.md:6, 12, 113`）。
+- cpn2-net1 的 FPGA BIT 状态：`CURRENT_STATUS.md:3` 只描述了 cpn1 恢复编译；cpn2 是**软件任务**，未描述 BIT 或加载。**没有 cpn2 的 BIT 文件、SHA256 或是否已构建的源码事实。**
+- composition-v1 的 BIT 是否完成：`composition-handoff-20261005.md:7-9` 显示最后核查时仍在布线（Phase 4.3，冲突 194），**无 routed DCP/BIT/MCS**，需接手读取实时 state。
+- 六个 `/dev/diskN` 的当前实际编号：`receipt.json` 记录 `/dev/disk5`，但 `SD_CARD.md:36` 与 `composition-v1-mac-20261004.md:38` 都明确要求每次重新 `diskutil list` 确认，**不能凭历史假定**。
+- `fpga.py` 对多数新 profile 的 `hash_verified: False`（`:191` 等）——**这是"未做实际哈希"的源码事实**，不是已校验。
+- 串口设备实际路径：`README.md:189` 记录本次实际为 `/dev/cu.usbserial-AV0KRCHT`，Mac snapshot 里的 runner 也以此为默认；但这是历史记录，本次插入后未在提供材料中重新确认。
+
+---
+
+# D. 可直接补到 Dell `MAC_FPGA_HANDOFF.md` 顶部的当前入口地图草稿
+
+> 说明：Dell 根 `MAC_FPGA_HANDOFF.md`（工作区文件，`iommu-platform` 外）是当前版（含 2026-10-04/10-05 条目）。`mac-snapshot/MAC_FPGA_HANDOFF.md` 是 **2026-09-15 旧版**（`:3` "更新：2026-09-15"），与 `mac-snapshot/README.md` / `AGENTS.md` 的当前内容不一致，**不要以其为当前入口**。`mac-snapshot/MAC_HANDOFF.md` 才是当前 Mac 交接。
+
+```markdown
+## 2026-10-05 当前入口地图（草稿，来自源码核对）
+
+- Mac 与 Dell 分工：源码/编译/Dell 结果接收在 /home/xvhaocheng/work；JTAG/串口/SD 写入在 Mac 工作区（Mac 根 /Users/jojo/Desktop/在mac链接pfga(codex)）。
+- 写 SD：
+  - 现行支持 software-update-20261004 的入口只有 scripts/write_research_sd.py，必须显式 --release software-update-20261004（默认 next-experiment-20261002 会写旧镜像）。
+  - scripts/sd_card.py 的 --release 白名单（含 skip 白名单）当前不含 software-update-20261004；不要用它写该 release。
+  - 两个入口都只写第一分区，30 MiB payload + 补零到 32 MiB；write_research_sd.py 已 fsync+sync+eject，状态 written_not_readback_verified。
+  - 盘号不能凭历史假定：每次 diskutil list 后确认整卡；write_research_sd.py 现硬编码 /dev/disk5 与 /dev/rdisk5s1。
+- FPGA 易失 BIT 加载：
+  - 现有四模式/新 BIT 不经 scripts/fpga.py（其 --profile 不含 composition/nonblock），直接 openFPGALoader -b genesys2 --freq 1000000 <bit>，不加 -f。
+  - scripts/fpga.py program 默认仍是历史 migration-4dma，须显式 --profile 选择迁移版；它对多数新 profile 只校验元数据，不做实际 SHA256。
+  - mac_update_reboot.py 用同一 BIT 做外置 JTAG 重启，默认 dry-run，--run 需 --port/--bit/--expected-kernel/--out。
+- 串口：
+  - 115200 8N1 无流控为统一参数。
+  - 真正内核级互斥只在 fpga.py console 的 TIOCEXCL；composition/nonblock 用只读 lsof 检查；mac_update_reboot 无独占检查。
+- 本轮实际状态：
+  - cpn2-net1 SD 已写卡（receipt.json: written_not_readback_verified，exit 0，ejected，synced）；board_boot_verified=false。
+  - 无 cpn2 的 BIT 完成/加载/BIT SHA 事实；composition-v1 的 BIT 状态以实时 state 为准（不要以 JSON 的 running 当成功）。
+- 不要复用：mac-snapshot/MAC_FPGA_HANDOFF.md 为 2026-09-15 旧版；Dell 根 MAC_FPGA_HANDOFF.md 与 mac-snapshot/MAC_HANDOFF.md 才是当前交接。
+```
+
+**建议随草稿一起放置的文件（仅建议，不新建）**
+- Mac 当前交接：`mac-snapshot/MAC_HANDOFF.md`。
+- Mac SD 流程说明：`mac-snapshot/SD_CARD.md`。
+- Mac FPGA/串口入口：`mac-snapshot/scripts/fpga.py`、`scripts/sd_card.py`、`scripts/write_research_sd.py`。
+- cpn2 更新流程与限制：`iommu-platform/docs/software-update-20261004.md`。
+- composition 上板说明与转交：`iommu-platform/docs/composition-v1-mac-20261004.md`、`iommu-platform/docs/composition-handoff-20261005.md`。
+- Dell 跨轮状态：`CURRENT_STATUS.md`。
+- 本次写卡回执：`iommu-platform/out/sd-install-20261005/receipt.json`。
+
+---
+
+**审查者声明**：以上均为对已给源码/回执**只读**核对；未执行任何命令，未修改任何文件，未进行任何板端操作。所有"未确证"项已显式标注；不存在仅凭经验补全的结论。

@@ -1,0 +1,131 @@
+diff --git a/tests/nonblock_read_admission.sv b/tests/nonblock_read_admission.sv
+--- a/tests/nonblock_read_admission.sv
++++ b/tests/nonblock_read_admission.sv
+@@ -16,5 +16,12 @@ module nonblock_read_admission #(
+     parameter int unsigned AddrWidth = 64,
+     parameter int unsigned LenWidth  = 8,
+     parameter bit ReadTagQueueEnable = 1'b0,
++    // Test-only: when set (with ReadTagQueueEnable) the completed-read tag
++    // FIFOs are indexed by SOURCE DMA STREAM instead of by bank, so reads from
++    // two DMA IDs in the same bank may be reordered.  Default 0 keeps the
++    // original bank-indexed behaviour and timing.
++    parameter bit ReadTagPerStreamEnable = 1'b0,
++    // AR id bit selecting the source DMA stream (DMA0/DMA1).
++    parameter int unsigned StreamIdBit = 2,
+     parameter type ar_chan_t = logic
+ ) (
+@@ -39,4 +39,7 @@
+     input  logic        fast_resp_valid_i,
+     input  logic        fast_resp_ready_i,
+     input  logic        fast_resp_bank_i,
++    // Test-only: source DMA stream (AR id bit StreamIdBit) of each bank's
++    // current successful read response.
++    input  logic [1:0]  bank_read_stream_i,
+     input  logic [1:0]  bank_is_read_i,
+@@ -98,8 +98,47 @@
+     logic [1:0]  fast_pending_q;
+     logic tag_q [2][8];
+     logic [2:0] tag_rd_q [2], tag_wr_q [2];
+     logic [3:0] tag_count_q [2];
+-    wire [1:0] tag_push = bank_trans_resp_valid_i & bank_trans_resp_ready_i &
+-        bank_is_read_i & ~bank_trans_resp_error_i;
++    wire [1:0] tag_push_bank = bank_trans_resp_valid_i & bank_trans_resp_ready_i &
++        bank_is_read_i & ~bank_trans_resp_error_i;
++    logic [1:0] tag_push;
++    logic [1:0] tag_push_fast;
++    logic       tag_push_dup;
++
++    // Default: the tag FIFO write index IS the bank (original behaviour).
++    // ReadTagPerStreamEnable: a bank's successful read pushes into the FIFO of
++    // the source DMA stream that issued it (bank_read_stream_i).  The stored
++    // FAST value stays derived from the bank-based fast_resp_bank_i comparison.
++    always_comb begin : tag_push_comb
++        tag_push      = 2'b00;
++        tag_push_fast = 2'b00;
++        tag_push_dup  = 1'b0;
++        if (ReadTagPerStreamEnable) begin
++            for (int b = 0; b < 2; b++) begin
++                if (tag_push_bank[b]) begin
++                    if (tag_push[bank_read_stream_i[b]])
++                        tag_push_dup = 1'b1;
++                    tag_push[bank_read_stream_i[b]]      = 1'b1;
++                    tag_push_fast[bank_read_stream_i[b]] =
++                        fast_resp_valid_i && fast_resp_ready_i &&
++                        (fast_resp_bank_i == 1'(b));
++                end
++            end
++        end else begin
++            tag_push = tag_push_bank;
++            tag_push_fast[0] = fast_resp_valid_i && fast_resp_ready_i &&
++                               (fast_resp_bank_i == 1'b0);
++            tag_push_fast[1] = fast_resp_valid_i && fast_resp_ready_i &&
++                               (fast_resp_bank_i == 1'b1);
++        end
++    end
++
++    // Test-only safety net: bank assignment is immutable at request time, so in
++    // per-stream mode two banks must never complete a read for the SAME source
++    // stream in the SAME cycle.  Flag it and stop the simulation.
++    always_comb begin : tag_push_dup_check
++        if (ReadTagQueueEnable && ReadTagPerStreamEnable && tag_push_dup)
++            $fatal(1, "nonblock_read_admission: two banks pushed the same source stream in one cycle");
++    end
+ 
+     logic [31:0] first_offers_q;
+@@ -116,4 +116,9 @@
+     wire capture_bank = s_ar_chan.id[BankIdBit];
+-    wire capture_fast = ReadTagQueueEnable ? tag_q[capture_bank][tag_rd_q[capture_bank]] :
++    // Capture/pop index: bank in default mode; source DMA stream when the
++    // per-stream reorder is enabled.  capture_bank itself stays bank-based, so
++    // budget/exempt accounting is unchanged.
++    wire capture_stream  = s_ar_chan.id[StreamIdBit];
++    wire capture_tag_idx = ReadTagPerStreamEnable ? capture_stream : capture_bank;
++    wire capture_fast = ReadTagQueueEnable ? tag_q[capture_tag_idx][tag_rd_q[capture_tag_idx]] :
+         fast_pending_q[capture_bank];
+     wire capture_fire = (mode_i != RA_NONE) && (state_q == ST_EMPTY) && s_ar_valid;
+@@ -214,17 +214,17 @@
+         end else if (ReadTagQueueEnable) begin
+             for (int b = 0; b < 2; b++) begin
+                 tag_count_q[b] <= tag_count_q[b] + 4'(tag_push[b]) -
+-                    4'(capture_fire && capture_bank == 1'(b));
++                    4'(capture_fire && capture_tag_idx == 1'(b));
+                 if (tag_push[b]) begin
+-                    tag_q[b][tag_wr_q[b]] <= fast_resp_valid_i && fast_resp_ready_i &&
+-                        fast_resp_bank_i == 1'(b);
++                    tag_q[b][tag_wr_q[b]] <= tag_push_fast[b];
+                     tag_wr_q[b] <= tag_wr_q[b] + 1;
+-                    if (tag_count_q[b] == 8 && !(capture_fire && capture_bank == 1'(b)))
++                    if (tag_count_q[b] == 8 && !(capture_fire && capture_tag_idx == 1'(b)))
+                         dbg_tag_fault[0] <= 1'b1;
+                 end
+-                if (capture_fire && capture_bank == 1'(b)) begin
++                if (capture_fire && capture_tag_idx == 1'(b)) begin
+                     tag_rd_q[b] <= tag_rd_q[b] + 1;
+                     if (tag_count_q[b] == 0) dbg_tag_fault[1] <= 1'b1;
+                 end
+             end
++            if (tag_push_dup) dbg_tag_fault[2] <= 1'b1;
+         end
+     end
+diff --git a/tests/nonblock_actual_dma_system_top.sv b/tests/nonblock_actual_dma_system_top.sv
+--- a/tests/nonblock_actual_dma_system_top.sv
++++ b/tests/nonblock_actual_dma_system_top.sv
+@@ -1240,8 +1240,9 @@
+     nonblock_read_admission #(
+         .BankIdBit (SameBankDmasEnable ? 3 : 2),
+         .IdWidth   (4),
+         .AddrWidth (64),
+         .LenWidth  (8),
+         .ReadTagQueueEnable(SharedPoolMode >= 4),
++        .ReadTagPerStreamEnable(HeaderParkMode != 0),
+         .ar_chan_t (slv_ar_chan_t)
+     ) i_read_admission (
+@@ -1264,4 +1264,8 @@
+         .fast_resp_valid_i (dbg_fast_resp_valid),
+         .fast_resp_ready_i (dbg_fast_resp_ready),
+         .fast_resp_bank_i  (dbg_fast_resp_bank),
++        .bank_read_stream_i ({
++            i_dma.i_sys.gen_banked.i_banked.gen_bank[1].i_bank.ar_data.id[2],
++            i_dma.i_sys.gen_banked.i_banked.gen_bank[0].i_bank.ar_data.id[2]
++        }),
+         .bank_is_read_i ({

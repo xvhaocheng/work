@@ -1,0 +1,424 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Finite controlled E3 CLI: fixed 64B, one ioctl owns both rounds and mapping lifetime. */
+#define _POSIX_C_SOURCE 200809L
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/idma.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#define E3_OBSERVER_MAGIC_V6 0x49444d4145330006ULL
+#define E3_BANK_V2           0x49444d4145330002ULL
+#define E3_CTRL_STAGE_DONE   8U
+
+#define E3_PREP_COLD 0U
+#define E3_PREP_HOT  1U
+#define E3_PAIR_COMPLEMENTARY 0U
+#define E3_PAIR_ZERO          1U
+
+#define E3_FIXED_VICTIM_PAGES    1U
+#define E3_FIXED_AGGRESSOR_PAGES 1U
+#define E3_FIXED_CHUNK_BYTES     64U
+#define E3_FIXED_TRANSFERS       1ULL
+#define E3_FIXED_WARMUP          0ULL
+#define E3_DEFAULT_TIMEOUT_MS    5000U
+
+/*
+ * Raw launcher record layout.
+ * These offsets/magic are not part of the provided UAPI patch; they must match
+ * the separately applied driver-0.patch launcher record.
+ */
+#define E3_LAUNCH_W_MAGIC         0U
+#define E3_LAUNCH_W_ERROR         1U
+#define E3_LAUNCH_W_FLAGS         2U
+#define E3_LAUNCH_W_INACTIVE_MASK 3U
+#define E3_LAUNCH_W_ISSUE         4U
+#define E3_LAUNCH_W_DONE          5U
+#define E3_LAUNCH_W_CANCEL        6U
+#define E3_LAUNCH_W_VICTIM_ID     7U
+#define E3_LAUNCH_W_AGGRESSOR_ID  8U
+#define E3_LAUNCH_MAGIC           0x4c41554e43483130ULL /* must match driver */
+#define E3_LAUNCH_FROZEN          (1ULL << 2)
+#define E3_LAUNCH_ABORTED         (1ULL << 0)
+
+static int strict_number(const char *s, unsigned max, unsigned *out)
+{
+    unsigned long long n = 0;
+
+    if (!s || !*s)
+        return -1;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9')
+            return -1;
+        n = n * 10 + (unsigned long long)(*s - '0');
+        if (n > max)
+            return -1;
+    }
+    *out = (unsigned)n;
+    return 0;
+}
+
+static void print_stats(const struct idma_experiment_stats *s)
+{
+    printf("{\"submitted\":%llu,\"completed\":%llu,\"completed_bytes\":%llu,"
+           "\"active_cycles\":%llu,\"iotlb_miss\":%llu,\"s1_ptw\":%llu,\"s2_ptw\":%llu,"
+           "\"refill_gap_ns_sum\":%llu,\"refill_gap_ns_max\":%llu,\"refill_gap_samples\":%llu,"
+           "\"in_flight_at_start\":%u,\"in_flight_at_end\":%u,\"data_errors\":%u,"
+           "\"quarantined\":%u}",
+           (unsigned long long)s->submitted, (unsigned long long)s->completed,
+           (unsigned long long)s->completed_bytes, (unsigned long long)s->active_cycles,
+           (unsigned long long)s->iotlb_miss, (unsigned long long)s->s1_ptw,
+           (unsigned long long)s->s2_ptw, (unsigned long long)s->refill_gap_ns_sum,
+           (unsigned long long)s->refill_gap_ns_max,
+           (unsigned long long)s->refill_gap_samples,
+           s->in_flight_at_start, s->in_flight_at_end,
+           s->data_errors, s->quarantined);
+}
+
+static int stats_zero(const struct idma_experiment_stats *s)
+{
+    return !s->submitted && !s->completed && !s->completed_bytes &&
+           !s->active_cycles && !s->iotlb_miss && !s->s1_ptw && !s->s2_ptw &&
+           !s->refill_gap_ns_sum && !s->refill_gap_ns_max &&
+           !s->refill_gap_samples && !s->in_flight_at_start &&
+           !s->in_flight_at_end && !s->data_errors && !s->quarantined;
+}
+
+static int lane_exact_1(const struct idma_experiment_stats *s)
+{
+    return s->submitted == 1 && s->completed == 1 &&
+           s->completed_bytes == 64 && !s->data_errors &&
+           !s->quarantined && !s->s2_ptw && !s->in_flight_at_end;
+}
+
+static int probe_exact_1(const struct idma_experiment_stats *s)
+{
+    return s->submitted == 1 && s->completed == 1 &&
+           s->completed_bytes == 64 && !s->iotlb_miss &&
+           !s->s1_ptw && !s->s2_ptw && !s->data_errors &&
+           !s->quarantined && !s->in_flight_at_end;
+}
+
+static int launcher_ok(const struct idma_e3_controlled *c, unsigned r)
+{
+    const __u64 *w = c->controlled[r].launcher;
+    unsigned expected_mask =
+        (c->pair.request.aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR) ? 1U : 3U;
+
+    if (w[E3_LAUNCH_W_MAGIC] != E3_LAUNCH_MAGIC)
+        return 0;
+    if (w[E3_LAUNCH_W_ERROR] != 0)
+        return 0;
+    if (!(w[E3_LAUNCH_W_FLAGS] & E3_LAUNCH_FROZEN))
+        return 0;
+    if (w[E3_LAUNCH_W_FLAGS] & E3_LAUNCH_ABORTED)
+        return 0;
+    if (w[E3_LAUNCH_W_INACTIVE_MASK] != expected_mask)
+        return 0;
+    if (!w[E3_LAUNCH_W_ISSUE] || w[E3_LAUNCH_W_ISSUE] != w[E3_LAUNCH_W_DONE])
+        return 0;
+    if (w[E3_LAUNCH_W_CANCEL] != 0)
+        return 0;
+    if (!w[E3_LAUNCH_W_VICTIM_ID] || !w[E3_LAUNCH_W_AGGRESSOR_ID])
+        return 0;
+    if (w[E3_LAUNCH_W_VICTIM_ID] != w[E3_LAUNCH_W_AGGRESSOR_ID])
+        return 0;
+    return 1;
+}
+
+static int controlled_round_ok(const struct idma_e3_controlled *c, unsigned r)
+{
+    const struct idma_experiment *v = &c->pair.result[r];
+    const struct idma_e3_controlled_round *ctl = &c->controlled[r];
+    unsigned expected_delay =
+        c->pair_mode == E3_PAIR_ZERO ? 0U :
+        (r ? 128U - c->pair.first_delay : c->pair.first_delay);
+    unsigned expected_a_prime = c->prep_mode == E3_PREP_HOT ? 1U : 0U;
+
+    if (!c->pair.sequence[r])
+        return 0;
+    if (v->status || !v->measurement_started || !v->measurement_complete ||
+        !v->hpm_configured)
+        return 0;
+    if (!ctl->prep_complete || ctl->flush_status != 0 ||
+        ctl->stage != E3_CTRL_STAGE_DONE)
+        return 0;
+    if (ctl->observer_magic != E3_OBSERVER_MAGIC_V6)
+        return 0;
+    if (c->pair.observation[r][0] != E3_BANK_V2 ||
+        c->pair.observation[r][1] != 0)
+        return 0;
+    if (c->pair.observation[r][3] != expected_delay)
+        return 0;
+    if (!ctl->v_hw_cycles)
+        return 0;
+
+    if (!lane_exact_1(&v->victim))
+        return 0;
+    if (c->pair.request.aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR) {
+        if (!stats_zero(&v->aggressor))
+            return 0;
+    } else {
+        if (!lane_exact_1(&v->aggressor))
+            return 0;
+    }
+
+    if (!lane_exact_1(&ctl->prime[0]))
+        return 0; /* V prime */
+    if (expected_a_prime) {
+        if (!lane_exact_1(&ctl->prime[1]))
+            return 0; /* hot A prime */
+    } else {
+        if (!stats_zero(&ctl->prime[1]))
+            return 0; /* cold A prime */
+    }
+
+    if (!probe_exact_1(&ctl->probe))
+        return 0;
+    if (!launcher_ok(c, r))
+        return 0;
+    return 1;
+}
+
+static void print_round(const struct idma_e3_controlled *c, unsigned r)
+{
+    const struct idma_experiment *v = &c->pair.result[r];
+    const struct idma_e3_controlled_round *ctl = &c->controlled[r];
+    unsigned delay =
+        c->pair_mode == E3_PAIR_ZERO ? 0U :
+        (r ? 128U - c->pair.first_delay : c->pair.first_delay);
+    unsigned i;
+
+    printf("{\"delay\":%u,\"sequence\":%llu,\"status\":%d,\"hpm_configured\":%u,"
+           "\"measurement_started\":%u,\"measurement_complete\":%u,"
+           "\"victim_elapsed_ns\":%llu,\"snapshot_before_ns\":%llu,"
+           "\"snapshot_after_ns\":%llu,\"drain_ns\":%llu,\"victim\":",
+           delay, (unsigned long long)c->pair.sequence[r], v->status,
+           v->hpm_configured, v->measurement_started, v->measurement_complete,
+           (unsigned long long)v->victim_elapsed_ns,
+           (unsigned long long)v->snapshot_before_ns,
+           (unsigned long long)v->snapshot_after_ns,
+           (unsigned long long)v->drain_ns);
+    print_stats(&v->victim);
+    printf(",\"aggressor\":");
+    print_stats(&v->aggressor);
+    printf(",\"e3_words\":[");
+    for (i = 0; i < IDMA_E3_WORDS; i++)
+        printf("%s%llu", i ? "," : "",
+               (unsigned long long)c->pair.observation[r][i]);
+    printf("],\"controlled\":{\"flush_status\":%d,\"prep_complete\":%u,"
+           "\"stage\":%u,\"prime\":[",
+           ctl->flush_status, ctl->prep_complete, ctl->stage);
+    print_stats(&ctl->prime[0]);
+    printf(",");
+    print_stats(&ctl->prime[1]);
+    printf("],\"probe\":");
+    print_stats(&ctl->probe);
+    printf(",\"launcher\":[");
+    for (i = 0; i < IDMA_E3_CONTROLLED_WORDS; i++)
+        printf("%s%llu", i ? "," : "",
+               (unsigned long long)ctl->launcher[i]);
+    printf("],\"observer_magic\":%llu,\"v_hw_cycles\":%llu}}",
+           (unsigned long long)ctl->observer_magic,
+           (unsigned long long)ctl->v_hw_cycles);
+}
+
+static void print_json(const struct idma_e3_controlled *c, int err, int attempted,
+                       int success, const char *stage, unsigned aggressor,
+                       unsigned prep, unsigned pair, unsigned first_delay,
+                       unsigned timeout)
+{
+    unsigned i;
+
+    printf("{\"schema\":\"idma.e3_controlled.v1\",\"success\":%s,"
+           "\"stage\":\"%s\",\"errno\":%d,\"run_attempted\":%s,"
+           "\"status\":%d,\"rounds_attempted\":%u,\"rounds_completed\":%u,"
+           "\"scope\":{\"hpm\":\"GO_to_both_drained\","
+           "\"observer\":\"V_window\"},"
+           "\"input\":{\"victim_id\":0,\"aggressor_id\":%u,"
+           "\"victim_pages\":1,\"aggressor_pages\":1,\"chunk_bytes\":64,"
+           "\"transfers\":1,\"warmup\":0,\"timeout_ms\":%u,"
+           "\"first_delay\":%u,\"prep_mode\":%u,\"prep\":\"%s\","
+           "\"pair_mode\":%u,\"pair\":\"%s\",\"flags\":%u},\"mapping\":[",
+           success ? "true" : "false", stage, err,
+           attempted ? "true" : "false", c->pair.status,
+           c->pair.rounds_attempted, c->pair.rounds_completed,
+           aggressor, timeout, first_delay, prep,
+           prep == E3_PREP_HOT ? "hot" : "cold",
+           pair, pair == E3_PAIR_ZERO ? "zero" : "complementary",
+           c->pair.request.flags);
+    for (i = 0; i < 8; i++)
+        printf("%s%llu", i ? "," : "",
+               (unsigned long long)c->pair.mapping[i]);
+    printf("],\"rounds\":[");
+    for (i = 0; i < 2; i++) {
+        if (i)
+            putchar(',');
+        print_round(c, i);
+    }
+    puts("]}");
+}
+
+static void usage(void)
+{
+    puts("Usage: idma_e3_controlled [--aggressor none|1] [--prep cold|hot]\n"
+         "       [--pair complementary|zero] [--first-delay 0|128]\n"
+         "       [--timeout-ms 1..60000]\n"
+         "Fixed /dev/idma0, V/A pages 1, chunk 64 bytes, transfers 1, warmup 0.\n"
+         "Zero pair requires first-delay 0. Solo (--aggressor none) is cold only.\n"
+         "One controlled ioctl; two rounds; no retry. Schema idma.e3_controlled.v1.");
+}
+
+int main(int argc, char **argv)
+{
+    struct idma_e3_controlled c = {0};
+    struct idma_experiment_caps caps = {0};
+    unsigned aggressor = 1U, prep = E3_PREP_COLD;
+    unsigned pair = E3_PAIR_COMPLEMENTARY;
+    unsigned first_delay = 0U, timeout = E3_DEFAULT_TIMEOUT_MS;
+    int fd = -1, rc = -1, err = 0, attempted = 0, success = 0;
+    const char *stage = "arguments";
+    unsigned seen = 0;
+
+    if (argc == 2 && !strcmp(argv[1], "--help")) {
+        usage();
+        return 0;
+    }
+
+    for (int i = 1; i < argc; i += 2) {
+        const char *names[] = {
+            "--aggressor", "--prep", "--pair", "--first-delay", "--timeout-ms"
+        };
+        unsigned k, n;
+
+        for (k = 0; k < 5; k++)
+            if (!strcmp(argv[i], names[k]))
+                break;
+        if (k == 5 || i + 1 == argc || (seen & (1U << k))) {
+            err = EINVAL;
+            goto output;
+        }
+        seen |= 1U << k;
+
+        if (k == 0) {
+            if (!strcmp(argv[i + 1], "none"))
+                n = IDMA_EXPERIMENT_NO_AGGRESSOR;
+            else if (!strcmp(argv[i + 1], "1"))
+                n = 1U;
+            else {
+                err = EINVAL;
+                goto output;
+            }
+        } else if (k == 1) {
+            if (!strcmp(argv[i + 1], "cold"))
+                n = E3_PREP_COLD;
+            else if (!strcmp(argv[i + 1], "hot"))
+                n = E3_PREP_HOT;
+            else {
+                err = EINVAL;
+                goto output;
+            }
+        } else if (k == 2) {
+            if (!strcmp(argv[i + 1], "complementary"))
+                n = E3_PAIR_COMPLEMENTARY;
+            else if (!strcmp(argv[i + 1], "zero"))
+                n = E3_PAIR_ZERO;
+            else {
+                err = EINVAL;
+                goto output;
+            }
+        } else {
+            unsigned max = (k == 3) ? 128U : 60000U;
+            if (strict_number(argv[i + 1], max, &n)) {
+                err = EINVAL;
+                goto output;
+            }
+        }
+
+        switch (k) {
+        case 0: aggressor = n; break;
+        case 1: prep = n; break;
+        case 2: pair = n; break;
+        case 3: first_delay = n; break;
+        case 4: timeout = n; break;
+        }
+    }
+
+    if ((aggressor != 1U && aggressor != IDMA_EXPERIMENT_NO_AGGRESSOR) ||
+        prep > E3_PREP_HOT || pair > E3_PAIR_ZERO ||
+        (first_delay != 0U && first_delay != 128U) ||
+        (pair == E3_PAIR_ZERO && first_delay != 0U) ||
+        (aggressor == IDMA_EXPERIMENT_NO_AGGRESSOR && prep != E3_PREP_COLD) ||
+        timeout < 1U || timeout > 60000U) {
+        err = EINVAL;
+        goto output;
+    }
+
+    c.pair.abi_version = 1U;
+    c.pair.struct_size = sizeof(c.pair);
+    c.pair.first_delay = first_delay;
+    c.pair.request = (struct idma_experiment) {
+        .abi_version = IDMA_EXPERIMENT_ABI,
+        .struct_size = sizeof(struct idma_experiment),
+        .aggressor_id = aggressor,
+        .victim_pages = E3_FIXED_VICTIM_PAGES,
+        .aggressor_pages = E3_FIXED_AGGRESSOR_PAGES,
+        .chunk_bytes = E3_FIXED_CHUNK_BYTES,
+        .run_timeout_ms = timeout,
+        .victim_transfers = E3_FIXED_TRANSFERS,
+        .warmup_transfers = E3_FIXED_WARMUP,
+    };
+    c.prep_mode = prep;
+    c.pair_mode = pair;
+
+    stage = "open";
+    fd = open("/dev/idma0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        err = errno;
+        goto output;
+    }
+
+    stage = "capabilities";
+    rc = ioctl(fd, IDMA_IOC_EXPERIMENT_CAPS, &caps);
+    if (rc) {
+        err = rc < 0 ? errno : EPROTO;
+        goto output;
+    }
+    if (caps.abi_version != IDMA_EXPERIMENT_ABI ||
+        caps.struct_size != sizeof(caps) ||
+        !(caps.capabilities & IDMA_EXPERIMENT_CAP_E3_CONTROLLED) ||
+        caps.device_id != 0 || caps.did != 10 || caps.page_bytes != 4096) {
+        err = EOPNOTSUPP;
+        goto output;
+    }
+
+    stage = "run";
+    attempted = 1;
+    rc = ioctl(fd, IDMA_IOC_RUN_E3_CONTROLLED, &c);
+    if (rc)
+        err = rc < 0 ? errno : EPROTO;
+    success = !rc && !c.pair.status &&
+              c.pair.rounds_attempted == 2 && c.pair.rounds_completed == 2;
+    for (unsigned r = 0; r < 2 && success; r++) {
+        if (!controlled_round_ok(&c, r))
+            success = 0;
+    }
+    if (!success && !err)
+        err = EPROTO;
+
+output:
+    if (fd >= 0 && close(fd) && !err) {
+        err = errno;
+        success = 0;
+        stage = "close";
+    }
+    print_json(&c, err, attempted, success, stage,
+               aggressor, prep, pair, first_delay, timeout);
+    if (err)
+        fprintf(stderr, "idma_e3_controlled: %s: %s\n",
+                stage, strerror(err));
+    return success ? 0 : 1;
+}

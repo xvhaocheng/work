@@ -1,0 +1,114 @@
+--- a/linux/drivers/misc/idma.c
++++ b/linux/drivers/misc/idma.c
+@@ -46,6 +46,26 @@
+ #define IDMA_OBS_MAGIC_V4 0x49444d414f425304ULL
+ #define IDMA_OBS_MAGIC_V5 0x49444d414f425305ULL
++#define IDMA_OBS_MAGIC_V6 0x49444d414f425306ULL
+ #define IDMA_E3_MAGIC 0x49444d4145330001ULL
+ #define IDMA_E3_MAGIC_V2 0x49444d4145330002ULL
+ #define IDMA_OBS_VALUES 34
+@@ -57,6 +77,27 @@
+ #define IDMA_BATCH_MAGIC 0x49444d4142544301ULL
+ #define IDMA_XFER_TIMEOUT_US 2000000
+ #define IDMA_MAX_DEVS 8
+ #define IDMA_MAX_PAGES 4096U
+ #define IDMA_MAX_RUN_TIMEOUT_MS 300000U
++
++/* DMA0 launcher register block; separate from observer registers. */
++#define IDMA_LAUNCHER_MAGIC_OFFSET 0xb0
++#define IDMA_LAUNCHER_CONTROL_OFFSET 0xb8
++#define IDMA_LAUNCHER_INDEX_OFFSET 0xc0
++#define IDMA_LAUNCHER_DATA_OFFSET 0xc8
++#define IDMA_LAUNCHER_MAGIC 0x49444d414c4e4301ULL
++#define IDMA_LAUNCHER_PREP 1ULL
++#define IDMA_LAUNCHER_PREP_HAS_A 0x100ULL
++#define IDMA_LAUNCHER_GO 2ULL
++#define IDMA_LAUNCHER_ABORT 4ULL
++#define IDMA_LAUNCHER_CLEAR 8ULL
++
++#define IDMA_LAUNCHER_STATUS_PREP BIT_ULL(0)
++#define IDMA_LAUNCHER_STATUS_RUNNING BIT_ULL(1)
++#define IDMA_LAUNCHER_STATUS_FROZEN BIT_ULL(2)
++#define IDMA_LAUNCHER_STATUS_ABORTED BIT_ULL(3)
++#define IDMA_LAUNCHER_HELD_SHIFT 8
++#define IDMA_LAUNCHER_ACTIVE_SHIFT 12
++#define IDMA_LAUNCHER_ERROR_SHIFT 32
++
++#define IDMA_CONTROLLED_STAGE_FLUSH 1
++#define IDMA_CONTROLLED_STAGE_APRIME 2
++#define IDMA_CONTROLLED_STAGE_VPRIME 3
++#define IDMA_CONTROLLED_STAGE_VPROBE 4
++#define IDMA_CONTROLLED_STAGE_PREPARE 5
++#define IDMA_CONTROLLED_STAGE_RUNNING 6
++#define IDMA_CONTROLLED_STAGE_DRAIN 7
++#define IDMA_CONTROLLED_STAGE_COMPLETE 8
+
+ struct idma_device {
+ 	struct miscdevice miscdev;
+@@ -703,7 +744,7 @@
+ struct idma_observation {
+ 	struct idma_device *control;
+ 	u64 sequence, e3_magic;
+-	bool armed, batch, path, e3, delay128, queue_pair;
++	bool armed, batch, path, e3, delay128, queue_pair, controlled;
+ };
+ 
+ static u64 idma_observation_sequence;
+@@ -712,22 +753,31 @@
+ static int idma_observation_prepare(struct idma_observation *o, bool enabled)
+ {
+ 	u64 magic;
+ 
+ 	if (!enabled)
+ 		return 0;
+ 	o->sequence = ++idma_observation_sequence;
+ 	o->control = idma_get_instance(0);
+ 	if (!o->control)
+ 		return -ENODEV;
+ 	magic = readq(o->control->reg + IDMA_OBS_MAGIC_OFFSET);
+ 	o->path = o->e3 || (o->batch && READ_ONCE(idma_path_observe));
+-	if (o->queue_pair && magic != IDMA_OBS_MAGIC_V5)
++	if (o->controlled && magic != IDMA_OBS_MAGIC_V6)
++		return -EOPNOTSUPP;
++	if (o->queue_pair && magic != IDMA_OBS_MAGIC_V5 &&
++	    magic != IDMA_OBS_MAGIC_V6)
+ 		return -EOPNOTSUPP;
+-	o->e3_magic = magic == IDMA_OBS_MAGIC_V5 ? IDMA_E3_MAGIC_V2 : IDMA_E3_MAGIC;
+-	if (o->e3 && magic != IDMA_OBS_MAGIC_V4 && magic != IDMA_OBS_MAGIC_V5)
++	o->e3_magic = (magic == IDMA_OBS_MAGIC_V5 || magic == IDMA_OBS_MAGIC_V6) ?
++		      IDMA_E3_MAGIC_V2 : IDMA_E3_MAGIC;
++	if (o->e3 && magic != IDMA_OBS_MAGIC_V4 &&
++	    magic != IDMA_OBS_MAGIC_V5 && magic != IDMA_OBS_MAGIC_V6)
+ 		return -EOPNOTSUPP;
+ 	if (o->control->did != 10 ||
+-	    (magic != IDMA_OBS_MAGIC_V5 && magic != IDMA_OBS_MAGIC_V4 && magic != IDMA_OBS_MAGIC_V3 &&
++	    (magic != IDMA_OBS_MAGIC_V6 && magic != IDMA_OBS_MAGIC_V5 &&
++	     magic != IDMA_OBS_MAGIC_V4 && magic != IDMA_OBS_MAGIC_V3 &&
+ 	     (o->path || (magic != IDMA_OBS_MAGIC_V2 && (o->batch || magic != IDMA_OBS_MAGIC)))))
+ 		return -EOPNOTSUPP;
+ 	/* Clear previous frozen results; never take ownership of an active session. */
+@@ -740,14 +790,20 @@
+ static int idma_observation_arm(struct idma_observation *o,
+ 				struct idma_device *v, struct idma_device *a, u64 count)
+ {
+ 	u64 command = 1 | (o->batch ? BIT_ULL(25) : 0) | (o->path ? BIT_ULL(26) : 0);
+ 
+ 	if (o->e3)
+ 		command |= BIT_ULL(27) | (o->delay128 ? BIT_ULL(28) : 0);
++	if (o->controlled)
++		command |= BIT_ULL(29);
+ 
+ 	if (!o->control)
+ 		return 0;
++	if (o->controlled && count != 1)
++		return -EINVAL;
+ 	if ((u32)v->id >= 4 || v->did != 10U + v->id ||
+ 	    (a && ((u32)a->id >= 4 || a->did != 10U + a->id)))
+ 		return -EOPNOTSUPP;
+@@ -868,7 +924,7 @@
+ static int idma_e3_finish(struct idma_observation *o, const struct idma_experiment *e, u64 *words)
+ {
+-	u64 n = e->victim_transfers * 2;
++	u64 n = o->controlled ? 1 : e->victim_transfers * 2;
+ 	unsigned int i, lane, stage;
+ 	bool valid;

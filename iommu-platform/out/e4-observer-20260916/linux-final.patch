@@ -1,0 +1,179 @@
+diff --git a/drivers/misc/idma.c b/drivers/misc/idma.c
+index 82e4a52a435f..3e8c14084a1b 100644
+--- a/drivers/misc/idma.c
++++ b/drivers/misc/idma.c
+@@ -35,6 +35,13 @@ MODULE_LICENSE("GPL v2");
+ #define IDMA_NEXT_ID_REG_OFFSET 0x28
+ #define IDMA_DONE_REG_OFFSET 0x30
+ #define IDMA_ACTIVE_CYCLES_REG_OFFSET 0x50
++#define IDMA_OBS_MAGIC_OFFSET 0x58
++#define IDMA_OBS_CONTROL_OFFSET 0x60
++#define IDMA_OBS_TARGET_OFFSET 0x68
++#define IDMA_OBS_INDEX_OFFSET 0x70
++#define IDMA_OBS_DATA_OFFSET 0x78
++#define IDMA_OBS_MAGIC 0x49444d414f425301ULL
++#define IDMA_OBS_VALUES 34
+ #define IDMA_XFER_TIMEOUT_US 2000000
+ #define IDMA_MAX_DEVS 8
+ #define IDMA_MAX_PAGES 4096U
+@@ -551,18 +558,124 @@ static bool idma_any_quarantined(void)
+ 	return quarantined;
+ }
+ 
++/* Disabled by default: ordinary E1 works with both old and observation BITs. */
++static bool idma_observe;
++module_param_named(observe, idma_observe, bool, 0644);
++MODULE_PARM_DESC(observe, "Collect passive E4 hardware timing (requires observation BIT)");
++
++struct idma_observation {
++	struct idma_device *control;
++	u64 sequence;
++	bool armed;
++};
++
++static u64 idma_observation_sequence;
++
++/* Called with the experiment lock, before preparing or submitting any DMA. */
++static int idma_observation_prepare(struct idma_observation *o, bool enabled)
++{
++	if (!enabled)
++		return 0;
++	o->sequence = ++idma_observation_sequence;
++	o->control = idma_get_instance(0);
++	if (!o->control)
++		return -ENODEV;
++	if (o->control->did != 10 ||
++	    readq(o->control->reg + IDMA_OBS_MAGIC_OFFSET) != IDMA_OBS_MAGIC)
++		return -EOPNOTSUPP;
++	/* Clear previous frozen results; never take ownership of an active session. */
++	if (readq(o->control->reg + IDMA_OBS_CONTROL_OFFSET) & 3)
++		return -EBUSY;
++	writeq(4, o->control->reg + IDMA_OBS_CONTROL_OFFSET);
++	return readq(o->control->reg + IDMA_OBS_CONTROL_OFFSET) ? -EIO : 0;
++}
++
++static int idma_observation_arm(struct idma_observation *o,
++				struct idma_device *v, struct idma_device *a, u64 count)
++{
++	u64 command = 1;
++
++	if (!o->control)
++		return 0;
++	if ((u32)v->id >= 4 || v->did != 10U + v->id ||
++	    (a && ((u32)a->id >= 4 || a->did != 10U + a->id)))
++		return -EOPNOTSUPP;
++	command |= (u64)v->id << 8;
++	if (a)
++		command |= BIT_ULL(24) | ((u64)a->id << 16);
++	writeq(count, o->control->reg + IDMA_OBS_TARGET_OFFSET);
++	writeq(command, o->control->reg + IDMA_OBS_CONTROL_OFFSET);
++	o->armed = true;
++	return readq(o->control->reg + IDMA_OBS_CONTROL_OFFSET) == 1 ? 0 : -EIO;
++}
++
++/* Drain/verify first. Frozen reads and logging are outside all timed windows. */
++static int idma_observation_finish(struct idma_observation *o,
++				   const struct idma_experiment *e, int run_error)
++{
++	u64 values[IDMA_OBS_VALUES], status;
++	void __iomem *base;
++	bool valid;
++	int i;
++
++	if (!o->control || !o->armed)
++		return 0;
++	base = o->control->reg;
++	status = readq(base + IDMA_OBS_CONTROL_OFFSET);
++	if (status & 3) {
++		writeq(2, base + IDMA_OBS_CONTROL_OFFSET);
++		status = readq(base + IDMA_OBS_CONTROL_OFFSET);
++	}
++	for (i = 0; i < IDMA_OBS_VALUES; i++) {
++		writeq(i, base + IDMA_OBS_INDEX_OFFSET);
++		values[i] = readq(base + IDMA_OBS_DATA_OFFSET);
++	}
++	valid = !run_error && status == 4 &&
++		values[7] == e->victim_transfers && values[8] == values[7] &&
++		values[9] == values[7] &&
++		values[0] == values[1] + values[2] + values[3] &&
++		values[0] == values[10] + values[11] + values[12] + values[13];
++	/* Opening stock + accepted requests must equal returns + closing stock. */
++	for (i = 0; i < 2; i++) {
++		u64 opening = values[30 + i], closing = values[32 + i];
++
++		if ((opening >> 16) + values[14 + 6 * i] !=
++		    (closing >> 16) + values[16 + 6 * i] ||
++		    (opening & 0xffff) + values[15 + 6 * i] !=
++		    (closing & 0xffff) + values[17 + 6 * i])
++			valid = false;
++	}
++	dev_info(o->control->miscdev.parent,
++		 "idma_obs seq=%llu part=time valid=%u status=%#llx v_did=%u a_did=%u cycles=%llu h=%llu p=%llu r=%llu hmax=%llu pmax=%llu rmax=%llu issued=%llu done=%llu polled=%llu\n",
++		 o->sequence, valid, status, e->victim_did, e->aggressor_did,
++		 values[0], values[1], values[2], values[3], values[4], values[5],
++		 values[6], values[7], values[8], values[9]);
++	dev_info(o->control->miscdev.parent,
++		 "idma_obs seq=%llu part=axi_v neither=%llu v_only=%llu a_only=%llu both=%llu ar=%llu aw=%llu rlast=%llu b=%llu ar_wait=%llu aw_wait=%llu start=%#llx end=%#llx\n",
++		 o->sequence, values[10], values[11], values[12], values[13],
++		 values[14], values[15], values[16], values[17], values[18],
++		 values[19], values[30], values[32]);
++	dev_info(o->control->miscdev.parent,
++		 "idma_obs seq=%llu part=axi_a ar=%llu aw=%llu rlast=%llu b=%llu ar_wait=%llu aw_wait=%llu start=%#llx end=%#llx shared_ar=%llu shared_aw=%llu shared_ar_wait=%llu shared_aw_wait=%llu\n",
++		 o->sequence, values[20], values[21], values[22], values[23],
++		 values[24], values[25], values[31], values[33], values[26],
++		 values[27], values[28], values[29]);
++	return valid ? 0 : -EIO;
++}
++
+ static long idma_run_experiment(struct idma_device *victim,
+ 			       struct idma_experiment __user *uarg)
+ {
+ 	struct idma_experiment e;
+ 	struct idma_stream streams[2] = {};
++	struct idma_observation observation = {};
+ 	struct idma_stream *v = &streams[0], *a = NULL;
+ 	struct idma_device *aggressor = NULL;
+ 	struct riscv_iommu_hpm_session *hpm = NULL;
+ 	struct riscv_iommu_hpm_sample before, after;
+ 	u64 active_before[2], active_after[2];
+ 	u64 start, end = 0, deadline, stamp;
+-	int ret, drain_ret, verify_ret;
++	int ret, drain_ret, verify_ret, observation_ret;
+ 
+ 	if (copy_from_user(&e, uarg, sizeof(e)))
+ 		return -EFAULT;
+@@ -592,6 +705,9 @@ static long idma_run_experiment(struct idma_device *victim,
+ 		e.aggressor_did = aggressor->did;
+ 		a = &streams[1];
+ 	}
++	ret = idma_observation_prepare(&observation, READ_ONCE(idma_observe));
++	if (ret)
++		goto out_put;
+ 	ret = idma_stream_prepare(v, victim, e.victim_pages, e.chunk_bytes, &e.victim);
+ 	if (ret)
+ 		goto out_cleanup;
+@@ -627,6 +743,9 @@ static long idma_run_experiment(struct idma_device *victim,
+ 		a->last_complete_ns = 0;
+ 	e.victim.in_flight_at_start = v->in_flight;
+ 	e.aggressor.in_flight_at_start = a && a->in_flight;
++	ret = idma_observation_arm(&observation, victim, aggressor, e.victim_transfers);
++	if (ret)
++		goto out_drain;
+ 	stamp = ktime_get_ns();
+ 	idma_snapshot(hpm, v, a, &before, active_before);
+ 	start = ktime_get_ns();
+@@ -670,10 +789,14 @@ static long idma_run_experiment(struct idma_device *victim,
+ 		}
+ 	}
+  out_cleanup:
++	observation_ret = idma_observation_finish(&observation, &e, ret);
++	if (observation_ret && !ret)
++		ret = observation_ret;
+ 	if (a)
+ 		idma_stream_cleanup(a);
+ 	idma_stream_cleanup(v);
+  out_put:
++	idma_put_instance(observation.control);
+ 	idma_put_instance(aggressor);
+  out_unlock:
+ 	mutex_unlock(&idma_experiment_lock);

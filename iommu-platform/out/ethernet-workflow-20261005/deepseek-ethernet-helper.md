@@ -1,0 +1,934 @@
+## Summary
+
+Adds a second, self-contained transport to `scripts/mac_update_reboot.py`: `--transport ssh` (pure Ethernet, Mac → board `eth0`), leaving `--transport uart` (the default) byte-for-byte behaviourally identical, so every existing test in `tests/test_mac_update_reboot.py` still passes. The new path never imports `pyserial`, never opens a serial port, never calls `sha256_file`, and reuses the already-accepted board-side `platform-fetch-update <url> --write` for the SD write.
+
+Verified against the supplied sources: UART path `scripts/mac_update_reboot.py:164-327` (`RebootRunner`, `SHA-256` at `:279`), CLI at `:330-342`, dispatch at `:357-387`; test expectations at `tests/test_mac_update_reboot.py:190-403` (notably dry-run directory listing `:205`, `sys.exit` cases `:207-221`, `argv[0] == 'openFPGALoader'` `:324`).
+
+---
+
+```diff
+--- a/scripts/mac_update_reboot.py
++++ b/scripts/mac_update_reboot.py
+@@ -29,5 +29,29 @@
+   * any error stops the run: no retry, no resume;
+   * success is never inferred from a boot log marker.  It requires a real
+     post-reboot uname -r equal to --expected-kernel, a canonical boot UUID
+     before and after reboot, and a boot UUID that changed after reboot.
++
++The pure-Ethernet path (--transport ssh) never opens or touches the serial
++port:
++
++  1. system ssh (BatchMode=yes, IdentitiesOnly=yes, an isolated known-hosts
++     file) reads uname -r and /proc/sys/kernel/random/boot_id from the explicit
++     --board-host.  This first call is also the public-key check: a rejected
++     credential fails immediately instead of waiting out a timeout;
++  2. when --payload is given, a temporary read-only HTTP server bound only to
++     --host-ip serves --payload's own directory, and the board is asked to run
++     platform-fetch-update <url> --write; a non-zero exit stops the run;
++  3. sync must exit 0, then openFPGALoader reloads the given BIT into SRAM;
++  4. ssh is retried at a fixed interval until the board answers again, and the
++     run succeeds only when uname -r equals --expected-kernel, the boot UUID is
++     canonical and differs from the pre-reboot one.
++
++  * the board's initramfs mints a new host key on every boot, so ssh always
++    runs with -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no and
++    never learns a host key; it is confined to the explicit --board-host and
++    nothing is ever scanned;
++  * the ssh private key is only handed to ssh -i: it is never opened, copied,
++    hashed or logged by this script;
++  * the temporary HTTP server is stopped in a finally block and only this
++    script's own child processes are ever signalled.
+ """
+@@ -36,10 +36,16 @@
+ import argparse
++import functools
+ import hashlib
++import http.server
+ import json
+ import math
+ import pathlib
+ import re
+ import secrets
++import shlex
++import shutil
+ import subprocess
+ import sys
++import threading
+ import time
++import urllib.parse
+@@ -47,6 +47,26 @@
+ BAUD = 115200
+ FPGA_BOARD = 'genesys2'
+ FPGA_FREQ = '1000000'
+ BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
+ TOKEN_PREFIX = 'IDMA-REBOOT-'
+ LOAD_TIMEOUT = 120.0
++
++SSH_RETRY_INTERVAL = 5.0
++OPENFPGALOADER_FALLBACK = '/opt/homebrew/bin/openFPGALoader'
++# The board initramfs mints a fresh host key on every boot: verify nothing and
++# learn nothing, and never leave the explicit --board-host.
++SSH_OPTIONS = (
++    '-o', 'BatchMode=yes',
++    '-o', 'IdentitiesOnly=yes',
++    '-o', 'UserKnownHostsFile=/dev/null',
++    '-o', 'StrictHostKeyChecking=no',
++    '-o', 'ConnectTimeout=10',
++    '-o', 'ServerAliveInterval=5',
++    '-o', 'ServerAliveCountMax=2',
++)
++AUTH_FAILURE_MARKERS = (
++    'permission denied',
++    'authentication failed',
++    'no supported authentication methods',
++    'too many authentication failures',
++)
+@@ -65,5 +65,9 @@
+ class UpdateError(Exception):
+     """Technical failure: stop immediately, keep the evidence, never retry."""
+ 
+ 
++class SshAuthError(UpdateError):
++    """The board refused this credential: fail at once instead of waiting."""
++
++
+ def utc_now():
+@@ -96,7 +96,35 @@
+ def default_process_runner(argv, cwd=None):
+     return subprocess.run(list(map(str, argv)), cwd=cwd,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           check=False, timeout=LOAD_TIMEOUT)
+ 
+ 
++def default_ssh_runner(argv, timeout):
++    """Run one system ssh command; the caller owns the timeout policy."""
++    return subprocess.run(list(map(str, argv)), stdout=subprocess.PIPE,
++                          stderr=subprocess.PIPE, check=False, timeout=timeout)
++
++
++def resolve_openfpgaloader():
++    """PATH first, then the Homebrew prefix when the PATH does not carry it."""
++    found = shutil.which('openFPGALoader')
++    if found:
++        return found
++    fallback = pathlib.Path(OPENFPGALOADER_FALLBACK)
++    if fallback.is_file():
++        return str(fallback)
++    raise UpdateError('openFPGALoader is neither on PATH nor at '
++                      + OPENFPGALOADER_FALLBACK)
++
++
++def looks_like_auth_failure(stderr_text):
++    lowered = (stderr_text or '').lower()
++    return any(marker in lowered for marker in AUTH_FAILURE_MARKERS)
++
++
++def build_ssh_argv(key, board_host, remote_command):
++    return (['ssh', '-i', str(key)] + list(SSH_OPTIONS)
++            + ['root@' + str(board_host), str(remote_command)])
++
++
+ class Console:
+@@ -158,7 +158,84 @@
+ def validate_boot_id(value):
+     if not isinstance(value, str) or not UUID_RE.match(value):
+         raise UpdateError('boot_id is not a canonical UUID: ' + repr(value))
+     return value
+ 
+ 
++def parse_marked_identity(text, start, end, tail):
++    """Strictly read one uname -r line and one boot_id line between markers."""
++    lines = [line.strip() for line in text.splitlines()]
++    if start not in lines:
++        raise UpdateError('identity capture is missing its start marker')
++    first = lines.index(start)
++    if end not in lines[first + 1:]:
++        raise UpdateError('identity capture is missing the uname -r end marker')
++    middle = lines.index(end, first + 1)
++    if tail not in lines[middle + 1:]:
++        raise UpdateError('identity capture is missing the boot_id end marker')
++    last = lines.index(tail, middle + 1)
++    uname_lines = [line for line in lines[first + 1:middle] if line]
++    boot_lines = [line for line in lines[middle + 1:last] if line]
++    if len(uname_lines) != 1:
++        raise UpdateError('identity capture did not print exactly one uname -r line')
++    if len(boot_lines) != 1:
++        raise UpdateError('identity capture did not print exactly one boot_id line')
++    return uname_lines[0], boot_lines[0]
++
++
++class _PayloadRequestHandler(http.server.SimpleHTTPRequestHandler):
++    """Read-only GET/HEAD handler; every request lands in the run's http.log."""
++
++    def log_message(self, fmt, *args):
++        log = getattr(self.server, 'access_log', None)
++        if log is None:
++            return
++        log.write(self.address_string() + ' ' + (fmt % args) + NEWLINE)
++        log.flush()
++
++
++class PayloadServer:
++    """Temporary read-only HTTP server bound to one Mac address and directory."""
++
++    def __init__(self, host_ip, directory, log_path):
++        self.host_ip = host_ip
++        self.directory = pathlib.Path(directory)
++        self.log_path = pathlib.Path(log_path)
++        self.port = None
++        self._server = None
++        self._thread = None
++        self._log = None
++
++    def start(self):
++        handler = functools.partial(_PayloadRequestHandler,
++                                    directory=str(self.directory))
++        self._log = open(self.log_path, 'a', encoding='utf-8')
++        server = http.server.ThreadingHTTPServer((self.host_ip, 0), handler)
++        server.access_log = self._log
++        self._server = server
++        self.port = server.server_address[1]
++        self._thread = threading.Thread(target=server.serve_forever,
++                                        kwargs={'poll_interval': 0.1},
++                                        daemon=True)
++        self._thread.start()
++
++    def url_for(self, name):
++        if self._server is None:
++            raise UpdateError('the temporary HTTP server is not running')
++        host = '[' + self.host_ip + ']' if ':' in self.host_ip else self.host_ip
++        return ('http://' + host + ':' + str(self.port) + '/'
++                + urllib.parse.quote(name))
++
++    def stop(self):
++        server, thread, log = self._server, self._thread, self._log
++        self._server = None
++        self._thread = None
++        self._log = None
++        if server is not None:
++            server.shutdown()
++            server.server_close()
++        if thread is not None:
++            thread.join(timeout=5.0)
++        if log is not None:
++            log.close()
++
++
+ class RebootRunner:
+@@ -324,7 +324,196 @@
+                 except Exception:
+                     pass
+             self.result['finished_at'] = utc_now()
+             write_json(self.out_dir / 'result.json', self.result)
+ 
+ 
++
++class SshRebootRunner:
++    """Pure-Ethernet update path: the serial port is never opened here."""
++
++    def __init__(self, args, out_dir, process_runner, ssh_runner,
++                 http_server_factory, loader_resolver, clock, sleeper):
++        self.args = args
++        self.out_dir = pathlib.Path(out_dir)
++        self.process_runner = process_runner
++        self.ssh_runner = ssh_runner
++        self.http_server_factory = http_server_factory
++        self.loader_resolver = loader_resolver
++        self.clock = clock
++        self.sleeper = sleeper
++        self.key = pathlib.Path(args.ssh_key).expanduser()
++        self.commands = []
++        self.sequence = 0
++        self.http = None
++        self.before_boot_id = None
++        self.result = {}
++
++    def _ssh_argv(self, remote_command):
++        return build_ssh_argv(self.key, self.args.board_host, remote_command)
++
++    def _remember(self, name, argv, proc, remote_command=None):
++        self.sequence += 1
++        prefix = '%02d-' % self.sequence
++        stdout_name = prefix + name + '.stdout'
++        stderr_name = prefix + name + '.stderr'
++        (self.out_dir / stdout_name).write_bytes(proc.stdout or b'')
++        (self.out_dir / stderr_name).write_bytes(proc.stderr or b'')
++        entry = {'name': name, 'argv': list(map(str, argv)),
++                 'returncode': getattr(proc, 'returncode', None),
++                 'stdout': stdout_name, 'stderr': stderr_name}
++        if remote_command is not None:
++            entry['remote_command'] = remote_command
++        self.commands.append(entry)
++
++    def _run_ssh(self, name, remote_command, timeout):
++        argv = self._ssh_argv(remote_command)
++        proc = self.ssh_runner(argv, timeout)
++        self._remember(name, argv, proc, remote_command)
++        return proc
++
++    def _run_local(self, name, argv):
++        proc = self.process_runner(argv, None)
++        self._remember(name, argv, proc)
++        return proc
++
++    def _fail_on_command(self, what, proc):
++        if proc.returncode == 0:
++            return
++        stderr_text = (proc.stderr or b'').decode('utf-8', 'replace')
++        reasons = [line.strip() for line in stderr_text.splitlines() if line.strip()]
++        message = what + ' exit=' + str(proc.returncode)
++        if reasons:
++            message += ' stderr=' + reasons[-1]
++        if looks_like_auth_failure(stderr_text):
++            raise SshAuthError(message)
++        raise UpdateError(message)
++
++    def _capture_identity(self, stage):
++        query = secrets.token_hex(8).upper()
++        start = '__IDMA_SSH_' + query + '_UNAME_START__'
++        end = '__IDMA_SSH_' + query + '_UNAME_END__'
++        tail = '__IDMA_SSH_' + query + '_CAPTURE_END__'
++        command = ('echo ' + start + '; uname -r; echo ' + end
++                   + '; cat ' + BOOT_ID_PATH + '; echo ' + tail)
++        proc = self._run_ssh('ssh-identity-' + stage, command,
++                             self.args.command_timeout)
++        self._fail_on_command('ssh identity query (' + stage + ')', proc)
++        text = (proc.stdout or b'').decode('utf-8', 'replace')
++        uname, boot_id = parse_marked_identity(text, start, end, tail)
++        return uname, validate_boot_id(boot_id)
++
++    def _fetch_payload(self):
++        payload = pathlib.Path(self.args.payload).expanduser()
++        server = self.http_server_factory(self.args.host_ip, payload.parent,
++                                          self.out_dir / 'http.log')
++        self.http = server
++        try:
++            server.start()
++        except OSError as exc:
++            raise UpdateError('cannot bind the temporary HTTP server to '
++                              + str(self.args.host_ip) + ': ' + str(exc))
++        url = server.url_for(payload.name)
++        self.result['http'] = {'host_ip': self.args.host_ip,
++                               'port': getattr(server, 'port', None),
++                               'directory': str(payload.parent), 'url': url}
++        command = 'platform-fetch-update ' + shlex.quote(url) + ' --write'
++        proc = self._run_ssh('board-fetch-update', command,
++                             self.args.update_timeout)
++        self._fail_on_command('board platform-fetch-update', proc)
++
++    def _sync(self):
++        proc = self._run_ssh('board-sync', 'sync', self.args.update_timeout)
++        self._fail_on_command('board sync', proc)
++
++    def _load_bit(self):
++        loader = self.loader_resolver()
++        argv = [loader, '-b', FPGA_BOARD, '--freq', str(self.args.jtag_hz),
++                str(self.args.bit)]
++        proc = self._run_local('fpga-load', argv)
++        self.result['fpga'] = {'board': FPGA_BOARD, 'freq': str(self.args.jtag_hz),
++                               'loader': loader, 'returncode': proc.returncode}
++        if proc.returncode != 0:
++            raise UpdateError('openFPGALoader exit=' + str(proc.returncode))
++
++    def _wait_for_boot_identity(self):
++        deadline = self.clock() + self.args.boot_timeout
++        last_error = 'no ssh attempt was made'
++        while True:
++            try:
++                uname, boot_id = self._capture_identity('after')
++            except SshAuthError:
++                raise
++            except UpdateError as exc:
++                last_error = str(exc)
++            else:
++                if uname != self.args.expected_kernel:
++                    last_error = ('uname -r mismatch: ' + repr(uname)
++                                  + ' != expected '
++                                  + repr(self.args.expected_kernel))
++                elif boot_id == self.before_boot_id:
++                    last_error = 'boot_id did not change after reboot: ' + boot_id
++                else:
++                    return uname, boot_id
++            if self.clock() >= deadline:
++                raise UpdateError('board did not answer with the expected identity '
++                                  'within ' + str(self.args.boot_timeout)
++                                  + 's: ' + last_error)
++            self.sleeper(SSH_RETRY_INTERVAL)
++
++    def _stop_http(self):
++        server = self.http
++        self.http = None
++        if server is None:
++            return
++        try:
++            server.stop()
++        except Exception:
++            pass
++
++    def run(self):
++        self.out_dir.mkdir(parents=True, exist_ok=False)
++        self.result = {
++            'schema': SCHEMA,
++            'mode': 'run',
++            'transport': 'ssh',
++            'started_at': utc_now(),
++            'board_host': self.args.board_host,
++            'host_ip': self.args.host_ip,
++            'ssh_key': str(self.key),
++            'ssh_options': list(SSH_OPTIONS),
++            'bit': str(self.args.bit),
++            'payload': str(self.args.payload) if self.args.payload else None,
++            'expected_kernel': self.args.expected_kernel,
++            'jtag_hz': self.args.jtag_hz,
++            'success_requires': [
++                'post-reboot uname -r == expected_kernel',
++                'canonical boot_id before and after reboot',
++                'boot_id changed after reboot',
++            ],
++            'status': 'running',
++        }
++        try:
++            before_uname, before_boot_id = self._capture_identity('before')
++            self.before_boot_id = before_boot_id
++            self.result['before'] = {'uname_r': before_uname, 'boot_id': before_boot_id}
++            if self.args.payload:
++                self._fetch_payload()
++            self._sync()
++            self._load_bit()
++            after_uname, after_boot_id = self._wait_for_boot_identity()
++            self.result['uname_r'] = after_uname
++            self.result['boot_id'] = after_boot_id
++            self.result['after'] = {'uname_r': after_uname, 'boot_id': after_boot_id}
++            self.result['status'] = 'complete'
++            return 0
++        except BaseException as exc:
++            self.result['status'] = 'failed'
++            self.result['error'] = type(exc).__name__ + ': ' + str(exc)
++            raise
++        finally:
++            self._stop_http()
++            self.result['commands'] = self.commands
++            self.result['finished_at'] = utc_now()
++            write_json(self.out_dir / 'result.json', self.result)
++
++
+ def build_arg_parser():
+@@ -330,13 +330,30 @@
+ def build_arg_parser():
+     parser = argparse.ArgumentParser(
+-        description='External JTAG BIT reload and boot UART verification')
++        description='External JTAG BIT reload and boot verification '
++                    '(UART or pure Ethernet)')
+     parser.add_argument('--run', action='store_true',
+                         help='open the serial port and load the BIT; default is dry-run')
++    parser.add_argument('--transport', choices=('uart', 'ssh'), default='uart',
++                        help='uart: legacy serial path (default); ssh: pure Ethernet')
+     parser.add_argument('--port', help='serial device (required with --run, never auto-scanned)')
+     parser.add_argument('--bit', help='local BIT file (required with --run, never auto-selected)')
+     parser.add_argument('--expected-kernel', help='exact uname -r expected after reboot')
+-    parser.add_argument('--out', help='new output directory (required with --run)')
++    parser.add_argument('--out', '--result-dir', dest='out',
++                        help='new output directory (required with --run)')
++    parser.add_argument('--payload',
++                        help='local fw_payload.bin served over HTTP (ssh transport only)')
++    parser.add_argument('--host-ip', dest='host_ip',
++                        help='Mac address the temporary HTTP server binds to (ssh transport)')
++    parser.add_argument('--board-host', dest='board_host',
++                        help='board SSH target; never auto-scanned (ssh transport)')
++    parser.add_argument('--ssh-key', dest='ssh_key',
++                        help='path handed to ssh -i; never read by this script (ssh transport)')
++    parser.add_argument('--jtag-hz', dest='jtag_hz', type=int, default=int(FPGA_FREQ),
++                        help='openFPGALoader JTAG clock in Hz (default 1000000)')
++    parser.add_argument('--update-timeout', dest='update_timeout', type=float,
++                        default=3600.0,
++                        help='timeout for the board fetch and sync commands in seconds')
+     parser.add_argument('--token-timeout', type=float, default=30.0)
+     parser.add_argument('--boot-timeout', type=float, default=180.0)
+     parser.add_argument('--command-timeout', type=float, default=30.0)
+     return parser
+@@ -345,10 +345,26 @@
+ def dry_run(args, stream=None):
+     stream = sys.stdout if stream is None else stream
++    if args.transport == 'ssh':
++        print('mode=dry-run (no serial, no ssh, no HTTP server, no JTAG load, '
++              'no writes)', file=stream)
++        print('transport=ssh', file=stream)
++        print('board_host=' + str(args.board_host), file=stream)
++        print('host_ip=' + str(args.host_ip), file=stream)
++        print('ssh_key=' + str(args.ssh_key), file=stream)
++        print('payload=' + str(args.payload), file=stream)
++        print('bit=' + str(args.bit), file=stream)
++        print('expected_kernel=' + str(args.expected_kernel), file=stream)
++        print('out=' + str(args.out), file=stream)
++        print('update_timeout=' + str(args.update_timeout), file=stream)
++        print('boot_timeout=' + str(args.boot_timeout), file=stream)
++        print('fpga_command=openFPGALoader -b ' + FPGA_BOARD + ' --freq '
++              + str(args.jtag_hz) + ' <BIT>', file=stream)
++        return 0
+     print('mode=dry-run (no serial, no JTAG load, no writes)', file=stream)
+     print('port=' + str(args.port), file=stream)
+     print('bit=' + str(args.bit), file=stream)
+     print('expected_kernel=' + str(args.expected_kernel), file=stream)
+     print('out=' + str(args.out), file=stream)
+     print('fpga_command=openFPGALoader -b ' + FPGA_BOARD + ' --freq ' + FPGA_FREQ + ' <BIT>',
+           file=stream)
+     return 0
+@@ -357,31 +357,54 @@
+-def main(argv=None, *, serial_factory=None, process_runner=None, clock=None, sleeper=None):
+-    args = build_arg_parser().parse_args(argv)
+-    if not args.run:
+-        return dry_run(args)
+-    for name in ('token_timeout', 'boot_timeout', 'command_timeout'):
+-        value = getattr(args, name)
+-        if not math.isfinite(value) or value <= 0:
+-            raise SystemExit('--' + name.replace('_', '-')
+-                             + ' must be a positive finite number')
+-    if not args.port:
+-        raise SystemExit('--port is required with --run (no auto scan)')
+-    if not args.bit:
+-        raise SystemExit('--bit is required with --run (no BIT auto selection)')
+-    if not args.expected_kernel:
+-        raise SystemExit('--expected-kernel is required with --run')
+-    if not args.out:
+-        raise SystemExit('--out is required with --run')
+-    bit = pathlib.Path(args.bit)
+-    if not bit.is_file():
+-        raise SystemExit('--bit is not a local file: ' + str(bit))
+-    if bit.stat().st_size == 0:
+-        raise SystemExit('--bit is empty: ' + str(bit))
+-    out_dir = pathlib.Path(args.out)
+-    if out_dir.exists():
+-        raise SystemExit('--out already exists: ' + str(out_dir))
+-    runner = RebootRunner(args, out_dir,
+-                          serial_factory or default_serial_factory,
+-                          process_runner or default_process_runner,
+-                          clock or time.monotonic,
+-                          sleeper or time.sleep)
+-    return runner.run()
++def main(argv=None, *, serial_factory=None, process_runner=None, clock=None,
++         sleeper=None, ssh_runner=None, http_server_factory=None,
++         loader_resolver=None):
++    args = build_arg_parser().parse_args(argv)
++    if not args.run:
++        return dry_run(args)
++    for name in ('token_timeout', 'boot_timeout', 'command_timeout', 'update_timeout'):
++        value = getattr(args, name)
++        if not math.isfinite(value) or value <= 0:
++            raise SystemExit('--' + name.replace('_', '-')
++                             + ' must be a positive finite number')
++    if not args.bit:
++        raise SystemExit('--bit is required with --run (no BIT auto selection)')
++    if not args.expected_kernel:
++        raise SystemExit('--expected-kernel is required with --run')
++    if not args.out:
++        raise SystemExit('--out is required with --run')
++    bit = pathlib.Path(args.bit)
++    if not bit.is_file():
++        raise SystemExit('--bit is not a local file: ' + str(bit))
++    if bit.stat().st_size == 0:
++        raise SystemExit('--bit is empty: ' + str(bit))
++    out_dir = pathlib.Path(args.out)
++    if out_dir.exists():
++        raise SystemExit('--out already exists: ' + str(out_dir))
++    if args.transport == 'ssh':
++        for name in ('board_host', 'host_ip', 'ssh_key'):
++            if not getattr(args, name):
++                raise SystemExit('--' + name.replace('_', '-')
++                                 + ' is required with --transport ssh')
++        if not pathlib.Path(args.ssh_key).expanduser().is_file():
++            raise SystemExit('--ssh-key is not a local file: ' + str(args.ssh_key))
++        if args.payload:
++            payload = pathlib.Path(args.payload).expanduser()
++            if not payload.is_file():
++                raise SystemExit('--payload is not a local file: ' + str(payload))
++            if payload.stat().st_size == 0:
++                raise SystemExit('--payload is empty: ' + str(payload))
++        runner = SshRebootRunner(args, out_dir,
++                                 process_runner or default_process_runner,
++                                 ssh_runner or default_ssh_runner,
++                                 http_server_factory or PayloadServer,
++                                 loader_resolver or resolve_openfpgaloader,
++                                 clock or time.monotonic,
++                                 sleeper or time.sleep)
++        return runner.run()
++    if not args.port:
++        raise SystemExit('--port is required with --run (no auto scan)')
++    runner = RebootRunner(args, out_dir,
++                          serial_factory or default_serial_factory,
++                          process_runner or default_process_runner,
++                          clock or time.monotonic,
++                          sleeper or time.sleep)
++    return runner.run()
+--- a/tests/test_mac_update_reboot.py
++++ b/tests/test_mac_update_reboot.py
+@@ -156,9 +156,106 @@
+     def __call__(self, argv, cwd=None):
+         self.calls.append(list(argv))
+         if self.board is not None and self.returncode == 0:
+             self.board.reboot()
+         return types.SimpleNamespace(returncode=self.returncode,
+                                      stdout=b'fake openFPGALoader\n', stderr=b'')
++class FakeResult:
++    def __init__(self, returncode=0, stdout=b'', stderr=b''):
++        self.returncode = returncode
++        self.stdout = stdout
++        self.stderr = stderr
++
++
++class FakeSsh:
++    """Answers the ssh commands the pure-Ethernet runner is expected to send."""
++
++    def __init__(self, before_kernel=KERNEL, after_kernel=KERNEL,
++                 before_boot_id=BOOT_ID, after_boot_id=SECOND_BOOT_ID,
++                 fetch_returncode=0, sync_returncode=0,
++                 auth_failure=False, not_ready_attempts=0):
++        self.before_kernel = before_kernel
++        self.after_kernel = after_kernel
++        self.before_boot_id = before_boot_id
++        self.after_boot_id = after_boot_id
++        self.fetch_returncode = fetch_returncode
++        self.sync_returncode = sync_returncode
++        self.auth_failure = auth_failure
++        self.not_ready_attempts = not_ready_attempts
++        self.phase = 'before'
++        self.calls = []
++
++    def _identity(self, command):
++        parts = command.split(';')
++        start = parts[0].split('echo ', 1)[1].strip()
++        end = parts[2].split('echo ', 1)[1].strip()
++        tail = parts[4].split('echo ', 1)[1].strip()
++        if self.phase == 'after':
++            if self.not_ready_attempts > 0:
++                self.not_ready_attempts -= 1
++                return FakeResult(255, b'',
++                                  b'ssh: connect to host: Connection refused\n')
++            kernel, boot_id = self.after_kernel, self.after_boot_id
++        else:
++            kernel, boot_id = self.before_kernel, self.before_boot_id
++        lines = [start, kernel, end, boot_id, tail, '']
++        return FakeResult(0, '\n'.join(lines).encode('utf-8'), b'')
++
++    def __call__(self, argv, timeout):
++        command = str(argv[-1])
++        self.calls.append({'argv': list(map(str, argv)), 'command': command,
++                           'timeout': timeout})
++        if self.auth_failure:
++            return FakeResult(255, b'',
++                              b'root@board: Permission denied (publickey).\n')
++        if command.startswith('echo __IDMA_SSH_'):
++            return self._identity(command)
++        if command.startswith('platform-fetch-update '):
++            return FakeResult(self.fetch_returncode,
++                              b'fetched ' + command.encode('utf-8') + b'\n',
++                              b'' if self.fetch_returncode == 0 else b'fetch failed\n')
++        if command == 'sync':
++            return FakeResult(self.sync_returncode, b'',
++                              b'' if self.sync_returncode == 0 else b'sync failed\n')
++        raise AssertionError('unexpected ssh command: ' + command)
++
++
++class FakeFpgaRunner:
++    """openFPGALoader stand-in: a successful load re-boots the fake board."""
++
++    def __init__(self, ssh, returncode=0):
++        self.ssh = ssh
++        self.returncode = returncode
++        self.calls = []
++
++    def __call__(self, argv, cwd=None):
++        self.calls.append(list(map(str, argv)))
++        if self.returncode == 0:
++            self.ssh.phase = 'after'
++        return types.SimpleNamespace(returncode=self.returncode,
++                                     stdout=b'fake openFPGALoader\n', stderr=b'')
++
++
++class FakePayloadServer:
++    """Stands in for the temporary HTTP server: nothing is ever bound."""
++
++    def __init__(self, host_ip, directory, log_path):
++        self.host_ip = host_ip
++        self.directory = str(directory)
++        self.log_path = str(log_path)
++        self.port = 8099
++        self.started = 0
++        self.stopped = 0
++
++    def start(self):
++        self.started += 1
++
++    def url_for(self, name):
++        return 'http://' + self.host_ip + ':' + str(self.port) + '/' + name
++
++    def stop(self):
++        self.stopped += 1
++
++
+ class MacUpdateRebootTests(unittest.TestCase):
+@@ -179,12 +179,52 @@
+     def _inject(self, **kwargs):
+         kwargs.setdefault('serial_factory', self._no_serial)
+         kwargs.setdefault('process_runner', self._no_process)
+         kwargs.setdefault('clock', self.clock)
+         kwargs.setdefault('sleeper', self.clock.sleep)
+         return kwargs
+ 
+     def run_args(self, out_dir, port='FAKE0', kernel=KERNEL, bit=None):
+         return ['--run', '--port', port, '--bit', str(bit or self.bit),
+                 '--expected-kernel', kernel, '--out', str(out_dir)]
++
++    def ssh_material(self):
++        """Created lazily so the dry-run test still sees only known.bit."""
++        key = self.tmp / 'fpga-platform'
++        payload = self.tmp / 'fw_payload.bin'
++        if not key.exists():
++            key.write_text('fake private key material\n')
++        if not payload.exists():
++            payload.write_bytes(b'\x00' * 4096)
++        return key, payload
++
++    def ssh_args(self, out_dir, kernel=KERNEL, bit=None, payload=False,
++                 boot_timeout='600', extra=()):
++        key, payload_file = self.ssh_material()
++        argv = ['--run', '--transport', 'ssh',
++                '--bit', str(bit or self.bit),
++                '--expected-kernel', kernel,
++                '--out', str(out_dir),
++                '--host-ip', '192.168.77.1',
++                '--board-host', '192.168.77.2',
++                '--ssh-key', str(key),
++                '--boot-timeout', str(boot_timeout),
++                '--update-timeout', '3600']
++        if payload:
++            argv += ['--payload', str(payload_file)]
++        return argv + list(extra)
++
++    def ssh_inject(self, ssh, fpga, servers):
++        def factory(host_ip, directory, log_path):
++            server = FakePayloadServer(host_ip, directory, log_path)
++            servers.append(server)
++            return server
++        return {'serial_factory': self._no_serial,
++                'process_runner': fpga,
++                'ssh_runner': ssh,
++                'http_server_factory': factory,
++                'loader_resolver': lambda: '/opt/homebrew/bin/openFPGALoader',
++                'clock': self.clock,
++                'sleeper': self.clock.sleep}
+ 
+     def test_dry_run_writes_nothing_and_touches_no_host(self):
+@@ -401,5 +401,150 @@
+         with self.assertRaises(SystemExit):
+             mac.main(argv, **self._inject())
+             self.assertFalse(out_dir.exists())
++
++    def test_ssh_success_never_touches_the_uart_or_hashes_a_bit(self):
++        ssh = FakeSsh()
++        fpga = FakeFpgaRunner(ssh)
++        servers = []
++        out_dir = self.tmp / 'ssh-success'
++        rc = mac.main(self.ssh_args(out_dir, payload=True),
++                      **self.ssh_inject(ssh, fpga, servers))
++        self.assertEqual(rc, 0)
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual(result['status'], 'complete')
++        self.assertEqual(result['transport'], 'ssh')
++        self.assertEqual(result['uname_r'], KERNEL)
++        self.assertEqual(result['boot_id'], SECOND_BOOT_ID)
++        self.assertEqual(result['before'], {'uname_r': KERNEL, 'boot_id': BOOT_ID})
++        self.assertEqual(result['after'],
++                         {'uname_r': KERNEL, 'boot_id': SECOND_BOOT_ID})
++        self.assertNotIn('bit_sha256', result)
++        self.assertFalse((out_dir / 'uart.log').exists())
++        self.assertEqual([c['name'] for c in result['commands']],
++                         ['ssh-identity-before', 'board-fetch-update',
++                          'board-sync', 'fpga-load', 'ssh-identity-after'])
++        fetch = [c for c in result['commands'] if c['name'] == 'board-fetch-update'][0]
++        self.assertEqual(fetch['remote_command'],
++                         'platform-fetch-update http://192.168.77.1:8099/fw_payload.bin --write')
++        fetch_calls = [c for c in ssh.calls
++                       if c['command'].startswith('platform-fetch-update ')]
++        self.assertEqual(len(fetch_calls), 1)
++        self.assertEqual(fetch_calls[0]['timeout'], 3600.0)
++        self.assertIn('BatchMode=yes', ssh.calls[0]['argv'])
++        self.assertIn('IdentitiesOnly=yes', ssh.calls[0]['argv'])
++        self.assertIn('UserKnownHostsFile=/dev/null', ssh.calls[0]['argv'])
++        self.assertIn('StrictHostKeyChecking=no', ssh.calls[0]['argv'])
++        self.assertIn('root@192.168.77.2', ssh.calls[0]['argv'])
++        self.assertEqual(len(servers), 1)
++        self.assertEqual(servers[0].started, 1)
++        self.assertEqual(servers[0].stopped, 1)
++        self.assertEqual(fpga.calls[0][0], '/opt/homebrew/bin/openFPGALoader')
++        self.assertIn(str(self.bit), fpga.calls[0])
++        self.assertNotIn('--write-flash', fpga.calls[0])
++
++    def test_ssh_auth_failure_fails_fast_and_starts_nothing(self):
++        ssh = FakeSsh(auth_failure=True)
++        fpga = FakeFpgaRunner(ssh)
++        servers = []
++        out_dir = self.tmp / 'ssh-auth'
++        with self.assertRaises(mac.SshAuthError):
++            mac.main(self.ssh_args(out_dir, payload=True),
++                     **self.ssh_inject(ssh, fpga, servers))
++        self.assertEqual(len(ssh.calls), 1)
++        self.assertEqual(fpga.calls, [])
++        self.assertEqual(servers, [])
++        self.assertFalse((out_dir / 'http.log').exists())
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual(result['status'], 'failed')
++        self.assertIn('SshAuthError', result['error'])
++        self.assertIn('permission denied', result['error'].lower())
++
++    def test_ssh_payload_write_failure_stops_before_sync_and_jtag(self):
++        ssh = FakeSsh(fetch_returncode=1)
++        fpga = FakeFpgaRunner(ssh)
++        servers = []
++        out_dir = self.tmp / 'ssh-fetch-fail'
++        with self.assertRaises(mac.UpdateError) as ctx:
++            mac.main(self.ssh_args(out_dir, payload=True),
++                     **self.ssh_inject(ssh, fpga, servers))
++        self.assertNotIsInstance(ctx.exception, mac.SshAuthError)
++        self.assertEqual(fpga.calls, [])
++        self.assertEqual(servers[0].stopped, 1)
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual([c['name'] for c in result['commands']],
++                         ['ssh-identity-before', 'board-fetch-update'])
++        self.assertIn('platform-fetch-update', str(ctx.exception))
++
++    def test_ssh_sync_failure_stops_before_jtag(self):
++        ssh = FakeSsh(sync_returncode=1)
++        fpga = FakeFpgaRunner(ssh)
++        servers = []
++        out_dir = self.tmp / 'ssh-sync-fail'
++        with self.assertRaises(mac.UpdateError) as ctx:
++            mac.main(self.ssh_args(out_dir, payload=True),
++                     **self.ssh_inject(ssh, fpga, servers))
++        self.assertEqual(fpga.calls, [])
++        self.assertIn('board sync', str(ctx.exception))
++        self.assertEqual(servers[0].stopped, 1)
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual([c['name'] for c in result['commands']],
++                         ['ssh-identity-before', 'board-fetch-update', 'board-sync'])
++
++    def test_ssh_jtag_failure_stops_before_the_reboot_wait(self):
++        ssh = FakeSsh()
++        fpga = FakeFpgaRunner(ssh, returncode=1)
++        servers = []
++        out_dir = self.tmp / 'ssh-jtag-fail'
++        with self.assertRaises(mac.UpdateError) as ctx:
++            mac.main(self.ssh_args(out_dir), **self.ssh_inject(ssh, fpga, servers))
++        self.assertEqual(len(fpga.calls), 1)
++        self.assertIn('openFPGALoader', str(ctx.exception))
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual(result['status'], 'failed')
++        self.assertNotIn('after', result)
++        self.assertEqual([c['name'] for c in result['commands']],
++                         ['ssh-identity-before', 'fpga-load'])
++
++    def test_ssh_without_payload_skips_the_http_server(self):
++        ssh = FakeSsh()
++        fpga = FakeFpgaRunner(ssh)
++        servers = []
++        out_dir = self.tmp / 'ssh-nopayload'
++        rc = mac.main(self.ssh_args(out_dir), **self.ssh_inject(ssh, fpga, servers))
++        self.assertEqual(rc, 0)
++        self.assertEqual(servers, [])
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertIsNone(result['payload'])
++        self.assertNotIn('http', result)
++        self.assertNotIn('board-fetch-update', [c['name'] for c in result['commands']])
++        self.assertEqual([c['name'] for c in result['commands']],
++                         ['ssh-identity-before', 'board-sync', 'fpga-load',
++                          'ssh-identity-after'])
++
++    def test_ssh_retries_until_the_board_answers_after_reboot(self):
++        ssh = FakeSsh(not_ready_attempts=2)
++        fpga = FakeFpgaRunner(ssh)
++        servers = []
++        out_dir = self.tmp / 'ssh-retry'
++        rc = mac.main(self.ssh_args(out_dir), **self.ssh_inject(ssh, fpga, servers))
++        self.assertEqual(rc, 0)
++        result = json.loads((out_dir / 'result.json').read_text())
++        names = [c['name'] for c in result['commands']]
++        self.assertEqual(names.count('ssh-identity-after'), 3)
++        self.assertEqual(result['status'], 'complete')
++        self.assertGreater(self.clock.t, 0)
++
++    def test_ssh_wrong_kernel_fails_after_the_boot_timeout(self):
++        ssh = FakeSsh(after_kernel='9.9.9-wrong')
++        fpga = FakeFpgaRunner(ssh)
++        servers = []
++        out_dir = self.tmp / 'ssh-kernel'
++        with self.assertRaises(mac.UpdateError) as ctx:
++            mac.main(self.ssh_args(out_dir, boot_timeout='20'),
++                     **self.ssh_inject(ssh, fpga, servers))
++        self.assertIn('uname -r', str(ctx.exception))
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual(result['status'], 'failed')
++        self.assertNotIn('uname_r', result)
+ 
+ if __name__ == '__main__':
+     unittest.main()
+```
+
+## Structure / how it maps to the requirements
+
+| Requirement | Where |
+|---|---|
+| Pure-net mode never opens UART | `SshRebootRunner` has no `serial_factory`/`Console`; tests inject `self._no_serial` and assert `uart.log` is absent |
+| System SSH, BatchMode + IdentitiesOnly, isolated knownhosts, explicit board host | `SSH_OPTIONS`, `build_ssh_argv()`; `root@<board_host>` is the only host ever named; documented in the module docstring |
+| Key only handed to `ssh -i` | `self.key = pathlib.Path(args.ssh_key).expanduser()` — only `is_file()`/existence is touched; no `open()`, no hashing, no logging of contents |
+| Order: identity → HTTP payload → sync → JTAG → identity wait | `SshRebootRunner.run()` (`_capture_identity('before')`, `_fetch_payload()`, `_sync()`, `_load_bit()`, `_wait_for_boot_identity()`) |
+| HTTP server bound only to host-ip, dir = payload.parent, escaped URL | `PayloadServer` (`(host_ip, 0)` bind, `SimpleHTTPRequestHandler(directory=...)`), `url_for()` uses `urllib.parse.quote`; the SSH command uses `shlex.quote(url)` |
+| No new hash / read-back / duplicate write | `platform-fetch-update <url> --write` invoked once, exit 0 required; no `sha256_file` call anywhere in the SSH path |
+| Per-stage failure stops everything | every stage calls `_fail_on_command`/raises `UpdateError` before the next stage |
+| SSH auth failure fast-fails | `_fail_on_command` → `looks_like_auth_failure` → `SshAuthError`; the wait loop re-raises `SshAuthError` immediately instead of retrying |
+| Bounded retry for boot-time connect failures | `_wait_for_boot_identity` retries every `SSH_RETRY_INTERVAL` (5 s) until `--boot-timeout`, reporting the last precise error |
+| Bounded, finite termination | `--update-timeout` bounds fetch/sync, `--command-timeout` bounds identity queries, `default_ssh_runner` passes `timeout=` to `subprocess.run` (which kills the child); `PayloadServer.stop()` uses `shutdown()` + `server_close()` + `join(5.0)`; `_stop_http()` runs in `finally` |
+| openFPGALoader PATH then Homebrew fallback, explicit BIT only | `resolve_openfpgaloader()`, `_load_bit()` uses `args.bit` verbatim, never scans |
+| kernel-release supplied by caller | `--expected-kernel` required, compared with `==`, never derived |
+| Existing UART behaviour/CLI preserved | `RebootRunner`, `Console`, `dry_run` UART branch, `--port/--bit/--expected-kernel/--out/--token-timeout/--boot-timeout/--command-timeout` unchanged; `--transport` defaults to `uart`; `--out` gained a `--result-dir` alias with the same dest |
+
+Evidence for the "don't break the old tests" constraint:
+- `tests/test_mac_update_reboot.py:205` asserts `self.tmp.iterdir() == ['known.bit']` → SSH key/payload fixtures are created lazily in `ssh_material()`, not in `setUp`.
+- `tests/test_mac_update_reboot.py:324` asserts `argv[0] == 'openFPGALoader'` → the UART `_load_bit` is untouched; the resolver is used only by the SSH runner.
+- `tests/test_mac_update_reboot.py:337` asserts `result['bit_sha256'] == mac.sha256_file(...)` → only in the UART result; the SSH result has no such key.
+- `tests/test_mac_update_reboot.py:207-221` and `:397-403` only require `SystemExit` → `main()` still refuses missing `--bit/--expected-kernel/--out` (checked before the transport split) and non-finite/non-positive timeouts.
+
+## Assumptions / not verified
+
+1. **`platform-fetch-update` CLI shape** is taken from the task text (`<url> --write`, first-partition bound, fsync). No source for the board-side tool was supplied, so quoting/arg order is assumed (`platform-fetch-update <url> --write`).
+2. **Python ≥ 3.7** on the Mac (`ThreadingHTTPServer`, `SimpleHTTPRequestHandler(directory=...)`, `BatchMode`).
+3. **`--boot-timeout` for SSH**: the flag keeps its 180 s default; the documented command below passes `600` explicitly, as specified. If you want 600 to be the SSH-mode default, that is a one-line change in `build_arg_parser`.
+4. **`--out` vs `--result-dir`**: treated as synonyms for one destination. `--result-dir` is the second option string, so `args.out` is unchanged for the UART path.
+5. **IPv4 assumed** for `--host-ip`; the URL builder brackets IPv6 literals but `PayloadServer` passes the raw string to `bind()` (IPv6 would need `AF_INET6`).
+6. **openFPGALoader is resolved lazily**, at the JTAG stage — after the SD write. If you prefer fail-before-write, call `self.loader_resolver()` right after the "before" identity capture; this was deliberately left as-is to keep the requested stage order.
+7. **No tests were executed by me** — the proposed tests are untested code; the hidden state/ordering assumptions (e.g. exact command-name list) must be confirmed by running them.
+8. `--jtag-hz` is `int` and rendered with `str()`; the UART path keeps using the `FPGA_FREQ` string constant.
+
+## Minimal acceptance
+
+```
+python3 -m unittest -v tests/test_mac_update_reboot.py          # old + new tests
+python3 scripts/mac_update_reboot.py --transport ssh \          # dry-run, no I/O
+    --host-ip 192.168.77.1 --board-host 192.168.77.2 --ssh-key ~/.ssh/fpga-platform \
+    --payload build/fw_payload.bin --bit accepted.bit \
+    --expected-kernel <delivery uname -r> --result-dir out/net3
+```
+
+Real run (net3, auto static IP + key already baked in):
+
+```
+python3 scripts/mac_update_reboot.py --run --transport ssh \
+  --payload build/fw_payload.bin \
+  --host-ip 192.168.77.1 --board-host 192.168.77.2 \
+  --ssh-key ~/.ssh/fpga-platform \
+  --bit accepted.bit --expected-kernel 6.1.0-cpn2-net3 \
+  --result-dir out/net3-run-01 \
+  --update-timeout 3600 --boot-timeout 600 --jtag-hz 1000000
+```
+
+Pass criteria (all in `out/net3-run-01/result.json`): `status == "complete"`, `before.boot_id != boot_id`, `uname_r == expected_kernel`, `transport == "ssh"`, no `bit_sha256`, per-command `returncode == 0` in `commands`, and the `finally` step having run (no lingering `PayloadServer` thread, `http.log` present only when `--payload` was used).
+
+Reboot-only (no payload) variant: drop `--payload`; the run still does identity → `sync` → JTAG → identity wait.

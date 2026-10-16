@@ -1,0 +1,1233 @@
+NVIDIA-open-gpu-kernel-modules: kernel-open/nvidia-uvm/uvm_gpu_access_counters.c Source File - doxygen documentation | Fossies Dox (https://fossies.org/dox/NVIDIA-open-gpu-kernel-modules-615.71.09/uvm__gpu__access__counters_8c_source.html)
+citeturn26search0 [wordlim: 200] Crawled: last month; 37#include "uvm_ats.h" ... 154 if (UVM_ATS_SUPPORTED())
+
+30#include "uvm_hmm.h"
+
+31#include "uvm_kvmalloc.h"
+
+32#include "uvm_tools.h"
+
+33#include "uvm_va_block.h"
+
+34#include "uvm_va_range.h"
+
+35#include "uvm_va_space_mm.h"
+
+36#include "uvm_perf_module.h"
+
+37#include "uvm_ats.h"
+
+38#include "uvm_ats_faults.h"
+
+39
+
+40#define UVM_PERF_ACCESS_COUNTER_BATCH_COUNT_MIN 1
+
+41#define UVM_PERF_ACCESS_COUNTER_BATCH_COUNT_DEFAULT 256
+
+42#define UVM_PERF_ACCESS_COUNTER_GRANULARITY UVM_ACCESS_COUNTER_GRANULARITY_2M
+
+43#define UVM_PERF_ACCESS_COUNTER_THRESHOLD_MIN 1
+
+44#define UVM_PERF_ACCESS_COUNTER_THRESHOLD_MAX ((1 << 16) - 1)
+
+45#define UVM_PERF_ACCESS_COUNTER_THRESHOLD_DEFAULT 256
+
+46
+
+47#define UVM_ACCESS_COUNTER_ACTION_BATCH_CLEAR 0x1
+
+48#define UVM_ACCESS_COUNTER_ACTION_TARGETED_CLEAR 0x2
+
+49
+
+50// Each page in a tracked physical range may belong to a different VA Block. We
+
+51// preallocate an array of reverse map translations. However, access counter
+
+52// granularity can be set to up to 16G, which would require an array too large
+
+53// to hold all possible translations. Thus, we set an upper bound for reverse
+
+54// map translations, and we perform as many translation requests as needed to
+
+55// cover the whole tracked range.
+
+56#define UVM_MAX_TRANSLATION_SIZE (2 * 1024 * 1024ULL)
+
+57#define UVM_SUB_GRANULARITY_REGIONS 32
+
+58
+
+59// Per-VA space access counters information
+
+60typedef struct
+
+61{
+
+62 // VA space-specific configuration settings. These override the global
+
+63 // settings
+
+64 atomic_t enable_migrations;
+
+65
+
+66 uvm_va_space_t *va_space;
+
+67} va_space_access_counters_info_t;
+
+68
+
+69// Enable/disable access-counter-guided migrations
+
+70static int uvm_perf_access_counter_migration_enable = -1;
+
+139 return parent_gpu_access_counter_buffer_get(parent_gpu, notif_buf_index);
+
+140 return NULL;
+
+141}
+
+142
+
+143// Whether access counter migrations are enabled or not. The policy is as
+
+144// follows:
+
+145// - Migrations are disabled by default on all non-ATS systems.
+
+146// - Users can override this policy by specifying on/off
+
+147static bool is_migration_enabled(void)
+
+148{
+
+149 if (uvm_perf_access_counter_migration_enable == 0)
+
+150 return false;
+
+151 else if (uvm_perf_access_counter_migration_enable > 0)
+
+152 return true;
+
+153
+
+154 if (UVM_ATS_SUPPORTED())
+
+155 return g_uvm_global.ats.supported;
+
+156
+
+157 return false;
+
+158}
+
+159
+
+160// Create the access counters tracking struct for the given VA space
+
+161//
+
+162// VA space lock needs to be held in write mode
+
+163static va_space_access_counters_info_t *va_space_access_counters_info_create(uvm_va_space_t *va_space)
+
+1526
+
+1527 if ((status == NV_OK) && (flags_status != NV_OK))
+
+1528 status = flags_status;
+
+1529
+
+1530 return status;
+
+1531}
+
+1532
+
+1533static NV_STATUS service_notification_ats(uvm_gpu_va_space_t *gpu_va_space,
+
+1534 struct mm_struct *mm,
+
+1535 uvm_access_counter_buffer_t *access_counters,
+
+1536 NvU32 index,
+
+1537 NvU32 *out_index)
+
+1538{
+
+1539
+
+1540 NvU32 i;
+
+1541 NvU64 base;
+
+1542 NvU64 end;
+
+1543 NvU64 address;
+
+1544 NV_STATUS status = NV_OK;
+
+1545 NV_STATUS flags_status;
+
+1546 struct vm_area_struct *vma = NULL;
+
+1547 uvm_gpu_t *gpu = gpu_va_space->gpu;
+
+1548 uvm_va_space_t *va_space = gpu_va_space->va_space;
+
+1549 uvm_access_counter_service_batch_context_t *batch_context = &access_counters->batch_service_context;
+
+1550 uvm_ats_fault_context_t *ats_context = &batch_context->ats_context;
+1673 NULL);
+
+1674 *out_index = index + 1;
+
+1675 }
+
+1676 }
+
+1677 else if (!gpu_va_space->va_space->pageable.migrations_enabled) {
+
+1678 status = notify_tools_and_process_flags(va_space,
+
+1679 gpu_va_space->gpu,
+
+1680 access_counters,
+
+1681 0,
+
+1682 &batch_context->notifications[index],
+
+1683 1,
+
+1684 0,
+
+1685 NULL);
+
+1686
+
+1687 *out_index = index + 1;
+
+1688 }
+
+1689 else if (uvm_ats_can_service_faults(gpu_va_space, mm)) {
+
+1690 status = service_notification_ats(gpu_va_space, mm, access_counters, index, out_index);
+
+1691 }
+
+1692 else {
+
+1693 NvU32 flags;
+
+1694 uvm_va_block_t *va_block = NULL;
+
+1695 struct vm_area_struct *vma = NULL;
+
+1696
+
+1697 // HMM and CDMM pageable memory are serviced through HMM VA blocks.
+
+1698 status = uvm_hmm_va_block_find_create(va_space, address, &vma, &va_block);
+
+1699
+
+1700 if (va_block) {
+
+1701 UVM_ASSERT(uvm_va_block_is_hmm(va_block));
+uvm_page_mask_t accessed_pages
+
+Definition uvm_gpu.h:503
+
+uvm_access_counter_service_batch_context_struct::ats_context
+
+uvm_ats_fault_context_t ats_context
+
+Definition uvm_gpu.h:509
+
+uvm_ats_fault_context_t
+
+Definition uvm_gpu.h:199
+
+uvm_global_struct::global_lock
+
+uvm_mutex_t global_lock
+
+Definition uvm_global.h:80
+
+uvm_global_struct::ats
+
+struct uvm_global_struct::@337051212250256171033203072205347354264006177171 ats
+
+uvm_gpu_struct::channel_manager
+
+uvm_channel_manager_t * channel_manager
+
+Definition uvm_gpu.h:769
+
+uvm_gpu_struct::id
+
+uvm_gpu_id_t id
+
+Definition uvm_gpu.h:694
+
+uvm_gpu_struct::parent
+
+uvm_parent_gpu_t * parent
+
+Definition uvm_gpu.h:664
+
+uvm_gpu_va_space_struct::gpu
+
+uvm_gpu_t * gpu
+
+Definition uvm_va_space.h:105
+
+uvm_gpu_va_space_struct::va_space
+
+uvm_va_space_t * va_space
+
+Definition uvm_va_space.h:104
+#define uint
+
+Definition types.h:59
+
+uvm_api.h
+
+uvm_ats.h
+
+UVM_ATS_SUPPORTED
+
+#define UVM_ATS_SUPPORTED()
+
+Definition uvm_ats.h:33
+
+uvm_ats_service_access_counters
+
+NV_STATUS uvm_ats_service_access_counters(uvm_gpu_va_space_t *gpu_va_space, struct vm_area_struct *vma, NvU64 base, uvm_ats_fault_context_t *ats_context)
+
+Definition uvm_ats_faults.c:760
+
+uvm_ats_faults.h
+
+UVM_CHANNEL_TYPE_MEMOPS
+
+@ UVM_CHANNEL_TYPE_MEMOPS
+
+Definition uvm_channel.h:88
+
+UVM_ASSERT_MSG
+
+#define UVM_ASSERT_MSG(expr, fmt,...)
+
+Definition uvm_common.h:169
+
+UVM_SIZE_1GB
+
+#define UVM_SIZE_1GB
+
+Definition uvm_common.h:204
+
+UVM_SIZE_1MB
+
+#define UVM_SIZE_1MB
+
+Definition uvm_common.h:203
+
+uvm_enable_builtin_tests
+
+int uvm_enable_builtin_tests
+
+UVM_DBG_PRINT
+
+#define UVM_DBG_PRINT(fmt,...)
+
+Definition uvm_common.h:101
+
+UVM_CMP_DEFAULT
+--------------------------------------------------------------------------------
+NVIDIA-open-gpu-kernel-modules: kernel-open/nvidia-uvm/uvm_gpu.c Source File - doxygen documentation | Fossies Dox (https://fossies.org/dox/NVIDIA-open-gpu-kernel-modules-615.71.09/uvm__gpu_8c_source.html)
+citeturn26search1 [wordlim: 200] Crawled: last month; 43#include "uvm_ats.h" ... 144 if (UVM_ATS_SUPPORTED() && parent_gpu->ats.non_pasid_ats_enabled && gpu_info->systemMemoryWindowSize) ... UvmGpuInfo_tag::atsSupport
+
+33#include "uvm_pmm_gpu.h"
+
+34#include "uvm_pmm_sysmem.h"
+
+35#include "uvm_va_space.h"
+
+36#include "uvm_user_channel.h"
+
+37#include "uvm_perf_events.h"
+
+38#include "uvm_perf_heuristics.h"
+
+39#include "uvm_common.h"
+
+40#include "ctrl2080mc.h"
+
+41#include "nv-kthread-q.h"
+
+42#include "uvm_gpu_access_counters.h"
+
+43#include "uvm_ats.h"
+
+44#include "uvm_test.h"
+
+45#include "uvm_conf_computing.h"
+
+46#include "uvm_linux.h"
+
+47#include "uvm_mmu.h"
+
+48#include "uvm_kvmalloc.h"
+
+49#if UVM_USE_DMA_IOVA_API()
+
+53#define UVM_PROC_GPUS_PEER_DIR_NAME "peers"
+
+54
+
+55// The uvm_peer_copy module parameter enables to choose from "phys" or "virt".
+
+56// It determines the addressing mode for P2P copies.
+
+57#define UVM_PARAM_PEER_COPY_VIRTUAL "virt"
+
+58#define UVM_PARAM_PEER_COPY_PHYSICAL "phys"
+
+59static char *uvm_peer_copy = UVM_PARAM_PEER_COPY_PHYSICAL;
+
+60module_param(uvm_peer_copy, charp, S_IRUGO);
+
+61MODULE_PARM_DESC(uvm_peer_copy, "Choose the addressing mode for peer copying, options: "
+
+62 UVM_PARAM_PEER_COPY_PHYSICAL " [default] or " UVM_PARAM_PEER_COPY_VIRTUAL ". "
+
+63 "Valid for Ampere+ GPUs.");
+
+65static uvm_user_channel_t *get_user_channel(uvm_rb_tree_node_t *node)
+
+66{
+
+67 return container_of(node, uvm_user_channel_t, instance_ptr.node);
+
+68}
+
+69
+
+70static uvm_gpu_link_type_t get_gpu_link_type(UVM_LINK_TYPE link_type)
+
+
+98 char uuid_buffer[UVM_UUID_STRING_LENGTH];
+
+99
+
+100 parent_gpu->rm_info = *gpu_info;
+
+101
+
+102 parent_gpu->system_bus.link = get_gpu_link_type(gpu_info->sysmemLink);
+
+103 UVM_ASSERT(parent_gpu->system_bus.link != UVM_GPU_LINK_INVALID);
+
+104
+
+105 parent_gpu->ats_supported = gpu_info->atsSupport;
+
+106
+
+107 parent_gpu->system_bus.link_rate_mbyte_per_s = gpu_info->sysmemLinkRateMBps;
+
+108
+
+109 if (gpu_info->systemMemoryWindowSize > 0) {
+
+110 // memory_window_end is inclusive but uvm_parent_gpu_is_coherent()
+
+111 // checks memory_window_end > memory_window_start as its condition.
+
+112 UVM_ASSERT(gpu_info->systemMemoryWindowSize > 1);
+
+113 parent_gpu->system_bus.memory_window_start = gpu_info->systemMemoryWindowStart;
+
+114 parent_gpu->system_bus.memory_window_end = gpu_info->systemMemoryWindowStart +
+
+115 gpu_info->systemMemoryWindowSize - 1;
+
+116 }
+
+117
+
+118 parent_gpu->nvswitch_info.is_nvswitch_connected = gpu_info->connectedToSwitch;
+
+119 parent_gpu->peer_address_info.is_nvlink_direct_connected = gpu_info->nvlDirectConnect;
+
+120
+
+121 if (parent_gpu->peer_address_info.is_nvlink_direct_connected) {
+
+122 parent_gpu->peer_address_info.peer_gpa_memory_window_start = gpu_info->nvlDirectConnectMemoryWindowStart;
+
+123 }
+
+124 else if (parent_gpu->nvswitch_info.is_nvswitch_connected) {
+
+125 // nvswitch is routed via physical pages, where the upper 13-bits of the
+
+126 // 47-bit address space holds the routing information for each peer.
+
+127 // Currently, this is limited to a 16GB framebuffer window size.
+
+128 parent_gpu->nvswitch_info.fabric_memory_window_start = gpu_info->nvswitchMemoryWindowStart;
+
+129 if (gpu_info->flaWindowForCpuMemNode.bSupported) {
+
+130 parent_gpu->egm.fabric_memory_window_start = gpu_info->flaWindowForCpuMemNode.flaStart;
+
+131 parent_gpu->egm.window_size = gpu_info->flaWindowForCpuMemNode.flaSize;
+
+132 }
+
+133 else {
+
+134 parent_gpu->egm.fabric_memory_window_start = gpu_info->nvswitchEgmMemoryWindowStart;
+
+135 }
+
+136 }
+
+137
+
+138 parent_gpu->ats.non_pasid_ats_enabled = gpu_info->nonPasidAtsSupport;
+
+139
+
+140 // Non-PASID ATS cannot be disabled if present, but it implies PASID ATS
+
+141 // support.
+
+142 // TODO: Bug 5161018: Include integrated GPUs in the assert once they
+
+143 // support PASID ATS.
+
+144 if (UVM_ATS_SUPPORTED() && parent_gpu->ats.non_pasid_ats_enabled && gpu_info->systemMemoryWindowSize)
+
+145 UVM_ASSERT(g_uvm_global.ats.supported);
+
+146
+
+147 uvm_uuid_string(uuid_buffer, &parent_gpu->uuid);
+
+148 snprintf(parent_gpu->name,
+
+149 sizeof(parent_gpu->name),
+
+150 "ID %u: %s: " UVM_PARENT_GPU_UUID_PREFIX "%s",
+
+151 uvm_parent_id_value(parent_gpu->id),
+
+152 parent_gpu->rm_info.name,
+
+153 uuid_buffer);
+
+154}
+
+156static NV_STATUS get_gpu_caps(uvm_gpu_t *gpu)
+
+157{
+
+158 NV_STATUS status;
+
+159 UvmGpuCaps gpu_caps;
+
+160
+
+161 memset(&gpu_caps, 0, sizeof(gpu_caps));
+
+162
+
+163 status = uvm_rm_locked_call(nvUvmInterfaceQueryCaps(uvm_gpu_device_handle(gpu), &gpu_caps));
+
+164 if (status != NV_OK)
+
+165 return status;
+
+166
+
+167 if (gpu_caps.numaEnabled) {
+
+168 UVM_ASSERT(uvm_parent_gpu_is_coherent(gpu->parent));
+
+169
+
+170 gpu->mem_info.numa.enabled = true;
+
+171 gpu->mem_info.numa.node_id = gpu_caps.numaNodeId;
+
+172 }
+
+173 else {
+
+174 gpu->mem_info.numa.node_id = NUMA_NO_NODE;
+
+175 }
+
+176
+
+177 return NV_OK;
+
+178}
+
+180// Return a PASID to use with the internal address space (AS), or -1 if not
+
+181// supported. This PASID is needed to enable ATS in the internal AS, but it is
+
+182// not used in address translation requests, which only translate GPA->SPA.
+
+183// The buffer management thus remains the same: DMA mapped GPA addresses can
+
+184// be accessed by the GPU, while unmapped addresses can not and any access is
+
+185// blocked and potentially unrecoverable to the engine that made it.
+
+186//
+
+187// If non-PASID ATS is supported, then we can skip this because that will handle
+
+188// things for us instead without us having to fake it with PASID ATS. This is
+
+189// only to enable the feature on other ATS systems.
+
+190static int gpu_get_internal_pasid(const uvm_gpu_t *gpu)
+
+191{
+
+192#if UVM_ATS_SVA_SUPPORTED() && defined(NV_IOMMU_IS_DMA_DOMAIN_PRESENT)
+
+193// iommu_is_dma_domain() was added in Linux 5.15 by commit bf3aed4660c6
+
+194// ("iommu: Introduce explicit type for non-strict DMA domains")
+
+195//
+
+196// SVA is not required for enabling ATS for internal UVM address spaces.
+
+197// However, it conveniently combines the necessary check for permissive license
+
+198// and the special behaviour of PASID 0 on SMMUv3 described below.
+
+199//
+
+200// PASID 0 is reserved on aarch64 SMMUv3 (see section 3.3.2 of the SMMU spec)
+
+201// because the corresponding page table is used to translate requests and
+
+202// transactions without an associated PASID.
+
+203// Linux 6.6+ generalized this value as IOMMU_NO_PASID for all architectures
+
+204// commit 4298780126c2 ("iommu: Generalize PASID 0 for normal DMA w/o PASID")
+
+205#ifdef IOMMU_NO_PASID
+
+206#define UVM_INTERNAL_PASID IOMMU_NO_PASID
+
+207#else
+
+208#define UVM_INTERNAL_PASID 0
+
+209#endif
+
+210
+
+211 // Enable internal ATS only if non-PASID ATS is disabled, but PASID ATS is
+
+212 // enabled, and we are using 64kB base page size. The base page size
+
+213 // limitation is needed to avoid GH180 MMU behaviour which does not refetch
+
+214 // invalid 4K ATS translations on access (see bug 3949400). This also works
+
+215 // in virtualized environments because the entire 64kB guest page has to be
+
+216 // mapped and pinned by the hypervisor for device access.
+
+217 if (!gpu->parent->ats.non_pasid_ats_enabled && g_uvm_global.ats.enabled &&
+
+218 uvm_parent_gpu_supports_ats(gpu->parent) && PAGE_SIZE == UVM_PAGE_SIZE_64K) {
+
+219 struct device *dev = &gpu->parent->pci_dev->dev;
+
+220 struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+
+221
+
+222 // Check that the iommu domain is controlled by linux DMA API and
+
+223 // return a valid reserved PASID. Using a reserved PASID is OK since
+
+224 // this value is only used for the internal UVM address space that
+
+225 // uses ATS only for GPA->SPA translations that don't use PASID.
+
+226 //
+
+227 // If a general reserved PASID is not available (e.g. non-smmuv3, <6.6)
+
+228 // we'd need to to reserve a PASID from the IOMMU driver here, or risk
+
+229 // PASID collision. Note that since the PASID should not be used during
+
+1546 UVM_ASSERT(num_possible_nodes() == 1);
+
+1547 parent_gpu->closest_cpu_numa_node = numa_mem_id();
+
+1548 }
+
+1549
+
+1550 UVM_ASSERT(!parent_gpu->rm_info.smcEnabled || parent_gpu->smc.supported);
+
+1551 parent_gpu->smc.enabled = !!parent_gpu->rm_info.smcEnabled;
+
+1552
+
+1553 uvm_mmu_init_gpu_chunk_sizes(parent_gpu);
+
+1554
+
+1555 status = uvm_ats_add_gpu(parent_gpu);
+
+1556 if (status != NV_OK) {
+
+1557 UVM_ERR_PRINT("uvm_ats_add_gpu failed: %s, GPU %s\n",
+
+1558 nvstatusToString(status),
+
+1559 uvm_parent_gpu_name(parent_gpu));
+
+1560 return status;
+
+1561 }
+
+1562
+
+1563 status = init_parent_procfs_files(parent_gpu);
+
+1564 if (status != NV_OK) {
+
+1565 UVM_ERR_PRINT("Failed to init parent procfs files: %s, GPU %s\n",
+
+1566 nvstatusToString(status),
+
+1567 uvm_parent_gpu_name(parent_gpu));
+
+1568 return status;
+
+1569 }
+
+1570
+
+1571 status = uvm_parent_gpu_init_isr(parent_gpu);
+
+1572 if (status != NV_OK) {
+
+1573 UVM_ERR_PRINT("Failed to init ISR: %s, GPU %s\n",
+
+1574 nvstatusToString(status),
+
+1575 uvm_parent_gpu_name(parent_gpu));
+
+1576 return status;
+
+1802{
+
+1803 // All channels should have been removed before the retained count went to 0
+
+1804 UVM_ASSERT(uvm_rb_tree_empty(&parent_gpu->instance_ptr_table));
+
+1805 UVM_ASSERT(uvm_rb_tree_empty(&parent_gpu->tsg_table));
+
+1806
+
+1807 deinit_parent_procfs_files(parent_gpu);
+
+1808
+
+1809 // Return ownership to RM
+
+1810 uvm_parent_gpu_deinit_isr(parent_gpu);
+
+1811
+
+1812 uvm_devmem_device_p2p_deinit(parent_gpu);
+
+1813
+
+1814 uvm_devmem_deinit(parent_gpu);
+
+1815 uvm_ats_remove_gpu(parent_gpu);
+
+1816
+
+1817 UVM_ASSERT(atomic64_read(&parent_gpu->mapped_cpu_pages_size) == 0);
+
+1818
+
+1819 // After calling nvUvmInterfaceUnregisterGpu() the reference to pci_dev may
+
+1820 // not be valid any more so clear it ahead of time.
+
+1821 parent_gpu->pci_dev = NULL;
+
+1822
+
+1823 deinit_parent_procfs_dir(parent_gpu);
+
+1824
+
+1825 if (parent_gpu->rm_info.isSimulated)
+
+UvmGpuClientInfo_tag::hClient
+
+NvHandle hClient
+
+Definition nv_uvm_types.h:586
+
+UvmGpuClientInfo_tag::hSmcPartRef
+
+NvHandle hSmcPartRef
+
+Definition nv_uvm_types.h:588
+
+UvmGpuCopyEngineCaps
+
+Definition nv_uvm_types.h:341
+
+UvmGpuCopyEngineCaps::p2p
+
+NvBool p2p
+
+Definition nv_uvm_types.h:368
+
+UvmGpuCopyEngineCaps::supported
+
+NvBool supported
+
+Definition nv_uvm_types.h:343
+
+UvmGpuCopyEngineCaps::sysmem
+
+NvBool sysmem
+
+Definition nv_uvm_types.h:362
+
+UvmGpuCopyEngineCaps::secure
+
+NvBool secure
+
+Definition nv_uvm_types.h:371
+
+UvmGpuCopyEngineCaps::shared
+
+NvBool shared
+
+Definition nv_uvm_types.h:353
+
+UvmGpuCopyEngineCaps::grce
+
+NvBool grce
+
+Definition nv_uvm_types.h:346
+
+UvmGpuCopyEngineCaps::nvlinkP2p
+
+NvBool nvlinkP2p
+
+Definition nv_uvm_types.h:365
+
+UvmGpuCopyEngineCaps::cePceMask
+
+UvmGpuInfo_tag::subdeviceCount
+
+NvU32 subdeviceCount
+
+Definition nv_uvm_types.h:630
+
+UvmGpuInfo_tag::atsSupport
+
+NvBool atsSupport
+
+Definition nv_uvm_types.h:711
+
+UvmGpuInfo_tag::accessCntrBufferCount
+
+NvU32 accessCntrBufferCount
+
+Definition nv_uvm_types.h:655
+
+UvmGpuInfo_tag::gpuImplementation
+
+NvU32 gpuImplementation
+
+Definition nv_uvm_types.h:615
+
+UvmGpuInfo_tag::gpcCount
+
+NvU32 gpcCount
+
+Definition nv_uvm_types.h:641
+
+UvmGpuInfo_tag::uuid
+
+NvProcessorUuid uuid
+
+Definition nv_uvm_types.h:609
+
+UvmGpuInfo_tag::smcSwizzId
+
+NvU32 smcSwizzId
+
+Definition nv_uvm_types.h:664
+
+UvmGpuInfo_tag::nvlDirectConnectMemoryWindowStart
+
+NvU64 nvlDirectConnectMemoryWindowStart
+
+Definition nv_uvm_types.h:724
+
+UvmGpuInfo_tag::connectedToSwitch
+
+NvBool connectedToSwitch
+
+Definition nv_uvm_types.h:691
+
+UvmGpuInfo_tag::name
+
+char name[0x40]
+
+Definition nv_uvm_types.h:605
+
+UvmGpuInfo_tag::isSimulated
+
+NvBool isSimulated
+
+Definition nv_uvm_types.h:636
+
+UvmGpuInfo_tag::nvswitchMemoryWindowStart
+
+NvU64 nvswitchMemoryWindowStart
+
+Definition nv_uvm_types.h:692
+
+UvmGpuInfo_tag::maxTpcPerGpcCount
+
+NvU32 maxTpcPerGpcCount
+
+Definition nv_uvm_types.h:652
+
+UvmGpuInfo_tag::sysmemLinkRateMBps
+
+NvU32 sysmemLinkRateMBps
+
+Definition nv_uvm_types.h:675
+
+UvmGpuInfo_tag::virtMode
+
+NvU32 virtMode
+
+Definition nv_uvm_types.h:633
+
+UvmGpuInfo_tag::nvswitchEgmMemoryWindowStart
+
+NvU64 nvswitchEgmMemoryWindowStart
+
+Definition nv_uvm_types.h:708
+
+UvmGpuInfo_tag::egmEnabled
+
+NvBool egmEnabled
+
+Definition nv_uvm_types.h:696
+
+UvmGpuInfo_tag::nonPasidAtsSupport
+
+NvBool nonPasidAtsSupport
+
+Definition nv_uvm_types.h:714
+
+UvmGpuInfo_tag::egmPeerId
+
+NvU8 egmPeerId
+
+Definition nv_uvm_types.h:699
+
+UvmGpuInfo_tag::maxGpcCount
+
+NvU32 maxGpcCount
+
+Definition nv_uvm_types.h:646
+
+UvmGpuInfo_tag::egmBaseAddr
+
+NvU64 egmBaseAddr
+
+Definition nv_uvm_types.h:702
+
+bool conf_computing_enabled
+
+Definition uvm_global.h:164
+
+uvm_global_struct::global_lock
+
+uvm_mutex_t global_lock
+
+Definition uvm_global.h:80
+
+uvm_global_struct::num_simulated_devices
+
+unsigned num_simulated_devices
+
+Definition uvm_global.h:102
+
+uvm_global_struct::peer_copy_mode
+
+uvm_gpu_peer_copy_mode_t peer_copy_mode
+
+Definition uvm_global.h:67
+
+uvm_global_struct::parent_gpus
+
+uvm_parent_gpu_t * parent_gpus[32]
+
+Definition uvm_global.h:48
+
+uvm_global_struct::gpu_table_lock
+
+uvm_spinlock_irqsave_t gpu_table_lock
+
+Definition uvm_global.h:99
+
+uvm_global_struct::pm
+
+struct uvm_global_struct::@153165025077340311011231221337046314275146015144 pm
+
+uvm_global_struct::ats
+
+struct uvm_global_struct::@337051212250256171033203072205347354264006177171 ats
+
+uvm_gpu_address_t
+
+Definition uvm_hal_types.h:185
+
+uvm_gpu_address_t::is_virtual
+Definition uvm_gpu.h:1070
+
+uvm_parent_gpu_struct::ats_supported
+
+bool ats_supported
+
+Definition uvm_gpu.h:1404
+
+uvm_parent_gpu_struct::egm
+
+struct uvm_parent_gpu_struct::@133302276014375044127201037066031324231137254114 egm
+
+uvm_parent_gpu_struct::virt_mode
+
+UVM_VIRT_MODE virt_mode
+
+Definition uvm_gpu.h:1060
+
+uvm_parent_gpu_struct::nvswitch_info
+
+struct uvm_parent_gpu_struct::@006324311313070033300074130354371363350011267215 nvswitch_info
+
+uvm_parent_processor_mask_t
+
+Definition uvm_processors.h:536
+
+uvm_rb_tree_node_t
+
+Definition uvm_rb_tree.h:42
+
+uvm_rb_tree_node_t::key
+
+NvU64 key
+
+Definition uvm_rb_tree.h:43
+
+uvm_rm_user_object_t
+
+Definition uvm_common.h:324
+
+uvm_rm_user_object_t::user_client
+
+NvHandle user_client
+
+Definition uvm_common.h:326
+
+uvm_rm_user_object_t::user_object
+
+NvHandle user_object
+#define UVM_ENTRY_RET(func_call)
+
+Definition uvm_api.h:165
+
+uvm_ats_add_gpu
+
+NV_STATUS uvm_ats_add_gpu(uvm_parent_gpu_t *parent_gpu)
+
+Definition uvm_ats.c:46
+
+uvm_ats_remove_gpu
+
+void uvm_ats_remove_gpu(uvm_parent_gpu_t *parent_gpu)
+
+Definition uvm_ats.c:56
+
+uvm_ats.h
+
+UVM_ATS_SUPPORTED
+
+#define UVM_ATS_SUPPORTED()
+
+Definition uvm_ats.h:33
+
+uvm_channel_manager_destroy
+
+void uvm_channel_manager_destroy(uvm_channel_manager_t *channel_manager)
+
+Definition uvm_channel.c:3976
+
+uvm_channel_manager_set_p2p_ce
+
+void uvm_channel_manager_set_p2p_ce(uvm_channel_manager_t *manager, uvm_gpu_t *peer, NvU32 optimal_ce)
+
+Definition uvm_channel.c:3231
+
+uvm_gpu_print_ce_mapping
+
+void uvm_gpu_print_ce_mapping(const uvm_gpu_t *gpu, struct seq_file *s)
+
+Definition uvm_channel.c:4115
+
+uvm_channel_manager_create
+
+NV_STATUS uvm_channel_manager_create(uvm_gpu_t *gpu, uvm_channel_manager_t **channel_manager_out)
+--------------------------------------------------------------------------------
+NVIDIA-open-gpu-kernel-modules: uvm_gpu.c - 610.57.04 vs. 615.71.09 changes | Fossies Diffs (https://fossies.org/diffs/NVIDIA-open-gpu-kernel-modules/610.57.04_vs_615.71.09/kernel-open/nvidia-uvm/uvm_gpu.c-diff.html)
+citeturn26search2 [wordlim: 200] Crawled: last month; #include "uvm_ats.h"  |  | #include "uvm_ats.h" ... if (UVM_ATS_SUPPORTED() && parent_gpu->ats.non_pasid_ats_enabled && gpu_info ->systemMemoryWindowSize)  |  | if (UVM_ATS_SUPPORTED() && parent_gpu->ats.non_pasid_ats_enabled && gpu_info ->systemMemoryWindowSize)
+
+### Source code changes of the file "kernel-open/nvidia-uvm/uvm_gpu.c" between
+NVIDIA-open-gpu-kernel-modules-610.57.04.tar.gz and NVIDIA-open-gpu-kernel-modules-615.71.09.tar.gz
+
+About: open-gpu-kernel-modules is the source release of the NVIDIA Linux open GPU kernel modules.
+
+[ To the main NVIDIA-open-gpu-kernel-modules source changes report ]
+
+uvm_gpu.c  (NVIDIA-open-gpu-kernel-modules-610.57.04)  | :  | uvm_gpu.c  (NVIDIA-open-gpu-kernel-modules-615.71.09)
+--- | --- | ---
+ |  | 
+skipping to change at line 49  |  | skipping to change at line 49
+--- | --- | ---
+#include "uvm_common.h"  |  | #include "uvm_common.h"
+#include "ctrl2080mc.h"  |  | #include "ctrl2080mc.h"
+#include "nv-kthread-q.h"  |  | #include "nv-kthread-q.h"
+#include "uvm_gpu_access_counters.h"  |  | #include "uvm_gpu_access_counters.h"
+#include "uvm_ats.h"  |  | #include "uvm_ats.h"
+#include "uvm_test.h"  |  | #include "uvm_test.h"
+#include "uvm_conf_computing.h"  |  | #include "uvm_conf_computing.h"
+#include "uvm_linux.h"  |  | #include "uvm_linux.h"
+#include "uvm_mmu.h"  |  | #include "uvm_mmu.h"
+#include "uvm_kvmalloc.h"  |  | #include "uvm_kvmalloc.h"
+ |  | #if UVM_USE_DMA_IOVA_API()
+ |  | #include <linux/dma-mapping.h>
+ |  | #endif
+ |  | 
+#define UVM_PROC_GPUS_PEER_DIR_NAME "peers"  |  | #define UVM_PROC_GPUS_PEER_DIR_NAME "peers"
+ |  | 
+// The uvm_peer_copy module parameter enables to choose from "phys" or "virt".  |  | // The uvm_peer_copy module parameter enables to choose from "phys" or "virt".
+// It determines the addressing mode for P2P copies.  |  | // It determines the addressing mode for P2P copies.
+parent_gpu->nvswitch_info.egm_fabric_memory_window_start = gpu_info->nvs  |  | if (gpu_info->flaWindowForCpuMemNode.bSupported) {
+witchEgmMemoryWindowStart;  |  | parent_gpu->egm.fabric_memory_window_start = gpu_info->flaWindowForC
+ |  | puMemNode.flaStart;
+ |  | parent_gpu->egm.window_size = gpu_info->flaWindowForCpuMemNode.flaSi
+ |  | ze;
+ |  | }
+ |  | else {
+ |  | parent_gpu->egm.fabric_memory_window_start = gpu_info->nvswitchEgmMe
+ |  | moryWindowStart;
+ |  | }
+}  |  | }
+ |  | 
+parent_gpu->ats.non_pasid_ats_enabled = gpu_info->nonPasidAtsSupport;  |  | parent_gpu->ats.non_pasid_ats_enabled = gpu_info->nonPasidAtsSupport;
+ |  | 
+// Non-PASID ATS cannot be disabled if present, but it implies PASID ATS  |  | // Non-PASID ATS cannot be disabled if present, but it implies PASID ATS
+// support.  |  | // support.
+// TODO: Bug 5161018: Include integrated GPUs in the assert once they  |  | // TODO: Bug 5161018: Include integrated GPUs in the assert once they
+// support PASID ATS.  |  | // support PASID ATS.
+if (UVM_ATS_SUPPORTED() && parent_gpu->ats.non_pasid_ats_enabled && gpu_info ->systemMemoryWindowSize)  |  | if (UVM_ATS_SUPPORTED() && parent_gpu->ats.non_pasid_ats_enabled && gpu_info ->systemMemoryWindowSize)
+UVM_ASSERT(g_uvm_global.ats.supported);  |  | UVM_ASSERT(g_uvm_global.ats.supported);
+ |  | 
+skipping to change at line 1473  |  | skipping to change at line 1482
+--- | --- | ---
+uvm_parent_gpu_name(parent_gpu));  |  | uvm_parent_gpu_name(parent_gpu));
+return status;  |  | return status;
+}  |  | }
+ |  | 
+uvm_conf_computing_check_parent_gpu(parent_gpu);  |  | uvm_conf_computing_check_parent_gpu(parent_gpu);
+ |  | 
+parent_gpu->pci_dev = gpu_platform_info->pci_dev;  |  | parent_gpu->pci_dev = gpu_platform_info->pci_dev;
+--------------------------------------------------------------------------------
+NVIDIA-open-gpu-kernel-modules: kernel-open/nvidia-uvm/uvm_gpu_access_counters.c File Reference - doxygen documentation | Fossies Dox (https://fossies.org/dox/NVIDIA-open-gpu-kernel-modules-615.71.09/uvm__gpu__access__counters_8c.html)
+citeturn26search3 [wordlim: 200] Crawled: last month; `#include "uvm_ats.h"` ... References uvm_global_struct::ats, g_uvm_global, UVM_ATS_SUPPORTED, and uvm_perf_access_counter_migration_enable.
+NVIDIA-open-gpu-kernel-modules  615.71.09 About: open-gpu-kernel-modules is the source release of the NVIDIA Linux open GPU kernel modules.
+Image  Fossies Dox: NVIDIA-open-gpu-kernel-modules-615.71.09.tar.gz  ("unofficial" and yet experimental* doxygen-generated source code documentation)  Image
+
+uvm_gpu_access_counters.c File Reference
+
+`#include "linux/sort.h"`
+`#include "nv_uvm_interface.h"`
+`#include "uvm_gpu_access_counters.h"`
+`#include "uvm_global.h"`
+`#include "uvm_api.h"`
+`#include "uvm_gpu.h"`
+`#include "uvm_hal.h"`
+`#include "uvm_hmm.h"`
+`#include "uvm_kvmalloc.h"`
+`#include "uvm_tools.h"`
+`#include "uvm_va_block.h"`
+`#include "uvm_va_range.h"`
+`#include "uvm_va_space_mm.h"`
+`#include "uvm_perf_module.h"`
+`#include "uvm_ats.h"`
+`#include "uvm_ats_faults.h"`
+
+Include dependency graph for uvm_gpu_access_counters.c:
+
+void init_access_counter_config ( const UvmGpuAccessCntrConfig * config,
+uvm_access_counter_buffer_t * access_counters )
+ | static
+
+Definition at line 375 of file uvm_gpu_access_counters.c.
+
+References config_granularity_to_bytes(), uvm_access_counter_buffer_struct::current_config, UvmGpuAccessCntrConfig_tag::granularity, min, NV_OK, UVM_ACCESS_COUNTER_GRANULARITY_64K, UVM_ASSERT, UVM_MAX_TRANSLATION_SIZE, and UVM_SUB_GRANULARITY_REGIONS.
+
+Referenced by access_counters_take_ownership().
+
+## ◆ is_migration_enabled()
+
+bool is_migration_enabled ( void )
+ | static
+
+Definition at line 147 of file uvm_gpu_access_counters.c.
+
+References uvm_global_struct::ats, g_uvm_global, UVM_ATS_SUPPORTED, and uvm_perf_access_counter_migration_enable.
+
+Referenced by uvm_parent_gpu_access_counters_required(), and va_space_access_counters_info_create().
+

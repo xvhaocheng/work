@@ -1,0 +1,416 @@
+diff --git a/drivers/misc/idma.c b/drivers/misc/idma.c
+index 3e8c14084a1b..89ec140bbe31 100644
+--- a/drivers/misc/idma.c
++++ b/drivers/misc/idma.c
+@@ -41,7 +41,15 @@ MODULE_LICENSE("GPL v2");
+ #define IDMA_OBS_INDEX_OFFSET 0x70
+ #define IDMA_OBS_DATA_OFFSET 0x78
+ #define IDMA_OBS_MAGIC 0x49444d414f425301ULL
++#define IDMA_OBS_MAGIC_V2 0x49444d414f425302ULL
+ #define IDMA_OBS_VALUES 34
++#define IDMA_BATCH_MAGIC_OFFSET 0x80
++#define IDMA_BATCH_CONTROL_OFFSET 0x88
++#define IDMA_BATCH_TARGET_OFFSET 0x90
++#define IDMA_BATCH_PAGES_OFFSET 0x98
++#define IDMA_BATCH_COMPLETED_OFFSET 0xa0
++#define IDMA_BATCH_ISSUED_OFFSET 0xa8
++#define IDMA_BATCH_MAGIC 0x49444d4142544301ULL
+ #define IDMA_XFER_TIMEOUT_US 2000000
+ #define IDMA_MAX_DEVS 8
+ #define IDMA_MAX_PAGES 4096U
+@@ -67,6 +75,7 @@ struct idma_stream {
+ 	u32 chunk;
+ 	u64 transfer_id, deadline_ns, last_complete_ns;
+ 	bool mapped_src, mapped_dst, in_flight, retain;
++	bool batch_configured, batch_started;
+ 	struct idma_experiment_stats *stats;
+ };
+ 
+@@ -506,6 +515,113 @@ static int idma_verify(struct idma_stream *s)
+ 	return 0;
+ }
+ 
++/* Batch mode still uses DEFAULT read/write copies. STOP never cancels AXI. */
++static int idma_batch_configure(struct idma_stream *s, u64 count)
++{
++	void __iomem *base = s->idma->reg;
++
++	if (readq(base + IDMA_BATCH_MAGIC_OFFSET) != IDMA_BATCH_MAGIC)
++		return -EOPNOTSUPP;
++	if (readq(base + IDMA_BATCH_CONTROL_OFFSET) & 2)
++		return -EBUSY;
++	writeq(0, base + IDMA_BATCH_CONTROL_OFFSET);
++	writeq(count, base + IDMA_BATCH_TARGET_OFFSET);
++	writeq(s->size / PAGE_SIZE, base + IDMA_BATCH_PAGES_OFFSET);
++	writeq(1, base + IDMA_BATCH_CONTROL_OFFSET);
++	s->batch_configured = true;
++	s->next_offset = 0;
++	return readq(base + IDMA_BATCH_CONTROL_OFFSET) == 1 ? 0 : -EIO;
++}
++
++static void idma_batch_stop(struct idma_stream *s)
++{
++	if (s && s->batch_configured && s->batch_started)
++		writeq(2, s->idma->reg + IDMA_BATCH_CONTROL_OFFSET);
++}
++
++static int idma_batch_collect(struct idma_stream *s)
++{
++	u64 status, issued, completed;
++
++	if (!s || !s->batch_configured)
++		return 0;
++	if (s->retain)
++		return -EIO;
++	status = readq(s->idma->reg + IDMA_BATCH_CONTROL_OFFSET);
++	if (status & 2) {
++		idma_quarantine(s);
++		return -EIO;
++	}
++	if (s->batch_started) {
++		issued = readq(s->idma->reg + IDMA_BATCH_ISSUED_OFFSET);
++		completed = readq(s->idma->reg + IDMA_BATCH_COMPLETED_OFFSET);
++		s->stats->submitted = issued;
++		s->stats->completed = completed;
++		s->stats->completed_bytes = completed * PAGE_SIZE;
++		s->touched_end = max(s->touched_end,
++			(size_t)min(completed, (u64)(s->size / PAGE_SIZE)) * PAGE_SIZE);
++		if (issued != completed || issued > IDMA_EXPERIMENT_MAX_TRANSFERS)
++			return -EIO;
++	}
++	return status >> 32 ? -EIO : 0;
++}
++
++static void idma_batch_disable(struct idma_stream *s)
++{
++	if (s && s->batch_configured && !s->retain)
++		writeq(0, s->idma->reg + IDMA_BATCH_CONTROL_OFFSET);
++}
++
++static int idma_batch_window(struct idma_stream *v, struct idma_stream *a,
++			     u64 deadline, u64 *end_ns)
++{
++	u32 spins = 0;
++	int ret;
++
++	if (ktime_get_ns() >= deadline) {
++		ret = -ETIMEDOUT;
++		goto out;
++	}
++	if (signal_pending(current)) {
++		ret = -EINTR;
++		goto out;
++	}
++	if (a) {
++		a->batch_started = true;
++		ret = idma_submit(a, false);
++		if (ret)
++			goto out;
++	}
++	v->batch_started = true;
++	ret = idma_submit(v, false);
++	if (ret)
++		goto out;
++	v->deadline_ns = deadline;
++	for (;;) {
++		if (ktime_get_ns() >= deadline) {
++			ret = -ETIMEDOUT;
++			break;
++		}
++		if (signal_pending(current)) {
++			ret = -EINTR;
++			break;
++		}
++		ret = idma_poll(v, false);
++		if (ret < 0)
++			break;
++		if (ret == 1) {
++			*end_ns = v->last_complete_ns;
++			return 0;
++		}
++		if (!(++spins & 1023))
++			cond_resched();
++		cpu_relax();
++	}
++ out:
++	*end_ns = ktime_get_ns();
++	return ret;
++}
++
+ static void idma_snapshot(struct riscv_iommu_hpm_session *hpm,
+ 			  struct idma_stream *v, struct idma_stream *a,
+ 			  struct riscv_iommu_hpm_sample *sample, u64 active[2])
+@@ -566,7 +682,7 @@ MODULE_PARM_DESC(observe, "Collect passive E4 hardware timing (requires observat
+ struct idma_observation {
+ 	struct idma_device *control;
+ 	u64 sequence;
+-	bool armed;
++	bool armed, batch;
+ };
+ 
+ static u64 idma_observation_sequence;
+@@ -574,14 +690,17 @@ static u64 idma_observation_sequence;
+ /* Called with the experiment lock, before preparing or submitting any DMA. */
+ static int idma_observation_prepare(struct idma_observation *o, bool enabled)
+ {
++	u64 magic;
++
+ 	if (!enabled)
+ 		return 0;
+ 	o->sequence = ++idma_observation_sequence;
+ 	o->control = idma_get_instance(0);
+ 	if (!o->control)
+ 		return -ENODEV;
++	magic = readq(o->control->reg + IDMA_OBS_MAGIC_OFFSET);
+ 	if (o->control->did != 10 ||
+-	    readq(o->control->reg + IDMA_OBS_MAGIC_OFFSET) != IDMA_OBS_MAGIC)
++	    (magic != IDMA_OBS_MAGIC_V2 && (o->batch || magic != IDMA_OBS_MAGIC)))
+ 		return -EOPNOTSUPP;
+ 	/* Clear previous frozen results; never take ownership of an active session. */
+ 	if (readq(o->control->reg + IDMA_OBS_CONTROL_OFFSET) & 3)
+@@ -593,7 +712,7 @@ static int idma_observation_prepare(struct idma_observation *o, bool enabled)
+ static int idma_observation_arm(struct idma_observation *o,
+ 				struct idma_device *v, struct idma_device *a, u64 count)
+ {
+-	u64 command = 1;
++	u64 command = 1 | (o->batch ? BIT_ULL(25) : 0);
+ 
+ 	if (!o->control)
+ 		return 0;
+@@ -632,7 +751,7 @@ static int idma_observation_finish(struct idma_observation *o,
+ 	}
+ 	valid = !run_error && status == 4 &&
+ 		values[7] == e->victim_transfers && values[8] == values[7] &&
+-		values[9] == values[7] &&
++		values[9] == (o->batch ? 1 : values[7]) &&
+ 		values[0] == values[1] + values[2] + values[3] &&
+ 		values[0] == values[10] + values[11] + values[12] + values[13];
+ 	/* Opening stock + accepted requests must equal returns + closing stock. */
+@@ -645,30 +764,45 @@ static int idma_observation_finish(struct idma_observation *o,
+ 		    (closing & 0xffff) + values[17 + 6 * i])
+ 			valid = false;
+ 	}
++	if (o->batch) {
++		u64 read_delay;
++
++		writeq(34, base + IDMA_OBS_INDEX_OFFSET);
++		read_delay = readq(base + IDMA_OBS_DATA_OFFSET);
++		valid = valid && values[2] == 0;
++		dev_info(o->control->miscdev.parent,
++			 "idma_batch_obs seq=%llu part=time valid=%u status=%#llx v_did=%u a_did=%u cycles=%llu h=%llu gap=%llu hmax=%llu gapmax=%llu issued=%llu done=%llu batch_polled=%llu done_to_read=%llu\n",
++			 o->sequence, valid, status, e->victim_did, e->aggressor_did,
++			 values[0], values[1], values[3], values[4], values[6],
++			 values[7], values[8], values[9], read_delay);
++	} else {
++		dev_info(o->control->miscdev.parent,
++			 "idma_obs seq=%llu part=time valid=%u status=%#llx v_did=%u a_did=%u cycles=%llu h=%llu p=%llu r=%llu hmax=%llu pmax=%llu rmax=%llu issued=%llu done=%llu polled=%llu\n",
++			 o->sequence, valid, status, e->victim_did, e->aggressor_did,
++			 values[0], values[1], values[2], values[3], values[4], values[5],
++			 values[6], values[7], values[8], values[9]);
++	}
+ 	dev_info(o->control->miscdev.parent,
+-		 "idma_obs seq=%llu part=time valid=%u status=%#llx v_did=%u a_did=%u cycles=%llu h=%llu p=%llu r=%llu hmax=%llu pmax=%llu rmax=%llu issued=%llu done=%llu polled=%llu\n",
+-		 o->sequence, valid, status, e->victim_did, e->aggressor_did,
+-		 values[0], values[1], values[2], values[3], values[4], values[5],
+-		 values[6], values[7], values[8], values[9]);
+-	dev_info(o->control->miscdev.parent,
+-		 "idma_obs seq=%llu part=axi_v neither=%llu v_only=%llu a_only=%llu both=%llu ar=%llu aw=%llu rlast=%llu b=%llu ar_wait=%llu aw_wait=%llu start=%#llx end=%#llx\n",
+-		 o->sequence, values[10], values[11], values[12], values[13],
++		 "%s seq=%llu part=axi_v neither=%llu v_only=%llu a_only=%llu both=%llu ar=%llu aw=%llu rlast=%llu b=%llu ar_wait=%llu aw_wait=%llu start=%#llx end=%#llx\n",
++		 (o->batch ? "idma_batch_obs" : "idma_obs"), o->sequence,
++		 values[10], values[11], values[12], values[13],
+ 		 values[14], values[15], values[16], values[17], values[18],
+ 		 values[19], values[30], values[32]);
+ 	dev_info(o->control->miscdev.parent,
+-		 "idma_obs seq=%llu part=axi_a ar=%llu aw=%llu rlast=%llu b=%llu ar_wait=%llu aw_wait=%llu start=%#llx end=%#llx shared_ar=%llu shared_aw=%llu shared_ar_wait=%llu shared_aw_wait=%llu\n",
+-		 o->sequence, values[20], values[21], values[22], values[23],
++		 "%s seq=%llu part=axi_a ar=%llu aw=%llu rlast=%llu b=%llu ar_wait=%llu aw_wait=%llu start=%#llx end=%#llx shared_ar=%llu shared_aw=%llu shared_ar_wait=%llu shared_aw_wait=%llu\n",
++		 (o->batch ? "idma_batch_obs" : "idma_obs"), o->sequence,
++		 values[20], values[21], values[22], values[23],
+ 		 values[24], values[25], values[31], values[33], values[26],
+ 		 values[27], values[28], values[29]);
+ 	return valid ? 0 : -EIO;
+ }
+ 
+-static long idma_run_experiment(struct idma_device *victim,
+-			       struct idma_experiment __user *uarg)
++static long idma_run_experiment_mode(struct idma_device *victim,
++			       struct idma_experiment __user *uarg, bool batch)
+ {
+ 	struct idma_experiment e;
+ 	struct idma_stream streams[2] = {};
+-	struct idma_observation observation = {};
++	struct idma_observation observation = { .batch = batch };
+ 	struct idma_stream *v = &streams[0], *a = NULL;
+ 	struct idma_device *aggressor = NULL;
+ 	struct riscv_iommu_hpm_session *hpm = NULL;
+@@ -683,6 +817,9 @@ static long idma_run_experiment(struct idma_device *victim,
+ 	e.victim_did = victim->did;
+ 	e.aggressor_did = IDMA_EXPERIMENT_NO_AGGRESSOR;
+ 	ret = idma_validate(&e);
++	if (!ret && batch && (e.chunk_bytes != PAGE_SIZE ||
++			      e.victim_transfers > IDMA_BATCH_MAX_TRANSFERS))
++		ret = -EINVAL;
+ 	if (ret)
+ 		goto out_copy;
+ 	ret = mutex_lock_interruptible(&idma_experiment_lock);
+@@ -705,9 +842,14 @@ static long idma_run_experiment(struct idma_device *victim,
+ 		e.aggressor_did = aggressor->did;
+ 		a = &streams[1];
+ 	}
+-	ret = idma_observation_prepare(&observation, READ_ONCE(idma_observe));
++	ret = idma_observation_prepare(&observation, batch || READ_ONCE(idma_observe));
+ 	if (ret)
+ 		goto out_put;
++	if (batch && (readq(victim->reg + IDMA_BATCH_MAGIC_OFFSET) != IDMA_BATCH_MAGIC ||
++	    (aggressor && readq(aggressor->reg + IDMA_BATCH_MAGIC_OFFSET) != IDMA_BATCH_MAGIC))) {
++		ret = -EOPNOTSUPP;
++		goto out_put;
++	}
+ 	ret = idma_stream_prepare(v, victim, e.victim_pages, e.chunk_bytes, &e.victim);
+ 	if (ret)
+ 		goto out_cleanup;
+@@ -728,7 +870,7 @@ static long idma_run_experiment(struct idma_device *victim,
+ 	 */
+ 	local_flush_icache_all();
+ 	deadline = ktime_get_ns() + (u64)e.run_timeout_ms * NSEC_PER_MSEC;
+-	if (a) {
++	if (a && (!batch || e.warmup_transfers)) {
+ 		ret = idma_submit(a, false);
+ 		if (ret)
+ 			goto out_drain;
+@@ -741,6 +883,19 @@ static long idma_run_experiment(struct idma_device *victim,
+ 	v->last_complete_ns = 0;
+ 	if (a)
+ 		a->last_complete_ns = 0;
++	if (batch) {
++		/* Software warmup is drained before enabling the autonomous mode. */
++		if (a) {
++			ret = idma_drain(a);
++			if (ret)
++				goto out_drain;
++		}
++		ret = idma_batch_configure(v, e.victim_transfers);
++		if (!ret && a)
++			ret = idma_batch_configure(a, IDMA_EXPERIMENT_MAX_TRANSFERS);
++		if (ret)
++			goto out_drain;
++	}
+ 	e.victim.in_flight_at_start = v->in_flight;
+ 	e.aggressor.in_flight_at_start = a && a->in_flight;
+ 	ret = idma_observation_arm(&observation, victim, aggressor, e.victim_transfers);
+@@ -751,12 +906,19 @@ static long idma_run_experiment(struct idma_device *victim,
+ 	start = ktime_get_ns();
+ 	e.snapshot_before_ns = start - stamp;
+ 	e.measurement_started = 1;
+-	ret = idma_run_window(v, a, e.victim_transfers, deadline, true, &end);
++	ret = batch ? idma_batch_window(v, a, deadline, &end) :
++		idma_run_window(v, a, e.victim_transfers, deadline, true, &end);
+ 	e.victim_elapsed_ns = end - start;
+ 	e.measurement_complete = !ret;
+ 	e.victim.in_flight_at_end = v->in_flight;
+ 	e.aggressor.in_flight_at_end = a && a->in_flight;
+-	/* No more A refills after V's final observed completion. */
++	/* Stop autonomous A after V observation; hardware window is already frozen. */
++	if (batch) {
++		idma_batch_stop(a);
++		if (ret)
++			idma_batch_stop(v);
++	}
++	/* No more software A refills after V's final observed completion. */
+ 	idma_snapshot(hpm, v, a, &after, active_after);
+ 	e.snapshot_after_ns = ktime_get_ns() - end;
+ 	idma_snapshot_delta(&e.victim, 0, &before, &after,
+@@ -765,6 +927,10 @@ static long idma_run_experiment(struct idma_device *victim,
+ 		idma_snapshot_delta(&e.aggressor, 1, &before, &after,
+ 				    active_before[1], active_after[1]);
+  out_drain:
++	if (batch) {
++		idma_batch_stop(v);
++		idma_batch_stop(a);
++	}
+ 	stamp = ktime_get_ns();
+ 	drain_ret = idma_drain(v);
+ 	if (drain_ret && !ret)
+@@ -775,6 +941,16 @@ static long idma_run_experiment(struct idma_device *victim,
+ 			ret = drain_ret;
+ 	}
+ 	e.drain_ns = ktime_get_ns() - stamp;
++	if (batch) {
++		drain_ret = idma_batch_collect(v);
++		if (drain_ret && !ret)
++			ret = drain_ret;
++		drain_ret = idma_batch_collect(a);
++		if (drain_ret && !ret)
++			ret = drain_ret;
++		if (!ret && e.victim.completed != e.victim_transfers)
++			ret = -EIO;
++	}
+ 	riscv_iommu_hpm_release(hpm);
+ 	if (!ret) {
+ 		/* Both lanes are drained: reacquire CPU visibility before any check. */
+@@ -792,6 +968,10 @@ static long idma_run_experiment(struct idma_device *victim,
+ 	observation_ret = idma_observation_finish(&observation, &e, ret);
+ 	if (observation_ret && !ret)
+ 		ret = observation_ret;
++	if (batch) {
++		idma_batch_disable(v);
++		idma_batch_disable(a);
++	}
+ 	if (a)
+ 		idma_stream_cleanup(a);
+ 	idma_stream_cleanup(v);
+@@ -807,13 +987,19 @@ static long idma_run_experiment(struct idma_device *victim,
+ 	return ret;
+ }
+ 
++static long idma_run_experiment(struct idma_device *victim,
++			       struct idma_experiment __user *uarg)
++{
++	return idma_run_experiment_mode(victim, uarg, false);
++}
++
+ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ {
+ 	struct idma_device *idma = fp->private_data;
+ 	struct idma_experiment_caps caps = {
+ 		.abi_version = IDMA_EXPERIMENT_ABI,
+ 		.struct_size = sizeof(caps),
+-		.capabilities = IDMA_EXPERIMENT_CAP_SW_REFILL,
++		.capabilities = IDMA_EXPERIMENT_CAP_SW_REFILL | IDMA_EXPERIMENT_CAP_HW_BATCH,
+ 		.device_id = idma->id,
+ 		.did = idma->did,
+ 		.max_pages = IDMA_MAX_PAGES,
+@@ -826,6 +1012,8 @@ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ 		if (riscv_iommu_hpm_supported(idma->miscdev.parent))
+ 			caps.capabilities |= IDMA_EXPERIMENT_CAP_DID_HPM;
+ 		return copy_to_user((void __user *)arg, &caps, sizeof(caps)) ? -EFAULT : 0;
++	case IDMA_IOC_RUN_BATCH:
++		return idma_run_experiment_mode(idma, (struct idma_experiment __user *)arg, true);
+ 	case IDMA_IOC_RUN_EXPERIMENT:
+ 		return idma_run_experiment(idma, (struct idma_experiment __user *)arg);
+ 	default:
+diff --git a/include/uapi/linux/idma.h b/include/uapi/linux/idma.h
+index 3103bf2662d1..86e6f4f9cb69 100644
+--- a/include/uapi/linux/idma.h
++++ b/include/uapi/linux/idma.h
+@@ -10,6 +10,8 @@
+ #define IDMA_EXPERIMENT_NO_AGGRESSOR ((__u32)~0U)
+ #define IDMA_EXPERIMENT_CAP_DID_HPM (1U << 0)
+ #define IDMA_EXPERIMENT_CAP_SW_REFILL (1U << 1)
++#define IDMA_EXPERIMENT_CAP_HW_BATCH (1U << 2)
++#define IDMA_BATCH_MAX_TRANSFERS (1ULL << 20)
+ /* HPM capability is preliminary; acquire checks slots/filter readback too. */
+ /* Neither capability nor configuration establishes board calibration. */
+ struct idma_experiment_caps {
+@@ -76,4 +78,10 @@ struct idma_experiment {
+ #define IDMA_IOC_EXPERIMENT_CAPS _IOR('i', 0x06, struct idma_experiment_caps)
+ #define IDMA_IOC_RUN_EXPERIMENT _IOWR('i', 0x07, struct idma_experiment)
+ 
++/* Separate operation/JSON semantics, same validated input layout; reserved=0.
++ * Batch stats count hardware tasks; refill gaps are not sampled. A counts include
++ * its startup and final drain, rather than just the V hardware window.
++ */
++#define IDMA_IOC_RUN_BATCH _IOWR('i', 0x08, struct idma_experiment)
++
+ #endif

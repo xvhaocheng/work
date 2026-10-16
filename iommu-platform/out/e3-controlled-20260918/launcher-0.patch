@@ -1,0 +1,549 @@
+diff --git a/cva6/corev_apu/fpga/src/dma_controlled_launcher.sv b/cva6/corev_apu/fpga/src/dma_controlled_launcher.sv
+new file mode 100644
+--- /dev/null
++++ b/cva6/corev_apu/fpga/src/dma_controlled_launcher.sv
+@@ -0,0 +1,588 @@
++// SPDX-License-Identifier: Solderpad-0.51
++// Controlled launcher for the iDMA observer-port frontend.
++// This block does not gate AXI. It only observes E3 select, frontend status,
++// and backend issue/done, and drives hold/go/cancel to the controlled ports.
++//
++// Error bits [63:32] are sticky until a successful PREP or CLEAR while inactive.
++// bit  name
++//  0   bad_cfg_strobe          partial cfg_wstrb_i
++//  1   bad_command             unknown or unsupported command
++//  2   bad_prep                PREP not allowed in current state
++//  3   bad_go                  GO not allowed in current state
++//  4   abort_inactive          ABORT while not active/frozen
++//  5   frontend_error          frontend_error_i while owned
++//  6   unexpected_issue        obs_issue_i on unselected port
++//  7   unexpected_done         obs_done_i on unselected port
++//  8   done_without_issue      obs_done_i before obs_issue_i
++//  9   issue_id_mismatch       issue ID not fixed V=0/A=4
++// 10   done_id_mismatch        done ID not fixed V=0/A=4
++// 11   extra_issue             more than one issue on a lane
++// 12   extra_done              more than one done on a lane
++// 13   tick_overflow           64-bit tick counter saturated
++// 14   bad_index               c0 index outside 0..31
++// 15   bad_c8_write            write to read-only c8
++// 16   bad_b0_write            write to read-only b0
++// 17   select_mismatch         reserved for A-select diagnostics
++// 18   cancel_issue_race       reserved for abort/issue race diagnostics
++module dma_controlled_launcher #(
++    parameter int unsigned NumPorts = 4
++) (
++    input  logic clk_i, rst_ni,
++    // 8-bit MMIO cfg window: b0 magic, b8 command/status, c0 index, c8 data.
++    input  logic cfg_valid_i, cfg_write_i,
++    input  logic [7:0] cfg_addr_i,
++    input  logic [63:0] cfg_wdata_i,
++    input  logic [7:0] cfg_wstrb_i,
++    output logic [63:0] cfg_rdata_o,
++    // Controlled frontend status.
++    input  logic [NumPorts-1:0] frontend_held_i,
++    input  logic [NumPorts-1:0] frontend_active_i,
++    input  logic [NumPorts-1:0] frontend_cancelled_i,
++    input  logic [NumPorts-1:0] frontend_error_i,
++    // Actual backend accept/completion.
++    input  logic [NumPorts-1:0] obs_issue_i,
++    input  logic [NumPorts-1:0] obs_done_i,
++    input  logic [63:0] obs_issue_id_i [NumPorts],
++    input  logic [63:0] obs_done_id_i [NumPorts],
++    // E3 select tap.
++    input  logic selected_i,
++    input  logic select_write_i,
++    input  logic [7:0] select_id_i,
++    input  logic [23:0] select_did_i,
++    input  logic [63:0] select_iova_i,
++    // Frontend controls.
++    output logic [NumPorts-1:0] launch_hold_o,
++    output logic [NumPorts-1:0] launch_go_o,
++    output logic [NumPorts-1:0] launch_cancel_o
++);
++    localparam logic [63:0] MAGIC = 64'h49444d414c4e4301;
++    localparam int unsigned V_PORT = 0;
++    localparam int unsigned A_PORT = 1;
++    localparam logic [63:0] V_ID = 64'd0;
++    localparam logic [63:0] A_ID = 64'd4;
++    localparam logic [7:0] A_SEL_ID = 8'd4;
++    localparam logic [23:0] A_DID = 24'd11;
++    localparam logic [63:0] CMD_PREP = 64'h1;
++    localparam logic [63:0] CMD_GO = 64'h2;
++    localparam logic [63:0] CMD_ABORT = 64'h4;
++    localparam logic [63:0] CMD_CLEAR = 64'h8;
++    localparam logic [63:0] CMD_HAS_A = 64'h100;
++
++    localparam int ERR_BAD_STROBE = 0;
++    localparam int ERR_BAD_CMD = 1;
++    localparam int ERR_BAD_PREP = 2;
++    localparam int ERR_BAD_GO = 3;
++    localparam int ERR_ABORT = 4;
++    localparam int ERR_FRONTEND = 5;
++    localparam int ERR_UNEXP_ISSUE = 6;
++    localparam int ERR_UNEXP_DONE = 7;
++    localparam int ERR_DONE_NO_ISSUE = 8;
++    localparam int ERR_ISSUE_ID = 9;
++    localparam int ERR_DONE_ID = 10;
++    localparam int ERR_EXTRA_ISSUE = 11;
++    localparam int ERR_EXTRA_DONE = 12;
++    localparam int ERR_TICK_OVF = 13;
++    localparam int ERR_BAD_INDEX = 14;
++    localparam int ERR_BAD_C8_WRITE = 15;
++    localparam int ERR_BAD_B0_WRITE = 16;
++
++    typedef enum logic [1:0] {ST_OFF, ST_PREP, ST_RUNNING, ST_FROZEN} state_t;
++    state_t state_q, state_n;
++
++    logic [31:0] error_q, error_n;
++    logic [63:0] ticks_q, ticks_n;
++    logic [NumPorts-1:0] expected_mask_q, expected_mask_n;
++    logic [NumPorts-1:0] hold_mask_q, hold_mask_n;
++    logic [NumPorts-1:0] issued_mask_q, issued_mask_n;
++    logic [NumPorts-1:0] done_mask_q, done_mask_n;
++    logic [NumPorts-1:0] cancelled_mask_q, cancelled_mask_n;
++    logic [NumPorts-1:0] seen_held_q, seen_held_n;
++    logic aborted_q, aborted_n;
++    logic has_a_q, has_a_n;
++    logic [7:0] index_q, index_n;
++
++    logic [63:0] v_issue_count_q, v_issue_count_n;
++    logic [63:0] a_issue_count_q, a_issue_count_n;
++    logic [63:0] v_done_count_q, v_done_count_n;
++    logic [63:0] a_done_count_q, a_done_count_n;
++
++    logic [63:0] go_a_ts_q, go_a_ts_n;
++    logic [63:0] a_select_ts_q, a_select_ts_n;
++    logic [63:0] go_v_ts_q, go_v_ts_n;
++    logic [63:0] v_issue_ts_q, v_issue_ts_n;
++    logic [63:0] a_issue_ts_q, a_issue_ts_n;
++    logic [63:0] v_done_ts_q, v_done_ts_n;
++    logic [63:0] a_done_ts_q, a_done_ts_n;
++    logic go_a_ts_valid_q, go_a_ts_valid_n;
++    logic a_select_ts_valid_q, a_select_ts_valid_n;
++    logic go_v_ts_valid_q, go_v_ts_valid_n;
++    logic v_issue_ts_valid_q, v_issue_ts_valid_n;
++    logic a_issue_ts_valid_q, a_issue_ts_valid_n;
++    logic v_done_ts_valid_q, v_done_ts_valid_n;
++    logic a_done_ts_valid_q, a_done_ts_valid_n;
++
++    logic [63:0] v_issue_id_q, v_issue_id_n;
++    logic [63:0] a_issue_id_q, a_issue_id_n;
++    logic [63:0] v_done_id_q, v_done_id_n;
++    logic [63:0] a_done_id_q, a_done_id_n;
++    logic v_issue_id_valid_q, v_issue_id_valid_n;
++    logic a_issue_id_valid_q, a_issue_id_valid_n;
++    logic v_done_id_valid_q, v_done_id_valid_n;
++    logic a_done_id_valid_q, a_done_id_valid_n;
++
++    logic [7:0] selected_id_q, selected_id_n;
++    logic [23:0] selected_did_q, selected_did_n;
++    logic [63:0] selected_iova_q, selected_iova_n;
++    logic selected_write_q, selected_write_n;
++
++    logic [NumPorts-1:0] go_pulse_q, go_pulse_n;
++    logic a_go_sent_q, a_go_sent_n;
++    logic v_go_sent_q, v_go_sent_n;
++    logic a_select_seen_q, a_select_seen_n;
++
++    logic [63:0] status_word;
++
++    assign launch_hold_o = hold_mask_q;
++    assign launch_go_o = go_pulse_q;
++
++    always_comb begin : status_comb
++        status_word = '0;
++        status_word[63:32] = error_q;
++        status_word[15:12] = 4'(frontend_active_i);
++        status_word[11:8]  = 4'(frontend_held_i);
++        status_word[3] = aborted_q;
++        status_word[2] = (state_q == ST_FROZEN) && !aborted_q;
++        status_word[1] = (state_q == ST_RUNNING);
++        status_word[0] = (state_q == ST_PREP) || (state_q == ST_RUNNING);
++    end
++
++    always_comb begin : cancel_comb
++        launch_cancel_o = '0;
++        if (aborted_q && state_q == ST_RUNNING) begin
++            for (int p = 0; p < NumPorts; p++) begin
++                if (expected_mask_q[p] && hold_mask_q[p] && frontend_held_i[p] &&
++                    !obs_issue_i[p] && !cancelled_mask_q[p]) begin
++                    launch_cancel_o[p] = 1'b1;
++                end
++            end
++        end
++    end
++
++    always_comb begin : read_comb
++        cfg_rdata_o = '0;
++        case (cfg_addr_i)
++            8'hb0: cfg_rdata_o = MAGIC;
++            8'hb8: cfg_rdata_o = status_word;
++            8'hc0: cfg_rdata_o = {56'b0, index_q};
++            8'hc8: begin
++                case (index_q)
++                    8'd0:  cfg_rdata_o = MAGIC;
++                    8'd1:  cfg_rdata_o = {32'b0, error_q};
++                    8'd2:  cfg_rdata_o = status_word;
++                    8'd3:  cfg_rdata_o = ticks_q;
++                    8'd4:  cfg_rdata_o = go_a_ts_q;
++                    8'd5:  cfg_rdata_o = a_select_ts_q;
++                    8'd6:  cfg_rdata_o = go_v_ts_q;
++                    8'd7:  cfg_rdata_o = v_issue_ts_q;
++                    8'd8:  cfg_rdata_o = a_issue_ts_q;
++                    8'd9:  cfg_rdata_o = v_done_ts_q;
++                    8'd10: cfg_rdata_o = a_done_ts_q;
++                    8'd11: cfg_rdata_o = v_issue_id_q;
++                    8'd12: cfg_rdata_o = a_issue_id_q;
++                    8'd13: cfg_rdata_o = v_done_id_q;
++                    8'd14: cfg_rdata_o = a_done_id_q;
++                    8'd15: cfg_rdata_o = 64'(issued_mask_q);
++                    8'd16: cfg_rdata_o = 64'(done_mask_q);
++                    8'd17: cfg_rdata_o = 64'(cancelled_mask_q);
++                    8'd18: cfg_rdata_o = 64'(seen_held_q);
++                    8'd19: cfg_rdata_o = 64'(expected_mask_q);
++                    8'd20: cfg_rdata_o = 64'(selected_id_q);
++                    8'd21: cfg_rdata_o = 64'(selected_did_q);
++                    8'd22: cfg_rdata_o = selected_iova_q;
++                    8'd23: cfg_rdata_o = {63'b0, selected_write_q};
++                    8'd24: cfg_rdata_o = v_issue_count_q;
++                    8'd25: cfg_rdata_o = a_issue_count_q;
++                    8'd26: cfg_rdata_o = v_done_count_q;
++                    8'd27: cfg_rdata_o = a_done_count_q;
++                    8'd28: cfg_rdata_o = {63'b0, has_a_q};
++                    8'd29: cfg_rdata_o = 64'(frontend_held_i);
++                    8'd30: cfg_rdata_o = 64'(frontend_active_i);
++                    8'd31: cfg_rdata_o = '0;
++                    default: cfg_rdata_o = '0;
++                endcase
++            end
++            default: cfg_rdata_o = '0;
++        endcase
++    end
++
++    always_comb begin : main_comb
++        // defaults
++        state_n = state_q;
++        error_n = error_q;
++        ticks_n = ticks_q;
++        expected_mask_n = expected_mask_q;
++        hold_mask_n = hold_mask_q;
++        issued_mask_n = issued_mask_q;
++        done_mask_n = done_mask_q;
++        cancelled_mask_n = cancelled_mask_q;
++        seen_held_n = seen_held_q;
++        aborted_n = aborted_q;
++        has_a_n = has_a_q;
++        index_n = index_q;
++        v_issue_count_n = v_issue_count_q;
++        a_issue_count_n = a_issue_count_q;
++        v_done_count_n = v_done_count_q;
++        a_done_count_n = a_done_count_q;
++        go_a_ts_n = go_a_ts_q;
++        a_select_ts_n = a_select_ts_q;
++        go_v_ts_n = go_v_ts_q;
++        v_issue_ts_n = v_issue_ts_q;
++        a_issue_ts_n = a_issue_ts_q;
++        v_done_ts_n = v_done_ts_q;
++        a_done_ts_n = a_done_ts_q;
++        go_a_ts_valid_n = go_a_ts_valid_q;
++        a_select_ts_valid_n = a_select_ts_valid_q;
++        go_v_ts_valid_n = go_v_ts_valid_q;
++        v_issue_ts_valid_n = v_issue_ts_valid_q;
++        a_issue_ts_valid_n = a_issue_ts_valid_q;
++        v_done_ts_valid_n = v_done_ts_valid_q;
++        a_done_ts_valid_n = a_done_ts_valid_q;
++        v_issue_id_n = v_issue_id_q;
++        a_issue_id_n = a_issue_id_q;
++        v_done_id_n = v_done_id_q;
++        a_done_id_n = a_done_id_q;
++        v_issue_id_valid_n = v_issue_id_valid_q;
++        a_issue_id_valid_n = a_issue_id_valid_q;
++        v_done_id_valid_n = v_done_id_valid_q;
++        a_done_id_valid_n = a_done_id_valid_q;
++        selected_id_n = selected_id_q;
++        selected_did_n = selected_did_q;
++        selected_iova_n = selected_iova_q;
++        selected_write_n = selected_write_q;
++        go_pulse_n = '0;
++        a_go_sent_n = a_go_sent_q;
++        v_go_sent_n = v_go_sent_q;
++        a_select_seen_n = a_select_seen_q;
++
++        // Tick counter while owned. Saturates and sets sticky fault.
++        if (state_q == ST_PREP || state_q == ST_RUNNING) begin
++            if (ticks_q == {64{1'b1}}) begin
++                error_n[ERR_TICK_OVF] = 1'b1;
++            end else begin
++                ticks_n = ticks_q + 1'b1;
++            end
++        end
++
++        // Track held seen while owned.
++        if (state_q == ST_PREP || state_q == ST_RUNNING) begin
++            seen_held_n = seen_held_q | frontend_held_i;
++        end
++
++        // Record frontend error while owned.
++        if ((state_q == ST_PREP || state_q == ST_RUNNING) &&
++            |(frontend_error_i & expected_mask_q)) begin
++            error_n[ERR_FRONTEND] = 1'b1;
++        end
++
++        // Actual backend events.
++        if (state_q == ST_PREP || state_q == ST_RUNNING) begin
++            if (|(obs_issue_i & ~expected_mask_q)) error_n[ERR_UNEXP_ISSUE] = 1'b1;
++            if (|(obs_done_i & ~expected_mask_q)) error_n[ERR_UNEXP_DONE] = 1'b1;
++            for (int p = 0; p < NumPorts; p++) begin
++                if (obs_issue_i[p] && expected_mask_q[p]) begin
++                    if (issued_mask_q[p]) error_n[ERR_EXTRA_ISSUE] = 1'b1;
++                    if (p == V_PORT && obs_issue_id_i[p] != V_ID) error_n[ERR_ISSUE_ID] = 1'b1;
++                    if (p == A_PORT && obs_issue_id_i[p] != A_ID) error_n[ERR_ISSUE_ID] = 1'b1;
++                    issued_mask_n[p] = 1'b1;
++                    if (p == V_PORT) begin
++                        v_issue_count_n = v_issue_count_q + 1'b1;
++                        if (!v_issue_ts_valid_q) begin v_issue_ts_n = ticks_q; v_issue_ts_valid_n = 1'b1; end
++                        if (!v_issue_id_valid_q) begin v_issue_id_n = obs_issue_id_i[p]; v_issue_id_valid_n = 1'b1; end
++                    end else if (p == A_PORT) begin
++                        a_issue_count_n = a_issue_count_q + 1'b1;
++                        if (!a_issue_ts_valid_q) begin a_issue_ts_n = ticks_q; a_issue_ts_valid_n = 1'b1; end
++                        if (!a_issue_id_valid_q) begin a_issue_id_n = obs_issue_id_i[p]; a_issue_id_valid_n = 1'b1; end
++                    end
++                end
++                if (obs_done_i[p] && expected_mask_q[p]) begin
++                    if (!issued_mask_q[p]) error_n[ERR_DONE_NO_ISSUE] = 1'b1;
++                    if (done_mask_q[p]) error_n[ERR_EXTRA_DONE] = 1'b1;
++                    if (p == V_PORT && obs_done_id_i[p] != V_ID) error_n[ERR_DONE_ID] = 1'b1;
++                    if (p == A_PORT && obs_done_id_i[p] != A_ID) error_n[ERR_DONE_ID] = 1'b1;
++                    done_mask_n[p] = 1'b1;
++                    if (p == V_PORT) begin
++                        v_done_count_n = v_done_count_q + 1'b1;
++                        if (!v_done_ts_valid_q) begin v_done_ts_n = ticks_q; v_done_ts_valid_n = 1'b1; end
++                        if (!v_done_id_valid_q) begin v_done_id_n = obs_done_id_i[p]; v_done_id_valid_n = 1'b1; end
++                    end else if (p == A_PORT) begin
++                        a_done_count_n = a_done_count_q + 1'b1;
++                        if (!a_done_ts_valid_q) begin a_done_ts_n = ticks_q; a_done_ts_valid_n = 1'b1; end
++                        if (!a_done_id_valid_q) begin a_done_id_n = obs_done_id_i[p]; a_done_id_valid_n = 1'b1; end
++                    end
++                end
++            end
++        end
++
++        // Command writes.
++        if (cfg_valid_i && cfg_write_i) begin
++            if (cfg_wstrb_i != 8'hff) begin
++                error_n[ERR_BAD_STROBE] = 1'b1;
++            end else begin
++                case (cfg_addr_i)
++                    8'hb0: error_n[ERR_BAD_B0_WRITE] = 1'b1;
++                    8'hb8: begin
++                        if ((cfg_wdata_i & ~(CMD_HAS_A)) == CMD_PREP) begin
++                            if ((state_q == ST_OFF || (state_q == ST_FROZEN && !aborted_q)) &&
++                                frontend_active_i == '0 && frontend_held_i == '0) begin
++                                state_n = ST_PREP;
++                                aborted_n = 1'b0;
++                                error_n = '0;
++                                has_a_n = cfg_wdata_i[8];
++                                expected_mask_n = '0;
++                                expected_mask_n[V_PORT] = 1'b1;
++                                expected_mask_n[A_PORT] = cfg_wdata_i[8];
++                                hold_mask_n = expected_mask_n;
++                                issued_mask_n = '0;
++                                done_mask_n = '0;
++                                cancelled_mask_n = '0;
++                                seen_held_n = '0;
++                                ticks_n = '0;
++                                v_issue_count_n = '0;
++                                a_issue_count_n = '0;
++                                v_done_count_n = '0;
++                                a_done_count_n = '0;
++                                go_a_ts_n = '0; a_select_ts_n = '0; go_v_ts_n = '0;
++                                v_issue_ts_n = '0; a_issue_ts_n = '0; v_done_ts_n = '0; a_done_ts_n = '0;
++                                go_a_ts_valid_n = 1'b0; a_select_ts_valid_n = 1'b0; go_v_ts_valid_n = 1'b0;
++                                v_issue_ts_valid_n = 1'b0; a_issue_ts_valid_n = 1'b0;
++                                v_done_ts_valid_n = 1'b0; a_done_ts_valid_n = 1'b0;
++                                v_issue_id_n = '0; a_issue_id_n = '0; v_done_id_n = '0; a_done_id_n = '0;
++                                v_issue_id_valid_n = 1'b0; a_issue_id_valid_n = 1'b0;
++                                v_done_id_valid_n = 1'b0; a_done_id_valid_n = 1'b0;
++                                selected_id_n = '0; selected_did_n = '0; selected_iova_n = '0; selected_write_n = 1'b0;
++                                go_pulse_n = '0;
++                                a_go_sent_n = 1'b0; v_go_sent_n = 1'b0; a_select_seen_n = 1'b0;
++                            end else begin
++                                error_n[ERR_BAD_PREP] = 1'b1;
++                            end
++                        end else if (cfg_wdata_i == CMD_GO) begin
++                            if (state_q == ST_PREP && error_q == 0 &&
++                                (frontend_held_i & expected_mask_q) == expected_mask_q) begin
++                                state_n = ST_RUNNING;
++                                if (has_a_q) begin
++                                    go_pulse_n[A_PORT] = 1'b1;
++                                    a_go_sent_n = 1'b1;
++                                    if (!go_a_ts_valid_q) begin
++                                        go_a_ts_n = ticks_q + 1'b1;
++                                        go_a_ts_valid_n = 1'b1;
++                                    end
++                                end else begin
++                                    go_pulse_n[V_PORT] = 1'b1;
++                                    v_go_sent_n = 1'b1;
++                                    if (!go_v_ts_valid_q) begin
++                                        go_v_ts_n = ticks_q + 1'b1;
++                                        go_v_ts_valid_n = 1'b1;
++                                    end
++                                end
++                            end else begin
++                                error_n[ERR_BAD_GO] = 1'b1;
++                            end
++                        end else if (cfg_wdata_i == CMD_ABORT) begin
++                            if (state_q == ST_OFF) begin
++                                state_n = ST_FROZEN;
++                                aborted_n = 1'b1;
++                                hold_mask_n = '0;
++                            end else if (state_q == ST_PREP || state_q == ST_RUNNING) begin
++                                aborted_n = 1'b1;
++                                state_n = ST_RUNNING;
++                            end else begin
++                                error_n[ERR_ABORT] = 1'b1;
++                            end
++                        end else if (cfg_wdata_i == CMD_CLEAR) begin
++                            if (state_q == ST_OFF || state_q == ST_FROZEN) begin
++                                error_n = '0;
++                            end else begin
++                                error_n[ERR_BAD_CMD] = 1'b1;
++                            end
++                        end else begin
++                            error_n[ERR_BAD_CMD] = 1'b1;
++                        end
++                    end
++                    8'hc0: begin
++                        if (cfg_wdata_i < 64'd32) index_n = cfg_wdata_i[7:0];
++                        else error_n[ERR_BAD_INDEX] = 1'b1;
++                    end
++                    8'hc8: error_n[ERR_BAD_C8_WRITE] = 1'b1;
++                    default: error_n[ERR_BAD_CMD] = 1'b1;
++                endcase
++            end
++        end
++
++        // A select capture and V go, but ABORT wins same-edge.
++        if (!aborted_n && state_q == ST_RUNNING && has_a_q && !a_select_seen_q && !v_go_sent_q) begin
++            if (selected_i && !select_write_i && select_id_i == A_SEL_ID && select_did_i == A_DID &&
++                (obs_issue_i[A_PORT] || issued_mask_q[A_PORT])) begin
++                a_select_seen_n = 1'b1;
++                selected_id_n = select_id_i;
++                selected_did_n = select_did_i;
++                selected_iova_n = select_iova_i;
++                selected_write_n = select_write_i;
++                if (!a_select_ts_valid_q) begin
++                    a_select_ts_n = ticks_q;
++                    a_select_ts_valid_n = 1'b1;
++                end
++                go_pulse_n[V_PORT] = 1'b1;
++                v_go_sent_n = 1'b1;
++                if (!go_v_ts_valid_q) begin
++                    go_v_ts_n = ticks_q + 1'b1;
++                    go_v_ts_valid_n = 1'b1;
++                end
++            end
++        end
++
++        // Abort drain: cancel remaining HOLD and record cancellations.
++        if (aborted_q && state_q == ST_RUNNING) begin
++            for (int p = 0; p < NumPorts; p++) begin
++                if (expected_mask_q[p] && hold_mask_q[p]) begin
++                    if (obs_issue_i[p]) begin
++                        hold_mask_n[p] = 1'b0;
++                    end else if (frontend_cancelled_i[p]) begin
++                        cancelled_mask_n[p] = 1'b1;
++                        hold_mask_n[p] = 1'b0;
++                    end else if (seen_held_q[p] && !frontend_held_i[p] &&
++                                 !issued_mask_q[p] && !done_mask_q[p]) begin
++                        cancelled_mask_n[p] = 1'b1;
++                        hold_mask_n[p] = 1'b0;
++                    end
++                end
++            end
++        end
++
++        // Finish conditions, only after drain.
++        if (state_q == ST_RUNNING && !aborted_q) begin
++            if (issued_mask_q == expected_mask_q && done_mask_q == expected_mask_q &&
++                (frontend_held_i & expected_mask_q) == '0 &&
++                (frontend_active_i & expected_mask_q) == '0) begin
++                state_n = ST_FROZEN;
++                hold_mask_n = '0;
++            end
++        end
++        if (state_q == ST_RUNNING && aborted_q) begin
++            if ((frontend_held_i & expected_mask_q) == '0 &&
++                (frontend_active_i & expected_mask_q) == '0 &&
++                (issued_mask_q & ~done_mask_q) == '0 &&
++                ((expected_mask_q & ~issued_mask_q & ~cancelled_mask_q & seen_held_q) == '0)) begin
++                state_n = ST_FROZEN;
++                hold_mask_n = '0;
++            end
++        end
++    end
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            state_q <= ST_OFF;
++            error_q <= '0;
++            ticks_q <= '0;
++            expected_mask_q <= '0;
++            hold_mask_q <= '0;
++            issued_mask_q <= '0;
++            done_mask_q <= '0;
++            cancelled_mask_q <= '0;
++            seen_held_q <= '0;
++            aborted_q <= 1'b0;
++            has_a_q <= 1'b0;
++            index_q <= '0;
++            v_issue_count_q <= '0;
++            a_issue_count_q <= '0;
++            v_done_count_q <= '0;
++            a_done_count_q <= '0;
++            go_a_ts_q <= '0; a_select_ts_q <= '0; go_v_ts_q <= '0;
++            v_issue_ts_q <= '0; a_issue_ts_q <= '0; v_done_ts_q <= '0; a_done_ts_q <= '0;
++            go_a_ts_valid_q <= 1'b0; a_select_ts_valid_q <= 1'b0; go_v_ts_valid_q <= 1'b0;
++            v_issue_ts_valid_q <= 1'b0; a_issue_ts_valid_q <= 1'b0;
++            v_done_ts_valid_q <= 1'b0; a_done_ts_valid_q <= 1'b0;
++            v_issue_id_q <= '0; a_issue_id_q <= '0; v_done_id_q <= '0; a_done_id_q <= '0;
++            v_issue_id_valid_q <= 1'b0; a_issue_id_valid_q <= 1'b0;
++            v_done_id_valid_q <= 1'b0; a_done_id_valid_q <= 1'b0;
++            selected_id_q <= '0; selected_did_q <= '0; selected_iova_q <= '0; selected_write_q <= 1'b0;
++            go_pulse_q <= '0;
++            a_go_sent_q <= 1'b0; v_go_sent_q <= 1'b0; a_select_seen_q <= 1'b0;
++        end else begin
++            state_q <= state_n;
++            error_q <= error_n;
++            ticks_q <= ticks_n;
++            expected_mask_q <= expected_mask_n;
++            hold_mask_q <= hold_mask_n;
++            issued_mask_q <= issued_mask_n;
++            done_mask_q <= done_mask_n;
++            cancelled_mask_q <= cancelled_mask_n;
++            seen_held_q <= seen_held_n;
++            aborted_q <= aborted_n;
++            has_a_q <= has_a_n;
++            index_q <= index_n;
++            v_issue_count_q <= v_issue_count_n;
++            a_issue_count_q <= a_issue_count_n;
++            v_done_count_q <= v_done_count_n;
++            a_done_count_q <= a_done_count_n;
++            go_a_ts_q <= go_a_ts_n; a_select_ts_q <= a_select_ts_n; go_v_ts_q <= go_v_ts_n;
++            v_issue_ts_q <= v_issue_ts_n; a_issue_ts_q <= a_issue_ts_n;
++            v_done_ts_q <= v_done_ts_n; a_done_ts_q <= a_done_ts_n;
++            go_a_ts_valid_q <= go_a_ts_valid_n; a_select_ts_valid_q <= a_select_ts_valid_n;
++            go_v_ts_valid_q <= go_v_ts_valid_n;
++            v_issue_ts_valid_q <= v_issue_ts_valid_n; a_issue_ts_valid_q <= a_issue_ts_valid_n;
++            v_done_ts_valid_q <= v_done_ts_valid_n; a_done_ts_valid_q <= a_done_ts_valid_n;
++            v_issue_id_q <= v_issue_id_n; a_issue_id_q <= a_issue_id_n;
++            v_done_id_q <= v_done_id_n; a_done_id_q <= a_done_id_n;
++            v_issue_id_valid_q <= v_issue_id_valid_n; a_issue_id_valid_q <= a_issue_id_valid_n;
++            v_done_id_valid_q <= v_done_id_valid_n; a_done_id_valid_q <= a_done_id_valid_n;
++            selected_id_q <= selected_id_n; selected_did_q <= selected_did_n;
++            selected_iova_q <= selected_iova_n; selected_write_q <= selected_write_n;
++            go_pulse_q <= go_pulse_n;
++            a_go_sent_q <= a_go_sent_n; v_go_sent_q <= v_go_sent_n; a_select_seen_q <= a_select_seen_n;
++        end
++    end
++endmodule

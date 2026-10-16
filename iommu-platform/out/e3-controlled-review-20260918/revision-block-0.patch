@@ -1,0 +1,478 @@
+--- a/out/e3-controlled-review-20260918/server_review_v6.py
++++ b/out/e3-controlled-review-20260918/server_review_v6.py
+@@ -100,7 +100,13 @@
+ EXPECTED_ROUNDS = 22
+ EXPECTED_ROWS = EXPECTED_ROUNDS * 19
+ 
+-OBS_RE = re.compile('idma_(batch|path)_obs seq=([0-9]+) +(.*)$')
+-FIELD_RE = re.compile('([A-Za-z_][A-Za-z0-9_]*)=([^ ]+)')
++# re.MULTILINE is required for '$' to match at every line end; '.' never
++# crosses a newline, so each match still stays inside one console line.
++# Without it the old pattern could only match at the end of the whole console,
++# which is exactly why every observation row was dropped.  Fragmented realtime
++# lines outside the dmesg dumps still match and are ignored by the dump-block
++# filter in parse_observations(); values no longer swallow a trailing '\r'.
++OBS_RE = re.compile(r'idma_(batch|path)_obs seq=([0-9]+)[ \t]+(.*)$', re.MULTILINE)
++FIELD_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)=([^ \t\r\n]+)')
+ BEGIN_RE = re.compile('^E3CTL: phase=(short|main) case=([0-9]+) begin taint=([0-9]+) args=(.*)$', re.M)
+ EXIT_RE = re.compile('E3CTL: phase=(short|main) case=([0-9]+) exit=([0-9]+) taint=([0-9]+)')
+@@ -107,5 +113,6 @@
+ COMPLETE_RE = re.compile('^E3CTL: complete ok mode=(short|main) output=(.*)$', re.M)
+ KERNEL_BAD = ('BUG:', 'Oops:', 'WARNING:', 'Kernel panic', 'experiment data mismatch')
++CLI_JSON_MARK = re.compile(r'\{\s*"schema"\s*:\s*"idma\.e3_controlled\.v1"')
+ 
+ 
+ def sha256_file(path):
+@@ -396,7 +403,7 @@
+         'trigger': None, 'classification': None, 'actual_added_cycles': None,
+         'v_hw_cycles': None, 'stats': {}, 'readings': {}, 'identity': None,
+         'insert': None, 'milestones': None, 'reasons': [], 'comparability': [],
+-        'internal_region_reasons': [], 'head': None, 'timings': None,
++        'internal_region_reasons': [], 'head': None, 'timings': None, 'word_deltas': {},
+     }
+     if not isinstance(entry, dict):
+         errors.append(label + ' is not a JSON object')
+@@ -690,6 +697,22 @@
+         if a_event & (1 << 2):
+             readings['pre_a_service_e4_minus_e39'] = resp_recv - a_trans_req
+         result['milestones'] = {'a_comp_in_window': bool(a_event & A_COMP_BIT),
+                                 'a_return_in_window': bool(a_event & A_RETURN_BIT)}
++        # Raw e3_words deltas recorded per triggered round.  They are reported as
++        # facts only: no value here (9, 2 or 4 included) is a pass/eligibility gate.
++        result['word_deltas'] = {
++            'e41_minus_e4': (a_trans_resp - resp_recv) if (a_event & (1 << 4)) else None,
++            'e70_minus_e41': (v_selected - a_trans_resp) if (v_event & (1 << 1)) else None,
++            'e42_minus_e41': ((words[IDX['a_record'] + REC['comp']] - a_trans_resp)
++                              if (a_event & A_COMP_BIT) else None),
++            'e73_minus_e71': ((words[IDX['v_record'] + REC['trans_response']]
++                               - words[IDX['v_record'] + REC['trans_request']])
++                              if ((v_event & (1 << 2)) and (v_event & (1 << 4))) else None),
++            'e4_minus_e69': (resp_recv - v_tr) if (v_event & (1 << 0)) else None,
++            'e4_minus_e39': (resp_recv - a_trans_req) if (a_event & (1 << 2)) else None,
++            'e70_minus_e4': (v_selected - resp_recv) if (v_event & (1 << 1)) else None,
++        }
+         if not (a_event & A_COMP_BIT):
+             comparability.append('a_comp_missing')
+         if not (a_event & A_RETURN_BIT):
+@@ -863,62 +936,158 @@
+-def pair_eligibility(rounds, exp):
+-    triggered = [item for item in rounds if item.get('trigger') == 1]
+-    result = {
+-        'triggered_rounds': len(triggered),
+-        'identity_prefix_insert_match': None,
+-        'pre_trigger_times_equal': None,
+-        'pre_history_equal': None,
+-        'differing_items': [],
+-        'causal_comparison': 'unavailable',
+-        'causal_conclusion': 'not_evaluated_by_script',
+-    }
+-    if len(triggered) == 0:
+-        result['reason'] = 'no_trigger_in_either_round'
+-        return result
+-    if len(triggered) == 1:
+-        result['reason'] = 'only_one_round_triggered'
+-        return result
+-    left, right = rounds[0], rounds[1]
+-    differences = []
+-    if left.get('identity') is None or right.get('identity') is None:
+-        result['reason'] = 'identity view unavailable'
+-        return result
+-    for name in ('s1_level', 'pte_pa'):
+-        if left['identity'][name] != right['identity'][name]:
+-            differences.append(name)
+-    for side in ('a', 'v'):
+-        for key in ('seq', 'id', 'did', 'write', 'iova'):
+-            if left['identity'][side][key] != right['identity'][side][key]:
+-                differences.append(side + '.' + key)
+-    if left['identity']['pre_history'] != right['identity']['pre_history']:
+-        differences.append('pre_history_words_78_93')
+-    if (left.get('insert') or {}).get('total') != (right.get('insert') or {}).get('total'):
+-        differences.append('insert_total')
+-    for item in (left.get('insert') or {}).get('records') or []:
+-        match = False
+-        for other in (right.get('insert') or {}).get('records') or []:
+-            if all(item[key] == other[key] for key in ('seq', 'id', 'did', 'iova', 'write', 'hit')):
+-                match = True
+-        if not match:
+-            differences.append('insert_record_identity')
+-    kw = {}
+-    for item, name in ((left, 'left'), (right, 'right')):
+-        kw[name + '_wait'] = item.get('readings', {}).get('pre_wait_e4_minus_e69')
+-        kw[name + '_a_service'] = item.get('readings', {}).get('pre_a_service_e4_minus_e39')
+-    pre_equal = (kw['left_wait'] is not None and kw['left_wait'] == kw['right_wait']
+-                 and kw['left_a_service'] is not None and kw['left_a_service'] == kw['right_a_service'])
+-    milestones = all((item.get('milestones') or {}).get('a_comp_in_window')
+-                     and (item.get('milestones') or {}).get('a_return_in_window')
+-                     for item in rounds)
+-    result['identity_prefix_insert_match'] = not differences
+-    result['pre_history_equal'] = 'pre_history_words_78_93' not in differences
+-    result['pre_trigger_times_equal'] = pre_equal
+-    result['differing_items'] = differences
+-    if differences:
+-        result['causal_comparison'] = 'limited_recorded_fields_differ'
+-    elif not pre_equal:
+-        result['causal_comparison'] = 'limited_by_pre_trigger_history'
+-    elif not milestones:
+-        result['causal_comparison'] = 'limited_by_missing_a_milestone'
+-    else:
+-        result['causal_comparison'] = 'best_available_pair_but_still_finite_n'
+-    return result
++INSERT_IDENTITY_FIELDS = ('seq', 'id', 'did', 'iova', 'write', 'hit')
++
++
++def round_diagnostics(item):
++    '''Per-round recorded facts exposed by pair_eligibility.
++
++    Observations only, never pass gates: a missing milestone or a truncated
++    insertion is reported as a reason and is never replaced by a zero.
++    '''
++    identity = item.get('identity') if isinstance(item.get('identity'), dict) else None
++    insert = item.get('insert') if isinstance(item.get('insert'), dict) else None
++    milestones = item.get('milestones') if isinstance(item.get('milestones'), dict) else None
++    out = {
++        'index': item.get('index'),
++        'sequence': item.get('sequence'),
++        'trigger': item.get('trigger'),
++        'classification': item.get('classification'),
++        'a_event': identity['a']['event'] if identity else None,
++        'v_event': identity['v']['event'] if identity else None,
++        'a_first_hit': identity['a']['first_hit'] if identity else None,
++        'v_first_hit': identity['v']['first_hit'] if identity else None,
++        'insert_total': insert.get('total') if insert else None,
++        'insert_count': insert.get('count') if insert else None,
++        'insert_truncated': insert.get('truncated') if insert else None,
++        'insert_selection_order': ([rec.get('selected') for rec in insert.get('records') or []]
++                                   if insert else None),
++        'milestones': ({'a_comp_in_window': milestones.get('a_comp_in_window'),
++                        'a_return_in_window': milestones.get('a_return_in_window')}
++                       if milestones else None),
++        'word_deltas': (dict(item.get('word_deltas')) if item.get('word_deltas') else None),
++        'reasons': [],
++    }
++    if item.get('trigger') != 1:
++        out['reasons'].append('no_trigger')
++        return out
++    if out['a_event'] is not None:
++        if not (out['a_event'] & A_COMP_BIT):
++            out['reasons'].append('a_comp_absent_from_window')
++        if not (out['a_event'] & A_RETURN_BIT):
++            out['reasons'].append('a_return_absent_from_window')
++    if milestones is None:
++        out['reasons'].append('milestones_unavailable')
++    if out['insert_truncated']:
++        out['reasons'].append('inserts_truncated')
++    return out
++
++
++def pair_eligibility(rounds, exp):
++    result = {
++        'triggered_rounds': 0,
++        'rounds': [round_diagnostics(item) for item in rounds],
++        'identity_match': None,
++        'pte_match': None,
++        'prefix_match': None,
++        'insertion_order_match': None,
++        'insertion_multiplicity_match': None,
++        'pre_trigger_times_equal': None,
++        'pre_history_equal': None,
++        'trigger_readings': None,
++        'a_milestones_present': None,
++        'differing_items': [],
++        'diagnostics': [],
++        'causal_comparison': 'unavailable',
++        'causal_conclusion': 'not_evaluated_by_script',
++    }
++    triggered = [item for item in rounds if item.get('trigger') == 1]
++    result['triggered_rounds'] = len(triggered)
++    if len(triggered) == 0:
++        result['reason'] = 'no_trigger_in_either_round'
++        result['diagnostics'].append(
++            'nontrigger control: identity/milestone/reading fields stay null, no zero-time substitute')
++        return result
++    if len(triggered) == 1:
++        result['reason'] = 'only_one_round_triggered'
++        return result
++    left, right = triggered[0], triggered[1]
++    if left.get('identity') is None or right.get('identity') is None:
++        result['reason'] = 'identity view unavailable'
++        return result
++    differences = []
++    sides = ('a', 'v') if exp['has_a'] else ('v',)
++    if not exp['has_a']:
++        result['diagnostics'].append('solo pair: the A-side identity is not part of the comparison')
++    for side in sides:
++        for key in ('seq', 'id', 'did', 'write', 'iova'):
++            if left['identity'][side][key] != right['identity'][side][key]:
++                differences.append(side + '.' + key)
++    result['identity_match'] = not differences
++    result['pte_match'] = all(left['identity'][name] == right['identity'][name]
++                              for name in ('s1_level', 'pte_pa'))
++    result['prefix_match'] = (left['identity']['pre_history'] == right['identity']['pre_history'])
++    result['pre_history_equal'] = result['prefix_match']
++    left_insert = left.get('insert') or {}
++    right_insert = right.get('insert') or {}
++    result['insertion_multiplicity_match'] = (
++        left_insert.get('total') == right_insert.get('total')
++        and left_insert.get('count') == right_insert.get('count')
++        and left_insert.get('truncated') == right_insert.get('truncated'))
++    left_records = left_insert.get('records') or []
++    right_records = right_insert.get('records') or []
++    result['insertion_order_match'] = (
++        len(left_records) == len(right_records)
++        and all(all(a.get(key) == b.get(key) for key in INSERT_IDENTITY_FIELDS)
++                for a, b in zip(left_records, right_records)))
++    for name, matched in (('identity', result['identity_match']),
++                          ('pte', result['pte_match']),
++                          ('prefix', result['prefix_match']),
++                          ('insertion_order', result['insertion_order_match']),
++                          ('insertion_multiplicity', result['insertion_multiplicity_match'])):
++        if not matched:
++            differences.append(name + '_mismatch')
++    result['differing_items'] = differences
++    kw = {}
++    for item, name in ((left, 'left'), (right, 'right')):
++        kw[name + '_wait'] = item.get('readings', {}).get('pre_wait_e4_minus_e69')
++        kw[name + '_a_service'] = item.get('readings', {}).get('pre_a_service_e4_minus_e39')
++    pre_equal = (kw['left_wait'] is not None and kw['left_wait'] == kw['right_wait']
++                 and kw['left_a_service'] is not None
++                 and kw['left_a_service'] == kw['right_a_service'])
++    result['pre_trigger_times_equal'] = pre_equal
++    result['trigger_readings'] = {
++        'left': {'e4_minus_e69': kw['left_wait'], 'e4_minus_e39': kw['left_a_service']},
++        'right': {'e4_minus_e69': kw['right_wait'], 'e4_minus_e39': kw['right_a_service']},
++    }
++    result['a_milestones_present'] = all(
++        (item.get('milestones') or {}).get('a_comp_in_window')
++        and (item.get('milestones') or {}).get('a_return_in_window')
++        for item in triggered)
++    result['diagnostics'].append(
++        'pre-trigger elapsed equality is a diagnostic, not an eligibility gate')
++    if not pre_equal:
++        result['diagnostics'].append('recorded pre-trigger elapsed times differ')
++    if differences:
++        result['causal_comparison'] = 'limited_recorded_fields_differ'
++    elif not result['a_milestones_present']:
++        result['causal_comparison'] = 'limited_by_missing_a_milestone'
++    else:
++        result['causal_comparison'] = 'best_available_pair_but_still_finite_n'
++    return result
++
++
++def first_difference(left, right, path=''):
++    '''First structural difference between two parsed JSON values, for messages.'''
++    if type(left) is not type(right):
++        return '%s type %s != %s' % (path or '<root>', type(left).__name__, type(right).__name__)
++    if isinstance(left, dict):
++        for key in sorted(set(left) | set(right)):
++            if key not in left:
++                return '%s.%s missing in console document' % (path, key)
++            if key not in right:
++                return '%s.%s missing in pair document' % (path, key)
++            found = first_difference(left[key], right[key], '%s.%s' % (path, key))
++            if found:
++                return found
++        return ''
++    if isinstance(left, list):
++        if len(left) != len(right):
++            return '%s length %d != %d' % (path, len(left), len(right))
++        for index, (l_item, r_item) in enumerate(zip(left, right)):
++            found = first_difference(l_item, r_item, '%s[%d]' % (path, index))
++            if found:
++                return found
++        return ''
++    if left != right:
++        return '%s %r != %r' % (path, left, right)
++    return ''
++
++
++def parse_console_documents(text, errors):
++    '''Every CLI idma.e3_controlled.v1 JSON document printed to the console.
++
++    Returned in console order with identical duplicates removed.  An
++    unparsable document, a document without a usable first sequence, or a
++    duplicate with different content is a structural error.
++    '''
++    decoder = json.JSONDecoder()
++    documents = []
++    duplicates = 0
++    conflicts = []
++    seen = {}
++    for match in CLI_JSON_MARK.finditer(text):
++        start = match.start()
++        try:
++            document, _end = decoder.raw_decode(text, start)
++        except ValueError as exc:
++            errors.append('console CLI JSON at offset %d is unparsable: %s' % (start, exc))
++            continue
++        if not isinstance(document, dict):
++            errors.append('console CLI JSON at offset %d is not an object' % start)
++            continue
++        if document.get('schema') != SCHEMA_PAIR:
++            errors.append('console CLI JSON at offset %d schema %r != %r'
++                          % (start, document.get('schema'), SCHEMA_PAIR))
++            continue
++        rounds = document.get('rounds')
++        if not isinstance(rounds, list) or not rounds or not isinstance(rounds[0], dict):
++            errors.append('console CLI JSON at offset %d has no usable first round' % start)
++            continue
++        sequence = rounds[0].get('sequence')
++        if not isinstance(sequence, int) or isinstance(sequence, bool):
++            errors.append('console CLI JSON at offset %d first sequence %r is not an integer'
++                          % (start, sequence))
++            continue
++        previous = seen.get(sequence)
++        if previous is None:
++            seen[sequence] = document
++            documents.append((sequence, document))
++        elif previous == document:
++            duplicates += 1
++        else:
++            conflicts.append('conflicting console CLI JSON for first sequence %d' % sequence)
++    return documents, duplicates, conflicts
++
++
++def check_console_documents(documents, ordered, errors):
++    '''Console CLI JSON must be exactly the 11 original pair documents, in order.'''
++    if len(documents) != len(MATRIX):
++        errors.append('console CLI JSON documents %d != %d expected pair documents'
++                      % (len(documents), len(MATRIX)))
++    sequences = [sequence for sequence, _ in documents]
++    if sequences != [2 * index + 1 for index in range(len(sequences))]:
++        errors.append('console CLI JSON first sequences %r are not 1,3,5,...,21 in order'
++                      % (sequences,))
++    if len(ordered) != len(documents):
++        errors.append('pair documents %d != console CLI JSON documents %d'
++                      % (len(ordered), len(documents)))
++    for index, (sequence, document) in enumerate(documents):
++        if index >= len(ordered):
++            break
++        expected_sequence, _position, pair_doc = ordered[index]
++        if sequence != expected_sequence:
++            errors.append('console CLI JSON #%d starts at sequence %s, pair document at %s'
++                          % (index + 1, sequence, expected_sequence))
++            continue
++        if document == pair_doc:
++            continue
++        detail = first_difference(document, pair_doc)
++        errors.append('console CLI JSON #%d (first sequence %s) != original pair document: %s'
++                      % (index + 1, sequence, detail or 'deep comparison failed'))
++    return errors
+ 
+ 
+ def expect_matrix_entry(pair_doc, exp):
+@@ -1017,6 +1186,8 @@
+     records = {}
+     conflicts = []
+     duplicates = 0
+     outside = 0
++    cli_documents = []
++    cli_duplicates = 0
+     if inputs['console_raw']['available']:
+         with open(console_path, 'rb') as handle:
+             raw_bytes = handle.read()
+@@ -1027,6 +1198,9 @@
+         text = raw_bytes.decode('utf-8', errors='replace')
+         blocks = dump_blocks(text)
+         records, conflicts, duplicates, outside = parse_observations(text, blocks)
+         structural.extend(conflicts)
++        cli_documents, cli_duplicates, cli_conflicts = parse_console_documents(text, structural)
++        structural.extend(cli_conflicts)
+         if len(blocks) < 2:
+             warnings.append('expected at least two dmesg.raw blocks (short and main), found %d' % len(blocks))
+@@ -1098,17 +1272,19 @@
+         version = None
+         if run_doc is not None:
+             version = run_doc.get('expected_linux_version')
+-        if version and ('Linux version ' + version) not in text:
+-            structural.append('console does not show expected Linux version ' + str(version))
++        version_errors = []
++        if version and ('Linux version ' + str(version)) not in text:
++            version_errors.append('console does not show expected Linux version ' + str(version))
+         for magic in ('0x49444D414F425306', '0x49444D414C4E4301'):
+             if magic not in text:
+-                structural.append('console does not show ' + magic)
++                version_errors.append('console does not show ' + magic)
++        structural.extend(version_errors)
+         checks['observed_version_and_magic'] = {
+-            'ok': True, 'expected_linux_version': version,
++            'ok': not version_errors, 'errors': version_errors,
++            'expected_linux_version': version,
+             'observer_magic_text_present': '0x49444D414F425306' in text,
+             'launcher_magic_text_present': '0x49444D414C4E4301' in text,
+         }
+     else:
+         checks['kernel_failure_markers'] = {'ok': None, 'reason': 'console unavailable'}
++        checks['observed_version_and_magic'] = {'ok': None, 'reason': 'console unavailable'}
+@@ -1145,6 +1321,14 @@
+     if [item[0] for item in ordered] != [2 * i + 1 for i in range(len(ordered))]:
+         pair_errors.append('pair order by first sequence %r is not 1,3,5,...,21' % ([item[0] for item in ordered],))
++    cli_errors = []
++    check_console_documents(cli_documents, ordered, cli_errors)
++    checks['console_cli_json_match'] = {
++        'ok': not cli_errors,
++        'documents': len(cli_documents),
++        'duplicate_documents_ignored': cli_duplicates,
++        'sequences': [sequence for sequence, _ in cli_documents],
++        'errors': cli_errors,
++    }
++    structural.extend(cli_errors)
+ 
+     for index, (_, position, doc) in enumerate(ordered):
+@@ -1205,6 +1389,7 @@
+                 'classification': summary.get('classification'),
+                 'v_hw_cycles': summary.get('v_hw_cycles'),
+                 'readings': dict(summary.get('readings') or {}),
++                'word_deltas': dict(summary.get('word_deltas') or {}),
+                 'reasons': list(summary.get('reasons') or []),
+                 'comparability': list(summary.get('comparability') or []),
+             })
+@@ -1216,20 +1401,26 @@
+         for item in rounds:
+             for reason in item.get('reasons') or []:
+-                errors.append('pair %d seq=%s: %s' % (index + 1, item.get('sequence'), reason))
++                errors.append('seq=%s %s' % (item.get('sequence'), reason))
+             for reason in item.get('comparability') or []:
+                 notes.append('pair %d seq=%s comparability: %s' % (index + 1, item.get('sequence'), reason))
++        # Every error raised while this pair was checked belongs to this pair.
++        # Do not drop messages that happen to lack a 'pair N ' prefix.
++        prefix = 'pair %d ' % (index + 1)
++        pair_error_list = sorted({message if message.startswith(prefix) else prefix + message
++                                  for message in errors})
+         pair_rows.append({
+             'pair': index + 1, 'phase': exp['phase'], 'case': exp['case'],
+             'role': exp['aggressor'] + '_' + exp['prep'] + '_' + exp['pair'],
+             'expected': {'aggressor': exp['aggressor'], 'prep': exp['prep'],
+                          'pair': exp['pair'], 'first_delay': exp['first_delay']},
+             'delays': [item.get('delay') for item in rounds],
+             'rounds': rounds, 'baseline': delta, 'eligibility': eligibility,
+-            'execution_ok': not [e for e in errors if ('pair %d ' % (index + 1)) in e],
+-            'errors': sorted({e for e in errors if ('pair %d ' % (index + 1)) in e}),
++            'execution_ok': not pair_error_list,
++            'errors': pair_error_list,
+         })
+-        pair_errors.extend(sorted({e for e in errors if ('pair %d ' % (index + 1)) in e}))
++        pair_errors.extend(pair_error_list)
+     structural.extend(pair_errors)
+     checks['pair_documents'] = {'ok': not pair_errors, 'errors': pair_errors}
+@@ -1243,8 +1434,13 @@
+-        checks['secondary_summary_comparison'] = {'ok': not comparison, 'differences': comparison,
+-                                                  'note': 'run.json is secondary evidence, not used as a pass flag'}
++        for name in sorted(comparison):
++            structural.append('run.json %s %r != script-computed %r'
++                              % (name, comparison[name][0], comparison[name][1]))
++        checks['secondary_summary_comparison'] = {
++            'ok': not comparison, 'differences': comparison,
++            'propagated_to_structural': bool(comparison),
++            'note': 'run.json is secondary evidence, but these counters are also derived '
++                    'independently here; a mismatch is reported as a structural error'}
+@@ -1267,7 +1463,9 @@
+         'totals': {'pairs': len(pair_rows), 'rounds': len(all_round_rows),
+                    'unique_uart_rows': len(records), 'expected_unique_uart_rows': EXPECTED_ROWS,
+                    'dmesg_blocks': len(blocks), 'duplicate_rows_ignored': duplicates,
+-                   'obs_like_lines_outside_dumps': outside},
++                   'obs_like_lines_outside_dumps': outside,
++                   'cli_json_documents': len(cli_documents),
++                   'duplicate_cli_json_documents_ignored': cli_duplicates},
+         'checks': checks,
+         'rounds': all_round_rows,
+         'pairs': pair_rows,

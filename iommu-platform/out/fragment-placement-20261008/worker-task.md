@@ -1,0 +1,4 @@
+有界普通C++观测补丁，由Codex负责新preTL RTL，禁止自行设计RTL或论文结论。基于随附原驱动 out/posttl-independent-20261008/natural_fragment_test.cpp，输出一个apply_patch精确补丁针对新的复制文件 out/fragment-placement-20261008/placement_test.cpp。这个复制文件会由Codex按原样创建。
+需求: natural负载、CONF1、S、warmup0、每流32KiB等全部不变，不改核心数据/guard/NEXT-DONE/quiet验收，不允许任何假完成计数。增加natural启用时的真实top->dbg_dma_issue/dbg_dma_done逐flow事件cycles和计数(同tick既有观察点，不能推进时钟)，记录硬件issue->done差，两flow必须各1真实issue/done且done>issue。原驱动wait_done顺序不是实际done时刻。nat_clear_run_state/reset流程不带旧计数。
+在现有NATURAL-JSON之后额外打印 PLACEMENT-METRICS-JSON，有自然case内实际总 n_tl_accept/n_tl_resp/n_iotlb_lookup/n_iotlb_hit/miss差/n_ddtw_ar/n_ptw_ar/n_fast/flow issue+done+cycles，明确这些全部从reset至drain观测，不把TL请求少当PTW少。准确查已有tick采样语义/可用变量并引用行号。
+沿用CSV格式、POSTTL-CHILD 和POSTTL-STATS计数语义 parent=32、child=64（模块位于preTL后TL皆有恢复逻辑）。natural n_nat_var在preTL会从32变64，原验收只是>0，不应改成强制32，也不减少页表次数假设。保持程序错误时不打印成功metrics；只能真实通过后打印。只增加小观测变量、tick采样、nat_clear、terminal输出/验收。输出完整精确patch、假设及行号证据。不可执行命令或编造运行。

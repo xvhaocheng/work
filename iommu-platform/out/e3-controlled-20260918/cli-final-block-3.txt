@@ -1,0 +1,221 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Fixed finite controlled E3 board runner.
+#
+# Usage: platform-e3-controlled short|main|all [OUTPUT_DIR]
+#   short: three short pairs
+#   main:  eight formal pairs. Run only after short passed on user/host.
+#   all:   short, then main only if short passed.
+#
+# OUTPUT_DIR is created new; it must not already exist.
+# Default OUTPUT_DIR is /tmp/e3-controlled-$$.
+#
+# No dmesg clear, no network, no SD burn, no ioctl retry, no hidden failure.
+# Every case requires a readable decimal taint of exactly 0 before and after
+# the run; any nonzero/unknown readback stops the run and is preserved.
+set -u
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+usage() {
+    cat <<'EOF'
+Usage: platform-e3-controlled short|main|all [OUTPUT_DIR]
+  short  3 short pairs
+  main   8 formal pairs (only after short passed on user/host)
+  all    short, then main if short passed
+OUTPUT_DIR must not exist. Default: /tmp/e3-controlled-$$.
+Matrix:
+  short 1: --aggressor none --prep cold --pair complementary --first-delay 0
+  short 2: --aggressor 1    --prep hot  --pair complementary --first-delay 0
+  short 3: --aggressor 1    --prep cold --pair zero          --first-delay 0
+  main 1:  --aggressor 1    --prep cold --pair zero          --first-delay 0
+  main 2:  --aggressor 1    --prep cold --pair complementary --first-delay 0
+  main 3:  --aggressor 1    --prep hot  --pair complementary --first-delay 0
+  main 4:  --aggressor 1    --prep cold --pair complementary --first-delay 128
+  main 5:  --aggressor 1    --prep cold --pair zero          --first-delay 0
+  main 6:  --aggressor 1    --prep cold --pair complementary --first-delay 0
+  main 7:  --aggressor 1    --prep hot  --pair complementary --first-delay 128
+  main 8:  --aggressor 1    --prep cold --pair complementary --first-delay 128
+EOF
+}
+
+fatal() {
+    echo "E3CTL: fatal: $*" >&2
+    exit 2
+}
+
+[ $# -ge 1 ] && [ $# -le 2 ] || { usage >&2; exit 2; }
+mode=$1
+case "$mode" in
+    short|main|all) ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+if [ $# -eq 2 ]; then
+    OUT=$2
+else
+    OUT=/tmp/e3-controlled-$$
+fi
+
+if [ -e "$OUT" ]; then
+    fatal "output directory already exists: $OUT"
+fi
+mkdir "$OUT" || fatal "mkdir failed: $OUT"
+
+: > "$OUT/input.txt" || fatal "input write failed: $OUT/input.txt"
+{
+    echo "mode=$mode"
+    echo "output=$OUT"
+} >> "$OUT/input.txt" || fatal "input write failed: $OUT/input.txt"
+
+if ! cat > "$OUT/matrix.txt" <<'EOF'
+short:
+1 --aggressor none --prep cold --pair complementary --first-delay 0
+2 --aggressor 1 --prep hot --pair complementary --first-delay 0
+3 --aggressor 1 --prep cold --pair zero --first-delay 0
+main:
+1 --aggressor 1 --prep cold --pair zero --first-delay 0
+2 --aggressor 1 --prep cold --pair complementary --first-delay 0
+3 --aggressor 1 --prep hot --pair complementary --first-delay 0
+4 --aggressor 1 --prep cold --pair complementary --first-delay 128
+5 --aggressor 1 --prep cold --pair zero --first-delay 0
+6 --aggressor 1 --prep cold --pair complementary --first-delay 0
+7 --aggressor 1 --prep hot --pair complementary --first-delay 128
+8 --aggressor 1 --prep cold --pair complementary --first-delay 128
+EOF
+then
+    fatal "matrix write failed: $OUT/matrix.txt"
+fi
+
+read_taint() {
+    if value=$(cat /proc/sys/kernel/tainted 2>/dev/null); then
+        case "$value" in
+            ''|*[!0-9]*) echo unknown ;;
+            *) echo "$value" ;;
+        esac
+    else
+        echo unknown
+    fi
+}
+
+save_dmesg() {
+    # Preserve the raw ring buffer verbatim; any de-duplication is done offline.
+    dmesg > "$OUT/dmesg.raw" 2> "$OUT/dmesg.err"
+    dmesg_rc=$?
+    if [ "$dmesg_rc" -eq 0 ]; then
+        return 0
+    fi
+    echo "dmesg collection failed rc=$dmesg_rc" > "$OUT/dmesg.error"
+    return "$dmesg_rc"
+}
+
+save_taint() {
+    if value=$(cat /proc/sys/kernel/tainted 2>/dev/null); then
+        echo "$value" > "$OUT/taint.txt" || return 1
+    else
+        echo unknown > "$OUT/taint.txt" || return 1
+    fi
+    return 0
+}
+
+collection_failed=0
+
+cleanup() {
+    rc=$?
+    trap - EXIT HUP INT TERM
+    save_dmesg || collection_failed=1
+    save_taint || collection_failed=1
+    if [ "$rc" -eq 0 ] && [ "$collection_failed" -ne 0 ]; then
+        rc=4
+    fi
+    echo "E3CTL: final_exit=$rc collection_failed=$collection_failed" >&2
+    if [ "$rc" -eq 0 ]; then
+        echo "E3CTL: complete ok mode=$mode output=$OUT"
+    fi
+    exit "$rc"
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+run_case() {
+    phase=$1
+    index=$2
+    shift 2
+
+    stdout_file="$OUT/$phase-$index.json"
+    stderr_file="$OUT/$phase-$index.err"
+
+    before_taint=$(read_taint)
+    if [ "$before_taint" != "0" ]; then
+        echo "E3CTL: phase=$phase case=$index before_taint=$before_taint refusing to run" >&2
+        return 3
+    fi
+
+    echo "E3CTL: phase=$phase case=$index begin taint=$before_taint args=$*" >&2
+    idma_e3_controlled "$@" > "$stdout_file" 2> "$stderr_file"
+    rc=$?
+    after_taint=$(read_taint)
+    echo "E3CTL: phase=$phase case=$index exit=$rc taint=$after_taint" >&2
+
+    cat "$stdout_file" || {
+        echo "E3CTL: phase=$phase case=$index stdout cat failed" >&2
+        return 4
+    }
+    if [ -s "$stderr_file" ]; then
+        cat "$stderr_file" >&2 || {
+            echo "E3CTL: phase=$phase case=$index stderr cat failed" >&2
+            return 4
+        }
+    fi
+
+    if [ "$after_taint" != "0" ]; then
+        echo "E3CTL: phase=$phase case=$index after_taint=$after_taint stopping" >&2
+        return 3
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        echo "E3CTL: phase=$phase case=$index failed rc=$rc" >&2
+        return "$rc"
+    fi
+    return 0
+}
+
+run_short() {
+    run_case short 1 --aggressor none --prep cold --pair complementary --first-delay 0 || return $?
+    run_case short 2 --aggressor 1 --prep hot --pair complementary --first-delay 0 || return $?
+    run_case short 3 --aggressor 1 --prep cold --pair zero --first-delay 0 || return $?
+    return 0
+}
+
+run_main() {
+    run_case main 1 --aggressor 1 --prep cold --pair zero --first-delay 0 || return $?
+    run_case main 2 --aggressor 1 --prep cold --pair complementary --first-delay 0 || return $?
+    run_case main 3 --aggressor 1 --prep hot --pair complementary --first-delay 0 || return $?
+    run_case main 4 --aggressor 1 --prep cold --pair complementary --first-delay 128 || return $?
+    run_case main 5 --aggressor 1 --prep cold --pair zero --first-delay 0 || return $?
+    run_case main 6 --aggressor 1 --prep cold --pair complementary --first-delay 0 || return $?
+    run_case main 7 --aggressor 1 --prep hot --pair complementary --first-delay 128 || return $?
+    run_case main 8 --aggressor 1 --prep cold --pair complementary --first-delay 128 || return $?
+    return 0
+}
+
+case "$mode" in
+    short)
+        run_short || exit $?
+        ;;
+    main)
+        echo "E3CTL: warning: main requires that short already passed on user/host" >&2
+        run_main || exit $?
+        ;;
+    all)
+        run_short || exit $?
+        echo "E3CTL: short passed; starting main" >&2
+        run_main || exit $?
+        ;;
+esac
+
+exit 0

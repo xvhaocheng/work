@@ -1,0 +1,253 @@
+#include "Vidma_controlled_pair_top.h"
+#include <verilated.h>
+#include <cassert>
+#include <cstdio>
+#include <cstdint>
+
+struct Tb {
+    Vidma_controlled_pair_top *d;
+
+    Tb() { d = new Vidma_controlled_pair_top; reset(); }
+    ~Tb() { delete d; }
+
+    void tick() {
+        d->clk_i = 0; d->eval();
+        d->clk_i = 1; d->eval();
+        d->clk_i = 0; d->eval();
+    }
+    void reset() {
+        d->rst_ni = 0;
+        d->v_cpu_valid_i = 0; d->v_cpu_write_i = 0; d->v_cpu_addr_i = 0; d->v_cpu_wdata_i = 0; d->v_cpu_wstrb_i = 0xff;
+        d->a_cpu_valid_i = 0; d->a_cpu_write_i = 0; d->a_cpu_addr_i = 0; d->a_cpu_wdata_i = 0; d->a_cpu_wstrb_i = 0xff;
+        d->v_backend_ready_i = 0; d->v_backend_idle_i = 1; d->v_trans_complete_i = 0;
+        d->a_backend_ready_i = 0; d->a_backend_idle_i = 1; d->a_trans_complete_i = 0;
+        d->selected_i = 0; d->select_write_i = 0; d->select_id_i = 0; d->select_did_i = 0; d->select_iova_i = 0;
+        tick();
+        d->rst_ni = 1;
+        tick();
+    }
+    void cpu_write(bool is_a, uint32_t addr, uint64_t data, uint8_t strb = 0xff) {
+        if (is_a) {
+            d->a_cpu_valid_i = 1; d->a_cpu_write_i = 1;
+            d->a_cpu_addr_i = addr; d->a_cpu_wdata_i = data; d->a_cpu_wstrb_i = strb;
+            while (!d->a_cpu_ready_o) tick();
+            tick();
+            d->a_cpu_valid_i = 0; d->a_cpu_write_i = 0;
+        } else {
+            d->v_cpu_valid_i = 1; d->v_cpu_write_i = 1;
+            d->v_cpu_addr_i = addr; d->v_cpu_wdata_i = data; d->v_cpu_wstrb_i = strb;
+            while (!d->v_cpu_ready_o) tick();
+            tick();
+            d->v_cpu_valid_i = 0; d->v_cpu_write_i = 0;
+        }
+        d->eval();
+    }
+    uint64_t cpu_read(bool is_a, uint32_t addr) {
+        if (is_a) {
+            d->a_cpu_valid_i = 1; d->a_cpu_write_i = 0; d->a_cpu_addr_i = addr;
+            while (!d->a_cpu_ready_o) tick();
+            uint64_t v = d->a_cpu_rdata_o;
+            tick();
+            d->a_cpu_valid_i = 0;
+            d->eval();
+            return v;
+        } else {
+            d->v_cpu_valid_i = 1; d->v_cpu_write_i = 0; d->v_cpu_addr_i = addr;
+            while (!d->v_cpu_ready_o) tick();
+            uint64_t v = d->v_cpu_rdata_o;
+            tick();
+            d->v_cpu_valid_i = 0;
+            d->eval();
+            return v;
+        }
+    }
+    void launcher_write(uint8_t addr, uint64_t data) { cpu_write(false, addr, data); }
+    uint64_t launcher_read(uint8_t addr) { return cpu_read(false, addr); }
+    void configure(bool is_a, uint64_t src, uint64_t dst) {
+        cpu_write(is_a, 0x00, src);
+        cpu_write(is_a, 0x08, dst);
+        cpu_write(is_a, 0x10, 64);
+        cpu_write(is_a, 0x18, 0);
+    }
+    uint64_t reserve(bool is_a) { return cpu_read(is_a, 0x28); }
+};
+
+static void test_basic_pair_flow() {
+    Tb t;
+    t.configure(false, 0x1000, 0x2000);
+    t.configure(true, 0x3000, 0x4000);
+    t.launcher_write(0xb8, 1 | 0x100);
+    uint64_t v_id = t.reserve(false);
+    uint64_t a_id = t.reserve(true);
+    assert(v_id != 0 && a_id != 0 && v_id != a_id);
+    assert(t.d->frontend_held_o == 3);
+    t.launcher_write(0xb8, 2); // GO -> A first
+    assert(t.d->launch_go_o == 2);
+    t.tick();
+    assert(t.d->launch_go_o == 0);
+    // A offers valid and is accepted.
+    t.d->a_backend_ready_i = 1;
+    while (!t.d->a_valid_o) t.tick();
+    t.tick();
+    t.d->a_backend_ready_i = 0;
+    // Valid A read select after actual A issue.
+    t.d->selected_i = 1; t.d->select_write_i = 0;
+    t.d->select_id_i = 4; t.d->select_did_i = 11; t.d->select_iova_i = 0x3000;
+    t.tick();
+    assert(t.d->launch_go_o == 1);
+    t.d->selected_i = 0;
+    // V offers valid and is accepted.
+    t.d->v_backend_ready_i = 1;
+    while (!t.d->v_valid_o) t.tick();
+    t.tick();
+    t.d->v_backend_ready_i = 0;
+    // Complete both.
+    t.d->a_trans_complete_i = 1; t.tick(); t.d->a_trans_complete_i = 0;
+    t.d->v_trans_complete_i = 1; t.tick(); t.d->v_trans_complete_i = 0;
+    t.tick();
+    assert((t.launcher_read(0xb8) & 4) == 4);
+    assert(t.launcher_read(0xc0) == 0);
+    t.launcher_write(0xc0, 11);
+    assert(t.launcher_read(0xc8) == v_id);
+    t.launcher_write(0xc0, 12);
+    assert(t.launcher_read(0xc8) == a_id);
+}
+
+static void test_go_then_immediate_abort() {
+    Tb t;
+    t.configure(false, 0x1000, 0x2000);
+    t.configure(true, 0x3000, 0x4000);
+    t.launcher_write(0xb8, 1 | 0x100);
+    t.reserve(false);
+    t.reserve(true);
+    t.launcher_write(0xb8, 2);
+    assert(t.d->launch_go_o == 2);
+    // Abort on the same edge before frontend samples registered go.
+    t.d->v_cpu_valid_i = 1; t.d->v_cpu_write_i = 1;
+    t.d->v_cpu_addr_i = 0xb8; t.d->v_cpu_wdata_i = 4; t.d->v_cpu_wstrb_i = 0xff;
+    t.d->eval();
+    assert(t.d->launch_go_o == 0);
+    assert(t.d->launch_cancel_o == 3);
+    t.tick();
+    t.d->v_cpu_valid_i = 0; t.d->v_cpu_write_i = 0;
+    t.tick();
+    assert(t.d->v_valid_o == 0 && t.d->a_valid_o == 0);
+    assert((t.launcher_read(0xb8) & 8) == 8);
+}
+
+static void test_count_backpressure_abort() {
+    Tb t;
+    t.configure(false, 0x1000, 0x2000);
+    t.launcher_write(0xb8, 1);
+    t.reserve(false);
+    t.launcher_write(0xb8, 2);
+    t.tick();
+    t.d->v_backend_ready_i = 0;
+    while (!t.d->v_valid_o) t.tick();
+    t.launcher_write(0xb8, 4);
+    assert((t.d->launch_cancel_o & 1) == 0);
+    t.tick();
+    assert(t.d->v_valid_o == 1);
+    t.d->v_backend_ready_i = 1;
+    t.tick();
+    t.d->v_backend_ready_i = 0;
+    t.d->v_trans_complete_i = 1; t.tick(); t.d->v_trans_complete_i = 0;
+    t.tick();
+    assert((t.launcher_read(0xb8) & 8) == 8);
+    assert((t.launcher_read(0xb8) & 4) == 4);
+}
+
+static void test_partial_reserve_abort() {
+    Tb t;
+    t.configure(false, 0x1000, 0x2000);
+    t.configure(true, 0x3000, 0x4000);
+    t.launcher_write(0xb8, 1 | 0x100);
+    t.reserve(false);
+    assert(t.d->frontend_held_o == 1);
+    t.launcher_write(0xb8, 4);
+    t.tick();
+    assert((t.launcher_read(0xb8) & 8) == 8);
+}
+
+static void test_new_prep_after_aborted_terminal() {
+    Tb t;
+    t.launcher_write(0xb8, 4);
+    t.tick();
+    assert((t.launcher_read(0xb8) & 8) == 8);
+    t.launcher_write(0xb8, 1);
+    assert((t.launcher_read(0xb8) & 1) == 1);
+    assert((t.launcher_read(0xb8) & 8) == 0);
+}
+
+static void test_v_release_only_valid_a_select() {
+    Tb t;
+    t.configure(false, 0x1000, 0x2000);
+    t.configure(true, 0x3000, 0x4000);
+    t.launcher_write(0xb8, 1 | 0x100);
+    t.reserve(false);
+    t.reserve(true);
+    t.launcher_write(0xb8, 2);
+    t.tick();
+    t.d->a_backend_ready_i = 1;
+    while (!t.d->a_valid_o) t.tick();
+    t.tick();
+    t.d->a_backend_ready_i = 0;
+    // Invalid selects.
+    t.d->selected_i = 1; t.d->select_write_i = 1; t.d->select_id_i = 4; t.d->select_did_i = 11;
+    t.tick();
+    assert(t.d->launch_go_o == 0);
+    t.d->select_write_i = 0; t.d->select_id_i = 5;
+    t.tick();
+    assert(t.d->launch_go_o == 0);
+    t.d->select_id_i = 4; t.d->select_did_i = 12;
+    t.tick();
+    assert(t.d->launch_go_o == 0);
+    // Valid select.
+    t.d->select_did_i = 11;
+    t.tick();
+    assert(t.d->launch_go_o == 1);
+}
+
+static void test_both_done_late_a() {
+    Tb t;
+    t.configure(false, 0x1000, 0x2000);
+    t.configure(true, 0x3000, 0x4000);
+    t.launcher_write(0xb8, 1 | 0x100);
+    t.reserve(false);
+    t.reserve(true);
+    t.launcher_write(0xb8, 2);
+    t.tick();
+    t.d->a_backend_ready_i = 1;
+    while (!t.d->a_valid_o) t.tick();
+    t.tick();
+    t.d->a_backend_ready_i = 0;
+    t.d->selected_i = 1; t.d->select_write_i = 0;
+    t.d->select_id_i = 4; t.d->select_did_i = 11;
+    t.tick();
+    t.d->selected_i = 0;
+    t.d->v_backend_ready_i = 1;
+    while (!t.d->v_valid_o) t.tick();
+    t.tick();
+    t.d->v_backend_ready_i = 0;
+    // V done first.
+    t.d->v_trans_complete_i = 1; t.tick(); t.d->v_trans_complete_i = 0;
+    t.tick();
+    assert((t.launcher_read(0xb8) & 4) == 0);
+    // A done late.
+    t.d->a_trans_complete_i = 1; t.tick(); t.d->a_trans_complete_i = 0;
+    t.tick();
+    assert((t.launcher_read(0xb8) & 4) == 4);
+}
+
+int main(int argc, char **argv) {
+    Verilated::commandArgs(argc, argv);
+    test_basic_pair_flow();
+    test_go_then_immediate_abort();
+    test_count_backpressure_abort();
+    test_partial_reserve_abort();
+    test_new_prep_after_aborted_terminal();
+    test_v_release_only_valid_a_select();
+    test_both_done_late_a();
+    std::puts("PASS idma_controlled_pair");
+    return 0;
+}

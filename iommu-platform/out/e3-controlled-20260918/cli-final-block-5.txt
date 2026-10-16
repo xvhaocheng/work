@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Bounded host-side tests for tests/board-e3-controlled.sh.
+
+The production runner is exercised through a TEST-ONLY transformed copy whose
+command search path and taint path point at isolated mocks.  No board
+hardware, no real /proc/sys/kernel/tainted read, and no production override
+are introduced.
+"""
+import os
+import signal
+import subprocess
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNNER = ROOT / 'tests' / 'board-e3-controlled.sh'
+
+EXPECTED_MATRIX = """short:
+1 --aggressor none --prep cold --pair complementary --first-delay 0
+2 --aggressor 1 --prep hot --pair complementary --first-delay 0
+3 --aggressor 1 --prep cold --pair zero --first-delay 0
+main:
+1 --aggressor 1 --prep cold --pair zero --first-delay 0
+2 --aggressor 1 --prep cold --pair complementary --first-delay 0
+3 --aggressor 1 --prep hot --pair complementary --first-delay 0
+4 --aggressor 1 --prep cold --pair complementary --first-delay 128
+5 --aggressor 1 --prep cold --pair zero --first-delay 0
+6 --aggressor 1 --prep cold --pair complementary --first-delay 0
+7 --aggressor 1 --prep hot --pair complementary --first-delay 128
+8 --aggressor 1 --prep cold --pair complementary --first-delay 128
+"""
+
+
+class BoardRunnerTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name)
+        self.bindir = self.dir / 'bin'
+        self.bindir.mkdir()
+        self.taint = self.dir / 'tainted'
+        self.taint.write_text('0\n')
+        self.count = self.dir / 'count'
+        self.runner = self.dir / 'runner.sh'
+
+        text = RUNNER.read_text()
+        # Fail loudly if the runner drifts and the TEST-only rewrites miss.
+        self.assertIn('PATH=/sbin:/bin:/usr/sbin:/usr/bin\n', text)
+        self.assertIn('/proc/sys/kernel/tainted', text)
+        text = text.replace(
+            'PATH=/sbin:/bin:/usr/sbin:/usr/bin\n',
+            'PATH="%s:/sbin:/bin:/usr/sbin:/usr/bin"\n' % self.bindir)
+        text = text.replace('/proc/sys/kernel/tainted', '"$E3_TEST_TAINT"')
+        self.runner.write_text(text)
+        os.chmod(self.runner, 0o755)
+
+        self._mock('dmesg',
+                   '#!/bin/sh\n'
+                   'echo "mock raw dmesg"\n'
+                   'exit "${E3_TEST_DMESG_RC:-0}"\n')
+        self._mock('idma_e3_controlled',
+                   '#!/bin/sh\n'
+                   'n=0\n'
+                   '[ -f "$E3_TEST_COUNT" ] && n=$(cat "$E3_TEST_COUNT")\n'
+                   'n=$((n + 1))\n'
+                   'echo "$n" > "$E3_TEST_COUNT"\n'
+                   'echo "{\\"mock_case\\":$n}"\n'
+                   'if [ -n "${E3_TEST_SLEEP:-}" ]; then sleep "$E3_TEST_SLEEP"; fi\n'
+                   'if [ -n "${E3_TEST_CLI_FAIL_AT:-}" ] && [ "$n" = "$E3_TEST_CLI_FAIL_AT" ]; then\n'
+                   '    exit 1\n'
+                   'fi\n'
+                   'if [ -n "${E3_TEST_TAINT_AT:-}" ] && [ "$n" = "$E3_TEST_TAINT_AT" ]; then\n'
+                   '    echo "${E3_TEST_TAINT_VALUE:-1}" > "$E3_TEST_TAINT"\n'
+                   'fi\n'
+                   'exit 0\n')
+
+    def _mock(self, name, body):
+        path = self.bindir / name
+        path.write_text(body)
+        os.chmod(path, 0o755)
+
+    def _env(self, **extra):
+        env = dict(os.environ)
+        env['E3_TEST_TAINT'] = str(self.taint)
+        env['E3_TEST_COUNT'] = str(self.count)
+        for key, value in extra.items():
+            env[key] = str(value)
+        return env
+
+    def _out(self, name):
+        return self.dir / name
+
+    def _run(self, *args, **extra):
+        return subprocess.run(['sh', str(self.runner), *args],
+                              env=self._env(**extra), capture_output=True,
+                              text=True, timeout=20)
+
+    def test_success_short(self):
+        out = self._out('out-short')
+        p = self._run('short', str(out))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('complete ok', p.stderr)
+        self.assertEqual((out / 'matrix.txt').read_text(), EXPECTED_MATRIX)
+        for index in (1, 2, 3):
+            self.assertTrue((out / ('short-%d.json' % index)).exists())
+        self.assertTrue((out / 'dmesg.raw').exists())
+        self.assertEqual((out / 'taint.txt').read_text(), '0\n')
+
+    def test_success_main_matrix(self):
+        out = self._out('out-main')
+        p = self._run('main', str(out))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for index in range(1, 9):
+            self.assertTrue((out / ('main-%d.json' % index)).exists())
+
+    def test_cli_error_stops(self):
+        out = self._out('out-cli')
+        p = self._run('short', str(out), E3_TEST_CLI_FAIL_AT=2)
+        self.assertNotEqual(p.returncode, 0, p.stderr)
+        self.assertTrue((out / 'short-2.json').exists())
+        self.assertFalse((out / 'short-3.json').exists())
+        self.assertEqual(self.count.read_text().strip(), '2')
+
+    def test_taint_change_stops(self):
+        out = self._out('out-taint')
+        p = self._run('short', str(out), E3_TEST_TAINT_AT=1)
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertTrue((out / 'short-1.json').exists())
+        self.assertFalse((out / 'short-2.json').exists())
+
+    def test_unknown_taint_refuses_before_case(self):
+        self.taint.write_text('unknown\n')
+        out = self._out('out-unknown')
+        p = self._run('short', str(out))
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertFalse((out / 'short-1.json').exists())
+        self.assertFalse(self.count.exists())
+
+    def test_capture_failure_is_nonzero(self):
+        out = self._out('out-capture')
+        p = self._run('short', str(out), E3_TEST_DMESG_RC=1)
+        self.assertNotEqual(p.returncode, 0, p.stderr)
+        self.assertTrue((out / 'dmesg.error').exists())
+
+    def test_output_dir_must_not_exist(self):
+        out = self._out('out-exists')
+        out.mkdir()
+        p = self._run('short', str(out))
+        self.assertEqual(p.returncode, 2, p.stderr)
+
+    def test_interrupt_is_nonzero(self):
+        out = self._out('out-int')
+        proc = subprocess.Popen(
+            ['sh', str(self.runner), 'short', str(out)],
+            env=self._env(E3_TEST_SLEEP=30),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        try:
+            time.sleep(0.5)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=15)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertNotEqual(proc.returncode, 0)
+
+
+if __name__ == '__main__':
+    unittest.main()

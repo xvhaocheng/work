@@ -1,0 +1,198 @@
+下面给出一个**仅增加观测变量、tick 内采样、nat_clear/reset 清零、terminal 验收与 JSON 输出**的 `apply_patch`。补丁假定 `out/fragment-placement-20261008/placement_test.cpp` 已由 Codex 按 `out/posttl-independent-20261008/natural_fragment_test.cpp` 原样复制。
+
+```diff
+*** Begin Patch
+*** Update File: out/fragment-placement-20261008/placement_test.cpp
+@@
+     uint64_t nat_r_stall_id = 0, nat_r_stall_addr = 0, nat_r_stall_len = 0;
+ 
++    // Real per-flow hardware issue/done observation for the natural run.
++    // Sampled in tick() at the same PRE-EDGE point as dbg_dma_issue /
++    // dbg_dma_done for the warm scoreboard; no extra clock is advanced.
++    // Bit0 = V/DMA0, bit1 = A/DMA1.
++    bool     nat_hw_track = false;
++    uint64_t n_nat_hw_v_issue = 0, n_nat_hw_v_done = 0;
++    uint64_t n_nat_hw_a_issue = 0, n_nat_hw_a_done = 0;
++    long     nat_hw_v_issue_cycle = -1, nat_hw_v_done_cycle = -1;
++    long     nat_hw_a_issue_cycle = -1, nat_hw_a_done_cycle = -1;
++
+     // Saved pre-copy payload snapshots; index 0 = V (DMA0), 1 = A (DMA1).
+@@
+         nat_r_stall_id = nat_r_stall_addr = nat_r_stall_len = 0;
++        n_nat_hw_v_issue = n_nat_hw_v_done = 0;
++        n_nat_hw_a_issue = n_nat_hw_a_done = 0;
++        nat_hw_v_issue_cycle = nat_hw_v_done_cycle = -1;
++        nat_hw_a_issue_cycle = nat_hw_a_done_cycle = -1;
++        nat_hw_track = false;
+     }
+@@
+         cfg_wr(SEL_A, REG_DST,  NAT_A_DST_PAGE_IOVA + (uint64_t)NAT_DST_OFF);
+         cfg_wr(SEL_A, REG_NB,   (uint64_t)natural_bytes);
+ 
++        // Enable the real dbg_dma_issue/dbg_dma_done event observer before the
++        // first NEXT_ID trigger.  The observer is sampled by the ordinary
++        // tick() pre-edge logic and never advances the clock or adds cfg
++        // traffic.
++        nat_hw_track = true;
++
+         // ---- NEXT_ID triggers, in the requested order ---------------------
+@@
+         check_quiet("natural");
+ 
++        // Freeze the hardware event observer after drain-to-quiet, before the
++        // terminal checks and JSON emission.
++        nat_hw_track = false;
++
+         nat_verify_and_report(beats);
+@@
+             if (warm_hw_v_busy && warm_hw_a_busy) ++warm_overlap_ticks;
+         }
+ 
++        // Natural write-order real hardware per-flow issue/done observer.
++        // Same PRE-EDGE sample point as the warm scoreboard above; bit0 =
++        // V/DMA0, bit1 = A/DMA1.  These are the real dbg_dma_issue /
++        // dbg_dma_done pulses, not the driver's wait_done ordering.
++        if (natural_enable && nat_hw_track) {
++            const uint32_t nat_iss = (uint32_t)top->dbg_dma_issue & 3u;
++            const uint32_t nat_dnn = (uint32_t)top->dbg_dma_done  & 3u;
++            if (nat_iss & 1u) {
++                ++n_nat_hw_v_issue;
++                if (nat_hw_v_issue_cycle < 0) nat_hw_v_issue_cycle = g_cycle;
++            }
++            if (nat_iss & 2u) {
++                ++n_nat_hw_a_issue;
++                if (nat_hw_a_issue_cycle < 0) nat_hw_a_issue_cycle = g_cycle;
++            }
++            if (nat_dnn & 1u) {
++                ++n_nat_hw_v_done;
++                if (nat_hw_v_done_cycle < 0) nat_hw_v_done_cycle = g_cycle;
++            }
++            if (nat_dnn & 2u) {
++                ++n_nat_hw_a_done;
++                if (nat_hw_a_done_cycle < 0) nat_hw_a_done_cycle = g_cycle;
++            }
++        }
++
+         if (top->dbg_fast_resp_valid && top->dbg_fast_resp_ready) {
+@@
+         warm_hw_a_issue     = 0;
+         warm_hw_a_done      = 0;
++        nat_hw_track        = false;
++        n_nat_hw_v_issue    = 0;
++        n_nat_hw_v_done     = 0;
++        n_nat_hw_a_issue    = 0;
++        n_nat_hw_a_done     = 0;
++        nat_hw_v_issue_cycle = -1;
++        nat_hw_v_done_cycle  = -1;
++        nat_hw_a_issue_cycle = -1;
++        nat_hw_a_done_cycle  = -1;
+ 
+         for (int i = 0; i < 8; ++i) tick();
+@@
+                     (unsigned long long)n_nat_vw_unattr,
+                     (unsigned long long)n_nat_vw_mismatch);
+ 
++        // ---- (5) real hardware issue/done placement ----------------------
++        // These are the real dbg_dma_issue/dbg_dma_done pulses sampled in
++        // tick() at the ordinary PRE-EDGE point.  The driver's wait_done
++        // order is not used as the done instant.  Exactly one issue and one
++        // done per real flow is required, and done must be strictly later
++        // than issue.
++        CHECK(n_nat_hw_v_issue == 1,
++              "natural: hardware V issue count != 1");
++        CHECK(n_nat_hw_v_done == 1,
++              "natural: hardware V done count != 1");
++        CHECK(n_nat_hw_a_issue == 1,
++              "natural: hardware A issue count != 1");
++        CHECK(n_nat_hw_a_done == 1,
++              "natural: hardware A done count != 1");
++        CHECK(nat_hw_v_issue_cycle >= 0 && nat_hw_v_done_cycle >= 0 &&
++              nat_hw_v_done_cycle > nat_hw_v_issue_cycle,
++              "natural: hardware V done cycle is not after issue cycle");
++        CHECK(nat_hw_a_issue_cycle >= 0 && nat_hw_a_done_cycle >= 0 &&
++              nat_hw_a_done_cycle > nat_hw_a_issue_cycle,
++              "natural: hardware A done cycle is not after issue cycle");
++
+         std::printf("POSTTL-STATS parents=%u children=%u policy=%u\n", (unsigned)top->dbg_frontier_grant, (unsigned)top->dbg_frontier_wait, (unsigned)read_admit_mode_val);
+         nat_report_json(beats);
++        nat_report_placement_json();
+     }
+@@
+             nat_trace_path.c_str());
+     }
+ 
++    // Reset-to-drain placement metrics.  Called only after every terminal
++    // CHECK in nat_verify_and_report() has passed, so a failing run never
++    // prints a success metrics line.  TL accept/resp counts are request-path
++    // observations; they are not used as a PTW count.  The n_ddtw_ar /
++    // n_ptw_ar fields are fed from the actual SYSTEM walker taps
++    // (n_walk_ddtw / n_walk_ptw, tick() lines 1599-1600); the legacy
++    // non-SYSTEM n_ddtw_ar/n_ptw_ar names remain the fallback.
++    void nat_report_placement_json() {
++        const long v_delta = (nat_hw_v_issue_cycle >= 0 && nat_hw_v_done_cycle >= 0)
++                           ? (nat_hw_v_done_cycle - nat_hw_v_issue_cycle) : -1;
++        const long a_delta = (nat_hw_a_issue_cycle >= 0 && nat_hw_a_done_cycle >= 0)
++                           ? (nat_hw_a_done_cycle - nat_hw_a_issue_cycle) : -1;
++        std::printf("PLACEMENT-METRICS-JSON {"
++            "\"schema\":\"placement-metrics-v1\","
++            "\"scope\":\"reset_to_drain\","
++            "\"tl_request_count_is_not_ptw_count\":1,"
++            "\"n_tl_accept\":%llu,"
++            "\"n_tl_resp\":%llu,"
++            "\"n_iotlb_lookup\":%llu,"
++            "\"n_iotlb_hit\":%llu,"
++            "\"n_iotlb_miss\":%llu,"
++            "\"n_ddtw_ar\":%llu,"
++            "\"n_ptw_ar\":%llu,"
++            "\"n_fast\":%llu,"
++            "\"flow\":{"
++              "\"v\":{\"issue_count\":%llu,\"done_count\":%llu,"
++                     "\"issue_cycle\":%ld,\"done_cycle\":%ld,"
++                     "\"issue_to_done_cycles\":%ld},"
++              "\"a\":{\"issue_count\":%llu,\"done_count\":%llu,"
++                     "\"issue_cycle\":%ld,\"done_cycle\":%ld,"
++                     "\"issue_to_done_cycles\":%ld}"
++            "}}\n",
++            (unsigned long long)n_tl_accept,
++            (unsigned long long)n_tl_resp,
++            (unsigned long long)n_iotlb_lookup,
++            (unsigned long long)n_iotlb_hit,
++            (unsigned long long)(n_iotlb_lookup - n_iotlb_hit),
++#ifdef ACTUAL_DMA_SYSTEM
++            (unsigned long long)n_walk_ddtw,
++            (unsigned long long)n_walk_ptw,
++#else
++            (unsigned long long)n_ddtw_ar,
++            (unsigned long long)n_ptw_ar,
++#endif
++            (unsigned long long)n_fast,
++            (unsigned long long)n_nat_hw_v_issue,
++            (unsigned long long)n_nat_hw_v_done,
++            nat_hw_v_issue_cycle, nat_hw_v_done_cycle, v_delta,
++            (unsigned long long)n_nat_hw_a_issue,
++            (unsigned long long)n_nat_hw_a_done,
++            nat_hw_a_issue_cycle, nat_hw_a_done_cycle, a_delta);
++    }
++
+     void tick() {
+*** End Patch
+```
+
+## 行号证据与已有语义
+
+- `dbg_dma_issue/dbg_dma_done` 既有 PRE-EDGE 采样点：原文件 `tick()` 中 `warm_hw_track` 块位于约 **1377-1387 行**。补丁在同一位置之后采样，没有新增时钟、没有额外 `tick()`。
+- 全局 `n_tl_accept/n_tl_resp` 在约 **1393-1400 行** 累加；`n_iotlb_lookup/n_iotlb_hit` 在约 **1402-1405 行** 累加；`n_fast` 在约 **1389-1392 行** 累加。它们都在 `reset()` 中清零，见约 **1829-1834 行**。因此 natural 运行时这些值覆盖 reset 至 drain-to-quiet。
+- SYSTEM 构建下真正的 walker 总计数是 `n_walk_ddtw` / `n_walk_ptw`：声明约 **390 行**，递增约 **1599-1600 行**。原 `n_ddtw_ar/n_ptw_ar` 在该 SYSTEM 路径下不是实际 walker 累加器，所以 JSON 字段 `n_ddtw_ar/n_ptw_ar` 在 SYSTEM 分支映射到 `n_walk_ddtw/n_walk_ptw`，避免把 TL 请求数误当 PTW 数。
+- natural 流程清零与 reset：`nat_clear_run_state()` 调用约 **863 行**，`reset(false)` 约 **870 行**，`check_quiet("natural")` 约 **910 行**，`nat_verify_and_report(beats)` 约 **912 行**。补丁在 `nat_clear_run_state()` 和 `reset()` 中都清零新计数。
+- `NATURAL-JSON` 由 `nat_report_json(beats)` 输出，调用点约 **1005 行**，定义约 **1010-1056 行**。补丁在 `nat_report_json(beats);` 之后调用 `nat_report_placement_json();`，因此 `PLACEMENT-METRICS-JSON` 在 `NATURAL-JSON` 之后。
+- 原验收 `n_nat_var > 0` 位于约 **967 行**。补丁**未修改**该检查，没有强制 32 或 64，也没有减少页表次数假设。
+- `POSTTL-STATS` 位于约 **1004 行**，补丁未修改其语义。提供的原文件中未出现 `POSTTL-CHILD`；若复制文件外部已有该行，本补丁不触碰。
+- 原驱动 `wait_done()` 只是轮询 DONE 寄存器匹配 NEXT_ID，见约 **1796-1813 行**；它不是硬件 done 时刻。补丁使用 `dbg_dma_done` 脉冲周期作为真实 done 周期。
+
+## 假设
+
+1. 新文件 `out/fragment-placement-20261008/placement_test.cpp` 与 `out/posttl-independent-20261008/natural_fragment_test.cpp` 内容完全一致，行号上下文可匹配。
+2. natural 运行走 `ACTUAL_DMA_SYSTEM` 构建；主入口对 `+natural` 的解析和 `tb.run_natural()` 调用在 `#ifdef ACTUAL_DMA_SYSTEM` 内，见约 **3028-3076 行**、**3219-3232 行**。
+3. `dbg_dma_issue` / `dbg_dma_done` 的 bit0 为 V/DMA0，bit1 为 A/DMA1，与原 `warm_hw_*` 约定一致，见约 **1378-1385 行**。
+4. 程序异常时主入口 `catch` 只打印 `NATURAL-JSON {completed:false, verified:false}`，见约 **3236-3249 行**。补丁新增的 `PLACEMENT-METRICS-JSON` 只在所有 terminal CHECK 通过后执行。
+5. 未执行任何命令、未运行仿真、未编造通过结果。以上为待 Codex 应用和验证的补丁。

@@ -1,0 +1,2 @@
+首次只读核账在第1条pcie_deliver拒绝：checker误把尚未首次flow报告的target=0要求为N。修正为首次flow前0、之后N；不改原始日志、配置或observer，不重跑模拟器。该失败是checker初始化假设错误，不是新实验结果。
+第二次只读核账揭示XML Request_Count是生成数而不是完成数（Base533–546同样以generated计IOPS）。修正为XML核生成数，并独立核原版/观测版stdout的generated/serviced，仍逐CQE核完成。原数据和模型不改/不重跑。

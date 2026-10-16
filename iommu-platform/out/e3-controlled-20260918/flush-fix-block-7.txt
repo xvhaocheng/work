@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Run the production host S1 flush helper against host-controlled MMIO/locks.
+
+Only kernel includes are removed, and the production helper bodies are
+extracted verbatim from iommu.c and compiled unchanged. This checks driver
+control flow, command encoding and locking, not RTL behavior or board counters.
+"""
+
+import hashlib
+import os
+from pathlib import Path
+import re
+import resource
+import subprocess
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+HELPERS = (
+    "riscv_iommu_cmd_inval_vma",
+    "riscv_iommu_flush_s1_check_ep",
+    "riscv_iommu_flush_s1_checked",
+)
+
+
+def without_includes(text):
+    return re.sub(r"^\s*#include[^\n]*", "", text, flags=re.MULTILINE)
+
+
+def extract_function(text, name):
+    match = re.search(r"^[A-Za-z_][^\n]*\b" + re.escape(name) + r"\s*\(",
+                      text, flags=re.MULTILINE)
+    assert match, "function not found: " + name
+    start = match.start()
+    open_brace = text.index("{", match.end())
+    depth = 0
+    for index in range(open_brace, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    raise AssertionError("unterminated function: " + name)
+
+
+def domain_type_definitions(text):
+    """Copy the real IOMMU_DOMAIN_* constants out of <linux/iommu.h>.
+
+    Re-joins backslash continuations so the extracted block is valid C for
+    hosts that cannot include <linux/iommu.h> directly.
+    """
+    lines = text.splitlines()
+    definitions = []
+
+    for index, line in enumerate(lines):
+        if not re.match(r"#define\s+_*IOMMU_DOMAIN_", line):
+            continue
+        block = [line]
+        while block[-1].rstrip().endswith("\\"):
+            index += 1
+            block.append(lines[index])
+        definitions.append("\n".join(block))
+
+    assert any("IOMMU_DOMAIN_SVA" in entry for entry in definitions), \
+        "IOMMU_DOMAIN_SVA not found in <linux/iommu.h>"
+    assert any("IOMMU_DOMAIN_DMA" in entry for entry in definitions), \
+        "IOMMU_DOMAIN_DMA not found in <linux/iommu.h>"
+    return "\n".join(definitions) + "\n"
+
+
+def main():
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    source = ROOT / "linux/drivers/iommu/riscv/iommu.c"
+    contents = source.read_text()
+    helpers = "\n\n".join(extract_function(contents, name)
+                          for name in HELPERS)
+    with tempfile.TemporaryDirectory(prefix="iommu-s1-flush-") as temporary:
+        temp = Path(temporary)
+        (temp / "production_bits.h").write_text(without_includes(
+            (ROOT / "linux/drivers/iommu/riscv/iommu-bits.h").read_text()))
+        (temp / "production_iommu_types.h").write_text(domain_type_definitions(
+            (ROOT / "linux/include/linux/iommu.h").read_text()))
+        (temp / "production_iommu.h").write_text(without_includes(
+            (ROOT / "linux/drivers/iommu/riscv/iommu.h").read_text()))
+        (temp / "production_s1_flush.c").write_text(helpers + "\n")
+        binary = temp / "s1-flush-test"
+        subprocess.run([
+            os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-O2", "-g",
+            "-Wall", "-Wextra", "-Werror", "-I", str(temp),
+            str(ROOT / "newtests/test_iommu_s1_flush.c"), "-o", str(binary),
+        ], check=True)
+        subprocess.run([str(binary)], check=True)
+    print(f"Production iommu.c (S1 helpers) SHA256: "
+          f"{hashlib.sha256(contents.encode()).hexdigest()}")
+    print("Host control/command/lock checks only; no RTL or board result.")
+
+
+if __name__ == "__main__":
+    main()

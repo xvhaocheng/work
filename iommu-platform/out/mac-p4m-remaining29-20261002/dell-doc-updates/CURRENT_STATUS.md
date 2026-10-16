@@ -1,0 +1,102 @@
+# 论文平台当前状态（精简版）
+
+## 2026-10-02 最新完成状态：P4M剩余29次已补齐
+
+- 29/29原runner检查通过，exit0、数据错误0、完成数正确、taint0。完整结果已回传并内容核对一致：`iommu-platform/out/mac-p4m-remaining29-20261002/`。
+- 原25份＋额外6份离线复核＋本次29份＝60份，每gap20（53在线＋7离线追认）。断电后新启动补缺，不是同一启动60次在线通过，后续分析须保留分段。
+- Linux00089保持运行，UART已释放。没有追加实验、构建或E2操作；下面E2建议仍为候选，不自动执行。详情见结果目录README及HANDOFF最新条目；旧reported_running由本条更新。
+
+## 2026-10-02 最新补充：续跑进行中；建议 E2 最小实验并行
+
+- 用户报告剩余 35 次正在运行（reported_running）；本轮未接收或审计新增结果，完成数未知。已复核基线仍为 25 次可用，不标记 60 次完成。下方历史段落的“35 未跑”不再代表最新运行状态。
+- 建议将 E2 作为与 E3／改善设计并行的小规模机制验证分支，不作为后者的前置条件：V 预热→A 有限访问→A 完全停止排空→V 首次探测，包含等时无 A、小重复集合、更大集合三类对照。范围及判据见 [实验计划 E2](iommu-platform/docs/experiment-plan.md)。
+- 仅 miss/PTW 增加不能直接认定 IOTLB 容量替换，需排除主动失效、上下文变化等原因并核对条目变化。E2 结果用于判断改善方案是否需要处理翻译记录受损；不自动要求双机制联合方案，也不把有限阴性结果推广到所有条件。本轮仅评议和状态交接，未启动 E2 实现、构建或板测。
+- 用户要求减少重复上板：已完善为同一 BIT＋软件包的 E2 单次部署设计，短验收→主矩阵→预设小复核自动执行。候选 W=0/1/4/7/8/16，运行时参数切换，补齐目标条目生命周期与探测前快照，避免只有 miss 而不能判断替换。每条件 10 次、A 总次数 112 为待核验冻结的工程候选；方案详见 [实验计划末节](iommu-platform/docs/experiment-plan.md)。仍为设计，未实现、未编译、未上板；不承诺一次调试即成功。
+
+## 2026-09-20 P4M formal60 recovery：采集修复已应用，resume35 prepared_not_run
+
+原始在线运行仍为 24 在线通过、25 attempted、35 unrun、runner exit5；第 25 次 formal-b09-g2000 因 `startup_line_count before=36 after=36 want=37` 停止，判定为 runner 记录计数假设失效，不是 DMA 失败或新硬件根因。第 25 次作为离线复核追认保留，原始 run.json 与 flags 不改写，不伪称 25 在线通过。
+
+采集修复脚本 `iommu-platform/tests/board-p4m-formal60.sh` 新 resume35 模式已由 Codex 应用，交付复制到 `iommu-platform/out/p4m-formal60-recovery-20260920/delivery/platform-p4m-formal60`。resume35 只跑 flat26..60，分配 12/12/11，合并已有 8/8/9 可成 20/20/20。Dell 无接板，本次 35 尚未运行，状态 prepared_not_run；Mac 侧按串口步骤执行后只读归档再合并审计。主机验证：test_board_p4m_start.py 41 项、test_p4m_formal60_recovery.py 16 项、test_p4m_formal60_resume.py 15 项通过；shell syntax 0；offline_revalidate.py 25/25 all_passed=true；原始 14 份 SHA 机械核对一致，25 份 before-dmesg 错误文件皆空。详见 [恢复报告](iommu-platform/docs/p4m-formal60-recovery.md) 与 [续跑交付说明](iommu-platform/out/p4m-formal60-recovery-20260920/delivery/README.md)。
+
+## 2026-09-20 P4M 启动控制软件：软件构建通过，板上未跑
+
+本轮完成 P4M 启动控制软件（驱动 batch start、测试、runner、finalizer）与配套文档：DeepSeek 起草，Codex 复核并执行。`make software PROFILE=migration-4dma-p4m JOBS=12` 退出 0（2026-09-20 12:12–12:13 UTC）。
+
+- 版本：内核 `6.5.0-rc2-00089-gefd9461d6459`，Linux `efd9461d6459049f59c9ea5466f3703e45413bb3`，顶层 `a08426f46720b646ae0fa052a0a27136a347b69f`，CVA6 `e822bc9d`、IOMMU `137f5e5`；新内核是独立软件基线，不与 `00088` 混算。
+- 硬件不变：沿用既有 BIT `7af1ccbc…`（未重建 FPGA），新 payload `fc8e8a73…`；交付目录 `out/p4m-start-control-20260920/delivery`，产物哈希、rootfs 内的新脚本及复用 BIT 来源均已核验。
+- 主机检查 6 套件全 0：batch-start 10 场景、scheduler、controlled、CLI、rootfs、board-p4m-start runner 41 例（含主机编译 CLI 与 BusyBox ash/awk）；均为主机检查，非板级证据。
+- 板上未跑（board_tested=false）：无功能/性能结论。板卡命令 `platform-p4m-start all /tmp/p4m-start-01`；UART 与日志由 Mac 侧捕获，Dell 未接板。
+- 协议、字段契约、runner 门限与判据见 [P4M 启动控制协议](iommu-platform/P4M_START_CONTROL.md)，验证见 [validation.md](iommu-platform/docs/validation.md)，产物见 [out](iommu-platform/out/p4m-start-control-20260920/)。
+- 下一步：4 短试次 + 8 比较试次（4 对）均只作描述，正式参数未冻结。
+
+## 2026-09-20 P4M pilot-21 完成（历史保留；21/21 与 gap500 反例不变）
+
+P4M 板上短验收已执行：`platform-p4m short /tmp/p4m-v7-01`，Solo/A1gap0/A8gap0/A8gap1000 四例 64 jobs、warmup 8、4 KiB，板卡退出 0、final taint=0、collection_failed=0。原始证据：[console.raw.log](iommu-platform/out/mac-p4m-short-20260920-180713-run-l7cin11d/console.raw.log)、[records.json](iommu-platform/out/mac-p4m-short-20260920-180713-run-l7cin11d/records.json)、[run.json](iommu-platform/out/mac-p4m-short-20260920-180713-run-l7cin11d/run.json)。复核脚本与报告：[p4m-short-results-review.md](iommu-platform/docs/p4m-short-results-review.md)、[review.json](iommu-platform/out/p4m-short-review-20260920/review.json)。修订后复核结果：正常复核 exit 0，自测 PASS，原始输入哈希未变。
+
+版本仍为 P4M profile `migration-4dma-p4m`/observer v7，内核 `6.5.0-rc2-00088-g9f8da9e7a6a0`，CVA6 `e822bc9d8adf`，Linux `9f8da9e7a6a0`，IOMMU `137f5e5fb1f2`。短验收只做功能验收，不证明正式收益；n=1。
+
+P4M-1/P4M-3 短验收功能完成；P4M-2 的 legacy `--batch` 与 `--p4m` gap0 显式对照已在 P4M-4 pilot-21 中执行，但结论未定（启动相位/预窗口历史混淆，n=3 仅描述性）。P4M-4 pilot-21 已完成：21/21 功能通过，原始记录与全量结果见 [p4m-pilot-results-review.md](iommu-platform/docs/p4m-pilot-results-review.md)、[RESULTS.md](iommu-platform/out/mac-p4m-pilot-20260920-202441-run-9_mfua8v/RESULTS.md)。正式 gap 点与重复数未冻结；保留 0/500/1000/2000 候选和 gap500 反例，不把 n=3 写成正式等价或正式收益。第三次 gap0 的开窗 A ID 为 1448，前两次均为 4；这表明开窗前 A 运行量不同。下一步优先收紧两路启动间隔并记录触发时间，先于正式 P4M-5；本轮只做分析/文档，不改代码、不跑板、不构建。
+
+## 2026-09-18 E3 v6 上板及服务器复核完成（历史）
+
+E3 v6 / Linux00087 已完成 3 对短验收 + 8 对正式实验；服务器独立复核 exit 0、9 组检查通过。11 对 / 22 轮、418 条唯一 UART、114 条相同重复去重，11 份完整 CLI JSON 与 UART 对象逐字段一致，原始输入哈希未变；8 项程序检查（正常对照 1、故障注入 7）均符合预期。原始回传在 [mac-e3-controlled](iommu-platform/out/mac-e3-controlled-20260918-164635-run-rk48bhte/)，[复核证据](iommu-platform/out/e3-controlled-review-20260918/server-review.json)。run.json 的 pending_upload 是上传前快照；现已在 Dell，未宣称验证 upload receipt。
+
+核心结果：4 对 cold 的 D128−D0，A 剩余服务和 V 剩余等待均增加 127/129/129/130 周期，V 自身翻译恒为 4 周期；14 个 cold 轮次 V 被选中均比 A 翻译响应晚 9 周期。身份、目标 A 的 PTE、前缀计数和完整插入身份配对一致，V 首查命中；D0/D0 的剩余等待差为 −2/0。结合串行控制器/AR FIFO 代码，支持本实现、此配置下 A miss 引起 V hit 等待的机制。样本仅 4 对，预触发耗时并非全部相同；不宣称完整 E3 矩阵完成、所有旧 A8 损失已解释或已有方法收益。[结果分析](iommu-platform/docs/e3-controlled-results-review.md)。
+
+整体方向保留，当前优先推进 P4M：共同 V 硬件窗口内的 A 完成量与边界在途计数，以及 A 完整拷贝结束后的硬件固定间隔基线。先验证 gap0/短正确性，再预试、冻结少量参数并画 V slowdown—A 完成速率曲线；具体间隔和重复数待预试，不自动扩旧 E3 矩阵。E2 按证据触发，P5 在规则冻结后评价。[下一步实施卡](iommu-platform/docs/e3-next-method-plan.md)。该阶段只做分析程序和文档；DeepSeek 提供程序/文档草案，Codex 核对关键证据与 RTL、做科学决策并实际执行复核。
+
+## 平台、版本与证据边界
+
+- 开发目录 `iommu-platform/`；Genesys 2、50 MHz、4 DMA、IOTLB 16、DS50/50，CPU 保留完成轮询。原工程和 archives 只作历史参考。
+- 最新板上版本（已完成短验收与 21 次预试）：P4M observer v7 / Linux00088，交付版本 CVA6 `e822bc9d`、Linux `9f8da9e7a6a0`、IOMMU `137f5e5`。原始启动日志确认内核；BIT/payload 下载哈希与 SD 回读证据仍未补齐。上板与回传由 Mac 完成，Dell 本机仍未接板。
+- [v6 配套产物](iommu-platform/out/e3-controlled-20260918/delivery/README.md)的软硬件构建已通过；该阶段未改实验源码或重新构建。旧 build-status 的 board 状态是交付时快照。
+- 时钟/CDC/外部 IO 审查、下载哈希和 SD 回读仍有未验证边界；本轮 run.json 的 smoke_passed/hpm_calibrated 为 null，不补写通过。详见 [验证记录](iommu-platform/docs/validation.md)。
+- E1 共跑现象、硬件连续供给、DS 回切复现及分段等待定位证据保留。v6 是独立 64 B 机制诊断；下一阶段回到既有连续 4 KiB 工作量，两类数据不混算。
+- 已获得范围明确的 E3 干预证据，尚无经过评价的缓解方法或已确认创新点。总体目标仍是方法论文；E2 与剩余 E3/E4 分支按方法设计需要展开。
+
+## 工作规则
+
+- 开任务先读本文件；需要行为约定读 [AGENTS.md](AGENTS.md)，平台内读 [iommu-platform/AGENTS.md](iommu-platform/AGENTS.md)。
+- 按任务定向读说明和代码；不要默认扫描整个 Linux、`.git`、`out/` 或恢复副本；没有新改动/验证需求时不重跑已完成完整构建。
+- 核查版本先用 `git --no-optional-locks status --short`、`git rev-parse HEAD`，再对照平台 `sources.lock.json`。`make check` 会写 `out/manifests`，不是严格只读。
+- 组件修改按实际依赖顺序提交并更新父 gitlink 和 lock：IOMMU → CVA6 → 顶层。不要重复应用 `provenance/` 中已纳入提交的补丁。
+- 构建成功只证明构建；仿真/主机模型不等于板卡验收；板上结果才写板卡结论。日志默认只保存，有实际错误再读。
+- 当前构建/恢复脚本不自动烧板、写 SD、推送 GitHub 或升级依赖；不要假定本机接了 FPGA/SD。板上操作沿用已有流程。
+- 旧 bundle/恢复副本覆盖迁移阶段，不能假定包含最新实验提交；迁移新实验前重新运行 `make bundle`。这里没有个人远端，直接 `clone --recursive` 不保证取到本地提交。
+- 完成实质工作后同步更新本文件的当前状态，并在 [HANDOFF.md](HANDOFF.md) 中保留阶段进展与证据；详细过程链接到专门文档和 [validation.md](iommu-platform/docs/validation.md)，不复制完整日志。
+- 研究目标是争取方法论文，尚无已确认创新点；论文逻辑与优先级见 [paper-logic.md](iommu-platform/docs/paper-logic.md)。
+
+## 最小按需阅读路线
+
+- 新任务入口：[AGENTS.md](AGENTS.md) → 本文件。
+- 平台使用/构建：[iommu-platform/README.md](iommu-platform/README.md)、[build.md](iommu-platform/docs/build.md)。
+- 最新 E3 v6 结果：[结果分析](iommu-platform/docs/e3-controlled-results-review.md)；下一步：[P4M 实施卡](iommu-platform/docs/e3-next-method-plan.md)、[P4M 基线](iommu-platform/P4M_BASELINE.md)。
+- 已执行 v6 协议：[E3_CONTROLLED.md](iommu-platform/E3_CONTROLLED.md)；旧 v5：[E3_QUEUE_PAIR.md](iommu-platform/E3_QUEUE_PAIR.md)。
+- E3 原协议/字段：[E3_SERVICE.md](iommu-platform/E3_SERVICE.md)；D0/D0 软件诊断字段：[E3_DIAGNOSTIC.md](iommu-platform/E3_DIAGNOSTIC.md)。
+- 当前代码地图：[repository-map-2026-09-18.md](iommu-platform/docs/repository-map-2026-09-18.md)。
+- 结果复核：[e3-diag-results-review.md](iommu-platform/docs/e3-diag-results-review.md)、[e3-results-review.md](iommu-platform/docs/e3-results-review.md)。
+- 验证历史：[validation.md](iommu-platform/docs/validation.md)；补丁来历：[patches.md](iommu-platform/docs/patches.md)。
+- 各阶段工作与证据：[HANDOFF.md](HANDOFF.md)；清理前快照：[历史归档](docs/history/HANDOFF-2026-09-18-before-cleanup.md)。
+
+## 历史任务来源
+
+- 需要历史决策原文时定向查源任务：当前标题「平台构建」，曾称「整理论文工作文件夹」；任务 ID `01a0806d-e7d2-7092-964c-0edd0919d17e`，host ID `remote-ssh-discovered:dell`。不要默认重读完整聊天。
+
+更新：2026-09-20。DeepSeek 起草，Codex 负责关键设计/复核与实际执行。
+
+## 2026-09-30 组会汇报资料
+
+已准备 2026-10-01 组会的 8 页、约 9 分钟中文 PPT/PDF、逐页讲稿、12 项问答和两张证据图，见 [资料入口](iommu-platform/out/group-meeting-20261001/README.md)。原始数字复算、8 页备注与 PDF 版面检查完成。本轮无新板测或平台编译；实验状态仍为前述 24 在线通过＋第 25 次离线认可、35 待续跑，今天板卡状态未确认。
+
+## 2026-09-30 汇报衔接与日语说明
+
+上次已汇报到 A/V 共跑变慢（用户确认，日期未知）。本次按 8 分钟、纯文字表格准备日语口述，拟推进到 E3 有限阻塞机制证据，并概述 P4M 吞吐取舍与下一步；尚未确认实际汇报完成。剩余计时定义、干预因果链与两次汇报边界已追加 [HANDOFF.md](HANDOFF.md)。本轮没有新增板测或编译，formal60 仍为 24 在线通过＋第 25 次离线认可、35 待运行；用户日后确认实际讲到的位置后再更新下一次衔接点。
+
+## 2026-09-30 方法创新讨论（未实施）
+
+Codex 与 DeepSeek 两轮讨论后，优先评估有限资源下的命中请求／在途查表解耦；固定 gap 保留为基线，反馈准入为备选。**尚无已确认新颖性**：HPCA2017 已有 hit-under-miss，需明确相对合理通用非阻塞的规则、成本或双方进度优势。先完成现有 formal60 并准备对照设计卡，差异明确后再考虑原型，不重开全部机制矩阵。本轮只查文献/关键代码与更新记录，没有改实验源码、构建或板测。详见 [paper-logic.md](iommu-platform/docs/paper-logic.md) 最新讨论及 [HANDOFF.md](HANDOFF.md)。
+
+补充（2026-09-30，继续讨论）：先建立合理有限非阻塞对照规格，再评估同容量静态保护；研究候选为必要保护位置/容量选择，动态借用暂不立项。尚未实现或验证该候选，不能把槽耗尽写为新发现。原 E3 结论与 formal60 续35状态不变，详见论文主线最新节。
+
+设计卡补充（2026-09-30）：已形成 N/P 筛选草案，N/P 共用处理路径和仲裁，P 仅改资源分配；结果容量分配时机仍待评估。新增计时契约覆盖接收前等待与 V 空闲期固定窗口。P 是静态对照，不是已确认新方法；尚缺逐分支正确性规格与实现。实验状态不变，见论文主线最新设计卡。

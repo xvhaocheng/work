@@ -1,0 +1,211 @@
+--- a/linux/drivers/iommu/riscv/iommu.c
++++ b/linux/drivers/iommu/riscv/iommu.c
+@@ -19,6 +19,7 @@
+ #include <linux/pci.h>
+ #include <linux/pci-ats.h>
+ #include <linux/init.h>
++#include <linux/atomic.h>
+ #include <linux/completion.h>
+ #include <linux/uaccess.h>
+ #include <linux/iommu.h>
+@@ -644,6 +645,7 @@ static irqreturn_t riscv_iommu_cmdq_process(int irq, void *data)
+ 	ctrl = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQCSR);
+ 	if (ctrl & (RISCV_IOMMU_CQCSR_CQMF |
+ 		    RISCV_IOMMU_CQCSR_CMD_TO | RISCV_IOMMU_CQCSR_CMD_ILL)) {
++		atomic64_inc(&iommu->cq_error_seq);
+ 		riscv_iommu_queue_ctrl(iommu, &iommu->cmdq, ctrl);
+ 		dev_warn_ratelimited(iommu->dev,
+ 				     "Command queue error: fault: %d tout: %d err: %d\n",
+@@ -2119,6 +2121,7 @@ int riscv_iommu_init(struct riscv_iommu_device *iommu)
+ 		   RISCV_IOMMU_IPSR_PMIP | RISCV_IOMMU_IPSR_PIP);
+ 	spin_lock_init(&iommu->cq_lock);
+ 	mutex_init(&iommu->eps_mutex);
++	atomic64_set(&iommu->cq_error_seq, 0);
+ 	ret = riscv_iommu_queue_init(iommu, RISCV_IOMMU_COMMAND_QUEUE);
+ 	if (ret)
+ 		goto fail;
+@@ -2053,6 +2056,169 @@ struct riscv_iommu_endpoint *riscv_iommu_hpm_endpoint(struct device *dev)
+ 		return NULL;
+ 	return ep;
+ }
+ 
++/*
++ * Accept only a plain ordinary Sv39 host first-stage domain whose device
++ * context still matches that domain. Called with ep->lock held, and without
++ * domain->lock (attach takes domain->lock before ep->lock).
++ */
++static int riscv_iommu_flush_s1_check_ep(struct riscv_iommu_endpoint *ep,
++					 struct riscv_iommu_domain *domain)
++{
++	struct riscv_iommu_dc *dc = ep->dc;
++	u64 tc, fsc, iohgatp;
++
++	if (!dc)
++		return -EOPNOTSUPP;
++
++	/* No S2, no nesting, no SVA/PASID: explicit host S1 only. */
++	if (domain->g_stage || domain->nested ||
++	    domain->domain.type == IOMMU_DOMAIN_SVA || ep->pasid_enabled ||
++	    domain->mode == RISCV_IOMMU_DC_FSC_MODE_BARE)
++		return -EOPNOTSUPP;
++
++	tc = le64_to_cpu(dc->tc);
++	fsc = le64_to_cpu(dc->fsc);
++	iohgatp = le64_to_cpu(dc->iohgatp);
++
++	if (!(tc & RISCV_IOMMU_DC_TC_V))
++		return -EOPNOTSUPP;
++	if (tc & (RISCV_IOMMU_DC_TC_EN_ATS | RISCV_IOMMU_DC_TC_EN_PRI |
++		  RISCV_IOMMU_DC_TC_PDTV | RISCV_IOMMU_DC_TC_T2GPA |
++		  RISCV_IOMMU_DC_TC_SXL))
++		return -EOPNOTSUPP;
++	if (FIELD_GET(RISCV_IOMMU_DC_IOHGATP_MODE, iohgatp) !=
++	    RISCV_IOMMU_DC_IOHGATP_MODE_BARE)
++		return -EOPNOTSUPP;
++	if (domain->mode != RISCV_IOMMU_DC_FSC_IOSATP_MODE_SV39)
++		return -EOPNOTSUPP;
++
++	/* Device context no longer matches the live domain: stale snapshot. */
++	if (FIELD_GET(RISCV_IOMMU_DC_FSC_MODE, fsc) != domain->mode ||
++	    FIELD_GET(RISCV_IOMMU_DC_FSC_PPN, fsc) !=
++		    virt_to_pfn(domain->pgd_root))
++		return -ESTALE;
++
++	return 0;
++}
++
++/*
++ * Global host first-stage invalidation barrier for one or two devices of the
++ * same IOMMU. The caller owns the HPM session (hpm_lock), has quiesced the
++ * relevant DMA and serializes binding changes. This only issues IOTINVAL.VMA
++ * with GV/AV/PSCV clear followed by a fence; it is not an ATS/PR/PW or
++ * general internal-state reset, and it never retries or resets on failure.
++ *
++ * Note on the current RTL: CQH advances when the fetch of the last beat
++ * completes, before decode. For this strict no-ATS/no-S2, quiesced
++ * experiment the CQ decodes the earlier VMA (its invalidations are issued
++ * before the fetch of the following IOFENCE), so CQH passing the following
++ * fence is sufficient evidence that the VMA pulse was issued. This is not a
++ * general fence-execution proof.
++ */
++int riscv_iommu_flush_s1_checked(struct riscv_iommu_device *iommu,
++				 const struct riscv_iommu_s1_flush_target *targets,
++				 unsigned int nr_targets)
++{
++	struct riscv_iommu_endpoint *ep[2] = { };
++	struct riscv_iommu_command cmd;
++	unsigned long flags;
++	unsigned int first, second, i;
++	u32 ctrl, tail;
++	u64 seq;
++	int ret;
++
++	if (!iommu || !targets || (nr_targets != 1 && nr_targets != 2))
++		return -EINVAL;
++	if (nr_targets == 2 &&
++	    (targets[0].dev == targets[1].dev ||
++	     targets[0].did == targets[1].did))
++		return -EINVAL;
++
++	for (i = 0; i < nr_targets; i++) {
++		if (!targets[i].dev || !targets[i].domain)
++			return -EINVAL;
++
++		ep[i] = riscv_iommu_hpm_endpoint(targets[i].dev);
++		if (!ep[i])
++			return -EOPNOTSUPP;
++		if (ep[i]->iommu != iommu)
++			return -EXDEV;
++		if (ep[i]->devid != targets[i].did)
++			return -ESTALE;
++	}
++	if (nr_targets == 2 && ep[0] == ep[1])
++		return -EINVAL;
++
++	/* Take both endpoint mutexes, always in ascending device id order. */
++	if (nr_targets == 2 && ep[0]->devid > ep[1]->devid) {
++		first = 1;
++		second = 0;
++	} else {
++		first = 0;
++		second = nr_targets - 1;
++	}
++	mutex_lock(&ep[first]->lock);
++	if (nr_targets == 2)
++		mutex_lock(&ep[second]->lock);
++
++	ret = 0;
++	for (i = 0; i < nr_targets; i++) {
++		/*
++		 * Re-read the live attachment under ep->lock, then dereference
++		 * the domain snapshot taken by acquire.
++		 */
++		if (!ep[i]->domain ||
++		    &ep[i]->domain->domain != targets[i].domain) {
++			ret = -ESTALE;
++			break;
++		}
++		ret = riscv_iommu_flush_s1_check_ep(ep[i], ep[i]->domain);
++		if (ret)
++			break;
++	}
++	if (ret)
++		goto unlock;
++
++	seq = atomic64_read(&iommu->cq_error_seq);
++
++	if (!iommu->cmdq.base || !iommu->cmdq.cnt ||
++	    (iommu->cmdq.cnt & (iommu->cmdq.cnt - 1)) ||
++	    iommu->cmdq.lui >= iommu->cmdq.cnt) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++	ctrl = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQCSR);
++	if (!(ctrl & RISCV_IOMMU_CQCSR_CQEN) ||
++	    !(ctrl & RISCV_IOMMU_CQCSR_CQON) ||
++	    (ctrl & (RISCV_IOMMU_CQCSR_CQMF | RISCV_IOMMU_CQCSR_CMD_TO |
++		     RISCV_IOMMU_CQCSR_CMD_ILL))) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++	/* Nothing may be posted but not yet fetched. cq_lock is dropped. */
++	spin_lock_irqsave(&iommu->cq_lock, flags);
++	tail = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQT) &
++	       (iommu->cmdq.cnt - 1);
++	spin_unlock_irqrestore(&iommu->cq_lock, flags);
++	if (tail != iommu->cmdq.lui) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++	/* IOTINVAL.VMA with GV, AV and PSCV clear: every host S1 entry. */
++	riscv_iommu_cmd_inval_vma(&cmd);
++	if (!riscv_iommu_post(iommu, &cmd)) {
++		ret = -EIO;
++		goto unlock;
++	}
++	if (!riscv_iommu_iofence_sync(iommu)) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++	ctrl = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQCSR);
++	if (atomic64_read(&iommu->cq_error_seq) != seq ||
++	    (ctrl & (RISCV_IOMMU_CQCSR_CQMF | RISCV_IOMMU_CQCSR_CMD_TO |
++		     RISCV_IOMMU_CQCSR_CMD_ILL))) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++unlock:
++	if (nr_targets == 2)
++		mutex_unlock(&ep[second]->lock);
++	mutex_unlock(&ep[first]->lock);
++	return ret;
++}
++
+ void riscv_iommu_remove(struct riscv_iommu_device *iommu)
+ {
+ 	/* An owner finishes restoring its HPM state before teardown proceeds. */

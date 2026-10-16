@@ -1,0 +1,147 @@
+[PATCH v2 3/8] iommu/arm-smmu-v3: Optimize range invalidation for latency
+pre {
+white-space: pre-wrap; /* css-2.1, curent FF, Opera, Safari */
+}
+[PATCH v2 3/8] iommu/arm-smmu-v3: Optimize range invalidation for latency
+Mostafa Saleh
+smostafa at google.com
+Tue Jul 7 04:45:40 PDT 2026
+Previous message (by thread): [PATCH v2 3/8] iommu/arm-smmu-v3: Optimize range invalidation for latency
+Next message (by thread): [PATCH v2 3/8] iommu/arm-smmu-v3: Optimize range invalidation for latency
+Messages sorted by:
+[ date ]
+[ thread ]
+[ subject ]
+[ author ]
+On Mon, Jul 06, 2026 at 01:26:40PM -0300, Jason Gunthorpe wrote:
+> The server IOMMU drivers focus on invalidation latency by default,
+> over-invalidating if necessary, to round the invalidation range up to a
+> single command. I think this represents a trade off for DMA non-FQ and SVA
+> where stalling the operation is overall worse than re-loading the IOTLB.
+>
+> For instance AMD and VT-d both round the range up to the largest aligned
+> power of two and invalidate that. This causes over-invalidation but that
+> is preferred on real HW over trying to issue a number of smaller
+> range invalidations.
+>
+> Only if a para-virtualizating hypervisor is detected do they switch to
+> using more accurate invalidation. This also triggers using
+> iommu_iotlb_gather_is_disjoint() (ie PT_FEAT_FLUSH_RANGE_NO_GAPS) to
+> remove over invalidation from the gather. A pvIOMMU has a hypervisor that
+> will walk the IOPTEs and resync them. Over invalidation, especially
+> significant over invalidation, can incur a big latency cost reloading alot
+> of page table. x86 IOMMUs have aligned range restrictions so there are
+> some pretty nasty corner cases that can trigger huge over invalidation.
+>
+> Currently SMMUv3 doesn't support detecting a hypervisor, and it
+> unconditionally runs in a NO_GAPS mode. This makes some sense for the
+> single invalidation flow where there is little reason to push single
+> commands across a gap.
+>
+> When we get to RIL hardware, this doesn't look so good. On real HW the
+> best option is the same as x86: issue a single RIL per gather and optimize
+> for latency. SMMUv3 has a significant advantage as its RIL does not have
+> alignment limitations so it's single-command over-invalidation is capped
+> at < 1/32 of the gather's size, making it much more suitable for a
+> pvIOMMU.
+>
+> However even with RIL SMMUv3 still uses NO_GAPS and it breaks down the
+> gather into several exactly sized RILs to avoid any over-invalidation,
+> costing latency on real HW.
+>
+> When the HW has RIL support follow the x86 approach in SMMUv3 and
+> calculate a single RIL per gather that will cover the required
+> invalidation.
+>
+> Calculate the smallest SCALE such that NUM can cover the range to minimize
+> over-invalidation. Always use a RIL command if RIL is possible working
+> around the spec limitations to form a valid one. If RIL is not possible
+> then do full invalidation.
+>
+That may be beneficial for servers, but I am not sure about other use
+cases, we already know that the invalidated entries are unmapped
+and not used. However, over invalidating might impact live DMA which
+would be bad for workloads sensitive to translation latency (as
+embedded cameras, displays for example). Maybe this can be configured
+instead (via cmdline)
+> At least one invalidation errata is avoided by 'always use RIL'.
+>
+Can you please clarify what that means?
+> Since the normal path is now the only one with a loop, split them into two
+> functions and fold a simplified version of arm_smmu_inv_size_too_big()
+> directly into the normal flow in a way that directly limits the number of
+> single invalidation commands generated, again focusing on controlling
+> latency.
+>
+> The end result is any gather is converted into either:
+> - One invalidate all
+> - One range invalidate op
+> - At most 512 single invalidation ops
+>
+> Signed-off-by: Jason Gunthorpe <jgg at nvidia.com>
+> ---
+> drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c | 257 ++++++++++++--------
+> 1 file changed, 153 insertions(+), 104 deletions(-)
+>
+> diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+> index d22012466e3965..1ad642e09eb92d 100644
+> --- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+> +++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+> @@ -2395,124 +2395,166 @@ static void arm_smmu_tlb_inv_context(void *cookie)
+> arm_smmu_domain_inv(smmu_domain);
+> }
+>
+[...]
+> + scale = fls64((num_tg - 1) / 32);
+> + if (scale > 31) {
+> + /*
+> + * Range too large for a single command, use full invalidation.
+> + */
+> + return false;
+> + }
+> +
+> + /* 16K granule TTL=1 is reserved (Section 4.4.1) */
+> + if (tg_lg2 == 14 && ttl == 1)
+> + ttl = 0;
+> +
+> + /* Verify address alignment for the TTL hint */
+> + if (ttl && !arm_smmu_ttl_addr_aligned(cur_tg << tg_lg2, tg_lg2, ttl))
+> + ttl = 0;
+> +
+> + arm_smmu_cmdq_batch_add_ril(smmu, cmds, cmd, tlbi->leaf_only,
+> + cur_tg << tg_lg2,
+> + DIV_ROUND_UP_ULL(num_tg, 1ULL << scale) - 1,
+> + scale, ttl, tg_enc);
+> + return true;
+> }
+>
+> -/* Used by non INV_TYPE_ATS* invalidations */
+> -static void arm_smmu_inv_to_cmdq_batch(struct arm_smmu_inv *inv,
+> +/*
+> + * One TLBI command per IOTLB entry, assuming the entries are all at least
+> + * iopte_granule sized. Returns false if too many commands would be needed which
+> + * indicates too high a latency. The threshold is similar to MAX_DVM_OPS in
+> + * arch/arm64/include/asm/tlbflush.h for the 4k PAGE_SIZE.
+> + */
+> +static bool arm_smmu_cmdq_batch_add_single(struct arm_smmu_device *smmu,
+> + struct arm_smmu_cmdq_batch *cmds,
+> + struct arm_smmu_cmd *cmd,
+> + struct arm_smmu_tlbi *tlbi)
+> +{
+> + unsigned long num_ops = tlbi->size / tlbi->iopte_granule;
+> + unsigned long iova = tlbi->iova;
+> + unsigned long i;
+> +
+> + if (!num_ops || num_ops > 512)
+Is there a reason that was added instead of keeping the old formula?
+Thanks,
+Mostafa
+Previous message (by thread): [PATCH v2 3/8] iommu/arm-smmu-v3: Optimize range invalidation for latency
+Next message (by thread): [PATCH v2 3/8] iommu/arm-smmu-v3: Optimize range invalidation for latency
+Messages sorted by:
+[ date ]
+[ thread ]
+[ subject ]
+[ author ]
+More information about the linux-arm-kernel
+mailing list

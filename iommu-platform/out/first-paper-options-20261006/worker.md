@@ -1,0 +1,140 @@
+**结论先行**：基于你给的这批材料，当前最值得写成“小而完整”的不是新大架构，而是围绕现有 IOMMU/DMA/共享 IOTLB 平台做 4 个候选：①软件 DMA 提交/在途预算/批量局部性；②容量保护×并发的组合失效归因；③排队/容量/软件供给的分辨；④更小的“观测字段充分性与事件账本”测量切口。前三项对应你点名的重点，第四项是不同方向的更小切口。  
+以下全是**立题草案与证据提取**，不是新颖性结论，未执行、未复现、不保证发表。行号来自你提供的带行号文本；PDF 抽取版本不同会导致行号漂移，应以短锚点复核。
+
+## 0. 本轮证据边界
+
+- 172/172 只是既有功能验收，不支撑机制、性能或新颖性；`composition-v1-spec-20261004.md:48`、`performance-council-decision-20261005.md:9`、`translation-comparison-20261006.md:139`。
+- 既有 A8/gap=0 的约 16% 条件差是单次启动、同一 boot 的三 block 现象，不能当机制已验证；`performance-council-decision-20261005.md:21-29`、`:33`。
+- 不把“共享树 PLRU 修好”本身当创新；宽泛“保护反噬”已有 KPart 等前作压力；`performance-council-decision-20261005.md:69`。
+- 不把 gap 名义值从窗口里扣掉当服务延迟；`composition-v1-spec-20261004.md:48`。
+- 不把 gap 后发下一项说成周期级开环发生器；`performance-council-decision-20261005.md:35`。
+- 不把“无 OS 修改/不用大页/禁止复制”当任意新限制；`translation-comparison-20261006.md:42`、`:114`。
+- ShadowUpdate、HELM、CATS、SPMC、Clover、LATPC、NB-Walker、CATO 等仍只有摘要/题录/待全文，不能判“已覆盖”或“未覆盖”；`translation-comparison-20261006.md:56`、`:122-127`、`shared-translation-gaps-20261006.md:43`。
+- 没有 2–3 设备真实应用，不否定所有小选题；但 FPGA 微基准不能冒充应用；`socdma2018.txt:452-456` 明确把 FPGA 当 emulator，不是优化后的加速器。
+
+## 1. 三项重点的逐项核验
+
+| 重点 | 已有证据 | 不能推出 | 必须比较/首验 |
+|---|---|---|---|
+| 软件 DMA 提交/在途预算/批量局部性 vs 仅降流量 | MMU-aware DMA 已做 DMA miss 重试、retirement buffer、无额外数据 buffer，`socdma2018.txt:79-99`、`:376-417`、`:545-569`；rIOMMU 已用 ring 顺序/单 IOTLB entry/N≥L 在途预算，`riommu2015.txt:106-134`、`:543-574`；IOTLB Bottleneck 已用 pseudo pass-through 固定软件映射、变源页数，`iotlb_bottleneck2010.txt:240-271`、`:313-314` | 只降低 miss 总数不等于解决；软件供给改善不能归功于新 PTW 调度，`translation-comparison-20261006.md:26` | vDMA/retirement buffer、rIOMMU/ring 顺序、pseudo pass-through、普通 in-flight 限流/静态配额/gap、chunk 调整 |
+| 容量保护×并发组合失效 vs 普通 PLRU bug | 源码显示条目分配隔离、替换历史共享，V touch 可改 A victim；`performance-council-decision-20261005.md:33`；四局部用例已定义精确预期，`:43-54`；P 是 mask 约束 tree-PLRU，`composition-v1-spec-20261004.md:5` | 局部依赖不证明造成板上约 16%；A16/g0 同总 miss 但 V 窗口约长 3%，只证明总 miss 不足；`:29`、`:33` | N、同容量分区内普通替换、touch=0、全 mask 旧 PLRU、KPart 类联合分配/带宽基线；`performance-council-decision-20261005.md:63`、`:69` |
+| 排队/容量/软件供给区分 vs 已有微基准 | IOTLB Bottleneck 用 IOMMU 开/关和固定 copy 次数隔离软件映射；`iotlb_bottleneck2010.txt:240-271`；rIOMMU 给出 software cycles 主导模型，`:295-351`、`:381-391`；MMU-aware DMA 用 hybrid IOMMU 信号 miss、DMA 重试；`socdma2018.txt:79-99`；PTW 调度已有 FCFS/批处理/短作业优先，`walk_scheduling2018.txt:291-309`、`:351-396`、`:640-665` | 总 miss 相同不等于轨迹相同；窗口计数不等于 cycle 级服务时间；不能用单个微基准把三类瓶颈混成一类 | 干预矩阵：软件映射开/关、PTW 批处理、容量/关联度、保护/非保护；同时看 W_V、r_A、总 miss、fast accept、GAP 占用、fill/inval；`performance-council-decision-20261005.md:65`、`composition-v1-spec-20261004.md:22-27` |
+
+## 2. 候选①：软件 DMA 提交/在途预算/批量局部性
+
+**一句话问题**：在总翻译缺失或总软件供给工作量固定时，DMA 提交粒度、在途 descriptor 预算和批量局部性是否改变共享 IOMMU 的排队与双方完成窗口，而不是仅改变 miss 流量？
+
+**最小潜在贡献（假设）**：给出“提交—在途—批量局部性”的条件排序/有效区域，说明何时可由降流量解释，何时必须由到达时序与在途预算解释；可以是测量+机制解释，不预设新硬件。
+
+**现有平台直接可用**：composition profile 的 S/N/P/PN、4DMA、DMA0/1 同 512 拍缓冲、gap 输入、V/A 计数、fill/fast/GAP/失效计数；`composition-v1-spec-20261004.md:4-5`、`:22-27`、`:44`。限制：当前批次是单 boot，不能冒充跨 boot；`composition-v1-spec-20261004.md:48`；coupled harness 没有真实 iDMA、XBAR/DS 仲裁或 DDR，人工有序返回队列不能当板上服务规律；`performance-council-decision-20261005.md:60`；目前工作负载模板是合成假设，无本项目实际应用轨迹；`:15`。
+
+**最强前作**：
+- MMU-aware DMA：DMA engine + retirement buffer 已处理 TLB miss、重试、保序，且省掉 16KiB 数据 buffer 只用 64B 元数据；`socdma2018.txt:376-417`、`:545-569`。候选必须证明普通重试/在途预算之外仍有可解释收益。
+- rIOMMU：ring 顺序、单 IOTLB entry/ring、N≥L 在途 IOVA、软件 map/unmap 成本模型；`riommu2015.txt:106-134`、`:543-574`。候选不能在“批处理/顺序提交”本身重复。
+- IOTLB Bottleneck：pseudo pass-through 消软件映射、固定 copy 操作、变源页数；`iotlb_bottleneck2010.txt:240-271`。候选必须与“只变容量/miss”的微基准区分。
+
+**最小反证/第一张结果图**：固定总 miss 或总搬运字节，改变提交粒度、在途深度、源页集合局部性；图 x 为在途/批量参数，y 为 W_V 与 r_A，叠加 iso-miss 线。若同一总 miss 下 W_V/r_A 分叉，说明总流量不足；若最强普通基线在不确定度内追平，候选弱。
+
+**简单强基线**：N；同容量分区内普通替换；静态配额/gap；有限 in-flight/简单仲裁；chunk 调整；软件预映射/pseudo pass-through；MMU-aware DMA 风格 retirement buffer。`performance-council-decision-20261005.md:63`。
+
+**实现涉及**：以软件驱动/测试 harness/事件解析为主；若平台不暴露 descriptor 深度或批量边界，需改软件提交层或测试 harness；若需队列占用观测，才考虑少量 RTL 观察。不要先改缓存。
+
+**学习前置与风险**：Linux DMA API、IOMMU 驱动、descriptor ring、队列/事件时序、SV 基础。风险：效果可能被 N 或简 in-flight 限流解释；无真实应用；平台特定。
+
+**停止/转测量论文**：若 N/普通分区/静态配额/简单 in-flight 已覆盖，或只改总 miss，或同总 miss 同轨迹，停止机制主张。转测量论文仍需：可重复事件账本、基线穷尽、阴性对照、至少一个 same-traffic different-timing 实例。
+
+## 3. 候选②：容量保护×并发组合失效 vs 普通 PLRU bug
+
+**一句话问题**：P/PN 的 A8/gap=0 组合退化，在相同总容量和相同总 miss 下，是否由共享 PLRU 历史与 fast accept/fill 时序闭合导致，还是普通 PLRU/容量分配/测试前态？
+
+**最小潜在贡献（假设）**：一个可复现的机制归因和条件排序：共享替换历史 + fast accept 改变 victim 轨迹，而不是“修 PLRU”本身；但必须先证明它不是普通组件级伪影。
+
+**现有平台直接可用**：真实 IOTLB、mask 约束 tree-PLRU、PolicyEnable、D20–D9F 快照/计数、四局部用例；`performance-council-decision-20261005.md:43-54`、`composition-v1-spec-20261004.md:5`、`:22-27`。限制：旧测试 `TouchEnable=0` 原样跑覆盖不了问题；`performance-council-decision-20261005.md:43`；四局部用例只回答指定组件输入下存在依赖，不回答 fast accept 能否产生该前缀、平台频度和性能影响；`:56`；同周期 touch/fill 与分支反转预期已写明，`:47-52`。
+
+**最强前作**：
+- KPart：已把缓存分配与带宽争用联合考虑，宽泛“保护反噬”不新；`performance-council-decision-20261005.md:69`。
+- MASK：已用 token/bypass/DRAM 调度处理共享 TLB 争用、thrashing 与翻译/数据干扰；`mask2018.txt:52-57`、`:828-887`、`:646-655`。候选不能只说“增加保护/减少争用”。
+- PTW 调度：已证明服务顺序和批处理改变进度；`walk_scheduling2018.txt:118-130`、`:291-309`、`:640-665`。候选若只改调度顺序，需与此区分。
+
+**最小反证/第一张结果图**：先复现四局部用例的 victim/原槽命中表；图上标出首次分歧边沿。若四例断言不符，先定位规格/测试/实现；若局部成立，再在 A8/g0 目标病例画 touch/fill/victim 与 W_V/r_A，证明是否与目标损失同因。`performance-council-decision-20261005.md:47-54`。
+
+**简单强基线**：N；同容量分区普通替换；touch=0；全 mask 旧 PLRU；无 P/无 fast 接受；KPart 类联合分配/带宽基线。`performance-council-decision-20261005.md:63`。
+
+**实现涉及**：主要是 RTL/测试台/波形与现有观测路径；可能需要一个观测 BIT，但先不建完整 DDR/iDMA 仿真；`performance-council-decision-20261005.md:61`。软件只做 test runner。
+
+**学习前置与风险**：SV、PLRU、IOTLB 队列/接受路径、Vivado 仿真。风险：局部断言可能暴露规格/测试/实现不一致；局部成立但目标病例无进度影响；容易滑回“普通 PLRU bug”。
+
+**停止/转测量论文**：局部不符即停止该例推论；局部成立但不影响目标病例进度，停止以它解释损失；普通替换/关闭 P 已覆盖事先界定条件，交工程结论。转测量论文仍需：实际 fast 接受频度、板上 trace、非局部轨迹、与普通替换的统计对照。
+
+## 4. 候选③：排队/容量/软件供给的分辨
+
+**一句话问题**：固定总资源下，现有微基准能否把 PTW 服务排队、IOTLB 容量/冲突、软件供给三类瓶颈分开，并给出可复现诊断阈值？
+
+**最小潜在贡献（假设）**：一个可证伪的分解协议和测量结果：哪些指标在受控干预下只随 miss 流量变，哪些能区分排队与容量/软件供给；可能是测量论文，不提出新机制。
+
+**现有平台直接可用**：正常 lookup/hit/miss、fast accept、GAP 占用、fill、替换违规、规范失效计数、D20–D9F 快照；`composition-v1-spec-20261004.md:22-27`。限制：当前计数器是窗口计数，不直接给 PTW 队列深度/服务时间；事件顺序、时钟对齐、缺失记录会影响因果判断；`translation-comparison-20261006.md:137`；单 boot 和组件仿真限制同上。
+
+**最强前作**：
+- IOTLB Bottleneck：pseudo pass-through 消软件映射后看 IOTLB 瓶颈，并明确单 I/OAT 微基准不是多设备系统评估；`iotlb_bottleneck2010.txt:240-271`、`:313-314`。
+- rIOMMU：给出 strict/defer 的 map/unmap cycle 分解，并论证翻译活动不主导吞吐、软件 cycle 才主导；`riommu2015.txt:295-351`、`:381-391`；还明确 rIOMMU 对 RDMA/SATA 不适用；`:585-607`。
+- PTW 调度：FCFS 与批处理/短作业优先可改变进度，说明服务顺序可与容量分离；`walk_scheduling2018.txt:291-309`、`:351-396`、`:640-665`。
+
+**最小反证/第一张结果图**：干预矩阵：行={软件映射开/关/预映射、PTW 批处理开/关、容量/关联度、保护/非保护}，列={W_V、r_A、总 miss、fast accept、GAP 占用、fill/inval}。若所有效果都与总 miss 共线，或所有解释都可归软件 cycle，候选降级为测量论文。
+
+**简单强基线**：IOMMU off/pseudo pass-through；strict/defer；固定容量 64 条；静态配额/gap；软件预映射；N/P。`performance-council-decision-20261005.md:63`。
+
+**实现涉及**：软件 CLI/驱动/事件解析为主，模型解释为辅；只有在要队列占用时才加少量 RTL 观测。不要先建大硬件。
+
+**学习前置与风险**：Linux IOMMU、DMA API、perf/计数器、队列论基础。风险：现有微基准已覆盖，或现有字段不足导致无法分辨；若无法分辨，阴性结果仍需完整矩阵才有测量论文价值。
+
+**停止/转测量论文**：若无法区分三类，或所有信号只是 miss 数代理，停止机制主张。转测量论文需：干预矩阵、指标定义、字段缺失清单、可复现 artifact、与已有微基准逐项对照。
+
+## 5. 候选④：现有观测字段的最小充分性与事件账本
+
+**一句话问题**：现有 D20–D9F 字段和 ABI 是否足以重建每个 V/A 作业的“提交→翻译等待→数据完成→消费者启动”账本？若不足，最小新增字段是什么？
+
+**最小潜在贡献（假设）**：测量/方法论文：给出字段最小性、误差分类和“哪些结论在现有字段下欠定”的证据；不提出新机制。该切口不同于前三项，因为问题不是“怎么调度/保护”，而是“现有观测能否支持因果判断”。
+
+**现有平台直接可用**：D20–D9F raw 快照、V/A/other 计数、OPEN/CLOSE 前后 PLRU、窗口 flags/cycles/error；`composition-v1-spec-20261004.md:6-40`；事件账本需求已列出应区分 task/group、device、对象/版本、提交/依赖、翻译入队/服务/返回、数据完成/可见、失效/确认、消费者启动；`translation-comparison-20261006.md:137`。限制：composition profile 移除旧 research 事件记录器和旧非阻塞诊断器，旧 D00–D1F 不再提供旧 capability；`composition-v1-spec-20261004.md:3`；只有窗口 active 计数；单 boot；未上板。
+
+**最强前作**：
+- CounterPoint：已用带噪 MMU 计数器检验/修正微架构模型，但不是在线控制器；`translation-comparison-20261006.md:87`。候选不能只说“用计数器推断隐藏行为”。
+- ObservUVM：已把观测反馈用于 GPU 超额订阅的驱逐/预取；`translation-comparison-20261006.md:89`。候选若只加字段指导策略，需证明翻译场景信息缺口不同。
+- MISE/ASM/Coz：已有因果剖析、有界扰动、性能归因；`translation-comparison-20261006.md:90`。候选需说明设备翻译事件账本缺什么。
+
+**最小反证/第一张结果图**：字段集合 vs 结论可复现性图：x 为现有字段子集/新增字段，y 为能否复现 W_V、r_A 排序或 CLOSE 后状态；或混淆矩阵：现有字段预测的下一 victim/窗口排序 vs 额外 oracle 字段。若现有字段已足够，或新增字段只提高分类不改变决策，候选弱。
+
+**简单强基线**：现有计数器单独；软件时间戳；完整事件 trace 作为 oracle；无额外字段的普通统计模型。
+
+**实现涉及**：软件解析/统计为主；若确认最小新增字段，再加一个观测 BIT，不先做机制。学习前置：事件 schema、统计/校准、RTL 观测路径。
+
+**停止/转测量论文**：若现有字段足够，或额外字段只提高分类/不改变决策，停止。转测量论文需：欠定性实例、字段最小性证明、阴性结果、可重复 artifact。
+
+## 6. 建议暂缓/否定的宽候选
+
+- **跨设备依赖指导翻译服务**：目标场景仍是假设；NIC–GPU 的 GPUDirect 路径要求 1:1 映射/直通，不能证明共享 IOMMU 翻译争用；`translation-comparison-20261006.md:11`、`:35`。VIO/BaM 只能作软件替代基线，不能自动证明瓶颈；`:37`。
+- **映射生命周期决定共享范围**：Hydra、IDYLL、ShadowUpdate、ShareMMU 已覆盖部分机制；ShadowUpdate 仍仅摘要；`translation-comparison-20261006.md:54-81`。当前证据不足，暂缓机制实施。
+- **同对象不同翻译表示**：PFM/EMT/RMM/Utopia 已覆盖双视图、混合/范围映射、多翻译结构；当前无已核实冲突实例；`translation-comparison-20261006.md:104-116`。
+- **独立“最少观测指导动作”**：CounterPoint/HELM/ObservUVM 已压近；只有同时证明信息缺口、低成本取得、跨负载净决策收益才独立；`translation-comparison-20261006.md:85-100`。
+
+## 7. 需 Codex 直接核的关键原文位置
+
+| 来源 | 直接核位置 | 目的 |
+|---|---|---|
+| MMU-aware DMA | `socdma2018.txt:79-99`、`:376-417`、`:545-569` | 核 DMA miss 重试、retirement buffer、无数据 buffer 的覆盖边界 |
+| rIOMMU | `riommu2015.txt:295-351`、`:381-391`、`:543-574`、`:585-607`、`:856-900` | 核软件 cycle 主导、ring/在途 N≥L、RDMA/SATA 限制、miss penalty 条件 |
+| IOTLB Bottleneck | `iotlb_bottleneck2010.txt:240-271`、`:313-314`、`:498-523`、`:889-923` | 核 pseudo pass-through、容量/关联/预取、微基准条件 |
+| PTW 调度 | `walk_scheduling2018.txt:87-106`、`:291-309`、`:351-396`、`:414-470`、`:841-857` | 核 single SIMD 多 walk、SJF/批处理、buffer 大小敏感 |
+| MASK | `mask2018.txt:416-448`、`:646-655`、`:828-887` | 核 TLB miss 放大、页表层命中、token/bypass/DRAM 基线 |
+| composition 规格 | `composition-v1-spec-20261004.md:4-5`、`:22-27`、`:40-45`、`:47-48` | 核 P/PLRU、计数器、ABI、172 实验与单 boot 边界 |
+| performance council | `performance-council-decision-20261005.md:21-29`、`:33-35`、`:41-54`、`:69-71`、`:75-78` | 核当前 16% 条件差、局部用例、KPart、停止条件 |
+| translation comparison | `translation-comparison-20261006.md:24-27`、`:39-46`、`:54-60`、`:85-100`、`:137-139` | 核跨设备/生命周期/观测/事件账本与验收契约 |
+| deepening | `shared-translation-deepening-20261006.md:53-58`、`:103-110` | 核共享净收益、关键性、慢 ACK、缺全文风险 |
+| gaps | `shared-translation-gaps-20261006.md:13-25`、`:29-35`、`:43-50` | 核直接前沿、经典近邻、缺全文不可判无覆盖 |
+
+## 8. 建议的下一步验收顺序
+
+1. 先做候选②的四局部用例，因为已有精确预期且能最快否定/确认局部依赖；`performance-council-decision-20261005.md:47-54`。
+2. 并行做候选①/③的第一张“同总 miss / 同总供给但不同时序”图，先证明普通基线留下可重复收益空间。
+3. 候选④先只做字段充分性审计，不先加 RTL；若发现欠定，再评估最小新增字段。
+4. 任何机制设计前，必须完成：真实/可信工作流入口、地址路径、事件账本、普通强基线、成本核算；否则收窄或停止，不用新增场景限制保候选。

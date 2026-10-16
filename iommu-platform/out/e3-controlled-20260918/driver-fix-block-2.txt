@@ -1,0 +1,726 @@
+/* Host model only. Production driver functions are inserted by
+ * test_idma_controlled.py.  This models software control flow; it is not FPGA,
+ * IOTLB, cache or HPM acceptance evidence.  Complex production observers
+ * (idma_observation_finish / idma_e3_finish) and idma_stream_prepare are
+ * deliberately stubbed here so the controlled session control flow can be
+ * exercised with real production helpers. */
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <linux/idma.h>
+
+typedef __u64 u64;
+typedef uint32_t u32;
+typedef uint8_t u8;
+typedef uintptr_t dma_addr_t;
+typedef uintptr_t phys_addr_t;
+struct device { int index; };
+struct page { int unused; };
+struct miscdevice { struct device *parent; };
+struct mutex { int unused; };
+struct iommu_domain { int unused; };
+#define BIT_ULL(n) (1ULL << (n))
+#define BIT(n) (1U << (n))
+#define __iomem
+#define __user
+#define WRITE_ONCE(dst, src) ((dst) = (src))
+#define READ_ONCE(src) (*(volatile __typeof__(src) *)&(src))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define dev_crit(dev, ...) ((void)(dev))
+#define NSEC_PER_USEC 1000ULL
+#define NSEC_PER_MSEC 1000000ULL
+#define PAGE_SIZE 4096U
+#define offset_in_page(ptr) ((uintptr_t)(ptr) & (PAGE_SIZE - 1))
+#define SZ_4K 4096U
+#define DMA_ATTR_FORCE_CONTIGUOUS 0
+#define current NULL
+#define GFP_KERNEL 0
+#define kzalloc(n, flags) calloc(1, n)
+#define kfree(ptr) free(ptr)
+
+/* PRODUCTION_TYPES */
+
+struct riscv_iommu_hpm_session { int unused; };
+struct riscv_iommu_hpm_sample { u64 cycles, iotlb_miss[2], s1_ptw[2], s2_ptw[2]; };
+
+struct fake_dma {
+	u64 regs[64];
+	u64 latency, due, next_id, done, submits, miss;
+	bool pending, populated, zero_id;
+};
+
+static struct fake_dma hw[2];
+static struct device devices[2] = {{0}, {1}};
+static struct idma_device idmas[2];
+static struct mutex idma_experiment_lock;
+static struct riscv_iommu_hpm_session session;
+static u64 now = 1000;
+static unsigned allocations, frees, unmaps, hpm_acquires, hpm_releases;
+static unsigned obs_arms, obs_reports, obs_mmio;
+static u64 idma_observation_sequence;
+static bool idma_observe, idma_path_observe;
+
+/* Launcher model. */
+static u64 l_status;
+static bool l_prep, l_go, l_has_a, l_aborted;
+static u8 l_held, l_reserved, l_issued, l_done, l_cancel;
+static u64 l_go_a_ts, l_asel_ts, l_go_v_ts, l_vissue_ts, l_aissue_ts;
+static u64 l_vdone_ts, l_adone_ts;
+static u64 l_vissue_id, l_aissue_id, l_vdone_id, l_adone_id;
+static u64 l_vissue_count, l_aissue_count, l_vdone_count, l_adone_count;
+static u64 l_a_src_iova;
+static unsigned l_gos, l_aborts;
+
+/* Per-case knobs. */
+static bool controlled_mode;
+static bool ctl_no_terminal, ctl_stall_a, ctl_stall_v;
+static bool ctl_bad_count, ctl_bad_id, ctl_zero_id_v, ctl_zero_id_a;
+static bool ctl_partial_a;   /* A reservation not held: partial prepare */
+static bool ctl_stop_go;     /* never issue V on GO (V stays held) */
+
+static void dev_info(struct device *dev, const char *fmt, ...)
+{
+	(void)dev; (void)fmt;
+	obs_reports++;
+}
+
+static struct page *idma_buffer_page(void *ptr)
+{
+	return (struct page *)((uintptr_t)ptr & ~(uintptr_t)(PAGE_SIZE - 1));
+}
+static phys_addr_t page_to_phys(struct page *page) { return (uintptr_t)page; }
+
+static void local_flush_icache_all(void)
+{
+	assert(!hw[0].pending && !hw[1].pending);
+}
+
+static phys_addr_t iommu_iova_to_phys(struct iommu_domain *domain, unsigned long iova)
+{
+	(void)domain;
+	return iova + PAGE_SIZE;
+}
+
+static void dev_err(struct device *dev, const char *format, int id, u32 did,
+		    size_t offset, size_t touched_end, size_t size, u32 chunk,
+		    unsigned src, unsigned src_after, unsigned expected_src,
+		    unsigned dst, unsigned dst_after, unsigned expected_dst,
+		    unsigned long src_iova, unsigned long dst_iova,
+		    const phys_addr_t *src_pa, const phys_addr_t *dst_pa,
+		    const phys_addr_t *src_pte_pa, const phys_addr_t *dst_pte_pa)
+{
+	(void)dev; (void)format; (void)id; (void)did; (void)offset; (void)touched_end;
+	(void)size; (void)chunk; (void)src; (void)src_after; (void)expected_src;
+	(void)dst; (void)dst_after; (void)expected_dst; (void)src_iova; (void)dst_iova;
+	(void)src_pa; (void)dst_pa; (void)src_pte_pa; (void)dst_pte_pa;
+}
+
+static void launcher_issue_v(void)
+{
+	l_vissue_id = IDMA_CONTROLLED_V_ID;
+	l_vissue_count = 1;
+	l_issued |= 1;
+	l_go_v_ts = now;
+	l_vissue_ts = now;
+	hw[0].pending = true;
+	hw[0].due = (ctl_stall_v || hw[0].latency == UINT64_MAX) ?
+		     UINT64_MAX : now + hw[0].latency;
+}
+
+static void launcher_on_done(int i)
+{
+	if (!controlled_mode || !l_go)
+		return;
+	if (i == 1) {
+		l_done |= 2;
+		l_adone_ts = now;
+		l_adone_id = IDMA_CONTROLLED_A_ID;
+		l_adone_count = 1;
+		if (l_has_a && !ctl_stop_go)
+			launcher_issue_v();
+	} else {
+		l_done |= 1;
+		l_vdone_ts = now;
+		l_vdone_id = IDMA_CONTROLLED_V_ID;
+		l_vdone_count = 1;
+	}
+	if ((l_done & (l_has_a ? 3 : 1)) == (l_has_a ? 3 : 1) && !ctl_no_terminal) {
+		l_status = IDMA_LAUNCHER_STATUS_FROZEN;
+		l_held = 0;
+	}
+}
+
+static void advance(u64 delta)
+{
+	int i;
+
+	now += delta;
+	for (i = 0; i < 2; i++) {
+		struct fake_dma *h = &hw[i];
+
+		if (h->pending && h->due != UINT64_MAX && now >= h->due) {
+			u8 *dst = (void *)(uintptr_t)h->regs[IDMA_DST_ADDR_REG_OFFSET / 8];
+			u8 *src = (void *)(uintptr_t)h->regs[IDMA_SRC_ADDR_REG_OFFSET / 8];
+
+			memcpy(dst, src, h->regs[IDMA_NUM_BYTES_REG_OFFSET / 8]);
+			h->done = h->next_id;
+			h->pending = false;
+			launcher_on_done(i);
+		}
+	}
+}
+
+static u64 ktime_get_ns(void) { advance(1000); return now; }
+static bool signal_pending(void *unused) { (void)unused; return false; }
+static void cpu_relax(void) { advance(1000); }
+static void cond_resched(void) { advance(1000); }
+
+static struct fake_dma *mmio(void *address, size_t *offset)
+{
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		uintptr_t p = (uintptr_t)address, base = (uintptr_t)hw[i].regs;
+
+		if (p >= base && p < base + sizeof(hw[i].regs)) {
+			*offset = p - base;
+			return &hw[i];
+		}
+	}
+	assert(!"invalid MMIO address");
+	return NULL;
+}
+
+static void launcher_reset_model(void)
+{
+	l_status = 0; l_prep = false; l_go = false; l_has_a = false;
+	l_held = l_reserved = l_issued = l_done = l_cancel = 0;
+	l_aborted = false;
+	l_go_a_ts = l_asel_ts = l_go_v_ts = l_vissue_ts = l_aissue_ts = 0;
+	l_vdone_ts = l_adone_ts = 0;
+	l_vissue_id = l_aissue_id = l_vdone_id = l_adone_id = 0;
+	l_vissue_count = l_aissue_count = l_vdone_count = l_adone_count = 0;
+	l_a_src_iova = 0;
+}
+
+static void launcher_go(void)
+{
+	l_gos++;
+	l_go = true;
+	l_status |= IDMA_LAUNCHER_STATUS_RUNNING;
+	l_go_a_ts = now;
+	if (l_has_a) {
+		l_aissue_id = IDMA_CONTROLLED_A_ID;
+		l_aissue_count = 1;
+		l_issued |= 2;
+		l_aissue_ts = now;
+		l_asel_ts = now;
+		hw[1].pending = true;
+		hw[1].due = (ctl_stall_a || hw[1].latency == UINT64_MAX) ?
+			     UINT64_MAX : now + hw[1].latency;
+		if (ctl_stop_go)
+			return;
+	} else {
+		launcher_issue_v();
+	}
+}
+
+static void launcher_abort(void)
+{
+	l_aborts++;
+	l_aborted = true;
+	if (l_held & 1) { l_cancel |= 1; l_held &= (u8)~1; hw[0].pending = false; hw[0].due = UINT64_MAX; }
+	if (l_held & 2) { l_cancel |= 2; l_held &= (u8)~2; hw[1].pending = false; hw[1].due = UINT64_MAX; }
+	if (l_issued & 1) {
+		hw[0].pending = false;
+		if (!(l_done & 1) && !ctl_stall_v && hw[0].latency != UINT64_MAX) {
+			l_done |= 1; l_vdone_ts = now;
+			l_vdone_id = IDMA_CONTROLLED_V_ID; l_vdone_count = 1;
+		}
+	}
+	if (l_issued & 2) {
+		hw[1].pending = false;
+		if (!(l_done & 2) && !ctl_stall_a && hw[1].latency != UINT64_MAX) {
+			l_done |= 2; l_adone_ts = now;
+			l_adone_id = IDMA_CONTROLLED_A_ID; l_adone_count = 1;
+		}
+	}
+	if (ctl_no_terminal)
+		return;
+	if (!l_held && !(l_issued & ~l_done))
+		l_status = IDMA_LAUNCHER_STATUS_FROZEN | IDMA_LAUNCHER_STATUS_ABORTED;
+}
+
+static u64 launcher_word(unsigned int idx)
+{
+	u8 expected = l_has_a ? 3 : 1;
+
+	switch (idx) {
+	case 0: return IDMA_LAUNCHER_MAGIC;
+	case 1: return 0;
+	case 2: return l_status;
+	case 3: return now;
+	case 4: return l_has_a ? l_go_a_ts : 0;
+	case 5: return l_has_a ? l_asel_ts : 0;
+	case 6: return l_go_v_ts;
+	case 7: return l_vissue_ts;
+	case 8: return l_has_a ? l_aissue_ts : 0;
+	case 9: return l_vdone_ts;
+	case 10: return l_has_a ? l_adone_ts : 0;
+	case 11: return l_vissue_id;
+	case 12: return l_has_a ? l_aissue_id : 0;
+	case 13: return ctl_bad_id ? 7 : l_vdone_id;
+	case 14: return l_has_a ? l_adone_id : 0;
+	case 15: return l_issued;
+	case 16: return l_done;
+	case 17: return l_cancel;
+	case 18: return l_reserved;
+	case 19: return expected;
+	case 20: return l_has_a ? IDMA_CONTROLLED_A_SELECT_ID : 0;
+	case 21: return l_has_a ? IDMA_CONTROLLED_A_SELECT_DID : 0;
+	case 22: return l_has_a ? l_a_src_iova : 0;
+	case 23: return 0;
+	case 24: return l_vissue_count + (ctl_bad_count ? 1 : 0);
+	case 25: return l_aissue_count;
+	case 26: return l_vdone_count + (ctl_bad_count ? 1 : 0);
+	case 27: return l_adone_count;
+	case 28: return l_has_a ? 1 : 0;
+	case 29: return l_held;
+	case 30: return 0;
+	case 31: return 0;
+	default: return 0;
+	}
+}
+
+static void writeq(u64 value, void *address)
+{
+	size_t offset;
+	struct fake_dma *h = mmio(address, &offset);
+
+	if (offset >= IDMA_LAUNCHER_MAGIC_OFFSET) {
+		if (offset == IDMA_LAUNCHER_CONTROL_OFFSET) {
+			if (value & IDMA_LAUNCHER_CLEAR)
+				launcher_reset_model();
+			else if (value & IDMA_LAUNCHER_PREP) {
+				l_prep = true;
+				l_has_a = !!(value & IDMA_LAUNCHER_PREP_HAS_A);
+				l_status |= IDMA_LAUNCHER_STATUS_PREP;
+			} else if (value & IDMA_LAUNCHER_GO) {
+				launcher_go();
+			} else if (value & IDMA_LAUNCHER_ABORT) {
+				launcher_abort();
+			}
+		}
+		h->regs[offset / 8] = value;
+		return;
+	}
+	if (offset >= IDMA_BATCH_MAGIC_OFFSET) {
+		h->regs[offset / 8] = value;
+		return;
+	}
+	if (offset >= IDMA_OBS_MAGIC_OFFSET) {
+		obs_mmio++;
+		if (offset == IDMA_OBS_CONTROL_OFFSET) {
+			if (value == 4)
+				value = 0;
+			else {
+				assert(hpm_acquires == hpm_releases + 1);
+				assert(!hw[0].pending && !hw[1].pending);
+				assert(value & BIT_ULL(29));   /* finite flag */
+				assert(h[0].regs[IDMA_OBS_TARGET_OFFSET / 8] == 1);
+				obs_arms++;
+				value = 1;
+			}
+		}
+		h->regs[offset / 8] = value;
+		return;
+	}
+	assert(!h->pending);
+	h->regs[offset / 8] = value;
+}
+
+static u64 readq(void *address)
+{
+	size_t offset;
+	struct fake_dma *h = mmio(address, &offset);
+
+	advance(1000);
+	if (offset >= IDMA_LAUNCHER_MAGIC_OFFSET) {
+		if (offset == IDMA_LAUNCHER_MAGIC_OFFSET)
+			return IDMA_LAUNCHER_MAGIC;
+		if (offset == IDMA_LAUNCHER_CONTROL_OFFSET)
+			return l_status;
+		if (offset == IDMA_LAUNCHER_INDEX_OFFSET)
+			return h->regs[offset / 8];
+		if (offset == IDMA_LAUNCHER_DATA_OFFSET)
+			return launcher_word((unsigned int)h->regs[IDMA_LAUNCHER_INDEX_OFFSET / 8]);
+		return h->regs[offset / 8];
+	}
+	if (offset >= IDMA_BATCH_MAGIC_OFFSET) {
+		if (offset == IDMA_BATCH_MAGIC_OFFSET)
+			return IDMA_BATCH_MAGIC;
+		return h->regs[offset / 8];
+	}
+	if (offset >= IDMA_OBS_MAGIC_OFFSET) {
+		obs_mmio++;
+		if (offset == IDMA_OBS_CONTROL_OFFSET)
+			return h->regs[offset / 8];
+		if (offset == IDMA_OBS_DATA_OFFSET) {
+			unsigned int index = (unsigned int)h->regs[IDMA_OBS_INDEX_OFFSET / 8];
+
+			return index == 0 ? 0xfeedU : 0;
+		}
+		return h->regs[offset / 8];
+	}
+	if (offset == IDMA_NEXT_ID_REG_OFFSET) {
+		assert(!h->pending);
+		h->submits++;
+		if (!h->populated) { h->miss++; h->populated = true; }
+		if (h->zero_id) {
+			hw[0].regs[IDMA_LAUNCHER_CONTROL_OFFSET / 8] |= 0; /* noop */
+			return 0;
+		}
+		if (controlled_mode && l_prep && !l_go) {
+			/* Reservation only; nothing is issued. */
+			unsigned int lane = (h == &hw[1]) ? 1 : 0;
+
+			if (lane == 1 && ctl_partial_a)
+				return 2;
+			if (lane == 0 && ctl_zero_id_v)
+				return 0;
+			if (lane == 1 && ctl_zero_id_a)
+				return 0;
+			l_reserved |= (u8)BIT(lane);
+			l_held |= (u8)BIT(lane);
+			if (lane == 1)
+				l_a_src_iova = h->regs[IDMA_SRC_ADDR_REG_OFFSET / 8];
+			h->next_id++;
+			return lane == 0 ? IDMA_CONTROLLED_V_ID : IDMA_CONTROLLED_A_ID;
+		}
+		h->pending = true;
+		h->next_id++;
+		h->due = (h->zero_id || h->latency == UINT64_MAX) ? UINT64_MAX : now + h->latency;
+		return h->next_id;
+	}
+	if (offset == IDMA_DONE_REG_OFFSET)
+		return h->done;
+	if (offset == IDMA_ACTIVE_CYCLES_REG_OFFSET)
+		return now;
+	return h->regs[offset / 8];
+}
+
+static int copy_from_user(void *dst, const void *src, size_t n) { memcpy(dst, src, n); return 0; }
+static int copy_to_user(void *dst, const void *src, size_t n) { memcpy(dst, src, n); return 0; }
+static int mutex_lock_interruptible(struct mutex *m) { (void)m; return 0; }
+static void mutex_unlock(struct mutex *m) { (void)m; }
+static const void *memchr_inv(const void *ptr, int c, size_t n)
+{
+	const unsigned char *p = ptr;
+
+	while (n--) {
+		if (*p != (unsigned char)c)
+			return p;
+		p++;
+	}
+	return NULL;
+}
+static bool idma_any_quarantined(void)
+{
+	return idmas[0].quarantined || idmas[1].quarantined;
+}
+static struct idma_device *idma_get_instance(u32 id)
+{
+	return id < 2 ? &idmas[id] : NULL;
+}
+static void idma_put_instance(struct idma_device *d) { (void)d; }
+static void idma_iommu_unmap_range(struct iommu_domain *d, unsigned long iova,
+				   size_t size, size_t page)
+{
+	(void)d; (void)iova; (void)size; (void)page;
+	unmaps++;
+}
+static void dma_free_attrs(struct device *d, size_t n, void *ptr, dma_addr_t dma,
+			   unsigned attrs)
+{
+	(void)n; (void)dma; (void)attrs;
+	assert(!hw[d->index].pending);
+	frees++;
+	free(ptr);
+}
+
+/* Stubs for the complex production pieces, replaced by simple models. */
+static u64 idma_pattern(struct idma_stream *s, size_t word);
+static int idma_stream_prepare(struct idma_stream *s, struct idma_device *idma,
+			       u32 pages, u32 chunk,
+			       struct idma_experiment_stats *stats)
+{
+	size_t i;
+
+	memset(s, 0, sizeof(*s));
+	s->idma = idma;
+	s->dev = idma->miscdev.parent;
+	s->stats = stats;
+	s->size = (size_t)pages * PAGE_SIZE;
+	s->chunk = chunk;
+	s->src = malloc(s->size);
+	s->dst = malloc(s->size);
+	assert(s->src && s->dst);
+	allocations += 2;
+	s->src_iova = (uintptr_t)s->src;
+	s->dst_iova = (uintptr_t)s->dst;
+	s->mapped_src = s->mapped_dst = true;
+	for (i = 0; i < s->size / sizeof(u64); i++) {
+		((u64 *)s->src)[i] = idma_pattern(s, i);
+		((u64 *)s->dst)[i] = ~idma_pattern(s, i);
+	}
+	return 0;
+}
+
+static int riscv_iommu_hpm_acquire(struct device *v, struct device *a,
+				   struct riscv_iommu_hpm_session **s)
+{
+	(void)v; (void)a;
+	hpm_acquires++;
+	*s = &session;
+	return 0;
+}
+static void riscv_iommu_hpm_read(struct riscv_iommu_hpm_session *s,
+				 struct riscv_iommu_hpm_sample *sample)
+{
+	int i;
+
+	(void)s;
+	memset(sample, 0, sizeof(*sample));
+	for (i = 0; i < 2; i++) {
+		sample->iotlb_miss[i] = hw[i].miss;
+		sample->s1_ptw[i] = hw[i].miss * 3;
+		sample->s2_ptw[i] = 0;
+	}
+	advance(1000);
+}
+static void riscv_iommu_hpm_release(struct riscv_iommu_hpm_session *s)
+{
+	assert(s == &session);
+	hpm_releases++;
+}
+static int riscv_iommu_hpm_flush_s1(struct riscv_iommu_hpm_session *s)
+{
+	assert(s == &session);
+	assert(hpm_acquires == hpm_releases + 1);
+	assert(!hw[0].pending && !hw[1].pending);
+	hw[0].populated = false;
+	hw[1].populated = false;
+	return 0;
+}
+
+static int idma_observation_finish(struct idma_observation *o,
+				   const struct idma_experiment *e, int run_error)
+{
+	(void)e;
+	if (!o->control || !o->armed)
+		return 0;
+	return run_error ? 0 : 0;
+}
+
+static int idma_e3_finish(struct idma_observation *o,
+			  const struct idma_experiment *e, u64 *words)
+{
+	(void)e;
+	if (!o->armed)
+		return -EIO;
+	memset(words, 0, IDMA_E3_WORDS * sizeof(u64));
+	return 0;
+}
+
+/* PRODUCTION_FUNCTIONS */
+
+static struct idma_experiment controlled_input(void)
+{
+	struct idma_experiment e = {
+		.abi_version = IDMA_EXPERIMENT_ABI,
+		.struct_size = sizeof(e),
+		.aggressor_id = 1,
+		.victim_pages = 1,
+		.aggressor_pages = 1,
+		.chunk_bytes = 64,
+		.run_timeout_ms = 100,
+		.victim_transfers = 1,
+	};
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		idmas[i].id = i;
+		idmas[i].did = 10 + i;
+		idmas[i].reg = hw[i].regs;
+		idmas[i].miscdev.parent = &devices[i];
+		hw[i].latency = 20000;
+		hw[i].regs[IDMA_BATCH_MAGIC_OFFSET / 8] = IDMA_BATCH_MAGIC;
+	}
+	hw[0].regs[IDMA_OBS_MAGIC_OFFSET / 8] = IDMA_OBS_MAGIC_V6;
+	hw[0].regs[IDMA_LAUNCHER_MAGIC_OFFSET / 8] = IDMA_LAUNCHER_MAGIC;
+	return e;
+}
+
+int main(int argc, char **argv)
+{
+	struct idma_e3_controlled c;
+	struct idma_experiment e;
+	const char *name;
+	long ret;
+
+	assert(argc == 2);
+	name = argv[1];
+	e = controlled_input();
+	memset(&c, 0, sizeof(c));
+	c.pair.abi_version = 1;
+	c.pair.struct_size = sizeof(c.pair);
+	c.pair.request = e;
+
+	if (!strcmp(name, "invalid_before_mmio")) {
+		c.pair.abi_version = 0;
+		ret = idma_run_e3_controlled(&idmas[0], &c);
+		assert(ret == -EINVAL);
+		assert(!allocations && !obs_mmio && !l_gos);
+		printf("PASS %s\n", name);
+		return 0;
+	}
+	if (!strcmp(name, "cold_solo_ok")) {
+		c.pair.request.aggressor_id = IDMA_EXPERIMENT_NO_AGGRESSOR;
+		c.prep_mode = 0;
+		controlled_mode = true;
+		ret = idma_run_e3_controlled(&idmas[0], &c);
+		assert(ret == 0);
+		assert(c.controlled[0].prime[1].iotlb_miss == 0);
+		assert(c.controlled[0].prime[1].submitted == 0);
+		assert(c.controlled[0].prime[0].iotlb_miss == 1);
+		assert(c.controlled[0].probe.iotlb_miss == 0);
+		assert(c.controlled[0].v_hw_cycles == 0xfeedU);
+		assert(c.pair.rounds_attempted == 2 && c.pair.rounds_completed == 2);
+		assert(hw[0].submits == 6); /* 3 per round, no CPU resubmit */
+		assert(allocations == 4 && frees == 4 && unmaps == 4);
+		printf("PASS %s\n", name);
+		return 0;
+	}
+	if (!strcmp(name, "hot_pair_lane")) {
+		c.prep_mode = 1;
+		c.pair_mode = 1;
+		controlled_mode = true;
+		ret = idma_run_e3_controlled(&idmas[0], &c);
+		assert(ret == 0);
+		/* A prime must read lane 1, V prime lane 0. */
+		assert(c.controlled[0].prime[1].iotlb_miss == 1);
+		assert(c.controlled[0].prime[0].iotlb_miss == 1);
+		assert(c.controlled[0].probe.iotlb_miss == 0);
+		assert(c.controlled[1].prime[1].iotlb_miss == 1);
+		assert(c.controlled[1].prime[0].iotlb_miss == 1);
+		assert(allocations == 4 && frees == 4);
+		printf("PASS %s\n", name);
+		return 0;
+	}
+	if (!strcmp(name, "no_cpu_resubmit")) {
+		controlled_mode = true;
+		ret = idma_run_e3_controlled(&idmas[0], &c);
+		assert(ret == 0);
+		/* pair, cold: V prime + V probe + formal V + formal A; per round. */
+		assert(hw[0].submits == 2 * 2);
+		assert(hw[1].submits == 2 * 1);
+		printf("PASS %s\n", name);
+		return 0;
+	}
+	if (!strcmp(name, "two_round_reset")) {
+		c.pair.first_delay = 128;
+		controlled_mode = true;
+		ret = idma_run_e3_controlled(&idmas[0], &c);
+		assert(ret == 0);
+		assert(c.pair.rounds_attempted == 2 && c.pair.rounds_completed == 2);
+		/* Round 2 must be fresh: no inherited counters/positions. */
+		assert(c.pair.result[0].victim.submitted == 1);
+		assert(c.pair.result[1].victim.submitted == 1);
+		assert(c.pair.result[1].measurement_complete);
+		assert(c.pair.result[1].hpm_configured == 1);
+		assert(c.controlled[1].prime[0].iotlb_miss == 1);
+		assert(c.controlled[1].probe.iotlb_miss == 0);
+		assert(c.controlled[0].flush_status == 0);
+		assert(c.controlled[1].flush_status == 0);
+		printf("PASS %s\n", name);
+		return 0;
+	}
+	if (!strcmp(name, "no_terminal_quarantine") ||
+	    !strcmp(name, "first_error_preserved")) {
+		controlled_mode = true;
+		ctl_no_terminal = true;
+		ret = idma_run_e3_controlled(&idmas[0], &c);
+		assert(ret == -ETIMEDOUT);
+		assert(c.pair.status == -ETIMEDOUT);
+		assert(c.pair.result[0].status == -ETIMEDOUT);
+		assert(!c.pair.result[0].measurement_complete);
+		assert(idmas[0].quarantined);
+		assert(allocations > frees);
+		assert(hpm_releases == 1 && hpm_acquires == 1);
+		printf("PASS %s\n", name);
+		return 0;
+	}
+	if (!strcmp(name, "timeout_a_stall_v_held")) {
+		controlled_mode = true;
+		ctl_stall_a = true;
+		e.run_timeout_ms = 1;
+		c.pair.request = e;
+		ret = idma_run_e3_controlled(&idmas[0], &c);
+		assert(ret == -ETIMEDOUT || ret == -EIO);
+		assert(idmas[0].quarantined || idmas[1].quarantined);
+		assert(allocations > frees);
+		printf("PASS %s\n", name);
+		return 0;
+	}
+	if (!strcmp(name, "prime_failure_undrained")) {
+		controlled_mode = true;
+		hw[0].latency = UINT64_MAX;
+		ret = idma_run_e3_controlled(&idmas[0], &c);
+		assert(ret == -ETIMEDOUT);
+		assert(idmas[0].quarantined);
+		assert(l_gos == 0);
+		assert(allocations > frees);
+		printf("PASS %s\n", name);
+		return 0;
+	}
+	if (!strcmp(name, "partial_prepare_zero_a")) {
+		controlled_mode = true;
+		ctl_zero_id_a = true;
+		ret = idma_run_e3_controlled(&idmas[0], &c);
+		assert(ret == -EIO);
+		assert(idmas[1].quarantined);
+		assert(l_gos == 0);
+		assert(allocations > frees);
+		printf("PASS %s\n", name);
+		return 0;
+	}
+	if (!strcmp(name, "zero_id_v")) {
+		controlled_mode = true;
+		ctl_zero_id_v = true;
+		ret = idma_run_e3_controlled(&idmas[0], &c);
+		assert(ret == -EIO);
+		assert(idmas[0].quarantined);
+		printf("PASS %s\n", name);
+		return 0;
+	}
+	if (!strcmp(name, "bad_count_quarantine") ||
+	    !strcmp(name, "bad_id_quarantine")) {
+		controlled_mode = true;
+		ctl_bad_count = !strcmp(name, "bad_count_quarantine");
+		ctl_bad_id = !strcmp(name, "bad_id_quarantine");
+		ret = idma_run_e3_controlled(&idmas[0], &c);
+		assert(ret == -EIO);
+		assert(allocations > frees);
+		printf("PASS %s\n", name);
+		return 0;
+	}
+
+	assert(!"unknown test");
+	return 1;
+}

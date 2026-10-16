@@ -1,0 +1,15 @@
+# D-CS1 synthetic conditional event model
+
+Only the frozen `../root/service-contract.json` is authoritative. `implementation-contract.json` records finer event/API choices before execution. All units are synthetic; native/RTL/area/CPU calibration and natural prehistory distribution are unknown.
+
+- `simulator.py`: finite two-owner source, mode-blind device provider, serial normal TL, PN-only DC/LEAF/shared response, per-owner partition LRU, three dependent PTE reads, coupled/split memory, CPU polling/callback/resubmit/free, setup/warm/cleanup and persistent cooling.
+- `worlds.json`: all 4 main + 4 holdout configurations, each 35 weighted prehistory tuples, each 8 target mode/wait actions. `O0_events` is full CPU-visible timestamped reference history. Prehistory/debug `h` never appears there. Each complete trace has an explicit deterministic invocation-start memoization key; duplicate tuples retain separate weight.
+- `negative-controls.json`: public-initial specification, actual full-reset and independently refreshed future runs, and matched-time all-hit equality controls. Independent-refresh rows form an exact Cartesian product with every old world of the same config; future tuples have weight 1/35 independent of old observations. Add old reference duration to `additional_time` (already includes holdout b/reset/maintenance/wait/mode write/target).
+- `traces/*.json.gz`: complete event records for every unique invocation. Each stores `[config,h_at_invocation_setup,mode,N]`. Alternative actions regenerate their own device/CPU/memory/arrival calendars; only exactly identical full initial state/config/mode/N is memoized.
+- `replay.py`, `check_saved.py`: independent causal/invariant replay, without simulator state transitions. Reconstructs cache, dependency chains, heads, TL/probe/response resources, memory pending/accepted/active sets, device FIFO/debt/work, per-owner live generation/credits and completion/free endpoint.
+- `verification.json`: first generator receipt; `replay-verification.json`: stronger independent replay receipt over all saved traces, including a real PN miss forged to hit/permission and rejected against reconstructed cache. `failure-compile-001.txt` preserves the initial syntax diagnostic. No runtime failure or parameter tuning occurred.
+- `cost-breakdowns.json`: per-trace CPU/lifecycle event counts and memory/device/translation service work, not additive elapsed time (concurrent work overlaps).
+
+First generation command used a 120-second process timeout; the invocation guard is 20,000 ticks. It completed in about 12 seconds. Stronger independent replay was added after that execution and replayed the saved traces without repeating unchanged model runs. Requested worker configuration: Sol/medium; actual model/effort runtime metadata unavailable, not inferred from request.
+
+Reproduction: `python3 simulator.py`; independent saved-trace verification: `python3 check_saved.py`. Outputs are synthetic model evidence, not performance measurements or novelty acceptance. Information grouping and decision analysis are performed separately by root/analysis, not this implementation.

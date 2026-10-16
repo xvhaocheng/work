@@ -1,0 +1,838 @@
+// SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
+//
+// tests/nonblock_actual_dma_top.sv
+//
+// BOUNDED DIAGNOSTIC WRAPPER -- NOT PRODUCTION RTL.
+//
+// Structure
+// ---------
+//   * re-instantiates the existing scalar-I/O joint harness
+//     tests/nonblock_banked_top.sv UNCHANGED and re-exports its complete
+//     comp / ddtw / ptw scalarDDR ports and its 10 dbg taps verbatim;
+//   * instantiates TWO real dma_core_wrap (non-intf, "type" flavour):
+//       DMA0 = V : DEVICE_ID 10, PROCESS_ID 20, ObserverPort=1, ResearchPort=0
+//       DMA1 = A : DEVICE_ID 11, PROCESS_ID 21, ObserverPort=0, ResearchPort=1
+//     exactly as ariane_peripherals_xilinx.sv:1253-1306 does for i==0/1,
+//     with the real board parameters:
+//       JobFifoDepth 8, BufferDepth 512, NumAxInFlight 8, MemSysDepth 0,
+//       RAWCouplingAvail 0, IsTwoD 0, BatchPort 1, LaunchPort 1, AxID 0;
+//   * muxes the two real translation-request masters with the real 4-input
+//     axi_mux used on the FPGA (2 live ports + 2 tied to zero) so the AxID
+//     carries the bank index exactly as the board does
+//     (SlvAxiIDWidth=2, NoSlvPorts=4 => master id width 4).
+//     nonblock_banked_top.BankIdBit is already 2 (line 628) and is untouched;
+//   * fullbuffer_jobs_i of the harness is driven from the REAL certificates
+//     (dma_core_wrap fullbuffer_job_o), never from a static 2'b11;
+//   * exposes one test-only configuration AXI slave selector that drives
+//     EXACTLY ONE dma_core_wrap axi_slv port at a time.  No frontend register
+//     is ever forced and the real backend is never bypassed: the FSM performs a
+//     real AW/W/B or AR/R AXI transaction on the selected slave.
+//
+// Observation-only taps do not drive anything.
+
+`include "axi/typedef.svh"
+`include "axi/assign.svh"
+`include "axi-iommu/typedef.svh"
+
+module nonblock_actual_dma_top
+  import rv_iommu_reg_pkg::*;
+  import rv_iommu::*;
+  import rv_iommu_cfg::*;
+  import axi_pkg::*;
+#(
+    parameter bit          NonblockEnable       = 1,
+    parameter int unsigned NumOutstandingTrans = 8,
+    parameter int unsigned WFifoDepth          = 32,
+    // Test-only elaboration switch, forwarded verbatim to the harness.
+    parameter bit          PolicyEnable        = 0
+) (
+    input  logic clk_i,
+    input  logic rst_ni,
+
+    // ---- runtime mode inputs (forwarded to the harness) --------------------
+    input  logic nonblock_enable_i,
+    input  logic policy_partition_i,
+    // Test-only ordinary baseline: suppress non-owner full-buffer permission.
+    // The actual DMA buffer capacity and certificate observation stay intact.
+    input  logic owner_only_i,
+
+    // ---------------- completion AXI  (re-export of nonblock_banked_top) ----
+    output logic         comp_aw_valid,
+    output logic [3:0]   comp_aw_id,
+    output logic [63:0]  comp_aw_addr,
+    output logic [7:0]   comp_aw_len,
+    output logic [2:0]   comp_aw_size,
+    output logic [1:0]   comp_aw_burst,
+    output logic [2:0]   comp_aw_prot,
+    output logic [0:0]   comp_aw_user,
+
+    output logic         comp_ar_valid,
+    output logic [3:0]   comp_ar_id,
+    output logic [63:0]  comp_ar_addr,
+    output logic [7:0]   comp_ar_len,
+    output logic [2:0]   comp_ar_size,
+    output logic [1:0]   comp_ar_burst,
+    output logic [2:0]   comp_ar_prot,
+    output logic [0:0]   comp_ar_user,
+
+    output logic         comp_w_valid,
+    output logic [63:0]  comp_w_data,
+    output logic [7:0]   comp_w_strb,
+    output logic         comp_w_last,
+
+    output logic         comp_b_ready,
+    output logic         comp_r_ready,
+
+    input  logic         comp_aw_ready,
+    input  logic         comp_ar_ready,
+    input  logic         comp_w_ready,
+    input  logic         comp_b_valid,
+    input  logic [3:0]   comp_b_id,
+    input  logic [1:0]   comp_b_resp,
+    input  logic         comp_r_valid,
+    input  logic [3:0]   comp_r_id,
+    input  logic [63:0]  comp_r_data,
+    input  logic [1:0]   comp_r_resp,
+    input  logic         comp_r_last,
+
+    // ---------------- DDTW AXI read port -----------------------------------
+    output logic         ddtw_ar_valid,
+    output logic [63:0]  ddtw_ar_addr,
+    output logic [3:0]   ddtw_ar_id,
+    output logic [7:0]   ddtw_ar_len,
+    output logic [2:0]   ddtw_ar_size,
+    output logic [1:0]   ddtw_ar_burst,
+    input  logic         ddtw_ar_ready,
+    output logic         ddtw_r_ready,
+    input  logic         ddtw_r_valid,
+    input  logic [63:0]  ddtw_r_data,
+    input  logic [3:0]   ddtw_r_id,
+    input  logic [1:0]   ddtw_r_resp,
+    input  logic         ddtw_r_last,
+
+    // ---------------- PTW AXI read port -------------------------------------
+    output logic         ptw_ar_valid,
+    output logic [63:0]  ptw_ar_addr,
+    output logic [3:0]   ptw_ar_id,
+    output logic [7:0]   ptw_ar_len,
+    output logic [2:0]   ptw_ar_size,
+    output logic [1:0]   ptw_ar_burst,
+    input  logic         ptw_ar_ready,
+    output logic         ptw_r_ready,
+    input  logic         ptw_r_valid,
+    input  logic [63:0]  ptw_r_data,
+    input  logic [3:0]   ptw_r_id,
+    input  logic [1:0]   ptw_r_resp,
+    input  logic         ptw_r_last,
+
+    // ---------------- TL observation (re-export of nonblock_banked_top) -----
+    output logic        dbg_tl_req_valid,
+    output logic        dbg_tl_req_ready,
+    output logic        dbg_tl_req_bank,
+    output logic        dbg_tl_resp_valid,
+    output logic        dbg_tl_resp_ready,
+    output logic        dbg_tl_resp_bank,
+    output logic        dbg_tl_ptw_active,
+    output logic        dbg_tl_ptw_r_fire,
+    output logic        dbg_tl_iotlb_lookup,
+    output logic        dbg_tl_iotlb_hit,
+
+    // ---------------- test-only configuration AXI slave selector ------------
+    // cfg_sel: 0 = DMA0 (V), 1 = DMA1 (A).  cfg_* is a single-beat AXI4 access
+    // on the selected dma_core_wrap axi_slv port.  Inputs must be held stable
+    // until cfg_ready is seen.
+    input  logic         cfg_sel,
+    input  logic         cfg_valid,
+    input  logic         cfg_write,
+    input  logic [63:0]  cfg_addr,
+    input  logic [63:0]  cfg_wdata,
+    input  logic [7:0]   cfg_wstrb,
+    output logic         cfg_ready,
+    output logic [63:0]  cfg_rdata,
+    output logic         cfg_error,
+
+    // ---------------- DMA observer taps (observation only, no feedback) -----
+    output logic [1:0]  dbg_dma_issue,
+    output logic [1:0]  dbg_dma_done,
+    output logic [1:0]  dbg_dma_poll,
+    output logic [1:0]  dbg_dma_batch_active,
+    output logic [1:0]  dbg_dma_batch_gap,
+    output logic [1:0]  dbg_dma_job_quiet,
+    output logic [1:0]  dbg_dma_fullbuffer,
+    output logic [1:0]  dbg_dma_launch_active,
+    output logic [1:0]  dbg_dma_launch_held,
+    output logic [1:0]  dbg_dma_launch_error,
+
+    // ---------------- nonblocking lifecycle taps (read-only) ----------------
+    // Re-exported from nonblock_banked_top's control/trace outputs so the S/N
+    // (nonblocking disabled/enabled) paths are observable rather than open.
+    output logic        dbg_nonblock_fire,
+    output logic        dbg_nonblock_busy,
+    output logic        dbg_in_flight,
+
+    // ---------------- fast/main + 2-bank hierarchical taps (read-only) ------
+    // Real instance names (for lookup):
+    //   i_sys             : nonblock_banked_top          (tests/nonblock_banked_top.sv)
+    //   i_sys.gen_banked.i_banked : rv_iommu_banked_ctl  (bank_busy[1:0])
+    //   i_sys.i_tl        : rv_iommu_tl_wrap             (fast_resp_*/slow_resp_valid)
+    //   i_sys.i_tl.gen_nonblock_hit.i_hit : rv_iommu_nonblock_hit
+    // These are pure observations; nothing here drives the DUT.
+    output logic        dbg_fast_resp_valid,
+    output logic        dbg_fast_resp_ready,
+    output logic        dbg_fast_resp_bank,
+    output logic        dbg_slow_resp_valid,
+    output logic [1:0]  dbg_bank_busy,
+    // Real registered cfg-FSM state (never a hard-wired 0).
+    output logic [2:0]  dbg_cfg_state
+);
+
+    // ------------------------------------------------------------------------
+    // Fixed widths
+    // ------------------------------------------------------------------------
+    localparam int unsigned AxiAddrWidth   = 64;
+    localparam int unsigned AxiDataWidth   = 64;
+    localparam int unsigned AxiUserWidth   = 1;
+    // DmaAxiIdWidth on the FPGA = ariane_soc::IdWidth - $clog2(4) = 4 - 2 = 2
+    localparam int unsigned DmaAxiIdWidth  = 2;
+    localparam int unsigned MuxAxiIdWidth  = 4;   // 2 + $clog2(4)
+    localparam int unsigned CfgBusIDWidth  = 6;   // ariane_soc::IdWidthSlave
+
+    typedef logic [AxiAddrWidth-1:0]      addr_t;
+    typedef logic [AxiDataWidth-1:0]      data_t;
+    typedef logic [AxiDataWidth/8-1:0]    strb_t;
+    typedef logic [AxiUserWidth-1:0]      user_t;
+    typedef logic [DmaAxiIdWidth-1:0]     dma_id_t;
+    typedef logic [MuxAxiIdWidth-1:0]     mux_id_t;
+    typedef logic [CfgBusIDWidth-1:0]     cfg_id_t;
+    typedef logic [23:0]                  did_t;
+    typedef logic                         ssidv_t;
+    typedef logic [19:0]                  subid_t;
+
+    // ------------------------------------------------------------------------
+    // DMA translation-request bus types (id width 2, as the FPGA DmaAxiIdWidth)
+    // ------------------------------------------------------------------------
+    `AXI_TYPEDEF_EXT_ALL(axi_tr2, addr_t, dma_id_t, data_t, strb_t, user_t,
+                         did_t, ssidv_t, subid_t)
+    // ------------------------------------------------------------------------
+    // Mux master bus types (id width 4 after axi_id_prepend)
+    // ------------------------------------------------------------------------
+    `AXI_TYPEDEF_EXT_ALL(axi_tr4, addr_t, mux_id_t, data_t, strb_t, user_t,
+                         did_t, ssidv_t, subid_t)
+
+    // ------------------------------------------------------------------------
+    // Configuration AXI slave bus types (id width 6 == ariane_soc::IdWidthSlave)
+    // ------------------------------------------------------------------------
+    `AXI_TYPEDEF_AW_CHAN_T(cfg_aw_chan_t, addr_t, cfg_id_t, user_t)
+    `AXI_TYPEDEF_W_CHAN_T (cfg_w_chan_t,  data_t, strb_t, user_t)
+    `AXI_TYPEDEF_B_CHAN_T (cfg_b_chan_t,  cfg_id_t, user_t)
+    `AXI_TYPEDEF_AR_CHAN_T(cfg_ar_chan_t, addr_t, cfg_id_t, user_t)
+    `AXI_TYPEDEF_R_CHAN_T (cfg_r_chan_t,  data_t, cfg_id_t, user_t)
+    `AXI_TYPEDEF_REQ_T    (cfg_req_t,  cfg_aw_chan_t, cfg_w_chan_t, cfg_ar_chan_t)
+    `AXI_TYPEDEF_RESP_T   (cfg_resp_t, cfg_b_chan_t,  cfg_r_chan_t)
+
+    // ------------------------------------------------------------------------
+    // Mux plumbing
+    // ------------------------------------------------------------------------
+    axi_tr2_req_t  [3:0] slv_reqs;
+    axi_tr2_resp_t [3:0] slv_resps;
+    axi_tr4_req_t        mux_mst_req;
+    axi_tr4_resp_t       mux_mst_resp;
+
+    // ------------------------------------------------------------------------
+    // Harness translation-request ports (individual bits, unpacked below)
+    // ------------------------------------------------------------------------
+    logic        tr_aw_valid;
+    logic [3:0]  tr_aw_id;
+    logic [63:0] tr_aw_addr;
+    logic [7:0]  tr_aw_len;
+    logic [2:0]  tr_aw_size;
+    logic [1:0]  tr_aw_burst;
+    logic [2:0]  tr_aw_prot;
+    logic [0:0]  tr_aw_user;
+    logic [23:0] tr_aw_did;
+    logic        tr_aw_ssid_valid;
+    logic [19:0] tr_aw_subid;
+    logic        tr_aw_mmu_atst;
+    logic        tr_aw_mmu_valid;
+
+    logic        tr_ar_valid;
+    logic [3:0]  tr_ar_id;
+    logic [63:0] tr_ar_addr;
+    logic [7:0]  tr_ar_len;
+    logic [2:0]  tr_ar_size;
+    logic [1:0]  tr_ar_burst;
+    logic [2:0]  tr_ar_prot;
+    logic [0:0]  tr_ar_user;
+    logic [23:0] tr_ar_did;
+    logic        tr_ar_ssid_valid;
+    logic [19:0] tr_ar_subid;
+    logic        tr_ar_mmu_atst;
+    logic        tr_ar_mmu_valid;
+
+    logic        tr_w_valid;
+    logic [63:0] tr_w_data;
+    logic [7:0]  tr_w_strb;
+    logic        tr_w_last;
+    logic [0:0]  tr_w_user;
+
+    logic        tr_b_ready;
+    logic        tr_r_ready;
+
+    logic        tr_aw_ready;
+    logic        tr_ar_ready;
+    logic        tr_w_ready;
+    logic        tr_b_valid;
+    logic [3:0]  tr_b_id;
+    logic [1:0]  tr_b_resp;
+    logic        tr_r_valid;
+    logic [3:0]  tr_r_id;
+    logic [63:0] tr_r_data;
+    logic [1:0]  tr_r_resp;
+    logic        tr_r_last;
+
+    // ------------------------------------------------------------------------
+    // Real DMA masters
+    // ------------------------------------------------------------------------
+    axi_tr2_req_t  dma0_mst_req, dma1_mst_req;
+    axi_tr2_resp_t dma0_mst_rsp, dma1_mst_rsp;
+
+    // Config slave plumbing: exactly one of cfg_req[0]/cfg_req[1] is live.
+    cfg_req_t  [1:0] cfg_req;
+    cfg_resp_t [1:0] cfg_rsp;
+
+    // DMA observer taps
+    logic        d0_issue, d0_done, d0_poll, d0_batch_active, d0_batch_gap;
+    logic        d0_job_quiet, d0_fullbuffer, d0_launch_active, d0_launch_held, d0_launch_err;
+    logic        d1_issue, d1_done, d1_poll, d1_batch_active, d1_batch_gap;
+    logic        d1_job_quiet, d1_fullbuffer, d1_launch_active, d1_launch_held, d1_launch_err;
+
+    logic [1:0]  fullbuffer_jobs_o;   // 2-bit harness permit, certificate-driven
+
+    // ========================================================================
+    // The two real frontend+backend wrappers
+    // ========================================================================
+    dma_core_wrap #(
+        .AxiAddrWidth     ( AxiAddrWidth    ),
+        .AxiDataWidth     ( AxiDataWidth    ),
+        .AxiIdWidth       ( DmaAxiIdWidth   ),
+        .AxiUserWidth     ( AxiUserWidth    ),
+        .AxiSlvIdWidth    ( CfgBusIDWidth   ),
+        .NumAxInFlight    ( 8               ),
+        .MemSysDepth      ( 0               ),
+        .JobFifoDepth     ( 8               ),
+        .BufferDepth      ( 512             ),
+        .RAWCouplingAvail ( 1'b0            ),
+        .ObserverPort     ( 1'b1            ),   // only V
+        .BatchPort        ( 1'b1            ),
+        .LaunchPort       ( 1'b1            ),
+        .ResearchPort     ( 1'b0            ),   // only A
+        .IsTwoD           ( 1'b0            ),
+        .axi_mst_req_t    ( axi_tr2_req_t   ),
+        .axi_mst_rsp_t    ( axi_tr2_resp_t  ),
+        .axi_slv_req_t    ( cfg_req_t       ),
+        .axi_slv_rsp_t    ( cfg_resp_t      ),
+        .DEVICE_ID        ( 24'd10          ),
+        .PROCESS_ID       ( 20'd20          ),
+        .AxID             ( 2'd0            )
+    ) i_dma0 (
+        .clk_i, .rst_ni,
+        .testmode_i     ( 1'b0              ),
+        .obs_issue_o    ( d0_issue          ),
+        .obs_done_o     ( d0_done           ),
+        .obs_poll_o     ( d0_poll           ),
+        .batch_active_o ( d0_batch_active   ),
+        .batch_gap_active_o ( d0_batch_gap  ),
+        .job_quiet_o    ( d0_job_quiet      ),
+        .fullbuffer_job_o ( d0_fullbuffer   ),
+        .policy_enable_i( 1'b0              ),
+        .policy_allow_i ( 1'b1              ),
+        .policy_abort_i ( 1'b0              ),
+        .batch_reverse_i( 1'b0              ),
+        .launch_hold_i  ( 1'b0              ),
+        .launch_go_i    ( 1'b0              ),
+        .launch_cancel_i( 1'b0              ),
+        .launch_held_o  ( d0_launch_held    ),
+        .launch_active_o( d0_launch_active  ),
+        .launch_cancelled_o ( /* open */    ),
+        .launch_error_o ( d0_launch_err     ),
+        .obs_issue_id_o ( /* open */        ),
+        .obs_done_id_o  ( /* open */        ),
+        .obs_poll_id_o  ( /* open */        ),
+        .obs_cfg_valid_o( /* open */        ),
+        .obs_cfg_write_o( /* open */        ),
+        .obs_cfg_addr_o ( /* open */        ),
+        .obs_cfg_wdata_o( /* open */        ),
+        .obs_cfg_wstrb_o( /* open */        ),
+        .obs_cfg_rdata_i( 64'd0             ),
+        .axi_mst_req_o  ( dma0_mst_req      ),
+        .axi_mst_rsp_i  ( dma0_mst_rsp      ),
+        .axi_slv_req_i  ( cfg_req[0]        ),
+        .axi_slv_rsp_o  ( cfg_rsp[0]        )
+    );
+
+    dma_core_wrap #(
+        .AxiAddrWidth     ( AxiAddrWidth    ),
+        .AxiDataWidth     ( AxiDataWidth    ),
+        .AxiIdWidth       ( DmaAxiIdWidth   ),
+        .AxiUserWidth     ( AxiUserWidth    ),
+        .AxiSlvIdWidth    ( CfgBusIDWidth   ),
+        .NumAxInFlight    ( 8               ),
+        .MemSysDepth      ( 0               ),
+        .JobFifoDepth     ( 8               ),
+        .BufferDepth      ( 512             ),
+        .RAWCouplingAvail ( 1'b0            ),
+        .ObserverPort     ( 1'b0            ),   // only V
+        .BatchPort        ( 1'b1            ),
+        .LaunchPort       ( 1'b1            ),
+        .ResearchPort     ( 1'b1            ),   // only A
+        .IsTwoD           ( 1'b0            ),
+        .axi_mst_req_t    ( axi_tr2_req_t   ),
+        .axi_mst_rsp_t    ( axi_tr2_resp_t  ),
+        .axi_slv_req_t    ( cfg_req_t       ),
+        .axi_slv_rsp_t    ( cfg_resp_t      ),
+        .DEVICE_ID        ( 24'd11          ),
+        .PROCESS_ID       ( 20'd21          ),
+        .AxID             ( 2'd0            )
+    ) i_dma1 (
+        .clk_i, .rst_ni,
+        .testmode_i     ( 1'b0              ),
+        .obs_issue_o    ( d1_issue          ),
+        .obs_done_o     ( d1_done           ),
+        .obs_poll_o     ( d1_poll           ),
+        .batch_active_o ( d1_batch_active   ),
+        .batch_gap_active_o ( d1_batch_gap  ),
+        .job_quiet_o    ( d1_job_quiet      ),
+        .fullbuffer_job_o ( d1_fullbuffer   ),
+        .policy_enable_i( 1'b0              ),
+        .policy_allow_i ( 1'b1              ),
+        .policy_abort_i ( 1'b0              ),
+        .batch_reverse_i( 1'b0              ),
+        .launch_hold_i  ( 1'b0              ),
+        .launch_go_i    ( 1'b0              ),
+        .launch_cancel_i( 1'b0              ),
+        .launch_held_o  ( d1_launch_held    ),
+        .launch_active_o( d1_launch_active  ),
+        .launch_cancelled_o ( /* open */    ),
+        .launch_error_o ( d1_launch_err     ),
+        .obs_issue_id_o ( /* open */        ),
+        .obs_done_id_o  ( /* open */        ),
+        .obs_poll_id_o  ( /* open */        ),
+        .obs_cfg_valid_o( /* open */        ),
+        .obs_cfg_write_o( /* open */        ),
+        .obs_cfg_addr_o ( /* open */        ),
+        .obs_cfg_wdata_o( /* open */        ),
+        .obs_cfg_wstrb_o( /* open */        ),
+        .obs_cfg_rdata_i( 64'd0             ),
+        .axi_mst_req_o  ( dma1_mst_req      ),
+        .axi_mst_rsp_i  ( dma1_mst_rsp      ),
+        .axi_slv_req_i  ( cfg_req[1]        ),
+        .axi_slv_rsp_o  ( cfg_rsp[1]        )
+    );
+
+    // ========================================================================
+    // Real 4-input axi_mux : 2 live DMA ports + 2 tied off
+    // ========================================================================
+    assign slv_reqs[0] = dma0_mst_req;
+    assign slv_reqs[1] = dma1_mst_req;
+    assign slv_reqs[2] = '0;
+    assign slv_reqs[3] = '0;
+    assign dma0_mst_rsp = slv_resps[0];
+    assign dma1_mst_rsp = slv_resps[1];
+    // slv_resps[2]/[3] intentionally open (tied-off slaves never response).
+
+    axi_mux #(
+        .SlvAxiIDWidth ( DmaAxiIdWidth      ),
+        .slv_aw_chan_t ( axi_tr2_aw_chan_t  ),
+        .mst_aw_chan_t ( axi_tr4_aw_chan_t  ),
+        .w_chan_t      ( axi_tr2_w_chan_t   ),
+        .slv_b_chan_t  ( axi_tr2_b_chan_t   ),
+        .mst_b_chan_t  ( axi_tr4_b_chan_t   ),
+        .slv_ar_chan_t ( axi_tr2_ar_chan_t  ),
+        .mst_ar_chan_t ( axi_tr4_ar_chan_t  ),
+        .slv_r_chan_t  ( axi_tr2_r_chan_t   ),
+        .mst_r_chan_t  ( axi_tr4_r_chan_t   ),
+        .slv_req_t     ( axi_tr2_req_t      ),
+        .slv_resp_t    ( axi_tr2_resp_t     ),
+        .mst_req_t     ( axi_tr4_req_t      ),
+        .mst_resp_t    ( axi_tr4_resp_t     ),
+        .NoSlvPorts    ( 4                  ),
+        .MaxWTrans     ( 8                  )
+    ) i_dma_iommu_tr_mux (
+        .clk_i,
+        .rst_ni,
+        .test_i      ( 1'b0             ),
+        .slv_reqs_i  ( slv_reqs         ),
+        .slv_resps_o ( slv_resps        ),
+        .mst_req_o   ( mux_mst_req      ),
+        .mst_resp_i  ( mux_mst_resp     )
+    );
+
+    // ========================================================================
+    // Unpack mux master request -> harness request bits (field by field).
+    // All stream/user/error-capable fields are preserved.
+    // ========================================================================
+    always_comb begin : unpack_mux_mst
+        tr_aw_valid      = mux_mst_req.aw_valid;
+        tr_aw_id         = mux_mst_req.aw.id;
+        tr_aw_addr       = mux_mst_req.aw.addr;
+        tr_aw_len        = mux_mst_req.aw.len;
+        tr_aw_size       = mux_mst_req.aw.size;
+        tr_aw_burst      = mux_mst_req.aw.burst;
+        tr_aw_prot       = mux_mst_req.aw.prot;
+        tr_aw_user       = mux_mst_req.aw.user;
+        tr_aw_did        = mux_mst_req.aw.stream_id;
+        tr_aw_ssid_valid = mux_mst_req.aw.ss_id_valid;
+        tr_aw_subid      = mux_mst_req.aw.substream_id;
+        tr_aw_mmu_atst   = mux_mst_req.aw.mmu_atst;
+        tr_aw_mmu_valid  = mux_mst_req.aw.mmu_valid;
+
+        tr_ar_valid      = mux_mst_req.ar_valid;
+        tr_ar_id         = mux_mst_req.ar.id;
+        tr_ar_addr       = mux_mst_req.ar.addr;
+        tr_ar_len        = mux_mst_req.ar.len;
+        tr_ar_size       = mux_mst_req.ar.size;
+        tr_ar_burst      = mux_mst_req.ar.burst;
+        tr_ar_prot       = mux_mst_req.ar.prot;
+        tr_ar_user       = mux_mst_req.ar.user;
+        tr_ar_did        = mux_mst_req.ar.stream_id;
+        tr_ar_ssid_valid = mux_mst_req.ar.ss_id_valid;
+        tr_ar_subid      = mux_mst_req.ar.substream_id;
+        tr_ar_mmu_atst   = mux_mst_req.ar.mmu_atst;
+        tr_ar_mmu_valid  = mux_mst_req.ar.mmu_valid;
+
+        tr_w_valid       = mux_mst_req.w_valid;
+        tr_w_data        = mux_mst_req.w.data;
+        tr_w_strb        = mux_mst_req.w.strb;
+        tr_w_last        = mux_mst_req.w.last;
+        tr_w_user        = mux_mst_req.w.user;
+
+        tr_b_ready       = mux_mst_req.b_ready;
+        tr_r_ready       = mux_mst_req.r_ready;
+    end
+
+    // Harness response bits -> mux master response
+    always_comb begin : pack_mux_mst_resp
+        mux_mst_resp = '0;
+        mux_mst_resp.aw_ready = tr_aw_ready;
+        mux_mst_resp.ar_ready = tr_ar_ready;
+        mux_mst_resp.w_ready  = tr_w_ready;
+        mux_mst_resp.b_valid  = tr_b_valid;
+        mux_mst_resp.b.id     = tr_b_id;
+        mux_mst_resp.b.resp   = tr_b_resp;
+        mux_mst_resp.b.user   = '0;
+        mux_mst_resp.r_valid  = tr_r_valid;
+        mux_mst_resp.r.id     = tr_r_id;
+        mux_mst_resp.r.data   = tr_r_data;
+        mux_mst_resp.r.resp   = tr_r_resp;
+        mux_mst_resp.r.last   = tr_r_last;
+        mux_mst_resp.r.user   = '0;
+    end
+
+    // ========================================================================
+    // Certificate-driven full-buffer permit (NOT a static 2'b11).
+    // Bit b == bank b full-buffer permit; bank0 = V = DMA0, bank1 = A = DMA1.
+    // ========================================================================
+    assign fullbuffer_jobs_o = { d1_fullbuffer, d0_fullbuffer };
+
+    // ========================================================================
+    // The unchanged joint harness (real banked CTL <-> real TL)
+    // ========================================================================
+    nonblock_banked_top #(
+        .NonblockEnable      ( NonblockEnable      ),
+        .BankedEnable        ( 1'b1                ),
+        .NumOutstandingTrans ( NumOutstandingTrans ),
+        .WFifoDepth          ( WFifoDepth          ),
+        .PolicyEnable        ( PolicyEnable        )
+    ) i_sys (
+        .clk_i                 ( clk_i               ),
+        .rst_ni                ( rst_ni              ),
+        .policy_partition_i    ( policy_partition_i  ),
+
+        .tr_aw_valid           ( tr_aw_valid         ),
+        .tr_aw_id              ( tr_aw_id            ),
+        .tr_aw_addr            ( tr_aw_addr          ),
+        .tr_aw_len             ( tr_aw_len           ),
+        .tr_aw_size            ( tr_aw_size          ),
+        .tr_aw_burst           ( tr_aw_burst         ),
+        .tr_aw_prot            ( tr_aw_prot          ),
+        .tr_aw_user            ( tr_aw_user          ),
+        .tr_aw_did             ( tr_aw_did           ),
+        .tr_aw_ssid_valid      ( tr_aw_ssid_valid    ),
+        .tr_aw_subid           ( tr_aw_subid         ),
+        .tr_aw_mmu_atst        ( tr_aw_mmu_atst      ),
+        .tr_aw_mmu_valid       ( tr_aw_mmu_valid     ),
+
+        .tr_ar_valid           ( tr_ar_valid         ),
+        .tr_ar_id              ( tr_ar_id            ),
+        .tr_ar_addr            ( tr_ar_addr          ),
+        .tr_ar_len             ( tr_ar_len           ),
+        .tr_ar_size            ( tr_ar_size          ),
+        .tr_ar_burst           ( tr_ar_burst         ),
+        .tr_ar_prot            ( tr_ar_prot          ),
+        .tr_ar_user            ( tr_ar_user          ),
+        .tr_ar_did             ( tr_ar_did           ),
+        .tr_ar_ssid_valid      ( tr_ar_ssid_valid    ),
+        .tr_ar_subid           ( tr_ar_subid         ),
+        .tr_ar_mmu_atst        ( tr_ar_mmu_atst      ),
+        .tr_ar_mmu_valid       ( tr_ar_mmu_valid     ),
+
+        .tr_w_valid            ( tr_w_valid          ),
+        .tr_w_data             ( tr_w_data           ),
+        .tr_w_strb             ( tr_w_strb           ),
+        .tr_w_last             ( tr_w_last           ),
+        .tr_w_user             ( tr_w_user           ),
+
+        .tr_b_ready            ( tr_b_ready          ),
+        .tr_r_ready            ( tr_r_ready          ),
+
+        .tr_aw_ready           ( tr_aw_ready         ),
+        .tr_ar_ready           ( tr_ar_ready         ),
+        .tr_w_ready            ( tr_w_ready          ),
+        .tr_b_valid            ( tr_b_valid          ),
+        .tr_b_id               ( tr_b_id             ),
+        .tr_b_resp             ( tr_b_resp           ),
+        .tr_r_valid            ( tr_r_valid          ),
+        .tr_r_id               ( tr_r_id             ),
+        .tr_r_data             ( tr_r_data           ),
+        .tr_r_resp             ( tr_r_resp           ),
+        .tr_r_last             ( tr_r_last           ),
+
+        .comp_aw_valid         ( comp_aw_valid       ),
+        .comp_aw_id            ( comp_aw_id          ),
+        .comp_aw_addr          ( comp_aw_addr        ),
+        .comp_aw_len           ( comp_aw_len         ),
+        .comp_aw_size          ( comp_aw_size        ),
+        .comp_aw_burst         ( comp_aw_burst       ),
+        .comp_aw_prot          ( comp_aw_prot        ),
+        .comp_aw_user          ( comp_aw_user        ),
+        .comp_ar_valid         ( comp_ar_valid       ),
+        .comp_ar_id            ( comp_ar_id          ),
+        .comp_ar_addr          ( comp_ar_addr        ),
+        .comp_ar_len           ( comp_ar_len         ),
+        .comp_ar_size          ( comp_ar_size        ),
+        .comp_ar_burst         ( comp_ar_burst       ),
+        .comp_ar_prot          ( comp_ar_prot        ),
+        .comp_ar_user          ( comp_ar_user        ),
+        .comp_w_valid          ( comp_w_valid        ),
+        .comp_w_data           ( comp_w_data         ),
+        .comp_w_strb           ( comp_w_strb         ),
+        .comp_w_last           ( comp_w_last         ),
+        .comp_b_ready          ( comp_b_ready        ),
+        .comp_r_ready          ( comp_r_ready        ),
+        .comp_aw_ready         ( comp_aw_ready       ),
+        .comp_ar_ready         ( comp_ar_ready       ),
+        .comp_w_ready          ( comp_w_ready        ),
+        .comp_b_valid          ( comp_b_valid        ),
+        .comp_b_id             ( comp_b_id           ),
+        .comp_b_resp           ( comp_b_resp         ),
+        .comp_r_valid          ( comp_r_valid        ),
+        .comp_r_id             ( comp_r_id           ),
+        .comp_r_data           ( comp_r_data         ),
+        .comp_r_resp           ( comp_r_resp         ),
+        .comp_r_last           ( comp_r_last         ),
+
+        .ddtw_ar_valid         ( ddtw_ar_valid       ),
+        .ddtw_ar_addr          ( ddtw_ar_addr        ),
+        .ddtw_ar_id            ( ddtw_ar_id          ),
+        .ddtw_ar_len           ( ddtw_ar_len         ),
+        .ddtw_ar_size          ( ddtw_ar_size        ),
+        .ddtw_ar_burst         ( ddtw_ar_burst       ),
+        .ddtw_ar_ready         ( ddtw_ar_ready       ),
+        .ddtw_r_ready          ( ddtw_r_ready        ),
+        .ddtw_r_valid          ( ddtw_r_valid        ),
+        .ddtw_r_data           ( ddtw_r_data         ),
+        .ddtw_r_id             ( ddtw_r_id           ),
+        .ddtw_r_resp           ( ddtw_r_resp         ),
+        .ddtw_r_last           ( ddtw_r_last         ),
+
+        .ptw_ar_valid          ( ptw_ar_valid        ),
+        .ptw_ar_addr           ( ptw_ar_addr         ),
+        .ptw_ar_id             ( ptw_ar_id           ),
+        .ptw_ar_len            ( ptw_ar_len          ),
+        .ptw_ar_size           ( ptw_ar_size         ),
+        .ptw_ar_burst          ( ptw_ar_burst        ),
+        .ptw_ar_ready          ( ptw_ar_ready        ),
+        .ptw_r_ready           ( ptw_r_ready         ),
+        .ptw_r_valid           ( ptw_r_valid         ),
+        .ptw_r_data            ( ptw_r_data          ),
+        .ptw_r_id              ( ptw_r_id            ),
+        .ptw_r_resp            ( ptw_r_resp          ),
+        .ptw_r_last            ( ptw_r_last          ),
+
+        .nonblock_enable_i     ( nonblock_enable_i   ),
+        .nonblock_fire_o       ( dbg_nonblock_fire   ),
+        .nonblock_busy_o       ( dbg_nonblock_busy   ),
+        .in_flight_o           ( dbg_in_flight       ),
+
+        .fullbuffer_jobs_i     ( fullbuffer_jobs_o & {2{!owner_only_i}} ),
+
+        .dbg_tl_req_valid      ( dbg_tl_req_valid    ),
+        .dbg_tl_req_ready      ( dbg_tl_req_ready    ),
+        .dbg_tl_req_bank       ( dbg_tl_req_bank     ),
+        .dbg_tl_resp_valid     ( dbg_tl_resp_valid   ),
+        .dbg_tl_resp_ready     ( dbg_tl_resp_ready   ),
+        .dbg_tl_resp_bank      ( dbg_tl_resp_bank    ),
+        .dbg_tl_ptw_active     ( dbg_tl_ptw_active   ),
+        .dbg_tl_ptw_r_fire     ( dbg_tl_ptw_r_fire   ),
+        .dbg_tl_iotlb_lookup   ( dbg_tl_iotlb_lookup ),
+        .dbg_tl_iotlb_hit      ( dbg_tl_iotlb_hit    )
+    );
+
+    // ========================================================================
+    // Test-only configuration AXI master FSM.
+    //
+    // Turns ONE external cfg request into ONE real AW/W/B or AR/R transaction
+    // on the selected dma_core_wrap axi_slv port.  The external master must
+    // hold cfg_valid/cfg_addr/cfg_wdata/cfg_wstrb/cfg_write/cfg_sel stable until
+    // cfg_ready is observed.  Nothing is forced into the frontend registers.
+    // ========================================================================
+    typedef enum logic [2:0] {
+        C_IDLE, C_AW, C_W, C_B, C_AR, C_R, C_HOLD
+    } cfg_state_e;
+
+    cfg_state_e  cfg_state_q;
+    logic [63:0] cfg_addr_q, cfg_wdata_q, cfg_rdata_q;
+    logic [7:0]  cfg_wstrb_q;
+    logic        cfg_sel_q, cfg_write_q, cfg_err_q;
+    logic        cfg_aw_done_q, cfg_w_done_q;
+    // Selected-slave request body.  Declared at module scope: a block-item
+    // declaration may not follow statements inside an always_comb begin-block.
+    cfg_req_t    cfg_drive_req;
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin : cfg_fsm
+        if (!rst_ni) begin
+            cfg_state_q <= C_IDLE;
+            cfg_addr_q  <= '0;
+            cfg_wdata_q <= '0;
+            cfg_wstrb_q <= '0;
+            cfg_sel_q   <= 1'b0;
+            cfg_write_q <= 1'b0;
+            cfg_rdata_q <= '0;
+            cfg_err_q   <= 1'b0;
+            cfg_aw_done_q <= 1'b0;
+            cfg_w_done_q  <= 1'b0;
+        end else begin
+            unique case (cfg_state_q)
+                C_IDLE: begin
+                    if (cfg_valid) begin
+                        cfg_addr_q  <= cfg_addr;
+                        cfg_wdata_q <= cfg_wdata;
+                        cfg_wstrb_q <= cfg_wstrb;
+                        cfg_sel_q   <= cfg_sel;
+                        cfg_write_q <= cfg_write;
+                        cfg_err_q   <= 1'b0;
+                        cfg_aw_done_q <= 1'b0;
+                        cfg_w_done_q  <= 1'b0;
+                        cfg_state_q <= cfg_write ? C_AW : C_AR;
+                    end
+                end
+                C_AW: begin
+                    // Offer AW and W independently: the register converter
+                    // may withhold AWREADY until WVALID is present.
+                    if (cfg_drive_req.aw_valid && cfg_rsp[cfg_sel_q].aw_ready)
+                        cfg_aw_done_q <= 1'b1;
+                    if (cfg_drive_req.w_valid && cfg_rsp[cfg_sel_q].w_ready)
+                        cfg_w_done_q <= 1'b1;
+                    if ((cfg_aw_done_q || cfg_rsp[cfg_sel_q].aw_ready) &&
+                        (cfg_w_done_q || cfg_rsp[cfg_sel_q].w_ready))
+                        cfg_state_q <= C_B;
+                end
+                C_B: begin
+                    if (cfg_rsp[cfg_sel_q].b_valid) begin
+                        cfg_err_q   <= (cfg_rsp[cfg_sel_q].b.resp != axi_pkg::RESP_OKAY);
+                        cfg_rdata_q <= '0;
+                        cfg_state_q <= C_HOLD;
+                    end
+                end
+                C_AR: begin
+                    if (cfg_rsp[cfg_sel_q].ar_ready) cfg_state_q <= C_R;
+                end
+                C_R: begin
+                    if (cfg_rsp[cfg_sel_q].r_valid) begin
+                        cfg_rdata_q <= cfg_rsp[cfg_sel_q].r.data;
+                        cfg_err_q   <= (cfg_rsp[cfg_sel_q].r.resp != axi_pkg::RESP_OKAY);
+                        cfg_state_q <= C_HOLD;
+                    end
+                end
+                C_HOLD: begin
+                    // Hold ready until the external master drops cfg_valid so a
+                    // held request can never be re-issued.
+                    if (!cfg_valid) cfg_state_q <= C_IDLE;
+                end
+                default: cfg_state_q <= C_IDLE;
+            endcase
+        end
+    end
+
+    // Drive the selected slave port; the other port stays completely idle.
+    always_comb begin : cfg_drive
+        cfg_drive_req = '0;
+        cfg_drive_req.aw.id    = '0;
+        cfg_drive_req.aw.addr  = cfg_addr_q;
+        cfg_drive_req.aw.len   = 8'd0;                 // single beat
+        cfg_drive_req.aw.size  = 3'd3;                 // 8 bytes
+        cfg_drive_req.aw.burst = axi_pkg::BURST_INCR;
+        cfg_drive_req.aw.user  = '0;
+        cfg_drive_req.w.data   = cfg_wdata_q;
+        cfg_drive_req.w.strb   = cfg_wstrb_q;
+        cfg_drive_req.w.last   = 1'b1;
+        cfg_drive_req.w.user   = '0;
+        cfg_drive_req.ar.id    = '0;
+        cfg_drive_req.ar.addr  = cfg_addr_q;
+        cfg_drive_req.ar.len   = 8'd0;
+        cfg_drive_req.ar.size  = 3'd3;
+        cfg_drive_req.ar.burst = axi_pkg::BURST_INCR;
+        cfg_drive_req.ar.user  = '0;
+        // Response-ready defaults are LOW.  A response may only be consumed in
+        // the state that expects it, so B/R can never be accepted early/lost.
+        cfg_drive_req.b_ready  = 1'b0;
+        cfg_drive_req.r_ready  = 1'b0;
+
+        unique case (cfg_state_q)
+            // Hold each channel until its own handshake, without waiting for
+            // the other channel or duplicating an already accepted request.
+            C_AW: begin
+                     cfg_drive_req.aw_valid = !cfg_aw_done_q;
+                     cfg_drive_req.w_valid  = !cfg_w_done_q;
+            end
+            C_B:     cfg_drive_req.b_ready  = 1'b1;
+            C_AR:    cfg_drive_req.ar_valid = 1'b1;
+            C_R:     cfg_drive_req.r_ready  = 1'b1;
+            default: ;
+        endcase
+
+        cfg_req[0] = '0;
+        cfg_req[1] = '0;
+        if (cfg_sel_q) cfg_req[1] = cfg_drive_req;
+        else           cfg_req[0] = cfg_drive_req;
+    end
+
+    assign cfg_ready = (cfg_state_q == C_HOLD);
+    assign cfg_rdata = cfg_rdata_q;
+    assign cfg_error = cfg_err_q;
+
+    // ========================================================================
+    // Observation-only DMA taps
+    // ========================================================================
+    assign dbg_dma_issue        = { d1_issue,         d0_issue         };
+    assign dbg_dma_done         = { d1_done,          d0_done          };
+    assign dbg_dma_poll         = { d1_poll,          d0_poll          };
+    assign dbg_dma_batch_active = { d1_batch_active,  d0_batch_active  };
+    assign dbg_dma_batch_gap    = { d1_batch_gap,     d0_batch_gap     };
+    assign dbg_dma_job_quiet    = { d1_job_quiet,     d0_job_quiet     };
+    assign dbg_dma_fullbuffer   = { d1_fullbuffer,    d0_fullbuffer    };
+    assign dbg_dma_launch_active= { d1_launch_active, d0_launch_active };
+    assign dbg_dma_launch_held  = { d1_launch_held,   d0_launch_held   };
+    assign dbg_dma_launch_error = { d1_launch_err,    d0_launch_err    };
+
+    // ========================================================================
+    // Read-only fast/main + 2-bank lifecycle taps.
+    // ========================================================================
+    assign dbg_fast_resp_valid = i_sys.i_tl.fast_resp_valid;
+    assign dbg_fast_resp_ready = i_sys.i_tl.fast_resp_ready;
+    assign dbg_fast_resp_bank  = i_sys.i_tl.fast_resp_data.bank;
+    assign dbg_slow_resp_valid = i_sys.i_tl.slow_resp_valid;
+    assign dbg_bank_busy       = i_sys.gen_banked.i_banked.bank_busy;
+    assign dbg_cfg_state       = cfg_state_q;
+
+endmodule

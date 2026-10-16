@@ -1,0 +1,306 @@
+# 定向补证据（第二轮）— 导航
+
+- **四处更正** → §1（直接替换上一 evidence-answer.md 的对应段落）。
+- **A. LTI 逐原文定位**（per-transaction lookaside / SPEC / completion,tag,invalidation / 是否规定 copy 联合作业准入或有限 prepared 槽防占满）→ §2。
+- **B. TAPA2023 / MetaSys2022 / XDMA2025 覆盖 E/F 哪些宽泛主张** → §3。
+- **C. 有限 prepared-slot 问题的最强普通对照**（整对预约 / 目的优先 / 留 1 mate 槽 / ready-copy queue；资源与并行代价；哪些是普通 reservation）→ §4。
+- **D. 可被 Codex 验证的近邻线索**（含"不知道/不确定"标注）→ §5。
+- **最多 3 个研究问题 + 停止条件** → §6。
+
+标签：**【P】**=所附全文原文事实；**【L】**=仅经二手引用、本轮无全文；**【I】**=推断；**【U】**=未实现候选/我方草案。
+
+> 声明：我本轮未运行任何代码、测试、综合或构建；下文不含任何"测试通过"声明。行号为所附转换文本的行号，换 PDF 转换需重映射。
+
+---
+
+# 1. 四处更正（替换段落）
+
+## 更正 1：socdma2018 的 PFN 去重/重发 ≠ copy payload 依赖；不得说 iDMA 没有 copy 依赖
+
+**作废**上一答复 §2 表中 iDMA2024 行"copy/job 级 源→目的数据依赖 = 无"、socdma2018 行"有：burst 按 page frame number 分组"、以及 §2 结论句"iDMA2024 与 AXI-REALM……无 copy 级源→目的 payload 依赖"。替换为：
+
+- **iDMA2024【P】**：描述符显式含 src/dst（`idma2024.txt:151-153`、`:234-236`）；transport layer 由 read manager → source shifter → dataflow element → destination shifter → write manager 组成（`idma2024.txt:245-251`、`:329-341`）。→ **引擎内部有明确的"源读出→目的写入"copy 语义**。但**对外 AXI-IOMMU 可见接口**只暴露地址/length/协议/选项/transfer_id/status（`idma2024.txt:151-153,219-227`），不含"哪个 R 供给哪个 W"的联合作业语义。
+- **socdma2018【P】**：retirement buffer 每条记录含 cluster-external/-internal address、length、AXI ID、DMA transfer ID、R/W（`socdma2018.txt:404-407`）；同 PFN 的动作是"把同页 failed burst 标 peeked（同页不报两次）→ PE 补 TLB → 标 reissuable"（`socdma2018.txt:409-417`）。这是**翻译页分组 + 有序重试**，原文没有把它表述为"源读→目的写 payload 依赖"。
+- **结论**：不得凭 PFN 称 socdma2018 独有 copy dependency；也不得说 iDMA 没有 copy 依赖。正确区分：**copy 语义存在于引擎/描述符内部（两者都有）；普通 AXI-IOMMU 外部接口不携带该语义（两者都不带）**。（与 Codex 的 `codex-proposal.md:7-9` 接口事实一致。）
+
+## 更正 2：C 伪代码只是"强普通方法可构造同规则"，不是已发表 C 的存在证明
+
+**作废**§5 标题"同合同最强普通 C 算法草案"。改为：**"合同下普通对照规则的表达草案"**。性质：【U】这是**我方用普通机制写出的规则集合**，只证明"强普通方法能构造出相同规则形状"，**不证明文献中已存在该 C**，也不能当"前作证据"。
+
+## 更正 3：reliable_prefix 必须与当前有效逻辑 AR 区间求交且连续；credit 只允许一个归还所有者
+
+**问题 (a)**：原 `for seg in dst_segs … p += seg.len` 会跨 AR 累加、并把整段 dst_segs 全加 → 双计。
+**问题 (b)**：消费路径 `free += consumed_bytes_of_k`，结束路径又 `free += r.reserved - r.unconsumed_tail` → 同批字节被归还两次。
+
+**短修订**：
+
+```
+p 只对"当前有效逻辑 AR 区间 [r.ar_lo, r.ar_hi)"求，并逐步裁剪：
+  p = 0
+  for seg in dst_segs ∩ [r.ar_lo, r.ar_hi)（按目的偏移升序）:
+      a = max(seg.lo, r.ar_lo + p)          # 从已保证前缀之后开始
+      b = min(seg.hi, r.ar_hi)
+      if b <= a: continue                   # 与当前 AR 区间无交
+      if tready[seg.dst_page] AND can_commit_before(seg) AND not depends_on_this_RLAST(seg):
+          p += (b - a)
+      else:
+          break                             # 必须连续；一断即停
+  return p                                  # 0 <= p <= (r.ar_hi - r.ar_lo)
+```
+
+**credit 守恒（二选一，禁止同时使用）**：
+
+```
+方案A（消费即归还；结束时不再归还）:
+  准入: free -= tail ; r.reserved = tail ; r.released = 0
+  消费第 k 段: free += bytes_k ; r.released += bytes_k
+  结束: assert r.released <= r.reserved ; free += 0
+
+方案B（结束时一次性归还；消费时不归还）:
+  准入: free -= tail ; r.reserved = tail ; r.consumed = 0
+  消费第 k 段: r.consumed += bytes_k        # 不动 free
+  结束: free += r.reserved - r.consumed
+
+不变量: 0 <= r.consumed <= r.released <= r.reserved；
+        Σ_r r.reserved + free = N（A 用 released，B 用 consumed）；
+        前缀 p 的字节从不入池、从不归还。
+删除原文的 r.unconsumed_tail（双记账名）。
+```
+
+## 更正 4：AXI-REALM 有"W 完整后 AW"的写资源承诺，不宜笼统说它无 drain
+
+**作废**§2 表中 AXI-REALM 行"可排空/drain = 无"这一笼统说法。改为：
+
+- **【P】**写侧：write buffer "forwards the AW request and the W burst only if the write data is fully contained within the buffer"（`axi-realm2025.txt:340-354`）→ **AW 在 W 数据完整前不被放行，这是对下游写路径的显式写资源承诺/就绪后提交**；buffer 容量为 2 AW + 1 个碎片写 burst（`:350-354`）。
+- **【P】**读侧：读响应仅 pass-through，只 gate `R.last`（`:301-302`），无读负载缓冲（`:289-305`）。
+- 正确说法：**有写侧（AW/W）就绪后提交的资源承诺；无通用事务级 drain、无读侧负载排空**。写侧这一条对候选 F 是强对照（见 §6-RQ3）。
+
+---
+
+# 2. A. LTI 2020 逐原文定位
+
+来源：`lti2020.txt`（ARM IHI 0089A, ID040620, 2020），非论文，是标准。
+
+## 2.1 per-transaction lookaside / 预准备
+
+- **【P】**`lti2020.txt:540-543`：LTI point-to-point，设备可**为每个 transaction 直接请求翻译**，TBU 管 TLB；"enabling translations to be requested **before ordering requirements are met** and avoiding the need to pass transactions through the TBU"。
+- **【P】**`lti2020.txt:621-623`（look-aside）："a translation request is made over LTI for each transaction, but the transaction data does not pass through the SMMU. Transaction completion is signaled to the TLBU using the LTI interface."
+- **【P】**`lti2020.txt:692-693`（表 1-1 Caching）："Translations must be used immediately and must not be not cached."
+- **【P】**`lti2020.txt:695-697`（Invalidation）："No invalidation is required, because translations are not cached."
+- **【P】**`lti2020.txt:708-710`（Ordering）：支持按事务顺序返回翻译，或乱序。
+- **【P】**`lti2020.txt:874-891`：三通道 LA/LR/LC 顺序固定，无阶段可跳；response 与 completion 不得同拍。
+
+**→ 对候选 F 的意义**【I】：LTI 已有"把译址准备与数据路径分离"的机制前作；**但**它同时规定翻译**即时使用、不可缓存、不需失效**，即 LTI 的"准备"是**瞬时使用**的，不是"可 pin 住、可排队的 prepared slot"。
+
+## 2.2 SPEC 不能直接当真实事务
+
+- **【P】**`lti2020.txt:1249-1257`：SPEC "is intended to prefetch a translation for later use and **is not used by a transaction**"；LTI SPEC "cannot be used for speculative read transactions"；"the translation that is returned **cannot be used by transactions**"。若 master 需要不 fault 的 speculative read，应发 LATRANS=R + LAFLOW=PRI。
+- **【P】**`lti2020.txt:1602`：SPEC 允许的 LRRESP 仅 Success / FaultRAZWI / FaultPRI。
+- **【P】**`lti2020.txt:2752`：SPEC 事务在翻译完成后即终止，allocation hint 被忽略。
+
+**→**【I】LTI 的"预准备通道"（SPEC）**结构上不能充当真实事务的译址**；真实事务必须另发 LA。这对 F 是"预准备与提交可分离"的强机制前作，但**不**构成"可复用 prepared translation slot"。
+
+## 2.3 completion / tag / invalidations
+
+- **【P】**`lti2020.txt:881-885`：slave 不把 completion 关联到具体事务，而是**按 completion tag 计数**；目的是判定"某 tag 的全部事务已完成"，"part of the translation invalidation process"；**只有两个 completion tag**。
+- **【P】**`lti2020.txt:1469-1471`：LRCTAG 宽 1 bit，任意值，master 必须原样带回 completion。
+- **【P】**`lti2020.txt:1784-1789`（6.2.1 Deadlock avoidance）：收到 response 后，completion **不得依赖后续软件活动**，也**不得依赖另一条 Stall response 的返回**。
+- **【P】**`lti2020.txt:915-923`：VC 的意图是"一个 VC 阻塞不得导致另一 VC 阻塞，以避免死锁"；slave 必须能跟踪 **≥4095** 条待 completion 的 response；**超过该数**时 slave 允许**在 VC 之间引入依赖**。
+- **【P】**`lti2020.txt:948`：每个 VC 单方向**最多 15 credits**。
+- **【P】**`lti2020.txt:1948-1949`：进入 ST_CLOSED 丢失全部 credit；进入 ST_OPEN 时每通道 TX 零 credit。
+
+**→**【I】LTI 有"有限未完成事务"概念（15 credits/VC、4095 completion 计数、超限可跨 VC 施加依赖），但那是 **credit / completion 计数**层，不是 **prepared translation slot** 层。
+
+## 2.4 是否规定"跨两个不同 src/dst 地址的 copy 联合作业准入"或"有限 prepared 槽防相互占满"
+
+**结论（只据全文）**：
+
+- **【P】**`lti2020.txt:1363-1365`（4.4 Transaction scope）："An LTI translation can only be used for accesses to data within a single 4kB page. If a memory transaction accesses data in more than one 4kB page, then a **separate LTI request must be made for the part of the transaction in each 4kB page**." → 一个跨 src 页与 dst 页的 copy 在 LTI 里**必然是两个独立请求、两个独立 LAID**；协议不含"把两个地址并成一个 job"的准入。
+- **【P】**能"关联两笔"的机制只有：
+  - `lti2020.txt:1105-1109`（LAID）：同一 VC 上未返回响应的旧 ID 不得重复，**除非两次都 LAOGV=1 且 LAOG 相同**；
+  - `lti2020.txt:1111-1120`（LAOGV/LAOG）：同 LAOG 的请求，其**响应必须按序返回**；
+  - `lti2020.txt:1791-1809`（6.2.2）：**一个 LTI 翻译可被多个事务共用**，条件是全在同一 4KB 区、Context/Transaction 字段全同、且 completion 发出前所有用该翻译的事务已全局可观察。
+  → 这些只是**响应顺序 + 共享同一 4kB 译址**，不是联合作业准入，也不是有限 prepared 槽的防占满规则。
+- **【待证/明确否定】**就本轮全文，LTI **没有**跨两个不同 src/dst 地址的 copy 联合作业准入规定；**没有**有限 prepared 槽之间的互占防护规定。LTI 直接覆盖 F 的只有两点：**look-aside 逐事务译址** + **SPEC 式预准备不可复用**。
+
+---
+
+# 3. B. TAPA / MetaSys / XDMA 直接覆盖 E/F 的哪些宽泛主张
+
+> 统一警告：【I】**一般可编程能力 ≠ 特定策略前作**。下表的写法是"该原文使哪些宽泛表述不再可作为创新点"，不是"该原文已实现本候选"。
+
+## 3.1 TAPA 2023（`tapa2023.txt`）
+
+| 被覆盖的宽泛主张 | 原文事实 |
+|---|---|
+| "消除/减小整 burst 缓冲可作创新" | 【P】`tapa2023.txt:798-806`：现有 HLS 会为整 burst 缓冲，512-bit AXI **每读/写通道 15 个 BRAM_18K**；32 条 HBM 通道下 >900 BRAM、>70% 底部 SLR；async_mmap "no longer need to set aside a large buffer… flow control mechanism is explicitly included in the user code"。Table 3 `:768-772`：BRAM 15 → 0。 |
+| "burst 边界由运行期信息决定" | 【P】`:437-447` + Table 1 `:508-521`：burst detector 合并连续地址；"In the case that the next input address is not available above a threshold, the burst detector will also conclude and issue out the current burst." |
+| "请求与响应用独立执行流分离" | 【P】`:448-449`："Users can use one dedicated task to issue read requests and another task to receive the read responses"；`:475-489` 示例代码。 |
+| "用户显式 flow control 替代大缓冲" | 【P】`:804-806`。 |
+
+**未覆盖**【P/I】：无 IOMMU、无译址、无"目的译址就绪"、无 src→dst copy 依赖；async_mmap 把 AXI 拆成 **5 个独立流**（`tapa2023.txt:463-471`），read_addr 与 write_addr 分开 → 恰恰说明**两个地址不一定同时可得**（对 §4 的整对预约构成约束）。
+
+## 3.2 MetaSys 2022（`metasys2022.txt`）
+
+| 被覆盖的宽泛主张 | 原文事实 |
+|---|---|
+| "引入 metadata sideband/接口本身是创新" | 【P】`:276-308`：tagged memory，每地址 8-bit ID → metadata，MMT/MMC/PMT；硬件优化组件可按地址查 tag 与 metadata。`:168-173` 自称 first full-system open-source lightweight metadata management；`:416-455` 与 XMem 逐条对比（XMem 编译期静态，MetaSys 运行期）。 |
+| "运行期动态元数据优于编译期静态" | 【P】`:441-453`。 |
+| "元数据 lookup 可按事件触发且可配 stall 模式" | 【P】`:353-362`、`:399-404`（force stall / no stall / best effort）。 |
+| "SHW 接口把语义信息绑到具体访存操作上" | 【P】`:345-350`：CREATE/MAP **与程序序中的下一条 load/store 绑定、共同提交**（"an implicit dependence is created in hardware between these instructions and the next load/store"）。 |
+| "多客户端共享元数据系统可扩展 + 竞争缓解" | 【P】`:1089-1131`（partitioning / prioritized insertion / no-stall）。 |
+
+**未覆盖**【P/I】：CPU/加速器访存语义；元数据绑"内存地址"而非"copy job 的 src↔dst 关系"；无译址 pin、无 prepared slot、无 AXI 事务补齐；且【P】`:927-930` PMT 不能把信息回供应用。
+
+## 3.3 XDMA 2025（`xdma2025.txt`）
+
+| 被覆盖的宽泛主张 | 原文事实 |
+|---|---|
+| "两端协作 copy 先建对端资源、收到许可再发数据" | 【P】`:255-263` 四步：local ctrl 发 cfg → remote ctrl 收入 DP 并回 grant → local 收 grant 才触发数据传输 → finish 握手；`:274-296` 两阶段 CFG / Data。 |
+| "不同事务之间无依赖、按 FIFO 自动仲裁" | 【P】`:293-296`："Although CFG and Data transactions share the AW/W channel, **deadlock will not occur as all transactions are one-to-one, and no dependency between different XDMA transactions.** Furthermore, XDMA can autonomously arbitrate the task based on the FIFO principle if contention happens." |
+| "读写解耦端口 + 全双工 + master/slave 双端口封装为 AXI 写" | 【P】`:61-67`、`:272-282`、`:320-329`。 |
+| "前段 N-D 仿射地址生成 + 可配深度 buffer 处理 bank conflict" | 【P】`:311-319`；`:388-398` Dbuf=3/5/9，buffer 小则无法稳定避免 bank conflict 停顿。 |
+| 近邻基线表 | 【P】Table I `:77-84`：HyperDMA / ESP DMA / Gemmini DMA / IDMA / AMD DMA v7.1 / TI EDMA3 / XDMA 的架构、地址生成维度、算中传输能力对比。 |
+
+**未覆盖**【P/I】：无 IOMMU、无译址就绪；CFG→grant 是**端到端资源配置**，不是"翻译就绪 pin"；原文**明确声称事务间无依赖**，故不覆盖"copy 内 R→W 依赖"。
+
+## 3.4 综合（覆盖判定）
+
+- **TAPA** 覆盖 E/F 中"减少整 burst 缓冲""运行期决定 burst 边界""读写路径分离"的宽泛表述。
+- **MetaSys** 覆盖"通用 HW-SW 元数据接口/查询本身"作为创新的表述（连同 XMem 谱系）。
+- **XDMA** 覆盖"两端协作、对端许可后再传数据""事务间依赖建模"的宽泛表述。
+- **三者都没有**覆盖：目的翻译就绪感知的准入、copy 内 src-read 与 dst-write 的**联合作业准备**、有限 prepared 槽的互占防护。
+
+---
+
+# 4. C. 有限 prepared-slot 问题的最强普通对照
+
+## 4.1 形式化【I】
+
+- K 个 prepared 槽 = K 个**已 pin 的译址结果**（策略上限，**不是 TLB 容量**）。
+- 每个 copy c 需两个**独立** pin：`a(c)`=src READ 译址、`b(c)`=dst WRITE 译址；pin 在 copy 提交/完成前不释放。
+- 若允许"先拿 a、再等 b"且无不变量：可达状态是 **K 个 copy 各持一个 pin、无一能取第二个** → hold-and-wait 循环，无进展。
+- 给定假设：**进入真实 AXI 前可取消未提交准备请求**；**DMA 顺序固定**；**PTW/DDR 最终会响应**。→ 死锁唯一来源是槽的循环占用；取消机制把死锁降为活锁/重试（需公平性）。
+
+## 4.2 四种手段的判定与代价
+
+| 手段 | 是否消除该问题 | 机制 | 资源/并行代价 |
+|---|---|---|---|
+| **整对预约**（原子取 a 与 b） | **消除** | copy 仅在 ≥2 空槽时准入；永不出现"持单 pin 等待" | 同时 pinned copy ≤ **⌊K/2⌋**；准入需两地址同时可得——iDMA/XDMA 有描述符含 src 与 dst（`idma2024.txt:151-153,234-236`；`xdma2025.txt:301-303`），但 TAPA async_mmap 的 read_addr/write_addr 是独立流（`tapa2023.txt:463-471`）**不保证**同时可得；有队头阻塞风险 |
+| **目的优先**（dst-first） | **不消除** | 仅把争用从 src 移到 dst；反例同上（K 个 copy 全持 dst pin 等 src）。因两个 pin 取自**同一同质池**，"角色有序"不给出无环等待图 | 只有与"≤K−1 个单 pin 持有者"或整对原子性合用才安全；单独使用 = 优先级启发 + src 侧对称饥饿风险 |
+| **总留 1 个 mate 槽**（空闲槽 ≥1） | **消除死锁** | 任意时刻单 pin 持有者 ≤K−1 ⇒ 至少一个持有者能取到第二个 pin 并推进；完成后释放 2 pin ⇒ 前进 | 可用并发 ≤K−1 个准备中 copy；峰值 pinned copy 仍 ≤⌊K/2⌋；**额外要求"提交在同一步原子释放两个 pin"**，否则需对第二资源（PTW 队列）做同样的"留 1"，否则死锁转移 |
+| **ready-copy queue** | **取决于定义** | 若"只有 a、b 都就绪才入队，出队时原子取两槽" ⇒ 等价整对预约，**消除**；若"允许持单 pin 在队里等 mate" ⇒ **重现问题** | 额外队列表项 + 队头阻塞；收益 = 可重排提交顺序，形状与 XDMA 的 Task FIFO & In-order Dispatch 相同（`xdma2025.txt:308-309`） |
+| （附加）可取消未提交准备 | 把死锁降为活锁 | 抢占打破循环 | 重做译址、浪费 PTW/DDR 带宽、可能饥饿（需公平/老化）。NoC 侧最接近的前作是 CTC"credit 用尽即以最后 credit 作 packet tail 结束注入、释放路径、连接不终止"（`ctc2009.txt:481-487`）——**但它是缩短已注入 packet**，不能照搬到"已接受的 AXI read burst" |
+
+## 4.3 哪些已是普通 reservation / deadlock avoidance（不应包装为创新）
+
+- **整对原子取两资源** = 经典 all-or-nothing / 2-单位原子申请；等价于 banker's 安全分配的特例（本例每 copy max=2，安全条件 K ≥ 并发数+1）。
+- **留 1 空槽保证前进** = 经典"至少一个空位"免死锁论证（同 NoC 免死锁需至少一个空 buffer）；LTI 也把 VC 存在目的写成"一 VC 阻塞不得阻塞另一 VC，以避免 deadlock"（`lti2020.txt:915-917`）。
+- **ready queue + 原子取槽** = 经典 admission control with pre-reservation。
+- **目的优先** = 经典 ordering/priority 启发；**单独不是免死锁**。
+- **取消未提交** = 经典 preemption-based deadlock recovery。
+
+**额外最强普通对照【U/待证】**：既然槽是**策略上限**而非 TLB 容量，最强普通基线还包括"把 pin 池加大 / 允许每个 copy 暂持两 pin"。候选必须先证明**扩大池有可测代价**（面积 / 时序 / 顺序开销），否则该有限槽问题本身不成立。
+
+---
+
+# 5. D. 可被 Codex 验证的近邻线索（含不确定标注）
+
+> 我只给能从所附全文直接读到题录的条目；**本轮无全文的统一标 [L]**，其内部机制不能当作已核事实。
+
+## 5.1 pair scheduling / co-admission
+
+| 线索 | 出处 | 全文 | 可验证点 |
+|---|---|---|---|
+| XDMA 两阶段 CFG→grant→Data | `xdma2025.txt:255-263,274-296` | **有** | 最接近的"成对协作 + 对端许可后传数据" |
+| LTI LAOG / 6.2.2 多事务共享同一 4kB 译址 | `lti2020.txt:1111-1120,1791-1809` | **有** | 把读/写两笔关联起来的**唯一** LTI 手段（仅顺序 + 共享译址） |
+| MetaSys CREATE/MAP 绑定下一条 load/store | `metasys2022.txt:345-350` | **有** | "元数据与下一访存配对"的硬件依赖先例 |
+
+**【不确定】**：本轮材料中**未见**任何原文规定"一个 copy 的两个地址作为一对做联合作业准入"。
+
+## 5.2 dependent translation preparation
+
+| 线索 | 出处 | 全文 | 可验证点 |
+|---|---|---|---|
+| LTI look-aside 逐事务译址 | `lti2020.txt:540-543,621-623` | **有** | 译址与数据路径分离 |
+| LTI Stall / ATST / NoStall / PRI 四种流 | `lti2020.txt:727-748,751-774,777-779,792-817` | **有** | 故障时"软件补页后重试"的完整定义 |
+| LTI SPEC 预准备但结果不可用 | `lti2020.txt:1249-1257` | **有** | 预准备 ≠ 可复用 prepared slot |
+| socdma2018 原 SoA"先 lock 整传输 TLB entry 再编程" | `socdma2018.txt:386-392` | **有** | 旧做法的带宽受限，本工作已弃用 |
+| TAPA 发请求/收响应分任务 | `tapa2023.txt:448-449,475-489` | **有** | 流水分离，但无译址 |
+
+**【不确定】**：本轮材料中**未见**"W 侧翻译准备依赖 R 侧"的任何原文。
+
+## 5.3 banker's / escape credit
+
+- 【P】CTC：credit + 耗尽即 tail 结束 + 连接不终止（`ctc2009.txt:481-487`）；单 credit counter + 单数据队列（`:22-24`）；P_REQ 携总大小、P_ACK 初始化 credit、K=每 P_ACK credit 数（`:382-407,466-494`）。
+- 【P】LTI：≤15 credits/VC（`lti2020.txt:948`）；≥4095 completion 计数，超限可跨 VC 施加依赖（`:919-923`）；PRI 的 page request credits 由 PCIe 软件分配、协议不可见（`lti2020.txt:816-817`）。
+- **【不确定】**：**Banker's algorithm 本身我本轮无任何所附材料支持其题录**（无 DOI/URL 线索），不要写成"近邻原文"。
+
+## 5.4 不完整 translation transaction 补齐
+
+- **AXI-REALM erealm**【P】：超时/协议违规时 **erealm 主动补完未完成事务**并把原因报给 core（IRQ 或 AXI 响应通道），记录 tID/address/出错 stage（`axi-realm2025.txt:353-354` 图 3f "Incomplete transaction gets completed by erealm and is restarted"；`:1056-1073`；stage 跟踪 `:505-529`；WCDT `:832-844`）。
+- **AXI-REALM 写侧就绪后提交**（更正 4）：`axi-realm2025.txt:340-354`。
+- **【不确定】**：erealm 的"补齐"是 bus 事务级补完，是否可类比"翻译级未完成补齐"需 Codex 判读。
+
+## 5.5 CTC / Soar / Alto / BIS
+
+- **CTC2009**：**有全文**（`ctc2009.txt`）；credit/tail/连接语义已核（`:22-24,382-412,481-487,466-494`）。
+- **Soar / Alto / BIS**：**本轮输入不含其全文**；仅在上轮地图 [L] 中被提及。**我不能确认其原文内容，不得据其立论**。若 Codex 要使用，需提供 PDF 或正式 DOI/URL 后再核。
+
+## 5.6 其他可从所附全文直接读出题录的近邻（供 Codex 抓全文）
+
+| 题名 | 作者 | 年 | Venue | 本轮出处 | 全文 |
+|---|---|---|---|---|---|
+| Cut and Forward: Safe and Secure Communication for FPGA System on Chips | F. Restuccia, R. Kastner | 2022 | IEEE TCAD 41(11) 4052–4063 | 正文 `axi-realm2025.txt:880-882`；参考段 [29]（行号待 Codex 定位） | 无 |
+| Is your bus arbiter really fair? (ABE) | F. Restuccia et al. | 2019 | ACM TECS 18(5s) | 正文 `:877-881`；ref [19] `:1101-1104` | 无 |
+| A Bandwidth Reservation Mechanism for AXI-based HW Accelerators on FPGAs (ABU) | M. Pagani et al. | 2019 | ECRTS 2019 | 正文 `:867-871`；ref [13] `:1150-1153` | 无 |
+| AXI-ICRT: Towards a Real-Time AXI-Interconnect for Highly Integrated SoCs | I. Gray, Z. Jiang, K. Yang, N. Fisher, N. Audsley, Z. Dong | 2023 | IEEE TC 72(3) 786–799 | 正文 `:930-935`；ref [14] `:1154-1157` | 无 |
+| AXI HyperConnect: A Predictable, Hypervisor-level Interconnect… | F. Restuccia et al. | 2020 | DAC 2020 | 正文 `:926-929`；ref [16] `:1164-1167` | 无 |
+| BRU: Bandwidth Regulation Unit for Real-Time Multicore Processors | F. Farshchi, Q. Huang, H. Yun | 2020 | RTAS 2020, 364–375 | 正文 `:887-901`；ref [34]（参考段行号待定位） | 无 |
+| SafeSU-2: A Safe Statistics Unit for Space MPSoCs | G. Cabo et al. | 2022 | DATE 2022, 1085–1086 | 正文 `:908-919`；ref [36] | 无 |
+| Expanding SafeSU capabilities… contention monitoring in complex SoCs | P. Andreu et al. | 2025 | FGCS 163, 107518 | ref [37] | 无 |
+| Lightweight Virtual Memory Support… pointer-rich data structures | P. Vogel et al. | 2017 | IEEE TPDS 28 | `socdma2018.txt:538-540` | 无 |
+| Efficient Virtual Memory Sharing via On-Accelerator Page Table Walking | P. Vogel et al. | 2017 | ACM TECS 16 | `socdma2018.txt:541-542` | 无 |
+| The case for richer cross-layer abstractions (XMem) | N. Vijaykumar et al. | 2018 | ISCA 2018 | `metasys2022.txt:1492-1493`；对比 `:416-455` | 无 |
+| The locality descriptor | N. Vijaykumar et al. | 2018 | ISCA 2018 | `metasys2022.txt:1490-1491` | 无 |
+| Gemmini: Enabling systematic DL architecture evaluation… | H. Genc et al. | 2021 | DAC 2021, 769–774 | `xdma2025.txt` 参考 [9] | 无 |
+| HyperDMA | M. Peng et al. | 2024 | ICICM 2024, 636–644 | `xdma2025.txt` 参考 [8] | 无 |
+| DataMaestro: A Versatile and Efficient Data Streaming Engine… | X. Yi et al. | 2025 | arXiv:2504.14091 | `xdma2025.txt` 参考 [13]；正文 `:314-319` | 无 |
+| AXI DMA v7.1 LogiCORE IP Product Guide | AMD/Xilinx | 2022 | 产品文档 | `idma2024.txt:1059-1060`；`xdma2025.txt` 参考 [11] | 无（非论文） |
+| AMBA AXI and ACE Protocol Specification (IHI 0022) / AMBA DTI (IHI 0088) / Arm SMMU (IHI 0070) | Arm | — | 标准 | `lti2020.txt:482-484` | 无 |
+| TACLeBench | H. Falk et al. | 2016 | WCET 2016 | `axi-realm2025.txt` 参考 [33] | 无 |
+
+**【不确定】**：上表"参考段行号"我只对 `:1101-1104 / :1141-1144 / :1150-1153 / :1154-1157 / :1164-1167` 有较高把握；[34]、[36]、[37] 的参考段行号请在 `axi-realm2025.txt` 用题名关键词检索后用 Codex 定位。
+
+---
+
+# 6. 最多 3 个研究问题 + 停止条件
+
+## RQ1（D vs 普通对照的可区分性）
+
+在同 DID/长度、同 AXI-可见前缀、不新增元数据的前提下，候选 D 的**准入/提交决定**是否存在任一输入，使得它**严格优于**普通规则 = {整对原子预约 + 空闲槽 ≥1 + FIFO ready-copy queue + 取消恢复}，且**槽数与状态不增加**？
+**停止条件**：若对所有输入两者决定一致，或差异只在**严格更多的槽/状态/更低并行**下出现 → 停止，把 D 降级为工程对照，不认证机制。（依据：`codex-proposal.md:43-45` 的第 1、3 条审定条件。）
+**必要条件**：必须给出**真实可达**的 RTL 见证；`codex-proposal.md:17` 的条件化不可辨识构造目前**未给 RTL 见证、未给普遍下界**【U】。
+
+## RQ2（E 的接口信息是否改变翻译层可观察量）
+
+把 `copy_seq + src/dst 有效逻辑 byte 区间` 导出给 IOMMU，是否改变**任一翻译层可观察量**（权限核查、PTE 取序、pin 生命周期、fence/invalidation），相对于"只有逐 4kB 页地址 + LAOG 顺序 + credits"的接口（LTI：`lti2020.txt:1363-1365,1105-1120,948,919-923`；meta 接口已有先例：`metasys2022.txt:327-351`）？
+**停止条件**：若唯一效果是给 MetaSys 式通用元数据换个名字，且 DMA 的 R→W 依赖从不改变 PTE 取序/权限/pin 寿命/失效 → 停止，判定 E 为**接口工程**（非机制），与 `codex-proposal.md:27` 一致。
+**可区分条件**：必须有真实 RTL 证据证明"同 AXI-可见前缀、同 DID/长度下，R→W 数据依赖不同"，否则 p=0 或退化成普通对照。
+
+## RQ3（F 是否落到既有两阶段协作 + 预准备通道）
+
+F 的"先准备首读/首写翻译，再选共享 W 承诺者"是否在**任一**输入上与下列两者不同：(a) XDMA 的 CFG→grant→Data 两阶段 + in-order/FIFO 仲裁 + "事务间无依赖"（`xdma2025.txt:255-296,308-309,293-296`）；(b) LTI SPEC/ATST 式**结果不可用于事务**的预准备（`lti2020.txt:1249-1257,751-774`）？
+**停止条件**：若 F 的 handle 寿命 + W 承诺者选择退化为"对已预译 fragment 的 ready queue + 原子整对分配" → 降级（与 `codex-proposal.md:44` 第 2 条一致）。
+**可区分条件**：F 必须给出一个共享 W owner 选择**既不是 FIFO/in-order、也不能由 SPEC 式预准备表达**的真实场景；且需与 §1-更正 4 的"W 完整后 AW"写资源承诺（`axi-realm2025.txt:340-354`）同合同比较。
+
+---
+
+# 7. 未决 / 需 Codex 核
+
+1. **【待证】**§4 的关键前提"槽是策略上限而非 TLB 容量、且扩大池有可测代价"——若无法给出代价证据，有限 prepared-slot 问题本身不成立。
+2. **【待证】**`codex-proposal.md:17` 的"条件化不可辨识构造"需要真实 RTL 见证；本轮不能替代 Codex 的裁决。
+3. **【待定位】**`axi-realm2025.txt` 参考段 [34] BRU、[36] SafeSU-2、[37] SafeSU-FGCS 的行号。
+4. **【无全文】**Soar / Alto / BIS / C&F / AXI-ICRT / ABU / ABE / HyperConnect / BRU / Vogel TPDS,TECS 2017：本轮只有二手引用，机制判读一律 [L]，不得升格为 [P]。
+5. **【待核】**socdma2018 是否为当前平台 iDMA legalizer 的直接前作：我只据"burst 不跨页"（`socdma2018.txt:396-397`）与 retirement buffer 做结构类比【I】；需 Codex 核 CVA6/iDMA legalizer 是否同样"burst 不跨页"。
+6. **声明**：我未运行任何代码、仿真、综合或构建；本答复**不含任何测试通过声明**。

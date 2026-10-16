@@ -1,0 +1,248 @@
+修订：已彻底移除 root 免密 key 相关（`DIRECTORIES`/`PROTECTED_DATA`/`validate_authorized_keys`/`authorized_keys`/SSH 权限与打包逻辑）；仅保留 `DATA` 两项、builder 两个可选 CLI、两个新网络配置文件。`tests/test_rootfs.py` 无需改，既有 fixture 自动遍历 `DATA`。Machelper 沿用原 `DELIVERY_SOURCES`，无 key、无新增授权 hash。
+
+最小验收：`git apply --check`；`python3 -m unittest tests.test_rootfs`；实际 rootfs 含 `etc/network/interfaces` 与 `etc/dhcpcd.conf`、无 `authorized_keys`，interfaces 为 `192.168.77.2/255.255.255.0` 且无 `gateway`，dhcpcd 含 `denyinterfaces eth0`；builder 以 `--output-dir=out/<日期>`、`--local-version=-cpn2-net3` 调用时交付到指定目录，delivery 含两配置与 Machelper、无 key。
+
+```diff
+diff --git a/scripts/rootfs.py b/scripts/rootfs.py
+--- a/scripts/rootfs.py
++++ b/scripts/rootfs.py
+@@ -25,3 +25,5 @@
+ DATA={
+     'etc/platform-research-plan.tsv': 'tests/research-plan.tsv',
++    'etc/network/interfaces': 'configs/board-network.interfaces',
++    'etc/dhcpcd.conf': 'configs/board-dhcpcd.conf',
+ }
+diff --git a/scripts/build_update_software.py b/scripts/build_update_software.py
+--- a/scripts/build_update_software.py
++++ b/scripts/build_update_software.py
+@@ -14,6 +14,7 @@
+ from __future__ import annotations
+ 
++import argparse
+ import importlib.util
+ import json
+ import shutil
+ from datetime import datetime, timezone
+@@ -29,2 +30,4 @@
+ LOCAL_VERSION = '-cpn2-net1'
++DEFAULT_OUTPUT_DIR = 'out/software-update-20261004'
++DEFAULT_LOCAL_VERSION = '-cpn2-net1'
+ JOBS = 12
+@@ -59,2 +62,4 @@
+     'mac_update_reboot.py': MAC_UPDATE_REBOOT,
++    'board-network.interfaces': ROOT / 'configs' / 'board-network.interfaces',
++    'board-dhcpcd.conf': ROOT / 'configs' / 'board-dhcpcd.conf',
+ }
+@@ -84,2 +89,6 @@
+     'rootscripts': ['scripts/rootfs.py'],
++    'network': [
++        'configs/board-network.interfaces',
++        'configs/board-dhcpcd.conf',
++    ],
+     'board_helpers': [
+@@ -112,5 +121,6 @@
+-def write_state(state):
+-    BASE.mkdir(parents=True, exist_ok=True)
+-    tmp = STATE_PATH.with_suffix(STATE_PATH.suffix + '.tmp')
+-    tmp.write_text(json.dumps(state, indent=2) + '\n')
+-    tmp.replace(STATE_PATH)
++def write_state(state, base=BASE):
++    base.mkdir(parents=True, exist_ok=True)
++    state_path = base / 'software-update-state.json'
++    tmp = state_path.with_suffix(state_path.suffix + '.tmp')
++    tmp.write_text(json.dumps(state, indent=2) + '\n')
++    tmp.replace(state_path)
+@@ -128,13 +138,14 @@
+-def ensure_previous(sha):
+-    manifest_path = PREVIOUS / 'previous-manifest.json'
+-    if PREVIOUS.exists():
++def ensure_previous(sha, base=BASE):
++    previous = base / 'previous'
++    manifest_path = previous / 'previous-manifest.json'
++    if previous.exists():
+         if manifest_path.is_file():
+             return json.loads(manifest_path.read_text())
+         return {'existing': True}
+-    PREVIOUS.mkdir(parents=True, exist_ok=False)
++    previous.mkdir(parents=True, exist_ok=False)
+     manifest = {}
+     for name, source in PREVIOUS_SOURCES.items():
+         entry = {'source': str(source), 'copied': False}
+         if source.is_file() and source.stat().st_size:
+-            destination = PREVIOUS / name
++            destination = previous / name
+             shutil.copy2(source, destination)
+@@ -215,7 +226,8 @@
+-def deliver(sha):
+-    DELIVERY.mkdir(parents=True, exist_ok=True)
++def deliver(sha, base=BASE):
++    delivery = base / 'delivery'
++    delivery.mkdir(parents=True, exist_ok=True)
+     manifest = {}
+     for name, source in DELIVERY_SOURCES.items():
+         if not source.is_file() or source.stat().st_size == 0:
+             raise RuntimeError('delivery artifact missing or empty: ' + str(source))
+-        destination = DELIVERY / name
++        destination = delivery / name
+@@ -228,39 +240,50 @@
+-def main():
+-    BASE.mkdir(parents=True, exist_ok=True)
+-    state = {
+-        'started_at': utc_now(),
+-        'source_mode': 'authorized_working_tree',
+-        'check_bypassed': 'authorized_software_working_tree',
+-        'fpga': 'not_run',
+-        'localversion': LOCAL_VERSION,
+-        'secrets_excluded': True,
+-        'status': 'running',
+-    }
+-    write_state(state)
+-    try:
+-        platform = load_platform()
+-        platform.ENV['LOCALVERSION'] = LOCAL_VERSION
+-        state['platform_commit'] = platform.capture(['git', 'rev-parse', 'HEAD'])
+-        state['platform_dirty'] = bool(platform.capture(['git', 'status', '--porcelain']))
+-
+-        state['previous'] = ensure_previous(platform.sha)
+-        state['inputs'] = capture_inputs(platform.sha)
+-
+-        platform.kernel(JOBS)
+-        platform.firmware(JOBS)
+-
+-        state['config'] = check_config(read_config())
+-        state['kernel_release'] = read_kernel_release()
+-        state['fw_payload_size'] = check_payload()
+-        state['artifacts'] = deliver(platform.sha)
+-
+-        state['status'] = 'complete'
+-        state['exit_code'] = 0
+-    except BaseException as exc:
+-        state['status'] = 'failed'
+-        state['exit_code'] = int(getattr(exc, 'returncode', None) or 1)
+-        state['error'] = type(exc).__name__ + ': ' + str(exc)
+-        raise
+-    finally:
+-        state['finished_at'] = utc_now()
+-        write_state(state)
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--output-dir', default=DEFAULT_OUTPUT_DIR,
++                        help='delivery base directory (default: %(default)s)')
++    parser.add_argument('--local-version', default=DEFAULT_LOCAL_VERSION,
++                        help='kernel LOCALVERSION (default: %(default)s)')
++    args = parser.parse_args(argv)
++    base = Path(args.output_dir)
++    if not base.is_absolute():
++        base = ROOT / base
++    local_version = args.local_version
++    base.mkdir(parents=True, exist_ok=True)
++    state = {
++        'started_at': utc_now(),
++        'source_mode': 'authorized_working_tree',
++        'check_bypassed': 'authorized_software_working_tree',
++        'fpga': 'not_run',
++        'localversion': local_version,
++        'base': str(base),
++        'secrets_excluded': True,
++        'status': 'running',
++    }
++    write_state(state, base)
++    try:
++        platform = load_platform()
++        platform.ENV['LOCALVERSION'] = local_version
++        state['platform_commit'] = platform.capture(['git', 'rev-parse', 'HEAD'])
++        state['platform_dirty'] = bool(platform.capture(['git', 'status', '--porcelain']))
++
++        state['previous'] = ensure_previous(platform.sha, base)
++        state['inputs'] = capture_inputs(platform.sha)
++
++        platform.kernel(JOBS)
++        platform.firmware(JOBS)
++
++        state['config'] = check_config(read_config())
++        state['kernel_release'] = read_kernel_release()
++        state['fw_payload_size'] = check_payload()
++        state['artifacts'] = deliver(platform.sha, base)
++
++        state['status'] = 'complete'
++        state['exit_code'] = 0
++    except BaseException as exc:
++        state['status'] = 'failed'
++        state['exit_code'] = int(getattr(exc, 'returncode', None) or 1)
++        state['error'] = type(exc).__name__ + ': ' + str(exc)
++        raise
++    finally:
++        state['finished_at'] = utc_now()
++        write_state(state, base)
+diff --git a/configs/board-network.interfaces b/configs/board-network.interfaces
+new file mode 100644
+--- /dev/null
++++ b/configs/board-network.interfaces
+@@ -0,0 +1,10 @@
++# interface file auto-generated by buildroot
++
++auto lo
++iface lo inet loopback
++
++# Static link to the Mac helper. Keep it local: no gateway.
++auto eth0
++iface eth0 inet static
++    address 192.168.77.2
++    netmask 255.255.255.0
+diff --git a/configs/board-dhcpcd.conf b/configs/board-dhcpcd.conf
+new file mode 100644
+--- /dev/null
++++ b/configs/board-dhcpcd.conf
+@@ -0,0 +1,51 @@
++# A sample configuration for dhcpcd.
++# See dhcpcd.conf(5) for details.
++
++# Allow users of this group to interact with dhcpcd via the control socket.
++#controlgroup wheel
++
++# Inform the DHCP server of our hostname for DDNS.
++#hostname
++
++# Use the hardware address of the interface for the Client ID.
++#clientid
++# or
++# Use the same DUID + IAID as set in DHCPv6 for DHCPv4 ClientID as per RFC4361.
++# Some non-RFC compliant DHCP servers do not reply with this set.
++# In this case, comment out duid and enable clientid above.
++duid
++
++# Persist interface configuration when dhcpcd exits.
++persistent
++
++# Do not let DHCP touch the static Mac link.
++denyinterfaces eth0
++
++# vendorclassid is set to blank to avoid sending the default of
++# dhcpcd-<version>:<os>:<machine>:<platform>
++vendorclassid
++
++# A list of options to request from the DHCP server.
++option domain_name_servers, domain_name, domain_search
++option classless_static_routes
++# Respect the network MTU. This is applied to DHCP routes.
++option interface_mtu
++
++# Request a hostname from the network
++option host_name
++
++# Most distributions have NTP support.
++#option ntp_servers
++
++# Rapid commit support.
++# Safe to enable by default because it requires the equivalent option set
++# on the server to actually work.
++option rapid_commit
++
++# A ServerID is required by RFC2131.
++require dhcp_server_identifier
++
++# Generate SLAAC address using the Hardware Address of the interface
++#slaac hwaddr
++# OR generate Stable Private IPv6 Addresses based from the DUID
++slaac private
+```

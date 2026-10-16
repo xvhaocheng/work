@@ -1,0 +1,429 @@
+diff --git a/drivers/iommu/riscv/iommu-hpm.c b/drivers/iommu/riscv/iommu-hpm.c
+index c9be8f9c3009..ddf2170148ba 100644
+--- a/drivers/iommu/riscv/iommu-hpm.c
++++ b/drivers/iommu/riscv/iommu-hpm.c
+@@ -17,6 +17,8 @@ struct riscv_iommu_hpm_session {
+ 	u32 saved_inhibit;
+ 	u64 saved_event[HPM_SESSION_COUNTERS];
+ 	u64 saved_counter[HPM_SESSION_COUNTERS];
++	unsigned int nr_targets;
++	struct riscv_iommu_s1_flush_target targets[2];
+ };
+ 
+ /* The programming bridge uses 32-bit register accesses, even on RV64. */
+@@ -159,6 +161,25 @@ int riscv_iommu_hpm_acquire(struct device *victim, struct device *aggressor,
+ 		ret = -EOPNOTSUPP;
+ 		goto restore;
+ 	}
++
++	/*
++	 * Snapshot the targets for a later riscv_iommu_hpm_flush_s1(). The
++	 * "core" domain is recorded exactly as iommu_get_domain_for_dev()
++	 * reports it, so a device that is not attached to a domain (NULL) or
++	 * that currently uses a domain owned by another consumer is still
++	 * accepted here and left for the flush to validate. No device or
++	 * domain reference is taken: the caller keeps both devices bound and
++	 * calls flush from the task that acquired the session.
++	 */
++	session->nr_targets = aggressor ? 2 : 1;
++	for (i = 0; i < session->nr_targets; i++) {
++		struct device *dev = i ? aggressor : victim;
++
++		session->targets[i].dev = dev;
++		session->targets[i].domain = iommu_get_domain_for_dev(dev);
++		session->targets[i].did = ep[i]->devid;
++	}
++
+ 	*out = session;
+ 	return 0;
+ 
+@@ -206,3 +227,13 @@ void riscv_iommu_hpm_release(struct riscv_iommu_hpm_session *session)
+ 	kfree(session);
+ }
+ EXPORT_SYMBOL_GPL(riscv_iommu_hpm_release);
++
++int riscv_iommu_hpm_flush_s1(struct riscv_iommu_hpm_session *session)
++{
++	if (!session)
++		return -EINVAL;
++	lockdep_assert_held(&session->iommu->hpm_lock);
++	return riscv_iommu_flush_s1_checked(session->iommu, session->targets,
++					    session->nr_targets);
++}
++EXPORT_SYMBOL_GPL(riscv_iommu_hpm_flush_s1);
+diff --git a/drivers/iommu/riscv/iommu.c b/drivers/iommu/riscv/iommu.c
+index de626442fcfc..d26dc390bb92 100644
+--- a/drivers/iommu/riscv/iommu.c
++++ b/drivers/iommu/riscv/iommu.c
+@@ -19,6 +19,7 @@
+ #include <linux/pci.h>
+ #include <linux/pci-ats.h>
+ #include <linux/init.h>
++#include <linux/atomic.h>
+ #include <linux/completion.h>
+ #include <linux/uaccess.h>
+ #include <linux/iommu.h>
+@@ -645,6 +646,13 @@ static irqreturn_t riscv_iommu_cmdq_process(int irq, void *data)
+ 	ctrl = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQCSR);
+ 	if (ctrl & (RISCV_IOMMU_CQCSR_CQMF |
+ 		    RISCV_IOMMU_CQCSR_CMD_TO | RISCV_IOMMU_CQCSR_CMD_ILL)) {
++		/*
++		 * Publish the error generation before the (relaxed) MMIO clear,
++		 * so an observer that reads a clean CQCSR afterwards also sees
++		 * the bumped generation.
++		 */
++		atomic64_inc(&iommu->cq_error_seq);
++		wmb();
+ 		riscv_iommu_queue_ctrl(iommu, &iommu->cmdq, ctrl);
+ 		dev_warn_ratelimited(iommu->dev,
+ 				     "Command queue error: fault: %d tout: %d err: %d\n",
+@@ -2055,6 +2063,238 @@ struct riscv_iommu_endpoint *riscv_iommu_hpm_endpoint(struct device *dev)
+ 	return ep;
+ }
+ 
++/*
++ * Validate one acquire-time target under ep->lock. The acquire snapshot and
++ * the endpoint's own domain must both still be the live "core" domain for
++ * this device, the domain must belong to this IOMMU and use the ordinary
++ * host S1 domain ops, and the device context must still match the domain's
++ * live Sv39 root. Only plain ordinary (DMA or UNMANAGED) host first-stage
++ * domains are accepted: SVA, identity, blocked, S2, nesting, PASID/PDTV and
++ * the ATS/PRI/T2GPA/SXL DC bits are rejected. Called without domain->lock
++ * (attach takes domain->lock before ep->lock), so domain->lock is never taken
++ * here and no inversion is possible.
++ */
++static int riscv_iommu_flush_s1_check_ep(struct riscv_iommu_device *iommu,
++					 struct riscv_iommu_endpoint *ep,
++					 struct iommu_domain *snapshot)
++{
++	struct riscv_iommu_domain *domain;
++	struct riscv_iommu_dc *dc;
++	u64 tc, fsc, iohgatp;
++
++	/*
++	 * Resolve the device/domain identity before dereferencing the stored
++	 * snapshot: the device must still report the same core domain and the
++	 * endpoint must still point at that same domain object.
++	 */
++	if (!snapshot || iommu_get_domain_for_dev(ep->dev) != snapshot)
++		return -ESTALE;
++	if (!ep->domain || &ep->domain->domain != snapshot)
++		return -ESTALE;
++
++	domain = ep->domain;
++	dc = ep->dc;
++
++	if (domain->iommu != iommu)
++		return -EXDEV;
++	if (domain->domain.ops != &riscv_iommu_domain_ops)
++		return -ESTALE;
++
++	/*
++	 * Ordinary host S1 only. IOMMU_DOMAIN_DMA / IOMMU_DOMAIN_UNMANAGED are
++	 * the only accepted types; identity, blocked, SVA, DMA_FQ, S2, nesting
++	 * and PASID are rejected as unsupported.
++	 */
++	if (domain->domain.type != IOMMU_DOMAIN_DMA &&
++	    domain->domain.type != IOMMU_DOMAIN_UNMANAGED)
++		return -EOPNOTSUPP;
++	if (domain->g_stage || domain->nested || ep->pasid_enabled)
++		return -EOPNOTSUPP;
++
++	/*
++	 * Sv39 requires IOSATP mode 8 with SXL == 0; mode 8 with SXL == 1
++	 * would be Sv32 and is rejected through the DC check below.
++	 */
++	if (domain->mode != RISCV_IOMMU_DC_FSC_IOSATP_MODE_SV39)
++		return -EOPNOTSUPP;
++	if (!domain->pgd_root)
++		return -EOPNOTSUPP;
++	if (!dc)
++		return -EOPNOTSUPP;
++
++	tc = le64_to_cpu(dc->tc);
++	fsc = le64_to_cpu(dc->fsc);
++	iohgatp = le64_to_cpu(dc->iohgatp);
++
++	if (!(tc & RISCV_IOMMU_DC_TC_V))
++		return -EOPNOTSUPP;
++	if (tc & (RISCV_IOMMU_DC_TC_EN_ATS | RISCV_IOMMU_DC_TC_EN_PRI |
++		  RISCV_IOMMU_DC_TC_PDTV | RISCV_IOMMU_DC_TC_T2GPA |
++		  RISCV_IOMMU_DC_TC_SXL))
++		return -EOPNOTSUPP;
++	if (FIELD_GET(RISCV_IOMMU_DC_IOHGATP_MODE, iohgatp) !=
++	    RISCV_IOMMU_DC_IOHGATP_MODE_BARE)
++		return -EOPNOTSUPP;
++
++	/* The live device context must still describe this exact domain. */
++	if (FIELD_GET(RISCV_IOMMU_DC_FSC_MODE, fsc) != domain->mode ||
++	    FIELD_GET(RISCV_IOMMU_DC_FSC_PPN, fsc) !=
++		    virt_to_pfn(domain->pgd_root))
++		return -ESTALE;
++
++	return 0;
++}
++
++/*
++ * Global host first-stage invalidation barrier for one or two devices of the
++ * same IOMMU. The caller owns the HPM session (hpm_lock), has quiesced the
++ * relevant DMA and serializes binding changes. Both endpoint locks are held
++ * across validation and command submission, taken in ascending device id
++ * order, and no domain->lock is taken. This only issues IOTINVAL.VMA with
++ * GV/AV/PSCV clear followed by a fence; it is not an ATS/PR/PW or general
++ * internal-state reset, and it never retries or resets on failure.
++ *
++ * Note on the current RTL: CQH advances when the fetch of the last beat
++ * completes, before decode. For this strict no-ATS/no-S2, quiesced
++ * experiment the CQ decodes the earlier VMA (its invalidations are issued
++ * before the fetch of the following IOFENCE), so CQH passing the following
++ * fence is sufficient evidence that the VMA pulse was issued. This is not a
++ * general fence-execution proof.
++ */
++int riscv_iommu_flush_s1_checked(struct riscv_iommu_device *iommu,
++				 const struct riscv_iommu_s1_flush_target *targets,
++				 unsigned int nr_targets)
++{
++	struct riscv_iommu_endpoint *ep[2] = { };
++	struct riscv_iommu_command cmd;
++	unsigned long flags;
++	unsigned int first, second, i;
++	u32 ctrl;
++	u64 seq;
++	int ret;
++
++	if (!iommu || !targets || (nr_targets != 1 && nr_targets != 2))
++		return -EINVAL;
++	if (nr_targets == 2 &&
++	    (targets[0].dev == targets[1].dev ||
++	     targets[0].did == targets[1].did))
++		return -EINVAL;
++
++	for (i = 0; i < nr_targets; i++) {
++		if (!targets[i].dev || !targets[i].domain)
++			return -EINVAL;
++
++		ep[i] = riscv_iommu_hpm_endpoint(targets[i].dev);
++		if (!ep[i])
++			return -EOPNOTSUPP;
++		if (ep[i]->iommu != iommu)
++			return -EXDEV;
++		if (ep[i]->devid != targets[i].did)
++			return -ESTALE;
++	}
++	if (nr_targets == 2 && ep[0] == ep[1])
++		return -EINVAL;
++
++	/* Take both endpoint mutexes, always in ascending device id order. */
++	if (nr_targets == 2 && ep[0]->devid > ep[1]->devid) {
++		first = 1;
++		second = 0;
++	} else {
++		first = 0;
++		second = nr_targets - 1;
++	}
++	mutex_lock(&ep[first]->lock);
++	if (nr_targets == 2)
++		mutex_lock_nested(&ep[second]->lock, SINGLE_DEPTH_NESTING);
++
++	ret = 0;
++	for (i = 0; i < nr_targets; i++) {
++		/*
++		 * Revalidate the endpoint identity under its lock, then let
++		 * the core check compare the live domain against the stored
++		 * acquire-time snapshot.
++		 */
++		if (ep[i]->dev != targets[i].dev ||
++		    ep[i]->devid != targets[i].did ||
++		    ep[i]->iommu != iommu) {
++			ret = -ESTALE;
++			break;
++		}
++		ret = riscv_iommu_flush_s1_check_ep(iommu, ep[i],
++						    targets[i].domain);
++		if (ret)
++			break;
++	}
++	if (ret)
++		goto unlock;
++
++	/* Sample the error generation before looking at any CQ status. */
++	seq = atomic64_read(&iommu->cq_error_seq);
++
++	if (!iommu->cmdq.base || !iommu->cmdq.cnt ||
++	    (iommu->cmdq.cnt & (iommu->cmdq.cnt - 1)) ||
++	    iommu->cmdq.lui >= iommu->cmdq.cnt) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++	ctrl = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQCSR);
++	if (!(ctrl & RISCV_IOMMU_CQCSR_CQEN) ||
++	    !(ctrl & RISCV_IOMMU_CQCSR_CQON) ||
++	    (ctrl & (RISCV_IOMMU_CQCSR_CQMF | RISCV_IOMMU_CQCSR_CMD_TO |
++		     RISCV_IOMMU_CQCSR_CMD_ILL))) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++	/*
++	 * Producer consistency, not a queue-empty claim: under cq_lock the
++	 * software write cursor must match the hardware tail. Reading and
++	 * comparing under the same lock keeps a concurrent poster from
++	 * invalidating the observation; cq_lock is dropped immediately after.
++	 */
++	spin_lock_irqsave(&iommu->cq_lock, flags);
++	if ((riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQT) &
++	     (iommu->cmdq.cnt - 1)) != iommu->cmdq.lui)
++		ret = -EIO;
++	spin_unlock_irqrestore(&iommu->cq_lock, flags);
++	if (ret)
++		goto unlock;
++
++	/* IOTINVAL.VMA with GV, AV and PSCV clear: every host S1 entry. */
++	riscv_iommu_cmd_inval_vma(&cmd);
++	if (!riscv_iommu_post(iommu, &cmd)) {
++		ret = -EIO;
++		goto unlock;
++	}
++	if (!riscv_iommu_iofence_sync(iommu)) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++	/*
++	 * End state must still be enabled and error-free. rmb() orders the
++	 * final CQCSR read before the generation read so an IRQ thread that
++	 * published the error and then cleared CQCSR is observed.
++	 */
++	ctrl = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQCSR);
++	rmb();
++	if ((ctrl & (RISCV_IOMMU_CQCSR_CQEN | RISCV_IOMMU_CQCSR_CQON)) !=
++		    (RISCV_IOMMU_CQCSR_CQEN | RISCV_IOMMU_CQCSR_CQON) ||
++	    (ctrl & (RISCV_IOMMU_CQCSR_CQMF | RISCV_IOMMU_CQCSR_CMD_TO |
++		     RISCV_IOMMU_CQCSR_CMD_ILL)) ||
++	    atomic64_read(&iommu->cq_error_seq) != seq) {
++		ret = -EIO;
++		goto unlock;
++	}
++
++unlock:
++	if (nr_targets == 2)
++		mutex_unlock(&ep[second]->lock);
++	mutex_unlock(&ep[first]->lock);
++	return ret;
++}
++
+ void riscv_iommu_remove(struct riscv_iommu_device *iommu)
+ {
+ 	/* An owner finishes restoring its HPM state before teardown proceeds. */
+@@ -2121,6 +2361,8 @@ int riscv_iommu_init(struct riscv_iommu_device *iommu)
+ 			   RISCV_IOMMU_IPSR_PMIP | RISCV_IOMMU_IPSR_PIP);
+ 	spin_lock_init(&iommu->cq_lock);
+ 	mutex_init(&iommu->eps_mutex);
++	/* Initialize the error generation before any queue IRQ is requested. */
++	atomic64_set(&iommu->cq_error_seq, 0);
+ 	ret = riscv_iommu_queue_init(iommu, RISCV_IOMMU_COMMAND_QUEUE);
+ 	if (ret)
+ 		goto fail;
+diff --git a/drivers/iommu/riscv/iommu.h b/drivers/iommu/riscv/iommu.h
+index 6eaf0083cc5f..4c6ba53e952b 100644
+--- a/drivers/iommu/riscv/iommu.h
++++ b/drivers/iommu/riscv/iommu.h
+@@ -101,6 +101,13 @@ struct riscv_iommu_device {
+ 	/* Serializes owned HPM sessions and raw sysfs HPM writes. */
+ 	struct mutex hpm_lock;
+ 	bool hpm_ready;
++
++	/*
++	 * Incremented by the command-queue IRQ thread before it clears a
++	 * reported CQ error, so that a checked S1 flush can notice an error
++	 * that was already handled and cleared from CQCSR.
++	 */
++	atomic64_t cq_error_seq;
+ };
+ 
+ struct riscv_iommu_domain {
+@@ -153,6 +160,18 @@ struct riscv_iommu_endpoint {
+ 	bool ir_enabled;
+ };
+ 
++/*
++ * Acquire-time snapshot of one device targeted by an HPM session flush: the
++ * bound device, the "core" iommu_domain attached to it and its device id.
++ * The session holds no reference; the caller keeps the device bound and
++ * serializes binding changes, and a NULL core domain is stored as-is.
++ */
++struct riscv_iommu_s1_flush_target {
++	struct device *dev;
++	struct iommu_domain *domain;
++	u32 did;
++};
++
+ /* Helper functions and macros */
+ 
+ static inline u32 riscv_iommu_readl(struct riscv_iommu_device *iommu,
+@@ -186,6 +205,15 @@ int riscv_iommu_sysfs_add(struct riscv_iommu_device *iommu);
+ 
+ struct riscv_iommu_endpoint *riscv_iommu_hpm_endpoint(struct device *dev);
+ 
++/*
++ * Checked global host first-stage invalidation barrier, implemented in
++ * iommu.c. Private to the RISC-V IOMMU driver; see iommu.c for the exact
++ * validation contract.
++ */
++int riscv_iommu_flush_s1_checked(struct riscv_iommu_device *iommu,
++				 const struct riscv_iommu_s1_flush_target *targets,
++				 unsigned int nr_targets);
++
+ static inline bool riscv_iommu_hpm_register(unsigned int offset)
+ {
+ 	return offset >= RISCV_IOMMU_REG_IOCOUNTOVF &&
+diff --git a/include/linux/riscv_iommu_hpm.h b/include/linux/riscv_iommu_hpm.h
+index 8476e2236228..113bc3762c99 100644
+--- a/include/linux/riscv_iommu_hpm.h
++++ b/include/linux/riscv_iommu_hpm.h
+@@ -20,8 +20,9 @@ struct riscv_iommu_hpm_sample {
+ /*
+  * Sleepable API for the current platform's single-DID endpoints. The caller
+  * keeps both devices bound, serializes their workloads, and calls acquire,
+- * read and release from the same task. Successful acquire owns counters 0..5
+- * until release; it does not own, stop or drain either DMA device.
++ * read, flush_s1 and release from the same task. Successful acquire owns
++ * counters 0..5 until release; it does not own, stop or drain either DMA
++ * device.
+  *
+  * supported checks the bound driver and live HPM capability. Acquire also
+  * verifies the six selectors and exact DID filtering, and may still return
+@@ -31,11 +32,19 @@ struct riscv_iommu_hpm_sample {
+  * sequentially, not atomically. Use differences around the desired window.
+  * Release restores saved selectors, event counts and inhibit state. Restored
+  * event counts exclude activity during the owned session; cycles retain it.
++ *
++ * flush_s1 issues a global host first-stage invalidation barrier for the
++ * session's devices. It must be called by the task that acquired the session
++ * while it still owns hpm_lock, after the caller has quiesced the relevant DMA
++ * and serialized binding changes. It does not reset ATS/PR/PW or any other
++ * internal IOMMU state and does not retry or reset on failure. A NULL session
++ * returns -EINVAL; when no RISC-V IOMMU is reachable it returns -EOPNOTSUPP.
+  */
+ #if IS_REACHABLE(CONFIG_RISCV_IOMMU)
+ bool riscv_iommu_hpm_supported(struct device *dev);
+ int riscv_iommu_hpm_acquire(struct device *victim, struct device *aggressor,
+ 			   struct riscv_iommu_hpm_session **out);
++int riscv_iommu_hpm_flush_s1(struct riscv_iommu_hpm_session *session);
+ void riscv_iommu_hpm_read(struct riscv_iommu_hpm_session *session,
+ 			  struct riscv_iommu_hpm_sample *sample);
+ void riscv_iommu_hpm_release(struct riscv_iommu_hpm_session *session);
+@@ -54,6 +63,12 @@ riscv_iommu_hpm_acquire(struct device *victim, struct device *aggressor,
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int
++riscv_iommu_hpm_flush_s1(struct riscv_iommu_hpm_session *session)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline void
+ riscv_iommu_hpm_read(struct riscv_iommu_hpm_session *session,
+ 		     struct riscv_iommu_hpm_sample *sample)

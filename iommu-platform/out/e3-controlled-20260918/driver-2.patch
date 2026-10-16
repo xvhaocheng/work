@@ -1,0 +1,561 @@
+@@ -945,6 +1001,390 @@
+ static void idma_stream_reseed(struct idma_stream *s)
+ {
+ 	size_t i;
+@@
+ 	s->batch_configured = s->batch_started = false;
+ }
+ 
++static bool idma_launcher_terminal(u64 status)
++{
++	return (status & IDMA_LAUNCHER_STATUS_FROZEN) &&
++	       !(status & IDMA_LAUNCHER_STATUS_RUNNING) &&
++	       !((status >> IDMA_LAUNCHER_HELD_SHIFT) & 0xf) &&
++	       !((status >> IDMA_LAUNCHER_ACTIVE_SHIFT) & 0xf);
++}
++
++static int idma_launcher_read_words(struct idma_device *launcher, u64 *words)
++{
++	unsigned int i;
++
++	if (readq(launcher->reg + IDMA_LAUNCHER_MAGIC_OFFSET) != IDMA_LAUNCHER_MAGIC)
++		return -EOPNOTSUPP;
++	for (i = 0; i < IDMA_E3_CONTROLLED_WORDS; i++) {
++		writeq(i, launcher->reg + IDMA_LAUNCHER_INDEX_OFFSET);
++		words[i] = readq(launcher->reg + IDMA_LAUNCHER_DATA_OFFSET);
++	}
++	return 0;
++}
++
++static int idma_controlled_validate(struct idma_device *victim,
++				    struct idma_e3_controlled *c, bool *has_a)
++{
++	struct idma_experiment *e = &c->pair.request;
++	bool a;
++
++	if (PAGE_SIZE != SZ_4K)
++		return -EOPNOTSUPP;
++	if (c->pair.abi_version != 1 || c->pair.struct_size != sizeof(c->pair) ||
++	    c->pair.reserved)
++		return -EINVAL;
++	if (c->prep_mode > 1 || c->pair_mode > 1 ||
++	    memchr_inv(c->reserved, 0, sizeof(c->reserved)))
++		return -EINVAL;
++	if (e->abi_version != IDMA_EXPERIMENT_ABI || e->struct_size != sizeof(*e) ||
++	    e->flags || memchr_inv(e->reserved, 0, sizeof(e->reserved)))
++		return -EINVAL;
++	a = e->aggressor_id != IDMA_EXPERIMENT_NO_AGGRESSOR;
++	if (a && e->aggressor_id != 1)
++		return -EINVAL;
++	if (!a && c->prep_mode)
++		return -EINVAL;
++	if (victim->id != 0 || victim->did != 10)
++		return -EINVAL;
++	if (e->victim_pages != 1 || (a && e->aggressor_pages != 1))
++		return -EINVAL;
++	if (e->chunk_bytes != 64 || e->victim_transfers != 1 ||
++	    e->warmup_transfers || !e->run_timeout_ms || e->run_timeout_ms > 60000)
++		return -EINVAL;
++	if (c->pair_mode == 1) {
++		if (c->pair.first_delay)
++			return -EINVAL;
++	} else if (c->pair.first_delay != 0 && c->pair.first_delay != 128) {
++		return -EINVAL;
++	}
++	*has_a = a;
++	return 0;
++}
++
++static int idma_controlled_environment(struct idma_device *victim,
++				       struct idma_device *aggressor)
++{
++	u64 status;
++
++	if (readq(victim->reg + IDMA_LAUNCHER_MAGIC_OFFSET) != IDMA_LAUNCHER_MAGIC)
++		return -EOPNOTSUPP;
++	status = readq(victim->reg + IDMA_LAUNCHER_CONTROL_OFFSET);
++	if (status & (IDMA_LAUNCHER_STATUS_RUNNING |
++		      (0xfULL << IDMA_LAUNCHER_HELD_SHIFT) |
++		      (0xfULL << IDMA_LAUNCHER_ACTIVE_SHIFT) |
++		      (0xffffffffULL << IDMA_LAUNCHER_ERROR_SHIFT)))
++		return -EBUSY;
++	if ((readq(victim->reg + IDMA_BATCH_CONTROL_OFFSET) & 2) ||
++	    (aggressor && (readq(aggressor->reg + IDMA_BATCH_CONTROL_OFFSET) & 2)))
++		return -EBUSY;
++	writeq(0, victim->reg + IDMA_BATCH_CONTROL_OFFSET);
++	if (readq(victim->reg + IDMA_BATCH_CONTROL_OFFSET))
++		return -EIO;
++	if (aggressor) {
++		writeq(0, aggressor->reg + IDMA_BATCH_CONTROL_OFFSET);
++		if (readq(aggressor->reg + IDMA_BATCH_CONTROL_OFFSET))
++			return -EIO;
++	}
++	return 0;
++}
++
++static int idma_controlled_prime(struct idma_stream *s,
++				 struct idma_experiment_stats *stats,
++				 struct riscv_iommu_hpm_session *hpm,
++				 u64 deadline)
++{
++	struct riscv_iommu_hpm_sample before, after;
++	u64 active_before[2], active_after[2];
++	u64 end = 0;
++	int ret;
++
++	if (!s)
++		return 0;
++	s->stats = stats;
++	memset(stats, 0, sizeof(*stats));
++	s->offset = s->next_offset = s->touched_end = 0;
++	s->in_flight = false;
++	s->transfer_id = s->deadline_ns = s->last_complete_ns = 0;
++	idma_snapshot(hpm, s, NULL, &before, active_before);
++	ret = idma_run_window(s, NULL, 1, deadline, true, &end);
++	idma_snapshot(hpm, s, NULL, &after, active_after);
++	stats->active_cycles = active_after[0] - active_before[0];
++	stats->iotlb_miss = after.iotlb_miss[0] - before.iotlb_miss[0];
++	stats->s1_ptw = after.s1_ptw[0] - before.s1_ptw[0];
++	stats->s2_ptw = after.s2_ptw[0] - before.s2_ptw[0];
++	if (ret)
++		return ret;
++	if (s->in_flight) {
++		ret = idma_drain(s);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int idma_controlled_resolve_launcher(struct idma_device *launcher,
++					    struct idma_stream *v,
++					    struct idma_stream *a,
++					    struct idma_experiment *e,
++					    u64 *words)
++{
++	bool v_cancelled, a_cancelled;
++	int ret;
++
++	ret = idma_launcher_read_words(launcher, words);
++	if (ret)
++		return ret;
++	if (words[0] != IDMA_LAUNCHER_MAGIC || words[1])
++		return -EIO;
++	if (words[15] != words[16])
++		return -EIO;
++	v_cancelled = (words[17] & 1) && !(words[16] & 1);
++	a_cancelled = a && (words[17] & 2) && !(words[16] & 2);
++	if (v_cancelled) {
++		v->in_flight = false;
++	} else if (v->in_flight) {
++		ret = idma_drain(v);
++		if (ret)
++			return ret;
++	}
++	if (a) {
++		if (a_cancelled) {
++			a->in_flight = false;
++		} else if (a->in_flight) {
++			ret = idma_drain(a);
++			if (ret)
++				return ret;
++		}
++	}
++	e->victim.submitted = words[24];
++	e->victim.completed = words[26];
++	e->victim.completed_bytes = words[26] * v->chunk;
++	if (words[26])
++		v->touched_end = max(v->touched_end, v->offset + v->chunk);
++	if (a) {
++		e->aggressor.submitted = words[25];
++		e->aggressor.completed = words[27];
++		e->aggressor.completed_bytes = words[27] * a->chunk;
++		if (words[27])
++			a->touched_end = max(a->touched_end, a->offset + a->chunk);
++	}
++	return 0;
++}
++
++static int idma_controlled_formal(struct idma_device *launcher,
++				  struct idma_stream *v, struct idma_stream *a,
++				  struct idma_observation *o,
++				  struct idma_experiment *e,
++				  struct idma_e3_controlled_round *round,
++				  struct riscv_iommu_hpm_session *hpm,
++				  u64 deadline)
++{
++	struct riscv_iommu_hpm_sample before, after;
++	u64 active_before[2], active_after[2];
++	u64 words[IDMA_E3_CONTROLLED_WORDS];
++	u64 status, start, end, v_done = 0;
++	int ret, poll_ret;
++
++	v->stats = &e->victim;
++	if (a)
++		a->stats = &e->aggressor;
++	memset(&e->victim, 0, sizeof(e->victim));
++	if (a)
++		memset(&e->aggressor, 0, sizeof(e->aggressor));
++	v->offset = v->next_offset = v->touched_end = 0;
++	v->in_flight = false;
++	v->transfer_id = v->deadline_ns = v->last_complete_ns = 0;
++	if (a) {
++		a->offset = a->next_offset = a->touched_end = 0;
++		a->in_flight = false;
++		a->transfer_id = a->deadline_ns = a->last_complete_ns = 0;
++	}
++
++	writeq(IDMA_LAUNCHER_CLEAR, launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET);
++	status = readq(launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET);
++	if (status & ~IDMA_LAUNCHER_STATUS_FROZEN)
++		return -EIO;
++	writeq(IDMA_LAUNCHER_PREP | (a ? IDMA_LAUNCHER_PREP_HAS_A : 0),
++	       launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET);
++	status = readq(launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET);
++	if (!(status & IDMA_LAUNCHER_STATUS_PREP) ||
++	    (status >> IDMA_LAUNCHER_ERROR_SHIFT))
++		return -EIO;
++
++	ret = idma_submit(v, false);
++	if (ret)
++		goto abort;
++	if (a) {
++		ret = idma_submit(a, false);
++		if (ret)
++			goto abort;
++	}
++	status = readq(launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET);
++	if ((status >> IDMA_LAUNCHER_ERROR_SHIFT) ||
++	    (((status >> IDMA_LAUNCHER_HELD_SHIFT) & 0xf) < (a ? 2 : 1))) {
++		ret = -EIO;
++		goto abort;
++	}
++
++	ret = idma_observation_arm(o, v->idma, a ? a->idma : NULL, 1);
++	if (ret)
++		goto abort;
++
++	idma_snapshot(hpm, v, a, &before, active_before);
++	start = ktime_get_ns();
++	e->measurement_started = 1;
++	e->snapshot_before_ns = start;
++	writeq(IDMA_LAUNCHER_GO, launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET);
++	status = readq(launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET);
++	if (status >> IDMA_LAUNCHER_ERROR_SHIFT) {
++		ret = -EIO;
++		goto abort;
++	}
++
++	for (;;) {
++		if (ktime_get_ns() >= deadline) {
++			ret = -ETIMEDOUT;
++			break;
++		}
++		if (signal_pending(current)) {
++			ret = -EINTR;
++			break;
++		}
++		poll_ret = idma_poll(v, false);
++		if (poll_ret < 0) {
++			ret = poll_ret;
++			break;
++		}
++		if (poll_ret == 1 && !v_done)
++			v_done = v->last_complete_ns;
++		if (a) {
++			poll_ret = idma_poll(a, false);
++			if (poll_ret < 0) {
++				ret = poll_ret;
++				break;
++			}
++		}
++		status = readq(launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET);
++		if (status >> IDMA_LAUNCHER_ERROR_SHIFT) {
++			ret = -EIO;
++			break;
++		}
++		if (idma_launcher_terminal(status))
++			break;
++		cpu_relax();
++	}
++
++	if (ret) {
++		writeq(IDMA_LAUNCHER_ABORT, launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET);
++		poll_ret = readq_poll_timeout(launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET,
++					      status, idma_launcher_terminal(status), 0,
++					      IDMA_XFER_TIMEOUT_US);
++		if (poll_ret) {
++			ret = -EIO;
++			goto quarantine;
++		}
++	}
++
++	ret = idma_controlled_resolve_launcher(launcher, v, a, e, words);
++	if (ret)
++		goto quarantine;
++
++	end = ktime_get_ns();
++	if (v_done)
++		e->victim_elapsed_ns = v_done - start;
++	e->measurement_complete = !ret;
++	idma_snapshot(hpm, v, a, &after, active_after);
++	idma_snapshot_delta(&e->victim, 0, &before, &after,
++			    active_before[0], active_after[0]);
++	if (a)
++		idma_snapshot_delta(&e->aggressor, 1, &before, &after,
++				    active_before[1], active_after[1]);
++	e->snapshot_after_ns = end - start;
++	round->v_hw_cycles = e->victim.active_cycles;
++
++	local_flush_icache_all();
++	if (!ret) {
++		poll_ret = idma_verify(v);
++		if (poll_ret)
++			ret = poll_ret;
++		if (a && !ret) {
++			poll_ret = idma_verify(a);
++			if (poll_ret)
++				ret = poll_ret;
++		}
++	}
++	memcpy(round->launcher, words, sizeof(round->launcher));
++	round->observer_magic = readq(launcher->reg + IDMA_OBS_MAGIC_OFFSET);
++	return ret;
++
++abort:
++	writeq(IDMA_LAUNCHER_ABORT, launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET);
++	poll_ret = readq_poll_timeout(launcher->reg + IDMA_LAUNCHER_CONTROL_OFFSET,
++				      status, idma_launcher_terminal(status), 0,
++				      IDMA_XFER_TIMEOUT_US);
++	if (poll_ret) {
++		ret = -EIO;
++		goto quarantine;
++	}
++	poll_ret = idma_controlled_resolve_launcher(launcher, v, a, e, words);
++	if (poll_ret && !ret)
++		ret = poll_ret;
++	memcpy(round->launcher, words, sizeof(round->launcher));
++	return ret;
++
++quarantine:
++	idma_quarantine(v);
++	if (a)
++		idma_quarantine(a);
++	return ret;
++}
++
++static int idma_controlled_one_round(struct idma_device *launcher,
++				     struct idma_stream *v, struct idma_stream *a,
++				     struct idma_observation *o,
++				     struct idma_experiment *e,
++				     struct idma_e3_controlled_round *round,
++				     u64 *e3_words,
++				     struct riscv_iommu_hpm_session *hpm,
++				     bool hot, u64 timeout_ms)
++{
++	u64 deadline = ktime_get_ns() + timeout_ms * NSEC_PER_MSEC;
++	int ret, fin_ret;
++
++	round->flush_status = -EINPROGRESS;
++	round->stage = IDMA_CONTROLLED_STAGE_FLUSH;
++	local_flush_icache_all();
++	ret = riscv_iommu_hpm_flush_s1(hpm);
++	round->flush_status = ret;
++	if (ret)
++		return ret;
++
++	round->stage = IDMA_CONTROLLED_STAGE_APRIME;
++	memset(&round->prime[1], 0, sizeof(round->prime[1]));
++	if (a && hot) {
++		ret = idma_controlled_prime(a, &round->prime[1], hpm, deadline);
++		if (ret)
++			return ret;
++	} else if (a) {
++		a->touched_end = 0;
++		a->in_flight = false;
++	}
++
++	round->stage = IDMA_CONTROLLED_STAGE_VPRIME;
++	memset(&round->prime[0], 0, sizeof(round->prime[0]));
++	ret = idma_controlled_prime(v, &round->prime[0], hpm, deadline);
++	if (ret)
++		return ret;
++
++	round->stage = IDMA_CONTROLLED_STAGE_VPROBE;
++	memset(&round->probe, 0, sizeof(round->probe));
++	ret = idma_controlled_prime(v, &round->probe, hpm, deadline);
++	if (ret)
++		return ret;
++	if (round->probe.iotlb_miss || round->probe.s1_ptw || round->probe.s2_ptw)
++		return -EIO;
++
++	local_flush_icache_all();
++	ret = idma_verify(v);
++	if (ret)
++		return ret;
++	if (a) {
++		ret = idma_verify(a);
++		if (ret)
++			return ret;
++	}
++
++	idma_stream_reseed(v);
++	if (a)
++		idma_stream_reseed(a);
++	local_flush_icache_all();
++	round->prep_complete = 1;
++
++	round->stage = IDMA_CONTROLLED_STAGE_PREPARE;
++	ret = idma_controlled_formal(launcher, v, a, o, e, round, hpm, deadline);
++	round->stage = IDMA_CONTROLLED_STAGE_DRAIN;
++	fin_ret = idma_observation_finish(o, e, ret);
++	if (fin_ret && !ret)
++		ret = fin_ret;
++	if (o->armed) {
++		fin_ret = idma_e3_finish(o, e, e3_words);
++		if (fin_ret && !ret)
++			ret = fin_ret;
++	}
++	round->stage = IDMA_CONTROLLED_STAGE_COMPLETE;
++	return ret;
++}
++
++static long idma_run_e3_controlled(struct idma_device *victim,
++				   void __user *uarg)
++{
++	struct idma_e3_controlled *c;
++	struct idma_experiment e;
++	struct idma_stream streams[2] = {};
++	struct idma_stream *v = &streams[0], *a = NULL;
++	struct idma_device *aggressor = NULL, *launcher = NULL;
++	struct idma_observation o = {};
++	struct riscv_iommu_hpm_session *hpm = NULL;
++	bool has_a = false;
++	unsigned int round;
++	long ret;
++
++	c = kzalloc(sizeof(*c), GFP_KERNEL);
++	if (!c)
++		return -ENOMEM;
++	if (copy_from_user(c, uarg, sizeof(*c))) {
++		ret = -EFAULT;
++		goto out_free;
++	}
++	memset(&c->pair.status, 0, sizeof(c->pair) - offsetof(struct idma_e3_pair, status));
++	memset(&c->pair.request.status, 0,
++	       sizeof(c->pair.request) - offsetof(struct idma_experiment, status));
++	memset(c->controlled, 0, sizeof(c->controlled));
++
++	ret = idma_controlled_validate(victim, c, &has_a);
++	if (ret)
++		goto out_copy;
++	e = c->pair.request;
++	e.victim_did = 10;
++	e.aggressor_did = has_a ? 11 : IDMA_EXPERIMENT_NO_AGGRESSOR;
++
++	ret = mutex_lock_interruptible(&idma_experiment_lock);
++	if (ret)
++		goto out_copy;
++	if (idma_any_quarantined()) {
++		ret = -EIO;
++		goto out_unlock;
++	}
++	if (has_a) {
++		aggressor = idma_get_instance(1);
++		if (!aggressor) {
++			ret = -ENODEV;
++			goto out_unlock;
++		}
++		if (aggressor->did != 11) {
++			ret = -EINVAL;
++			goto out_put;
++		}
++		a = &streams[1];
++	}
++	launcher = victim;
++	ret = idma_controlled_environment(victim, aggressor);
++	if (ret)
++		goto out_put;
++
++	ret = idma_stream_prepare(v, victim, 1, 64, &e.victim);
++	if (ret)
++		goto out_put;
++	if (a) {
++		ret = idma_stream_prepare(a, aggressor, 1, 64, &e.aggressor);
++		if (ret)
++			goto out_cleanup;
++	}
++	c->pair.mapping[0] = v->src_iova;
++	c->pair.mapping[1] = v->dst_iova;
++	c->pair.mapping[2] = page_to_phys(idma_buffer_page(v->src));
++	c->pair.mapping[3] = page_to_phys(idma_buffer_page(v->dst));
++	if (a) {
++		c->pair.mapping[4] = a->src_iova;
++		c->pair.mapping[5] = a->dst_iova;
++		c->pair.mapping[6] = page_to_phys(idma_buffer_page(a->src));
++		c->pair.mapping[7] = page_to_phys(idma_buffer_page(a->dst));
++	}
++
++	for (round = 0; round < 2; round++) {
++		bool hot = c->prep_mode == 1;
++
++		o = (struct idma_observation) {
++			.batch = true,
++			.e3 = true,
++			.controlled = true,
++			.delay128 = c->pair_mode == 1 ? false :
++				    (round ? c->pair.first_delay == 0 :
++					     c->pair.first_delay == 128),
++		};
++		ret = idma_observation_prepare(&o, true);
++		if (ret)
++			break;
++		c->pair.sequence[round] = o.sequence;
++		c->pair.rounds_attempted++;
++		ret = riscv_iommu_hpm_acquire(v->dev, a ? a->dev : NULL, &hpm);
++		if (ret)
++			break;
++		e.hpm_configured = 1;
++		ret = idma_controlled_one_round(launcher, v, a, &o, &e,
++						&c->controlled[round],
++						c->pair.observation[round],
++						hpm, hot, e.run_timeout_ms);
++		riscv_iommu_hpm_release(hpm);
++		hpm = NULL;
++		c->pair.result[round] = e;
++		if (ret) {
++			c->pair.status = ret;
++			break;
++		}
++		c->pair.rounds_completed++;
++		if (round == 0) {
++			idma_stream_reseed(v);
++			if (a)
++				idma_stream_reseed(a);
++			idma_put_instance(o.control);
++			o.control = NULL;
++		}
++	}
++	if (hpm)
++		riscv_iommu_hpm_release(hpm);
++	if (o.control)
++		idma_put_instance(o.control);
++	if (a)
++		idma_stream_cleanup(a);
++	idma_stream_cleanup(v);
++out_put:
++	idma_put_instance(aggressor);
++out_unlock:
++	mutex_unlock(&idma_experiment_lock);
++out_copy:
++	c->pair.status = ret;
++	if (copy_to_user(uarg, c, sizeof(*c)))
++		ret = -EFAULT;
++out_free:
++	kfree(c);
++	return ret;
++}
++
+ static long idma_run_session(struct idma_device *victim,
+ 			    struct idma_experiment *request, bool batch, struct idma_e3_pair *pair,
+ 			    struct idma_e3_diag_round *diagnostic, bool queue_pair)
