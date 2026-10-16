@@ -1,3 +1,13 @@
+# 2026年10月16日 MAP-EVIDENCE-INPUT-1：公开输入有界验收完成
+
+MAP-EVIDENCE-INPUT-1已完成有界输入验收，实际取得公开数据前缀及3份完整小文本，只作其他身份参考。当前合格匹配输入0，原生再用、fullCPU与netgain仍为null；匹配输入0不等再用或收益0。 Zenodo7727193整包791,012,771 bytes，本轮仅HTTP206取前8,388,608 bytes；读到70个tar header，最后1项不完整，按固定规则选3个完整小文本。未验整包MD5/gzip，余包未审，不能据样本断言整包无事件。论文主要Linux5.15/iPerf TCP；所读CPU分类CSV与DAT汇总不具当前source/B map/CQ/fullCPU关系。
+
+DMA_PMD cover仅作者聚合；DAMN是Linux4.7/ConnectX-4参考；DMA shadowing是ASPLOS2016、Linux3.19、被测Intel Fortville。两作者对应完整条目所查未给专属code/raw入口，不推全球不存在；lore HTTP200实际challenge，正文未知。 后继MAP-INPUT-READY-GATE为conditional_trigger_not_queued：这批入口验收结束，不自动重复相同搜索、合同或旧阈值账。仅在具体新record/config、另一身份或设计差项，或具名member及决定问题出现时触发有界后继；不等一般授权/保证痛点，不自动采集、开发、全包下载或板测。
+
+V1-N/K低完整实现成本整合假设保留：固定B/config、K预留lazy sparse关联、满额O0、无独立idle eviction，借真实frame/全部片段寿命整合。普通R/dma-buf slot/O3同享接口按各自覆盖范围判断，本轮未补完整实现成本差异，不新增novelty/netgain或共享干扰主张，未选论文主线。 20项worker来源hash/size及4项完整作者条目href检查通过，仅属provenance。保存8项HTTP响应含2份challenge；0原生运行、artifact执行、host新probe、模型/旧账、构建、生产Linux/RTL/ABI/collector或设备动作。 Codex-only；两研究席请求Sol/high、文档Sol/medium，实际独立metadata unknown，未声称切换root。 B1/I/D/A5/A2及独立工程保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；10月15—28日窗口不重启。
+
+[本轮入口](../out/mapping-evidence-input-20261016/README.md)／[裁决](../out/mapping-evidence-input-20261016/root/decision-analysis.md)／[接受](../out/mapping-evidence-input-20261016/root/root-result-acceptance.json)／[输入判定](../out/mapping-evidence-input-20261016/root/input-verdicts.json)／[后继gate](../out/mapping-evidence-input-20261016/root/next-minimal-contract.json)／[文档验收](../out/mapping-evidence-input-20261016/documentation/verification.json)。旧全文以下按字节不变后缀保留，双AGENTS、现行保护块与14个历史坏链不改。
+
 # 2026年10月16日 MAP-REUSE-OPPORTUNITY-1完成：转已有匹配输入验收
 
 本次仅同步root稳定接受。MAP-REUSE-OPPORTUNITY-1已完成源码来源、观测、配对与CPU合同。选定cyclic、linear、native-XDP、order0子切面每次RX allocation一页一个packet位置，重复B映射须跨真实recycle/再次alloc。源码支持正常再用机会及受限/退出条件；频率、完整CPU和收益未取得，native统计为null，不能写成0。

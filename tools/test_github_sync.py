@@ -166,11 +166,13 @@ class PlanTests(Base):
     def test_fixtures_and_assets_override_artifact_rules(self):
         self.write('test/fixtures/libx.so')
         self.write('testdata/blob.o')
+        self.write('llvm/test/Inputs/path.gen/model.o')
         self.write('assets/rootfs-base.cpio')
         self.write('test/fixtures/tool')
         self.plan()
         included = self.included()
         for rel in ('test/fixtures/libx.so', 'testdata/blob.o',
+                    'llvm/test/Inputs/path.gen/model.o',
                     'assets/rootfs-base.cpio', 'test/fixtures/tool'):
             self.assertIn(rel, included)
 

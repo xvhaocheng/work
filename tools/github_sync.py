@@ -84,7 +84,7 @@ EVIDENCE_EXTS = frozenset(['.log', '.rpt', '.json', '.md', '.txt', '.csv',
 EVIDENCE_NAMES = frozenset(['.config', 'system.map', 'module.symvers'])
 # Directories whose contents are hand written / third party data: never apply
 # the artefact rules there.
-FIXTURE_DIRS = frozenset(['fixtures', 'fixture', 'testdata', 'test-data',
+FIXTURE_DIRS = frozenset(['fixtures', 'fixture', 'inputs', 'testdata', 'test-data',
                           'test_data', 'assets'])
 CREDENTIAL_BASENAMES = frozenset(['.netrc', '.git-credentials', '.pypirc',
                                   '.npmrc', '.dockercfg'])
