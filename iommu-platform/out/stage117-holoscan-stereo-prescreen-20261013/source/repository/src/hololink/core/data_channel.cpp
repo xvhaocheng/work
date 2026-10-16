@@ -1,0 +1,601 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "data_channel.hpp"
+
+#include <arpa/inet.h>
+#include <unistd.h>
+
+#include <limits>
+#include <thread>
+
+#include "logging_internal.hpp"
+
+namespace hololink {
+
+// The RoCE data-plane memory map programmed by the base DataChannel is only
+// supported on FPGAs that are this version or newer; configure_roce() rejects
+// anything older. Revision-specific subclasses that understand an older layout
+// override minimum_hsb_ip_version(). Control-plane-only use isn't tested.
+constexpr int64_t MINIMUM_HSB_IP_VERSION = 0x2602;
+
+#ifndef HOLOLINK_ROCE_USE_GPU_VRAM
+#define HOLOLINK_ROCE_USE_GPU_VRAM 1
+#endif
+
+DataChannel::DataChannel(const Metadata& metadata, const std::function<std::shared_ptr<Hololink>(const Metadata& metadata)>& create_hololink)
+{
+    auto hololink = create_hololink(metadata);
+    initialize(metadata, hololink);
+}
+
+// This protected constructor is only valid for programming tools which
+// circumvent version checking done above.
+DataChannel::DataChannel(const Metadata& metadata, std::shared_ptr<Hololink> hololink)
+{
+    initialize(metadata, hololink);
+}
+
+void DataChannel::initialize(const Metadata& metadata, std::shared_ptr<Hololink> hololink)
+{
+    enumeration_metadata_ = metadata;
+    hololink_ = hololink;
+    peer_ip_ = metadata.get<std::string>("peer_ip").value();
+    vp_mask_ = metadata.get<int64_t>("vp_mask").value();
+    data_plane_ = metadata.get<int64_t>("data_plane").value();
+    sensor_ = metadata.get<int64_t>("sensor").value();
+    sif_address_ = metadata.get<int64_t>("sif_address").value();
+    vp_address_ = metadata.get<int64_t>("vp_address").value();
+    hif_address_ = metadata.get<int64_t>("hif_address").value();
+    qp_number_ = 0;
+    rkey_ = 0;
+    multicast_ = "";
+    multicast_port_ = 0;
+    broadcast_port_ = 0;
+    auto multicast = metadata.get<std::string>("multicast");
+    auto multicast_port = metadata.get<int64_t>("multicast_port");
+    auto broadcast_port = metadata.get<int64_t>("broadcast_port");
+    if (broadcast_port) {
+        broadcast_port_ = static_cast<uint16_t>(broadcast_port.value());
+        HSB_LOG_INFO(fmt::format("DataChannel broadcast port={}.", broadcast_port_));
+    } else if (multicast && multicast_port) {
+        multicast_ = multicast.value();
+        multicast_port_ = static_cast<uint16_t>(multicast_port.value());
+        HSB_LOG_INFO(fmt::format("DataChannel multicast address={} port={}.", multicast_, multicast_port_));
+    }
+    frame_end_event_valid_ = false;
+    frame_end_event_ = static_cast<Hololink::Event>(0); // not used when frame_end_event_valid_ is false
+    auto frame_end_event = metadata.get<int64_t>("frame_end_event");
+    if (frame_end_event) {
+        frame_end_event_valid_ = true;
+        frame_end_event_ = static_cast<Hololink::Event>(frame_end_event.value());
+    }
+    fpga_uuid_ = metadata.get<std::string>("fpga_uuid").value();
+    packetizer_program_ = std::make_shared<NullPacketizerProgram>();
+}
+
+/*static*/ bool DataChannel::enumerated(const Metadata& metadata)
+{
+    if (!metadata.get<int64_t>("hif_address")) {
+        return false;
+    }
+    if (!metadata.get<std::string>("peer_ip")) {
+        return false;
+    }
+    if (!metadata.get<int64_t>("data_plane")) {
+        return false;
+    }
+    return Hololink::enumerated(metadata);
+}
+
+/* static */ void DataChannel::use_multicast(Metadata& metadata, std::string address, uint16_t port)
+{
+    metadata["multicast"] = address;
+    metadata["multicast_port"] = static_cast<int64_t>(port);
+}
+
+/* static */ void DataChannel::use_broadcast(Metadata& metadata, uint16_t port)
+{
+    metadata["broadcast_port"] = static_cast<int64_t>(port);
+}
+
+/* static */ void DataChannel::use_mtu(Metadata& metadata, uint32_t mtu)
+{
+    metadata["mtu"] = static_cast<int64_t>(mtu);
+}
+
+std::shared_ptr<Hololink> DataChannel::hololink() const { return hololink_; }
+
+const std::string& DataChannel::peer_ip() const { return peer_ip_; }
+
+void DataChannel::authenticate(uint32_t qp_number, uint32_t rkey)
+{
+    qp_number_ = qp_number;
+    rkey_ = rkey;
+}
+
+static uint32_t compute_payload_size(uint32_t frame_size, uint32_t overhead, uint32_t mtu)
+{
+    const uint32_t page_size = hololink::core::PAGE_SIZE;
+    // Round down
+    if ((overhead + page_size) >= mtu) {
+        throw std::runtime_error(fmt::format("mtu={} is too small.", mtu));
+    }
+    uint32_t payload_size = ((mtu - overhead) / page_size) * page_size;
+    if (payload_size > mtu) {
+        throw std::runtime_error(fmt::format("payload_size={} and mtu={}.", payload_size, mtu));
+    }
+    const uint64_t packets = (frame_size + payload_size - 1) / payload_size; // round up
+    HSB_LOG_INFO(
+        "mtu={} overhead={} payload_size={} packets={}", mtu, overhead, payload_size, packets);
+    return payload_size;
+}
+
+void DataChannel::configure_common(uint32_t frame_size, uint32_t overhead, uint32_t local_data_port)
+{
+    // Get MTU from metadata if specified
+    uint32_t mtu = hololink::core::DEFAULT_MTU;
+    auto mtu_opt = enumeration_metadata_.get<int64_t>("mtu");
+    if (mtu_opt) {
+        mtu = static_cast<uint32_t>(mtu_opt.value());
+    }
+    uint32_t payload_size = compute_payload_size(frame_size, overhead, mtu);
+
+    const std::string& peer_ip = this->peer_ip();
+    auto [local_ip, local_device, local_mac] = core::local_ip_and_mac(peer_ip);
+
+    // Data plane destination addresses
+    uint32_t mac_high = (local_mac[0] << 8) | (local_mac[1] << 0);
+    uint32_t mac_low
+        = ((local_mac[2] << 24) | (local_mac[3] << 16) | (local_mac[4] << 8) | (local_mac[5] << 0));
+    in_addr_t ip = inet_network(local_ip.c_str());
+    uint32_t udp_port = local_data_port;
+
+    // Override those if we're using multicast or broadcast.
+    if (broadcast_port_) {
+        ip = INADDR_BROADCAST;
+        uint8_t broadcast_mac[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+        mac_high = (broadcast_mac[0] << 8) | (broadcast_mac[1] << 0);
+        mac_low = ((broadcast_mac[2] << 24) | (broadcast_mac[3] << 16) | (broadcast_mac[4] << 8) | (broadcast_mac[5] << 0));
+        udp_port = static_cast<uint32_t>(broadcast_port_);
+    } else if (!multicast_.empty()) {
+        ip = inet_network(multicast_.c_str());
+        uint8_t broadcast_mac[] = { 0x01, 0x00, 0x5E, static_cast<uint8_t>((ip >> 16) & 0x7F), static_cast<uint8_t>((ip >> 8) & 0xFF), static_cast<uint8_t>((ip >> 0) & 0xFF) };
+        mac_high = (broadcast_mac[0] << 8) | (broadcast_mac[1] << 0);
+        mac_low = ((broadcast_mac[2] << 24) | (broadcast_mac[3] << 16) | (broadcast_mac[4] << 8) | (broadcast_mac[5] << 0));
+        udp_port = static_cast<uint32_t>(multicast_port_);
+    }
+
+#define PAGES(x) ((x) >> 7)
+    hololink_->write_uint32(hif_address_ + DP_PACKET_SIZE, PAGES(payload_size));
+    hololink_->write_uint32(hif_address_ + DP_PACKET_UDP_PORT, DATA_SOURCE_UDP_PORT);
+    hololink_->write_uint32(vp_address_ + DP_BUFFER_LENGTH, frame_size);
+    hololink_->write_uint32(vp_address_ + DP_HOST_MAC_LOW, mac_low);
+    hololink_->write_uint32(vp_address_ + DP_HOST_MAC_HIGH, mac_high);
+    hololink_->write_uint32(vp_address_ + DP_HOST_IP, ip);
+    hololink_->write_uint32(vp_address_ + DP_HOST_UDP_PORT, udp_port);
+
+    // Enable the current packetizer program.
+    packetizer_program_->enable(*hololink_, sif_address_);
+
+    // Apply VLAN tagging if use_vlan() was called.
+    auto vlan_enabled = enumeration_metadata_.get<int64_t>("vlan_enabled");
+    if (vlan_enabled && vlan_enabled.value() == 1) {
+        auto vlan_id = static_cast<uint16_t>(enumeration_metadata_.get<int64_t>("vlan_id").value());
+        auto sensor_pcp = static_cast<uint8_t>(enumeration_metadata_.get<int64_t>("vlan_sensor_pcp").value());
+        auto evt_pcp = static_cast<uint8_t>(enumeration_metadata_.get<int64_t>("vlan_evt_pcp").value());
+        hololink_->configure_vlan(Hololink::VlanTarget::SENSOR_VP, sensor_, vlan_id, sensor_pcp);
+        hololink_->set_vlan_enable(Hololink::VlanTarget::SENSOR_VP, sensor_, true);
+        hololink_->configure_vlan(Hololink::VlanTarget::EVT, 0, vlan_id, evt_pcp);
+        hololink_->set_vlan_enable(Hololink::VlanTarget::EVT, 0, true);
+    }
+}
+
+int64_t DataChannel::minimum_hsb_ip_version() const
+{
+    return MINIMUM_HSB_IP_VERSION;
+}
+
+void DataChannel::verify_hsb_ip_version()
+{
+    // We're enabling the data plane; make sure the memory map in the distal
+    // device is compatible with what this DataChannel programs.
+    auto hsb_ip_version = enumeration_metadata_.get<int64_t>("hsb_ip_version"); // or None
+    if (!hsb_ip_version) {
+        throw UnsupportedVersion("No 'hsb_ip_version' field found.");
+    }
+    if (hsb_ip_version.value() < minimum_hsb_ip_version()) {
+        throw UnsupportedVersion(fmt::format("hsb_ip_version={:#X}; minimum supported version={:#X}.",
+            hsb_ip_version.value(), minimum_hsb_ip_version()));
+    }
+}
+
+void DataChannel::configure_roce(uint64_t frame_memory, size_t frame_size, size_t page_size, unsigned pages, uint32_t local_data_port)
+{
+    verify_hsb_ip_version();
+
+    // Contract enforcement
+    if (frame_memory & (hololink::core::PAGE_SIZE - 1)) {
+        throw std::runtime_error(fmt::format("frame_memory={:#x} must be {}-byte aligned.", frame_memory, hololink::core::PAGE_SIZE));
+    }
+    if (page_size & (hololink::core::PAGE_SIZE - 1)) {
+        throw std::runtime_error(fmt::format("page_size={:#x} must be {}-byte aligned.", page_size, hololink::core::PAGE_SIZE));
+    }
+    size_t aligned_frame_size = hololink::core::round_up(frame_size, hololink::core::PAGE_SIZE);
+    size_t metadata_size = hololink::core::PAGE_SIZE;
+    size_t aligned_frame_with_metadata = aligned_frame_size + metadata_size;
+    if (frame_size <= hololink::core::PAGE_SIZE) { // Allowing for no metadata mode, to be improved
+        if (page_size < aligned_frame_size) {
+            throw std::runtime_error(fmt::format("page_size={:#x} must be at least {:#x} bytes.", page_size, aligned_frame_size));
+        }
+    } else if (page_size < aligned_frame_with_metadata) {
+        throw std::runtime_error(fmt::format("page_size={:#x} must be at least {:#x} bytes.", page_size, aligned_frame_with_metadata));
+    }
+
+    if (pages > 4096) {
+        throw std::runtime_error(fmt::format("pages={} can be at most 4096.", pages));
+    }
+    if (pages < 1) {
+        throw std::runtime_error(fmt::format("pages={} must be at least 1.", pages));
+    }
+    size_t highest_address = frame_memory + page_size * pages;
+    if (PAGES(highest_address) > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error(fmt::format("highest_address={:#x}; pages={:#x} cannot fit in 32-bits.", highest_address, PAGES(highest_address)));
+    }
+
+    // Clearing DP_VP_MASK should be unnecessary-- we should only
+    // be here following a reset, but be defensive and make
+    // sure we're not transmitting anything while we update.
+    hololink_->and_uint32(hif_address_ + DP_VP_MASK, ~vp_mask_);
+
+    const uint32_t roce_overhead = 74;
+    const uint32_t frame_msb = frame_memory >> 32;
+    const uint32_t frame_lsb = frame_memory & 0xFFFFFFFF;
+    configure_common(frame_size, roce_overhead, local_data_port);
+    hololink_->write_uint32(vp_address_ + DP_QP, qp_number_);
+    hololink_->write_uint32(vp_address_ + DP_RKEY, rkey_);
+    hololink_->write_uint32(vp_address_ + DP_PAGE_LSB, frame_lsb);
+    hololink_->write_uint32(vp_address_ + DP_PAGE_MSB, frame_msb);
+    hololink_->write_uint32(vp_address_ + DP_PAGE_INC, PAGES(page_size));
+    hololink_->write_uint32(vp_address_ + DP_MAX_BUFF, pages - 1);
+
+    // Restore the DP_VP_MASK to re-enable the sensor.
+    hololink_->or_uint32(hif_address_ + DP_VP_MASK, vp_mask_);
+}
+
+void DataChannel::configure_coe(uint8_t channel, size_t frame_size, uint32_t pixel_width, bool vlan_enabled)
+{
+    HSB_LOG_INFO("Enabling 1722 COE: channel={}, frame_size={}, pixel_width={}", channel, frame_size, pixel_width);
+
+    if (channel >= 64) {
+        throw std::runtime_error(fmt::format("channel={} must be less than 64.", channel));
+    }
+
+    if (vlan_enabled) {
+        /* No known HSB version supports VLAN at the moment. */
+        throw std::runtime_error("VLAN is not supported");
+    }
+
+    // Clearing DP_VP_MASK should be unnecessary-- we should only
+    // be here following a reset, but be defensive and make
+    // sure we're not transmitting anything while we update.
+    hololink_->and_uint32(hif_address_ + DP_VP_MASK, ~vp_mask_);
+
+    size_t coe_overhead = 46U; // 14 Ethernet + 12 avtpdu + 12 gisf + 8 coe
+    if (vlan_enabled) {
+        coe_overhead += 4U; // 4 VLAN header
+    }
+    configure_common(frame_size, coe_overhead);
+    const uint32_t enable_1722B = 1;
+    uint32_t line_threshold_log2 = 0;
+    while (true) {
+        if ((1u << line_threshold_log2) >= pixel_width) {
+            break;
+        }
+        line_threshold_log2++;
+        if (line_threshold_log2 > 127) {
+            throw std::runtime_error(fmt::format("pixel_width={} is too large.", pixel_width));
+        }
+    }
+    uint32_t cfg_1722B = (enable_1722B << 24) | (line_threshold_log2 << 25) | channel;
+    hololink_->write_uint32(vp_address_ + DP_QP, cfg_1722B);
+
+    // Restore the DP_VP_MASK to re-enable the sensor.
+    hololink_->or_uint32(hif_address_ + DP_VP_MASK, vp_mask_);
+}
+
+void DataChannel::unconfigure()
+{
+    // This stops transmission.
+    hololink_->and_uint32(hif_address_ + DP_VP_MASK, ~vp_mask_);
+    // Let any in-transit data flush out.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // Clear the ROCE configuration.
+    hololink_->write_uint32(vp_address_ + DP_BUFFER_LENGTH, 0);
+    hololink_->write_uint32(vp_address_ + DP_QP, 0);
+    hololink_->write_uint32(vp_address_ + DP_RKEY, 0);
+    hololink_->write_uint32(vp_address_ + DP_PAGE_LSB, 0);
+    hololink_->write_uint32(vp_address_ + DP_PAGE_MSB, 0);
+    hololink_->write_uint32(vp_address_ + DP_PAGE_INC, 0);
+    hololink_->write_uint32(vp_address_ + DP_MAX_BUFF, 0);
+    hololink_->write_uint32(vp_address_ + DP_HOST_MAC_LOW, 0);
+    hololink_->write_uint32(vp_address_ + DP_HOST_MAC_HIGH, 0);
+    hololink_->write_uint32(vp_address_ + DP_HOST_IP, 0);
+    hololink_->write_uint32(vp_address_ + DP_HOST_UDP_PORT, 0);
+
+    // Disable the packetizer program.
+    packetizer_program_->disable(*hololink_, sif_address_);
+}
+
+void DataChannel::configure_socket(int socket_fd)
+{
+    const std::string& peer_ip = this->peer_ip();
+    auto [local_ip, local_device, local_mac] = core::local_ip_and_mac(peer_ip);
+
+    if (broadcast_port_) {
+        //
+        HSB_LOG_INFO(fmt::format("DataChannel configure_socket socket_fd={} broadcast_port={} local_ip={} local_device={}.", socket_fd, broadcast_port_, local_ip, local_device));
+        int on = 1;
+        // Allow us to receive broadcast.
+        int r = setsockopt(socket_fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+        if (r != 0) {
+            throw std::runtime_error(fmt::format("SO_BROADCAST failed with errno={}: \"{}\"", errno, strerror(errno)));
+        }
+        // Allow other programs to receive these broadcast packets.
+        r = setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+        if (r != 0) {
+            throw std::runtime_error(fmt::format("SO_REUSEPORT failed with errno={}: \"{}\"", errno, strerror(errno)));
+        }
+        // We use INADDR_ANY to receive but listen only to the specific receiver interface.
+        r = setsockopt(socket_fd, SOL_SOCKET, SO_BINDTODEVICE, local_device.data(), local_device.size());
+        if (r != 0) {
+            throw std::runtime_error(fmt::format("SO_BINDTODEVICE failed with errno={}: \"{}\"", errno, strerror(errno)));
+        }
+        // Configure what we listen to.
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(broadcast_port_);
+        address.sin_addr.s_addr = INADDR_ANY;
+        if (bind(socket_fd, (sockaddr*)&address, sizeof(address)) < 0) {
+            throw std::runtime_error(fmt::format("bind failed with errno={}: \"{}\"", errno, strerror(errno)));
+        }
+        HSB_LOG_INFO(fmt::format("(done) DataChannel configure_socket socket_fd={} multicast_address={}.", socket_fd, multicast_));
+    } else if (!multicast_.empty()) {
+        //
+        HSB_LOG_INFO(fmt::format("DataChannel configure_socket socket_fd={} multicast_address={} multicast_port={} local_ip={} local_device={}.", socket_fd, multicast_, multicast_port_, local_ip, local_device));
+        struct ip_mreq mreq = {}; // fill with zeros.
+        int r = inet_aton(multicast_.c_str(), &mreq.imr_multiaddr);
+        if (r) {
+            r = inet_aton(local_ip.c_str(), &mreq.imr_interface);
+        }
+        if (!r) {
+            throw std::runtime_error(fmt::format("DataChannel failed socket configuration for multicast={}.", multicast_));
+        }
+        r = setsockopt(socket_fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+        if (r) {
+            throw std::runtime_error(fmt::format("DataChannel failed to set socket configuration for multicast={}, errno={}.", multicast_, errno));
+        }
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(multicast_port_);
+        if (inet_pton(AF_INET, multicast_.c_str(), &address.sin_addr) != 1) {
+            throw std::runtime_error(
+                fmt::format("Failed to convert address {}", multicast_));
+        }
+
+        if (bind(socket_fd, (sockaddr*)&address, sizeof(address)) < 0) {
+            throw std::runtime_error(fmt::format("bind failed with errno={}: \"{}\"", errno, strerror(errno)));
+        }
+        HSB_LOG_INFO(fmt::format("(done) DataChannel configure_socket socket_fd={} multicast_address={}.", socket_fd, multicast_));
+    } else {
+        // Not multicast; use bind(local_ip,0) so that the kernel assigns us a UDP port.
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(0);
+        if (inet_pton(AF_INET, local_ip.c_str(), &address.sin_addr) != 1) {
+            throw std::runtime_error(
+                fmt::format("Failed to convert address {}", local_ip));
+        }
+
+        if (bind(socket_fd, (sockaddr*)&address, sizeof(address)) < 0) {
+            throw std::runtime_error(fmt::format("bind failed with errno={}: \"{}\"", errno, strerror(errno)));
+        }
+        HSB_LOG_INFO(fmt::format("(done) DataChannel configure_socket socket_fd={} local_ip={}.", socket_fd, local_ip));
+    }
+}
+
+/* static */ void DataChannel::use_data_plane_configuration(Metadata& metadata, int64_t data_plane)
+{
+    auto fpga_uuid = metadata.get<std::string>("fpga_uuid").value();
+    auto enumeration_strategy = hololink::Enumerator::get_uuid_strategy(fpga_uuid);
+    enumeration_strategy->use_data_plane_configuration(metadata, data_plane);
+}
+
+/* static */ void DataChannel::use_sensor(Metadata& metadata, int64_t sensor_number)
+{
+    auto fpga_uuid = metadata.get<std::string>("fpga_uuid").value();
+    auto enumeration_strategy = hololink::Enumerator::get_uuid_strategy(fpga_uuid);
+    enumeration_strategy->use_sensor(metadata, sensor_number);
+}
+
+/* static */ void DataChannel::use_vlan(Metadata& metadata,
+    uint16_t vlan_id, uint8_t sensor_pcp, uint8_t evt_pcp)
+{
+    if (vlan_id == 0 || vlan_id > 0x0FFEu) {
+        throw std::invalid_argument(
+            fmt::format("vlan_id {} out of range [1, 4094]", vlan_id));
+    }
+    metadata["vlan_enabled"] = static_cast<int64_t>(1);
+    metadata["vlan_id"] = static_cast<int64_t>(vlan_id);
+    metadata["vlan_sensor_pcp"] = static_cast<int64_t>(sensor_pcp);
+    metadata["vlan_evt_pcp"] = static_cast<int64_t>(evt_pcp);
+}
+
+class FrameEndSequencer
+    : public Hololink::Sequencer {
+public:
+    FrameEndSequencer(std::shared_ptr<Hololink> hololink, Hololink::Event event)
+        : Hololink::Sequencer()
+        , hololink_(hololink)
+        , event_(event)
+    {
+    }
+
+    void enable() override
+    {
+        done();
+        assign_location(event_);
+        write(*hololink_);
+        hololink_->configure_apb_event(event_, location());
+    }
+
+public:
+    std::shared_ptr<Hololink> hololink_;
+    Hololink::Event event_;
+};
+
+std::shared_ptr<Hololink::Sequencer> DataChannel::frame_end_sequencer()
+{
+    if (!frame_end_event_valid_) {
+        throw std::runtime_error(fmt::format("frame_end_sequencer isn't available for sensor={}.", sensor_));
+    }
+    auto r = std::make_shared<FrameEndSequencer>(hololink_, frame_end_event_);
+    return r;
+}
+
+void DataChannel::set_packetizer_program(std::shared_ptr<PacketizerProgram> program)
+{
+    if (!program) {
+        throw std::runtime_error("Invalid packetizer program");
+    }
+    packetizer_program_ = program;
+}
+
+ReceiverMemoryDescriptor::ReceiverMemoryDescriptor(CUcontext cu_context, size_t size)
+{
+    CudaCheck(cuInit(0));
+    CudaCheck(cuCtxSetCurrent(cu_context));
+    CUdevice device;
+    CudaCheck(cuCtxGetDevice(&device));
+    int integrated = 0;
+
+    // Add enough space to guarantee that the pointer we return
+    // can be page aligned.
+    size_t page_size = getpagesize();
+    size_t page_mask = page_size - 1;
+    // Make sure size isn't gonna overflow
+    if (size > std::numeric_limits<size_t>::max() - 2 * page_size) {
+        throw std::overflow_error(fmt::format("Requested buffer size={:#x} is too large for page-aligned allocation", size));
+    }
+    // DMA-BUF export needs a page-aligned base AND length; round length up and
+    // over-allocate one page so the aligned base still fits the aligned length.
+    size_t aligned_size = hololink::core::round_up(size, page_size);
+    size_t allocation_size = aligned_size + page_size;
+
+    CudaCheck(cuDeviceGetAttribute(&integrated, CU_DEVICE_ATTRIBUTE_INTEGRATED, device));
+
+    // For discrete GPUs, prefer GPU VRAM (cuMemAlloc) so that RDMA data lands
+    // in VRAM directly via GPUDirect RDMA (DMA-BUF path in RoceReceiver).
+    // This requires the system to have GPUDirect RDMA configured correctly
+    // (e.g. nvidia_peermem loaded, IOMMU grants write access to the NIC).
+    //
+    // If GPU VRAM allocation succeeds but cuMemGetHandleForAddressRange fails,
+    // the CUDA driver does not support DMA-BUF export for this allocation, and
+    // RDMA registration would have to fall back to casting the device pointer
+    // as a CPU VA (invalid for discrete GPU). In that case we release the VRAM
+    // and fall through to pinned host memory.
+    //
+    // If DMAR faults appear in dmesg after switching to the GPU VRAM path
+    // ("PTE Write access is not set", fault reason 0x05), the NVIDIA GPU
+    // driver is mapping VRAM pages read-only for the NIC's IOMMU domain.
+    // This silently discards all RDMA data writes. In that case configure
+    // GPUDirect RDMA properly (load nvidia_peermem, or update the driver),
+    // or build with -DHOLOLINK_ROCE_USE_GPU_VRAM=OFF to force pinned host memory.
+    bool use_gpu_vram = (integrated == 0) && HOLOLINK_ROCE_USE_GPU_VRAM;
+    if (use_gpu_vram) {
+        HSB_LOG_DEBUG("Attempting GPU VRAM: size={:#x} aligned_size={:#x} allocation_size={:#x} "
+                      "page_size={:#x}",
+            size, aligned_size, allocation_size, page_size);
+        CUdeviceptr device_deviceptr = 0;
+        CUresult alloc_result = cuMemAlloc(&device_deviceptr, allocation_size);
+        if (alloc_result != CUDA_SUCCESS) {
+            HSB_LOG_INFO("cuMemAlloc failed (result={}); falling back to pinned host memory.", (int)alloc_result);
+            use_gpu_vram = false;
+        } else {
+            // Verify DMA-BUF export is supported for this allocation.
+            // cuMemGetHandleForAddressRange requires page-aligned range; align
+            // the candidate pointer before testing.
+            CUdeviceptr aligned = device_deviceptr;
+            size_t rem = aligned & page_mask;
+            if (rem) {
+                aligned += (page_size - rem);
+            }
+            int dmabuf_fd = -1;
+            CUresult dmabuf_result = cuMemGetHandleForAddressRange(
+                (void*)&dmabuf_fd, aligned, aligned_size,
+                CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+            if (dmabuf_fd >= 0) {
+                ::close(dmabuf_fd);
+            }
+            if (dmabuf_result != CUDA_SUCCESS) {
+                HSB_LOG_INFO("cuMemGetHandleForAddressRange failed (result={}); "
+                             "could not export this GPU VRAM allocation as a DMA-BUF. "
+                             "Falling back to pinned host memory.",
+                    (int)dmabuf_result);
+                cuMemFree(device_deviceptr);
+                use_gpu_vram = false;
+            } else {
+                // DMA-BUF export works; commit to the GPU VRAM allocation.
+                deviceptr_.reset(device_deviceptr);
+                mem_ = aligned;
+                // host_ptr_ stays nullptr: RoceReceiver will use ibv_reg_dmabuf_mr.
+                HSB_LOG_INFO("Using GPU VRAM: device_ptr={:#x} size={:#x}", mem_, size);
+            }
+        }
+    }
+
+    if (!use_gpu_vram) {
+        // Pinned host memory: accessible from both CPU and GPU, and always
+        // mapped with read/write IOMMU access for all PCIe devices.  RDMA
+        // writes land here directly; the GPU reads via the device-mapped ptr.
+        host_deviceptr_.reset([allocation_size] {
+            void* host_deviceptr;
+            unsigned int flags = CU_MEMHOSTALLOC_DEVICEMAP;
+            CudaCheck(cuMemHostAlloc(&host_deviceptr, allocation_size, flags));
+            return host_deviceptr;
+        }());
+
+        CUdeviceptr device_deviceptr;
+        CudaCheck(cuMemHostGetDevicePointer(&device_deviceptr, host_deviceptr_.get(), 0));
+        CUdeviceptr mem = device_deviceptr;
+        // Round up size to page boundary;
+        // Note: host_deviceptr_ is what we'll free; don't try to free mem_.
+        size_t rem = mem & page_mask;
+        if (rem) {
+            mem += (page_size - rem);
+        }
+        mem_ = mem;
+
+        // Compute the aligned host CPU pointer (same offset as device pointer).
+        size_t offset = mem - device_deviceptr;
+        host_ptr_ = static_cast<uint8_t*>(host_deviceptr_.get()) + offset;
+        HSB_LOG_INFO("Using pinned host memory: host_ptr={} device_ptr={:#x} size={:#x}",
+            host_ptr_, mem_, size);
+    }
+}
+
+} // namespace hololink

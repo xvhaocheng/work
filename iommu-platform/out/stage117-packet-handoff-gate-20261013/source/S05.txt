@@ -1,0 +1,105 @@
+1800: 	struct rte_mbuf **pkts, uint32_t count, int16_t dma_id, uint16_t vchan_id)
+1801: 	__rte_requires_capability(&vq->access_lock)
+1802: 	__rte_requires_shared_capability(&vq->iotlb_lock)
+1803: {
+1804: 	struct buf_vector buf_vec[BUF_VECTOR_MAX];
+1805: 	uint32_t pkt_idx = 0;
+1806: 	uint16_t num_buffers;
+1807: 	uint16_t avail_head;
+1808: 
+1809: 	struct vhost_async *async = vq->async;
+1810: 	struct async_inflight_info *pkts_info = async->pkts_info;
+1811: 	uint32_t pkt_err = 0;
+1812: 	uint16_t n_xfer;
+1813: 	uint16_t slot_idx = 0;
+1814: 
+1815: 	/*
+1816: 	 * The ordering between avail index and desc reads need to be enforced.
+1817: 	 */
+1818: 	avail_head = rte_atomic_load_explicit((unsigned short __rte_atomic *)&vq->avail->idx,
+1819: 		rte_memory_order_acquire);
+1820: 
+1821: 	rte_prefetch0(&vq->avail->ring[vq->last_avail_idx & (vq->size - 1)]);
+1822: 
+1823: 	async_iter_reset(async);
+1824: 
+1825: 	for (pkt_idx = 0; pkt_idx < count; pkt_idx++) {
+1826: 		uint64_t pkt_len = pkts[pkt_idx]->pkt_len + dev->vhost_hlen;
+1827: 		uint16_t nr_vec = 0;
+1828: 
+1829: 		if (unlikely(reserve_avail_buf_split(dev, vq, pkt_len, buf_vec,
+1830: 						&num_buffers, avail_head, &nr_vec) < 0)) {
+1831: 			VHOST_DATA_LOG(dev->ifname, DEBUG,
+1832: 				"failed to get enough desc from vring");
+1833: 			vq->shadow_used_idx -= num_buffers;
+1834: 			break;
+1835: 		}
+1836: 
+1837: 		VHOST_DATA_LOG(dev->ifname, DEBUG,
+1838: 			"current index %d | end index %d",
+1839: 			vq->last_avail_idx, vq->last_avail_idx + num_buffers);
+1840: 
+1841: 		if (mbuf_to_desc(dev, vq, pkts[pkt_idx], buf_vec, nr_vec, num_buffers, true) < 0) {
+1842: 			vq->shadow_used_idx -= num_buffers;
+1843: 			break;
+1844: 		}
+1845: 
+1846: 		slot_idx = (async->pkts_idx + pkt_idx) & (vq->size - 1);
+1847: 		pkts_info[slot_idx].descs = num_buffers;
+1848: 		pkts_info[slot_idx].mbuf = pkts[pkt_idx];
+1849: 
+1850: 		vq->last_avail_idx += num_buffers;
+1851: 		vhost_virtqueue_reconnect_log_split(vq);
+1852: 	}
+1853: 
+1854: 	if (unlikely(pkt_idx == 0))
+1855: 		return 0;
+1856: 
+1857: 	n_xfer = vhost_async_dma_transfer(dev, vq, dma_id, vchan_id, async->pkts_idx,
+1858: 			async->iov_iter, pkt_idx);
+1859: 
+1860: 	pkt_err = pkt_idx - n_xfer;
+1861: 	if (unlikely(pkt_err)) {
+1862: 		uint16_t num_descs = 0;
+1863: 
+1864: 		VHOST_DATA_LOG(dev->ifname, DEBUG,
+1865: 			"%s: failed to transfer %u packets for queue %u.",
+1866: 			__func__, pkt_err, vq->index);
+1867: 
+1868: 		/* update number of completed packets */
+1869: 		pkt_idx = n_xfer;
+1870: 
+1871: 		/* calculate the sum of descriptors to revert */
+1872: 		while (pkt_err-- > 0) {
+1873: 			num_descs += pkts_info[slot_idx & (vq->size - 1)].descs;
+1874: 			slot_idx--;
+1875: 		}
+1876: 
+1877: 		/* recover shadow used ring and available ring */
+1878: 		vq->shadow_used_idx -= num_descs;
+1879: 		vq->last_avail_idx -= num_descs;
+1880: 		vhost_virtqueue_reconnect_log_split(vq);
+1881: 	}
+1882: 
+1883: 	/* keep used descriptors */
+1884: 	if (likely(vq->shadow_used_idx)) {
+1885: 		uint16_t to = async->desc_idx_split & (vq->size - 1);
+1886: 
+1887: 		store_dma_desc_info_split(vq->shadow_used_split,
+1888: 				async->descs_split, vq->size, 0, to,
+1889: 				vq->shadow_used_idx);
+1890: 
+1891: 		async->desc_idx_split += vq->shadow_used_idx;
+1892: 
+1893: 		async->pkts_idx += pkt_idx;
+1894: 		if (async->pkts_idx >= vq->size)
+1895: 			async->pkts_idx -= vq->size;
+1896: 
+1897: 		async->pkts_inflight_n += pkt_idx;
+1898: 		vq->shadow_used_idx = 0;
+1899: 	}
+1900: 
+1901: 	return pkt_idx;
+1902: }
+1903: 
+1904: 

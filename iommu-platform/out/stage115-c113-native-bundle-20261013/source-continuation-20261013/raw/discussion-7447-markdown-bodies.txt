@@ -1,0 +1,157 @@
+
+[markdown-body]
+
+        
+Hey there, I wanted to ask if somebody can explain a thing I've encountered lately when using DeepSpeed-ZerO-Infinity with transformers.
+
+
+So I use the vanilla integration and configured DeepSpeed with the following json-file:
+
+
+
+{
+  "train_batch_size": "auto",
+  "gradient_accumulation_steps": "auto",
+
+  "zero_optimization": {
+    "stage": 3,
+
+    "offload_param":    { "device": "nvme", "nvme_path": "/home/local/mem", "pin_memory": true, "buffer_count": 200, "buffer_size": 4194304 },
+    "offload_optimizer":{ "device": "cpu", "nvme_path": "/home/local/mem", "pin_memory": true },
+    "stage3_prefetch_bucket_size":  0,
+    "stage3_max_reuse_distance":    0,
+    
+    "memory_efficient_linear": true,
+    "overlap_comm": true,
+    "contiguous_gradients": true
+  }
+}
+
+
+
+
+while the corresponding yaml looks like this:
+
+
+
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  deepspeed_config_file: ds_config.json
+  zero3_init_flag: false
+distributed_type: DEEPSPEED
+enable_cpu_affinity: false
+machine_rank: 0
+main_training_function: main
+num_machines: 1
+num_processes: 1
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+
+
+
+
+Accelerate launches DeepSpeed as it should and starts to offload parameters.
+
+
+Now I tried to apply DeepSpeed on Qwen/Qwen3-0.6B and PeFT + the GRPOTrainer from trl.
+
+
+The thing I wonder about is:
+
+
+You might have noticed
+
+
+
+"offload_param":    { "device": "nvme", "nvme_path": "/home/local/mem", "pin_memory": true, "buffer_count": 200, "buffer_size": 4194304 }, 
+
+
+
+
+in my config.json. Which differs widely from the parameters that the documentation recommends.
+
+
+If I look into the swap-folder /home/local/mem I can see several (197) swp files, which all stand for a layer that has to be offloaded. They are quite small except for  the first one (0).
+
+
+The token embedding layer (0) has around 311000000 byte (311 MB) in FP16 for Qwen3-0.6B, the linear layers are 2, 4, 6 MB so that is a huge difference. This also is visible in the sizes of the files which are saved in the memory dir.
+
+
+
+As every .swp file reflects a singular buffer in the all_gather operation I have 196 buffers which are small and one that is large.
+
+
+The only choice I can make for buffer_size in the json-configuration is a single parameter count (multiplied by the parameter bytes internally), which needs to fit all.
+
+
+So if I choose "4194304" any of the Qwen layers to be offloaded will fit, except for token_embedding_layer which seems to be marked swappable by deepspeed.
+
+
+Persistence on other devices is checked by the total parameter count but only for the lower bound, so anything smaller then x will never be offloaded.
+
+
+
+A little dig into the code:
+
+
+In "deepspeed/runtime/zero/partition_parameters.py" (line 1665 for the 0.17.2 branch) this is the place where parameters are prepared for nvme offloading.
+
+
+
+            if param.ds_tensor is None:
+                final_location = None
+                if self.remote_device == OffloadDeviceEnum.nvme and self.param_swapper.swappable_tensor(
+                        numel=partition_size):
+
+
+
+
+When I run DeepSpeed I get the following error:
+
+
+[rank0]: AssertionError: More elements 155582464 than buffer size 4194304
+
+
+As the token embedding layer exceeds the buffer, where all of the other layers would fit.
+
+
+If I change the condition to:
+
+
+
+            if param.ds_tensor is None:
+                final_location = None
+                if self.remote_device == OffloadDeviceEnum.nvme and self.param_swapper.swappable_tensor(
+                        numel=partition_size)  and partition_size < 1e8:
+
+
+
+
+DeepSpeed-Infinity goes to work and works fine, as the execution continues in the else-branch and as a consequence the large layer is reserved either on the RAM or in GPU memory, but not on the nvme and I can use DeepSpeed.
+
+
+
+
+So my question is, how am I supposed to handle this in the best way, can I mark the layer as non-offloadable by configuration? Or is there a better way? The token embedding layer seems to be often quite sizeable in comparison to other linear layers.
+
+
+    
+[markdown-body]
+
+        
+I'm also not quite sure if the amount of buffers I chose is correct, but in the all_gather operation all of them should be pulled at once from the NVMe so the small value (5) in conjunction with the buffer_size of 1e9 that the documentation provides also leads to an error in my case. Where it says
+
+
+
+[rank0]:     assert len(swap_in_paths) <= len(
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: AssertionError: Not enough buffers 5 for swapping 197
+
+
+
+    
