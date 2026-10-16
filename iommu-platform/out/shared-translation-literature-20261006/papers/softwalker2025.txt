@@ -1,0 +1,1984 @@
+ SoftWalker: Supporting Software Page Table Walk for Irregular
+                      GPU Applications
+                   Sungbin Jang                                            Junhyeok Park∗                                      Yongho Lee
+            Sungkyunkwan University                           Electronics and Telecommunications                       Sungkyunkwan University
+            Suwon, Republic of Korea                                   Research Institute                              Suwon, Republic of Korea
+              sunbi3361@skku.edu                                   Daejeon, Republic of Korea                             jhyn205@skku.edu
+                                                                      vzx00770@etri.re.kr
+
+                    Osang Kwon                                             Donghyun Kim                                      Juyoung Seok
+            Sungkyunkwan University                                  Sungkyunkwan University                           Sungkyunkwan University
+            Suwon, Republic of Korea                                 Suwon, Republic of Korea                          Suwon, Republic of Korea
+               osang915@skku.edu                                      ehdgus583205@skku.edu                              tjrwndud5@skku.edu
+
+                                                                             Seokin Hong
+                                                                     Sungkyunkwan University
+                                                                     Suwon, Republic of Korea
+                                                                         seokin@skku.edu
+Abstract                                                                                  Keywords
+Address translation has become a significant and growing perfor-                          GPGPU, Virtual Memory, Address Translation, Page Table Walk
+mance bottleneck in modern GPUs, especially for emerging irregu-
+lar applications with high TLB miss rates. The limited concurrency                        ACM Reference Format:
+of hardware Page Table Walkers (PTWs), due to their small and                             Sungbin Jang, Junhyeok Park, Yongho Lee, Osang Kwon, Donghyun Kim,
+                                                                                          Juyoung Seok, and Seokin Hong. 2025. SoftWalker: Supporting Software
+fixed number, causes severe contention and substantial queueing de-
+                                                                                          Page Table Walk for Irregular GPU Applications. In 58th IEEE/ACM In-
+lays under high translation pressure, which significantly degrades
+                                                                                          ternational Symposium on Microarchitecture (MICRO ’25), October 18–22,
+performance.                                                                              2025, Seoul, Republic of Korea. ACM, New York, NY, USA, 17 pages. https:
+   This paper introduces SoftWalker, a novel, scalable, and flexible                      //doi.org/10.1145/3725843.3756056
+framework that fundamentally shifts the GPU page table walking
+from fixed-function hardware to software execution. SoftWalker
+leverages the GPU’s massive thread-level parallelism by dynami-                           1    Introduction
+cally dispatching specialized, lightweight software threads running                       Modern Graphics Processing Units (GPUs) have become indispens-
+on GPU cores to handle TLB misses requiring page table walks. In                          able accelerators for a wide range of tasks, from scientific simu-
+addition, to expand L2 TLB MSHR capacity on demand, SoftWalker                            lations and data analytics to deep learning and graphics render-
+incorporates In-TLB MSHRs, a key innovation that repurposes un-                           ing [11, 26, 40, 64, 67, 92, 95]. To support the increasingly large
+derutilized L2 TLB entries to track outstanding misses when existing                      datasets and complex memory access patterns characteristic of
+MSHRs are saturated. By alleviating MSHR-induced contention,                              these applications, GPUs have incorporated sophisticated virtual
+this design preserves the key advantage of highly parallel page                           memory systems. This trend is further accelerated by the advent
+table walking in software. SoftWalker enables thousands of concur-                        of high-speed interconnects like NVLink [63, 69] and Compute
+rent page table walks, significantly reducing PTW-level contention                        Express Link (CXL) [15, 51, 73]. These technologies allow multiple
+and translation queueing delays. As a result, it achieves an average                      GPUs or system-level memory expansions to be combined into a
+reduction of 72.8% in page walk latency and delivers an average                           single, large memory domain, positioning the virtual memory sys-
+speedup of 2.24× (3.94× for irregular workloads).                                         tem as the cornerstone for abstracting data location and enabling
+                                                                                          seamless access across the expanded, heterogeneous memory space.
+CCS Concepts                                                                              Consequently, these virtual memory systems provide benefits like
+• Computing methodologies → Graphics processors; • Soft-                                  larger address spaces, programmability, and support for advanced
+ware and its engineering → Virtual memory.                                                features such as unified memory and demand paging [3, 43, 84]. Cen-
+                                                                                          tral to GPU virtual memory is the address translation mechanism,
+∗ This work was done while the author was at Sungkyunkwan University.
+                                                                                          which maps virtual addresses generated by GPU threads to physical
+                                                                                          addresses. This process typically relies on a hierarchy of Translation
+                                                                                          Lookaside Buffers (TLBs) to cache recent translations and hardware
+This work is licensed under a Creative Commons Attribution 4.0 International License.     Page Table Walkers (PTWs) to resolve TLB misses by traversing
+MICRO ’25, Seoul, Republic of Korea                                                       multi-level page tables residing in memory [36, 46, 47, 60, 75, 76].
+© 2025 Copyright held by the owner/author(s).
+ACM ISBN 979-8-4007-1573-0/25/10                                                             Despite many benefits, address translation is increasingly be-
+https://doi.org/10.1145/3725843.3756056                                                   coming a significant bottleneck, particularly for applications with
+
+
+
+
+                                                                                    401
+MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea                                                                                                       Jang, et al.
+
+
+    LD/ST instruction     ALU instruction                        SM stall      Warp stall
+                                                                                                   contention in a limited number of PTWs. In contrast, our approach
+                                                                                                   offloads the TLB misses to one of the SMs by launching a PW Warp.
+ Warp 1
+ Warp 2                    Queueing Delay      PW Latency Data                                     This warp executes a lightweight software routine that traverses
+ Warp 3
+ Warp 4
+                                                                                                   the page table hierarchy, thereby repurposing idle GPU execution
+                                                                                      Time
+                                                                                                   resources to serve as on-demand page table walkers. Since the GPU
+                                                                                                   can launch enough PW Warps to handle a large number of concur-
+                                      (a) Baseline                                                 rent TLB misses, SoftWalker can eliminate queueing delays caused
+    LD/ST instruction     ALU instruction      PTW instruction   SM stall      Warp stall          by limited PTW resources. As a result, our approach resolves stalls
+                                                                                                   associated with address translation faster than the baseline, leading
+  Warp 1                                                                                           to significant performance improvement.
+  Warp 2                 PW Latency     Data                           Saved Cycles
+  Warp 3                                                                                              SoftWalker incorporates two architectural innovations to enable
+  Warp 4
+ PW Warp                 SW Walking
+                                                                                                   this software-based approach by overcoming associated challenges.
+                                                                                                   First, it introduces PW Warps, which are isolated from regular user
+                                                                                      Time
+                                                                                                   warps to maintain security and avoid interfering with application
+                                    (b) SoftWalker                                                 parallelism. SoftWalker implements PW Warps on each SM with
+                        Figure 1: SoftWalker Overview                                              minimal hardware overhead. Second, to address the bottleneck
+                                                                                                   caused by the limited number of L2 TLB MSHRs, it introduces In-
+irregular memory access patterns [6, 7, 35, 45, 49, 72, 85, 86]. Un-                               TLB MSHRs inspired by In-Cache MSHRs [21]. This mechanism
+like regular workloads with coalesced memory accesses, irregular                                   repurposes underutilized L2 TLB entries themselves to temporarily
+applications (common in graph processing, sparse linear algebra,                                   store metadata for pending TLB misses when the dedicated hard-
+and database operations) often exhibit scattered, fine-grained mem-                                ware MSHRs are full. In-TLB MSHR notably expands the system’s
+ory accesses with poor spatial and temporal locality. Consequently,                                capacity to track concurrent outstanding translations without re-
+threads within the same warp often access different memory pages,                                  quiring large, power-hungry hardware MSHR structures and allows
+exceeding the limited capacity of on-chip TLBs and resulting in                                    more page walks to be processed in parallel.
+frequent TLB misses.                                                                                  Together, SoftWalker can support thousands of concurrent page
+   Conventional GPUs attempt to handle these TLB misses using                                      walks, effectively eliminating the contention-induced queueing de-
+a small, fixed number of hardware-based PTWs [6, 23, 45, 49, 52,                                   lays that plague hardware-based page walk systems under high
+53, 72, 77, 78, 86, 94]. While this design is sufficient for workloads                             TLB miss pressure. Converting stall cycles, often prevalent during
+with high TLB hit rates, its limited scalability in parallelizing page                             long-latency memory operations (including address translation)
+walks through hardware PTWs introduces a critical bottleneck                                       in irregular workloads, into productive page-walking work, Soft-
+under high translation pressure. When numerous TLB misses oc-                                      Walker improves address translation throughput and overall GPU
+cur simultaneously across thousands of active threads, the limited                                 resource utilization. Our evaluation demonstrates that SoftWalker
+number of hardware PTWs becomes a heavily contended resource.                                      significantly reduces page table walk latency by an average of 72.6%
+This contention leads to substantial queueing delays, as translation                               and achieves substantial application speedups of 2.24x on average
+requests are buffered until a PTW becomes available. Our experi-                                   across diverse workloads (3.94x for irregular workloads). To ensure
+mental results reveal that for irregular workloads, queueing delay                                 compatibility with latency-sensitive regular workloads, SoftWalker
+accounts for 95% of the total page table walk latency on average                                   can operate in a hybrid mode that retains conventional hardware
+(see Section 3.3 for more details), far exceeding the actual page                                  PTWs and selectively uses software-based walkers only when nec-
+table traversal time. While scaling the number of hardware PTWs                                    essary, enabling flexible and practical deployment across diverse
+may reduce queueing delays, it incurs substantial area and power                                   GPU environments.
+overheads and requires proportionally larger associated structures                                    The key contributions of this paper are as follows:
+like Miss Status Holding Registers (MSHRs) and Page Walk Buffers                                        • Detailed Analysis on Page Walk Contentions. We pro-
+(PWBs), posing scalability challenges [23, 77, 86].                                                         vide a detailed analysis of GPU workloads that show irregular
+   To address this challenge, this paper introduces SoftWalker, a                                           memory access patterns, highlighting severe contention in
+scalable and flexible framework that performs GPU page table walk-                                          page table walks. This motivates the need for scalable page
+ing entirely in software. Instead of relying solely on fixed-function                                       walk mechanisms.
+hardware, SoftWalker leverages the inherent massive Thread-Level                                        • Software-Defined Page Walk Framework. We propose
+Parallelism (TLP) of the GPU itself to perform page table walks.                                            SoftWalker, the first software-defined framework for GPU
+The key idea is to dynamically launch specialized, lightweight GPU                                          page table walk. It utilizes specialized software threads (PW
+threads (termed Page Walk Warps or PW Warps) to handle TLB                                                  Warps) executed on SMs to dynamically scale page walk
+misses by leveraging idle GPU cycles. Figure 1 depicts the concep-                                          concurrency by leveraging the GPU’s inherent thread-level
+tual overview of SoftWalker. When there are a massive number of                                             parallelism and converting idle compute resources into on-
+TLB misses in the baseline architecture, the Streaming Multipro-                                            demand walkers. This design addresses the scalability limi-
+cessors (SMs)1 are stalled due to high queueing delay caused by                                             tations of fixed hardware PTWs fundamentally.
+                                                                                                        • Architectural Integration. We detail the architectural sup-
+1We use NVIDIA’s terminology in this paper. However, our proposed technique is                              port for SoftWalker, including PW Warp management (Soft-
+general and applicable to other GPU architectures (e.g., AMD, Intel).                                       PWB, SoftWalker Controller, Request Distributor) and minimal
+
+
+
+
+                                                                                             402
+SoftWalker: Supporting Software Page Table Walk for Irregular GPU Applications                                            MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea
+
+
+        ISA extensions (LDPT, FL2T, FPWC, FFB). Furthermore, we in-
+                                                                                                                                                      L2 TLB coverage (1024 entries)
+        troduce In-TLB MSHRs, a lightweight and flexible technique
+        that repurposes underutilized L2 TLB entries as temporary
+        storage to track outstanding TLB misses.
+      • Evaluation. We evaluate SoftWalker across diverse work-
+        loads and various configurations, demonstrating on average
+        72.8% reduction in translation latency and a 2.24× perfor-                                                                   (a) nw
+        mance improvement.
+
+           GPU Core               Page Walk Requests
+    Reg.    ①SIMT Core
+    File
+                                 ⑤ Page Walk Buffer
+               ②L1 TLB
+    L1 Cache                                                 ⑧ Page Table
+                 MSHRs                 ⑥
+                                                            (Cache hierarchy)
+               ③L2 TLB         PTW*   PTW    •••   PTW
+  L2D Cache
+               ④MSHRs                                                                                                                (b) bfs
+
+ GDDR/HBM      Page Walk        ⑦ Page Walk Cache
+               Subsystem                                  *PTW: Page Table Walker
+
+ Figure 2: GPU architecture with virtual memory support
+
+2 Background and Motivation
+2.1 GPU Virtual Memory                                                                                                               (c) 2dc
+Memory virtualization in GPUs is essential for supporting large                           Figure 3: Access patterns of two irregular (nw [13], bfs [58])
+address spaces and enabling unified memory access between CPUs                            applications and one regular (2dc [24]) application. For each
+and GPUs. GPUs employ a multi-level TLB hierarchy to reduce ad-                           application, the left figure shows the overall view of memory
+dress translation overheads by caching virtual-to-physical address                        access pattern, while the right figure shows a zoomed-in view
+mappings. Typically, each SM has a private L1 TLB, while a large                          of the red-boxed region in the left. We use a 64KB page size
+L2 TLB is shared among all SMs [45, 77].                                                  in this experiment.
+   Figure 2 depicts the address translation process in GPUs. When
+an SM issues global memory access, it first looks up the TLB to                              To analyze the memory access pattern in page granularity, we
+translate the virtual address to a physical address before accessing                      profile the addresses of global load/store instructions for three ap-
+the cache hierarchy (①). On a TLB miss (②-③), the Miss Status                             plications in the real GPU environment. Figure 3 shows the memory
+Holding Registers (MSHRs) of each TLB hold the information of the                         access pattern of nw, bfs, and 2dc in 64KB page granularity. The
+missed request and forward it to the next TLB level or Page Walk                          x-axis of each graph represents cycles, while the y-axis represents
+Subsystem (④). Then, the Page Walk Subsystem buffers missed                               the page indexes. The 2dc shows a regular access pattern, sequen-
+requests of L2 TLB into the Page Walk Buffer (PWB) (⑤). GPUs                              tially accessing the contiguous region. Such a pattern allows GPUs
+rely on a highly threaded Page Table Walker (PTW) to handle a                             to highly utilize their pipeline and memory bandwidth with a high
+large number of page table walk requests simultaneously generated                         TLB hit rate. In contrast, nw and bfs exhibit irregular memory ac-
+by thousands of threads [75, 76]. In this paper, the terms ‘page                          cess patterns, accessing a wide range of address space within a
+table walk’ and ‘page walk’ are used interchangeably to refer to the                      short time window. These access patterns easily exceed the L2 TLB
+process of translating a virtual address into a physical address by                       coverage, resulting in frequent TLB misses and contention at PTWs.
+traversing the page table structure. The idle PTW selects a page                             To estimate page walk contention on a real GPU (NVIDIA A2000),
+walk request from the PWB and traverses page tables by issuing                            we develop a microbenchmark that generates a variable number
+a memory request to the cache hierarchy (⑥). Since conventional                           of concurrent page walks by issuing memory accesses from warps
+GPUs adopt multi-level radix page tables [45, 60], the PTW sequen-                        with one active thread, each accessing a distinct cache line. As
+tially accesses each level of page tables (⑧). Page Walk Cache (PWC)                      shown in Figure 4, average memory access latency increases pro-
+enables PTWs to skip accessing intermediate levels of page tables                         portionally with the degree of concurrency. This trend directly
+by caching recently accessed Page Table Entries (PTEs) (⑦).
+                                                                                                                   5000
+                                                                                                Avg. Load Cycles
+
+
+
+
+                                                                                                                   4000
+2.2     Characteristics of GPU Address Translation                                                                 3000
+                                                                                                                                                   Latency increases by 4x
+Modern GPUs leverage coalescing to maintain high throughput                                                        2000
+                                                                                                                   1000
+for regular workloads, merging a warp’s memory accesses and                                                           0
+translation requests when they fall within the same cache line
+                                                                                                                            1
+
+
+
+
+                                                                                                                          112
+                                                                                                                          128
+                                                                                                                          144
+                                                                                                                          160
+                                                                                                                          176
+                                                                                                                          192
+                                                                                                                          208
+                                                                                                                          224
+                                                                                                                          240
+                                                                                                                          256
+                                                                                                                           16
+                                                                                                                           32
+                                                                                                                           48
+                                                                                                                           64
+                                                                                                                           80
+                                                                                                                           96
+
+
+
+
+or page [12, 81, 82]. However, this model easily fails for irregular                                                         Number of Concurrent Page Walks
+workloads. The scattered memory accesses can cause a single warp
+instruction to trigger up to 32 distinct cache and TLB lookups,                           Figure 4: Average memory access latency of the NVIDIA
+thereby decreasing the overall performance [6, 75, 76, 85, 86].                           A2000 as the number of concurrent page walks increases.
+
+
+
+
+                                                                                    403
+MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea                                                                                                                                      Jang, et al.
+
+
+                                                    32 PTWs         64     128   256      512          1024         Ideal PTWs & MSHRs
+                                                                                          14.3 14.8 14.8
+           10
+            8
+ Speedup
+
+
+
+
+            6
+            4
+            2
+            0
+                 bc   dc   sssp   gc   nw    st2d    xsb      bfs        sy2k spmv gesv      gups                   cc      kc     2dc      fft    histo         red        scan gemm                 GM
+
+                                                Figure 5: Impact of increasing PTWs on performance.
+
+indicates contention; in an ideal system without bottlenecks, the                               Table 1: Comparison with prior works mitigating page walks
+latency would remain relatively constant regardless of the number                                                                                                              Need HW         Page walk
+                                                                                                                            Purpose         Approach       Flexibility
+                                                                                                                                                                              page walker?    throughput
+of concurrent requests. At 256 concurrent walks, the latency in-
+                                                                                                                             Reducing
+creases by 4x compared to a single walk, confirming that page walk                                    NHA [86]
+                                                                                                                           # page walks
+                                                                                                                                            Coalescing               No           Yes           ∼16 ×
+                                                                                                   Page Walk                 Reducing
+contention is a significant performance bottleneck in real GPUs.                                 Scheduling [85]         warp divergence
+                                                                                                                                            Scheduling               No           Yes                 X
+
+   Based on the observed memory access patterns and contention                                         HPT [32]
+                                                                                                                            Removing          Hashed
+                                                                                                                                                                     No           Yes                 X
+                                                                                                                         pointer chasing    Page Table
+in page walks, we conduct a simulation-based study to evaluate                                       SoftWalker          Increasing page     Software          O
+                                                                                                                                                                                  No          32 × (# SMs)
+                                                                                                       (Ours)            walk throughput      Thread       (SW-based)
+the performance impact of PTW contention. Along with increasing
+the number of PTWs, we also enlarge the L2 TLB MSHR and PWB
+entries proportionally to accommodate the additional walkers. De-                                              32 PTWs     Ideal PTWs & MSHRs                        32 PTWs     Ideal PTWs & MSHRs
+                                                                                                                                  5.3 6.2   8.1   14.2                                  5.9     4.7       9.7
+tailed experimental configurations and benchmark information are                                           4                                                         4
+
+
+
+
+                                                                                                                                                           Speedup
+                                                                                                 Speedup
+                                                                                                           3                                                         3
+in Table 3 and Table 4. Figure 5 shows the speedup of each appli-                                          2                                                         2
+cation with increasing PTWs, normalized to the 32-PTW baseline.                                            1                                                         1
+                                                                                                           0                                                         0
+The results show that in the ideal case, where there is no page walk
+
+
+
+
+                                                                                                                                                                             bc
+                                                                                                                                                                             dc
+
+                                                                                                                                                                            nw
+
+
+
+
+                                                                                                                                                                          spmv
+                                                                                                                                                                           sssp
+
+
+
+
+                                                                                                                                                                           gesv
+                                                                                                                                                                           sy2k
+
+
+                                                                                                                                                                           gups
+                                                                                                                                                                            xsb
+                                                                                                                                                                            bfs
+                                                                                                                   bc
+                                                                                                                   dc
+                                                                                                                 sssp
+
+                                                                                                                  nw
+
+
+
+
+                                                                                                                spmv
+                                                                                                                 gesv
+                                                                                                                   gc
+
+
+
+                                                                                                                  bfs
+                                                                                                                 sy2k
+
+
+                                                                                                                 gups
+                                                                                                                 st2d
+                                                                                                                  xsb
+contention, the GPU achieves an average speedup of 2.58× over the
+baseline with 32 PTWs. Especially for irregular applications, which                                 (a) Page table walk coalescing                                       (b) Large page (2MB)
+require more than 32 PTWs to reach peak performance, the GPU
+achieves an average speedup of 4.84× over the baseline. While reg-                              Figure 6: Impact of page table walk contention under large
+ular applications are sufficient with 32 PTWs, irregular applications                           pages and page walk coalescing
+require PTWs from 256 to 1024 to fully resolve contention in page
+walks. These findings indicate that PTW contention significantly                                Scheduling Page Table Walk Requests. Shin et al. [85] proposed
+degrades overall performance by stalling address translation and                                a page walk scheduling mechanism to mitigate latency imbalance
+leaving other resources, such as execution pipelines, underutilized.                            within a warp. They reduce the latency gap between the first and
+   While increasing the number of PTWs improves performance, it                                 the last completed page walk requests in the same warp instruction
+is not a scalable or practical solution due to excessive power and                              by scheduling page table walk requests. Although this technique de-
+area overheads [23, 77, 86]. Increasing PTWs requires more entries                              creases the stall cycles of a warp, it cannot resolve the fundamental
+in the L2 TLB MSHR and PWB, which are commonly implemented                                      cause of page table walk contentions.
+using fully associative structures, incurring significant power and                             Hashed Page Table. Hashed Page Tables [29, 32, 48, 87, 88, 98]
+area overheads [22, 27, 30, 50]. Therefore, a fundamentally different                           mitigate page walk overhead by replacing multiple page table steps
+approach is required to increase the throughput of page walks.                                  with a hash-based single access. FS-HPT [32] adopted a Hashed
+                                                                                                Page Table (HPT) to the GPU virtual memory system to mitigate
+                                                                                                page walk overhead. By exploiting the insight that GPU HPT has a
+2.3             Mitigating Page Walk Overheads in GPUs                                          lower hash collision rate than CPU, it removed sequential accesses
+As discussed above, contention during page walks results in signifi-                            to each level of the page tables. However, FS-HPT aims to reduce
+cant performance degradation, as it stalls the pipeline and underuti-                           memory accesses per page walk request, not increase the page walk
+lizes the cache hierarchy. Rather than simply increasing the number                             throughput. Therefore, HPT-equipped GPUs will still suffer from
+of PTWs, prior studies have explored alternative approaches from                                contention in PTW.
+various perspectives to address this challenge.                                                 TLB-Related Techniques. One of the strongest methods to reduce
+Coalescing Page Table Walk Requests. Neighborhood-Aware                                         page walks is to increase the TLB hit rate. CoLT [74], Mosaic [6],
+page table walk (NHA) [86] proposed a page table walk coalescing                                and SnakeByte [49] extended TLB reach by coalescing PTEs of a
+mechanism, which merges multiple page walk requests targeting                                   contiguous virtual address region into a single entry. The coalesced
+the same cache line into a single request. Since GPU accesses cache                             entry can cover wider address regions than the system page size by
+hierarchy in a cacheline granularity (32-128B), this strategy can                               introducing multiple valid bits in each entry or recursive merging.
+merge up to 16 page walk requests into a single one. However, NHA                               However, irregular workloads easily thrash TLB entries, reducing
+is only effective when currently pending page walk requests are fit                             the effectiveness of coalescing. Meanwhile, Avatar [72] proposed a
+into a single cacheline of the page table. When multiple page walk                              TLB speculation in GPUs. When an L1 TLB miss occurs, they spec-
+requests in the PWB cannot be merged (nw and bfs in Figure 3),                                  ulatively calculate the physical address and validate the speculated
+there are substantial contentions in page walks.                                                address using the PTE embedded within a data cacheline. Even if
+
+
+
+
+                                                                                       404
+SoftWalker: Supporting Software Page Table Walk for Irregular GPU Applications                                      MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea
+
+
+                                             32 PTWs     64    128   256    512    1024        Ideal PTWs & MSHRs      Queueing Delay
+ Norm. Latency
+
+
+
+
+                   1
+                 0.8
+                 0.6
+                 0.4
+                 0.2
+                   0
+                       bc   dc   sssp   gc   nw   st2d   xsb   bfs   sy2k spmv gesv     gups           cc    kc      2dc    fft   histo   red   scan gemm            GM
+
+                             Figure 7: Breakdown of page table walk latency. The striped bar represents the queueing delay.
+
+this approach eliminates L2 TLB accesses and page walks, it funda-                        3.2     The Dominance of Queueing Delay in Page
+mentally requires a page walk when validating on an uncompressed                                  Table Walk Latency
+cacheline, causing contention in page walks.
+                                                                                          Contention among page walk requests increases page walk latency
+Common Constraints in Prior Techniques. As discussed above,
+                                                                                          and stalls the GPU pipeline, degrading overall performance. In this
+prior techniques may still suffer from page walk contention for
+                                                                                          paper, we define page walk latency as the sum of queueing delay
+applications with large memory footprints and irregular access
+                                                                                          and page table access latency. Queueing delay refers to the time
+patterns at the page level. To verify that contention in page table
+                                                                                          between issuing an address translation request and the point at
+walks remains even with prior techniques, we evaluate the speedup
+                                                                                          which a PTW begins processing it, while page table access latency
+of page table walk coalescing [86] and large page (2MB) [6, 49, 74]
+                                                                                          denotes the time the PTW spends traversing the page table hier-
+as the number of PTWs increases. Since the input sizes of our
+                                                                                          archy. We observe that, for irregular applications, the dominant
+benchmarks fit within the L2 TLB coverage for large pages, we select
+                                                                                          contributor to page walk latency is a queueing delay caused by
+10 benchmarks whose memory footprints can be scaled beyond
+                                                                                          contention in PTWs. Figure 7 illustrates how page walk latency
+the L2 TLB capacity and estimate the speedup by increasing their
+                                                                                          changes with the number of available PTWs. The striped region
+memory footprints. Figure 6 shows the impact of PTW contention
+                                                                                          of each bar represents the queueing delay. Our results show that,
+when either page table walk coalescing (Figure 6a) or large pages
+                                                                                          in the baseline configuration, queueing delay accounts for 95% of
+is applied (Figure 6b). The results show that increasing PTWs still
+                                                                                          total page walk latency for irregular applications. This result in-
+provides substantial performance improvements by mitigating page
+                                                                                          dicates that contention at PTWs has a more significant impact on
+walk contentions, even in systems employing these techniques.
+                                                                                          performance than the cost of individual page walks. As the num-
+These findings indicate that increasing the number of PTWs is
+                                                                                          ber of cores continues to grow in modern GPUs, the contention in
+beneficial and complementary to prior approaches.
+                                                                                          hardware PTWs is severely exacerbated, necessitating a scalable
+Software-Based Approach. To enable scalable page walk through-
+                                                                                          solution to alleviate the bottleneck and unlock performance for
+put, we introduce SoftWalker, a software-based page table walk
+                                                                                          irregular applications.
+mechanism. Table 1 summarizes prior techniques aimed at mitigat-
+ing page walk overheads in GPU virtual memory systems. Unlike
+                                                                                            Key Observation: For irregular GPU applications, the
+prior approaches focusing on coalescing page walks or mitigat-
+                                                                                            dominant factor contributing to page walk latency is
+ing specific inefficiencies in the walks, SoftWalker directly targets
+                                                                                            queueing delays induced by contention in PTWs
+the throughput limitation of hardware page walkers. SoftWalker
+achieves this by dynamically launching lightweight threads to per-
+form page walks in response to L2 TLB misses. This approach offers
+scalability and flexibility, as the page walk process is implemented
+                                                                                          3.3      Opportunity to Walk GPU Page Tables
+in software. Furthermore, SoftWalker eliminates the dependency                                     Using a Thread
+on hardware page table walkers, unlike prior techniques.                                  Building on the key observation in Section 3.2, the question is how
+                                                                                          to scale page walk throughput without incurring extensive hard-
+                                                                                          ware cost. Previous CPU design explored software-managed TLBs,
+                                                                                          where TLB misses trigger exceptions handled by the Operating
+3 A Software-Based Page Table Walk in GPUs                                                System (OS) [25, 31, 38, 57]. In such systems, a TLB miss causes the
+                                                                                          CPU to switch from user mode to kernel mode and invoke a TLB
+3.1 Key Concept                                                                           exception handler, which loads the missing PTE into the TLB before
+To mitigate the bottleneck resulting from a limited PTWs, we intro-                       resuming execution of the faulting instruction. Finally, the OS re-
+duce SoftWalker, a software-based framework designed to handle                            turns control to the original context to replay the stalled instruction.
+page walks. The fundamental principle of SoftWalker is to dynami-                         However, frequent privilege transitions and heavyweight context
+cally launch multiple page walk threads on demand, thereby lever-                         switches make such approaches inappropriate for latency-sensitive
+aging idle GPU cycles for page walk tasks, as illustrated in Figure 1.                    CPU cores [19, 56].
+By providing sufficient page walk bandwidth on demand, Soft-                                  In contrast, GPUs utilize fine-grained multithreading to inter-
+Walker effectively eliminates queuing delays caused by contention                         leave thousands of threads with minimal context switching over-
+during page walks and resolves severe bottlenecks in page walks.                          head (as low as one cycle) [14, 55]. This massive thread-level paral-
+In the following section, we will discuss key insights on applying                        lelism inherent in GPU architectures presents a compelling opportu-
+software-based page table walks for GPUs.                                                 nity to revisit software-based address translation. Specifically, GPUs
+
+
+
+
+                                                                                  405
+MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea                                                                                                   Jang, et al.
+
+
+                                                                                                       HW Page Walk Latency
+                             Issued   Scoreboard   LSU   ALU   Other
+                                                                                           L1T miss L2T miss          Replay
+ Percentage of Warp
+  Scheduler Cycles
+
+
+
+                      100%
+                       80%                                                       Ideal     L1T   L2T     Page Table Access L1T
+                       60%                                                                                               HW Page Walk Latency
+                       40%
+                       20%                                                                 L1T miss L2T miss                                                 Replay
+                        0%                                                      Baseline   L1T   L2T               Queueing Delay               Page Table Access L1T
+                                bc
+                                dc
+
+
+
+                               nw
+
+
+
+
+                             spmv
+                              gesv
+
+
+
+
+                                                                   kc
+
+
+
+                                                                histo
+                              sssp
+
+
+
+
+                                                                   fft
+
+
+
+
+                                                               gemm
+                              sy2k
+
+
+
+                              gups
+                              st2d
+                               xsb
+
+
+
+
+                                                                   cc
+
+                                                                  2dc
+
+
+
+                                                                  red
+                                gc
+
+
+
+
+                               bfs
+
+
+
+
+                                                                 scan
+                                                                                                                SW Page Walk Latency
+                                                                                           L1T miss L2T miss                             Replay
+                                                                                                                                                      Saved Cycles
+                                                                               SoftWalker L1T    L2T    L2T-SM Inst. Page Table Access SM-L2T L1T
+    Figure 8: Breakdown of warp scheduler cycles of A2000                                                                                                        Time
+
+
+can potentially scale the throughput of page walks by parallelizing            Figure 9: Page table walk latency comparison among ideal
+the walking process across threads. This unique capability opens               case with sufficient hardware PTWs (top), baseline with only
+the door to efficient software-managed page table walk mechanisms              a limited number of hardware PTWs (middle), and software-
+on GPUs, which can be designed to exploit thread-level parallelism             based approach (bottom). The green boxes represent addi-
+to service multiple walk requests concurrently, thereby improving              tional latency for the software-based approach.
+address translation throughput.
+                                                                               delay to become the dominant component (about 95%), thereby
+  Key Insight ①: The massive thread-level parallelism and                      dramatically increasing the overall page walk latency. On the other
+  low context-switching overhead of GPUs make thread-                          hand, a software-based approach (bottom) effectively eliminates
+  based page table walks feasible and scalable.                                these contention-induced queueing delays. The key to improved
+                                                                               page walk latency lies in a reasonable trade-off between slightly
+                                                                               increased per-page walk latency and dramatically reduced total
+   GPUs rely on warp scheduling to efficiently hide memory latency             page walk latency. As shown in the figure, the software-based ap-
+by rapidly switching execution contexts among warps. Despite this              proach introduces small overheads for instruction execution and
+capability, SMs often encounter significant stall cycles, predom-              SM-L2 TLB communication (i.e., forwarding TLB misses to cores
+inantly due to long-latency memory operations and data depen-                  and returning page walk results to the TLB), making its intrinsic
+dencies. These stalls become severe in irregular workloads, where              per-walk latency slightly longer than that of an ideal case. However,
+memory accesses exhibit minimal spatial locality and increased                 this slight increase in per-walk latency is negligible compared to the
+memory divergence, leading to ineffective warp-level coalescing                massive queueing delay it eliminates. As a result, by launching hun-
+and underutilized hardware resources [44, 86, 93, 97, 99].                     dreds of walkers, SoftWalker mitigates the severe queueing delay
+   To quantify the proportion of stall cycles during execution, we             that plagues the baseline system, yielding a substantial speedup.
+analyze warp scheduler cycles on a real GPU. Figure 8 presents
+the cycle breakdown for NVIDIA A2000 [61]. Except for issued                     Key Insight ③: The massive throughput of software-based
+cycles (shown in black), all other cycles indicate that the warp                 page table walk eliminates the dominant queueing delay,
+scheduler is unable to issue any instructions from the current active            compensating for the modest increase in individual walk
+warps. For irregular applications, we observe that nearly 90% of the             latency.
+warp scheduler cycles are attributed to memory and scoreboard
+stalls, highlighting substantial underutilization of the GPU pipeline.
+These underutilized cycles represent a key opportunity: rather than               In summary, the insights discussed above highlight the effec-
+remaining idle, they can be repurposed to perform page table walks             tiveness of a software-managed GPU page table walker in improv-
+in software. By utilizing these idle cycles for software-driven page           ing page walk throughput. By leveraging thread-level parallelism
+table walks, GPUs can mitigate contention in page table walks and              and utilizing idle GPU cycles, this approach significantly reduces
+improve the utilization of their extensive computational resources.            contention-induced queuing delays. In the following section, we de-
+                                                                               tail the architecture and implementation of SoftWalker, and explain
+  Key Insight ②: Abundant stall cycles on irregular GPU ap-                    how it mitigates queueing delays in page table walks.
+  plications provide enough room for executing a software-
+  based page table walk.                                                       4 Implementation
+                                                                               4.1 Overview
+   GPU’s massive parallelism, capability for rapid context switching,          SoftWalker is designed to efficiently handle GPU page table walks in
+and enough idle core cycles provide a strong opportunity to realize            software by leveraging GPU cores to parallelize and scale the trans-
+a scalable software-based page table walk. The increased page walk             lation process. Figure 10 illustrates a high-level overview of how
+bandwidth addresses the contention in handling PTWs, detailed in               page walk requests are managed and executed within SoftWalker.
+Section 3.2. Figure 9 provides a conceptual timeline view of three                The detailed operation flow of SoftWalker is as follows: Upon
+different page table walk scenarios.                                           encountering an L2 TLB miss, the L2 TLB records the miss in its as-
+   In an ideal hardware scenario with sufficient PTWs (top), the               sociated MSHRs. Then, the page walk request looks up PWCs and is
+total page walk latency consists solely of the page table access               forwarded to a Request Distributor (❶). The Request Distributor se-
+time alone. However, a realistic baseline with a limited number of             lects the core to process that request, and the SoftWalker Controller
+PTWs (middle) suffers from heavy contention, causing queueing                  dedicated to each core fills the request into software-managed PWB
+
+
+
+
+                                                                         406
+SoftWalker: Supporting Software Page Table Walk for Irregular GPU Applications                                            MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea
+
+
+                                                    PW Warp Slot     SoftWalker Components
+                                                                                                     core resources (e.g., registers, shared memory) so PW Warps can
+  SM Pipeline
+            ❹PTW Inst.
+                               Fetch/            Warp         Operand            ❼ ALU               issue with zero admission delay and execute through the core’s
+                               Decode           Sched.        Collector
+            I-Cache                                                                                  standard instruction pipeline like ordinary code. Once resident, the
+                                                            ❺ Execute Inst.
+         SoftWalker
+            Code               I-Buffer       Scoreboard                            LSU              PW Warp enters a lightweight wait–execute loop governed by the
+   ❸ Launch PW Warp                                                                                  SoftWalker Controller. As page walk requests are directed to an
+                                                                   ❻ Load PW Req.
+            L1 TLB                            L1D/ShMem                                              SM, the controller signals the warp scheduler to start scheduling
+                          ❷ Fill PWB
+                                          SoftPWB
+                                                                      ❾
+                                                                           Fill L2 TLB               a PW Warp. The loop persists for the lifetime of the application
+        SoftWalker                                  •••                          &
+         Controller                                                       Update PWC                 kernel, keeping translation capacity continuously available.
+                      Lookup                                                                            This design provides a secure and scalable mechanism to perform
+   ❿ Done        ❶ PWC                                                            ❽ Load PTE
+    Request            PWC        In-TLB MSHR MSHR L2 TLB
+                                                                      Memory Partition               page table walks in parallel without limiting the occupancy of SM
+   Distributor                                                          Page Tables
+                                                                                                     or compromising system isolation. We will discuss overheads or
+                      Figure 10: SoftWalker Architecture                                             security issues associated with PW Warps in Section 5.
+
+(SoftPWB) (❷). Subsequently, the SoftWalker Controller initiates a                                   4.3    ISA Extension
+specialized warp called a Page Walk Warp (PW Warp) to perform
+                                                                                                     To enable PW Warp to handle the entire page walk process, we ex-
+software-managed page table walks (❸). PW Warp fetches page
+                                                                                                     tend GPU ISA to support 1) loading PTE using the physical address,
+walk code from the instruction cache and runs the instructions
+                                                                                                     bypassing TLB, 2) filling L2 TLB entry, 3) updating PWC entries,
+within the SM pipeline (❹-❺). The PW Warp’s operations are as
+                                                                                                     and 4) storing VPN that causes page fault to the Fault Buffer when it
+follows: loads page walk requests from PWB (❻), computes page
+                                                                                                     loads invalid PTE. We summarize the extended ISA in Table 2. First,
+table offsets (❼), gets PTE from in-memory page tables (❽), and fills
+                                                                                                     LDPT is a memory load instruction that loads PTE to the destination
+L2 TLB and PWC (❾). Finally, once the PW Warp fills the L2 TLB
+                                                                                                     register from the page table using the base address of each level of
+entry, the SoftWalker Controller marks the operation as complete,
+                                                                                                     the page table. Second, FL2T is a special instruction that fills the
+freeing the PW Warp for the next page walk assignment (❿).
+                                                                                                     L2 TLB entry with the last-level PTE that PW Warp loads from
+                                                                                                     the page table. When L2 TLB receives the PTE that FL2T sent, it
+4.2     Page Walk Warp
+                                                                                                     searches its MSHR and resolves the matching entry. Third, FPWC
+SoftWalker performs software-based page walks by executing in-                                       updates PWC entries right after it loads the PTE of each page table
+struction sequences using GPU threads. To run these threads, the                                     level. Since the L2 TLB sends page walk requests with the base
+GPU must allocate threads on each SM. However, simply allocating                                     address of the recently accessed level of the page table by refer-
+dedicated threads for page walks reduces the number of threads                                       encing PWC, in most cases, each thread is only responsible for
+available for the user kernel to be scheduled on an SM, potentially                                  updating the Page Directory Entry (PDE). Finally, FFB is an instruc-
+degrading application parallelism. Alternatively, sharing warp con-                                  tion that stores the invalid PTE to the Fault Buffer for page fault
+texts—as explored in Assist Warp designs such as CABA [93]—could                                     handling [2, 42, 100]. These ISA extensions allow SoftWalker to
+allow the reuse of existing warp resources. Nevertheless, this ap-                                   complete the page walk process exploiting the GPU core pipeline,
+proach is unsuitable for address translation, where page walks                                       without relying on hardware page walkers.
+involve accessing privileged virtual-to-physical mapping.
+   To resolve these challenges, SoftWalker introduces a Page Walk
+                                                                                                                 Table 2: ISA Extension for SoftWalker
+Warp (PW Warp), a specialized warp that is structurally isolated
+from regular warps to each SM. Rather than consuming the limited                                               ISA                     Description
+number of user warp contexts, SoftWalker provisions dedicated                                                          Load page table entry from the page table.
+architectural slots for the PW Warp, including an instruction buffer                                           LDPT
+                                                                                                                       This instruction bypasses accessing TLB
+entry, scoreboard entries, and SIMT stack entries. The PW Warp                                                 FL2T    Fill L2 TLB entry with the PTE.
+is given the highest scheduling priority, as delays in page walks                                              FPWC    Fill Page Walk Cache entry.
+can stall the execution of other warp instructions and degrade                                                  FFB    Fill Fault Buffer with invalid PTE.
+overall performance. In addition to warp context resources, the PW
+Warp also requires a small number of registers. In our experiments,
+compiling the page walk code with a real GPU compiler revealed                                       4.4    Page Walk Request Management
+that a PW Warp requires only 16 registers, representing a negligible                                 To manage page walk requests efficiently in SoftWalker, we need
+portion of the available register file. Recent studies have shown                                    architectural support, especially for 1) distributing page walks from
+that GPU applications typically underutilize register files due to                                   L2 TLB to each SM and 2) buffering page walk requests in each SM.
+thread or thread block limits [1, 33, 34, 44, 45, 93, 99]. Leveraging                                Request Distributor. First, we introduce a Request Distributor on
+this observation, SoftWalker allocates a small number of unused                                      the L2 TLB-side, which assigns each L2 TLB miss to a target core.
+registers to the PW Warp with minimal impact on the resources.                                       The distributor maintains a per-core request counter to prevent
+   The operation of PW Warp can be realized by the host driver                                       request overflow during distribution and to ensure that page walk
+to orchestrate PW Warps under a thread block model. Before the                                       requests are assigned only to cores with idle PW Warps. The top half
+application kernel is dispatched, the driver preloads page walk                                      of Figure 11 represents the Request Distributor. Once the distributor
+instructions into device memory and launches a single, specialized                                   selects a core based on each counter value (❶), it increments the
+block on each SM. This pre-launch reserves a minimal slice of                                        counter associated with it (❷) and sends page table walk requests to
+
+
+
+
+                                                                                               407
+MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea                                                                                                                                                   Jang, et al.
+
+
+                  PW Warp
+                                               SoftWalker Controller                                             PTWs      MSHRs           PTWs + MSHRs                  PTWs           MSHRs        PTWs + MSHRs
+             ❻ Initiation      SoftPWB Status Bitmap                ❹ Set Status PWB Slot
+                  with Mask     T1 T2 T3 T4 T5 T6 T7 T8                  T29 T30 T31 T32                        5                                                        3
+
+
+
+
+                                                                                                      Speedup
+
+
+
+
+                                                                                                                                                               Speedup
+                                                                                                                4
+                                01 01 01 01 10 10 10 10            •••    00 00 00 00                           3                                                        2
+SM-Side                            Processing        Valid                    Empty                             2                                                        1
+                                                           ❺ Fill PW Req. to Empty Slot                         1
+                                                                                                                0                                                        0
+            Pipeline          0x1 0x2 0x3 0x4 0xA 0xB 0xC 0xD ••• 0x0 0x0 0x0 0x0
+                       Load                                                                                          32    64      128 256 512 1024                                32   64    128 256 512 1024
+                                           SoftPWB (In Shared Memory)
+                                                   ❼ Decrement Counter        ❸ Send PW Req.
+                                                                                                                    (a) Base page (64KB)                                      (b) Large page (2MB)
+           FL2T                    FPWC
+                                                               Per Core Request Counter
+                        L2 TLB                                                                       Figure 12: Speedup of irregular applications when scaling
+                       Miss Req.           ❶ Select Core       C1 C2 C3              Cn
+TLB-Side    L2 TLB                   PWC                       32 16 8        •••     0              PTWs and L2 TLB MSHRs independently and jointly. “PTWs”
+                                                                ❷ Increment Counter.                 scales the number of PTWs while fixing MSHRs, “MSHRs”
+                                                                Request Distributor                  scales MSHRs while fixing PTWs, and “PTWs+MSHRs” scales
+      Figure 11: Management of page table walk requests                                              both. All results are normalized to a baseline with 32 PTWs
+                                                                                                     and 128 L2 TLB MSHRs.
+
+the selected core (❸). The counter is decremented when it receives                                   page sizes in Figure 12a and 12b respectively, reveal that both re-
+the TLB fill request from that core (❼).                                                             sources are significant bottlenecks. With a 64KB page size, scaling
+SoftPWB and SoftWalker Controller. Each SM must be able to                                           only the PTWs achieves just 59.3% of the ideal performance, while
+accept and manage the page walk request that the Request Distribu-                                   scaling only the MSHRs is even less effective at 30.4%. Similarly, for
+tor sent. To support this, we introduce SoftPWB, a shared memory-                                    a large 2MB page, with scaling only PTWs or only MSHRs reaching
+based request buffer that holds pending page walk requests for                                       just 83.4% and 63.7% of the ideal case, respectively. This analysis
+that core’s PW Warp. We repurpose a portion of the L1D/shared                                        suggests that it is crucial to scale both PTWs and L2 TLB MSHRs.
+memory space as the SoftPWB so that the PW Warp can access                                              To expand the L2 TLB MSHR capacity at a low cost, we leverage
+the SoftPWB entries using standard load instructions. Each request                                   underutilized L2 TLB entries for additional MSHR resources. We
+consists of 1) a 33-bit VPN, 2) a 31-bit PFN of the page table base                                  observe that only 2.4% of accesses result in L2 TLB hits across
+address derived from PWC, and 3) a 2-bit field for the current level                                 irregular applications, underscoring the severe underutilization of
+of the page table, when assuming 49-bit virtual and 47-bit physical                                  L2 TLB entries in such workloads. These findings motivate a new
+address [60]. Therefore, we reserve 96 bits for each SoftPWB entry.                                  mechanism that better leverages the idle L2 TLB entries, enabling
+   To manage the buffer and orchestrate the execution of PW Warp,                                    them to buffer outstanding TLB misses when the dedicated MSHR
+we introduce SoftWalker Controller. It tracks the status of each                                     structures are already fully occupied [21, 96].
+PW Warp thread using a compact bitmap called a SoftPWB Status                                           We propose In-TLB MSHR, a mechanism that extends MSHR
+Bitmap. Each entry in the bitmap contains 2 bits and encodes the                                     capacity by allowing L2 TLB entries to act as temporary MSHR
+state of a thread: invalid (no request assigned), valid (request ready                               slots. Figure 13 shows the In-TLB MSHR design. Each entry equips a
+for processing), or processing (currently executing a page walk).                                    pending bit, enabling it to hold either a valid translation or metadata
+The bottom half of Figure 11 depicts the SoftPWB and SoftWalker                                      for a pending miss. The pending bit is associated with the valid bit
+Controller. Once the controller receives the page walk request,                                      to indicate three states (valid, invalid, MSHR) of each TLB entry.
+the controller updates the status of the ‘invalid’ entry to ‘valid’ by                               The operation of In-TLB MSHR is as follows: When a TLB miss
+looking up the bitmap (❹) and fills the request to the corresponding                                 occurs, and all MSHRs are occupied (❶), the TLB selects a victim
+SoftPWB position (❺). When the SoftWalker Controller detects                                         entry based on its replacement policy (❷) and stores the metadata
+a valid entry and the PW Warp is idle, it triggers a page table                                      of the outstanding request (e.g., SM ID, Warp ID) in that entry (❸).
+walk, updating the status of the corresponding entry from ‘valid’ to                                 We allow the in-TLB MSHR to reserve the same tag in a set index to
+‘processing’ (❻). Once the walk begins, the controller updates the                                   support the MSHR merge [21]. Once the corresponding page walk
+status to "processing" and later resets it to invalid upon completion.                               completes (❹), the L2 TLB controller clears the pending bits of all
+                                                                                                     tag-matching ways (❺). After that, it fills PTE information into one
+4.5        In-TLB MSHR                                                                               of the matching ways (❻) and resolves all corresponding misses
+While SoftWalker increases page walk throughput by generating                                        (❼). In this way, SoftWalker can handle more concurrent misses
+page walk threads, this enhanced throughput reveals another criti-                                   even under high MSHR pressure.
+cal bottleneck: a limited number of L2 TLB MSHRs. If L2 TLB MSHR
+                                                                                                                                    Pending Bit        Tag/Data Array                                       L2 TLB
+entries are fully occupied, the L2 TLB can not reserve requests from                                             TLB               P V Tag Way 1 P V Tag Way 2               •••     P V Tag Way n
+                                                                                                      ❶
+the L1 TLB (in this paper, we define it as MSHR failure). These                                                 Access             0 1 0x0A PTE 0 0 0x0D Invalid             •••     1 0 0x7F MSHR
+                                                                                                                MSHR                                                                                   16 MSHRs
+                                                                                                                                                                                                           MSHRs
+                                                                                                                                                Reserve    •
+                                                                                                                                                                                                      Sets MSHRs
+                                                                                                                                                                                                            MSHRs
+MSHR failures prevent the system from fully exploiting thousands                                                0x1CF     ❷
+                                                                                                                            Set              ❸             •
+                                                                                                                                              Pending Req. •
+                                                                                                                            sel.
+                                                                                                                                   1 0 0x0C MSHR 1 0 0x0C MSHR                       1 0 0xE3 MSHR
+of page walkers [5, 21].                                                                                0x1CF
+                                                                                                                                                                             •••
+
+
+   To see the impact of scaling PTWs and L2 TLB MSHRs inde-                                              PTE
+                                                                                                                                            ❻ Fill                             SM ID     Warp ID    Fotmat/Misc.
+                                                                                                         PTW                           =               =                                 In TLB MSHR Entry
+                                                                                                      ❹
+pendently and jointly, we estimate the performance of irregular                                         Return                               Pending
+                                                                                                                                              Entry
+applications: 1) fix L2 TLB MSHR entries as 128 and scaling PTWs,                                                                                                            Pending/Valid 01: Valid 10: MSHR
+                                                                                                                                                                                           00: Invalid
+2) fix PTWs as 32 and scaling L2 TLB MSHRs, and 3) scaling both.                                      ❼
+                                                                                                                 TLB               ❺
+                                                                                                                                     Unset Pending Bit
+                                                                                                                Return              of All Matching Way                            New Path          New Component
+Each configuration is denoted as “PTWs”, “MSHRs”, and “PTWs +
+MSHRs” in Figure 12. The results, shown for both 64KB and 2MB                                                                              Figure 13: In-TLB MSHR
+
+
+
+
+                                                                                               408
+SoftWalker: Supporting Software Page Table Walk for Irregular GPU Applications                              MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea
+
+
+   In-TLB MSHR boosts the effective capacity for in-flight transla-                    Warp by updating the SoftPWB bitmap of matching threads from
+tion requests without increasing the size of the dedicated MSHR                        ‘processing’ to ‘invalid’.
+structure. Because the design does not use TLB entries when exist-
+ing MSHR entries are enough, it remains compatible with regular                        5 Discussion
+GPU workloads that rely on high L2 TLB hit rates.
+                                                                                       5.1 Security Implication
+4.6     Working Flow of SoftWalker                                                     Resource Isolation of PW Warp. To ensure robust isolation, Soft-
+                                                                                       Walker must safeguard its internal data structures from unautho-
+With this mechanism in place, a PW Warp is capable of handling L2
+                                                                                       rized access. Although GPU architectures provide intra-warp regis-
+TLB misses by performing page table lookups in software, leverag-
+                                                                                       ter communication via warp shuffle instructions (e.g., __shfl_ [20,
+ing spatially and temporally underutilized resources on each core.
+                                                                                       66]), SoftWalker remains unaffected by potential attacks leveraging
+First, the Request Distributor forwards L2 TLB misses to the SMs,
+                                                                                       these instructions. This is because page walks are delegated to a ded-
+and the SoftWalker Controller on each SM initiates a page walk.
+                                                                                       icated PW warp, which operates in isolation from all other warps.
+The SoftWalker Controller then marks the corresponding SoftPWB
+                                                                                       Importantly, GPU hardware enforces strict register file partitioning,
+bitmap entry as ‘processing’ (changing it from ‘valid’) and launches
+                                                                                       ensuring that register contents remain inaccessible across warps,
+the associated PW Warp to handle the request.
+                                                                                       CTAs, or kernel invocations [37, 59, 66, 68, 83]. Additionally, the
+   Figure 14 describes the abstraction of the instruction sequence
+                                                                                       translation metadata within SoftPWB is stored in shared memory,
+that the PW Warp executes. The code sequence is preloaded onto
+                                                                                       which is architecturally isolated from regular warps. An attacker
+the GPU memory by the GPU driver on the host side prior to kernel
+                                                                                       thread block cannot access the data of a previously executed PW
+launch. Threads in PW Warp load page walk requests—such as
+                                                                                       warp because shared memory is scoped to the thread block that al-
+virtual page numbers (VPNs), starting levels, and page table base
+                                                                                       located it; upon the block’s termination, its entire memory mapping
+addresses—from the SoftPWB into their register files, and decodes
+                                                                                       is invalidated. Moreover, an attacker block that runs concurrently
+require information (lines 3-6). Then, they compute offsets for each
+                                                                                       on the same SM cannot invade the shared memory of a PW warp.
+level of the page table (line 10). Using the offset and page table
+                                                                                       This is because the shared memory of each thread block is mapped
+base address, threads load PTE information by issuing the LDPT
+                                                                                       to a private and isolated logical address space [66]. Consequently,
+instruction (line 13). After loading PTE, if the PTE is invalid, the
+                                                                                       the GPU’s hardware memory protection mechanism raises an ex-
+thread uses the FFB instruction to store it into the Fault Buffer (lines
+                                                                                       ception on illegal memory access attempts, effectively preventing
+16-19). If the PTE is valid, threads issue FPWC, which is a kind of store
+                                                                                       any out-of-bounds access.
+instruction to update PWC (line 21). Note that each thread starts
+                                                                                       Register File Uninitialization. The characteristic of PW Warp,
+its page walk from the PWC hit level as the Request Distributor
+                                                                                       which contains the page table’s physical address in register files,
+consults the PWC before dispatching page walk requests. This
+                                                                                       induces a potential security vulnerability. Pustelnik et al. [79] re-
+process continues until the last-level page table is accessed (lines
+                                                                                       cently demonstrated that several commercial GPU architectures
+8-23). When threads load the last level PTE, they complete the
+                                                                                       (e.g., AGX, Adreno, RTX) omit register file initialization prior to
+translation by inserting the final mapping into the TLB, issuing
+                                                                                       shader execution. This enables leakage of stale values left in regis-
+the FL2T instruction (line 26). The FL2T instruction also decreases
+                                                                                       ters across kernel invocations, thus violating inter-kernel isolation.
+the corresponding counter dedicated to the core at the Request
+                                                                                       In the context of SoftWalker, uninitialized registers may expose
+Distributor. Finally, the SoftWalker Controller finalizes the PW
+                                                                                       sensitive metadata such as physical page table addresses to adver-
+   1   int idx = threadIdx.x;                                                          saries, which breaks down memory protection schemes. [28, 39].
+   2                                                                                   SoftWalker can eliminate this vulnerability by adopting the guide-
+   3   uint128_t pw_req = softPWB[idx]; // load PW request 1
+   4   uint64_t pt_base = pw_req & 0x0FFFFFFF FFFFFFFF;    4                           line that inserts cleanup instructions after shader execution, which
+   5   uint64_t vpn      = pw_req >> 64;                   5                           was proposed by Pustelnik et al. [79].
+   6   int pt_level      = (pw_req >> 60) & 0xF;           6
+   7                                                       7
+   8   while (pt_level < 5) {                              8                           5.2    Hardware Overhead
+   9     // Calculate page table offset for each level     9
+  10     int offset = (vpn >> ((pt_level-1)*9)) & 0x1FF;   10                          SoftWalker requires additional storage in each SM associated with
+  11                                                       11
+  12     // Access each level of the page table            12
+                                                                                       SoftWalker Controller and PW Warp. The controller requires 2 bits
+  13     pt_base = __load_page_table(pt_base, offset);        LDPT                     for each thread in PW Warp (total 64 bits) to track the status of
+  14                                                       14                          page walk requests in the SoftPWB. To store PW Warp context, it
+  15     // Page fault handling                            15
+  16     if (__page_fault(pt_base)) {                      16                          requires a 64-bit instruction buffer, 126-bit scoreboard entry [44],
+  17       __fill_fault_buffer(vpn, pt_level);                FFB                      and eight 160-bit (32-bit for 32-lane, 64-bit for PC, and 64-bit for
+  18       return;                                         18
+  19     }                                                 19                          RPC) SIMT Stack entry [44, 99]. Therefore, SoftWalker requires
+  20     // Update PWC                                     20                          extra storage of 1470 bits (64+126+8x160) per SM.
+  21     __fill_page_walk_cache(vpn, pt_level, pt_base);      FPWC
+  22     pt_level++;                                       22
+                                                                                          In-TLB MSHR requires an additional 1-bit pending bit for each
+  23   }                                                   23                          entry; a total of 1024 bits is required. In addition, to evaluate the
+  24                                                       24                          overhead of In-TLB MSHR control logic, we implement it using
+  25   // Fill L2 TLB entry                                25
+  26   __fill_l2_tlb(vpn, pt_base);                           FL2T                     Synopsys Design Compiler [89] with 28𝑛𝑚 UMC standard cells [91].
+                                                                                       The additional area overhead for In-TLB MSHR control logic is
+               Figure 14: Code Block for SoftWalker                                    0.0061𝑚𝑚 2 . Even if we synthesize it with a larger process (28𝑛𝑚),
+
+
+
+
+                                                                                 409
+MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea                                                                                                                           Jang, et al.
+
+
+                     32 PTWs                     64 PTWs             128 PTWs               256 PTWs         remain, it redirects subsequent requests to software walkers. The
+                     512 PTWs                    1024 PTWs           SoftWalker                              hybrid version requires only adding a counter to track active page
+            3                                                                                                walk requests handled by hardware page walkers. With this design,
+                                                                                    16    16 32   32
+           2.5                              SoftWalker                       16 8        32                  regular workloads can utilize the hardware walkers as their primary
+                                                                     8   8
+ Speedup
+
+
+
+
+            2                                      8       16 4   4 32
+                                                                       4                                     translation mechanism, while PW Warps remain for irregular ones.
+                                        4                                                                    We evaluate the implications of this hybrid design in Section 6.
+           1.5                      4              16           32
+                                             8               1
+            1    11 1           4           8 1 16 1          32
+           0.5
+                                                                                                             5.5     Compatibility with Unified Virtual Memory
+                 1         4                16        64        256      1024        4096     16384          SoftWalker is compatible with Unified Virtual Memory (UVM) [84].
+                                                   Relative Area (Log sacle)                                 When a PW Warp encounters an invalid PTE (i.e., a page fault), it
+Figure 15: Speedup versus area overhead for various hard-                                                    executes the dedicated FFB instruction to log the fault information
+ware configurations. Each data point is labeled with the num-                                                into a fault buffer [2, 84, 100]. From the UVM driver’s perspective,
+ber of PWB ports. Speedup and area overhead are normalized                                                   this behavior is equivalent to a page fault reported by a hardware
+to the 32 PTWs with one PWB port.                                                                            page walker, enabling the existing page fault handling protocol to
+                                                                                                             remain unchanged [9, 94].
+the area overhead is extremely small compared to 628.4𝑚𝑚 2 , which
+is the GA102 full-chip area (7𝑛𝑚 process) [61].
+                                                                                                                                   Table 3: Experimental Setup
+5.3              Performance vs. Area
+                                                                                                                   Component                                Parameter
+One potential solution for mitigating page walk contention is to
+increase the number of hardware page walkers. However, this ap-                                                    # of SMs                                   46 SMs
+proach is not cost-effective. Prior work [50] shows that 192 hard-                                             Clock Frequency                              1500 MHz
+                                                                                                               Max. # of Warps                           48 warps per SM
+ware page walkers with 18 PWB ports occupy 3.9% of the total
+                                                                                                                                                      32 entries, 64KB page,
+GPU chip area. This overhead arises from the use of a Content-                                                  L1 TLB (per SM)                    10 cycles, fully-associative,
+Addressable Memory (CAM) structure in the PWB, where scaling                                                                                 32 MSHR entries, 192 merges per entry
+the number of entries and ports leads to super-linear area growth.                                                                                  1024 entries, 64KB page,
+   We evaluate the performance benefit of SoftWalker relative to                                                L2 TLB (Shared)                         80 cycles, 16-way,
+its hardware cost by comparing its performance and area with                                                                                 128 MSHR entries, 46 merges per entry
+                                                                                                                   L1D Cache             128KB per SM, 40 cycles, 128B line (32B Sector)
+those of hardware PTW scaling. Area overheads are estimated us-
+                                                                                                                   L2D Cache                 4MB, 180 cycles, 128B line (32B Sector)
+ing CACTI [8, 80]. For the hardware-only approaches, we scale
+                                                                                                                                                       GDDR6, 1750 MHz,
+the number of PTWs and proportionally increase the PWB entries                                                       Memory
+                                                                                                                                                   16 channels, total 448GB/s
+and L2 TLB MSHRs, which are implemented using CAM struc-                                                          Page Table                       four-level radix page table
+ture [50, 75, 76, 85, 86]. We also model the effect of varying the                                             Page Walk Cache                     32 entries, fully-associative
+number of PWB ports for each PTW configuration. Figure 15 illus-                                               Page Table Walker                      32 page table walkers
+trates the trade-off between performance and relative area overhead                                                                               32 page walk threads per SM,
+for various configurations. The area efficiency of SoftWalker can                                                                                  32 SoftPWB entries per SM
+                                                                                                                   SoftWalker
+                                                                                                                                         128 L2 TLB MSHR entries, 46 merges per entry
+be effectively evaluated by comparing it to hardware configura-                                                                                  up to 1024 entry In-TLB MSHR
+tions with similar area overheads, highlighted by the red dashed
+box. Within this area budget (relative area ≈ 16–64), 32, 64, or
+even 128 PTWs achieve speedups of 1.1x to 2.1x. In contrast, Soft-                                                                      Table 4: Benchmarks
+Walker achieves a higher speedup of over 2.6× within the same area
+                                                                                                                                                            Footprint   L2 TLB     Required
+budget. These results demonstrate that, for a given hardware cost,                                              Type              Name              Abbr.
+                                                                                                                                                              (MB)       MPKI       # PTWs
+SoftWalker delivers substantially better performance than simply                                                           betweenness centr [58]    bc       1194        9.0819      256
+scaling hardware PTWs.                                                                                                        degree centr [58]      dc       1138         26.17      512
+                                                                                                                                   sssp [58]        sssp      1788       30.2808      512
+                                                                                                                             graph coloring [58]     gc       1294       13.7029      256
+5.4              Hybrid Approach                                                                               Irregular
+                                                                                                              (Required
+                                                                                                                                    nw [13]
+                                                                                                                                stencil2d [17]
+                                                                                                                                                     nw
+                                                                                                                                                    st2d
+                                                                                                                                                               612
+                                                                                                                                                               612
+                                                                                                                                                                         44.5329
+                                                                                                                                                                          4.8493
+                                                                                                                                                                                      512
+                                                                                                                                                                                      256
+While SoftWalker enables scalable software-managed page walks                                                   # PTWs          xsbench [90]         xsb       360       57.9595      512
+                                                                                                                 > 32)              bfs [58]         bfs      1396       22.1519      256
+for irregular workloads, it may degrade the performance of regular                                                                syr2k [24]        sy2k       192       120.696     1024
+applications with high TLB hit rates and low address translation                                                                  spmv [17]         spmv       288      2517.196      512
+                                                                                                                               gesummv [24]         gesv       226      1320.543      512
+pressure. This is because the regular applications have negligible                                                                gups [35]         gups       308      318.8202     1024
+queueing delay compared to irregular ones; the increased actual                                                             connceted comp [58]      cc       2306       0.1309       32
+page walk latency could incur a slowdown. One of the promising                                                                   kcore [58]          kc       1152       0.5271       32
+                                                                                                               Regular          2dconv [24]          2dc      1120       0.0767       32
+solutions is retaining the existing hardware page walkers alongside                                           (Required            fft [17]          fft       610        0.077       32
+SoftWalker. As a result, we propose a hybrid design, where Request                                             # PTWs          histogram [62]       histo     1124       0.0976       32
+                                                                                                                ≤ 32)          reduction [62]        red      1124       0.3383       32
+Distributor prioritizes sending page walk requests to hardware page                                                               scan [62]         scan       516       0.1458       32
+walkers as long as any are available; once no free hardware walkers                                                              gemm [62]          gemm       288       0.0614       32
+
+
+
+
+                                                                                                       410
+SoftWalker: Supporting Software Page Table Walk for Irregular GPU Applications                                               MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea
+
+
+                                 Baseline    NHA     FS-HPT       SW w/o In-TLB MSHR      SoftWalker                  SW Hybrid     Ideal PTWs & MSHRs
+                                                                                   11.2 11.5 14.8
+           10
+            8
+ Speedup
+
+
+
+
+            6
+            4
+            2
+            0
+                bc   dc   sssp    gc    nw   st2d   xsb    bfs    sy2k spmv gesv       gups                      cc     kc    2dc    fft   histo   red   scan gemm            GM
+
+                                                                 Figure 16: Overall Performance.
+
+
+
+
+                                                                                          Reduction (%)
+6 Evaluation                                                                                              100%
+
+
+
+
+                                                                                           MSHR Fail
+                                                                                                           80%
+                                                                                                           60%
+6.1 Methodology                                                                                            40%
+                                                                                                           20%
+                                                                                                            0%
+Simulation Setup. We use Accel-sim v1.2.0 [41], a cycle-accurate
+
+
+
+
+                                                                                                                         bc
+                                                                                                                         dc
+
+
+                                                                                                                        nw
+
+
+
+
+                                                                                                                       sy2k
+                                                                                                                      spmv
+                                                                                                                       gesv
+
+
+
+
+                                                                                                                                                             kc
+                                                                                                                       sssp
+
+
+                                                                                                                       st2d
+
+
+
+
+                                                                                                                       gups
+
+
+
+
+                                                                                                                                                            2dc
+                                                                                                                                                             fft
+                                                                                                                                                          histo
+                                                                                                                                                            red
+                                                                                                                                                           scan
+                                                                                                                                                         gemm
+
+                                                                                                                                                                                 GM
+                                                                                                                         gc
+
+
+                                                                                                                        xsb
+                                                                                                                        bfs
+
+
+
+
+                                                                                                                                                             cc
+GPU simulator configured similarly to an NVIDIA RTX 3070
+GPU [61]. Table 3 summarizes our detailed simulation parame-
+ters. For the baseline architecture, we extended the simulator to                       Figure 17: Percentage of L2 TLB MSHR failure reduction
+support hierarchical TLBs, a complete page walk subsystem, and a                        when enabling In-TLB MSHR relative to the baseline.
+multi-level radix page table. As described in Section 3.3, the total
+page walk latency is derived by adding page table access latency                         6.2              SoftWalker Result and Analysis
+and the queueing delay. The hardware page table access latency
+in our simulation is not a fixed value but is dynamically measured                      Speedup. Figure 16 shows the speedup of various GPU appli-
+by the memory system model, as page walks are a series of mem-                          cations when applying Neighborhood-Aware address translation
+ory read requests whose latency depends on cache and DRAM                               (NHA) [86], Fixed-Size Hashed Page Table (FS-HPT) [32], Soft-
+behavior. We validate this approach by measuring the latency on                         Walker without In-TLB MSHR (SW w/o In-TLB MSHR), Soft-
+an NVIDIA A2000 GPU, confirming our simulated latency (250-450                          Walker with In-TLB MSHR (SoftWalker), SoftWalker with hard-
+cycles) is consistent with real-world hardware performance (300-                        ware PTWs (SW Hybrid), and ideal PTWs with ideal MSHRs
+400 cycles) [72]. Our baseline system employs 128 L2 TLB MSHR                           over our baseline GPU architecture. Among prior studies, we select
+entries and supports up to 32 concurrent hardware-managed page                          NHA and FS-HPT as the state-of-the-art techniques since they aim
+walkers [23, 53, 77, 78, 85, 86]. We adopt a 64KB page as the base                      to mitigate page table walk overhead. The NHA shows an average
+page size, which is widely supported by conventional GPUs.                              1.22× speedup by eliminating page table walk requests that fit into
+    We implemented SoftWalker within the simulator by extending                         the same cacheline (32B sector) of currently processed requests,
+the ISA and incorporating the proposed architecture, including                          while FS-HPT achieves an average 1.13× speedup over the baseline
+PW Warp, Request Distributor, SoftPWB, and In-TLB MSHR. The                             by eliminating the level dependency of traditional radix page tables.
+In-TLB MSHRs can accommodate up to 1024 outstanding misses                              On the other hand, SW w/o In-TLB MSHR achieves an average
+when there is no free entry in the existing L2 TLB MSHR. Each SM                        1.63× speedup over the baseline, as it can process up to thousands
+equips one dedicated PW Warp and a 32-entry SoftPWB. The PW                             of page walks that NHA and FS-HPT can not.
+Warp runs assembly-level (i.e., SASS [65]) page walk code sequence,                        However, increasing only PTWs shows limited performance im-
+described in Figure 14. As defined in Section 3.3, the page walk                        provement compared to the ideal case. This is because our baseline
+latency of SoftWalker is the sum of page table access latency, addi-                    architecture equips a fixed number of L2 TLB MSHRs (128 entries),
+tional communication latencies, and instruction execution latency.                      generating a fixed number of outstanding page walk requests. It
+We model the communication latency as equal to the L2 TLB ac-                           limits the effectiveness of increased parallelism in page walks. With
+cess latency, based on the assumption that the Request Distributor                      In-TLB MSHR, the SoftWalker can handle multiple concurrent page
+is located near the L2 TLB. The instruction execution latency is                        walks beyond the existing L2 TLB MSHR entries. Figure 17 shows
+dynamically determined by the simulator’s core pipeline model.                          the percentage of reduced L2 TLB MSHR failures when In-TLB
+Benchmarks. We evaluate SoftWalker using a set of GPU work-                             MSHR is enabled compared to the baseline (32 PTWs). For irregular
+loads drawn from established suites [13, 17, 24, 35, 58, 62, 90]. As                    GPU applications, except for spmv, In-TLB MSHR almost eliminates
+summarized in Table 4, we set the memory footprint of each bench-                       the L2 TLB MSHR failures, enabling GPU threads to process thou-
+mark to exceed the coverage capacity of the L2 TLB to ensure                            sands of page walks in parallel. Since spmv requires more MSHR
+meaningful pressure on the address translation system. We classify                      entries than In-TLB MSHR can provide, it cannot completely elimi-
+workloads based on their page table walk concurrency requirement.                       nate the MSHR failures. Nevertheless, it reduces about 65% of MSHR
+Irregular workloads exhibit high L2 TLB MPKI and require a large                        failures and allows GPU threads to handle hundreds of page walk
+number of concurrent page table walkers (more than 256) to hide                         requests concurrently. Our experiment results show that In-TLB
+queueing delays. In contrast, regular workloads with minimal TLB                        MSHR eliminates 95.3% of L2 TLB MSHR failures, enabling GPU
+pressure operate efficiently with 32 PTWs.                                              threads to process thousands of page walks in parallel. As a result,
+                                                                                        SoftWalker with In-TLB MSHR achieves an average speedup of
+                                                                                        2.24× (3.94× for irregular applications) over the baseline. In addi-
+                                                                                        tion, compared to the prior works, SoftWalker shows an average
+                                                                                        speedup of 1.84× and 1.98× over NHA and FS-HPT, respectively.
+
+
+
+
+                                                                                 411
+MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea                                                                                                                                               Jang, et al.
+
+
+                                           Baseline     NHA
+                                                      Baseline     FS-HPT
+                                                                    NHA       SW w/o In-TLB
+                                                                             FS-HPT         MSHR
+                                                                                       SW w/o        SoftWalkerSoftWalker
+                                                                                              In-TLB MSHR           SW HybridSW Hybrid
+                                                                                                                                 Ideal PTW Ideal
+                                                                                                                                            & MSHR      Queueing Delay
+                                                                                                                                                 PTW & MSHR
+0.8
+0.6
+0.4
+0.2
+1.2
+  0 1.2
+  1
+  Norm. Latency
+
+
+
+
+      1
+    0.8
+    0.6
+    0.4
+    0.2
+      0
+                               bc     dc      sssp     gc    nw     st2d    xsb   bfs   sy2k spmv gesv       gups                        cc       kc     2dc    fft   histo      red   scan gemm            GM
+
+                                              Figure 18: Page walk latency comparison. The striped bar represents the queueing delay.
+
+                                NHA        FS-HPT     SoftWalker    SW Hybrid     Ideal PTWs & MSHRs                                   Baseline        SoftWalker     SW Hybrid        Ideal PTWs & MSHRs
+  Stall Reduction (%)
+
+
+
+
+                                                                                                                L2D Miss Rate
+                        100%                                                                                                      1
+                         80%                                                                                                    0.8
+                         60%                                                                                                    0.6
+                         40%                                                                                                    0.4
+                         20%                                                                                                    0.2
+                          0%                                                                                                      0
+                        -20%
+
+
+
+
+                                                                                                                                          bc
+                                                                                                                                          dc
+
+
+
+                                                                                                                                         nw
+
+
+
+
+                                                                                                                                       spmv
+
+
+
+
+                                                                                                                                                                                        histo
+                                                                                                                                        sssp
+
+
+
+
+                                                                                                                                        gesv
+
+
+
+
+                                                                                                                                                                                           kc
+
+                                                                                                                                                                                           fft
+
+                                                                                                                                                                                          red
+
+                                                                                                                                                                                       gemm
+                                                                                                                                        sy2k
+
+
+
+                                                                                                                                        gups
+                                                                                                                                          gc
+
+                                                                                                                                        st2d
+                                                                                                                                         xsb
+                                                                                                                                         bfs
+
+
+
+
+                                                                                                                                                                                           cc
+
+                                                                                                                                                                                          2dc
+
+
+
+
+                                                                                                                                                                                         scan
+                                  bc
+                                  dc
+
+
+
+                                 nw
+
+
+
+
+                               spmv
+                                sssp
+
+
+
+
+                                gesv
+
+
+
+
+                                                                                 kc
+
+                                                                                 fft
+
+
+
+
+                                                                             gemm
+                                gups
+
+
+
+
+                                                                              histo
+                                                                                red
+                                  gc
+
+                                st2d
+                                 xsb
+
+                                sy2k
+                                 bfs
+
+
+
+
+                                                                                 cc
+
+                                                                                2dc
+
+
+
+
+                                                                               scan
+                                                                                                                                              Figure 20: L2 data cache miss rate.
+                         Figure 19: Stall reduction of warp scheduler cycles.
+
+Page Table Walk Latency. Figure 18 shows the normalized page                                                  A Case for Regular Applications. The SoftWalker implementa-
+table walk latency of each configuration relative to the baseline. As                                         tion incurs performance degradation in some regular GPU applica-
+mentioned in Section 3.3, we defined the page table walk latency                                              tions. Specifically, for 2dc, histo, red, and scan, SoftWalker results
+as the sum of actual memory access latency and queueing delay.                                                in slowdowns of 4.3%, 8.6%, 10.9%, and 3.1%, respectively, compared
+The NHA and FS-HPT still show high page table walk latency,                                                   to the baseline. This degradation originates from the additional
+reducing only 20% and 16% of page walk latency compared to the                                                page table walk latency introduced by the communication between
+baseline, respectively. This is because those techniques cannot meet                                          the L2 TLB and each SM. As shown in Figures 18 and 19, regular
+the required page walk throughput for irregular GPU applications.                                             applications without page table walk contention experience slightly
+On the other hand, SoftWalker effectively eliminates almost all                                               increased page table walk latency (up to 18%) and stall cycles (up
+queueing delays of page table walks, reducing total page table                                                to 10%), leading to the observed slowdown.
+walk latency by an average of 72.8% compared to the baseline. The                                                Recognizing this potential performance issue for regular ap-
+reduction in the queueing delay is derived from 1) a reduction in                                             plications, as discussed in Section 5, we proposed an alternative
+L2 TLB MSHR contentions and 2) a reduction in PTW contentions.                                                design: the SoftWalker Hybrid version. This hybrid approach re-
+Stall Reduction. SoftWalker exploits stall cycles to walk page                                                tains traditional hardware-structured PTWs alongside the numer-
+tables using the PW Warp. By utilizing idle cycles, our proposed                                              ous software-based walkers, specifically to benefit latency-sensitive
+architecture can effectively eliminate contentions in page table                                              regular applications. Our experimental results confirm that the Soft-
+walks, thereby reducing stall cycles caused by address translation.                                           Walker Hybrid version effectively eliminates the performance gap
+Figure 19 shows each application’s percentage of stall reduction                                              observed with the pure SoftWalker, successfully reducing the page
+compared to the baseline when applying SoftWalker. For irregular                                              walk latency back to baseline levels.
+applications, SoftWalker reduces an average of 71% stalls, resolving
+contentions in L2 TLB MSHRs and PTWs.                                                                         6.3                     Sensitivity Study
+Impact on L2 Cache. The increased page walk traffic introduced
+                                                                                                              Comparison with Scaled Hardware Baselines. We compare
+by SoftWalker may raise concerns about potential L2 cache con-
+                                                                                                              SoftWalker’s performance against stronger hardware-centric base-
+tention2 . However, our analysis shows this is not the case; the L2
+                                                                                                              lines: 1) more hardware page walkers and 2) hardware page walkers
+cache miss rate remains unchanged compared to the baseline, as
+                                                                                                              with In-TLB MSHR. This analysis enables us to compare SoftWalker
+shown in Figure 20. The primary reason is that the severe PTW
+                                                                                                              with a hardware configuration of comparable area cost (128 PTWs)
+contention in the baseline architecture leaves the memory system,
+                                                                                                              and to identify the sources of its performance improvement.
+including the L2 cache, heavily underutilized. Our experimental
+results show that irregular applications under the baseline configu-
+                                                                                                                                      128 PTWs     128 PTWs + In-TLB MSHR        SW w/o In-TLB MSHR   SoftWalker
+ration consume only 6.7% of total memory bandwidth on average.                                                                                                            11.2
+                                                                                                                                10
+Similarly, we see no notable changes in the L2 cache MSHR fail-                                                                  8
+                                                                                                                Speedup
+
+
+
+
+ure ratio. Consequently, SoftWalker productively repurposes this                                                                 6
+                                                                                                                                 4
+idle memory bandwidth to handle page walks. Furthermore, since                                                                   2
+                                                                                                                                 0
+these irregular workloads already exhibit high L2 miss rates, the
+                                                                                                                                       sy2k
+
+                                                                                                                                       gesv
+                                                                                                                                         bc
+                                                                                                                                         dc
+
+
+
+                                                                                                                                        nw
+
+
+
+
+                                                                                                                                                                                   gemm
+                                                                                                                                       sssp
+
+
+
+                                                                                                                                       st2d
+
+
+
+
+                                                                                                                                      spmv
+
+                                                                                                                                       gups
+
+
+
+                                                                                                                                                                                       kc
+                                                                                                                                                                                      2dc
+                                                                                                                                                                                       fft
+                                                                                                                                                                                    histo
+                                                                                                                                                                                      red
+                                                                                                                                                                                     scan
+
+
+
+                                                                                                                                                                                                              GM
+                                                                                                                                         gc
+
+
+
+                                                                                                                                        xsb
+                                                                                                                                        bfs
+
+
+
+
+                                                                                                                                                                                       cc
+
+
+
+
+added page walk traffic is less likely to evict useful, long-lived data
+cachelines.
+                                                                                                              Figure 21: Speedup of SoftWalker and an iso-area hardware
+2 The page walk traffic does not affect the L1D cache, as we assume PTEs are cached
+                                                                                                              baseline (128 PTWs), evaluated with and without the In-TLB
+only in the L2 cache, following prior works [6, 7, 77, 78]                                                    MSHR. All results are normalized to the baseline (32 PTWs).
+
+
+
+
+                                                                                                       412
+SoftWalker: Supporting Software Page Table Walk for Irregular GPU Applications                                                                   MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea
+
+
+                Baseline     40     80     120      160       200     Ideal PTWs & MSHRs                                           SW w/o In-TLB MSHR   128   256    512     1024   Ideal PTWs & MSHRs
+                                             12.0 11.2 10.5 14.8                                                                                                 11.2 14.8
+           10                                                                                                                 10
+            8                                                                                                                  8
+ Speedup
+
+
+
+
+                                                                                                                    Speedup
+            6                                                                                                                  6
+            4                                                                                                                  4
+            2                                                                                                                  2
+            0                                                                                                                  0
+                   bc
+                   dc
+
+
+
+                  nw
+
+
+
+
+                                                                                                                                      bc
+                                                                                                                                      dc
+
+
+
+
+                                                                                                                                                                              histo
+                 sssp
+
+
+
+
+                                                                       kc
+
+
+
+                                                                    histo
+
+
+
+
+                                                                                                                                     nw
+                                                                       fft
+
+                                                                      red
+
+                                                                   gemm
+
+
+
+
+                                                                                                                                    sssp
+
+
+
+
+                                                                                                                                                                                 kc
+                 sy2k
+                spmv
+                 gesv
+                 gups
+
+
+
+
+                                                                                                                                    sy2k
+                                                                                                                                   spmv
+                                                                                                                                    gesv
+
+
+
+
+                                                                                                                                                                                 fft
+
+                                                                                                                                                                                red
+                                                                                                   GM
+
+
+
+
+                                                                                                                                    gups
+
+
+
+
+                                                                                                                                                                             gemm
+
+                                                                                                                                                                                                     GM
+                   gc
+
+                 st2d
+                  xsb
+                  bfs
+
+
+
+
+                                                                       cc
+
+                                                                      2dc
+
+
+
+
+                                                                     scan
+
+
+
+
+                                                                                                                                      gc
+
+                                                                                                                                    st2d
+                                                                                                                                     xsb
+                                                                                                                                     bfs
+
+
+
+
+                                                                                                                                                                                 cc
+
+                                                                                                                                                                                2dc
+
+
+
+
+                                                                                                                                                                               scan
+            Figure 22: Impact of L2 TLB latency on SoftWalker.                                                     Figure 24: Impact of the number of In-TLB MSHR entries on
+                                                                                                                   the speedup of SoftWalker over the baseline.
+
+                           50 cycles per level    100        200    300       400
+                                                                                                                      The results show that SoftWalker’s speedup gradually increases
+
+
+
+
+                                                                                           Rdeuction Ratio
+                                                                                           Queueing Delay
+                                                                    10.9 12.4 13.2
+           10                                                                        1.0
+                                                                                                                   as the per-level access latency increases. Specifically, when the per-
+ Speedup
+
+
+
+
+            8                                                                        0.8
+            6                                                                        0.6
+            4                                                                        0.4                           level page table access latency is set to 50, 100, 200, 300, and 400
+            2                                                                        0.2
+            0                                                                        0.0                           cycles, SoftWalker achieves the speedup of 1.6×, 2.3×, 3.5×, 4.2×,
+                                                                                                                   and 4.8×, respectively. A similar trend is observed in the reduction
+                                                                                                                   of queueing delay. This is because the lower page table access
+Figure 23: Impact of page table access latency on the speedup                                                      latency 1) incurs relatively low queueing delay and 2) reduces the
+and queueing delay reduction ratio of SoftWalker.                                                                  performance sensitivity to page walks. Nevertheless, even with the
+                                                                                                                   lower page walk latency, SoftWalker achieves substantial speedup
+                                                                                                                   by eliminating a large portion of queueing delay.
+    First, focusing on an iso-area comparison, Figure 21 demon-                                                    Varying In-TLB MSHR Entries and Merges. In-TLB MSHR al-
+strates that SoftWalker consistently outperforms the 128 PTWs by                                                   lows GPU threads to process more outstanding L2 TLB misses in
+about 18.5% for irregular workloads. This demonstrates that, for a                                                 parallel beyond the existing MSHR entries. As mentioned in Sec-
+given hardware budget, the software-managed parallelism of Soft-                                                   tion 6.1, SoftWalker uses L2 TLB entries as storage for pending
+Walker is a more effective solution than simply scaling the number                                                 misses up to 1024 entries on demand. To evaluate the impact of
+of hardware walkers. Second, the figure indicates that SoftWalker’s                                                In-TLB MSHR capacity, we measure the overall performance, vary-
+performance gain is not solely due to the In-TLB MSHR mechanism.                                                   ing the maximum number of In-TLB MSHR entries. (Note that the
+Adding In-TLB MSHR to the baseline or to the 128-PTW config-                                                       system allocates In-TLB MSHR entries only when all regular MSHR
+uration does not improve performance. Rather, it even causes a                                                     entries are full.)
+slowdown for gc, xsb, bfs, and sy2k, since there are fewer page                                                       Figure 24 illustrates the speedup of SoftWalker over the base-
+walkers than the available MSHR entries. In such cases, In-TLB                                                     line, gradually increasing the maximum number of possible In-TLB
+MSHR pollutes the L2 TLB by occupying a large portion of en-                                                       MSHR entries. The results indicate that for maximum In-TLB MSHR
+tries with long-lived pending translations. These results confirm                                                  entry counts of 0 (when In-TLB MSHR is not used), 128, 256, 512,
+that scaling both the number of PTWs and the MSHR capacity to-                                                     and 1024, the respective average speedups over the baseline are
+gether achieves a significant performance gain, as analyzed earlier                                                1.63×, 1.88×, 2.04×, 2.12×, and 2.24×, respectively. This improve-
+in Figure 12.                                                                                                      ment stems from In-TLB MSHR’s ability to effectively resolve MSHR
+Varying L2 TLB Access Latency. Compared to the traditional                                                         contention by repurposing underutilized L2 TLB entries to function
+hardware-based page table walk, SoftWalker requires additional                                                     as MSHRs. Consequently, most irregular applications demonstrate
+communications between the L2 TLB and each SM. To see the                                                          gradual performance gains as the In-TLB MSHR capacity expands.
+impact of these additional latencies on SoftWalker, we estimate                                                       Even with the existence of In-TLB MSHR, some applications do
+the speedup of SoftWalker, gradually increasing the L2 TLB access                                                  not reach the ideal performance as closely as other irregular ones.
+latency from 40 cycles to 200 cycles. Figure 22 shows the speedup                                                  For sy2k, while In-TLB MSHR reduces almost all L2 TLB MSHR
+of SoftWalker with various TLB latencies over the baseline. As the                                                 failures, the L2 TLB hit rate decreases as the maximum In-TLB
+L2 TLB access latency gets longer, the performance of SoftWalker                                                   MSHR increases. This leads to a sub-optimal performance for sy2k.
+becomes lower. With the 40-cycle latency, SoftWalker shows 2.31×                                                   Meanwhile, we found that spmv’s MSHR failure does not decrease
+speedup, which is very close to the ideal (2.58×). Even though                                                     further in over 128 entries because its access pattern frequently
+SoftWalker shows reduced speedup with a long, 200-cycle latency,                                                   causes high contention within specific L2 TLB set indices. This per-
+it still shows 2.07×, which is comparable to the baseline. This is                                                 set bottleneck limits the effectiveness of In-TLB MSHR for spmv.
+because the queueing delay of page table walk accounts for a large                                                 Despite these application-specific behaviors, In-TLB MSHR still
+portion of total page table walk latency, even with the increased L2                                               offers a decisive improvement over the baseline by provisioning
+TLB access latency, as we discussed in Section 3.3.                                                                essential MSHR capacity on demand, thereby enabling substantial
+Varying Page Walk Latency. To evaluate SoftWalker’s sensi-                                                         performance gains across a wide range of irregular workloads.
+tivity to memory access latency, we vary the per-level page table                                                  Large Page. Increasing the page size (e.g., 2MB) extends TLB cov-
+access latency from 50 to 400 cycles. Figure 23 shows the resulting                                                erage and reduces the number of page walk steps, effectively miti-
+speedup and queueing delay reduction for irregular applications.                                                   gating address translation and page walk overhead. However, some
+The speedup for each configuration is normalized to a correspond-                                                  irregular applications still exhibit aggressive access patterns that
+ing baseline with 32 PTWs and the same per-level latency.                                                          extend beyond the increased page size. Figure 25 shows the speedup
+
+
+
+
+                                                                                                             413
+MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea                                                                                                                Jang, et al.
+
+                  Baseline    SoftWalker      SW Hybrid          Ideal PTWs & MSHRs
+                                                                                        7.0 7.2 9.7
+           6                                                                                                operations to dedicated warps to reduce interference with compute
+           5
+ Speedup
+
+
+
+
+           4
+           3
+                                                                                                            warps, while WASP [16] introduces hardware support for fine-
+           2                                                                                                grained warp role partitioning to exploit pipeline parallelism. These
+           1
+           0                                                                                                techniques typically target producer-consumer patterns within a
+                 bc     dc    sssp     nw     xsb       bfs     sy2k     spmv    gesv    gups               thread block and rely on static assignment or compiler guidance.
+               Figure 25: Speedup over baseline using 2MB pages.                                            In contrast, SoftWalker introduces a dynamic and privileged form
+                                                                                                            of specialization, launching dedicated warps (PW Warps) to handle
+                       Baseline      Random     Round Robin            Stall Aware                          address translation. This makes it uniquely suited for mitigating
+                                               11.2 11.2 11.3
+           10                                                                                               system-level bottlenecks, such as TLB miss-handling.
+            8
+ Speedup
+
+
+
+
+            6
+            4
+            2
+            0                                                                                               7.3    Mitigating Address Translation Overhead in
+                    bc
+                    dc
+
+
+
+                   nw
+                  sssp
+
+
+
+
+                                                                    kc
+
+
+
+                                                                 histo
+                  sy2k
+                 spmv
+                  gesv
+                  gups
+
+
+
+
+                                                                    fft
+
+                                                                   red
+
+                                                                gemm
+
+                                                                                              GM
+                    gc
+
+                  st2d
+                   xsb
+                   bfs
+
+
+
+
+                                                                    cc
+
+                                                                   2dc
+
+
+
+
+                                                                  scan
+                                                                                                                   Future GPU Architectures
+                                                                                                            While evolving GPU architectures meet increasing application de-
+Figure 26: Speedup over baseline with alternative Request
+                                                                                                            mands, they also introduce new limitations in address translation.
+Distributor design.
+                                                                                                            Trans-FW [54] and IDYLL [52] have sought to improve multi-GPU
+                                                                                                            performance by mitigating address translation overheads arising
+of selected applications over the baseline when using a 2MB page                                            from multi-GPU systems. MASK [7], DWS [77], and STAR [53]
+size. We select 10 applications whose memory footprint can be ex-                                           reduced contentions in page table walks and TLB caused by multi-
+panded over the L2 TLB coverage (2GB in our configuration). Seven                                           tenancy. MGvm [78] and CLAP [71] attempted to mitigate remote
+applications show performance improvement when applying Soft-                                               access overhead caused by virtual memory systems in multi-chip
+Walker. sssp, nw, bfs, gesv show 1.26×, 1.18×, and 2.29× speedup                                            GPU architectures [4]. SoftWalker complements these hardware-
+over the baseline, while xsb, spmv, and gups still show substantial                                         centric solutions, providing an additional avenue to reduce transla-
+speedup, 5.1×, 4.5×, 7.0×, respectively. These results suggest that                                         tion overheads through the efficient use of idle GPU resources.
+SoftWalker can effectively reduce page table walk contentions, even
+with an increased page size.
+Request Distributor Design. The Request Distributor assigns L2                                              8     Conclusion
+TLB miss requests to SMs for processing. To evaluate the impact
+                                                                                                            We present SoftWalker, a scalable software-based page table walk
+of its distribution policy, we compare three approaches: Random,
+                                                                                                            mechanism that leverages GPU threads to address page walk con-
+Stall-Aware, and Round-Robin (our default choice) policies. Fig-
+                                                                                                            tention for irregular GPU applications. Introducing lightweight
+ure 26 compares the performance of SoftWalker under different
+                                                                                                            architectural extensions—such as the PW Warp, SoftPWB, and In-
+Request Distributor policies, relative to the baseline. The results
+                                                                                                            TLB MSHR—SoftWalker enables massively parallel page walks and
+show no significant performance differences, as the high proportion
+                                                                                                            reduces contention-induced queueing delay. In addition, our hybrid
+of stall cycles in irregular applications ensures nearly all SMs have
+                                                                                                            design allows SoftWalker to operate with hardware walkers, provid-
+sufficient idle execution resources to handle page walks. Given that
+                                                                                                            ing low-latency page walk for regular applications. Experimental
+the specific policy is non-critical, we adopted the low-overhead
+                                                                                                            results show SoftWalker achieves a 72.8% reduction in page walk
+round-robin approach for its effectiveness and simplicity.
+                                                                                                            latency and a 2.24× speedup on average. SoftWalker demonstrates
+7 Related Work                                                                                              that software-managed page table walk is a scalable and efficient
+                                                                                                            solution for future GPU memory systems.
+7.1 Leveraging Underutilized Resources
+Prior research leveraged underutilized GPU resources to increase
+performance or power efficiency. CABA [93] utilizes assist warps to                                         Acknowledgments
+perform cache line compression during idle pipeline cycles, thereby                                         We thank the anonymous reviewers for their valuable feedback.
+alleviating memory bandwidth bottlenecks. Virtual Thread [99]                                               This work was partly supported by The Ministry of Science and
+introduces a novel CTA context-switching mechanism that in-                                                 ICT (MSIT) under the Information Technology Research Center
+creases Thread-Level Parallelism for memory-intensive workloads                                             (ITRC) support program (No.II212052, 25%) supervised by the In-
+by exploiting unused register files and shared memory capacity.                                             stitute of Information & Communications Technology Planning &
+Other works, such as Reconfigurable Instruction Cache [45], Mor-                                            Evaluation (IITP), the Institute of Information & Communications
+pheus [18], and Linebacker [70], repurpose underutilized on-chip                                            Technology Planning & Evaluation(IITP) grant funded by the Korea
+resources to expand cache or TLB capacity. Despite prior efforts,                                           government (MSIT) (No.10692981, 25% / No.00228970, 50%), and
+SoftWalker is the first to leverage idle GPU pipelines for resolving                                        the BK21 FOUR Project. Sungbin Jang, Yongho Lee, Osang Kwon,
+contentions in page table walks.                                                                            and Seokin Hong are affiliated with the Department of Electrical
+                                                                                                            and Computer Engineering. Donghyeon Kim is affiliated with the
+7.2             Warp Specialization                                                                         Department of Semiconductor Convergence Engineering. Juyoung
+Warp specialization improves GPU efficiency by assigning warps to                                           Seok is affiliated with the Department of Semiconductor Display
+distinct functional roles. CUDA-DMA [10] offloads memory copy                                               Engineering. Seokin Hong is the corresponding author.
+
+
+
+
+                                                                                                      414
+SoftWalker: Supporting Software Page Table Walk for Irregular GPU Applications                                        MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea
+
+
+References                                                                                       Optimization (CGO). IEEE, 73–84.
+  [1] Mohammad Abdel-Majeed and Murali Annavaram. 2013. Warped register                     [21] Keith I Farkas and Norman P Jouppi. 1994. Complexity/performance tradeoffs
+      file: A power efficient register file for GPGPUs. In 2013 IEEE 19th International          with non-blocking loads. ACM SIGARCH Computer Architecture News 22, 2
+      symposium on high performance computer architecture (HPCA). IEEE, 412–423.                 (1994), 211–222.
+  [2] Tyler Allen and Rong Ge. 2021. In-Depth Analyses of Unified Virtual Memory            [22] Yuan Feng, Yuke Li, Jiwon Lee, Won Woo Ro, and Hyeran Jeon. 2025. Heliostat:
+      System for GPU Accelerated Computing. In Proceedings of the International                  Harnessing Ray Tracing Accelerators for Page Table Walks. In Proceedings of
+      Conference for High Performance Computing, Networking, Storage and Analysis.               the 52nd Annual International Symposium on Computer Architecture. 122–136.
+      1–15.                                                                                 [23] Yuan Feng, Seonjin Na, Hyesoon Kim, and Hyeran Jeon. 2024. Barre Chord:
+  [3] AMD 2012. AMD GRAPHICS CORES NEXT (GCN) ARCHITECTURE. AMD.                                 Efficient Virtual Memory Translation for Multi-Chip-Module GPUs. In 2024
+      https://www.amd.com/Documents/GCN_Architecture_whitepaper.pdf                              ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA).
+  [4] Akhil Arunkumar, Evgeny Bolotin, Benjamin Cho, Ugljesa Milic, Eiman                        IEEE, 834–847.
+      Ebrahimi, Oreste Villa, Aamer Jaleel, Carole-Jean Wu, and David Nellans. 2017.        [24] Scott Grauer-Gray, Lifan Xu, Robert Searles, Sudhee Ayalasomayajula, and John
+      MCM-GPU: Multi-chip-module GPUs for continued performance scalability.                     Cavazos. 2012. Auto-tuning a high-level language targeted to GPU codes. In
+      ACM SIGARCH Computer Architecture News 45, 2 (2017), 320–332.                              2012 innovative parallel computing (InPar). IEEE, 1–10.
+  [5] Mikhail Asiatici and Paolo Ienne. 2021. Large-scale graph processing on FPGAs         [25] Gary N Hammond, Koichi Yamada, Stephen G Burger, James O Hays, Jonathan K
+      with caches for thousands of simultaneous misses. In 2021 ACM/IEEE 48th Annual             Ross, and William R Bryg. 1999. Software and hardware-managed translation
+      International Symposium on Computer Architecture (ISCA). IEEE, 609–622.                    lookaside buffer. US Patent 5,940,872.
+  [6] Rachata Ausavarungnirun, Joshua Landgraf, Vance Miller, Saugata Ghose,                [26] Sukhyun Han, Seongwook Kim, Gwangeun Byeon, Jihun Yoon, and Seokin Hong.
+      Jayneel Gandhi, Christopher J Rossbach, and Onur Mutlu. 2017. Mosaic: a                    2025. Zebra: Leveraging Diagonal Attention Pattern for Vision Transformer
+      GPU memory manager with application-transparent support for multiple page                  Accelerator. In 2025 Design, Automation & Test in Europe Conference (DATE).
+      sizes. In Proceedings of the 50th Annual IEEE/ACM International Symposium on               IEEE, 1–7.
+      Microarchitecture. 136–150.                                                           [27] Mark D Hill and Alan Jay Smith. 2002. Evaluating associativity in CPU caches.
+  [7] Rachata Ausavarungnirun, Vance Miller, Joshua Landgraf, Saugata Ghose,                     IEEE Trans. Comput. 38, 12 (2002), 1612–1630.
+      Jayneel Gandhi, Adwait Jog, Christopher J Rossbach, and Onur Mutlu. 2018.             [28] Ralf Hund, Carsten Willems, and Thorsten Holz. 2013. Practical timing side
+      Mask: Redesigning the gpu memory hierarchy to support multi-application                    channel attacks against kernel space ASLR. In 2013 IEEE Symposium on Security
+      concurrency. ACM SIGPLAN Notices 53, 2 (2018), 503–518.                                    and Privacy. IEEE, 191–205.
+  [8] Rajeev Balasubramonian, Andrew B Kahng, Naveen Muralimanohar, Ali Shafiee,            [29] Won Hur, Jiwon Lee, Jaewon Kwon, Minjae Kim, and Won Woo Ro. 2025. Hash-
+      and Vaishnav Srinivas. 2017. CACTI 7: New tools for interconnect exploration               Scape: Leveraging Virtual Address Dynamics for Efficient Hashed Page Tables.
+      in innovative off-chip memories. ACM Transactions on Architecture and Code                 IEEE Trans. Comput. (2025).
+      Optimization (TACO) 14, 2 (2017), 1–25.                                               [30] Koji Inoue, Tohru Ishihara, and Kazuaki Murakami. 1999. Way-predicting
+  [9] Trinayan Baruah, Yifan Sun, Ali Tolga Dinçer, Saiful A Mojumder, José L Abellán,           set-associative cache for high performance and low energy consumption. In
+      Yash Ukidave, Ajay Joshi, Norman Rubin, John Kim, and David Kaeli. 2020.                   Proceedings of the 1999 international symposium on Low power electronics and
+      Griffin: Hardware-software support for efficient page migration in multi-gpu               design. 273–275.
+      systems. In 2020 IEEE International Symposium on High Performance Computer            [31] Bruce Jacob and Trevor Mudge. 1997. Software-managed address translation.
+      Architecture (HPCA). IEEE, 596–609.                                                        In Proceedings Third International Symposium on High-Performance Computer
+ [10] Michael Bauer, Henry Cook, and Brucek Khailany. 2011. CudaDMA: optimiz-                    Architecture. IEEE, 156–167.
+      ing GPU memory bandwidth via warp specialization. In Proceedings of 2011              [32] Sungbin Jang, Junhyeok Park, Osang Kwon, Yongho Lee, and Seokin Hong. 2024.
+      international conference for high performance computing, networking, storage and           Rethinking page table structure for fast address translation in gpus: A fixed-size
+      analysis. 1–11.                                                                            hashed page table. In Proceedings of the 2024 International Conference on Parallel
+ [11] Gwangeun Byeon, Seongwook Kim, Hyungjin Kim, Sukhyun Han, Jinkwon Kim,                     Architectures and Compilation Techniques. 325–337.
+      Prashant Nair, Taewook Kang, and Seokin Hong. 2025. Avalanche: Optimizing             [33] Hyeran Jeon, Gokul Subramanian Ravi, Nam Sung Kim, and Murali Annavaram.
+      Cache Utilization via Matrix Reordering for Sparse Matrix Multiplication Accel-            2015. GPU register file virtualization. In Proceedings of the 48th International
+      erator. In Proceedings of the 52nd Annual International Symposium on Computer              Symposium on Microarchitecture. 420–432.
+      Architecture. 1746–1759.                                                              [34] Naifeng Jing, Yao Shen, Yao Lu, Shrikanth Ganapathy, Zhigang Mao, Minyi
+ [12] Niladrish Chatterjee, Mike O’Connor, Gabriel H Loh, Nuwan Jayasena, and                    Guo, Ramon Canal, and Xiaoyao Liang. 2013. An energy-efficient and scalable
+      Rajeev Balasubramonia. 2014. Managing DRAM latency divergence in irregular                 eDRAM-based register file architecture for GPGPU. ACM SIGARCH Computer
+      GPGPU applications. In SC’14: Proceedings of the International Conference for              Architecture News 41, 3 (2013), 344–355.
+      High Performance Computing, Networking, Storage and Analysis. IEEE, 128–139.          [35] Adwait Jog, Onur Kayiran, Tuba Kesten, Ashutosh Pattnaik, Evgeny Bolotin,
+ [13] Shuai Che, Michael Boyer, Jiayuan Meng, David Tarjan, Jeremy W Sheaffer, Sang-             Niladrish Chatterjee, Stephen W Keckler, Mahmut T Kandemir, and Chita R
+      Ha Lee, and Kevin Skadron. 2009. Rodinia: A benchmark suite for heterogeneous              Das. 2015. Anatomy of gpu memory system for multi-application execution. In
+      computing. In 2009 IEEE international symposium on workload characterization               Proceedings of the 2015 international symposium on memory systems. 223–234.
+      (IISWC). IEEE, 44–54.                                                                 [36] Corbet Jonathan. 2017. Five-Level Page Tables. (2017). https://lwn.net/Articles/
+ [14] Xi E Chen and Tor M Aamodt. 2009. A first-order fine-grained multithreaded                 717293/
+      throughput model. In 2009 IEEE 15th International Symposium on High Perfor-           [37] Ni Kang, Ahmad Alawneh, Mengchi Zhang, and Timothy G Rogers. 2024.
+      mance Computer Architecture. IEEE, 329–340.                                                Concurrency-Aware Register Stacks for Efficient GPU Function Calls. In 2024
+ [15] Compute Express Link Consortium 2023. CXL 3.1 Specification. Compute                       57th IEEE/ACM International Symposium on Microarchitecture (MICRO). IEEE,
+      Express Link Consortium. https://computeexpresslink.org/cxl-specification/                 686–699.
+ [16] Neal C Crago, Sana Damani, Karthikeyan Sankaralingam, and Stephen W Keck-             [38] Paul A Karger. 2007. Performance and security lessons learned from virtualizing
+      ler. 2024. Wasp: Exploiting gpu pipeline parallelism with hardware-accelerated             the alpha processor. In Proceedings of the 34th annual international symposium
+      automatic warp specialization. In 2024 IEEE International Symposium on High-               on Computer architecture. 392–401.
+      Performance Computer Architecture (HPCA). IEEE, 1–16.                                 [39] Vasileios P Kemerlis, Michalis Polychronakis, and Angelos D Keromytis. 2014.
+ [17] Anthony Danalis, Gabriel Marin, Collin McCurdy, Jeremy S Meredith, Philip C                ret2dir: Rethinking kernel isolation. In 23rd USENIX Security Symposium
+      Roth, Kyle Spafford, Vinod Tipparaju, and Jeffrey S Vetter. 2010. The scalable             (USENIX Security 14). 957–972.
+      heterogeneous computing (SHOC) benchmark suite. In Proceedings of the 3rd             [40] Bernhard Kerbl, Georgios Kopanas, Thomas Leimkühler, and George Drettakis.
+      workshop on general-purpose computation on graphics processing units. 63–74.               2023. 3d gaussian splatting for real-time radiance field rendering. ACM Trans.
+ [18] Sina Darabi, Mohammad Sadrosadati, Negar Akbarzadeh, Joël Lindegger, Mo-                   Graph. 42, 4 (2023), 139–1.
+      hammad Hosseini, Jisung Park, Juan Gómez-Luna, Onur Mutlu, and Hamid                  [41] Mahmoud Khairy, Zhesheng Shen, Tor M Aamodt, and Timothy G Rogers. 2020.
+      Sarbazi-Azad. 2022. Morpheus: Extending the last level cache capacity in GPU               Accel-Sim: An Extensible Simulation Framework for Validated GPU Modeling. In
+      systems using idle GPU core resources. In 2022 55th IEEE/ACM International                 2020 ACM/IEEE 47th Annual International Symposium on Computer Architecture
+      Symposium on Microarchitecture (MICRO). IEEE, 228–244.                                     (ISCA). IEEE, 473–486.
+ [19] Francis M David, Jeffrey C Carlyle, and Roy H Campbell. 2007. Context switch          [42] Hyojong Kim, Jaewoong Sim, Prasun Gera, Ramyad Hadidi, and Hyesoon Kim.
+      overheads for Linux on ARM platforms. In Proceedings of the 2007 workshop on               2020. Batch-aware unified memory management in GPUs for irregular work-
+      Experimental computer science. 3–es.                                                       loads. In Proceedings of the Twenty-Fifth International Conference on Architectural
+ [20] Simon Garcia De Gonzalo, Sitao Huang, Juan Gómez-Luna, Simon Hammond,                      Support for Programming Languages and Operating Systems. 1357–1370.
+      Onur Mutlu, and Wen-mei Hwu. 2019. Automatic generation of warp-level                 [43] Junsu Kim, Jaebeom Jeon, Jaeyong Park, Sangun Choi, Minseong Gil, Seokin
+      primitives and atomic instructions for fast and portable parallel reduction on             Hong, Gunjae Koo, Myung Kuk Yoon, and Yunho Oh. 2025. MOST: Mem-
+      GPUs. In 2019 IEEE/ACM International Symposium on Code Generation and                      ory Oversubscription-aware Scheduling for Tensor Migration on GPU Unified
+                                                                                                 Storage. IEEE Computer Architecture Letters (2025).
+
+
+
+
+                                                                                      415
+MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea                                                                                                                  Jang, et al.
+
+
+ [44] Keunsoo Kim, Sangpil Lee, Myung Kuk Yoon, Gunjae Koo, Won Woo Ro, and                  [69] NVIDIA 2025. NVML API Reference Guide. NVIDIA. https://docs.nvidia.com/
+      Murali Annavaram. 2016. Warped-preexecution: A GPU pre-execution approach                   deploy/nvml-api/group__NvLink.html
+      for improving latency hiding. In 2016 IEEE International Symposium on High             [70] Yunho Oh, Gunjae Koo, Murali Annavaram, and Won Woo Ro. 2019. Linebacker:
+      Performance Computer Architecture (HPCA). IEEE, 163–175.                                    Preserving victim cache lines in idle register files of GPUs. In Proceedings of the
+ [45] Jagadish B Kotra, Michael LeBeane, Mahmut T Kandemir, and Gabriel H Loh.                    46th International Symposium on Computer Architecture. 183–196.
+      2021. Increasing gpu translation reach by leveraging under-utilized on-chip            [71] Junhyeok Park, Sungbin Jang, Osang Kwon, Yongho Lee, and Seokin Hong.
+      resources. In MICRO-54: 54th Annual IEEE/ACM International Symposium on                     2025. Leveraging Chiplet-Locality for Efficient Memory Mapping in Multi-
+      Microarchitecture. 1169–1181.                                                               Chip Module GPUs. In Proceedings of the 58th Annual IEEE/ACM International
+ [46] Osang Kwon, Yongho Lee, and Seokin Hong. 2022. Pinning page structure                       Symposium on Microarchitecture.
+      entries to last-level cache for fast address translation. IEEE Access 10 (2022),       [72] Junhyeok Park, Osang Kwon, Yongho Lee, Seongwook Kim, Gwangeun Byeon,
+      114552–114565.                                                                              Jihun Yoon, Prashant J Nair, and Seokin Hong. 2024. A Case for Speculative
+ [47] Osang Kwon, Yongho Lee, and Seokin Hong. 2025. Improving Address Transla-                   Address Translation with Rapid Validation for GPUs. In 2024 57th IEEE/ACM
+      tion in Tagless DRAM Cache by Caching PTE Pages. In 2025 Design, Automation                 International Symposium on Microarchitecture (MICRO). IEEE, 278–292.
+      & Test in Europe Conference (DATE). IEEE, 1–7.                                         [73] Junbum Park, Yongho Lee, Sungbin Jang, Wonyoung Lee, and Seokin Hong. 2025.
+ [48] Osang Kwon, Yongho Lee, Junhyeok Park, Sungbin Jang, Byungchul Tak, and                     SPB: Towards Low-Latency CXL Memory via Speculative Protocol Bypassing.
+      Seokin Hong. 2024. Distributed page table: Harnessing physical memory as an                 In 2025 Design, Automation & Test in Europe Conference (DATE). IEEE, 1–7.
+      unbounded hashed page table. In 2024 57th IEEE/ACM International Symposium             [74] Binh Pham, Viswanathan Vaidyanathan, Aamer Jaleel, and Abhishek Bhat-
+      on Microarchitecture (MICRO). IEEE, 36–49.                                                  tacharjee. 2012. Colt: Coalesced large-reach tlbs. In 2012 45th Annual IEEE/ACM
+ [49] Jiwon Lee, Ju Min Lee, Yunho Oh, William J Song, and Won Woo Ro. 2023.                      International Symposium on Microarchitecture. IEEE, 258–269.
+      Snakebyte: A tlb design with adaptive and recursive page merging in gpus. In           [75] Bharath Pichai, Lisa Hsu, and Abhishek Bhattacharjee. 2014. Architectural
+      2023 IEEE International Symposium on High-Performance Computer Architecture                 Support for Address Translation on GPUs: Designing Memory Management
+      (HPCA). IEEE, 1195–1207.                                                                    Units for CPU/GPUs with Unified Address Spaces. ACM SIGARCH Computer
+ [50] Jiwon Lee, Myung Kuk Yoon, Ipoom Jeong, Yunho Oh, and Won Woo Ro. 2025.                     Architecture News 42, 1 (2014), 743–758.
+      Marching Page Walks: Batching and Concurrent Page Table Walks for Enhancing            [76] Jason Power, Mark D Hill, and David A Wood. 2014. Supporting x86-64 Address
+      GPU Throughput. In 2025 IEEE International Symposium on High-Performance                    Translation for 100s of GPU Lanes. In 2014 IEEE 20th International Symposium
+      Computer Architecture (HPCA). IEEE, 626–639.                                                on High Performance Computer Architecture (HPCA). IEEE, 568–578.
+ [51] Yongho Lee, Junbum Park, Osang Kwon, Sungbin Jang, and Seokin Hong. 2025.              [77] B Pratheek, Neha Jawalkar, and Arkaprava Basu. 2021. Improving gpu multi-
+      Buddy ECC: Making Cache Mostly Clean in CXL-Based Memory Systems for                        tenancy with page walk stealing. In 2021 IEEE International Symposium on
+      Enhanced Error Correction at Low Cost. In 2025 Design, Automation & Test in                 High-Performance Computer Architecture (HPCA). IEEE, 626–639.
+      Europe Conference (DATE). IEEE, 1–7.                                                   [78] B Pratheek, Neha Jawalkar, and Arkaprava Basu. 2022. Designing virtual mem-
+ [52] Bingyao Li, Yanan Guo, Yueqi Wang, Aamer Jaleel, Jun Yang, and Xulong Tang.                 ory system of mcm gpus. In 2022 55th IEEE/ACM International Symposium on
+      2023. Idyll: Enhancing page translation in multi-gpus via light weight pte inval-           Microarchitecture (MICRO). IEEE, 404–422.
+      idations. In Proceedings of the 56th Annual IEEE/ACM International Symposium           [79] Frederik Dermot Pustelnik, Xhani Marvin Sass, and Jean-Pierre Seifert. 2024.
+      on Microarchitecture. 1163–1177.                                                            Whispering Pixels: Exploiting Uninitialized Register Accesses in Modern GPUs.
+ [53] Bingyao Li, Yueqi Wang, Tianyu Wang, Lieven Eeckhout, Jun Yang, Aamer Jaleel,               In 2024 IEEE 9th European Symposium on Security and Privacy (EuroS&P). IEEE,
+      and Xulong Tang. 2024. STAR: Sub-Entry Sharing-Aware TLB for Multi-Instance                 345–360.
+      GPU. In 2024 57th IEEE/ACM International Symposium on Microarchitecture                [80] Divya Praneetha Ravipati, Victor M van Santen, Shivendra Singh Parihar, Yo-
+      (MICRO). IEEE, 309–323.                                                                     gesh Singh Chauhan, Preeti Ranjan Panda, and Hussam Amrouch. 2025. Cryo-
+ [54] Bingyao Li, Jieming Yin, Anup Holey, Youtao Zhang, Jun Yang, and Xulong                     CACTI: Cryogenic-Aware CACTI for Cache Modeling down to 10K in Advanced
+      Tang. 2023. Trans-fw: Short circuiting page table walk in multi-gpu systems via             7nm FinFETs. IEEE Trans. Comput. (2025).
+      remote forwarding. In 2023 IEEE International Symposium on High-Performance            [81] Minsoo Rhu, Michael Sullivan, Jingwen Leng, and Mattan Erez. 2013. A locality-
+      Computer Architecture (HPCA). IEEE, 456–470.                                                aware memory hierarchy for energy-efficient GPU architectures. In Proceedings
+ [55] Mat Loikkanen and Nader Bagherzadeh. 1996. A fine-grain multithreading                      of the 46th Annual IEEE/ACM International Symposium on Microarchitecture.
+      superscalar architecture. In Proceedings of the 1996 Conference on Parallel Archi-          86–98.
+      tectures and Compilation Technique. IEEE, 163–168.                                     [82] Timothy G Rogers, Mike O’Connor, and Tor M Aamodt. 2013. Divergence-aware
+ [56] Jeffrey C Mogul and Anita Borg. 1991. The effect of context switches on cache               warp scheduling. In Proceedings of the 46th Annual IEEE/ACM International
+      performance. ACM SIGPLAN Notices 26, 4 (1991), 75–84.                                       Symposium on Microarchitecture. 99–110.
+ [57] David Nagle, Richard Uhlig, Tim Stanley, Stuart Sechrest, Trevor Mudge, and            [83] Mohammad Sadrosadati, Amirhossein Mirhosseini, Ali Hajiabadi, Seyed Borna
+      Richard Brown. 1993. Design tradeoffs for software-managed TLBs. In Pro-                    Ehsani, Hajar Falahati, Hamid Sarbazi-Azad, Mario Drumond, Babak Falsafi,
+      ceedings of the 20th annual international symposium on Computer architecture.               Rachata Ausavarungnirun, and Onur Mutlu. 2021. Highly concurrent latency-
+      27–38.                                                                                      tolerant register files for GPUs. ACM Transactions on Computer Systems (TOCS)
+ [58] Lifeng Nai, Yinglong Xia, Ilie G Tanase, Hyesoon Kim, and Ching-Yung Lin.                   37, 1-4 (2021), 1–36.
+      2015. GraphBIG: understanding graph computing in the context of industrial             [84] Nikolay Sakharnykh. 2018. Everything You Need to Know about Unified Mem-
+      solutions. In Proceedings of the International Conference for High Performance              ory. https://www.nvidia.com/en-us/on-demand/session/gtcsiliconvalley2018-
+      Computing, Networking, Storage and Analysis. 1–12.                                          s8430/
+ [59] NVIDIA. 2017. NVIDIA TESLA V100 GPU ARCHITECTURE. (2017).                              [85] Seunghee Shin, Guilherme Cox, Mark Oskin, Gabriel H Loh, Yan Solihin, Ab-
+      https://images.nvidia.com/content/volta-architecture/pdf/volta-architecture-                hishek Bhattacharjee, and Arkaprava Basu. 2018. Scheduling page table walks
+      whitepaper.pdf                                                                              for irregular GPU applications. In 2018 ACM/IEEE 45th Annual International
+ [60] NVIDIA 2020. Pascal MMU Format Changes. NVIDIA. https://nvidia.github.io/                   Symposium on Computer Architecture (ISCA). IEEE, 180–192.
+      open-gpu-doc/pascal/gp100-mmu-format.pdf                                               [86] Seunghee Shin, Michael LeBeane, Yan Solihin, and Arkaprava Basu. 2018.
+ [61] NVIDIA 2021. NVIDIA AMPERE GA102 GPU ARCHITECTURE. NVIDIA.                                  Neighborhood-aware address translation for irregular GPU applications. In
+      https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-                                2018 51st Annual IEEE/ACM International Symposium on Microarchitecture (MI-
+      architecture-whitepaper-v2.pdf                                                              CRO). IEEE, 352–363.
+ [62] NVIDIA. 2024. NVIDIA CUDA Samples. (2024). https://github.com/NVIDIA/                  [87] Dimitrios Skarlatos, Apostolos Kokolis, Tianyin Xu, and Josep Torrellas. 2020.
+      cuda-samples                                                                                Elastic cuckoo page tables: Rethinking virtual memory translation for paral-
+ [63] NVIDIA 2024. NVIDIA GH200 Grace Hopper Superchip Architecture. NVIDIA.                      lelism. In Proceedings of the Twenty-Fifth International Conference on Architectural
+      https://resources.nvidia.com/en-us-grace-cpu/nvidia-grace-hopper                            Support for Programming Languages and Operating Systems. 1093–1108.
+ [64] NVIDIA. 2024. NVIDIA High Performance Conjugate Gradient Benchmark                     [88] Jovan Stojkovic, Namrata Mantri, Dimitrios Skarlatos, Tianyin Xu, and Josep
+      (HPCG). https://github.com/NVIDIA/nvidia-hpcg                                               Torrellas. 2023. Memory-efficient hashed page tables. In 2023 IEEE International
+ [65] NVIDIA. 2025. CUDA Binary Utilites. (2025). https://docs.nvidia.com/cuda/                   Symposium on High-Performance Computer Architecture (HPCA). IEEE, 1221–
+      cuda-binary-utilities/contents.html                                                         1235.
+ [66] NVIDIA. 2025. CUDA C++ Programming Guide. (2025). https://docs.nvidia.                 [89] Synopsys 2025. DC Ultra. Synopsys. https://www.synopsys.com/content/dam/
+      com/cuda/cuda-c-programming-guide/                                                          synopsys/implementation&signoff/datasheets/dc-ultra-ds.pdf
+ [67] NVIDIA. 2025. CUDA Toolkit Documentation. (2025). https://docs.nvidia.com/             [90] John R Tramm, Andrew R Siegel, Tanzima Islam, and Martin Schulz. 2014.
+      cuda/cuda-driver-api/group__CUDA__GRAPH.html                                                XSBench - The Development and Verification of a Performance Abstraction for
+ [68] NVIDIA. 2025. Nsight Compute Documentation. (2025). https://docs.nvidia.                    Monte Carlo Reactor Analysis. The Role of Reactor Physics toward a Sustainable
+      com/nsight-compute/index.html                                                               Future (PHYSOR) (2014).
+
+
+
+
+                                                                                       416
+SoftWalker: Supporting Software Page Table Walk for Irregular GPU Applications                                    MICRO ’25, October 18–22, 2025, Seoul, Republic of Korea
+
+
+ [91] UMC 2022. 28 Nanometer. UMC. https://www.umc.com/upload/media/05_                   [96] Shaoxian Xu, Sitong Lu, Zhiyuan Shao, Xiaofei Liao, and Hai Jin. 2024. MiCache:
+      Press_Center/3_Literatures/Process_Technology/28nm_Brochure.pdf                          An MSHR-inclusive Non-blocking Cache Design for FPGAs. In Proceedings of the
+ [92] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,                 2024 ACM/SIGDA International Symposium on Field Programmable Gate Arrays.
+      Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. Attention Is All You           22–32.
+      Need. Advances in neural information processing systems 30 (2017).                  [97] Jianchao Yang, Mei Wen, Dong Chen, Zhaoyun Chen, Zeyu Xue, Yuhang Li,
+ [93] Nandita Vijaykumar, Gennady Pekhimenko, Adwait Jog, Abhishek Bhowmick,                   Junzhong Shen, and Yang Shi. 2024. HyFiSS: A Hybrid Fidelity Stall-Aware
+      Rachata Ausavarungnirun, Chita Das, Mahmut Kandemir, Todd C Mowry, and                   Simulator for GPGPUs. In 2024 57th IEEE/ACM International Symposium on
+      Onur Mutlu. 2015. A case for core-assisted bottleneck acceleration in GPUs:              Microarchitecture (MICRO). IEEE, 168–185.
+      enabling flexible data compression with assist warps. ACM SIGARCH Computer          [98] Idan Yaniv and Dan Tsafrir. 2016. Hash, don’t cache (the page table). ACM
+      Architecture News 43, 3S (2015), 41–53.                                                  SIGMETRICS Performance Evaluation Review 44, 1 (2016), 337–350.
+ [94] Yueqi Wang, Bingyao Li, Aamer Jaleel, Jun Yang, and Xulong Tang. 2024. GRIT:        [99] Myung Kuk Yoon, Keunsoo Kim, Sangpil Lee, Won Woo Ro, and Murali An-
+      Enhancing multi-GPU performance with fine-grained dynamic page placement.                navaram. 2016. Virtual thread: Maximizing thread-level parallelism beyond
+      In 2024 IEEE International Symposium on High-Performance Computer Architec-              GPU scheduling limit. ACM SIGARCH Computer Architecture News 44, 3 (2016),
+      ture (HPCA). IEEE, 1080–1094.                                                            609–621.
+ [95] Yingcan Wei, Matthias Langer, Fan Yu, Minseok Lee, Jie Liu, Ji Shi, and Ze-        [100] Tianhao Zheng, David Nellans, Arslan Zulfiqar, Mark Stephenson, and
+      huan Wang. 2022. A gpu-specialized inference parameter server for large-scale            Stephen W Keckler. 2016. Towards high performance paged memory for GPUs.
+      deep recommendation models. In Proceedings of the 16th ACM Conference on                 In 2016 IEEE International Symposium on High Performance Computer Architec-
+      Recommender Systems. 408–419.                                                            ture (HPCA). IEEE, 345–357.
+
+
+
+
+                                                                                   417
+

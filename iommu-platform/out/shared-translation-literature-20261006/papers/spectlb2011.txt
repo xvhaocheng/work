@@ -1,0 +1,750 @@
+                                        SpecTLB: A Mechanism for
+                                      Speculative Address Translation
+
+                                               Thomas W. Barr, Alan L. Cox, Scott Rixner
+                                                                        Rice University
+                                                                         Houston, TX
+                                                                  {twb, alc, rixner}@rice.edu
+
+ABSTRACT                                                                                   1. INTRODUCTION
+Data-intensive computing applications are using more and more                                 The memory capacity of modern computers is growing at a much
+memory and are placing an increasing load on the virtual mem-                              faster rate than the size of translation-lookaside buffers (TLBs).
+ory system. While the use of large pages can help alleviate the                            Therefore, TLB misses are becoming more frequent and address
+overhead of address translation, they limit the control the operat-                        translation is an increasingly significant performance bottleneck.
+ing system has over memory allocation and protection. We present                           Recent work has shown that the impact of address translation on
+a novel device, the SpecTLB, that exploits the predictable behav-                          overall system performance ranges from 5-14% even for nominally
+ior of reservation-based physical memory allocators to interpolate                         sized applications in a non-virtualized environment [5]. Larger ap-
+address translations.                                                                      plications have even higher overhead, approaching 50% in some
+   Our device provides speculative translations for many TLB                               cases [17].
+misses on small pages without referencing the page table. While                               Virtualization compounds address translation overhead. Nested
+these interpolations must be confirmed, doing so can be done in                            paging, a popular mechanism for hardware supported memory
+parallel with speculative execution. This effectively hides the ex-                        virtualization, increases virtual memory overhead dramatically.
+ecution latency of these TLB misses. In simulation, the SpecTLB                            Translating a single guest virtual address to a machine physical ad-
+is able to overlap an average of 57% of page table walks with suc-                         dress can take as many as twenty-four memory accesses on x86-64.
+cessful speculative execution over a wide variety of applications.                         Consequently, the overhead of virtual memory increases to up to
+We also show that the SpecTLB outperforms a state-of-the-art TLB                           89% for real-world workloads when using nested paging [5].
+prefetching scheme for virtually all tested applications with signif-                         The use of large pages reduces the performance overhead of vir-
+icant TLB miss rates. Moreover, we show that the SpecTLB is                                tual memory by increasing TLB coverage. Each entry in the TLB
+efficient since mispredictions are extremely rare, occurring in less                       that holds a large page covers a larger region of virtual memory,
+than 1% of TLB misses. In essense, the SpecTLB effectively en-                             so the entire TLB is able to translate a larger region of the address
+ables the use of small pages to achieve fine-grained allocation and                        space. However, this increased coverage does not come for free.
+protection, while avoiding the associated latency penalties of small                          The page is the unit of a program’s address space that the oper-
+pages.                                                                                     ating system can allocate and protect. The operating system must
+                                                                                           allocate an entire page of physical memory at a time, regardless of
+                                                                                           how much of that space will be used by the application. Always
+Categories and Subject Descriptors                                                         allocating large pages leads to excessive physical memory use if a
+C.0 [General]: Modelling of computer architecture; C.4                                     program fragments its virtual memory use. More critically, appli-
+[Performance of systems]: Design studies; D.4.2 [Operating Sys-                            cation permissions (read/write/execute) must be consistent across
+tems]: Virtual Memory                                                                      an entire page, large or small. Finally, the operating system can tell
+                                                                                           if memory has been modified or accessed on a page granularity. It
+General Terms                                                                              uses this facility to know when to write back portions of memory
+                                                                                           mapped files. This means that if large pages are used for memory
+Performance, Design
+                                                                                           mapped files, the operating system must write back the entire large
+                                                                                           page even if only a single byte was modified.
+Keywords                                                                                      On x86-64, pages are only available in three sizes: 4KB, 2MB
+TLB, Memory Management                                                                     and 1GB. The large gap between these sizes makes page size selec-
+                                                                                           tion critical. Using too small of a page overburdens the TLB, while
+                                                                                           using too large of a page can waste physical memory and have high
+                                                                                           I/O overhead. The proper page size for a region of memory may
+                                                                                           change from application to application or even from execution to
+                                                                                           execution. Therefore, some modern operating systems take an au-
+Permission to make digital or hard copies of all or part of this work for                  tomatic approach to selecting page size.
+personal or classroom use is granted without fee provided that copies are                     FreeBSD’s reservation-based physical memory allocator uses
+not made or distributed for profit or commercial advantage and that copies
+                                                                                           small pages for all memory by default. After a program uses ev-
+bear this notice and the full citation on the first page. To copy otherwise, to
+republish, to post on servers or to redistribute to lists, requires prior specific         ery 4KB page within an entire 2MB region of virtual memory, that
+permission and/or a fee.                                                                   contiguous region is promoted to a large page. To prepare for this,
+ISCA’11, June 4–8, 2011, San Jose, California, USA.                                        the operating system places small pages that might be promoted in
+Copyright 2011 ACM 978-1-4503-0472-6/11/06 ...$10.00.
+
+
+
+
+                                                                                     307
+the future into large page reservations. In a reservation, 4KB pages
+are aligned within a 2MB region of physical memory correspond-                      63:48   47:39     38:30     29:21      20:12        11:0
+ing to their alignment within their 2MB region of virtual memory.                    se     L4 idx    L3 idx    L2 idx     L1 idx    page offset
+This means that within a reservation, consecutive virtual pages will
+also be consecutive physical pages [19].                                            Figure 1: Decomposition of the x86-64 virtual address.
+   Processor architectures must evolve to meet the demands of
+modern operating systems [18]. The challenges involved in address
+translation require innovative architectural solutions that provide           2.     BACKGROUND
+support for such reservation-based physical memory allocators. In
+this paper, we present the SpecTLB, a novel TLB-like structure that              The SpecTLB is intricately tied to the operation of address trans-
+exploits the contiguity and alignment generated by a reservation-             lation and pysical memory allocation. This section provides back-
+based physical memory allocator to interpolate address translations           ground information that explains how traditional x86 address trans-
+based on the physical address of nearby pages. While the under-               lation works, how address translation is extended to handle virtu-
+lying page table still must be walked to verify these speculative             alization, and how a reservation-based physical memory allocator
+translations, this walk can be done concurrently with speculative             operates. This background provides context to help explain how
+memory access and execution. This new capability allows the op-               the SpecTLB is able to improve performance by hiding the latency
+erating system to maintain fine-grained protection and allocation             of TLB misses.
+over memory while hiding the latency of the resulting TLB misses.
+   We show that the SpecTLB is able to eliminate the latency                  2.1     x86 Address Translation
+penalty from a majority of TLB misses with an unmodified version
+                                                                                 All x86 processors since the Intel 80386 have used a radix tree
+of FreeBSD. However, one of the key contributions of the SpecTLB
+                                                                              to record the mapping from virtual to physical addresses. Although
+is its ability to achieve large-page like performance when large
+                                                                              the depth of this tree has increased, to accommodate larger physi-
+pages are impractical to use, such as in virtualization. Traditional
+                                                                              cal and virtual address spaces, the procedure for translating virtual
+hypervisors implement I/O by marking pages of the guest physi-
+                                                                              addresses to physical addresses using this tree is essentially un-
+cal address space that contain memory mapped I/O as unavailable.
+                                                                              changed. A virtual address is split into a page number and a page
+When the guest system accesses them, the hypervisor is invoked
+                                                                              offset. The page number is further split into a sequence of indices.
+which emulates the I/O device. Ideally, the physical memory space
+                                                                              The first index is used to select an entry from the root of the tree,
+of a virtualized guest would be stored as a small number of 1GB
+                                                                              which may contain a pointer to a node at the next lower level of the
+pages. However, the guest physical pages that the guest operating
+                                                                              tree. If the entry does contain a pointer, the next index is used to
+system will use for I/O are fixed, defined by the x86 architecture
+                                                                              select an entry from this node, which may again contain a pointer
+itself. Therefore, the hypervisor must have fine-grained protection
+                                                                              to a node at the next lower level of the tree. These steps repeat until
+control over those pages. With a speculative TLB, this space can
+                                                                              the selected entry is either invalid (in essence, a NULL pointer in-
+be stored in a 1GB reservation with both data and emulated I/O
+                                                                              dicating there is no valid translation for that portion of the address
+pages mixed together. All accesses are made speculatively, as if
+                                                                              space) or the entry instead points to a data page using its physical
+they were to a data page. Therefore, all guest physical memory ac-
+                                                                              address. In the latter case, the page offset from the virtual address
+cesses can proceed without blocking for a TLB miss. If the address
+                                                                              is added to the physical address of this data page to obtain the full
+turns out to be part of a data region, the speculative work is com-
+                                                                              physical address. In a simple memory management unit (MMU)
+mitted. However, if an address is part of an emulated I/O region,
+                                                                              design, this procedure requires one memory access per level in the
+the speculative execution will not be committed, and the hypervisor
+                                                                              tree.
+will be invoked as before.
+                                                                                 Figure 1 shows the precise decomposition of a virtual address by
+   We evaluate the SpecTLB using a microarchitecture-
+                                                                              x86-64 processors [1]. Standard x86-64 pages are 4KB, so there
+independent simulation. We quantify how often TLB misses
+                                                                              is a single 12-bit page offset. The remainder of the 48-bit virtual
+are predictable and how many MMU-related memory accesses
+                                                                              address is divided into four 9-bit indices, which are used to select
+can be parallelized with our system. Our results show that the
+                                                                              entries from the four levels of the page table. The four levels of
+SpecTLB can remove 40% of the high-latency DRAM accesses
+                                                                              the x86-64 page table are named PML4 (Page Map Level 4), PDP
+related to memory management from the critical path of execution.
+                                                                              (Page Directory Pointer), PD (Page Directory) and PT (Page Table).
+Moreover, prediction accuracy is very high, exceeding 99%
+                                                                              In this paper, however, for clarity, we will refer to these levels as
+for most benchmarks. Finally, a SpecTLB only needs to be of
+                                                                              L4 (PML4), L3 (PDP), L2 (PD) and L1 (PT). Finally, the 48-bit
+moderate size, approaching maximum hit-rate with tens of entries
+                                                                              virtual address is sign extended to 64 bits (the se field). As the
+on our benchmarks.
+                                                                              virtual address space grows, additional index fields (e.g., L5) may
+   Additionally, we show that the SpecTLB compares well against
+                                                                              be added, reducing the size of the sign extension.
+TLB prefetching. We simulate a previously described TLB
+                                                                                 An entry in the page table is 8 bytes in size regardless of its level
+prefetching scheme [12] and show that our system adapts more
+                                                                              within the tree. Since a 9-bit index is used to select an entry at
+readily to applications with random access patterns and performs
+                                                                              every level of the tree, the overall size of a node is always 4KB,
+unused speculative work less frequently.
+                                                                              the same as the page size. Hence, nodes are commonly called page
+   The rest of this paper is organized as follows. Section 2 de-
+                                                                              table pages. The tree can be sparsely populated with nodes—if at
+scribes the format of the x86-64 page table and the operation of a
+                                                                              any level, there are no valid virtual addresses with a particular 9-bit
+reservation-based physical memory manager. Section 3 discusses
+                                                                              index, the sub-tree beneath that index is not instantiated. For exam-
+the design of the SpecTLB. Section 4 describes our simulator. Sec-
+                                                                              ple, if there are no valid virtual addresses with L4 index 0x03a,
+tions 5 and 6 discuss our simulation results for applications running
+                                                                              that entry in the top level of the page table will indicate so, and the
+natively and under nested paging, respectively. Section 7 discusses
+                                                                              262,657 page table pages (1 L3 page, 512 L2 pages, and 262,144
+related work. Finally, we conclude in Section 8.
+                                                                              L1 pages) beneath that entry in the radix tree page table will not
+                                                                              exist. This yields significant memory savings, as large portions of
+
+
+
+
+                                                                        308
+Figure 2: An example page walk for virtual address (0b9,
+00c, 0ae, 0c2, 016). Each page table entry stores the
+physical page number for either the next lower level page ta-
+ble page (for L4, L3, and L2) or the data page (for L1). Only
+12 bits of the 40-bit physical page number are shown in these
+figures for simplicity.
+                                                                                 Figure 3: The two-dimensional page walk used in nested pag-
+                                                                                 ing. Each intermediate guest physical address must be trans-
+                                                                                 lated through the hypervisor page table.
+the 256 TB virtual address space are never allocated for typical ap-
+plications.
+    Figure 2 illustrates the radix tree page table walk for the virtual
+address 0x0000 5c83 15cc 2016. For the remainder of the                             Alternatively, an L2 entry can directly point to a contiguous and
+paper, such 64-bit virtual addresses will be denoted as (L4 index,               aligned 2MB data page instead of pointing to an L1 page table page.
+L3 index, L2 index, L1 index, page offset) for clarity. In this case,            In Figure 2, virtual address (0b9, 00d, 0bd, 123f5d7) is
+the virtual address being translated is (0b9, 00c, 0ae, 0c2,                     within a large page. This large-page support greatly increases max-
+016). Furthermore, for simplicity of the examples, only 3 hex-                   imum TLB coverage. In addition, it lowers the number of memory
+adecimal digits (12 bits) will be used to indicate the physical page             accesses to locate one of these pages from four to three. Finally, it
+number, which is actually 40 bits in x86-64 processors.                          greatly reduces the number of total page table entries required since
+    As shown in the figure, the translation process for this address             each entry maps a much larger region of memory. Similarly, an L3
+proceeds as follows. First, the page walk hardware must locate the               entry can directly point to a 1GB page.
+top-level page table page, which stores L4 entries. The physical
+address of this page is stored in the processor’s CR3 register. In               2.2    Nested Paging
+order to translate the address, the L4 index field (9 bits) is extracted            To reduce virtualization overhead, AMD and Intel have imple-
+from the virtual address and appended to the physical page num-                  mented nested paging on recent processors [5, 26]. Nested paging
+ber (40 bits) from the CR3 register. This yields a 49-bit physical               uses two sets of page tables to translate the virtual addresses used
+word address that is used to obtain the appropriate 8-byte L4 entry              by programs in guest virtual machines to host physical addresses.
+(offset 0b9 in the L4 page table page in the figure). The L4 entry               A process running in the guest accesses memory through a guest
+may contain the physical page number of an L3 page table page                    virtual address. This is first translated into an intermediate “guest
+(in this case 042). In which case, the process is repeated by ex-                physical address” through the guest’s page table. Then, the guest
+tracting the L3 index field from the virtual address and appending               physical address is itself translated into a host physical address us-
+it to this physical page number to obtain the appropriate L3 entry.              ing the hypervisor’s page table.
+This process repeats until the selected entry is invalid or specifies               On a TLB miss, the guest virtual address must first be translated
+the physical page number of the actual data in memory, as shown                  to a guest physical address, then to a host physical address. This
+in the figure. Each page table entry along this path is highlighted in           process is complicated by the fact that the guest page table uses
+grey in the figure. The page offset from the virtual address is then             guest physical addresses to point to each lower level of the page
+appended to this physical page number to yield the data’s physical               table. These references must themselves be translated. An example
+address. Note that since page table pages are always aligned on                  of this is shown in Figure 3. The guest page table walk is shown
+page boundaries, the low order bits of the physical address of the               vertically, starting with the guest CR3 register in the upper left and
+page table pages are not stored in the entries of the page table.                proceeding downwards. However, each pointer in the guest page
+    Given this structure, the current 48-bit x86-64 virtual address              table must be translated through the hypervisor page table. These
+space requires four memory references to “walk” the page table                   translations are shown as the five horizontal page table walks (hL4
+from top to bottom to translate a virtual address (one for each level            through hL1). Overall, twenty-four accesses are required to various
+of the radix tree page table). As the address space continues to                 page tables per guest TLB miss.
+grow, more levels will be added to the page table, further increas-                 To reduce the number of page table references required, AMD
+ing the cost of address translation. A full 64-bit virtual address               has introduced a Nested TLB (NTLB). This caches the results of
+space will require six levels, leading to six memory accesses per                the hypervisor translations from guest to host physical addresses
+translation.                                                                     for the first four translations that are for the guest page table, al-
+
+
+
+
+                                                                           309
+                                             Figure 4: An example of a typical nested page walk.
+
+
+lowing a nested page walk to be skipped on a NTLB hit, as shown                 that is virtually and physically aligned to the faulting virtual ad-
+in Figure 4. The NTLB does not cache the fifth translation, since               dress. When the program faults again on the same region of virtual
+those translations are already cached by the normal system TLB,                 memory, the fault handler will recognize that the address is part of
+which is far larger than the NTLB.                                              a reservation, and it will again return the virtually and physically
+   The cost of the fifth hypervisor translation can be reduced by us-           aligned small page within that reservation. When all small pages in
+ing large pages in the hypervisor table. This reduces the number of             the reservation are allocated, the mapping is promoted, that is, the
+memory or cache references from four to three. Ideally, a hyper-                small page mappings are replaced by a single large page mapping.
+visor would use a page size that is close in magnitude to the size              However, under memory pressure, this reservation may be broken
+of the entire guest physical memory space, such as the 1GB page                 down if it is never fully utilized. The virtual memory system can
+available in x86-64. However, the hypervisor emulates guest I/O                 then return the unused pages back to the free pool of small pages.
+devices using permissions in the hypervisor page table. This pre-
+cludes the use of very large pages because memory mapped I/O, in-
+cluding devices using fixed addresses within the “ISA hole”, must
+                                                                                3. PAGE TABLE SPECULATION
+be emulated by the hypervisor using permission bits, which can                     The SpecTLB is a translation-lookaside buffer that tracks par-
+only be set on a page granularity.                                              tially filled large-page reservations instead of large pages them-
+                                                                                selves. On a TLB miss, the SpecTLB is consulted to see if the
+                                                                                virtual page that missed in the TLB may be part of a large page
+2.3 FreeBSD Reservation System                                                  reservation. If so, the physical address of the missing page can
+   The ability to dynamically select the optimal page size is im-               be interpolated between the starting and ending physical addresses
+portant because incorrect page size selection (either too big or too            of the reservation using the small page’s position within the large
+small) can have significant overhead in execution time. For exam-               reservation.
+ple, in 2009, Google identified “dynamic huge pages, which can                     The primary difference between the SpecTLB and a traditional
+be assembled and broken down on demand” as a key objective for                  TLB is that mappings generated by the SpecTLB are predictions;
+their Linux kernel work [8]. Allocating a large page when only a                they are not guaranteed to be correct. An entry in the SpecTLB
+small part of it will be used has the obvious effect of wasting phys-           indicates that the operating system may have placed small pages
+ical memory. However, a more important side-effect is increased                 within a particular physical reservation in the past, but it does not
+I/O traffic. Since the OS can only track application memory use on              guarantee that any particular virtual page was placed in the reser-
+a page granularity, it must write back an entire page to disk when              vation or even that the page is valid. This distinction means that
+a memory mapped file is modified. The overhead of writing back                  a TLB miss that does hit in the SpecTLB must still be validated
+two megabytes to disk when only a single byte is changed can over-              against the underlying page table. However, the interpolated trans-
+whelm the performance gained by using large pages [19].                         lation can be used for speculative execution while the page walk
+   One approach to dynamically selecting page size is a reservation-            itself continues in parallel. If the interpolated translation matches
+based physical memory allocator, as first suggested by Talluri and              the result from the page walk, the speculative work can be com-
+Hill [24]. Navarro, et al. ([19]) extended this idea to a practical             mitted and execution continues. If the results differ, the speculative
+memory allocation system and implemented it under FreeBSD. For                  work is not committed and execution restarts from the first incor-
+example, this extended design reclaims partially filled reservations,           rect prediction. While the SpecTLB does not reduce the overall
+allowing the empty pages to be used by other processes.                         memory bandwidth required by the MMU, it does reduce the la-
+   When a process allocates virtual memory, through mmap() or                   tency penalty from TLB misses by removing the page walk from
+indirectly through malloc(), the operating system does not im-                  the critical path of execution.
+mediately allocate any physical memory. Instead, it creates a book-                This relaxed requirement of correctness allows two different
+keeping entry that describes the allocation and what virtual ad-                variants of the SpecTLB to be built: one that requires software sup-
+dresses are being used. Physical memory is only allocated and the               port and one that does not. We describe both in this section.
+page table updated when the program first tries to access that virtual
+memory. Since the page table does not have mappings for those vir-              3.1    Explicit page table marking
+tual addresses until then, that first access causes a page fault. Then,            The SpecTLB maintains a set of large page reservations it be-
+the fault handler locates the bookkeeping entry associated with the             lieves the operating system is assigning to the current process. This
+faulting virtual address and actually allocates memory.                         set is maintained by monitoring which small page page table en-
+   The fault handler uses that bookkeeping entry to predict if the              tries are marked by the operating system as being part of a large
+virtual memory space used is likely to be contiguous and larger                 page reservation. These marks are implemented using one of the
+than a large page. For example, a memory mapped 5KB file will                   currently unused bits in bottom level (L1) page table entries in x64-
+not use an entire 2MB page, so it will not be placed in a reservation.          64. They do not effect how these entries are translated; they are still
+If the handler decides that a superpage is appropriate, it will reserve         standard small pages and they are only used to maintain the con-
+an entire large physical page, and allocate the small page within it            tents of the SpecTLB.
+
+
+
+
+                                                                          310
+   For purposes of describing the operation of the SpecTLB, we                 0c2, equal to the physical page’s offset within a 2MB phys-
+will use a similar simplified address representation as described in           ical page. Specifically, (virtual address)[20:12] ==
+Section 2.1. Virtual addresses are split up into four indices and              (physical address) [20:12]. This equality can be used
+an offset: e.g., (0b9, 00c, 0ae, 0c2, a2e). Physical ad-                       as a heuristic to signal that the operating system has placed this
+dresses are similarly divided into the nine-bit parts of a physical            page within a reservation. While it has a false positive rate of 1:512
+page number and a page offset: e.g., {0ac, 0c2, a2e}. For                      (assuming 4K pages that are not part of a reservation are placed
+simplicity, only eighteen bits (two parts) of the 40-bit physical page         randomly), it has a zero false negative rate.
+number are used in the following description.                                     The heuristic based SpecTLB uses this detection scheme to
+   The SpecTLB associates the bits of the virtual address corre-               maintain its contents. Translations are inserted when (virtual
+sponding to a 2MB virtual page number with the physical address                address)[20:12] == (physical address)
+of the reservation Note that only the upper bits of the transla-               [20:12] and entries are removed when they lead to false
+tion, those that select a particular large physical or virtual page            predictions.
+are stored. A SpecTLB entry for a particular address is effectively
+whatever the standard TLB entry would be if that address were part             3.3    Memory side-effects
+of a large page.                                                                  TLB entries in modern processors store the effective memory
+   On a subsequent TLB miss, the SpecTLB is searched like a nor-               type of the memory region, enabling the processor to know that the
+mal TLB. If a subsequent TLB miss is for virtual address (0b9,                 memory region has special properties, such as being uncacheable
+00c, 0ae, 0c3, 001), the newly added SpecTLB entry will                        and/or being used for I/O. Care must be taken when memory ac-
+match. This means that the new virtual address is part of that same            cesses are made to such regions, as they can have irreversible side
+virtual large page and that the operating system likely placed the             effects.
+corresponding physical page within the physical reservation. The                  With the use of a SpecTLB, it is important to prevent memory
+speculative translation concatenates the stored physical page num-             references made using speculative translations from causing irre-
+ber of the matching reservation with the large page offset from the            versible side effects before the translation has been validated. This
+virtual address, yielding {0ac, 0c3, 001}. This speculative                    may occur when a reservation is broken down and pages are re-
+translation is provided to the core, which uses it to speculatively            claimed from that reservation. The reclaimed pages could be re-
+execute subsequent instructions.                                               tasked for any purpose, including for I/O. With heuristic reservation
+   Of course, this translation may not be valid. The underlying                detection, it is possible to improperly speculate on these reclaimed
+reservation may have been broken down by the operating system or               regions. Therefore, hardware mechanisms may be necessary to pre-
+the virtual address may not even be valid. Therefore, while the pro-           vent speculative I/O accesses.
+cessor can use this translation, it must do so speculatively. While               Tagging requests throughout the memory system as being spec-
+program execution continues, the standard x86 page walk happens                ulative should be sufficient to ensure safety. Current systems do
+concurrently. If the predicted physical address matches the actual             not need such a tag because speculative accesses are always made
+address, the speculative work may be committed. Otherwise, exe-                to a page that is already known to be safe. While the exact archi-
+cution must roll back to the point of the misprediction. This roll-            tectural implementation is beyond the scope of this paper, this tag
+back capability is important because it is useful to be able to make           could be used to prevent speculative accesses from reaching an I/O
+predictions even on reservations that were previously broken down.             controller or writing to memory. Additionally, this will allow new
+In this case, the pages that were allocated when the reservation still         speculative execution from other systems such as the prefetcher or
+existed will still be stored in predictable physical page numbers.             branch predictor to make similar memory accesses without going
+   Since SpecTLB translations are always confirmed against the un-             through the TLB.
+derlying architectural page table, implementations can be more lazy               Alternatively, the explicit marking SpecTLB can avoid these
+about SpecTLB invalidation than they can be with a TLB. Stale en-              problems entirely by ensuring that uncachable and I/O memory is
+tries do not lead to incorrect operation, as they do in a TLB. Invalid         never mapped into 2MB regions of memory that also contain data
+translations generated by stale entries will be corrected automati-            pages with the reservation bit set. In effect, the reservation bit be-
+cally. Our implementation only invalidates the SpecTLB on a con-               comes a reservation-safe bit, indicating that speculative accesses to
+text switch, though even this is not strictly necessary.                       nearby pages are safe.
+   The SpecTLB can support multiple reservation sizes by main-
+taining a structure for both 2MB and 1GB reservations. The con-                3.4 Virtualization
+tents of the 1GB structure is maintained by monitoring the reserva-
+                                                                                  The extra overhead of nested paging (see Section 2.1) magnifies
+tion bit of 2MB pages while the contents of the 2MB structure is
+                                                                               the possible benefit of the SpecTLB. While I/O emulation require-
+maintained by monitoring the bit in 4KB pages.
+                                                                               ments preclude the use of 1GB pages in the hypervisor page table
+                                                                               (see Section 2.2), it is still possible to use 2MB pages within a 1GB
+3.2    Heuristic reservation detection                                         reservation. This means that even a small SpecTLB will be able
+   The above description of the SpecTLB requires explicit mark-                to keep track of all the reservations used by the hypervisor. Thus,
+ing of the page table. This requires both a modification of the x86            it can speculatively translate any guest physical address into a host
+page table architecture and the operating system itself. However, it           physical address.
+is possible to build a variant of the SpecTLB that detects reserva-               In the nested page walk, if there is a NTLB miss, the SpecTLB
+tions and requires no modification to existing system software that            provides a speculative translation that allows the next guest page
+supports large page reservations.                                              table entry to be read immediately. Similarly, the SpecTLB can
+   To allow a region of memory to be promoted to a large                       provide a speculative translation for the fifth hypervisor translation
+page, small pages must be aligned within their large page reser-               (guest physical to host physical translation for the underlying data)
+vation. In the example above, virtual address (0b9, 00c,                       that is never provided by the NTLB. We call this process “horizon-
+0ae, 0c2, a2e) is mapped to physical address {0ac, 0c2,                        tal speculation” (Figure 5). In our design, the nested page walk can
+a2e}. The virtual page’s offset within a 2MB virtual page is                   defer all accesses to the hypervisor page table until after the spec-
+
+
+
+
+                                                                         311
+                                                                                are not included in this study. Page table loads are simulated by
+                                                                                the SpecTLB simulator. Context switches are monitored by track-
+                                                                                ing the value of the CR3 register. These trigger TLB invalidations
+                                                                                in our simulator. Finally, our custom analyzer plugin to SimNow
+                                                                                counts the total number of instructions executed during the trace.
+
+                                                                                4.2    Benchmarks
+                                                                                   Traces were collected for several popular benchmarks, in-
+                                                                                cluding the SPEC CPU2006 suite [11], SPECjbb2005 [23], the
+                                                                                NASA Advanced Computing Parallel Benchmarks (NAS) suite [2],
+                                                                                benchw [7] and an ad-hoc Python microbenchmark. However, not
+                                                                                all of the benchmarks in the SPEC CFP2006 suite could be com-
+                                                                                piled with the standard tool chain in FreeBSD 8.0, so soplex, cal-
+                                                                                culix and wrf are not included in this study. SPECjbb2005 was
+                                                                                run on one warehouse, and Sweep3d was run on a 150x150x150
+                                                                                grid. The NAS benchmarks are configured to use a class-C problem
+                                                                                size for all benchmarks but dc, which was too large to run within
+                                                                                our simulator. The class-B size was used for this benchmark. The
+        Figure 5: Horizontal and diagonal speculation.                          benchw benchmark functions similarly to TPC-H. Specifically, this
+                                                                                benchmark executes a JOIN between two tables of approximately
+                                                                                one gigabyte in size under PostgreSQL 8.4 using default tunings.
+ulative page walk. These accesses are only needed to verify the
+                                                                                The Python benchmark is a custom microbenchmark that initializes
+SpecTLB translations and can occur in parallel with other specula-
+                                                                                a large array of long integers.
+tive work. If any of the speculative translations end up being incor-
+rect (primarily due to a region of memory being an emulated I/O
+device), the speculative work is canceled and the page walk starts
+                                                                                4.3    SpecTLB Simulation
+over. In the common case, however, all the additional memory and                   A custom memory system simulator was built to simulate the
+cache accesses to the hypervisor page table are removed from the                SpecTLB design with heuristic reservation detection, both in nested
+critical path of execution. This leaves five SpecTLB or NTLB ac-                and native execution. This simulator models an MMU that closely
+cesses as the only additional unhidden latency of the nested page               resembles that of the Family 10h AMD Opteron [5]. It includes
+walk above the native page walk.                                                a 64-entry, fully-associative L1 TLB with random replacement, a
+   The largest possible performance benefit from the SpecTLB is                 512-entry, 4-way set associative L2 TLB with LRU replacement
+seen when large page reservations are used in both the hypervisor               for small pages, a 128-entry L2 TLB for large pages, a 16-entry
+and the guest. In this case, the SpecTLB is modified to associate the           Nested TLB, and a 24-entry Page Walk Cache.
+guest virtual address of a guest reservation directly to a host phys-              A 1MB L2 cache was included in the model, simulated using the
+ical address. This is analogous to how the normal TLB functions.                Dinero IV cache simulator [9]. Both application data accesses and
+On a TLB miss, the SpecTLB can immediately provide a specula-                   MMU page table accesses are simulated using a shared L2 cache
+tive host physical address while the entire nested page walk occurs             model. Instruction loads are not instrumented and are not included
+in parallel. We call this process diagonal speculation because both             in this study. The L1 cache was not simulated, since the page walk
+the guest and hypervisor page table entries are skipped.                        hardware does not use it on the Opteron.
+   If a speculative diagonal translation is not available for a partic-            The simulator reads the memory trace, running each virtual ad-
+ular address, the CPU can perform horizontal speculation to hide                dress through the TLB and data cache model. On a TLB miss, the
+the latency from the nested portions of the walk.                               SpecTLB is searched to see if a possible matching reservation can
+                                                                                be found. If so, a speculative physical page number is generated.
+                                                                                If this page number matches the actual page number stored in the
+4. METHODOLOGY                                                                  trace, the speculation is correct. The MMU simulator then performs
+   The actual execution time benefit of speculative execution de-               the native or nested page walk and keeps track of memory accesses
+pends greatly on the parallelism of the underlying microarchi-                  made to the page table.
+tecture. Instead of evaluating the SpecTLB against any partic-                     Since explicit reservation marking is not yet included in any op-
+ular current-generation machine, we used a microarchitecture-                   erating system, the heuristic based SpecTLB is implemented. As a
+independent simulation that shows the memory-level parallelism                  baseline, the number of reservations tracked by the SpecTLB is set
+that we expose. As memory systems continue to become more and                   at 24, the number of entries in the AMD Page Walk Cache. This
+more parallel, the SpecTLB will have an increasingly significant                size is varied from one to forty-eight.
+impact on the overhead of address translation.                                     We included a model of the distance-based TLB prefetcher de-
+                                                                                scribed by Kandiraju and Sivasubramaniam [12] in our simulator
+4.1    Full-system simulator                                                    for comparison. Our model was configured to use 32 entries for
+   The AMD SimNow [4] full-system simulator was used to run                     both the distance and prefetch buffers, which is the size explored
+various benchmarks under an unmodified version of FreeBSD 8.0-                  by Kandiraju and Sivasubramaniam that most closely matched the
+Release for x86-64. A custom analyzer plugin to SimNow records                  size of our simulated SpecTLB. We had to modify the original de-
+each virtual memory access made by the simulated system along                   sign of the TLB prefetcher to support multiple page sizes, which
+with the associated physical address and page size. This trace in-              was not addressed by the original paper. We chose a simple ap-
+cludes all memory loads and stores made by the guest operating                  proach, replicating the entire prefetcher for each page size. After
+system and processes, but it does not include instruction or page               each TLB miss which is filled by a page of a particular size, that
+table loads. Instruction loads are not modeled by SimNow, so they               size TLB prefetcher attempts to fetch the next page of that size that
+
+
+
+
+                                                                          312
+will be used. This is an optimistic design since it greatly increases         of TLB misses per program DRAM access, mcf, has 96% of its
+the amount of history tracked by the overall system. A more practi-           MMU-related DRAM accesses overlapped.
+cal implementation would combine prefetch history from different
+page sizes which could lead to conflict between entries.                      5.2    Overlap opportunity
+   For nested operation, we assume that the 1GB SpecTLB is large                 Superscalar microprocessors can speculatively execute only a
+enough to hold all reservations in use by the hypervisor and is never         limited number of instructions as constrained by the size of their re-
+flushed.                                                                      order buffer. If the instructions after a TLB miss complete quickly,
+                                                                              the reorder buffer may fill before the parallelized page walk com-
+5.    SIMULATION RESULTS                                                      pletes. The processor then has to stall until the page walk is com-
+   This section evaluates the SpecTLB using the aforementioned                plete, as it does without the SpecTLB. However, the load or store
+applications. The ability to accurately predict translations and hide         which triggered the TLB miss is by definition to an address not re-
+MMU-related cache and DRAM accesses are examined. These re-                   cently accessed, or else it would have hit in the TLB. Therefore,
+sults show that even a small SpecTLB is effective at accurately               it is less likely to be cached and may be a long-latency operation
+predicting the majority of translations for many benchmarks and               itself. The high-latency TLB miss can be overlapped with the high-
+enabling parallelization of much of the overhead of address trans-            latency load or store before the reorder buffer starts to fill.
+lation.                                                                          To examine this, our simulator was instrumented to determine
+                                                                              the fraction of memory operations that cause TLB misses and a
+5.1    TLB miss parallelization                                               read miss in the L2 cache for the data itself. The per-benchmark
+   When a translation is able to be accurately predicted, all mem-            average of this fraction is 40% and is as high as 93% (sphinx3).
+ory and page walk cache accesses required to serve the TLB miss               These results are presented for all workloads in Table 2. These
+are removed from the critical path of execution. Instead, the pre-            long-latency read operations present significant latency in a single
+dicted translation can be used immediately to enable the memory               instruction that can be executed while the parallelized page walk
+reference to proceed in parallel with the page walk.                          completes.
+   Table 2 shows the potential TLB miss parallelization benefits of
+the SpecTLB. The first columns of the table show the average num-
+                                                                              5.3    Misprediction Cost
+ber of instructions between TLB misses as well as the average num-               On a misprediction, unnecessary work will be performed, which
+ber of memory accesses and DRAM accesses made by the program                  may lead to increased resource contention and power consumption.
+between TLB misses. Some applications, like povray, incur a TLB               However, since the SpecTLB does not provide a speculative trans-
+miss for every 1.3 DRAM accesses. Since TLB miss handling is                  lation when a request is not part of a tracked reservation, mispre-
+memory intensive, we report the frequency of TLB misses in rela-              diction rates are extremely low (Table 2). Therefore, even when the
+tion to memory system activity.                                               SpecTLB is unable to provide predicted translations, the penalty
+   A speculative translation is only attempted when a matching                from its use should be low. Misprediction rates are below 1% for
+reservation is found. The rate at which this happens varies sig-              over half the benchmarks tested.
+nificantly by workload. As shown in Table 2 in the attempts per                  The mispredictions that are present are either for pages that are
+walk column, some benchmarks, such as mcf find a reservation                  not present, that were allocated after a reservation was broken down
+and attempt a speculative translation over 99% of the time. Oth-              or were made using a incorrect SpecTLB entry. Incorrect SpecTLB
+ers, such as libquantum never attempt a speculative translation.              entries are generated when a page is aligned by chance, not because
+Over half the benchmarks have speculation rates greater than 62%.             it was part of a reservation. Using explicit marking avoids these
+The ability to speculatively translate addresses depends on the lo-           incorrect entries.
+cality in which a program uses its address space and if it is used
+in a fragmented manner, leading to partially filled reservations that         5.4    Sizing and replacement considerations
+were never able to be promoted to a large page.                                  Even a relatively small SpecTLB is effective. Each entry covers
+   Even using heuristic-based reservation detection, most bench-              512 small pages, or 2MB of virtual address space, so even a small
+marks have a prediction accuracy above 99%. While some bench-                 device is effective. For SPECjbb2005, the benchmark that requires
+marks have particularly low prediction accuracies (less than 35%              the most entries, reducing device size from 24 to 12 entries only
+in the case of dc.B), speculation happens comparatively rarely in             reduces successful speculation rate by 3%. Other benchmarks are
+these workloads. In this case, a speculative prediction is only at-           impacted even less. Additionally, we simulated both LRU and ran-
+tempted for 8.3% of TLB misses. The low rate of speculation here              dom replacement policies and found both to be equally effective.
+is likely due to its small working set, which would lead to compar-
+atively few reservations being made. An explicit reservation mark-            5.5    Comparison to TLB prefetching
+ing based SpecTLB would eliminate these mispredictions.                          Both the SpecTLB and TLB prefetching are speculative tech-
+   When addresses are accurately predicted, the page table walk               niques for hiding the latency of TLB misses. The SpecTLB uses
+can be overlapped with speculative execution using the predicted              large-page reservations to predict the translation for the current
+address. A high prediction rate combined with high accuracy al-               TLB miss, and the TLB prefetcher uses access patterns to predict
+lows useful work to be performed in parallel with much of the                 future TLB misses. The SpecTLB does speculative work in the
+overhead of virtual memory. This is quantified by counting the                form of the instructions that are executed while a speculative trans-
+number of total L2 data cache misses made by the MMU as well                  lation is confirmed. The TLB prefetcher does speculative work in
+as the fraction that are overlapped through successful prediction.            the form of page table walks to prefetch page table entries.
+Since DRAM accesses are so slow, this fraction should translate                  When simulated with the parameters described in Section 4, the
+into a proportional speedup of overall TLB miss handling. Tested              SpecTLB handles a larger fraction of TLB misses than the TLB
+benchmarks have an average of 40% of their MMU-related DRAM                   prefetcher does in all but seven of the benchmarks tested (dc.B,
+accesses overlapped with speculative execution by successful pre-             ep.C, bzip2, GemsFDTD, lbm, libquantum and milc). Of these,
+diction. The benchmark which sees a particularly large number                 the TLB prefetcher handles less than 20% of TLB misses for all
+
+
+
+
+                                                                        313
+benchmarks other than ep.C, bzip2 and milc. These three bench-                    For example, on a TLB miss, the processor will use the SpecTLB
+marks are well suited for a TLB prefetcher because they have a                 to translate the guest physical address of the gL4 page table entry
+very regular access pattern. However, this regular access pattern              into a host physical entry. This entry is loaded, which provides
+also means that TLB miss rates are comparatively low, and thus ac-             the guest physical address of the gL3 page table entry. Again, the
+celerating address translation will have a proportional small impact           SpecTLB translates this into a host physical entry. This process re-
+on execution time.                                                             peats until the gL1 entry provides the guest physical address of the
+   Finally, simulation shows that while misprediction rates are very           underlying data. This is translated with a fifth and final SpecTLB
+low for the SpecTLB (less than 1% for over half the benchmarks),               access, and the data is loaded. At this point, the nL4, nL3, nL2,
+the TLB prefetcher must perform a large number of unnecessary                  nL1 and nL0 phases are performed in parallel with speculative ex-
+page walks to achieve a reasonable hit rate. For example, with a               ecution and in any order.
+TLB prefetcher, the MMU performs 1.118 page walks per TLB
+miss for PostgreSQL, an application which has a relatively high                7.    RELATED WORK
+TLB miss rate. Over half the benchmarks tested require 1.3 page
+                                                                                  The SpecTLB implements a very limited form of value predic-
+walks per TLB miss.
+                                                                               tion. Martin, et al. show that simply verifying that the value
+   While TLB prefetching does not rely on any specific operating
+                                                                               predicted and the value actually fetched match is not sufficient
+system behavior, it does require that applications access memory
+                                                                               to guarantee correctness on shared-memory multiprocessors [14].
+in predictable patterns. As a result, the SpecTLB handles a higher
+                                                                               One process could incorrectly predict a value while another pro-
+fraction of TLB misses for nearly all applications tested that have
+                                                                               cess modifies the underlying address. This could lead to a false
+significant TLB miss rates.
+                                                                               positive verification which could be a correctness violation under
+                                                                               some strict memory consistency models. Fortunately, the page ta-
+6.    NESTED PAGING SUPPORT                                                    ble uses a weak ordering consistency model since the TLB must be
+   Virtualization compounds the overhead of virtual memory by                  explicitly be flushed when the page table is changed. When a TLB
+forcing every guest physical address to be translated into a host              flush occurs for a given address space, any speculative translations
+physical address. While the use of large pages in the guest reduces            not yet verified by the SpecTLB should be cancelled. This should
+this overhead, recent work has shown that the overall execution                be sufficient to guarantee correctness. Romanescu, et al. discuss
+time penalty as compared to native execution is still between 7-               memory consistency issues in virtual memory in more detail [20].
+14% [5]. In this section, we argue that diagonal and horizontal                They show that in multithreaded applications, global TLB synchro-
+speculation (see Section 3.4) can significantly reduce this overhead.          nization may be necessary to guarantee correctness. This will also
+   Figure 4 shows a timeline of a typical nested page walk. In the             be needed for the SpecTLB.
+common case, the Nested TLB translates the guest physical ad-                     Talluri and Hill first proposed a reservation based memory al-
+dresses of guest page table entries to host physical addresses. Since          locator for using a partial-subblock TLB [24]. This device, like
+the Nested TLB does not translate guest physical addresses of data             the SpecTLB, provides direct support for translating small pages
+(non-page table) pages, the bottom level nested translation (nL0)              within a large page reservation. However, unlike the SpecTLB, the
+must be performed by walking the hypervisor page table.                        partial-subblock TLB explicitly tracks which small pages within
+   If both the guest and hypervisor use large page reservations, di-           the reservation are valid. While this also increases TLB cover-
+agonal speculation can allow this entire process to occur during               age compared to a standard TLB, the partial-sublock TLB needs
+speculative execution. The rate at which diagonal speculation is               a much larger structure than the SpecTLB does. Each entry must
+possible in nested paging is identical to the rate at which specu-             have a valid and modified bit for each small page within a large
+lation is possible in native execution. These results are shown in             page reservation. With the 4KB and 2MB page sizes explored in
+detail in Table 2. However, when diagonal speculation fails or is              this paper, 1024 bits per entry are required in a partial-subblock
+not possible, horizontal speculation can allow the nested phases of            TLB.
+the nested page walk to occur in parallel with speculative execution.             This explicit tracking approach also means that the partial-
+   Table 1 shows the number of memory and DRAM accesses made                   subblock TLB is unable to hide access latencies that the SpecTLB
+in each phase of the nested page walk as shown in Figure 4. These              can. Assuming you do not preload each subblock TLB entry (which
+results are split into those TLB misses where diagonal speculation             would require accessing 512 page table entries for each TLB miss),
+was successful and those where it was not. When diagonal specu-                the subblock TLB must suffer a TLB miss and access to the page
+lation is successful, all cache and DRAM accesses are overlapped               table for each 4KB page upon first access to that page. In contrast,
+with speculative execution. When diagonal speculation is not suc-              the SpecTLB also hides the TLB miss latency of the first access
+cessful, horizontal speculation can overlap the memory accesses                to each 4KB page in the region, as the mapping can be predicted
+in the nested (nL4, nL3, nL2, nL1, nL0) phases with speculative                immediately.
+work.                                                                             Navarro, et al. extended this idea into a completely auto-
+   When the SpecTLB performs horizontal speculation, the hyper-                matic system for superpage management and implemented it under
+visor page walks (and the memory accesses contained in the nested              FreeBSD [19]. Most critically, this extension developed the recla-
+phases) do not contribute to the critical-path latency of the TLB              mation of partially filled superpage reservations. Additionally, their
+miss. The SpecTLB can immediately translate any guest physical                 work extended the system to support multiple page sizes and de-
+address into a speculative host physical address. This means that              fragmentation of physical memory. While these systems are trying
+all four guest page table entries can be loaded in succession, just            to create promotable reservations, as a by-product they also create
+as in the native translation, without access to the hypervisor page            the contiguity in the page table that is exploited by the SpecTLB.
+table. The five nested phases must be performed at some point to                  Earlier approaches to supporting superpages in general-purpose
+verify that the speculative translations were correct, but these can           operating systems, such as IRIX, Solaris, and HP-UX, relied upon
+be done later in execution. As long as sufficient memory band-                 the program to explicitly specify a static page size for a region of
+width is available, this hides all of the additional latency generated         the virtual address space [10, 16, 15]. These operating systems
+by using nested paging.                                                        would then allocate and map the entire superpage at once. Conse-
+
+
+
+
+                                                                         314
+                                                      nL4     gL4        nL3      gL3      nL2      gL2      nL1      gL1      nL0
+               No diagonal      L2 accesses          0.005   0.109      0.066    0.149    0.105    0.359    0.279    1.000    1.062
+               speculation      DRAM accesses        0.000   0.048      0.033    0.075    0.049    0.161    0.142    0.372    0.199
+              After diagonal    L2 accesses          0.000   0.029      0.028    0.033    0.031    0.044    0.057    0.946    0.946
+               speculation      DRAM accesses        0.000   0.028      0.028    0.028    0.029    0.031    0.033    0.197    0.046
+
+Table 1: Memory accesses to the page table in different phases of the nested page walk for an average of all benchmarks examined.
+The table is split into those TLB misses where diagonal speculation was not attempted or failed and those where diagonal speculation
+was successful.
+
+
+
+quently, there would never be any partially filled reservations to be         8. CONCLUSIONS
+exploited by the SpecTLB. However, in such systems, a program                     With memory capacity growing faster than TLB sizes, the in-
+had to be conservative in its use of superpages to avoid wasted               creasing footprint of modern applications will lead to higher and
+physical memory and increased I/O. In contrast, with FreeBSD’s                higher virtual memory overhead. While much progress has been
+promotion-based approach, it is possible for the system to be very            made to accelerate TLB miss handling with various techniques
+aggressive in speculatively allocating reservations, most of which            such as caching and large pages, the footprint and access pattern
+may never be promoted, because of the low impact of breaking                  of popular workloads is making address translation more and more
+reservations. Thus, the SpecTLB may have many opportunities                   difficult. We have presented a device, the SpecTLB, that effectively
+to exploit partially filled reservations in situations where the same         decouples the address translation from the allocation and permis-
+program running under these earlier operating systems would not               sion setting of large pages. Our device exploits a reservation based
+have used superpages.                                                         physical memory allocator to deliver much of the benefit of large
+   Romer, et al. propose the creation of superpages by moving ex-             pages without incurring their limitations.
+isting pages, previously scattered throughout physical memory, into               Operating systems that use reservation based memory allocation
+contiguous blocks [21]. While this process may be prohibitively               are currently designed to use reservations in the hope that those
+expensive for very large superpages, it may have more success with            reservations will fill and memory will be promoted to a large page.
+the architecture described here that does not require a full reserva-         FreeBSD is tuned to reserve memory only when there is a possi-
+tion.                                                                         bility that it will be able to promote a region to a large page. Our
+   Saulsbury, et al. propose a prefetching scheme for TLBs that               results show that even with these tunings, there are enough partially
+preload pages based recently accessed pages [22]. Unlike the sys-             filled reservations that an accurate prediction can be made for over
+tem presented in this paper, their techniques require page table              62% of TLB misses for the majority of benchmarks tested. More-
+modification. More recent work has proposed architecturally inde-             over, we show that these predictions can enable 40% of the MMU
+pendent prefetching techniques based on access patterns and inter-            related DRAM accesses to be performed in parallel with data ac-
+core cooperation [12, 6]. We simulated the work of Kandiraju and              cess.
+Sivasubramaniam [12] in Section 5.5.                                              When compared to the TLB prefetcher, a different architectural
+   Bhargava, et al. first described the AMD page walk cache and               approach to hiding the latency of TLB miss handling, we show
+their extensions to it to support virtualization [5]. Barr, et al.            that the SpecTLB is able to handle a higher percentage of TLB
+explored the design space of these dedicated MMU caches and                   misses in virtually all applications tested that have significant TLB
+showed that they are often successful at eliminating memory ac-               miss rates. Moreover, the SpecTLB is far more sensitive in when it
+cesses for upper level page table entries [3].                                performs speculative work. It mispredicts translations less than 1%
+   Alternatively, page table accesses can be accelerated by replac-           of the time for most benchmarks while the TLB prefetcher causes
+ing the page table format with one that requires fewer accesses.              an 30% increase in the number of page walks which must be done.
+In terms of space, a radix tree-based page table can be an ineffi-                Finally, we show that our device can hide the increased latency
+cient representation for a large, sparsely-populated virtual address          from nested paging. Recent work has shown that nested paging
+space. Liedtke introduced Guarded Page Tables to address this                 comes with significant performance penalty. While the use of very
+problem [13]. In particular, Guarded Page Tables allow for path               large pages (1GB on x86-64) would greatly reduce the frequency of
+compression. If there is only one valid path through multiple levels          TLB misses, they cannot typically be used because the hypervisor
+of the tree, then the entry prior to this path can be configured such         needs to maintain fine-grained control over guest physical address
+that the page walk will skip these levels. Talluri and Hill presented         space permissions. Speculative address translation allows the per-
+an alternate form of the inverted page table, the clustered page ta-          formance of large pages while maintaining fine-grained control.
+ble, that derives from their subblock-TLB [25]. This technique can                Although neither Windows nor Linux currently implement a
+dramatically reduce the size of an inverted page table.                       reservation-based physical memory allocator, the limitations of the
+   Aside from the prefetchers simulated in Section 5.5, these tech-           current large page support in Linux are widely recognized [8].
+niques focus on reducing either the frequency of TLB misses or                Therefore, rather than restricting the scope of our work to devel-
+their cost in terms of main memory accesses. In contrast, the                 oping hardware features that benefit the current versions of these
+SpecTLB allows whatever cost a TLB miss has to be parallelized                operating systems, this paper has stepped outside that box. It has,
+with other work. It does not prevent the page table walk, it hides            instead, explored innovative hardware that complements a new ap-
+its latency. Therefore, all of the hardware techniques discussed              proach to physical memory management that is now being used
+above could be combined with the SpecTLB to reduce the memory                 by at least one operating system, FreeBSD. Arguably, this paper’s
+bandwidth required by the paralellized page table walks. They are             results strengthen the case for other operating systems to adopt
+complementary to, not competitive with, the SpecTLB.                          a reservation-based approach to physical memory management,
+                                                                              because of the potential gains from synergistic hardware. More
+
+
+
+
+                                                                        315
+broadly, this paper provides a compelling example of the benefits                ACM/IEEE international symposium on Microarchitecture,
+of coordinated innovation in hardware and software.                              MICRO 34, pages 328–337, Washington, DC, USA, 2001.
+                                                                                 IEEE Computer Society.
+9.   REFERENCES                                                             [15] C. Mather, I. Subramanian, I. Subramanian, C. Mather,
+ [1] Advanced Micro Devices. AMD x86-64 Architecture                             K. Peterson, K. Peterson, B. Raghunath, and B. Raghunath.
+     Programmer’s Manual, Volume 2, 2002.                                        Implementation of Multiple Pagesize Support in HP-UX,
+ [2] D. H. Bailey, E. Barszcz, J. T. Barton, D. S. Browning, R. L.               1998.
+     Carter, R. A. Fatoohi, P. O. Frederickson, T. A. Lasinski,             [16] J. Mauro and R. McDougall. Solaris Internals. Sun
+     H. D. Simon, V. Venkatakrishnan, and S. K. Weeratunga. The                  Microsystems Press, 2000.
+     nas parallel benchmarks. Technical report, The International           [17] C. McCurdy, A. L. Cox, and J. Vetter. Investigating the TLB
+     Journal of Supercomputer Applications, 1991.                                Behavior of High-end Scientific Applications on Commodity
+ [3] T. W. Barr, A. L. Cox, and S. Rixner. Translation caching:                  Microprocessors. In ISPASS ’08: Proceedings of the ISPASS
+     Skip, don’t walk (the page table). In ISCA ’10: Proceedings                 2008 - IEEE International Symposium on Performance
+     of the 37th annual international symposium on Computer                      Analysis of Systems and software, pages 95–104,
+     architecture, New York, NY, USA, 2010. ACM.                                 Washington, DC, USA, 2008. IEEE Computer Society.
+ [4] R. Bedicheck. SimNow: Fast platform simulation purely in               [18] J. C. Mogul. SIGOPS to SIGARCH: Now it’s our turn to
+     software. In Hot Chips 16, 2004.                                            push you around. In OSDI 2010, Berkeley, CA, USA, 2010.
+ [5] R. Bhargava, B. Serebrin, F. Spadini, and S. Manne.                         USENIX Association.
+     Accelerating two-dimensional page walks for virtualized                [19] J. Navarro, S. Iyer, P. Druschel, and A. Cox. Practical,
+     systems. In ASPLOS XIII: Proceedings of the 13th                            transparent operating system support for superpages.
+     international conference on Architectural support for                       SIGOPS Oper. Syst. Rev., 36(SI):89–104, 2002.
+     programming languages and operating systems, pages                     [20] B. F. Romanescu, A. R. Lebeck, and D. J. Sorin. Specifying
+     26–35, New York, NY, USA, 2008. ACM.                                        and dynamically verifying address translation-aware memory
+ [6] A. Bhattacharjee and M. Martonosi. Inter-core cooperative                   consistency. In Proceedings of the fifteenth edition of
+     tlb for chip multiprocessors. In ASPLOS ’10: Proceedings of                 ASPLOS on Architectural support for programming
+     the fifteenth edition of ASPLOS on Architectural support for                languages and operating systems, ASPLOS ’10, pages
+     programming languages and operating systems, pages                          323–334, New York, NY, USA, 2010. ACM.
+     359–370, New York, NY, USA, 2010. ACM.                                 [21] T. H. Romer, W. H. Ohlrich, A. R. Karlin, and B. N.
+ [7] J. Corbet. benchw. http://benchw.sourceforge.net/.                          Bershad. Reducing TLB and memory overhead using online
+ [8] J. Corbet. KS2009: How Google uses Linux.                                   superpage promotion. In ISCA ’95: Proceedings of the 22nd
+     http://lwn.net/Articles/357658/.                                            annual international symposium on Computer architecture,
+ [9] J. Edler and M. D. Hill. Dinero IV Trace-Driven                             pages 176–187, New York, NY, USA, 1995. ACM.
+     Uniprocessor Cache Simulator, 1998.                                    [22] A. Saulsbury, F. Dahlgren, and P. Stenström. Recency-based
+[10] N. Ganapathy and C. Schimmel. General purpose operating                     tlb preloading. In ISCA ’00: Proceedings of the 27th annual
+     system support for multiple page sizes. In In Proceedings of                international symposium on Computer architecture, pages
+     the USENIX Conference. USENIX, pages 91–104, 1998.                          117–127, New York, NY, USA, 2000. ACM.
+[11] J. L. Henning. SPEC CPU2006 benchmark descriptions.                    [23] Standard Performance Evaluation Corporation. The SPEC
+     SIGARCH Comput. Archit. News, 34(4):1–17, 2006.                             JBB2005 Benchmark, 2005.
+[12] G. B. Kandiraju and A. Sivasubramaniam. Going the                      [24] M. Talluri and M. D. Hill. Surpassing the tlb performance of
+     distance for tlb prefetching: an application-driven study. In               superpages with less operating system support. In
+     ISCA ’02: Proceedings of the 29th annual international                      Proceedings of the Sixth International Conference on
+     symposium on Computer architecture, pages 195–206,                          Architectural Support for Programming Languages and
+     Washington, DC, USA, 2002. IEEE Computer Society.                           Operating Systems, 1994.
+[13] J. Liedtke. Address space sparsity and fine granularity. In EW         [25] M. Talluri, M. D. Hill, and Y. A. Khalidi. A new page table
+     6: Proceedings of the 6th workshop on ACM SIGOPS                            for 64-bit address spaces. In SOSP ’95: Proceedings of the
+     European workshop, pages 78–81, New York, NY, USA,                          fifteenth ACM symposium on Operating systems principles,
+     1994. ACM.                                                                  pages 184–200, New York, NY, USA, 1995. ACM.
+[14] M. M. K. Martin, D. J. Sorin, H. W. Cain, M. D. Hill, and              [26] R. Uhlig, G. Neiger, D. Rodgers, A. Santoni, F. Martins,
+     M. H. Lipasti. Correctly implementing value prediction in                   A. Anderson, S. Bennett, A. Kagi, F. Leung, and L. Smith.
+     microprocessors that support multithreading or                              Intel Virtualization Technology. Computer, 38(5):48 – 56,
+     multiprocessing. In Proceedings of the 34th annual                          May 2005.
+
+
+
+
+                                                                      316
+                                        TLB miss rate                Speculations              Prediction   DRAM Accesses Overlapped       data cache misses     TLB Prefetcher
+                    name     ins/miss    mem/miss dram/miss   total attempts   attempts/walk    accuracy    per walk   fraction of total   after TLB misses    accuracy overhead
+                    bzip2       950       2342      250.0       5393             0.293           0.998      0.040          0.235                0.700           0.978     1.890
+                      gcc      8020       3578      235.4       10516            0.852           0.988      0.288          0.664                0.831           0.330     1.568
+                      mcf      210         87        12.6      502933            0.992           1.000      0.143          0.956                0.781           0.051     1.065
+                   gobmk       8722       3326       22.4        3648            0.279           0.994      0.091          0.338                0.423           0.261     1.320
+                   hmmer      16145       8908       58.1        4713            0.903           0.996      0.169          0.703                0.208           0.712     1.366
+                    sjeng     18433       6522       10.4        2561            0.383           0.985      0.121          0.393                0.556           0.096     1.091
+              libquantum     1275748     224895    40091.7         0             0.000           0.000      0.000          0.000                0.806           0.024     1.076
+                  h264ref     18605       9171       19.3        3878            0.785           0.999      0.096          0.475                0.295           0.506     1.634
+                 omnetpp       5410       1407       33.3       22875            0.754           0.994      0.100          0.602                0.676           0.325     1.465
+                     astar    51888      21769      52.5         1287            0.625           0.981      0.092          0.317                0.067           0.350     1.437
+                   bwaves      8763        5260      78.6       7918             0.963           0.999      0.141          0.720                0.084           0.850     1.391
+                   gamess     40429       18410       1.5       1450             0.590           1.000      0.013          0.304                0.057           0.032     1.178
+                      milc   18490         8048     192.4       4525             0.828           0.999      0.076          0.280                0.818           0.862     1.723
+                  zeusmp      42484        8018     824.2        4570            0.952           1.000      0.131          0.521                0.746           0.924     1.335
+                 gromacs      25142       10828      27.7        3434            0.857           0.992      0.142          0.603                0.314           0.148     1.318
+                    cactus    16674       12433     105.9        3010            0.846           1.000      0.258          0.609                0.508           0.628     1.504
+                  leslie3d    17028        6727     254.1        5924            0.931           1.000      0.209          0.706                0.630           0.707     1.589
+                     namd     44411       15728      16.1       1437             0.518           0.990      0.051          0.311                0.261           0.067     1.229
+                      deal   32357        19022       4.4       1134             0.472           0.984      0.016          0.260                0.121           0.168     1.240
+                 sphinx3       3740        1149      55.7       31090            0.833           0.995      0.179          0.700                0.934           0.393     1.339
+
+
+
+
+317
+                 calculix     72338       24671       4.6        420             0.234           0.933      0.046          0.336                0.249           0.022     1.169
+                    Gems      51135       19572       1.5         50             0.023           0.000      0.000          0.000                0.047           0.012     1.046
+                     tonto   33002        16266       2.1       1123             0.412           0.978      0.008          0.196                0.060           0.065     1.209
+                       lbm   666336      324572    20150.3         2             0.015           1.000      0.061          0.027                0.439           0.068     1.114
+                   povray     61836       31687       1.3        528             0.375           1.000      0.016          0.267                0.071           0.001     1.050
+                     bt.C    109448       45809      54.4         815            0.815           0.996      0.108          0.434                0.084           0.715     1.409
+                     cg.C    33512         4776      26.4        152             0.019           0.928      0.013          0.013                0.892           0.013     1.044
+                     dc.B    43508        21323      23.6         170            0.083           0.353      0.011          0.073                0.067           0.190     1.107
+                     ep.C    23927         7633      77.3         79             0.014           0.962      0.004          0.023                0.299           0.897     1.899
+                      is.C   140525       35884      53.1         860            0.721           0.995      0.103          0.346                0.078           0.617     1.565
+                     lu.C    103736       41975      52.4         796            0.743           0.996      0.104          0.335                0.083           0.649     1.562
+                     sp.C    18346         7709      20.4        5664            0.965           0.999      0.102          0.720                0.500           0.883     1.789
+                     ua.C    117350       38486      48.5         470            0.415           0.994      0.068          0.193                0.236           0.117     1.199
+            PostgreSQL         2450        1354      13.4       29996            0.762           0.989      0.060          0.448                0.331           0.106     1.118
+             Python 2.6       29200       13028      65.1       3323             0.760           0.998      0.112          0.419                0.535           0.633     1.302
+           SPECjbb2005         5432        2506      49.9        8848            0.418           0.971      0.142          0.310                0.535           0.151     1.176
+
+      Table 2: SpecTLB simulation results for SPEC CPU2006 (integer and floating point), NAS, PostgreSQL, Python and SPECjbb2005 benchmarks. TLB miss rates are shown
+      as the number of program instructions, memory references and DRAM accesses between TLB misses. TLB prefetcher accuracy is the fraction of TLB misses that are served
+      from the TLB prefetch buffer and overhead is the number of page walks performed per TLB miss.
+

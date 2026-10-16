@@ -1,0 +1,9 @@
+# §64 root acceptance
+
+One Q8/B9 build and15 new actual complete-copy runs,15exit0. DriveractualsourceR256, CSVsourceARdeclared256 and targetW256each agree. Eachstage64 nestedmetricsrecordequalscorresponding§63recordexcludingtracepath;10/15physicalCSVsexact,5 differ. Inrun01futureprefix makesone rawV-AW7cyclesearlier,physicalAW5earlier,sevenphysicalWbeats1earlier;lastW/joblatenciesunchanged. Therefore not claimall15CSVsame nor that earlierAWhaszeroeffect. Firstattemptedbyteexactauditincorrectlyassertedall15same andstopped; correctedrootauditexplicitlyrecords10true/5false; source/log/CSVunchanged.
+
+Critical source and bounded proof directly reviewed by root in ../shared-read-quantum-credit-20261009/critical-future-credit-review.md. Correctcreditedprefixis input axi_mux firstAWownerpush, notexternalDDR/B; actualFIFO consumption remainsraw W. FullsuccessfulWRITEgrant, realfifo/skidhandshake andrelaxedterminalextraAWcovergate areallnecessary. single-reset/singlejob/monotonicprefixonly; multiplejobsneedsnewepochcontract. Arithmetic64bit avoids512wrapping9bits.
+
+Because ordinaryorderedAWreservationusingexistingcoveragecanimplementthesameadmissionset, thisisstrongsimplecomparator, notindependentfuturecreditalgorithm. Incurrentonechild-Boutstandingfixtureearlierheaderrarelychangescompletion; normalbroadcastsourceisserialreturnedthroughtheexistingmux and qwriterwaitsBaftereachchild. Thesearecandidatebottleneckhypotheses, notprovenrealFPGA PNrootcause. Nextordinarywritepipeliningand/orfanoutneedsfairpathbudget; next§65asksameRcosthandoverJtradeoff.
+
+Sealed9file snapshotandallrunledger inthisdir. Codexpersonallydesigns/implements/executesandaccepts; criticalnativeCodexseatprovesboundedmodelandsources butdoesnotexecute. No production/BIT/Linux/board/SD/synthesis/MIG actions.

@@ -1,0 +1,734 @@
+# 导航摘要
+
+本组 G12_update 的主线是：**1989 年 Mach 软件 TLB shootdown**把“远端翻译缓存的失效必须等所有相关 CPU 完成”确立为正确性条件；随后演化出三条分支：  
+1. **并发数据结构与按需/定向 shootdown**：RadixVM 2013 用 radix tree、Refcache、per-core page table 与 targeted shootdown，试图让非重叠 mmap/munmap/pagefault 并行扩展，但自身也承认 APIC/IPI 路径在 80 核下单次 shootdown 可达近 1 ms（radvm2013 L785-L790）。  
+2. **虚拟化/被抢占 vCPU 的完成条件**：Shoot4U 2016 把 guest TLB 失效搬进 VMM，用 VPID/ASID + invpid 由 VMM 直接失效，避免等待被调度的 vCPU，但其证据仅在 KVM x86、2-VM/PARSEC 场景（shoot4u2016 L258-L289, L330-L359）。  
+3. **按需/惰性副本、回收与 NUMA**：Hydra 2024 做 per-VMA owner + per-page-table sharer list 的 partial lazy replication，并用“无副本则无本地 TLB 条目”的不变量过滤 shootdown（hydra2024 L260-L278, L545-L573）；Ptlbmalloc2 2020 从应用分配器角度减少 shootdown（ptlbmalloc2020 L231-L241）；FPR 2024 从 mmap 页面回收路径跳过 shootdown（fpr2024 L97-L118）。  
+供比较旧文：Mitosis 2020 做整页表 eager replication/migration（mitosis2020 L27-L39, L651-L667）；Latr 2018 做 free/migration 的 lazy shootdown，有 64 个 per-core state 上限和 IPI fallback（latr2018 L397-L415, L921-L933）。
+
+**本组证据能支持的卡点**：远端失效的 IPI 成本、被抢占/调度延迟、队列容量与 fallback、按需副本首次访问的远端 PTW、复制后更新/shootdown 的作用域、回收延迟与 ABA、per-core 页表的内存开销、尾延迟。  
+**不能从本组推出的点**：没有任何一篇论文覆盖 IOMMU、ATS/PASID/PRI、设备 DMA 完成语义、设备 SVA、FPGA 或 CXL 设备共享地址翻译；因此**不能把 CPU TLB shootdown 的“完成”直接当作 DMA 的翻译失效保证**。所有“未找到”只说明本组全文未覆盖，不等于全领域无人做。
+
+JSON 只为新 id 生成卡：`shootdown1989, radvm2013, hydra2024, shoot4u2016, ptlbmalloc2020, fpr2024`；旧 id 只在报告正文比较，不在 JSON 重复建卡。
+
+---
+
+# A. 按时间解释：本组问题与机制演化
+
+## 1. 1989：Mach 软件 shootdown 把“远端失效完成”变成同步屏障
+
+Black 等人在 `shootdown1989` 中定义的经典问题不是“TLB 一致性是否重要”，而是：**当某个 CPU 修改 pmap/虚拟到物理映射时，如何保证其他 CPU 的 TLB 不再使用旧映射**。文中明确说大多数多处理机不允许一个处理器对其他处理器的 TLB 做失效，只能通过软件通知或硬件支持；且两个 TLB 特征使问题复杂化：硬件 reload 机制可能在 flush 后重新载入不一致条目，TLB 也可能异步回写 reference/modify bits，因此**必须在物理映射更新期间 stall 远端处理器**（shootdown1989 L119-L137）。
+
+机制是 initiator/responder 四阶段：initiator 对使用该 pmap 的处理器排队动作、设 action-needed、发中断并等待；responder 收到中断后把自己从 active 集合移除并自旋，直到 initiator 完成 pmap 修改；然后 responder 做 TLB 失效、清 action-needed、重新加入 active（shootdown1989 L201-L221）。维护成本落在内核 pmap 和中断处理上；队列溢出时 responder flush 整个 TLB（shootdown1989 L237-L267）。评价在 16 处理器 Encore Multimax 上：基本成本约 430 µs 第一处理器 + 55 µs/额外处理器；惰性求值减少约 60% 内核开销、97% Parthenon 开销；内核 pmap 约 1%、用户 pmap <0.2%（shootdown1989 L427-L429, L451-L460, L498-L514）。但它同时预言：该算法大机器会 scale badly，100 处理器基本 shootdown 可达 6 ms（shootdown1989 L656-L657）。
+
+这段演化最关键的遗留条件是：**shootdown 完成 = 所有相关 CPU 已失效/已不再使用该 pmap，initiator 才可继续**。后文所有 CPU 侧方案都在改“谁做失效、何时必须完成、能否少通知谁”，但没有改“设备/DMA 必须在何时看到失效”的问题，因为全文没有设备/DMA。
+
+## 2. 2013 RadixVM：并发更新 + 定向 shootdown + 引用计数回收
+
+RadixVM 把问题从“单锁地址空间上的 shootdown”推向“多线程对同一地址空间并行 mmap/munmap/pagefault”。它用三件事：radix tree 组织 mapping metadata，Refcache 做可扩展引用计数，per-core page tables + 精确 TLB 跟踪来定向 shootdown（radvm2013 L8-L27, L94-L119）。其中 TLB shootdown 的关键判断是：x86 不告诉内核哪些 TLB 缓存了哪个映射，因此传统内核保守地给所有运行同一地址空间的核发中断；RadixVM 用 per-core page table 精确追踪哪些核可能缓存了该映射，从而只通知这些核，并对未共享映射完全消除 shootdown（radvm2013 L164-L183, L403-L420）。munmap 必须收集 fault 过该区域的核、发 IPI、等所有核清 per-core page table 和本地 TLB 后，才能释放锁并递减物理页引用（radvm2013 L447-L461）。
+
+但 RadixVM 自己的证据也暴露瓶颈：80 核上向其他 79 核投递 shootdown IPI 并等 ACK 接近 1 ms，APIC 的 IPI 协议看起来不可扩展（radvm2013 L785-L790）；per-core page table 在 Metis 80 核下有 13× 内存开销（radvm2013 L678-L681）；Refcache 要延迟两个 epoch 才能确认 zero（radvm2013 L212-L234）。因此它支持“非重叠、多数本地、per-core 页表可承受”的场景，不等于支持“设备共享翻译”或“全局共享映射低尾延迟”。
+
+## 3. 2016 Shoot4U：被抢占 vCPU 改变了“何时必须完成”
+
+Shoot4U 的问题非常明确：虚拟化环境下，远端 vCPU 可能被 host scheduler 抢占，TLB shootdown 等待 ACK 的时间可以比原生环境大几个数量级；PARSEC 中 dedup 在 2-VM 下 64% CPU 时间花在 TLB shootdown 上，整体 slowdown 达 70.6×（shoot4u2016 L11-L38, L167-L171, L199-L212）。传统 IPI 注入要等目标 vCPU 被调度；Shoot4U 改为 guest 发 hypercall，VMM 确定承载目标 vCPU 的物理 CPU，直接向这些物理 CPU 发 IPI，并由 VMM 自己执行 guest TLB 失效，因此完成不再依赖目标 vCPU 是否在运行（shoot4u2016 L258-L289）。
+
+它依赖 Intel VPID/AMD ASID 和 invpid 类指令，当前实现最多 64 vCPU（shoot4u2016 L223-L246, L286-L289）。评价在 KVM/Linux 3.16、双路 Dell R450、2 个 12-vCPU VM、PARSEC；2-VM 下平均延迟 9,048 µs（baseline）→ 5,401 µs（kvmtlb）→ 22 µs（Shoot4U），最大延迟 194,108 µs → 126,923 µs → 15,034 µs（shoot4u2016 L295-L338）。这是“被抢占 CPU 完成”分支的最强证据，但仍然只是 guest 页表，不是设备 DMA。
+
+## 4. 2018 Latr：把 free/migration 的 shootdown 做到 scheduler tick
+
+Latr 是旧文对照，但它是“软件惰性更新”的关键前作。它不在关键路径上等 ACK，而是把 per-core Latr state（start/end、mm_struct、CPU bitmask、flags、active）写入内存，由各核在 scheduler tick 或 context switch 时扫 state 并做本地 TLB 失效（latr2018 L287-L336, L338-L395）。free 操作把虚拟/物理页放入 lazy-reclamation list，等两个 scheduler tick（2 ms）后由后台线程释放，从而保证关联 TLB 条目已被至少一次 tick 失效（latr2018 L397-L415）。迁移类似：AutoNUMA 先记 state，第一个核在 tick 时改页表，其他核只本地失效（latr2018 L419-L456）。它只适用于 free 和 migration，不适用于 mprotect、CoW、mremap；每核只有 64 个 state，超过则回退 IPI；不支持 THP（latr2018 L921-L933）。评价在 Linux 4.10、2-socket 16-core 和 8-socket 120-core，munmap 最多改善 70.8%，Apache 最多改善 59.9%（latr2018 L592-L629, L720-L724）。
+
+## 5. 2020 Ptlbmalloc2：把 shootdown 成本移到用户分配器策略
+
+Ptlbmalloc2 从应用分配器层减少 TLB shootdown。它指出多线程应用的 shootdown 很多来自应用内存管理，现有分配器以内存效率换 TLB 性能；它提出 global hysteresis，用全局内存状态而非单 arena 决定何时 trim，以避免 arena imbalance 引发大量 shootdown（ptlbmalloc2020 L19-L40, L231-L241, L299-L319）。它量化了 shootdown 随 CPU 数线性增长、远端 socket IPI 约本地 3 倍、虚拟化约 3× slowdown、叠加抢占/NUMA 抽象可达一个数量级（ptlbmalloc2020 L155-L224）。评价在 Ubuntu 18.04/4.15、4 Intel Xeon、256GB、KVM、PARSEC；ptlbmalloc2 相对 glibc 最高 70% cycles/execution time，但平均提升表显示多数场景 0-7%（ptlbmalloc2020 L67-L68, L372-L419, L675-L688）。它支持“应用层可减少 shootdown”，但代价是线程竞争和内存效率的再平衡。
+
+## 6. 2020 Mitosis / 2024 Hydra：NUMA 页表副本、按需副本与共享者信息
+
+Mitosis 2020 是 Hydra 的直接前作/对照：它做**整页表 eager replication**，把页表复制到所有 socket，并用 circular linked list 找副本；更新时在临界区内 eager 更新所有副本；accessed/dirty bits 从所有副本 OR；page-table migration 通过在新 socket 复制后再释放旧副本实现（mitosis2020 L27-L39, L123-L142, L651-L667, L728-L737, L799-L860）。它在 4-socket Intel Xeon E7-4850v3 上最多 1.34×（多 socket）和 3.24×（迁移），但 mprotect 有 3.2× 开销、munmap 1.3-1.4×（4-way replication），并承认现有 OS 不支持 page-table migration（mitosis2020 L34-L39, L113-L122, L1756-L1761）。
+
+Hydra 2024 改为 **lazy + partial per-PTE replication**：每个 VMA 有 owner node，page-table 有 circular sharer list；owner invariant 是“有效 PTE 若存在，owner 必有”；更新只发给 sharer list 中的副本；若某 socket 没有某 page-table 副本，则按设计不可能有该 PTE 的 TLB 条目，所以 shootdown 可跳过（hydra2024 L260-L278, L386-L448, L545-L573）。它还在 page fault 时按 degree d prefetch 相邻 PTE，降低首次远端 PTW 惩罚（hydra2024 L498-L543）。评价在 8-socket E7-8890 v3、8TB、Linux v4.17/6.5.7；页表 footprint 比 Mitosis 小很多，XSBench 极端共享时 Hydra 会收敛到 Mitosis；应用结果总体匹配 Mitosis，Canneal 上 Mitosis 1.22× vs Hydra 1.19×，但 Mitosis 在装载阶段多复制导致 21% slowdown（hydra2024 L644-L710, L760-L794, L807-L825, L862-L877）。它仍把 THP、虚拟化 nested page table、intra-socket shootdown 列为未来/未优先（hydra2024 L1110-L1125, L1152-L1154）。
+
+## 7. 2024 FPR：页面回收路径跳过 shootdown，但要处理 ABA 与语义变化
+
+FPR 的切入点是 mmap-munmap 和 page cache eviction 中物理页被同一应用回收。若页被同一 recycling context 重用，TLB shootdown 可跳过；只有页离开 recycling context 时才发 shootdown。实现是 `MAP_FPR` 标志、每物理页 8 字节 tracking（2 bits flags、22 bits ID、40 bits version），skipped shootdown 逻辑从 release 移到 allocation；为避免 ABA，内核递增给新映射的虚拟地址，不再反复返回同 VA（fpr2024 L97-L118, L270-L324, L325-L350, L380-L405）。kswapd 回收路径要特殊处理：只在低 watermark 时批量 evict FPR recycling 页，一次 shootdown（fpr2024 L325-L350）。评价在 Linux 5.15/6.10、Intel/AMD、pmem、Optane SSD、NVMe、Apache/LevelDB/LMDB；真实应用最多 28%，微基准 92%；FPR 自身内存 metadata 约 0.2%，无 FPR 时最多约 1% 处理开销（fpr2024 L38-L44, L614-L635, L1020-L1033）。但它明确说：FPR 不得用于会 segfault 的程序，因为可能访问 stale page；也不优化匿名 malloc/free；虚拟化留作未来（fpr2024 L129-L135, L354-L360, L1036-L1044）。
+
+**演化总结**：从 1989 的“所有相关 CPU 同步失效” → 2013 的“定向通知 + per-core 页表 + 引用计数回收” → 2016 的“VMM 代替被抢占 vCPU 完成失效” → 2018/2020 的“惰性/按需/回收路径延迟 shootdown” → 2020/2024 的“NUMA 副本 + 共享者信息过滤 shootdown” → 2024 的“页面回收上下文跳过 shootdown”。变化的是优化段、信息产生点、完成时限和成本承担者；不变的是所有证据都限于 **CPU 页表/TLB**。
+
+---
+
+# B. 证据卡
+
+## shootdown1989
+
+**题录核对**：题目 `Translation Lookaside Buffer Consistency: A Software Approach`（shootdown1989 L1-L2）；作者 David L. Black, Richard F. Rashid, David B. Golub, Charles R. Hill, Robert V. Baron（L4）；年份 1989 来自 ACM 版权行（L62）；venue 在本文题头未见明确会议/期刊名，`null`；DOI 未见，`null`；`publication_status=published`。  
+**最强前作/关键改变**：前作包括 Teller 等 TLB consistency on highly parallel shared memory multiprocessors（L677-L691 的 related work 引用 [25]）和 Thompson 等 System V/MIPS 方案（L656-L666）。关键改变是把 TLB consistency 系统化实现为 Mach pmap 的 shootdown，并给出性能测量与硬件支持选项。  
+**精确机制**：initiator 加 pmap 锁，对使用该 pmap 的处理器排队、发中断并等 responder 不再 active/不再使用 pmap；responder 自旋直到 pmap 更新完成，然后失效 TLB、清 flag、重新 active（L201-L221）。因为硬件 reload 和 reference/modify bit writeback 会重新引入不一致，必须 stall 远端处理器（L129-L137）。  
+**复用粒度与身份/权限前提**：粒度是 pmap 内 start/end 地址范围，队列可溢出并退化为整 TLB flush（L237-L267）；身份是 pmap + active processor set + per-processor action queue；没有权限/设备身份，只有地址空间与 CPU 集合。  
+**资源共享 vs 映射共享/SVA**：是同一 pmap/共享地址空间在多个 CPU 上的映射共享；没有设备共享、SVA、PASID、ATS、DMA。  
+**评价配置**：16 处理器 NS32332 Encore Multimax，instrumented Mach kernel；测试程序 + Mach/Parthenon/Agora/Camelot（L372-L376, L334-L367）。  
+**限制/未覆盖**：无 pageout 活动；结论主要适用于物理内存充足系统（L281-L285）；预测 100 处理器时基本 shootdown 6 ms（L656-L657）；硬件支持未实现/未验成本收益（L598-L603）；无设备/DMA。  
+**对可能创新点最强反证**：不能把“软件 shootdown 便宜”推成“大机器/设备也便宜”；本文自己说会 scale badly 且需要硬件支持或系统结构匹配（L656-L657, L598-L603）。  
+**后续必追引文**：Teller et al. HICSS 1988（[25], L696-L699）；Thompson et al. USENIX 1988（[29], L722-L726）；Cheriton VMP（[8], L704-L709）；MC88200（[17], L740）；RP3（[4], L685-L687）。  
+**可导航证据**：L119-L137; L169-L180; L201-L221; L237-L267; L399-L443; L451-L460; L498-L514; L656-L657。  
+**relations**：无本组内 actual_citation 证据（1989 参考文献未列后续论文）；mechanism_comparison 与 radvm2013/latr2018/mitosis2020/hydra2024 的 CPU shootdown 线有关，来源分别为各自章节。
+
+## radvm2013
+
+**题录核对**：题目 `RadixVM: Scalable address spaces for multithreaded applications`（radvm2013 L1）；作者 Austin T. Clements, M. Frans Kaashoek, Nickolai Zeldovich（L2）；年份 2013；venue EuroSys 2013, Prague（L55-L56）；DOI 未在题头给出，`null`；published。  
+**最强前作/关键改变**：前作是 Bonsai VM（L147-L148）、Linux 单地址空间锁（L31-L38）、Barrelfish/Corey 等（L108-L119）。关键改变是把 radix tree、Refcache、per-core page tables + targeted shootdown 组合起来，使非重叠 mmap/munmap/pagefault 并行。  
+**精确机制**：radix tree 存 per-page mapping metadata；Refcache 用 per-core delta cache、epoch、review queue、weak reference 延迟回收；pagefault 把当前核加入 mapping metadata 的 shootdown list；munmap 收集 fault 过该区域的核，发 IPI 让它们清 per-core page table 和本地 TLB，等完成后再释放物理页（L403-L461）。  
+**复用粒度与身份/权限前提**：粒度是 mapping metadata、radix tree slot/node、per-core page table entry、Refcache object；身份是进程地址空间 + per-core page table + core list。  
+**资源共享 vs 映射共享/SVA**：同一进程/共享地址空间内页映射；非设备/SVA。  
+**评价配置**：80-core、8×10-core Intel E7-8870、256GB；Linux 3.5.7、Bonsai、RadixVM；Metis + local/pipeline/global 微基准（L497-L509, L532-L539）。  
+**限制/未覆盖**：只保证非重叠区域完美扩展；重叠会串行（L162-L163）；不实现 radix tree collapsing（L473-L475）；无 swapping（L469-L471）；per-core page table 内存 13×（L678-L681）；Refcache 延迟两个 epoch（L212-L234）；APIC IPI 在 80 核下近 1 ms（L785-L790）。  
+**对可能创新点最强反证**：targeted shootdown 并不能消除 IPI 协议本身的不可扩展；RadixVM 在 global 微基准中仍受 shootdown 成本限制（L785-L790），per-core page table 也有高内存代价（L678-L681）。  
+**后续必追引文**：Bonsai/RCU balanced trees（[7], L848-L852）；SNZI（[12], L870-L873）；Barrelfish（[3], L813-L817）；Corey（[5], L832-L837）；Metis（[22], L861-L863）；Linux scalability（[6], L842-L846）。  
+**可导航证据**：L8-L27; L89-L93; L164-L183; L403-L461; L645-L681; L785-L790; L830-L837。  
+**relations**：actual_citation → shootdown1989（radvm2013 [4], L825-L829）；mechanism_comparison → hydra2024（Hydra 第 7 节评 RadixVM per-core page table 内存问题，hydra2024 L1138-L1146）。
+
+## hydra2024
+
+**题录核对**：题目 `Scalable and Effective Page-table and TLB management on NUMA Systems`（hydra2024 L23）；作者 Bin Gao, Qingxuan Kang, Hao-Wei Tee, Kyle Timothy Ng Chu, Alireza Sanaee, Djordje Jevdjic（L3-L5, L25-L27）；年份 2024；venue 2024 USENIX ATC, July 10-12, 2024, Santa Clara（L11-L13）；DOI 题头未给，`null`；published。  
+**最强前作/关键改变**：最强前作是 Mitosis（eager full page-table replication）和 RadixVM/LATR。关键改变是 owner per VMA + per-page-table sharer circular list + lazy/partial per-PTE replica，并把 sharer 信息用于过滤 TLB shootdown（L48-L65, L174-L185, L332-L344, L386-L448）。  
+**精确机制**：VMA owner 是分配它的 NUMA socket；owner invariant 为“有效 PTE 存在则 owner 必有”；目标 socket 缺 PTE 时从 owner 复制单 PTE 并加入 sharer list；更新只传播到 sharer list；若某 socket 无该 page-table 副本，则不可能有对应 PTE 的 TLB 条目，故不发 shootdown（L260-L278, L417-L448, L545-L573）。  
+**复用粒度与身份/权限前提**：粒度是 PTE、page-table page、VMA owner、sharer list；前提是页表副本可精确追踪、owner 持有有效 PTE、per-VMA owner 分配语义。  
+**资源共享 vs 映射共享/SVA**：NUMA socket 间进程页表副本共享；非设备/SVA。  
+**评价配置**：8-socket E7-8890 v3、18 cores/socket、1TB/socket、8TB；Linux v4.17 和 v6.5.7；Btree、Redis、Graph500、Canneal、HashJoin、XSBench、Memcached、Apache；含 malloc、webserver、Memcached case study（L644-L710, L807-L825, L881-L891, L1002-L1006, L1098-L1107）。  
+**限制/未覆盖**：THP 非优先（L1112-L1125）；虚拟化 nested paging 未来工作（L1077-L1094）；intra-socket shootdown 未解决（L1105-L1109）；极端共享时 Hydra 收敛到 Mitosis（L791-L794）；首次访问远端 PTW 仍存在，靠 prefetch 缓解（L498-L543）。  
+**对可能创新点最强反证**：partial lazy replica 不是无条件优于 eager：XSBench 极端共享时二者 footprint 相同并收敛（L791-L794）；Canneal 上 Mitosis 1.22× vs Hydra 1.19×，Hydra 优势伴随 Mitosis 装载期 21% slowdown（L862-L877）。  
+**后续必追引文**：Mitosis（[1], L1202-L1207）；RadixVM（[14], L1217-L1220）；LATR（[38], L1288-L1293）；vMitosis（[51], L1362-L1367）；Prefetched Address Translation（[44], L1327-L1330）；Barrelfish（[7], L1233-L1238）；Amit et al. Don’t shoot down TLB shootdowns（[5], L1224-L1226）。  
+**可导航证据**：L32-L67; L174-L185; L260-L278; L386-L448; L498-L543; L545-L573; L862-L877; L1138-L1146。  
+**relations**：actual_citation → mitosis2020（hydra2024 [1], L1202-L1207）；actual_citation → radvm2013（[14], L1217-L1220）；actual_citation → latr2018（[38], L1288-L1293）；mechanism_comparison → fpr2024（二者都跳过不必要 shootdown，但 Hydra 以 NUMA 页表副本/sharer list 过滤，FPR 以页面 recycling context 过滤，来源 hydra2024 §3.5 与 fpr2024 §IV）。
+
+## shoot4u2016
+
+**题录核对**：题目 `Shoot4U: Using VMM Assists to Optimize TLB Operations on Preempted vCPUs`（shoot4u2016 L1-L2）；作者 Jiannan Ouyang, John R. Lange, Haoqiang Zheng（L4-L6）；年份 2016；venue VEE ’16, April 02-03, 2016, Atlanta, GA, USA（L56）；DOI `10.1145/2892242.2892245`（L58）；published。  
+**最强前作/关键改变**：前作是 kvmtlb（KVM paravirt remote flush TLB）和 lock-holder preemption 工作（L89-L118）。关键改变是把 TLB 失效从 guest vCPU 搬到 VMM：VMM 直接对 guest TLB 条目执行 invpid 类失效，不再等被抢占 vCPU 被调度。  
+**精确机制**：guest 发 hypercall，参数为 vCPU bitmap 与地址范围；VMM 找到承载目标 vCPU 的物理 CPU，发物理 IPI；IPI 由 VMM 处理，VMM 直接失效 guest TLB 条目；initiating VMM busy-wait 直到完成，然后返回 hypercall（L258-L289）。  
+**复用粒度与身份/权限前提**：粒度是 vCPU bitmap + 地址范围；身份是 VPID/ASID（Intel/AMD）和 VM/vCPU 上下文；需要硬件虚拟化扩展和 VMM 支持。  
+**资源共享 vs 映射共享/SVA**：guest VM 内共享页表；不是设备/SVA。  
+**评价配置**：双路 Dell R450，Ivy-Bridge Xeon 6 cores each，24GB，CentOS 7/Linux 3.16 + modified KVM；2 VMs × 12 vCPUs，PARSEC + sysbench competing；对比 baseline、kvmtlb、Shoot4U（L295-L325）。  
+**限制/未覆盖**：最多 64 vCPUs（bitmap 大小，L286-L289）；只优化 TLB flush/shootdown，不优化其他 preemption 问题；最坏 2-VM max 仍 15,034 µs（L330-L338）；未涉及设备 DMA。  
+**对可能创新点最强反证**：VMM-assisted 失效也只能解决“被抢占 vCPU 导致等待”这一段；它仍要 VMM 发物理 IPI 并 poll，且仅对 TLB 失效路径，不能推成所有远端翻译失效都低延迟（L258-L289, L330-L338）。  
+**后续必追引文**：KVM Paravirt Remote Flush TLB（[4], L668-L670）；Kim et al. demand-based coordinated scheduling（[13], L697-L700）；PMT spinlock（[16], L668-L672）；Uhlig et al. 2004（[21], L688-L691）；VMware ESX scheduler（[8], L677-L678）；PLE（[19], L683-L684）。  
+**可导航证据**：L11-L38; L167-L171; L223-L246; L258-L289; L330-L359; L643-L655。  
+**relations**：无本组内 actual_citation 证据；mechanism_comparison → fpr2024/hydra2024/latr2018：三者在不同层处理 shootdown 完成/延迟，但只有 Shoot4U 专门处理被抢占 vCPU，来源 shoot4u2016 §3-§4 与各自对应章节。
+
+## ptlbmalloc2020
+
+**题录核对**：题目 `Ptlbmalloc2: Reducing TLB Shootdowns with High Memory Efficiency`（ptlbmalloc2020 L7）；作者可见文本为 Stijn Schildermans, Jianchen Shan, Xiaoning Ding, Kris Aerts（L9-L15；版式似三列，Kris Aerts 在第一列第二行，作者顺序需正式 PDF 复核）；年份 2020；venue ISPA/BDCloud/SocialCom/SustainCom 2020（L1-L2）；DOI `10.1109/ISPA-BDCloud-SocialCom-SustainCom51426.2020.00036`（L68）；published。  
+**最强前作/关键改变**：前作包括 Black 1989、LATR、Shoot4U、RadixVM、Amit ATC 2017、DiDi。关键改变是从应用分配器层提出 global hysteresis，显式平衡内存效率与 TLB shootdown。  
+**精确机制**：识别 arena imbalance：单个 arena 的 trim/expand 触发大量 shootdown，但全局内存效率收益可能很小；global hysteresis 让分配器看全局 arena 累计内存和 trim 阈值，只在全局可 trim 空间超阈值时缩 arena，从而减少 munmap/madvise 类 shootdown（L231-L241, L299-L319）。  
+**复用粒度与身份/权限前提**：粒度是 arena、分配段、trim 阈值；身份是线程/arena/分配器，无设备身份；依赖应用分配器可插入 glibc 之上。  
+**资源共享 vs 映射共享/SVA**：应用堆地址空间在 CPU 核间的映射失效；非设备/SVA。  
+**评价配置**：Ubuntu 18.04/kernel 4.15，4 Intel Xeon（20 cores/40 threads each），256GB，KVM；PARSEC 3.0；CPU 4-64、socket 1-4（L86-L94, L372-L419）。  
+**限制/未覆盖**：平均提升有限（多数 0-7%，L675-L688）；global hysteresis 绑定 legacy allocator 设计（L742-L752）；未集成进 glibc 本体导致 arena 锁竞争（L390-L395）；不涉及设备。  
+**对可能创新点最强反证**：应用层减少 shootdown 不是免费：global hysteresis 会牺牲部分内存效率/引入线程竞争，且性能提升依赖 arena imbalance 是否发生（L390-L406, L701-L703）。  
+**后续必追引文**：LATR（[2], L771-L774）；Shoot4U（[3], L776-L777）；Black 1989（[7], L711-L714）；Amit ATC 2017（[6], L709-L710）；DiDi（[11], L767-L769）；RadixVM（[28], L778-L780）；Barrelfish（[26], L770-L773）；Corey（[27], L773-L776）。  
+**可导航证据**：L19-L40; L43-L64; L99-L148; L155-L224; L231-L241; L299-L319; L372-L419; L675-L688。  
+**relations**：actual_citation → shootdown1989（[7], L711-L714）；actual_citation → latr2018（[2], L771-L774）；actual_citation → shoot4u2016（[3], L776-L777）；actual_citation → radvm2013（[28], L778-L780）；mechanism_comparison → hydra2024/fpr2024：均在 OS/分配器层减少 shootdown，但触发源与身份粒度不同（本节 §4 与 hydra2024 §3.5、fpr2024 §IV）。
+
+## fpr2024
+
+**题录核对**：题目 `Skip TLB flushes for reused pages within mmap’s`（fpr2024 L1）；作者 Frederic Schimmelpfennig, André Brinkmann, Hossein Asadi, Reza Salkhordeh（L2）；年份 2024；venue arXiv preprint `arXiv:2409.10946v1 [cs.OS] 17 Sep 2024`（L14）；DOI 题头未给，`null`；`publication_status=preprint`。  
+**最强前作/关键改变**：前作包括 LATR、ABIS、Amit ATC 2017、SITE、DiDi、ATTC、HATRIC、Fastmap。关键改变是把 shootdown 跳过条件从“哪些核缓存了映射”转为“物理页是否在同一 recycling context 中被重用”，从而跳过 mmap-munmap 和 page cache eviction 中大量 shootdown（L97-L118）。  
+**精确机制**：`MAP_FPR` 标志开启 recycling context；每物理页 tracking ID，离开 context 时 ID 变化并触发 shootdown；skipped shootdown 从 release 移到 allocation；为避免 ABA，内核递增新 mmap 的虚拟地址，而不是重复返回同一 VA；kswapd 在低 watermark 时批量 evict FPR page 并一次 shootdown（L270-L324, L325-L350）。  
+**复用粒度与身份/权限前提**：粒度是物理页 frame；身份是 recycling context（单 mmap、进程、子进程、用户 uid 等，L361-L379）；只有正确调试、不会 segfault 的程序可长期开启，否则可能访问 stale page（L129-L135）。  
+**资源共享 vs 映射共享/SVA**：同一进程/用户上下文内的物理页复用；不是设备/SVA。  
+**评价配置**：Linux 5.15 和 6.10；Intel Xeon 9242 96 cores 2-socket、AMD Epyc 7413 48 cores 2-socket、Intel Xeon 5215 10 cores + Optane DC NVMM；nullblk、Optane SSD、SATA SSD、pmem；Apache、LevelDB、LMDB、PARSEC、YCSB（L614-L635, L784-L802, L901-L928, L1024-L1033）。  
+**限制/未覆盖**：不优化匿名 mmap/munmap malloc/free（L354-L360）；虚拟化未来工作（L1036-L1044）；kswapd 路径需要特殊批量处理，否则 ABA/一致性风险（L325-L350）；程序 segfault 时可访问 stale 数据（L129-L135）。  
+**对可能创新点最强反证**：跳过 shootdown 不是透明无代价的“安全优化”：FPR 改变了 free 语义，依赖程序正确性和 opt-in，且只对 recycling 路径有效；普通 mmap 和其他 shootdown 来源仍存在（L129-L135, L354-L360）。  
+**后续必追引文**：LATR（[18], L1116-L1120）；Amit ATC 2017（[1], L1049-L1051）；Don’t shoot down TLB shootdowns（[2], L1052-L1054）；SITE（[3], L1055-L1057）；DiDi（[30], L1089-L1092）；ATTC（[14], L1103-L1106）；HATRIC（[32], L1098-L1102）；Fastmap（[21], L1050-L1051）；z-READ（[22], L1054-L1055）；EcoTLB（[19], L1121-L1123）。  
+**可导航证据**：L8-L44; L97-L118; L270-L324; L325-L350; L380-L405; L614-L635; L1020-L1033。  
+**relations**：actual_citation → latr2018（[18], L1116-L1120）；mechanism_comparison → hydra2024（都跳过 shootdown，但 Hydra 靠 NUMA 页表 sharer 信息，FPR 靠 recycling context；来源 hydra2024 §3.5 与 fpr2024 §IV）；mechanism_comparison → latr2018（FPR 在 mmap/eviction 路径，Latr 在 free/migration 路径，二者都依赖延迟回收正确性；来源 fpr2024 §III-B 与 latr2018 §4.2）。
+
+## 对比旧文证据卡（不生成 JSON 重复卡）
+
+### mitosis2020
+
+**题录核对**：题目 `Mitosis: Transparently Self-Replicating Page-Tables for Large-Memory Machines`（mitosis2020 L5-L6）；作者 Reto Achermann, Ashish Panwar, Abhishek Bhattacharjee, Timothy Roscoe, Jayneel Gandhi（L7-L13）；年份 2020；venue ASPLOS ’20, March 16–20, 2020, Lausanne, Switzerland（L20-L23）；DOI `10.1145/3373376.3378468`（L24, L78）；published。  
+**机制**：整页表 eager replication 到所有 socket；circular linked list 定位副本；更新在临界区 eager 更新所有副本；accessed/dirty bits 从所有副本 OR；migration 用新 socket 复制后释放旧副本（L651-L667, L728-L737, L799-L860）。  
+**限制**：现有 OS 不支持 page-table migration（L113-L122）；4-way replication 下 mprotect 3.2×、munmap 1.3-1.4× 开销（L1756-L1761）；虚拟化 nested paging 留未来（L818-L844）；大数据集/跨 socket 仍受远端 PTW 影响。  
+**对 Hydra 的反证**：整页表复制提供更多本地性，但更新/内存代价高；Hydra 在极端共享时又收敛到 Mitosis（hydra2024 L791-L794），说明“按需一定优于 eager”不成立。  
+**actual_citation**：→ radvm2013（[17], L1830-L1832）。
+
+### latr2018
+
+**题录核对**：题目 `Latr: Lazy Translation Coherence`（latr2018 L1）；作者 Mohan Kumar, Steffen Maass, Sanidhya Kashyap, Ján Veselý, Zi Yan, Taesoo Kim, Abhishek Bhattacharjee, Tushar Krishna（L2-L4）；年份 2018；venue ASPLOS’18, March 24–28, 2018, Williamsburg, VA, USA（L77-L80）；DOI `10.1145/3173162.3173198`（L81）；published。  
+**机制**：per-core Latr state 队列；free/migration 不在关键路径等 ACK，scheduler tick 或 context switch 时扫 state 并本地失效；free 等两个 tick（2 ms）后后台释放；migration 由第一个核改页表，其他核只本地失效（L287-L336, L397-L456）。  
+**限制**：只覆盖 free 和 migration；mprotect/CoW/mremap 不适用；每核 64 state，超过回退 IPI；不支持 THP（L921-L933）；有最多 1.7% 应用开销（L869-L880）。  
+**actual_citation**：→ shootdown1989（[15], L997-L1001）；→ radvm2013（[18], L1010-L1013）。
+
+---
+
+# 对照矩阵：优化段、信息产生、完成时限、维护成本
+
+| 论文 | 优化的是哪一段 | 信息何处产生 | 何时必须完成/排序约束 | 谁承担维护成本 | 复用/失效粒度 | 身份/权限匹配前提 | 资源共享 vs 映射共享/SVA | 评估方式 |
+|---|---|---|---|---|---|---|---|---|
+| shootdown1989 | 远端 TLB 失效路径：initiator 排队、发 IPI、等 responder 不再 active/使用 pmap | pmap 操作检测到不一致风险；active processor set；per-processor action queue | initiator 完成 pmap 更新前，相关 responder 必须已 spin/失效；队列可 overflow flush | OS 内核/pmap，中断禁用，IPI，initiator spin | pmap 地址范围 start/end，队列动作 | pmap + active processor set | CPU 间共享同一 pmap；非设备/SVA | 16 处理器 Multimax 实机测量 |
+| radvm2013 | 并发 mmap/munmap/pagefault + targeted shootdown + 引用计数回收 | radix tree mapping metadata；per-core page table fault 记录；Refcache delta/epoch | munmap 返回前必须清 page table、失效所有已收集核；Refcache 延迟 2 epoch 回收 | OS 内核；per-core 页表内存；Refcache 后台 flush/review | page mapping、radix tree slot/node、Refcache object | 进程地址空间 + per-core page table + core list | 进程内共享地址空间；非设备/SVA | 80-core 实机测量，Metis+微基准 |
+| shoot4u2016 | 虚拟化 shootdown：VMM 直接失效 guest TLB，不等 vCPU 调度 | VPID/ASID；vCPU bitmap；VMM 检查 vCPU 运行状态与物理 CPU | hypercall 返回前 VMM 完成失效；不再依赖目标 vCPU 被调度 | VMM/hypervisor + 物理 IPI + VMM poll | vCPU bitmap + 地址范围 | VPID/ASID + vCPU/VM | guest VM 内共享页表；非设备/SVA | KVM/Linux 3.16 实机测量，PARSEC |
+| latr2018 | free/migration 的 shootdown 从关键路径移出 | per-core Latr state：start/end、mm、CPU bitmask、flags、active | scheduler tick/context switch 时失效；free 页等 2 ms 后才释放 | OS 内核；每核 state 队列；后台回收线程 | start/end + mm_struct + CPU bitmask | mm_struct + CPU bitmask | 进程地址空间；非设备/SVA | Linux 4.10 实机测量，2/8-socket |
+| ptlbmalloc2020 | 应用分配器 arena resize/trim 引发的 mmap/munmap/madvise shootdown | 全局 arena 累计内存、trim 阈值、CPU 数估算的 shootdown 成本 | 分配器决定何时 trim；避免每 arena 小改动即触发 shootdown | 应用分配器库（glibc 之上）；线程/arena 锁竞争 | arena、分配段、阈值 | 线程/arena/分配器；无设备身份 | 应用堆地址空间；非设备/SVA | PARSEC 实机测量，4-64 CPU、1-4 socket、KVM |
+| mitosis2020 | NUMA 页表读（远端 PTW）和写（副本一致性） | per-socket page-table replica；circular linked list；owner? 实际为全副本 eager | 页表更新在临界区 eager 传播所有副本；迁移时新 socket 复制后释放旧副本 | OS 内核 + PV-Ops；副本内存；OR accessed/dirty bits | page-table page / 整个进程页表；socket 粒度 | 进程页表 + socket/副本链表 | 进程页表副本；非设备/SVA | 4-socket 实机测量 |
+| hydra2024 | NUMA 页表读（远端 PTW）+ 写（副本一致性）+ shootdown 过滤 | VMA owner；per-page-table sharer circular list；本地副本存在性 | 更新只到 sharer list；无副本则无 TLB 条目，可跳过 shootdown；首次缺 PTE 时从 owner 复制 | Linux 内核；owner/replica 链表；prefetch；过滤逻辑 | PTE、page-table page、VMA owner | VMA owner + page-table sharer list | 进程页表副本；非设备/SVA | 8-socket 实机测量，多应用+微基准 |
+| fpr2024 | mmap-munmap 与 page cache eviction 中回收页的 shootdown | 每物理页 tracking ID；recycling context；global shootdown counter；version | 页离开 recycling context 时必须 shootdown；ABA 通过 VA 递增避免；kswapd 批量后一次 shootdown | Linux 内核；每页 8B metadata；应用 opt-in/拦截库 | 物理页 frame + recycling context | page ID + pid/mmap/uid 等 context | 进程/用户上下文内页复用；非设备/SVA | Linux 5.15/6.10 实机测量，多存储介质 |
+
+---
+
+# 被本组反证的常见创新说法
+
+1. **“软件 shootdown 足以支撑任意规模，无需硬件/结构匹配”**  
+   反证：1989 自己预测 100 处理器基本 shootdown 约 6 ms，并说需要高优先级软件中断和避免 stall 远端处理器的 MMU 设计（shootdown1989 L656-L657, L598-L610）。RadixVM 也观察到 80 核 APIC IPI 协议非扩展，79 核 shootdown 接近 1 ms（radvm2013 L785-L790）。
+
+2. **“只要做 targeted shootdown，就能消除远端 TLB 失效成本”**  
+   反证：RadixVM 的 targeted shootdown 对非共享映射有效，但在 global 共享微基准中仍受 shootdown 限制；APIC 投递本身就是瓶颈（radvm2013 L785-L790）。Hydra 也只在“无副本则无 TLB 条目”的 sharer 信息成立时过滤，且首次访问仍可能远端 PTW（hydra2024 L260-L278, L498-L543）。
+
+3. **“按需/惰性副本一定比 eager 副本好”**  
+   反证：Hydra 在 XSBench 极端共享时每个 socket 都复制所有页表，最终等价于 Mitosis（hydra2024 L791-L794）；Canneal 上 Mitosis 运行期 1.22× vs Hydra 1.19×，Hydra 的优势伴随 Mitosis 装载期 21% slowdown，说明是权衡而非单向取代（hydra2024 L862-L877）。
+
+4. **“VMM-assisted 失效可以消除被抢占 vCPU 的所有延迟”**  
+   反证：Shoot4U 仍要 VMM 向承载目标 vCPU 的物理 CPU 发 IPI 并 poll，只是把等待从 guest vCPU 调度改成 VMM 完成；2-VM 最坏延迟仍有 15,034 µs，且仅支持最多 64 vCPU（shoot4u2016 L258-L289, L330-L338）。
+
+5. **“惰性 shootdown 是通用、透明、无代价的”**  
+   反证：Latr 只适用于 free/migration，mprotect/CoW/mremap 必须同步；每核 64 state，溢出回退 IPI；不支持 THP（latr2018 L921-L933）。FPR 改变 free 语义，要求程序正确且 opt-in，否则可能访问 stale page；不优化匿名 malloc/free，虚拟化留未来（fpr2024 L129-L135, L354-L360）。
+
+6. **“应用分配器可以同时最大化内存效率和 TLB 可扩展性，且无副作用”**  
+   反证：Ptlbmalloc2 的 global hysteresis 会引入线程竞争和内存效率再平衡；平均提升多数场景仅 0-7%，部分 benchmark 甚至略慢（ptlbmalloc2020 L390-L406, L675-L688）。
+
+7. **“单 CPU / NUMA CPU 页表结果可直接作为设备 DMA 的保证”**  
+   反证：本组所有全文只讨论 CPU 页表/TLB 与 OS/虚拟化/分配器；没有 IOMMU、ATS/PASID、DMA 完成或设备 SVA。把 1989 的单 CPU/NUMA CPU shootdown 结果直接推成 DMA 保证，超出全文证据范围。
+
+---
+
+# C. 被证据支持的剩余瓶颈与不能断言的点
+
+## 被证据支持的剩余瓶颈
+
+1. **远端失效的 IPI/中断成本随核数增长**  
+   1989：基本 shootdown 线性增长，100 处理器预测 6 ms（L427-L429, L656-L657）。RadixVM：80 核投递+等待近 1 ms，APIC 非扩展（L785-L790）。Ptlbmalloc2：CPU 数线性 IPI；远端 socket IPI 约本地 3×；虚拟化约 3× slowdown，叠加抢占/NUMA 抽象可达一个数量级（L155-L224）。
+
+2. **被抢占/不可调度 CPU 的完成延迟**  
+   Shoot4U：dedup 2-VM 下 64% CPU 花在 TLB shootdown；slowdown 70.6×；延迟分布 90th percentile 增两个数量级（L27-L28, L167-L171, L199-L212）。Shoot4U 把 VMM 作为完成者，但最坏延迟仍高（L330-L338）。
+
+3. **队列容量与 fallback**  
+   1989：per-processor update queue 是小 buffer，溢出则 responder 整 TLB flush（L237-L267）。Latr：每核 64 state，超过则回退 IPI；state 数量与 sweep 成本有权衡（L921-L933）。Shoot4U：vCPU bitmap 限 64（L286-L289）。Hydra：sharer list 是 circular linked list，更新要遍历 sharer；无副本则跳过（L417-L448）。
+
+4. **动态映射/迁移/失效的完成条件**  
+   Latr 的 free 必须等两个 tick 后才释放；migration 必须等所有核失效后才允许下一次 page fault 迁移（L397-L456）。Mitosis 迁移靠新 socket 复制后释放旧副本；现有 OS 不支持页表迁移（L113-L122, L799-L860）。Hydra 更新只到 sharer list，owner invariant 保证无副本则无 TLB 条目（L260-L278, L417-L448）。FPR 在页离开 recycling context 时必须 shootdown，否则 ABA（L302-L324, L325-L350）。这些完成条件是 CPU 页表语境。
+
+5. **远端 PTW / page-table placement**  
+   Mitosis：远端页表可造成 3.3× slowdown，迁移场景 1.4-3.2× slowdown，2MB 页下仍可到 2.3×；page-table migration 不支持（L356-L375, L1718-L1726）。Hydra：首次访问新 socket 必有远端 PTW，靠 lazy copy + prefetch 缓解；RadixVM 的 per-core 页表在 288 核约 60% 内存用于页表（Hydra 对 RadixVM 的评价，L1138-L1146；Hydra 自身 L498-L543）。
+
+6. **容量/内存开销**  
+   RadixVM：per-core page table 在 Metis 80 核 13×，约 1.3 GB/3.6%；共享页表约 100 MB/0.3%（L678-L681）。Mitosis：16 replica 约 2.9% 内存，4-socket 约 0.6%（L1763-L1776）。Hydra：page-table footprint 0.5x-1x，XSBench 极端共享收敛到 Mitosis（L760-L794）。FPR：每页 8B，0.2% 开销（L380-L405）。Ptlbmalloc2：global hysteresis 牺牲部分内存效率/线程竞争（L390-L406）。
+
+7. **尾延迟与不均衡**  
+   1989：时间分布非正态，偏斜，90th percentile 与 median 差异大；Agora 双峰（L515-L533）。Shoot4U：最大延迟 baseline 194,108 µs vs Shoot4U 15,034 µs，仍显示尾延迟（L330-L338）。Latr：同步 shootdown 是数据中心尾延迟来源之一；Latr 有最多 1.7% 开销和 fallback IPI（L114-L124, L921-L933）。FPR：单 I/O 线程可影响 compute 线程吞吐最多 30% 浪费（L46-L52, Fig.1）。
+
+## 不能断言的点（全文可支持范围）
+
+- 全文未出现 **IOMMU、ATS、PASID、PRI、设备 SVA、DMA 完成/ATS invalidation completion**。因此不能断言“设备 DMA 能在 shootdown 完成后看到新翻译”，也不能把 CPU TLB shootdown 的 ACK 语义直接映射为设备翻译失效语义。
+- 全文未出现 **FPGA、加速器、CXL 设备共享地址翻译**。Hydra 提到 CXL/多节点作为背景和未来方向（L154-L160, L1077-L1094），但没有实现/评估设备翻译。
+- 全文未给出 **远端 PTW 在设备/IOMMU 场景的队列/容量/尾延迟**。Mitosis/Hydra/RadixVM 的远端 PTW 是 CPU 页表 walk；不能推成 IOMMU 的 remote page-table walk。
+- 全文未评估 **动态迁移下“何时必须完成失效”对设备 DMA 的排序约束**。Latr/Mitosis/Hydra 的迁移完成条件都是 OS 页表/CPU TLB 语境。
+- 全文未覆盖 **多设备共享同一虚拟地址空间（SVA）时的身份、权限、PASID 匹配**。Hydra 的 VMA owner/sharer、FPR 的 recycling context、Shoot4U 的 VPID/ASID 都不是设备身份。
+- “未找到”不等于“未实现”：本组只支持到上述全文范围；全领域是否已有设备/IOMMU/SVA 方案，需要另找 IOMMU、ATS/PASID、共享虚拟地址、设备页表相关一手全文。
+
+---
+
+```json
+{
+  "papers": [
+    {
+      "id": "shootdown1989",
+      "title": "Translation Lookaside Buffer Consistency: A Software Approach",
+      "authors": [
+        "David L. Black",
+        "Richard F. Rashid",
+        "David B. Golub",
+        "Charles R. Hill",
+        "Robert V. Baron"
+      ],
+      "year": 1989,
+      "venue": null,
+      "doi": null,
+      "publication_status": "published",
+      "relevance": "foundation",
+      "evaluation_type": ["measurement", "analysis"],
+      "mechanism": "Mach pmap 软件 shootdown：initiator 排队动作并发 IPI，responder 自旋直到 pmap 更新完成，再做远端 TLB 失效并确认。",
+      "assumptions": [
+        "多处理器共享 pmap，远端 TLB 只能由本 CPU 或软件中断失效",
+        "为使 pmap 更新正确，必须 stall 远端处理器，因为硬件 reload 和 reference/modify bit writeback 可能引入不一致",
+        "pmap 操作有锁，active/idle processor set 与 per-processor action queue 可维护"
+      ],
+      "limitations": [
+        "全文只覆盖 CPU TLB/pmap，不涉及设备 DMA、IOMMU、SVA",
+        "无 pageout 活动；结论主要适用于物理内存充足场景",
+        "预测大机器 scale badly，100 处理器基本 shootdown 约 6 ms",
+        "未实现和评估硬件支持特性的成本收益"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shootdown1989.txt",
+          "location": "L1-L4",
+          "claim": "题头确认题目与作者。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shootdown1989.txt",
+          "location": "L119-L137",
+          "claim": "说明为何需要 stall 远端处理器：硬件 reload 与 reference/modify bit writeback。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shootdown1989.txt",
+          "location": "L201-L221",
+          "claim": "四阶段 shootdown 协议与 responder spin 完成条件。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shootdown1989.txt",
+          "location": "L237-L267",
+          "claim": "队列溢出 flush 整个 TLB、pending interrupt 检查、惰性求值。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shootdown1989.txt",
+          "location": "L427-L429",
+          "claim": "基本成本为第一处理器 430 微秒，每额外处理器 55 微秒。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shootdown1989.txt",
+          "location": "L451-L460",
+          "claim": "惰性求值减少内核 shootdown 约 60%，Parthenon 约 97%。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shootdown1989.txt",
+          "location": "L498-L514",
+          "claim": "内核 pmap shootdown 约 1%，用户 pmap <0.2%，但随处理器线性增长。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shootdown1989.txt",
+          "location": "L656-L657",
+          "claim": "作者自己指出算法在大机器上 scale badly，100 处理器可达 6 ms。"
+        }
+      ],
+      "relations": []
+    },
+    {
+      "id": "radvm2013",
+      "title": "RadixVM: Scalable address spaces for multithreaded applications",
+      "authors": [
+        "Austin T. Clements",
+        "M. Frans Kaashoek",
+        "Nickolai Zeldovich"
+      ],
+      "year": 2013,
+      "venue": "EuroSys 2013 (Prague, Czech Republic)",
+      "doi": null,
+      "publication_status": "published",
+      "relevance": "core",
+      "evaluation_type": ["measurement"],
+      "mechanism": "Radix tree 存 per-page mapping metadata，Refcache 可扩展引用计数，per-core page tables 精确追踪哪些核缓存了映射并定向发送 TLB shootdown。",
+      "assumptions": [
+        "非重叠 mmap/munmap/pagefault 应并行；重叠区域可串行",
+        "x86 不报告 TLB 内容时，可用 per-core page table 的 fault 记录推断哪些核可能缓存映射",
+        "Refcache 延迟检测 zero 引用可接受，两 epoch 后确认回收"
+      ],
+      "limitations": [
+        "只保证非重叠区域完美扩展，重叠操作串行",
+        "未实现 radix tree collapsing，未支持 swapping",
+        "per-core page table 内存开销可达 13×",
+        "APIC IPI 协议在 80 核近 1 ms，targeted shootdown 仍受 IPI 限制",
+        "不涉及设备 DMA、IOMMU、SVA"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/radvm2013.txt",
+          "location": "L1-L2",
+          "claim": "题头确认题目与作者。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/radvm2013.txt",
+          "location": "L8-L27",
+          "claim": "摘要给出 radix tree、Refcache、targeted TLB shootdown 三技术。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/radvm2013.txt",
+          "location": "L164-L183",
+          "claim": "x86 不告诉内核哪些 TLB 有映射；RadixVM 用 per-core 页表精确追踪并消除未共享映射 shootdown。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/radvm2013.txt",
+          "location": "L403-L461",
+          "claim": "munmap 收集 fault 过区域的核，发 IPI，等所有核清页表和本地 TLB 后才释放页。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/radvm2013.txt",
+          "location": "L678-L681",
+          "claim": "Metis 80 核下 per-core page table 约 1.3 GB/3.6%，共享页表约 100 MB/0.3%，相差 13×。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/radvm2013.txt",
+          "location": "L785-L790",
+          "claim": "80 核下向其他 79 核投递 shootdown IPI 并等待接近 1 ms，APIC IPI 协议看似不可扩展。"
+        }
+      ],
+      "relations": [
+        {
+          "target": "shootdown1989",
+          "type": "actual_citation",
+          "source": "radvm2013 L825-L829 参考文献[4]明确引用 Black et al. ASPLOS 1989"
+        },
+        {
+          "target": "hydra2024",
+          "type": "mechanism_comparison",
+          "source": "Hydra 第 7 节讨论 RadixVM 的 per-core 页表内存问题，hydra2024 L1138-L1146"
+        }
+      ]
+    },
+    {
+      "id": "hydra2024",
+      "title": "Scalable and Effective Page-table and TLB management on NUMA Systems",
+      "authors": [
+        "Bin Gao",
+        "Qingxuan Kang",
+        "Hao-Wei Tee",
+        "Kyle Timothy Ng Chu",
+        "Alireza Sanaee",
+        "Djordje Jevdjic"
+      ],
+      "year": 2024,
+      "venue": "2024 USENIX Annual Technical Conference (ATC '24)",
+      "doi": null,
+      "publication_status": "published",
+      "relevance": "core",
+      "evaluation_type": ["measurement"],
+      "mechanism": "Hydra 对 NUMA 页表做 lazily、partial、on-demand per-PTE 复制：VMA 有 owner，page-table 有 sharer circular list；只更新 sharer list 中的副本，并利用“无副本则无本地 TLB 条目”不变量过滤 TLB shootdown。",
+      "assumptions": [
+        "每个 VMA 有一个 owner socket，owner 必持有有效 PTE",
+        "page-table sharer list 可精确维护，且能定位至少一个副本",
+        "没有某 socket 的 page-table 副本，则该 socket 不可能有对应 PTE 的 TLB 条目",
+        "首次访问缺 PTE 的远端 PTW 惩罚可由后续本地访问摊薄"
+      ],
+      "limitations": [
+        "THP 非优先，未实现",
+        "虚拟化 nested page table 留未来工作",
+        "intra-socket shootdown 未解决",
+        "极端共享时 Hydra 收敛到 Mitosis",
+        "首次访问仍有远端 PTW，需要 prefetch 缓解",
+        "不涉及设备 DMA、IOMMU、SVA"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/hydra2024.txt",
+          "location": "L23-L27",
+          "claim": "题头确认题目与作者。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/hydra2024.txt",
+          "location": "L32-L67",
+          "claim": "摘要报告 TLB shootdown 在 NUMA 下最高 40× 开销，并提出 partial lazy replication。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/hydra2024.txt",
+          "location": "L260-L278",
+          "claim": "给出无副本则无 TLB 条目的不变量，用 sharer 信息过滤 shootdown。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/hydra2024.txt",
+          "location": "L386-L448",
+          "claim": "owner 分配、sharer circular list、按需复制 PTE、更新只到 sharer 的协议。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/hydra2024.txt",
+          "location": "L498-L543",
+          "claim": "PTE prefetching 缓解首次远端 PTW，prefetch 不增加 coherence 开销。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/hydra2024.txt",
+          "location": "L545-L573",
+          "claim": "用 page-table sharer 信息安全减少 TLB shootdown 作用域。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/hydra2024.txt",
+          "location": "L791-L794",
+          "claim": "XSBench 极端共享时 Hydra 每个 socket 都复制，等价收敛到 Mitosis。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/hydra2024.txt",
+          "location": "L862-L877",
+          "claim": "应用结果总体匹配 Mitosis；Canneal Mitosis 1.22× vs Hydra 1.19×，Mitosis 装载期多 21% slowdown。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/hydra2024.txt",
+          "location": "L1098-L1107",
+          "claim": "Memcached 几何平均提升 36%，shootdown 减少 50%-96%。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/hydra2024.txt",
+          "location": "L1112-L1125",
+          "claim": "THP 支持非优先，virtualization 留未来工作。"
+        }
+      ],
+      "relations": [
+        {
+          "target": "mitosis2020",
+          "type": "actual_citation",
+          "source": "hydra2024 L1202-L1207 参考文献[1]引用 Mitosis ASPLOS 2020"
+        },
+        {
+          "target": "radvm2013",
+          "type": "actual_citation",
+          "source": "hydra2024 L1217-L1220 参考文献[14]引用 RadixVM EuroSys 2013"
+        },
+        {
+          "target": "latr2018",
+          "type": "actual_citation",
+          "source": "hydra2024 L1288-L1293 参考文献[38]引用 LATR ASPLOS 2018"
+        },
+        {
+          "target": "fpr2024",
+          "type": "mechanism_comparison",
+          "source": "Hydra §3.5 用 NUMA 页表 sharer 过滤 shootdown；FPR §IV 用 recycling context 过滤；来源 hydra2024 L545-L573 与 fpr2024 L97-L118"
+        }
+      ]
+    },
+    {
+      "id": "shoot4u2016",
+      "title": "Shoot4U: Using VMM Assists to Optimize TLB Operations on Preempted vCPUs",
+      "authors": [
+        "Jiannan Ouyang",
+        "John R. Lange",
+        "Haoqiang Zheng"
+      ],
+      "year": 2016,
+      "venue": "VEE '16 (Atlanta, GA, USA)",
+      "doi": "10.1145/2892242.2892245",
+      "publication_status": "published",
+      "relevance": "core",
+      "evaluation_type": ["measurement"],
+      "mechanism": "Guest 发 hypercall 给 VMM，VMM 找承载目标 vCPU 的物理 CPU，发物理 IPI 并由 VMM 直接执行 guest TLB 失效，使完成不依赖被抢占 vCPU 被调度。",
+      "assumptions": [
+        "x86 硬件提供 VPID/ASID 和 invpid 类指令，VMM 可直接失效 guest TLB 条目",
+        "VMM 可确定目标 vCPU 当前所在的物理 CPU",
+        "VMM 可代替 guest 处理失效并在 hypercall 返回前完成"
+      ],
+      "limitations": [
+        "当前实现最多支持 64 vCPU",
+        "只优化 TLB flush/shootdown，不解决其他同步原语抢占",
+        "2-VM 最坏延迟仍达 15,034 µs",
+        "不涉及设备 DMA、IOMMU、SVA"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shoot4u2016.txt",
+          "location": "L1-L6",
+          "claim": "题头确认题目与作者。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shoot4u2016.txt",
+          "location": "L11-L38",
+          "claim": "摘要报告 dedup 中 64% CPU 花在 TLB shootdown，Shoot4U 最多减少 85% 运行时间。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shoot4u2016.txt",
+          "location": "L223-L246",
+          "claim": "依赖 VPID/ASID 和 invpid 类指令，由 VMM 直接失效 guest TLB。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shoot4u2016.txt",
+          "location": "L258-L289",
+          "claim": "Shoot4U hypercall 接口、VMM 物理 IPI、VMM 内部失效与 poll 完成流程。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shoot4u2016.txt",
+          "location": "L286-L289",
+          "claim": "当前 bitmap 实现支持最多 64 vCPU。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/shoot4u2016.txt",
+          "location": "L330-L338",
+          "claim": "延迟表：2-VM 平均 baseline 9,048 µs、kvmtlb 5,401 µs、Shoot4U 22 µs；最大仍 15,034 µs。"
+        }
+      ],
+      "relations": [
+        {
+          "target": "fpr2024",
+          "type": "mechanism_comparison",
+          "source": "Shoot4U §4-§5 用 VMM 完成失效；FPR §IV 用 recycling context 跳过失效；均属完成条件/降低成本，但层次不同"
+        },
+        {
+          "target": "hydra2024",
+          "type": "mechanism_comparison",
+          "source": "Hydra §3.5 过滤 shootdown；Shoot4U §4 改由 VMM 执行失效；来源 hydra2024 L545-L573 与 shoot4u2016 L258-L289"
+        }
+      ]
+    },
+    {
+      "id": "ptlbmalloc2020",
+      "title": "Ptlbmalloc2: Reducing TLB Shootdowns with High Memory Efficiency",
+      "authors": [
+        "Stijn Schildermans",
+        "Jianchen Shan",
+        "Xiaoning Ding",
+        "Kris Aerts"
+      ],
+      "year": 2020,
+      "venue": "2020 IEEE ISPA/BDCloud/SocialCom/SustainCom",
+      "doi": "10.1109/ISPA-BDCloud-SocialCom-SustainCom51426.2020.00036",
+      "publication_status": "published",
+      "relevance": "core",
+      "evaluation_type": ["measurement"],
+      "mechanism": "在 glibc 之上实现分配器库 ptlbmalloc2，用 global hysteresis 看应用全局内存状态决定 arena trim，减少 arena imbalance 触发的 mmap/munmap/madvise TLB shootdown。",
+      "assumptions": [
+        "TLB shootdown 开销可由 CPU 数和 NUMA/虚拟化状态估算",
+        "应用内存变化可由全局 arena 累计状态评估",
+        "分配器可在 glibc 之上插入并管理 arena/trim 策略"
+      ],
+      "limitations": [
+        "平均性能提升有限，多数场景 0-7%",
+        "global hysteresis 绑定 legacy 分配器设计，未集成进 glibc 本体导致锁竞争",
+        "只针对 arena imbalance 类 shootdown",
+        "不涉及设备 DMA、IOMMU、SVA"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/ptlbmalloc2020.txt",
+          "location": "L19-L40",
+          "claim": "摘要：TLB consistency 成本上升，现有分配器以内存效率换 TLB 性能，ptlbmalloc2 同时追求两者。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/ptlbmalloc2020.txt",
+          "location": "L155-L224",
+          "claim": "量化 CPU 数、NUMA、虚拟化对 TLB shootdown 的影响；远端 IPI 约本地 3×，虚拟化约 3×，叠加抢占可达一个数量级。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/ptlbmalloc2020.txt",
+          "location": "L231-L241",
+          "claim": "arena imbalance：16 线程可产生 2.3 亿 TLB shootdown IPI；反转 free 顺序减少 99.8% shootdown 和 87% 运行时间。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/ptlbmalloc2020.txt",
+          "location": "L299-L319",
+          "claim": "global hysteresis 概念：用全局应用状态决定 arena trim 阈值。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/ptlbmalloc2020.txt",
+          "location": "L675-L688",
+          "claim": "平均性能表显示多数场景提升 0-7%，并非普遍大幅加速。"
+        }
+      ],
+      "relations": [
+        {
+          "target": "shootdown1989",
+          "type": "actual_citation",
+          "source": "ptlbmalloc2020 L711-L714 参考文献[7]引用 Black et al. 1989"
+        },
+        {
+          "target": "latr2018",
+          "type": "actual_citation",
+          "source": "ptlbmalloc2020 L771-L774 参考文献[2]引用 LATR ASPLOS 2018"
+        },
+        {
+          "target": "shoot4u2016",
+          "type": "actual_citation",
+          "source": "ptlbmalloc2020 L776-L777 参考文献[3]引用 Shoot4U VEE 2016"
+        },
+        {
+          "target": "radvm2013",
+          "type": "actual_citation",
+          "source": "ptlbmalloc2020 L778-L780 参考文献[28]引用 RadixVM EuroSys 2013"
+        },
+        {
+          "target": "fpr2024",
+          "type": "mechanism_comparison",
+          "source": "Ptlbmalloc2 §4 从 arena 分配器减少 shootdown；FPR §IV 从 page recycling 减少 shootdown；来源 ptlbmalloc2020 L231-L241 与 fpr2024 L97-L118"
+        }
+      ]
+    },
+    {
+      "id": "fpr2024",
+      "title": "Skip TLB flushes for reused pages within mmap’s",
+      "authors": [
+        "Frederic Schimmelpfennig",
+        "André Brinkmann",
+        "Hossein Asadi",
+        "Reza Salkhordeh"
+      ],
+      "year": 2024,
+      "venue": "arXiv preprint (arXiv:2409.10946v1 [cs.OS])",
+      "doi": null,
+      "publication_status": "preprint",
+      "relevance": "core",
+      "evaluation_type": ["measurement"],
+      "mechanism": "FPR 给物理页维护 recycling context ID；mmap/munmap 与 kswapd eviction 中若页仍被同一 context 回收，则跳过 TLB shootdown；页离开 context 到别的进程时才 shootdown，并用虚拟地址迭代避免 ABA。",
+      "assumptions": [
+        "页可能被同一进程/用户 recycling context 重用",
+        "可用 MAP_FPR opt-in 标志和 per-page tracking metadata 跟踪 recycling",
+        "程序不会依赖 munmap 后立即 segfault 来调试；否则 FPR 会保留 stale 访问",
+        "kswapd 批量 evict 可在低 watermark 触发一次 shootdown"
+      ],
+      "limitations": [
+        "不优化匿名 mmap/munmap malloc/free",
+        "虚拟化支持留未来工作",
+        "程序有 segfault 时可访问 stale 数据，必须谨慎开启",
+        "kswapd 回收路径需要特殊批量处理",
+        "不涉及设备 DMA、IOMMU、SVA"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/fpr2024.txt",
+          "location": "L1-L3",
+          "claim": "题头确认题目与作者。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/fpr2024.txt",
+          "location": "L8-L44",
+          "claim": "摘要报告 FPR 跳过 mmap 回收页 shootdown，真实应用最高 28%，微基准 92%，无需硬件修改。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/fpr2024.txt",
+          "location": "L97-L118",
+          "claim": "核心洞察：页被同一应用回收时可跳过 shootdown；只有页离开 recycling path 才需要 shootdown。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/fpr2024.txt",
+          "location": "L270-L324",
+          "claim": "FPR tracking ID；unmap 时若 ID 非零则跳过，离开 recycling context 时触发 shootdown。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/fpr2024.txt",
+          "location": "L325-L350",
+          "claim": "ABA 问题与虚拟地址迭代；kswapd 批量 evict FPR 页并一次 shootdown。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/fpr2024.txt",
+          "location": "L380-L405",
+          "claim": "每数据页 8B tracking，2 bits flags、22 bits ID、40 bits version，约 0.5% 开销。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/fpr2024.txt",
+          "location": "L1020-L1033",
+          "claim": "无 FPR 时 overhead 最多 1%，PARSEC 中 0%-1.2%。"
+        }
+      ],
+      "relations": [
+        {
+          "target": "latr2018",
+          "type": "actual_citation",
+          "source": "fpr2024 L1116-L1120 参考文献[18]引用 LATR ASPLOS 2018"
+        },
+        {
+          "target": "hydra2024",
+          "type": "mechanism_comparison",
+          "source": "Hydra §3.5 用 NUMA 页表 sharer 信息跳过 shootdown；FPR §IV 用 recycling context 跳过 shootdown；来源 hydra2024 L545-L573 与 fpr2024 L97-L118"
+        },
+        {
+          "target": "latr2018",
+          "type": "mechanism_comparison",
+          "source": "FPR §III-B 讨论 LATR 不覆盖 page eviction；Latr §4.2 仅 free/migration 惰性；来源 fpr2024 L213-L215 与 latr2018 L397-L415"
+        }
+      ]
+    }
+  ]
+}
+```

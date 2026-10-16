@@ -1,0 +1,118 @@
+# 新 Linux 00091 cost-followup 11 项离线整理报告
+
+## 0. 一句话导航
+- 本次是 Linux 6.5.0-rc2-00091-g9ad05d00cca7、同一次启动下的独立 cost-followup 11 项软件采集；在线 11/11 通过，离线 analyzer 退出码 0、status ok、11/11，输入 105 文件 sha256 前后一致。
+- 完成的是同版 Solo/A8g0/A8g2000 主阶段各 3 次与 short Solo/A8g0 各 1 次的代价对照；不是旧 84 项的继续，也不与旧 non-Solo 拼成同一减速比例。
+- 有限证明：主阶段 A8g0 相对 Solo 中位耗时约 2.6042 倍，A8g2000 约 1.6531 倍；gap2000 相对 gap0 的 V 同窗吞吐中位提高 57.54%，A 同窗吞吐中位下降 47.53%。
+- 未证明：不能把全部损失归因 IOMMU；不能把软件 HPM miss/PTW 当硬件窗口 PTW；不能证明全局 E2 阳性；不能证明 M 占用计费有增量控制价值或创新。
+- 下一步：先用现有数据检查计数/类型权重 baseline 能否解释实际占用及其限制；再冻结最小可证伪诊断（如固定每 16 抽样相位处理），不立即完整 M 上板，也不加大量重复。
+
+## 1. 文件、状态与口径
+- 在线采集：out/mac-research-followup-20261002/README.md:3-9；UART 日志 out/research-followup-review-20261002/uart-readable.txt:282-320。
+- 离线分析：out/research-followup-review-20261002/analysis/report.zh.txt:7 总体状态 ok，退出码 0；:20-21 出现 11/期望 11，独立校验 11，失败/缺失/未运行 0；:9-10 输入文件数 105，sha256 前后一致。
+- 逐次机械复算：out/research-followup-review-20261002/direct-check.json rows；主阶段中位/min/max：main_groups。
+- 速率分母：raw[0xc19] win_cycles，共同硬件窗口；A 分子按 report.zh.txt:42 p4m.window[3]；启动到结束计数字段 raw[0xc03]..raw[0xc07]；共同窗口字段 raw[0xc19]..raw[0xc23]；关窗锁存 raw[0xc2c] 仅信息（report.zh.txt:42-45）。
+- 平台 50 MHz，20 ns/cycle；抽样每第 16 个 eligible A copy，只描述该固定相位，不外推到全体 A（report.zh.txt:46）。
+
+## 2. 11 项逐次结果（时间与速率）
+数据来自 direct-check.json rows。
+
+| id | stage | condition | cycles | ms | V MiB/s | A MiB/s | a_window_done |
+|---|---:|---|---:|---:|---:|---:|---:|
+| short-cost-solo | short | solo | 44046 | 0.88092 | 283.794215 | 0.000000 | 0 |
+| short-cost-a8g0 | short | a8g0 | 114001 | 2.28002 | 109.648161 | 109.648161 | 64 |
+| cost-b01-solo | main | solo | 2822016 | 56.44032 | 283.485281 | 0.000000 | 0 |
+| cost-b01-a8g0 | main | a8g0 | 7349593 | 146.99186 | 108.849565 | 108.849565 | 4096 |
+| cost-b01-a8g2000 | main | a8g2000 | 4663611 | 93.27222 | 171.540894 | 57.166338 | 1365 |
+| cost-b02-a8g0 | main | a8g0 | 7342719 | 146.85438 | 108.951466 | 108.951466 | 4096 |
+| cost-b02-a8g2000 | main | a8g2000 | 4665036 | 93.30072 | 171.488494 | 57.107008 | 1364 |
+| cost-b02-solo | main | solo | 2824569 | 56.49138 | 283.229052 | 0.000000 | 0 |
+| cost-b03-a8g0 | main | a8g0 | 7349100 | 146.98200 | 108.856867 | 108.856867 | 4096 |
+| cost-b03-a8g2000 | main | a8g2000 | 4667838 | 93.35676 | 171.385554 | 57.114570 | 1365 |
+| cost-b03-solo | main | solo | 2821594 | 56.43188 | 283.527680 | 0.000000 | 0 |
+
+## 3. 主阶段中位[min,max]与同版对比
+
+| 条件 | ms median [min,max] | V MiB/s median [min,max] | A MiB/s median [min,max] |
+|---|---|---|---|
+| solo | 56.44032 [56.43188,56.49138] | 283.485281 [283.229052,283.527680] | 0 |
+| a8g0 | 146.98200 [146.85438,146.99186] | 108.856867 [108.849565,108.951466] | 108.856867 [108.849565,108.951466] |
+| a8g2000 | 93.30072 [93.27222,93.35676] | 171.488494 [171.385554,171.540894] | 57.114570 [57.107008,57.166338] |
+
+计算（中位比，非同步 pair）：
+- V 相对 Solo 耗时比：a8g0 = 146.982 / 56.44032 = 2.6042，即 slowdown +160.42%；a8g2000 = 93.30072 / 56.44032 = 1.6531，即 slowdown +65.31%。
+- short 独立单点：short-a8g0 / short-solo = 2.28002 / 0.88092 = 2.5882，即 slowdown +158.82%；但 short 只有 1+1，不与主阶段合并。
+- gap2000 对 gap0：V 吞吐提高 = (171.488494 - 108.856867) / 108.856867 = 57.54%；V 耗时降低 = (146.982 - 93.30072) / 146.982 = 36.52%；A 同窗吞吐下降 = (108.856867 - 57.114570) / 108.856867 = 47.53%。
+- A 同窗完成数中位从 4096 降到 1365，降幅 66.67%；但窗口时间也从约 147 ms 降到约 93 ms，所以归一化 A 吞吐降 47.53%。
+- 无 p 值、无等价性保证；中位比不是逐次同步 pair。
+
+## 4. 硬件窗口与软件 HPM（必须分开读）
+- 主阶段所有 run 的 V 硬件窗口：main_v=81920，complete_v=16384，select_v=16384，lookup_hit_v=16384，lookup_miss_v=0；V 软件 HPM miss/PTW=[0,0]。这说明 V 无需 miss 也能慢，但不能单独证明全部损失来自 IOMMU。
+- 主阶段 A8g0：hardware_window.complete_a=16382，select_a=16382，lookup_hit_a=11263，lookup_miss_a=5119；A 软件 HPM miss/PTW=[5140,5140]。
+- 主阶段 A8g2000：complete_a 分别 5458/5456/5460，select_a 5457/5456/5460，lookup_hit_a 3069/3068/3070，lookup_miss_a 2388/2388/2390；A 软件 HPM miss/PTW 分别 [2406,2406]/[2402,2402]/[2408,2408]。
+- short-cost-a8g0：V lookup_hit_v=256、lookup_miss_v=0；A lookup_hit_a=175、lookup_miss_a=79；A 软件 HPM miss/PTW=[100,100]。
+- 重要口径：HPM phase counters 括住每个软件相位并包含 MMIO，不是精确硬件窗口，不能与共同窗口混用；因此软件 A miss/PTW 5140 不等于硬件窗口 lookup_miss_a 5119，2406 不等于 2388，不能说是同窗 PTW 硬件计数。
+- Solo 修复确认 A 无实际流量：主阶段与 short Solo 的 a_mib_s=0.0，a_window_done=0，hardware_window.main_a=0，complete_a=0，select_a=0，lookup_hit_a=0，lookup_miss_a=0，A HPM=[0,0]。
+
+## 5. 占用抽样：相同每 copy req=4/miss=2
+来源：out/research-followup-review-20261002/analysis/report.zh.txt:59-65。
+
+| stage/case | condition | req/miss | n samples | 控制器占用周期 min/median/max | 搬运总周期中位 |
+|---|---:|---:|---:|---:|---:|
+| cost-b01-a8g0 | main | 4/2 | 255 | 1380/1406/1494 | 2085 |
+| cost-b02-a8g0 | main | 4/2 | 255 | 1381/1405/1511 | 2085 |
+| cost-b03-a8g0 | main | 4/2 | 255 | 1379/1408/1487 | 2088 |
+| short-cost-a8g0 | short | 4/2 | 3 | 1393/1406/1412 | 2091 |
+| cost-b01-a8g2000 | main | 4/2 | 85 | 819/832/1093 | 1511 |
+| cost-b02-a8g2000 | main | 4/2 | 85 | 819/836/905 | 1512 |
+| cost-b03-a8g2000 | main | 4/2 | 85 | 819/832/900 | 1509 |
+
+说明：main g0 三 run 中位 1406/1405/1408，g2000 三 run 中位 832/836/832。samples 是每第 16 个 eligible A copy 的固定相位，不是独立 run，也不能代表总体 A；不能把 255/85 当重复次数或显著性样本。
+
+## 6. 运行环境、日志与启动恢复
+- Linux：6.5.0-rc2-00091-g9ad05d00cca7；boot_id：db14364a-c046-4e6a-8ae7-f4dea007724a（README.md:4；uart-readable.txt:102,280-281）。
+- UART 保留一次 hrtimer 慢中断：[73.619877] hrtimer: interrupt took 12921440 ns，约 12.9 ms（uart-readable.txt:290）。taint0 不等于无 warning。
+- 初次串口停于 SPI 初始化，同 BIT 以 1MHz 重新加载后从 SD 正常启动；这是启动恢复，不是实验重跑，未改 SD、未重编译、未改被测代码（README.md:5）。
+- 本报告只读整理，未改文件、未编译、未上板。
+
+## 7. 完成、有限证明、未证明
+完成：
+- 在线采集 11/11，final_exit=0，FOLLOWUP_EXIT=0，collection_failed=0（README.md:3；uart-readable.txt:318-320）。
+- 离线 analyzer 退出码 0，status ok，11/11，输入哈希前后一致（report.zh.txt:7,9-10,20-21）。
+- 同版主阶段 Solo/A8g0/A8g2000 各 3 次，short Solo/A8g0 各 1 次；给出逐次与 median[min,max]（direct-check.json）。
+
+有限证明：
+- 本次同版、同启动、同硬件窗口口径下，A8 竞争条件使 V 变慢；A8g0 中位耗时约 2.6042x Solo，A8g2000 约 1.6531x Solo。
+- gap2000 相对 gap0：V 同窗吞吐中位 +57.54%，A 同窗吞吐中位 -47.53%；A 同窗完成数中位 4096->1365。
+- 主阶段 V 硬件窗口 lookup_hit_v=16384、lookup_miss_v=0，且 V 软件 HPM miss/PTW=0，仍然变慢；说明不能断言 V 必须 miss 才慢。
+- Solo A 无活动：A 速率 0，硬件窗口 A 计数全 0，A HPM 全 0。
+- 相同每 copy req=4/miss=2 下，main 占用抽样中位：g0 1406/1405/1408，g2000 832/836/832。
+
+未证明：
+- 全局 E2 阳性未建立；本次输出目录没有可分析 E2 用例（report.zh.txt:36），旧 E2 未重跑。
+- 软件 HPM miss/PTW 不等于硬件窗口 miss；不能把 5140/2406 等当同窗 PTW 硬件计数。
+- 不能把全部 V 损失归因 IOMMU；互连、数据竞争、CPU 供给、相位等未排除。
+- 不能把每 16 抽样样本当独立 run 或总体；无 p 值、无等价保证。
+- 不能跨版本拼接旧 84 与新 11；旧 84 仍 80 成功/2 失败/2 未运行，新 11 独立（README.md:7；report.zh.txt:16）。
+- M 占用计费未实现，创新未建立；占用变化不等于增量控制价值；gap 改变竞争/数据通路也有 confound（docs/paper-logic.md:3,376,434 等）。
+- E3 仅为有限因果，P4M60 保留；不能说完整机制或方法完成（docs/paper-logic.md:3,313-314,376）。
+
+## 8. 下一步（1-2 路径与门槛）
+路径 A（优先，现有数据离线）：计数/类型权重 baseline 能否解释实际占用及其限制。
+- 用 direct-check 与 report.zh 的 req=4/miss=2、每 run 255/85 samples、g0/g2000 占用中位，比较按字节、按请求、按 miss、按固定类型权重与实测占用/搬运总周期。
+- 继续门槛：若 baseline 在训练内已能解释大部分占用变化，则 H-M0 额外价值假设削弱，暂停完整 M 上板，转为限制报告；若存在超出 baseline 的稳定差异，且能写出合法边界与可证伪预测，才冻结最小 RTL/诊断原型。
+
+路径 B（同批最小诊断）：冻结采样偏相位处理的最小可证伪诊断。
+- 检查每第 16 个 eligible A copy 的固定相位是否系统偏置占用估计；预注册相位分层或小诊断，不把 samples 当独立 run，不大量加重复。
+- 停止门槛：若相位处理改变占用中位或差异解释，先修正测量口径；若仍然只有占用变化、没有增量控制价值，停止 M 新方法主张。
+- 不立即完整 M 上板，不新增大规模重复；依据 paper-logic 最终五轮（docs/paper-logic.md:374-434）。
+
+## 9. 不确定性
+- hrtimer 慢中断对本次窗口的具体影响未量化。
+- 初次 SPI 挂起的硬件原因未定位，只完成同 BIT 1MHz 重载恢复。
+- 软件 HPM 相位含 MMIO，与硬件窗口不同口径；差值 14-21 的来源未逐条解释。
+- 固定每 16 抽样相位偏置未测。
+- A 的竞争路径、互连/数据竞争贡献未分离。
+- 旧 84 与新 11 不可合并；旧 E2 未重跑。
+- 无统计检验、无独立样本、无总体外推。
+- M 占用计费的合法性、资源成本、控制价值均未实现验证。

@@ -1,0 +1,120 @@
+--- a/tests/nonblock_actual_dma_test.cpp
++++ b/tests/nonblock_actual_dma_test.cpp
+@@ -390,6 +390,11 @@
+     bool ds_priority = false;  // model-only causal intervention, window only
+     uint32_t write_tail_pause = 0; // finite WREADY backpressure at last 8 DMA beats
+     uint64_t write_tail_holds = 0, write_tail_hold_cycles = 0;
++    bool read_latency_overlap = false; // model-only, post-warm phase
++    bool ddr_setup_wait = false, ddr_model_empty = true;
++    unsigned ddr_setup_port = 0;
++    uint64_t w_read_empty = 0, w_read_setup = 0, w_read_transfer = 0, w_read_backpressure = 0;
++    uint64_t w_read_setup_port[4] = {0, 0, 0, 0};
+     bool ddr_r_held = false;
+     FILE* event_trace = nullptr;
+     bool trace_ptw_active = false;
+@@ -565,6 +570,8 @@
+     // The plain DDR model latency applies uniformly to every accepted DDR read;
+     // the real 50/50 DS delayer adds latency on the DS path in RTL only.
+     void drive_ddr() {
++        ddr_setup_wait = false;
++        ddr_model_empty = mem_q.empty();
+         top->ddr_aw_ready = 1;
+         top->ddr_w_ready  = 1;
+         if (write_tail_pause != 0 && !caw_q.empty()) {
+@@ -605,7 +612,20 @@
+             if (ds != mem_q.end()) std::rotate(mem_q.begin(), ds, ds + 1);
+         }
+         MemRead& h = mem_q.front();
+-        if (h.latency > 0) { h.latency--; return; }
++        ddr_setup_port = (h.id >> 4) & 3u;
++        if (read_latency_overlap && measurement_phase) {
++            // Same isolated-request delay as the old model: AR accepted at
++            // t first returns at t + latency + 1. Queued requests age from
++            // acceptance, allowing their preparation delays to overlap.
++            if (g_cycle <= h.accepted_cycle + (long)ptw_latency) {
++                ddr_setup_wait = true;
++                return;
++            }
++        } else if (h.latency > 0) {
++            --h.latency;
++            ddr_setup_wait = true;
++            return;
++        }
+ 
+         top->ddr_r_valid = 1;
+         top->ddr_r_data  = read64(h.addr + (uint64_t)h.beat * 8);
+@@ -844,6 +864,15 @@
+             ++w_cycles;
+ 
+ #ifdef ACTUAL_DMA_SYSTEM
++            // Mutually exclusive service states at the existing PRE-EDGE
++            // measurement sample. This observes the memory model only.
++            if (ddr_model_empty) ++w_read_empty;
++            else if (ddr_setup_wait) {
++                ++w_read_setup;
++                ++w_read_setup_port[ddr_setup_port];
++            } else if (top->ddr_r_valid && top->ddr_r_ready) ++w_read_transfer;
++            else if (top->ddr_r_valid) ++w_read_backpressure;
++            else CHECK(false, "DDR read service state is unclassified");
+             // Read-admission proxy: accumulate the PRE-EDGE event pulses
+             // directly.  No open/close cumulative differences are used.
+             if (top->dbg_ra_new_captured)      ++w_ra_captures;
+@@ -1326,6 +1355,8 @@
+         w_ds_latency_sum = w_ds_latency_n = w_ds_latency_max = 0;
+         ddr_r_held = false;
+         write_tail_holds = write_tail_hold_cycles = 0;
++        w_read_empty = w_read_setup = w_read_transfer = w_read_backpressure = 0;
++        for (auto& c : w_read_setup_port) c = 0;
+         trace_ptw_active = false;
+         trace_aw_flags = 0;
+         cpu_progress_cycle = g_cycle;
+@@ -2338,6 +2369,18 @@
+         std::printf("WRITE-TAIL-TERMINAL-JSON {\"pause_cycles\":%u,\"holds\":%llu,\"hold_cycles\":%llu}\n",
+                     (unsigned)write_tail_pause, (unsigned long long)write_tail_holds,
+                     (unsigned long long)write_tail_hold_cycles);
++        CHECK(w_read_empty + w_read_setup + w_read_transfer + w_read_backpressure == w_cycles,
++              "DDR read service accounting does not cover the complete window");
++        CHECK(w_read_transfer == w_ddr_r && w_read_backpressure == w_ddr_r_stall,
++              "DDR read service accounting disagrees with original window counters");
++        std::printf("READ-SERVICE-WINDOW-JSON {\"mode\":\"%s\",\"latency_model\":\"%s\","
++                    "\"scope\":\"post_warm_pre_edge_(open,close]\",\"empty\":%llu,\"setup\":%llu,"
++                    "\"transfer\":%llu,\"backpressure\":%llu,\"setup_port\":[%llu,%llu,%llu,%llu]}\n",
++                    name, read_latency_overlap ? "acceptance_overlap" : "head_serial",
++                    (unsigned long long)w_read_empty, (unsigned long long)w_read_setup,
++                    (unsigned long long)w_read_transfer, (unsigned long long)w_read_backpressure,
++                    (unsigned long long)w_read_setup_port[0], (unsigned long long)w_read_setup_port[1],
++                    (unsigned long long)w_read_setup_port[2], (unsigned long long)w_read_setup_port[3]);
+         std::printf("FRONTIER-TERMINAL-JSON {"
+                     "\"schema\":\"actual-dma-frontier-terminal-v1\","
+                     "\"mode\":\"%s\",\"e2_mode\":%u,"
+@@ -2367,6 +2410,7 @@
+     bool        cpu_writes = false;
+     bool        ds_priority = false;
+     uint32_t    write_tail_pause = 0;
++    bool        read_latency_overlap = false;
+     std::string trace_path;
+     std::string read_admit = "none";
+     uint32_t    read_budget = 256;
+@@ -2412,6 +2456,14 @@
+         if (const char* v = val("cpu-writes")) cpu_writes = (std::strtoul(v, nullptr, 0) != 0);
+         if (const char* v = val("ds-priority")) ds_priority = (std::strtoul(v, nullptr, 0) != 0);
+         if (const char* v = val("write-tail-pause")) write_tail_pause = (uint32_t)std::strtoul(v, nullptr, 0);
++        if (const char* v = val("read-latency-model")) {
++            const std::string m = v;
++            if (m != "serial" && m != "overlap") {
++                std::fprintf(stderr, "nonblock_actual_dma_test: +read-latency-model must be serial|overlap\n");
++                return 2;
++            }
++            read_latency_overlap = (m == "overlap");
++        }
+         if (const char* v = val("event-trace")) trace_path = v;
+         if (const char* v = val("read-admit"))  read_admit = v;
+         if (const char* v = val("read-budget")) read_budget = (uint32_t)std::strtoul(v, nullptr, 0);
+@@ -2517,6 +2569,7 @@
+         tb.cpu_writes      = cpu_writes;
+         tb.ds_priority     = ds_priority;
+         tb.write_tail_pause = write_tail_pause;
++        tb.read_latency_overlap = read_latency_overlap;
+         tb.read_admit_mode_str = read_admit;
+         tb.read_admit_mode_val = read_admit_val;
+         tb.read_admit_measure_only = read_admit_measure_only;

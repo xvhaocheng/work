@@ -1,0 +1,404 @@
+## Findings (what is already there, what is missing)
+
+Target file: `out/shared-read-data-obligation-20261009/multi_test.cpp` (line numbers below are from the supplied content; every patch is anchored on unique text, so ±drift is harmless).
+
+Already present and correct for a 4088 fixture — **no change needed**:
+
+* Derived next-page leaf address: `run_natural()` lines 1203‑1216 compute `last_byte = NAT_A_DST_PAGE_IOVA + nat_a_dst_off + natural_bytes - 1`, then `l0_idx = (last_byte >> 12) & 0x1FF`, then `a_next_pte_addr = 0x70000 + l0_idx*8`.
+  * 3072 → `last_byte = 0x200093FF`, `l0_idx = 9` → `0x70048`
+  * 4088 → `last_byte = 0x200097F7`, `l0_idx = 9` → `0x70048`
+  → the *same* address, and the delay matcher at 2712‑2721 is range-based (`lo <= a_next_pte_addr < hi`) with a `a_next_pte_delay_applied == 0` guard, so it still fires **exactly once**.
+* Full target + outside-area byte checks (1370‑1400) are generic in `nat_a_dst_off`: `off_beats_a = 511` for 4088, `copied_a` window `[511, 767)`, and the three certificate CHECKs (`off_beats_a < 512`, `off_beats_a+256 > 512`, `off_beats_a+256 <= 4608`) all hold.
+* Physical W per flow stays 256 beats: the 4088 split is one 1‑beat burst at `0x90100FF8` (region `NR_ADST`) plus one 255‑beat burst at `0x90101000` (region `NR_ADST`), so `nat_pw_beats[NR_ADST] == want` (1439) and `nat_pw_beats[NR_VSRC|NR_ASRC] == 0` (1441) are unaffected.
+* Logical 2048 B returns, `issue/done == 1`, virtual `vw_beats == 2*want`, `vwlast == vaw` — all unchanged and satisfiable by the split A write.
+* PTE tables / payload / expected data: untouched (the 4088 copy maps entirely into the already-mapped first and second A destination pages, leaf indices 8 and 9).
+
+Missing / to extend:
+
+1. `+a-dst-offset` parse gate rejects 4088 (line 4198‑4201) and its message says `0|3072`.
+2. `+a-next-pte-delay` CLI gate hard-requires exactly `3072` (line 4457‑4461).
+3. Comment/“help” text in the flag block (239‑250), `run_natural()` (1185‑1190), the beat-offset comment (1369), the cross-page certificate comment (1385‑1389) and the 5b comment (1520‑1525) still describe only 3072.
+4. Runtime CHECK message at 1527‑1529 names only 3072.
+5. No terminal geometry field exists: `first_a_page_beats`, effective offset, and the **expected** first raw-parent byte count are absent from `NATURAL-JSON`.
+
+Interpretation note: “old/new JSON patches” — I return the patches as **exact unescaped OLD/NEW blocks** (verbatim-applicable, no JSON unescaping) plus a JSON manifest of the *emitted* NATURAL‑JSON fields. Producing the C++ strings inside an escaped JSON array would add escaping risk for no gain; the blocks below are byte-exact.
+
+---
+
+## Patch set (apply all 12; hunks are disjoint)
+
+### P1 — `+a-dst-offset` parse gate (anchor: lines 4198‑4202)
+
+OLD
+```cpp
+            if (end == v || *end != '\0' || (nv != 0 && nv != 3072)) {
+                std::fprintf(stderr,
+                    "nonblock_actual_dma_test: +a-dst-offset must be 0|3072\n");
+                return 2;
+            }
+```
+NEW
+```cpp
+            if (end == v || *end != '\0' ||
+                (nv != 0 && nv != 3072 && nv != 4088)) {
+                std::fprintf(stderr,
+                    "nonblock_actual_dma_test: +a-dst-offset must be "
+                    "0|3072|4088\n");
+                return 2;
+            }
+```
+
+### P2 — CLI cross-checks (anchor: lines 4450‑4462)
+
+OLD
+```cpp
+    // §54 cross-page A destination fixture is shared-source only.
+    if (a_dst_offset_opt != 0 && !(natural && shared_source)) {
+        std::fprintf(stderr,
+            "nonblock_actual_dma_test: +a-dst-offset=3072 requires +natural=1 "
+            "and +shared-source=1\n");
+        return 2;
+    }
+    if (a_next_pte_delay != 0 && a_dst_offset_opt != 3072) {
+        std::fprintf(stderr,
+            "nonblock_actual_dma_test: +a-next-pte-delay requires "
+            "+a-dst-offset=3072 (a cross-page A destination)\n");
+        return 2;
+    }
+```
+NEW
+```cpp
+    // §54 cross-page A destination fixture is shared-source only.
+    if (a_dst_offset_opt != 0 && !(natural && shared_source)) {
+        std::fprintf(stderr,
+            "nonblock_actual_dma_test: +a-dst-offset=%u requires +natural=1 "
+            "and +shared-source=1\n", (unsigned)a_dst_offset_opt);
+        return 2;
+    }
+    // +a-next-pte-delay needs a cross-page A destination, i.e. either supported
+    // nonzero offset (3072|4088); it is applied at most once.
+    if (a_next_pte_delay != 0 &&
+        !(a_dst_offset_opt == 3072 || a_dst_offset_opt == 4088)) {
+        std::fprintf(stderr,
+            "nonblock_actual_dma_test: +a-next-pte-delay requires a cross-page "
+            "A destination (+a-dst-offset=3072|4088)\n");
+        return 2;
+    }
+```
+
+### P3 — flag block comment + declared range (anchor: lines 239‑250)
+
+OLD
+```cpp
+    // §54 cross-page A destination fixture (test-only, natural actual-DMA run).
+    // +a-dst-offset=0|3072 (default 0): effective A-side destination offset in the
+    // shared-source natural 2 KiB geometry.  3072 makes the 2048-byte A copy reach
+    // the second A destination page (physical first 1 KiB at PA 0x9010_0c00,
+    // second 1 KiB at PA 0x9010_1000).  The ordinary (non-shared) path keeps its
+    // existing A destination offset NAT_DST_OFF (3072) and is unchanged.
+    // +a-next-pte-delay=N (default 0): bounded delay inserted BEFORE the first DDR
+    // RVALID of the ONE read that covers the actual A destination next-page leaf
+    // PTE address; it delays no other A context/source traffic.  Both flags are
+    // inert unless given.
+    static uint32_t a_dst_offset_opt = 0;   // +a-dst-offset (0|3072)
+    static uint32_t a_next_pte_delay = 0;   // +a-next-pte-delay (0..100000)
+```
+NEW
+```cpp
+    // §54 cross-page A destination fixture (test-only, natural actual-DMA run).
+    // +a-dst-offset=0|3072|4088 (default 0): effective A-side destination offset
+    // in the shared-source natural 2 KiB geometry.  BOTH nonzero values make the
+    // 2048-byte A copy span two A destination pages:
+    //   3072 -> FIRST A page carries 1024 B (128 beats) at PA 0x9010_0c00,
+    //           second A page carries the other 1024 B at PA 0x9010_1000;
+    //   4088 -> FIRST A page carries only 8 B (one beat) at PA 0x9010_0ff8,
+    //           second A page carries the remaining 2040 B (255 beats).
+    // Both offsets derive the SAME actual A destination next-page leaf PTE
+    // address 0x70048 (A L0 leaf index 9) from the last copied IOVA byte; no PTE
+    // table or payload constant is changed by this flag.  The terminal geometry
+    // fields first_a_page_beats / a_first_raw_parent_bytes_expected are DERIVED
+    // from this offset and carry the `expected` label: this DUT exposes no raw
+    // A-side parent-AW telemetry, so no observed raw-AW split is claimed.
+    // The ordinary (non-shared) path keeps its existing A destination offset
+    // NAT_DST_OFF (3072) and is unchanged.
+    // +a-next-pte-delay=N (default 0): bounded delay inserted BEFORE the first DDR
+    // RVALID of the ONE read that covers the actual A destination next-page leaf
+    // PTE address; it delays no other A context/source traffic.  Accepted for
+    // either nonzero cross-page offset (3072|4088) and applied at most once.
+    // Both flags are inert unless given.
+    static uint32_t a_dst_offset_opt = 0;   // +a-dst-offset (0|3072|4088)
+    static uint32_t a_next_pte_delay = 0;   // +a-next-pte-delay (0..100000)
+```
+
+### P4 — derived geometry helpers (insert after `nat_a_src_pa()`, anchor: lines 576‑578)
+
+OLD
+```cpp
+    uint64_t nat_a_src_pa() const {
+        return shared_source ? NAT_V_SRC_PA : NAT_A_SRC_PA;
+    }
+```
+NEW
+```cpp
+    uint64_t nat_a_src_pa() const {
+        return shared_source ? NAT_V_SRC_PA : NAT_A_SRC_PA;
+    }
+
+    // §54 terminal A destination WRITE geometry: DERIVED, never observed.
+    // Cross-page shared fixture (offset 3072|4088) -> the FIRST A destination
+    // page carries (PAGE_BYTES - nat_a_dst_off)/8 of the 256 destination beats;
+    // every other combination reports the full 2048 B copy as 256 first-page
+    // beats.  `a_first_raw_parent_bytes_expected` keeps the `_expected` label
+    // because no raw A-side parent-AW split telemetry exists in this DUT.
+    uint32_t a_first_page_beats() const {
+        if (shared_source && nat_a_dst_off != 0)
+            return (uint32_t)((PAGE_BYTES - nat_a_dst_off) / 8u);
+        return 256u;
+    }
+    uint32_t a_first_raw_parent_bytes_expected() const {
+        return a_first_page_beats() * 8u;
+    }
+```
+
+### P5 — `run_natural()` geometry comment (anchor: lines 1185‑1190)
+
+OLD
+```cpp
+        // §50/§54: shared-source mode is page-aligned for V (dst_offset 0) and
+        // uses the CONF=129 experiment (decouple_rw | AxCACHE=0010).  The A
+        // destination offset is 0 by default and becomes +a-dst-offset (0|3072)
+        // in shared mode; 3072 makes the 2048-byte A copy reach the second A
+        // destination page.  The ordinary path keeps dst_offset NAT_DST_OFF
+        // (3072) for BOTH flows and CONF=1 unchanged.
+```
+NEW
+```cpp
+        // §50/§54: shared-source mode is page-aligned for V (dst_offset 0) and
+        // uses the CONF=129 experiment (decouple_rw | AxCACHE=0010).  The A
+        // destination offset is 0 by default and becomes +a-dst-offset
+        // (0|3072|4088) in shared mode; both nonzero values make the 2048-byte A
+        // copy reach the second A destination page (3072 -> 128 first-page
+        // beats, 4088 -> a single first-page beat).  The ordinary path keeps
+        // dst_offset NAT_DST_OFF (3072) for BOTH flows and CONF=1 unchanged.
+```
+
+### P6 — pre-run geometry print (anchor: lines 1225‑1228)
+
+OLD
+```cpp
+        std::printf("== natural cross-page A: a_next_pte_addr=0x%016llx "
+                    "a_next_pte_delay=%u ==\n",
+                    (unsigned long long)a_next_pte_addr,
+                    (unsigned)a_next_pte_delay);
+```
+NEW
+```cpp
+        std::printf("== natural cross-page A: a_next_pte_addr=0x%016llx "
+                    "a_next_pte_delay=%u ==\n",
+                    (unsigned long long)a_next_pte_addr,
+                    (unsigned)a_next_pte_delay);
+        // Derived (expected) A destination write geometry, printed BEFORE the
+        // run so the cross-page split is visible even when the run aborts and no
+        // terminal NATURAL-JSON is emitted.
+        std::printf("== natural A destination geometry (derived, expected): "
+                    "a_cross_page=%d a_effective_dst_offset=%u "
+                    "first_a_page_beats=%u a_first_raw_parent_bytes_expected=%u "
+                    "==\n",
+                    (int)(shared_source && nat_a_dst_off != 0),
+                    (unsigned)nat_a_dst_off,
+                    (unsigned)a_first_page_beats(),
+                    (unsigned)a_first_raw_parent_bytes_expected());
+```
+
+### P7 — beat-offset comment (anchor: line 1369)
+
+OLD
+```cpp
+        const uint32_t off_beats_a = nat_a_dst_off / 8;  // 384 both modes
+```
+NEW
+```cpp
+        // A destination head offset in beats: 384 (offset 3072), 511 (offset
+        // 4088), or 384 again on the ordinary NAT_DST_OFF path.
+        const uint32_t off_beats_a = nat_a_dst_off / 8;
+```
+
+### P8 — cross-page certificate comment (anchor: lines 1385‑1389)
+
+OLD
+```cpp
+        // §54 explicit cross-page certificate: the A destination interval
+        // really covers the second A destination page, so BOTH A destination
+        // pages are proven byte-for-byte.  For off_beats_a=384, beats=256:
+        // first page k=0..383 and second page k=640..1023 must keep their
+        // pre-copy value, k=384..639 must carry the copied payload.
+```
+NEW
+```cpp
+        // §54 explicit cross-page certificate: the A destination interval
+        // really covers the second A destination page, so BOTH A destination
+        // pages are proven byte-for-byte.  beats=256 for the shared fixture:
+        //   offset 3072 (off_beats_a=384): k=0..383 and k=640..1023 keep their
+        //     pre-copy value, k=384..639 carry the copied payload;
+        //   offset 4088 (off_beats_a=511): the first page carries exactly one
+        //     copied beat (k=511) and the second page carries the remaining
+        //     k=512..766, so k=0..510 and k=767..1023 keep their pre-copy value.
+        // The three CHECKs below are the generic form of that statement and hold
+        // for both offsets: 1 <= (PAGE_BEATS - off_beats_a) <= beats-1.
+```
+
+### P9 — 5b certificate comment (anchor: lines 1520‑1525)
+
+OLD
+```cpp
+        // ---- (5b) §54 cross-page A destination / PTE-delay certificate ----
+        // A requested +a-next-pte-delay must really have stretched the first
+        // RVALID of the read that covers the actual A destination next-page
+        // leaf PTE.  A silent no-op is a hard failure, so the run cannot pass
+        // while pretending the delay was applied.  This runs only after every
+        // original full-copy / hardware CHECK above has passed.
+```
+NEW
+```cpp
+        // ---- (5b) §54 cross-page A destination / PTE-delay certificate ----
+        // A requested +a-next-pte-delay must really have stretched the first
+        // RVALID of the read that covers the actual A destination next-page
+        // leaf PTE.  A silent no-op is a hard failure, so the run cannot pass
+        // while pretending the delay was applied.  The delay is inserted by at
+        // most ONE matching walker read, so a_next_pte_delay_applied is 0/1 and
+        // must be exactly 1 when +a-next-pte-delay is nonzero; it is accepted for
+        // either nonzero cross-page offset (3072|4088), both of which derive
+        // a_next_pte_addr = 0x70048.  This runs only after every original
+        // full-copy / hardware CHECK above has passed.
+```
+
+### P10 — 5b CHECK message (anchor: lines 1527‑1529)
+
+OLD
+```cpp
+            CHECK(nat_a_dst_off != 0,
+                  "natural(cross-page): +a-next-pte-delay needs a cross-page A "
+                  "destination (+a-dst-offset=3072)");
+```
+NEW
+```cpp
+            CHECK(nat_a_dst_off != 0,
+                  "natural(cross-page): +a-next-pte-delay needs a cross-page A "
+                  "destination (+a-dst-offset=3072|4088)");
+```
+
+### P11 — `NATURAL-JSON` format string (anchor: line 1645)
+
+OLD
+```cpp
+            "\"a_next_pte_addr\":\"0x%016llx\","
+            "\"vaw\":%llu,\"var\":%llu,\"vw_beats\":%llu,\"vwlast\":%llu,"
+```
+NEW
+```cpp
+            "\"a_next_pte_addr\":\"0x%016llx\","
+            "\"a_cross_page\":%d,\"a_effective_dst_offset\":%u,"
+            "\"first_a_page_beats\":%u,"
+            "\"a_first_raw_parent_bytes_expected\":%u,"
+            "\"a_first_raw_parent_bytes_basis\":\"derived_geometry_expected\","
+            "\"vaw\":%llu,\"var\":%llu,\"vw_beats\":%llu,\"vwlast\":%llu,"
+```
+
+### P12 — `NATURAL-JSON` argument list (anchor: line 1667) — **must land with P11**
+
+OLD
+```cpp
+            (unsigned long long)a_next_pte_addr,
+            (unsigned long long)n_nat_vaw, (unsigned long long)n_nat_var,
+```
+NEW
+```cpp
+            (unsigned long long)a_next_pte_addr,
+            (int)(shared_source && nat_a_dst_off != 0),
+            (unsigned)nat_a_dst_off,
+            (unsigned)a_first_page_beats(),
+            (unsigned)a_first_raw_parent_bytes_expected(),
+            (unsigned long long)n_nat_vaw, (unsigned long long)n_nat_var,
+```
+
+Schema string stays `natural-write-order-v1` (purely additive fields). `a_dst_offset` (already emitted, line 1663) and the new `a_effective_dst_offset` carry the same value under two names on purpose, so the geometry group is self-contained.
+
+---
+
+## Emitted-field manifest (JSON)
+
+```json
+{
+  "schema": "natural-write-order-v1",
+  "added_fields": {
+    "a_cross_page":                        "int  = (shared_source && nat_a_dst_off != 0)",
+    "a_effective_dst_offset":              "uint = nat_a_dst_off (0 | 3072 | 4088)",
+    "first_a_page_beats":                  "uint = (PAGE_BYTES - nat_a_dst_off)/8 when shared&&offset!=0, else 256",
+    "a_first_raw_parent_bytes_expected":   "uint = first_a_page_beats * 8",
+    "a_first_raw_parent_bytes_basis":      "\"derived_geometry_expected\"  (constant; marks the value as derived/expected, NOT observed)"
+  },
+  "expected_values": {
+    "a_dst_offset=0":    {"a_cross_page": 0, "first_a_page_beats": 256, "a_first_raw_parent_bytes_expected": 2048},
+    "a_dst_offset=3072": {"a_cross_page": 1, "first_a_page_beats": 128, "a_first_raw_parent_bytes_expected": 1024},
+    "a_dst_offset=4088": {"a_cross_page": 1, "first_a_page_beats": 1,   "a_first_raw_parent_bytes_expected": 8}
+  },
+  "unchanged_fields_used_as_evidence": {
+    "a_next_pte_addr":              "0x70048 for both 3072 and 4088",
+    "a_next_pte_delay_applied":     "must be exactly 1 when +a-next-pte-delay != 0",
+    "a_next_pte_ar_matches":        "1 whenever applied == 1 (increment shares the applied guard)",
+    "a_dst_w_beats / want_beats_per_dma": "256 each (physical W per flow preserved)"
+  }
+}
+```
+
+---
+
+## Assumptions
+
+1. `+a-dst-offset=4088` is accepted only with `+natural=1 +shared-source=1 +natural-bytes=2048` (the existing shared-source gate at 4443‑4448 already forces 2048). I did not relax that.
+2. `+a-next-pte-delay` stays `0..100000` and now requires either `3072` **or** `4088`; it is still applied at most once, to the single walker read whose byte range covers `0x70048`.
+3. The 4088 copy is contiguous across two *already mapped* A destination pages (leaf 8 and leaf 9), so `setup_memory_natural()` needs no change: `NAT_DST_PAGES = 9` already covers it.
+4. Physical/observed DDR-side counts are unchanged in kind: 256 A destination W beats total, 256 source read beats per detach rule, `n_nat_vaw` becomes 3 (V, A-1beat, A-255beat) and `n_nat_vwlast == n_nat_vaw`.
+5. `first_a_page_beats` is defined for the shared 2048-byte fixture per the requested formula; on the ordinary (non-shared) path it reports the literal `256` even though that path uses `NAT_DST_OFF=3072` with 2048/32768 bytes. That field therefore is **not** a claim about the ordinary 32 KiB geometry (flagged below).
+6. All these flags are parsed/executed only in an `ACTUAL_DMA_SYSTEM` build (parse block 4146‑4348; `tb.run_natural()` call 4567‑4584). A non-system build ignores them.
+7. No RTL, budget, PTE table, payload, expected-data or existing CHECK was weakened. `scenario_budget`/`total_budget()` untouched.
+
+---
+
+## Acceptance cases (exact flag vectors; nothing executed here)
+
+**A. 4088 geometry, new data-debt rule (primary PASS case)**
+```
++mode=s +natural=1 +shared-source=1 +natural-bytes=2048 +natural-first=v
++a-dst-offset=4088 +natural-trace=<path>
+```
+Expected terminal record: `NATURAL-JSON completed:true verified:true`, `a_dst_offset:4088`, `a_effective_dst_offset:4088`, `a_cross_page:1`, `first_a_page_beats:1`, `a_first_raw_parent_bytes_expected:8`, `a_next_pte_addr:"0x70048"`, `a_next_pte_delay:0`, `a_next_pte_delay_applied:0`, `a_dst_w_beats:256`, `want_beats_per_dma:256`; byte evidence: exactly one copied beat at A dst PA `0x90100FF8` and 255 copied beats at `0x90101000..0x901017F7` (source words 1..255), with all other bytes of the 9 mapped A destination pages equal to their pre-copy value; `SHARE50-JSON` logical `a_rbytes:2048`/`v_rbytes:2048`; `PLACEMENT-METRICS-JSON` flow A `issue_count:1 done_count:1`.
+
+**B. 4088 + bounded PTE delay**
+Case A plus `+a-next-pte-delay=64`. Must be **accepted by the CLI** (this is what P2 unlocks) and must report `a_next_pte_delay:64`, `a_next_pte_delay_applied:1`, `a_next_pte_ar_matches:1`, `a_next_pte_addr:"0x70048"`. A requested delay that never matched must still hard-fail (P10 keeps that obligation).
+
+**C. 3072 regression** — Case A with `+a-dst-offset=3072`: expects `a_cross_page:1`, `first_a_page_beats:128`, `a_first_raw_parent_bytes_expected:1024`, identical `a_next_pte_addr:0x70048`, and unchanged byte geometry (k=384..639 copied).
+
+**D. Offset-0 regression** — Case A with `+a-dst-offset=0`: expects `a_cross_page:0`, `first_a_page_beats:256`, `a_first_raw_parent_bytes_expected:2048`, `a_next_pte_delay_applied:0`, single destination page written.
+
+**E. CLI negatives (exit 2)**
+* `+a-dst-offset=1024` → `+a-dst-offset must be 0|3072|4088`
+* `+a-dst-offset=4088` without `+shared-source=1` (or without `+natural=1`) → `+a-dst-offset=4088 requires +natural=1 and +shared-source=1`
+* `+natural=1 +shared-source=1 +natural-bytes=2048 +a-next-pte-delay=64 +a-dst-offset=0` → `+a-next-pte-delay requires a cross-page A destination (+a-dst-offset=3072|4088)`
+* `+natural=1 +shared-source=1 +natural-bytes=2048 +a-next-pte-delay=64 +a-dst-offset=3072` still accepted (regression of the old gate).
+
+**F. expected FAIL under the old B-quiet-gated prototype (contrast case, not a fixture defect)**
+
+Same vector as Case A, executed against the **old** B-quiet-gated obligation rule. Expected outcome: the run does **not** reach terminal checks and does **not** print a PASS line. It is expected to terminate on one of the existing bounded failure surfaces — `watchdog: no handshake progress while waiting DONE`, `scenario budget exhausted while waiting DONE`, or `not quiet: TL in_flight!=0 or DMA job_quiet!=3` — each preceded by `dump_stall()` (3077‑3216), followed by the failure record at 4593‑4596 with `completed:false, verified:false` and `rc = 1`. Rationale is the §55 note that an A destination offset of 4088 puts only one A write beat in the first page, so the required A peak/preparation is gated behind the V q2 W head and the A B never retires (`out/shared-read-frontier-closure-20261009/critical-frontier-closure-and-rejoin.md:25-26`). This case must not be read as a new CLI rejection: `+a-dst-offset=4088` is accepted, only the terminal checks differ. Under the subsequent data-debt rule the same vector is the Case-A PASS.
+
+**Non-goals confirmed:** no RTL edit, no budget lowering, no PTE-table/expected-data change, no change to any existing byte/hardware CHECK, no new rule encoded in C++.
+
+---
+
+## Unresolved / flagged for Codex (do not treat as applied)
+
+1. **Virtual-W pairing with a split A write.** 4088 introduces a second A write burst, one of them single-beat (`VLEN=0`). If the design ever offers that burst's first W beat on the translation-request port *before* its own AW, the existing observer (2222‑2243) mispairs and trips `n_nat_vw_unattr`, `n_nat_vw_mismatch` or `n_nat_vaw_q.empty()` (1470‑1478). Those CHECKs already carry the “observer cannot pair legal W-before-AW; not a DUT verdict” caveat, so a legitimate 4088 PASS could be reported as a failure. Deciding whether to tolerate/repair that observer is an RTL/root call, not a bounded fixture change — not patched here.
+2. **`first_a_page_beats` scope.** On the ordinary (non-shared) path it returns the literal `256` per the requested rule, which is only coincidentally correct for the 2048-byte geometry; the 32768-byte ordinary run is not represented. If the field must be meaningful there, it would need a different formula — requires an explicit decision.
+3. **Second-page derived count.** `a_second_raw_parent_bytes_expected` (= 2048 − first page bytes; 1024 for 3072, 2040 for 4088) is *not* emitted — not requested. Available on request.
+4. **Observed split is deliberately absent.** No field claims an observed raw-AW split. The only per-flow split counters available are the global q-child W counters (`dbg_pause_a_*`, q-writer) and the post-translation DDR-side `paw`/`pw` events; neither is raw *parent* AW telemetry, so per the constraint none was surfaced as “actual”. If root adds real A raw-parent telemetry, `a_first_raw_parent_bytes_expected` should be **supplemented**, not silently renamed.
+5. **`a_next_pte_ar_matches == 1`** is structurally guaranteed (increment shares the `a_next_pte_delay_applied == 0` guard at 2712‑2721), so no new CHECK was added for it; if a stricter assertion is wanted, it is `CHECK(a_next_pte_ar_matches == 1)` inside the existing 5b block.

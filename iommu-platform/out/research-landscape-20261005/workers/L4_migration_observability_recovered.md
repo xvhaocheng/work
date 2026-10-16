@@ -1,0 +1,243 @@
+# 第四部分：动态驻留、迁移、映射更新与可观测性
+
+> 范围：只读所附六篇论文全文提取与四份官方文档；未运行实验，未复现论文。行号指所附 `.txt` 提取文本。vAttention 以 **ASPLOS 2025 正式版** `vattention2025.txt` 为准，旧 L3 报告中按 2024 预印本的题录与数字应替换。NDS 平台按 Codex 已核对的 §5.3/6.1 保留为“自建 SSD + NVMeoF 实物平台”，不虚构纠错。
+
+---
+
+## 1. 版本与题录核验
+
+| 文献 | 正式题录/状态 | 本文使用的文件与关键位置 |
+|---|---|---|
+| PagedAttention | Kwon et al., *Efficient Memory Management for LLM Serving with PagedAttention*, SOSP ’23 | `pagedattention2023.txt:1-2, 87-90` |
+| Batch-aware UVM | Kim et al., *Batch-Aware Unified Memory Management in GPUs for Irregular Workloads*, ASPLOS ’20 | `batch_uvm2020.txt:1-2, 13-17` |
+| IDYLL | Li et al., *IDYLL: Enhancing Page Translation in Multi-GPUs via Light Weight PTE Invalidations*, MICRO ’23 | `idyll2023.txt:1-2, 43-48` |
+| OASIS | Wang et al., *OASIS: Object-Aware Page Management for Multi-GPU Systems*, HPCA 2025 | `oasis2025.clean.txt:1, 5-6` |
+| ObservUVM | Pratheek B. et al., *Observability-aided GPU Memory Oversubscription*, ISCA 2026 | `observuvm2026.txt:1`；工件与 ISCA26 AE 信息见 `observuvm2026.txt:1025-1120` |
+| vAttention | Prabhu et al., *vAttention: Dynamic Memory Management for Serving LLMs without PagedAttention*, ASPLOS ’25 | `vattention2025.txt:1-2, 42-45, 55-60` |
+
+官方文档：
+- RISC-V IOMMU in-memory queues，`riscv_queues2026.txt`
+- CUDA stream-ordered allocator，`cuda_stream_alloc.txt`
+- Linux HMM，`linux_hmm.txt`
+- Linux SVA/ENQCMD，`linux_sva.txt`
+
+---
+
+## 2. 评估性质核查：实物/仿真/离线/在线
+
+| 论文 | 原始评估平台 | 工作负载 | 离线/在线 | 是否易被读成“所有应用/所有 GPU 成立” |
+|---|---|---|---|---|
+| PagedAttention | NVIDIA A100 1/4/8 GPU，Google Cloud，实测 | OPT-13B/66B/175B、LLaMA-13B；ShareGPT/Alpaca，Poisson 请求 | 在线服务式实测；合成到达轨迹 | 摘要给 2–4×，但 §8 明确“并不一般地适用于每个 GPU 负载”，DNN 训练等反而可能退化：`pagedattention2023.txt:1032-1049` |
+| Batch-aware UVM | 真机 Titan Xp 剖析 + MacSim 周期级仿真 | GraphBIG 11 个图/不规则负载，50%/75% oversubscription | 应用执行，不是网络在线服务；UE 仅仿真 | 平均 2× over SOTA prefetch；没有声称所有应用/GPU：`batch_uvm2020.txt:909-910, 1004-1016`；UE 未在真机实现：`:695-698` |
+| IDYLL | MGPUSim 仿真，4/8/16 GPU | 11 个多 GPU 应用 + VGG16/ResNet18 | 离线仿真 | 69.9% 为仿真平均；大页 36.3%，8/16 GPU 才做敏感性；不能当真实 A100 硬件结论：`idyll2023.txt:31, 189-190, 714-715, 911-935` |
+| OASIS | MGPUSim 仿真，4/8/16 GPU | 11 个多 GPU 应用 | 离线仿真 | “near-optimal” 对比的是 hypothetical Ideal；2MB 页收益降为 43%；有非均匀对象/阶段限制：`oasis2025.clean.txt:133, 210-218, 887-910` |
+| ObservUVM | 真机 NVIDIA 3090 24GB + AMD Ryzen 7950X，PCIe 4.0 | 14 个应用，10–70% oversubscription | 应用执行，不是网络在线服务 | 单 GPU；多 GPU 仅讨论/未来：`observuvm2026.txt:661-664, 930-945`；没有“所有应用/所有 GPU”结论 |
+| vAttention | 真机 1–2×A100 80GB，另用 1–2×H100 | Yi-6B、Llama-3-8B、Yi-34B；arXiv-Summarization；离线与在线 QPS | 实测；有离线吞吐与在线 CDF | decode 仅与最优 PagedAttention 持平；prefill/e2e 增益依赖 context length 与 P:D ratio：`vattention2025.txt:869-916, 900-905`；不是所有模型/所有 GPU 普适结论 |
+
+结论：六篇均未逐字写出“所有应用、所有 GPU 都成立”的过度结论。最需要防的是把 PagedAttention 的 2–4×、IDYLL/OASIS 的仿真平均增益、ObservUVM 的 34%、vAttention 的“alternative”读成跨全部硬件/负载的普适律。
+
+---
+
+## 3. 六篇紧凑证据卡
+
+### 卡 1 — PagedAttention / vLLM
+- **题录/问题**：SOSP ’23；LLM 服务中 KV cache 巨大、动态增长，连续预分配造成内部/外部碎片与共享困难：`pagedattention2023.txt:15-50, 134-160`。
+- **机制**：把 KV cache 分成块，逻辑块→物理块表；块表翻译、按需分配、copy-on-write、引用计数、并行采样/beam search 共享：`:111-133, 327-409`。
+- **适用假设/代价**：需要改 attention kernel、在服务框架里再实现一套内存管理；块表与额外分支使 attention kernel 比 FasterTransformer 基线慢 20–26%，块大小敏感：`:930-963`。
+- **评估/强基线**：A100 实测；OPT/LLaMA；ShareGPT/Alpaca；FasterTransformer、Orca (Max/Pow2/Oracle)：`:743-772, 841-852`。
+- **不能外推**：2–4× 不适用于所有 GPU 负载；DNN 训练或非 LLM 计算受限场景可能因额外间接层退化：`:1032-1049`。
+- **一句结论**：PagedAttention 证明“虚拟分页式 KV 管理”在 LLM 服务有效，不证明一切动态 GPU 内存都应改为用户态分页。
+
+### 卡 2 — Batch-Aware UVM
+- **题录/问题**：ASPLOS ’20；GPU demand paging 的 batch fault handling 引入大规模串行化，page eviction 又在关键路径：`batch_uvm2020.txt:10-36, 243-266`。
+- **机制**：Thread Oversubscription，用类似 CPU 线程块上下文切换增加每批 fault 数；Unobtrusive Eviction，先抢占式单页驱逐再双向流水迁移：`:24-30, 444-571`。
+- **适用假设/代价**：针对图/不规则负载，page 在 GPU core 间共享，常规 core throttling 无效；UE 需要改 runtime 和内存状态追踪；batch fault 处理时间 20µs 量级、50%/75% oversubscription：`:107-135, 718-742`。
+- **评估/强基线**：真机 Titan Xp 剖析 + MacSim；GraphBIG 11 应用；强基线为 Zheng et al. SOTA prefetch、ETC、PCIe compression：`:251-266, 738-739, 1004-1016`。
+- **不能外推**：平均 2× 是仿真/特定 oversubscription 与图负载；UE 真机未完整实现；不能推出所有 GPU/所有应用都同样受益：`:695-698, 909-910`。
+- **一句结论**：批量 fault 与 eviction 串行化是实测痛点，但解法依赖不规则负载和 oversubscription 条件。
+
+### 卡 3 — IDYLL
+- **题录/问题**：MICRO ’23；多 GPU UVM 下频繁 page migration 触发大量 PTE invalidation，广播失效与 demand TLB miss 争用 page walk 资源：`idyll2023.txt:14-31, 115-134`。
+- **机制**：In-PTE Directory 用 PTE 未用位记录哪些 GPU 持有有效映射，过滤不必要失效；Lazy Invalidation/IRMB 批量合并同 VPN 高位失效、暂存并惰性写回 page table；另有 IDYLL-InMem 作为无 PTE 未用位时的替代：`:118-133, 469-668`。
+- **关键实测解释**：平均 42% 执行时间耗在 page table invalidation；失效请求占 page walk 请求 27.2%，其中约 32% 不必要；去掉失效干扰可使 demand TLB miss latency 降 55.8%：`:134-135, 404-425`。
+- **评估/强基线**：MGPUSim 4 GPU；11 应用；基线为 access counter-based migration、first/on-touch、zero-latency invalidation、large pages、page replication、Trans-FW；平均 69.9%：`:31, 189-190, 1026-1049`。
+- **不能外推**：仿真结果；4KB 默认页；2MB 页收益降到 36.3%；不是真实多 GPU 硬件实测：`:927-935`。
+- **一句结论**：迁移必须更新翻译，失效不是附带成本，而是多 GPU 地址翻译的一阶瓶颈；但结论仍属仿真体系。
+
+### 卡 4 — OASIS
+- **题录/问题**：HPCA 2025；多 GPU UVM 的 page management 对 application object 无感知，同一应用不同对象/不同阶段偏好不同策略：`oasis2025.clean.txt:14-33, 53-99`。
+- **机制**：Object Tracker 在 `cudaMallocManaged` 上层编码 Obj ID；Object Table 记录对象共享/读写模式；Object Policy Controller 在 on-touch、access-counter、duplication 间动态切换；自校正处理 phase 变化：`:99-107, 444-698`。
+- **适用假设/代价**：对象内页面模式需大体一致；用单个页面判对象模式；2MB 页会把 private 变 shared，收益下降；共享-rw-mix 对象无法达到 ideal：`:306-349, 887-910, 963-965`。
+- **评估/强基线**：MGPUSim 4/8/16 GPU；11 应用；基线为 uniform on-touch/access-counter/duplication、Ideal、GRIT；平均 64%/35%/42%，比 GRIT 高 12%：`:25-33, 796-799, 1012-1049`。
+- **不能外推**：仿真；“near-optimal” 是相对 hypothetical Ideal；不能推出所有应用/对象都能分相或均匀。
+- **一句结论**：对象粒度是缓解逐页学习开销的可行折中，但对象边界、阶段边界和大页冲突仍是公开限制。
+
+### 卡 5 — ObservUVM
+- **题录/问题**：ISCA 2026；UVM driver 在 CPU 上无法观测 GPU 对 HBM-resident page 的访问，LRM 驱逐经常赶走活跃区域；prefetch 缺反馈：`observuvm2026.txt:8-26, 29-71, 249-262`。
+- **机制**：复用 NVIDIA access counters，把 HBM 区域中少量 64KB sample page 迁到 DRAM/pin，用 PCIe 访问计数提供 sampled observability；把 eviction/prefetch policy 放用户态，driver 只做机制；实现 LRU/LFU/CP、Tournament、FDP/RGP：`:73-119, 373-410, 445-529`。
+- **适用假设/代价**：依赖应用空间局部性；只观测少量 key region；采样页迁移与用户态通信有约 2.4%+1.8% 开销；单 GPU；多 GPU 尚未实现：`:406-410, 754-764, 930-945`。
+- **评估/强基线**：真机 RTX 3090 + Ryzen 7950X；14 应用；基线 UVM、ACBM、EarlyAdaptor；TM++ 平均 34% over UVM，约 20% over ACBM/EA：`:99-101, 734, 895-920`。
+- **不能外推**：不能推出 access counter 能直接观测 HBM；不能推出多 GPU/所有 GPU 同样有效。
+- **一句结论**：可观测性本身是独立瓶颈，且可在不改硬件的前提下用采样近似 access bits，但只覆盖 key region 与有局部性的负载。
+
+### 卡 6 — vAttention（ASPLOS ’25 正式版）
+- **题录/问题**：PagedAttention 把 KV cache 虚拟布局从连续改为非连续，迫使重写 attention kernel、服务框架再实现内存管理、CPU/GPU 关键路径额外开销：`vattention2025.txt:12-37, 95-117`。
+- **机制**：CUDA VMM API 分离虚拟/物理分配；保留虚拟连续，按需映射物理页；扩展 PyTorch caching allocator；后台线程重叠分配，deferred reclamation + eager allocation；改开源 UVM driver 支持 64KB 等小页：`:26-36, 431-513, 517-668`。
+- **适用假设/代价**：每迭代 KV 需求可预测；分配带宽需求 ≤750MB/s；需修改 NVIDIA driver/服务框架；收益依赖长 context 与 prefill 占比：`:408-428, 598-683, 900-905`。
+- **评估/强基线**：真机 1–2×A100、另用 H100；Yi-6B/Llama-3-8B/Yi-34B；基线 vLLM、FlashAttention-2 Paged、FlashInfer Paged；decode 最高比 vLLM 快 1.99×，但与最优 Paged decode 持平；prefill 比 FA2_Paged 最高 1.24×，e2e 最高 1.18×/1.23×；FA3 比 FA2_Paged 高 1.26–1.5×：`:754-758, 830-836, 869-916, 1042-1043`。
+- **不能外推**：不是所有场景都快于 PagedAttention；decode 仅持平；不能推出 64KB 页对所有模型都有利，也不能推出该 VMM 控制面对所有 GPU 应用通用。
+- **一句结论**：vAttention 证明“虚拟连续 + 物理按需”是 PagedAttention 的强替代，但其收益边界由 workload 可预测性、context/P:D 比例和驱动扩展共同决定。
+
+---
+
+## 4. 演变：从容量/故障到失效/观测
+
+1. **经典 demand paging 阶段**：GPU UVM 以 page fault 和迁移解决容量问题，但 Batch-aware UVM 证明 fault batch 与 eviction 串行化会变成 throughput 瓶颈：`batch_uvm2020.txt:10-36, 243-266`。
+2. **LLM 动态对象阶段**：PagedAttention 把 OS 分页思想搬进 KV cache，解决碎片并支持共享，但引入 kernel 重写、用户态内存管理与虚拟非连续：`pagedattention2023.txt:95-117`。
+3. **多 GPU 翻译一致性阶段**：IDYLL 把焦点从“迁不迁”转到“迁移后如何失效翻译”；广播失效、page walk cache 抖动、迁移等待成为独立瓶颈：`idyll2023.txt:14-31, 105-124`。
+4. **策略粒度阶段**：OASIS 发现逐页策略学习开销大，对象粒度可降低元数据与决策成本，但对象/阶段/大页之间冲突：`oasis2025.clean.txt:53-99, 306-349`。
+5. **可观测性阶段**：ObservUVM 指出 UVM driver 对 HBM-resident page 是盲的，把 access counters 从“迁移用”改为“观测用”，并分离 policy 与 mechanism：`observuvm2026.txt:13-26, 73-119`。
+6. **接口语义阶段**：CUDA stream allocator 已把分配变成 stream-ordered 且有 pool/release threshold；RISC-V IOMMU 已有 IOTINVAL/IODIR/IOFENCE/ATS.INVAL 语义；Linux HMM/SVA 已有映射镜像、mmu_notifier、迁移与 PASID/ATS/PRI 路径。动态驻留问题已不再只是“缺一个 API”。
+
+---
+
+## 5. 强基线、适用条件、未解决但有证据的限制
+
+### 5.1 强基线
+- PagedAttention：FasterTransformer、Orca (Max/Pow2/Oracle)：`pagedattention2023.txt:743-762`。
+- Batch-aware UVM：Zheng et al. SOTA prefetch、ETC、PCIe compression：`batch_uvm2020.txt:738-739, 1004-1016`。
+- IDYLL：access counter migration、on/first-touch、zero-latency invalidation、Trans-FW、large pages、page replication：`idyll2023.txt:184-204, 291-307, 927-994, 1026-1049`。
+- OASIS：uniform on-touch/access counter/duplication、Ideal、GRIT：`oasis2025.clean.txt:25-33, 1012-1049`。
+- ObservUVM：UVM、ACBM、EarlyAdaptor、Forest（相关）：`observuvm2026.txt:895-920, 957-975`。
+- vAttention：vLLM、FA2_Paged、FI_Paged、FA2_vAttention、FI_vAttention、FA3：`vattention2025.txt:744-758, 1042-1043`。
+
+### 5.2 适用条件
+- 动态映射是否可隐藏，取决于“需求可预测性 + 重叠/延迟回收 + 缓存池/分配粒度 + workload 阶段”：`vattention2025.txt:408-428, 598-683`；反例见 GMLake 裸 VMM 慢 115× 的 L3 引用，但那是特定裸同步 VMM 场景。
+- 多 GPU 失效优化只在共享页频繁迁移时有效；大页、只读复制、低共享场景收益下降：`idyll2023.txt:927-994`。
+- 对象粒度只在对象内页面模式大体一致时成立；non-uniform app 与 2MB 页是反例：`oasis2025.clean.txt:306-349, 887-910`。
+- 可观测性依赖空间局部性；采样观测只跟踪 key regions，不是全 HBM 全量 access bits：`observuvm2026.txt:406-410`。
+- IOMMU/设备侧：IOTINVAL 只管 IOATC，不管 DDT/PDT；目录缓存要用 IODIR；ATS.INVAL 才管设备 ATC；IOFENCE.C 只保证已被 IOMMU 处理的请求的全局序，不保证尚未被处理的 in-flight 请求：`riscv_queues2026.txt:403, 404-427, 344-351`。
+
+### 5.3 未解决但有证据的限制
+- **失效突发与 page walk 资源争用**：IDYLL 实测失效占用 42% 执行时间，失效请求占 page walk 请求 27.2%，不必要失效约 32%：`idyll2023.txt:134-135, 404-425`。
+- **迁移后翻译更新代价**：page migration 改映射后，所有含旧映射的 per-GPU TLB 与本地页表必须失效；UVM driver 会向所有 GPU 广播，即使该 GPU 从未请求该翻译：`idyll2023.txt:105-124, 292-307`。
+- **可观测性盲区**：UVM driver 只看到 DRAM-resident page fault，看不到 HBM-resident 访问；access counters 只跟踪 GPU→DRAM over PCIe：`observuvm2026.txt:13-26, 73-86`。
+- **对象/页/区域粒度冲突**：OASIS 用对象降开销但受非均匀对象限制；ObservUVM 用 2MB region 采样但依赖局部性；vAttention 用虚拟连续+64KB/2MB page-group，需在碎片与 TLB/分配粒度间折中：`oasis2025.clean.txt:306-349`、`observuvm2026.txt:89-99`、`vattention2025.txt:1078-1223`。
+- **接口合法不等于高性能**：RISC-V 允许“忽略操作数并全局失效”以实现 IOTINVAL；也允许简单实现无条件全局排序：`riscv_queues2026.txt:280-282, 352-355`。合法但可能昂贵；性能问题不能由合法性推出。
+
+---
+
+## 6. 重点问题回答
+
+### 6.1 运行时到底看不到什么？
+- UVM driver 看不到 GPU 对 **HBM-resident page** 的访问；只能看到对 DRAM-resident page 的 page fault 流：`observuvm2026.txt:13-26`。
+- NVIDIA access counters 原本只跟踪 GPU→DRAM over PCIe，不跟踪 HBM：`observuvm2026.txt:73-86, 178-188`。
+- IDYLL 中 UVM driver 不知道哪些 GPU 持有某翻译的有效副本，因此基线向所有 GPU 广播失效，即使 GPU 从未请求该页：`idyll2023.txt:292-307`。
+- OASIS 指出 UVM page management 是 application object agnostic，不知道对象语义、共享/私有/读写与阶段：`oasis2025.clean.txt:14-33, 53-99`。
+- PagedAttention/vAttention 的对比也说明：用户态或驱动层看不到的代价会落到 kernel 重写、block table、VMM API 往返与关键路径：`pagedattention2023.txt:930-943`、`vattention2025.txt:12-37`。
+
+### 6.2 对象/页/内存层次的决策粒度如何冲突？
+- **对象粒度**：OASIS 减少逐页学习元数据和开销，但对象可能 non-uniform，且 2MB 页会把 private 挤成 shared：`oasis2025.clean.txt:306-349, 887-910`。
+- **页/PTE 粒度**：IDYLL 在 PTE 粒度过滤失效、批量合并，但受 PTE 未用位、IRMB 容量、TLB shootdown 仍即时执行限制：`idyll2023.txt:493-668`。
+- **区域粒度**：ObservUVM 用 2MB region + 64KB sample page；依赖局部性，且采样可能漏掉未访问 sample page 的活跃 region：`observuvm2026.txt:89-99, 406-410`。
+- **虚拟张量/物理 page-group 粒度**：vAttention 保留虚拟连续，物理用 64KB/128KB/256KB/2MB page-group；小页减碎片，大页减少分配开销，但二者在 batch、碎片、TLB 行为上冲突：`vattention2025.txt:1078-1223`。
+- **batch 粒度**：Batch-aware UVM 在“每批 fault 更多”与“额外上下文切换/过早驱逐”间折中：`batch_uvm2020.txt:444-535`。
+
+### 6.3 为什么迁移会增加翻译更新代价？
+IDYLL 给出的链是：page migration 修改虚拟→物理映射；所有含旧映射的 per-GPU TLB 和本地页表都要失效；传统 UVM driver 广播失效到所有 GPU；每个 GPU 走本地页表失效对应 PTE；这些失效请求与 demand TLB miss 争用 page walk 队列、page walk cache 和 walker 线程；page walk cache 被失效冲刷后，demand miss 更慢；同时失效延迟又拉长 page migration waiting latency：`idyll2023.txt:105-124, 292-307, 404-425, 818-842`。IDYLL 实测 demand TLB miss latency 降 55.8%，page migration waiting latency 降 71%：`:404-425, 818-842`。
+
+### 6.4 哪些普通“细粒度失效/批量失效”已非空白？
+- IDYLL：In-PTE directory 做**按 GPU 定向失效**；Lazy Invalidation/IRMB 做**按 VPN 高位批量合并 + 惰性 PTE 更新**；TLB shootdown 仍即时，PTE 失效延迟：`idyll2023.txt:469-668`。
+- RISC-V IOMMU：IOTINVAL.VMA/GVMA 已支持按 GSCID/PSCID/ADDR 的粒度选择，NL/S 扩展支持非叶/地址范围失效；IODIR 支持 DDT/PDT 目录缓存失效；ATS.INVAL 支持设备 ATC 失效；IOFENCE.C 支持完成/全局序：`riscv_queues2026.txt:153-302, 302-367, 368-427`。
+- CUDA stream allocator：`cudaMallocAsync/cudaFreeAsync` 已有 stream-ordered 语义、event 依赖复用、pool、release threshold、机会性复用与内部依赖：`cuda_stream_alloc.txt:60-78, 117-160, 162-208`。
+- Linux HMM：`mmu_interval_notifier` 的 invalidate 回调、`hmm_range_fault_unlocked_timeout`、`migrate_vma_*` 已经把“页表镜像一致性 + 迁移 + 设备 MMU 失效”做成公共路径：`linux_hmm.txt:175-242, 285-388`。
+- 因而，“细粒度失效”“批量失效”“目录过滤”“惰性更新”“采样观测”都不是空白；新工作必须与这些机制对比语义和代价。
+
+### 6.5 CUDA stream allocator 与 RISC-V IOTINVAL/IOFENCE 已具备什么语义？哪些性能问题不能由合法性推导？
+- **CUDA stream allocator**：分配/释放是 stream-ordered；同流自动有序；跨流可通过 event 依赖复用；deallocation 必须排在所有访问之后；pool 可保留内存，release threshold 控制何时归还 OS；driver 可机会性复用或插入内部依赖；pool 碎片可 remap 整理：`cuda_stream_alloc.txt:60-78, 117-160, 162-208`。它没有承诺分配延迟为零，也没有承诺跨所有进程/所有互操作接口都能自动回收；非 CUDA 接口/多进程时需显式 trim：`:155-160`。
+- **RISC-V IOTINVAL**：IOTINVAL.VMA/GVMA 同步软件对 stage-1/stage-2 页表的修改并使匹配 IOATC 项失效；操作数可限制 GSCID/PSCID/ADDR；实现**可以忽略操作数并全局失效**；IOTINVAL 对 IOMMU directory caches 无效，后者要用 IODIR：`riscv_queues2026.txt:153-302, 368-403`。
+- **IOFENCE.C**：完成保证之前从 CQ 取出的命令已完成并提交；PR/PW 可要求之前已由 IOMMU 处理的读/写提交到全局序点；但**不保证尚未被 IOMMU 处理的 in-flight 设备请求**，需要互联特定 fence：`riscv_queues2026.txt:302-367, 344-351`。
+- **合法性不能推出性能**：全局失效、忽略操作数、无条件全局排序都合法，但可能造成页表缓存抖动、失效风暴、迁移等待和 ordering 停顿：`riscv_queues2026.txt:280-282, 352-355`。ATS.INVAL 的 timeout 与 IOFENCE 等待也说明设备侧失效完成是性能变量：`:404-427`。
+
+### 6.6 SVA/HMM 的四个事项必须分开
+- **同一地址**：SVA 允许处理器和设备使用同一虚拟地址，通常靠 PASID/IOMMU；HMM 通过把 CPU 页表镜像到设备页表实现同一地址指向同一物理页：`linux_sva.txt:96-115, 139-171`、`linux_hmm.txt:145-174`。
+- **映射一致性**：SVA 用 `mmu_notifier()` 保持 device TLB 与 CPU cache/页表同步；HMM 用 `mmu_interval_notifier` invalidate 回调、`mmu_interval_read_retry` 保证设备页表更新与 CPU 页表更新一致：`linux_sva.txt:109-115, 147-155`、`linux_hmm.txt:175-242`。
+- **数据缓存一致性**：不等于同一地址或映射一致性。HMM 明确说多数 I/O bus 只允许设备访问主存，cache coherency 常为可选；CPU 访问设备内存往往非缓存一致；PCIe 方向也有限：`linux_hmm.txt:122-144`。
+- **迁移**：HMM 的迁移是另一条路径：CPU 访问 device page 会 fault 并迁回；`migrate_vma_setup/pages/finalize` 还要求调用 `mmu_notifier_invalidate_range_start/end` 失效其他设备 MMU，并区分只失效正在迁移的 device private 映射：`linux_hmm.txt:145-174, 285-388`。
+- **对本项目的边界**：不能由上述文档推出 CVA6 + RISC-V IOMMU 平台“已实现 ATS/PRI/SVA”或“已实现 HMM 式迁移”；只能用于说明这些是不同语义层。
+
+---
+
+## 7. 对 L3 报告的有界修订：纠错列表/应替换段落
+
+> 只列应删除/替换处；其余证据卡不动。行号指 `workers/L3_data_lifecycle.md`。
+
+### 修订 1：删除“唯一硬分界”
+- **删除**：L3 第 13 行“真正吃 RTT 的是……”中的全称化，尤其是“这是本线唯一的硬分界”；第 14 行“这是本线唯一的硬分界”；第 53 行“只有当地址必须等他方数据返回且无法并发时，才是结构性缺口。这条线 44 年来的所有方案成败，都落在这一分界上。”
+- **替换段**：
+> 地址依赖（pointer chasing、multi-level translation）是一类明确的结构性串行来源，但不是唯一硬分界。带宽/容量（Batch-aware UVM 的 migration/eviction、ObservUVM 的 LRM 误驱逐）、布局（NDS 维度不匹配；vAttention 虚拟连续 vs 物理分页）、同步与翻译一致性（IDYLL PTE invalidation、RISC-V IOFENCE 排序）同样可形成结构性限制。能否隐藏只是其中一个轴；动态内存映射也受可预测性、重叠、page-group 粒度与驱动/接口限制。
+- **依据**：`batch_uvm2020.txt:10-36, 243-266`、`observuvm2026.txt:29-71, 249-262`、`idyll2023.txt:105-124`、`vattention2025.txt:95-117`、`riscv_queues2026.txt:302-367`。
+
+### 修订 2：删除“prefetcher/reorder 完全无能为力”“只能 PIM/NIC”
+- **删除/替换**：L3 第 14 行“作者们一致承认 prefetcher 与 reorder 都无能为力”；第 28 行“对策是 PIM”；第 202 行表项“只能 PIM/NIC 内解链”；第 209 行“预取在 IMPICA 与 DX100 里都被列为已知不够的基线”可保留但需限定为“所评估的具体预取器/重排窗口”。
+- **替换段**：
+> 原文只证明 IMPICA 所述的不规则 pointer chasing 让其评估的 prefetcher 无效，以及 DX100 明确不覆盖 pointer chasing、其重排只针对 array-based indirection。它不排除预测、helper threads、多独立链并行、地址流预计算等方案；Tiara 的 register-chained load 说明链可在 NIC 内折叠，但不是唯一 PIM/NIC 解。应写成“本批材料显示：对真串行地址依赖，已见 PIM/近 NIC/近内存解链方案；其他预测/并行解链仍需逐案验证”。
+- **依据**：`impica2016.txt:8-14, 50-53`、`dx1002025.txt:37-38, 479-495`、`tiara2026.txt:262-331`。
+
+### 修订 3：GMLake 裸 VMM 与 vAttention 不能推出“所有动态映射只有可预知/缓存池才工作”
+- **删除/替换**：L3 第 15 行“所以瓶颈位置取决于是否可预知 + 是否有缓存池/重叠，不是 VMM 本身”；第 121 行“不能推出动态映射永远不是瓶颈”；第 138 行“裸 VMM API 用 2MB chunk 分配 2GB 比 cudaMalloc 慢 115×”；第 181 行“必须有缓存池/重叠，否则裸 VMM 慢 100×+”；第 250 行“GMLake 则证明不加缓存池才是瓶颈”。
+- **替换段**：
+> GMLake 的 115× 是特定裸 VMM API、2MB chunk、2GB 分配、无缓存池/无重叠的实现与实验条件；vAttention 的隐藏依赖每迭代需求可预测、后台重叠、延迟回收+提前分配、特定模型/驱动扩展（`vattention2025.txt:408-428, 598-683, 1040-1057`）。不能推出“所有动态映射只有可预知/缓存池才可工作”，也不能推出“无缓存必慢 100×”。应写成：动态映射成本高度依赖分配粒度、同步/异步、重叠、缓存池、驱动实现和工作负载可预测性；vAttention 与 GMLake 是两端条件样本，不是全称规律。
+- **vAttention 题录替换**：L3 第 117 行题录改为 `vAttention: Dynamic Memory Management for Serving LLMs without PagedAttention, ASPLOS ’25`（`vattention2025.txt:1-2, 42-45`）。L3 第 121 行旧数字替换为：真机 1–2×A100/H100；decode 最高比 vLLM 快 1.99×，但与最优 PagedAttention decode 持平；prefill 比 FA2_Paged 最高 1.24×，e2e 最高 1.18×/1.23×；FA3 比 FA2_Paged 高 1.26–1.5×（`vattention2025.txt:830-836, 869-916, 1042-1043`）。删除“TTFT 相对 FlashInfer paged 降 1.45×”这一旧预印本表述，改用最终版在线中位延迟降低 42%/28%/29%：`vattention2025.txt:1025-1027`。
+- **全局替换**：L3 中把 vAttention 作为正式结论处，`vattention2024.txt` 引用应改为 `vattention2025.txt`；L3 第 293 行“vattention2024 与 vtensor2024 均为 arXiv”应改为“vAttention 为 ASPLOS ’25 正式版；vTensor/FlexInfer 仍为 arXiv 2407.15309v1”。
+
+### 修订 4：“epoch 重复 GPS”“没有论文给出定量边界”
+- **删除/替换**：L3 第 210 行“把 epoch 当作新口号会重复 GPS 已做过的事”；第 224 行“目前没有论文给出这一定量边界”。
+- **替换段**：
+> 本批材料未以 epoch 为核心机制；GPS 用的是弱内存模型作用域与订阅/广播（`gps2021.txt:373-430`），Tiara 用注册期静态验证（`tiara2026.txt:303-330`）。因此只能说“本批材料未建立 epoch 的新颖性”，不能证明它与 GPS 重复或全领域不存在。同理，动态内存“可预知度→是否需要隐藏/缓存”的定量边界，本批所附材料没有给出；应写成“本批未给出”，不写成“目前没有论文给出”。
+- **依据**：`gps2021.txt:373-430, 576-591`、`tiara2026.txt:303-330`。
+
+### 修订 5：BypassD 日志模式与 NDS 平台
+- **BypassD**：L3 第 101 行“ext4（非数据日志）”、第 187 行“ext4 非日志”应改为“ext4 ordered-mode 约束（具体模式以原文为准）”。不要写成“泛指无日志”。若需逐字引用，回 `bypassd2024.txt` 原文核假设条件。
+- **NDS 平台**：L3 第 84 行“AMD RyZen 3700X + RTX 2080 + 自建 32 通道 TLC-NAND SSD”可保留；Codex 已核对 NDS §5.3/6.1，作者确实报告自建 SSD + NVMeoF 实验平台，不需按“无实物源”改为待核查。若 L3 另有“NDS 仅模拟”之类表述，应删。
+
+### 修订 6：数值比较只在同论文同实验可横比
+- **替换段**：
+> 倍率比较仅在同一论文、同一平台、同一基线、同一工作负载/oversubscription 设置内可横比。IDYLL 69.9%、OASIS 64%/35%/42%、ObservUVM 34% over UVM、vAttention 1.99× over vLLM 等来自不同硬件/仿真/负载，不可相互排名，也不可拼成“联合收益”。L3 第 158、181、229、250 等处的跨论文比较应加“不可横比”标注。
+- **依据**：各自评估设置见 `idyll2023.txt:189-190, 283-295`、`oasis2025.clean.txt:182-190`、`observuvm2026.txt:661-664`、`vattention2025.txt:754-758`。
+
+---
+
+## 8. 地图第六分支草稿：动态驻留与观测（约 800 字）
+
+动态驻留的核心问题已从“容量不够怎么办”推进到“谁在何时看到什么、以什么粒度做决策、迁移后如何更新翻译”。早期 GPU UVM 用 demand paging 解决 oversubscription，但 Batch-aware UVM 实测指出，fault batch 与 eviction 串行化本身会进入关键路径；解法不是单纯加缓存，而是增加可并发 fault 数、把 eviction 移出关键路径。到了 LLM 服务，PagedAttention 把 KV cache 分页化，解决碎片并支持共享，却把动态分配代价转成 attention kernel 重写、Block-Table、用户态内存管理和虚拟非连续。vAttention 走相反路线：虚拟地址保持连续，物理页按需映射，用 CUDA VMM API、后台重叠、延迟回收和提前分配隐藏分配延迟。它证明 PagedAttention 不是唯一解，但也明确 decode 仅与最优 PagedAttention 持平，prefill/e2e 收益依赖长 context 和 prefill 占比。因此“动态映射一定是瓶颈”与“动态映射永远可隐藏”都不成立。
+
+多 GPU 把问题推向翻译一致性。IDYLL 指出，page migration 改映射后必须失效所有 GPU 的旧 PTE；传统 UVM 广播失效，造成 demand TLB miss 与失效请求争用 page walk 资源，实测近半执行时间耗在 invalidation。IDYLL 的 In-PTE directory 和 IRMB 说明“定向失效、批量失效、惰性 PTE 更新”已有系统化解法，不再空白；但其结果是 MGPUSim 仿真，且大页收益下降。OASIS 进一步指出，逐页学习策略元数据开销高，对象粒度可降本，但对象可能非均匀、阶段会变、2MB 页会把私有页挤成共享页。可见对象、页、区域、page-group 四种粒度各有冲突，没有单一粒度通吃。
+
+观测是这条线最新的一层。ObservUVM 明确 UVM driver 看不到 GPU 对 HBM-resident page 的访问，只能看 DRAM page fault；它复用 access counters 采样 key region，把 policy 放用户态，在不改硬件下获得近似 access bits。它仍依赖空间局部性、只观测少量区域，且是单 GPU。与此同时，接口层已具备不少语义：CUDA stream allocator 有 stream-ordered 分配、pool、release threshold、event 依赖复用；RISC-V IOMMU 有 IOTINVAL/IODIR/IOFENCE/ATS.INVAL，可做翻译缓存、目录缓存和设备 ATC 失效，并区分“已处理请求的全局序”与 in-flight 请求；Linux HMM/SVA 已把页表镜像、mmu_notifier 同步、PASID/ATS/PRI、迁移分开实现。但这些语义只规定正确性，不规定性能：全局失效合法但可能昂贵，IOFENCE 可等待但不保证低延迟，stream pool 可复用但不保证零分配延迟。
+
+因此，第六分支的真正缺口不是“缺一个动态映射 API”，而是：运行时看不到什么、在哪个粒度决策、迁移如何触发翻译更新、失效/批量/目录/惰性哪些已非空白、以及合法语义如何映射到可测成本。SVA/HMM 还提醒：同一地址、映射一致性、数据缓存一致性、迁移是四件事，不能互相推导；更不能由此推出本项目已实现 ATS/SVA/HMM 迁移。
+
+---
+
+## 9. 跨分支 5 个有根据的卡点（明确标为推断）
+
+> 以下“推断”是综合判断，不是任一论文原文结论。
+
+1. **观测盲区与设备侧失效状态脱节，缺少端到端可观测接口**（推断）。ObservUVM 证明 OS 看不到 HBM 访问；RISC-V IOMMU 的 IOTINVAL 只管 IOATC，目录缓存要 IODIR，设备 ATC 要 ATS.INVAL，IOFENCE 不知道未处理 in-flight 请求。把这些拼起来，才能知道“迁移—失效—数据可见性”何时真正完成。证据：`observuvm2026.txt:13-26, 73-119`、`riscv_queues2026.txt:403, 404-427, 344-351`。
+2. **迁移成本、翻译更新成本、同步成本缺统一成本模型**（推断）。IDYLL 量化了 invalidation 对 page walk 与迁移等待的影响；Batch-aware UVM 量化了 fault batch/eviction；vAttention 量化了 VMM API 与重叠；HMM 给出 notifier/migration 路径；IOFENCE 给出排序语义。它们各自成立，但没有一个跨页表/TLB/ATC/数据搬运的公共成本分解。证据：`idyll2023.txt:404-425, 818-842`、`batch_uvm2020.txt:243-266`、`vattention2025.txt:598-683`、`linux_hmm.txt:285-388`、`riscv_queues2026.txt:302-367`。
+3. **“细粒度/批量失效”已非空白，新方案必须与目录过滤、惰性更新、地址范围失效对比**（推断）。IDYLL、RISC-V IOTINVAL/NL/S 扩展、IODIR、IOFENCE、CUDA event 复用都已覆盖一部分；只提“更细粒度失效”不足以构成缺口。证据：`idyll2023.txt:469-668`、`riscv_queues2026.txt:153-302, 368-427`、`cuda_stream_alloc.txt:162-208`。
+4. **对象/页/区域/page-group 粒度冲突没有单一最优**（推断）。OASIS 的对象粒度、IDYLL 的 PTE 粒度、ObservUVM 的 2MB region+64KB sample、vAttention 的虚拟张量+page-group、HMM 的 range/vma 粒度各有适用条件；运行时可能需要动态切换，但切换本身有观测/失效/元数据成本。证据：`oasis2025.clean.txt:306-349, 887-910`、`observuvm2026.txt:89-99`、`vattention2025.txt:1078-1223`、`linux_hmm.txt:175-242`。
+5. **动态驻留性能取决于可预测性/局部性/重叠的相变，但本批材料未建立定量边界**（推断）。vAttention 依赖每迭代可预测与重叠；ObservUVM 依赖空间局部性；OASIS 依赖对象相内一致；IDYLL 依赖共享页频率。反例和正例都有，但“何时可隐藏、何时必须缓存/限制/驱逐”的定量边界在本批所附材料中未给出，也不能写成全领域空白。证据：`vattention2025.txt:408-428`、`observuvm2026.txt:406-410`、`oasis2025.clean.txt:459-489`、`idyll2023.txt:927-994`。
+
+---
+
+## 10. 建议 Codex 验收检查
+
+1. 核对 `vattention2025.txt:869-916` 是否确为 decode 与最优 PagedAttention 持平、最高 1.99× over vLLM；`vattention2025.txt:1042-1043` 是否确为 FA3 1.26–1.5×。
+2. 核对 `idyll2023.txt:134-135` 是否确为平均 42% 执行时间在 page table invalidation；`:404-425` 是否确为 32% 不必要、55.8% demand latency 降低。
+3. 核对 `observuvm2026.txt:661-664` 是否确为单 GPU 3090/Ryzen 7950X；`:930-945` 是否确为多 GPU future。
+4. 核对 `oasis2025.clean.txt:887-910` 是否确为 2MB 页收益降至 43%；`:306-349` 是否确为非均匀对象限制。
+5. 核对 `riscv_queues2026.txt:403` 是否确为 IOTINVAL 对 IOMMU directory caches 无效；`:344-351` 是否确为 IOFENCE 只管已处理请求。
+6. 核对 `linux_hmm.txt:122-144` 是否确为 I/O bus cache coherency 常为可选；`linux_sva.txt:109-115` 是否确为 mmu_notifier 同步 device TLB。
+7. 按第 7 节逐条修订 L3；vAttention 卡必须整体替换为 ASPLOS ’25 题录与数字，并全局更新 `vattention2024.txt` 引用。

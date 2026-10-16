@@ -1,0 +1,950 @@
+                                    Utilizing the IOMMU Scalably
+
+        Omer Peleg          Adam Morrison               Benjamin Serebrin                                          Dan Tsafrir
+                       Technion                              Google                                                 Technion
+           {omer,mad}@cs.technion.ac.il                 serebrin@google.com                                dan@cs.technion.ac.il
+
+
+
+Abstract                                                                                   2500
+                                                                                                      no iommu
+                                                                                                      static 1:1 mapping
+
+
+
+
+                                                                   trans/sec [thousands]
+                                                                                           2000       eiovar
+IOMMUs provided by modern hardware allow the OS to                                                    stock linux
+enforce memory protection controls on the DMA opera-                                       1500
+tions of its I/O devices. An IOMMU translation manage-
+                                                                                           1000
+ment design must scalably handle frequent concurrent
+updates of IOMMU translations made by multiple cores,                                      500
+
+which occur in high throughput I/O workloads such as                                         0
+                                                                                                  2   4     6      8    10   12   14   16
+multi-Gb/s networking. Today, however, OSes experi-                                                               cores
+ence performance meltdowns when using the IOMMU              Figure 1. Parallel netperf throughput (Linux): Performance
+in such workloads.                                           meltdown due to dynamic IOMMU mapping updates.
+   This paper explores scalable IOMMU management
+designs and addresses the two main bottlenecks we find       malicious devices [8, 13, 46], and buggy drivers [7, 15,
+in current OSes: (1) assignment of I/O virtual addresses     22, 31, 41, 44], which may misconfigure a device to over-
+(IOVAs), and (2) management of the IOMMU’s TLB.              write system memory. This intra-OS protection [45] is
+   We propose three approaches for scalable IOVA as-         recommended by hardware vendors [23, 29] and imple-
+signment: (1) dynamic identity mappings, which eschew        mented in existing OSes [5, 12, 25, 36]. OSes can employ
+IOVA allocation altogether, (2) allocating IOVAs using       intra-OS protection both in non-virtual setups, having di-
+the kernel’s kmalloc, and (3) per-core caching of IO-        rect access to the physical IOMMU, and in virtual setups,
+VAs allocated by a globally-locked IOVA allocator. We        by exposing the IOMMU to the VM through hardware-
+further describe a scalable IOMMU TLB management             supported nested IOMMU translation [2, 27], by paravir-
+scheme that is compatible with all these approaches.         tualization [9, 31, 40, 45], or by full emulation of the
+   Evaluation of our designs under Linux shows that (1)      IOMMU interface [3].
+they achieve 88.5%–100% of the performance obtained             Intra-OS protection requires each DMA operation to
+without an IOMMU, (2) they achieve similar latency to        be translated with a transient IOMMU mapping [12] ded-
+that obtained without an IOMMU, (3) scalable IOVA al-        icated to the DMA, which is destroyed once it com-
+location and dynamic identity mappings perform compa-        pletes so that the device cannot access the memory fur-
+rably, and (4) kmalloc provides a simple solution with       ther [29, 37]. For example, a network interface card
+high performance, but can suffer from unbounded page         (NIC) driver maps the buffers it inserts into the NIC’s
+table blowup.                                                receive (RX) rings to receive packets. Once a packet ar-
+                                                             rives (via DMA), the driver unmaps the packet’s buffer.
+1   Introduction                                                These transient dynamic IOMMU mappings pose a
+Modern hardware provides an I/O memory management            performance challenge for driving high-throughput I/O
+unit (IOMMU) [2, 6, 24, 27] that mediates direct mem-        workloads. Such workloads require dynamic mappings
+ory accesses (DMAs) by I/O devices in the same way           to be created and destroyed millions of times a second
+that a processor’s MMU mediates memory accesses by           by multiple cores concurrently, since a single core of-
+instructions. The IOMMU interprets the target address        ten cannot sustain high enough throughput [30]. This
+of a DMA as an I/O virtual address (IOVA) [32] and at-       paper specifically targets multi-Gb/s networking—NICs
+tempts to translate it to a physical address, blocking the   providing 10–40 Gb/s (and soon 100 Gb/s)—as a repre-
+DMA if no translation (installed by the OS) exists.          sentative demanding case.
+   IOMMUs thus enable the OS to restrict a device’s             Current OSes melt down under load when the
+DMAs to specific physical memory locations, and              IOMMU is enabled in such a workload. Figure 1 demon-
+thereby protect the system from errant devices [18, 29],     strates the problem on Linux. It shows the combined
+throughput of 270 netperf instances running a request-         a bottleneck. We design a compatible scalable batching
+response workload (described in § 6) on a 16-core x86          data structure as a replacement (§ 5).
+server with a 10 Gb/s NIC, which we use as a running
+                                                               Design space exploration We evaluate the perfor-
+example throughout the paper. Mediating DMAs by the
+                                                               mance, page table memory consumption and implemen-
+IOMMU imposes only negligible overhead by itself, as
+                                                               tation complexity of our designs (§ 6). We find that (1)
+evidenced by the throughput obtained when the IOMMU
+                                                               our designs achieve 88.5%–100% of the throughput ob-
+is configured with static identity mappings that pass
+                                                               tained without an IOMMU, (2) our designs achieve sim-
+DMA requests through the IOMMU unchanged. In con-
+                                                               ilar latency to that obtained without an IOMMU, (3) the
+trast, when IOMMU management is enabled, through-
+                                                               savings dynamic identity mapping obtains from not allo-
+put drops significantly and ceases to increase with the
+                                                               cating IOVAs are negated by its more expensive IOMMU
+number of cores. This occurs with both Linux’s stock
+                                                               page table management, making it perform comparably
+IOMMU subsystem or the recent EiovaR [35] optimiza-
+                                                               to scalable IOVA allocation, and (4) IOVA-kmalloc pro-
+tion, which targets the sequential performance of Linux’s
+                                                               vides a simple solution with high performance, but it can
+IOMMU subsystem (see § 3.1). Other OSes suffer from
+                                                               suffer from unbounded page table blowup if empty page
+similar scalability problems (§ 3).
+                                                               tables are not reclaimed (as in Linux).
+   This paper thus considers the IOMMU manage-
+ment problem of designing a subsystem supporting high-         Contributions This paper makes four contributions:
+throughput concurrent updates of IOMMU mappings.                 • Identifying IOVA allocation and IOTLB invalida-
+We analyze the bottlenecks in current IOMMU manage-                tion as the bottlenecks in the IOMMU management
+ment designs (§ 3) and explore the trade-offs in the de-           subsystems of current OSes.
+sign space of their solutions (§§ 4–5). Our designs ad-          • Three designs for scalable IOVA allocation: (1) dy-
+dress the two main bottlenecks we find in current OSes:            namic identity mappings, (2) IOVA-kmalloc, and
+IOVA assignment and IOTLB invalidation.                            (3) per-core caching of IOVAs, as well as a scalable
+                                                                   IOTLB invalidation scheme.
+IOVA assignment Creating an IOMMU mapping for a                  • Evaluation of the new and existing designs on sev-
+physical memory location requires the OS to designate              eral high throughput I/O workloads.
+a range of IOVAs that will map to the physical loca-             • Design space exploration: we compare the perfor-
+tion. The driver will later configure the device to DMA            mance, page table memory consumption and imple-
+to/from the IOVAs. OSes presently use a dedicated, cen-            mentation complexity of the proposed designs.
+tralized (lock-protected) IOVA allocator that becomes a
+bottleneck when accessed concurrently.                         2   Background: IOMMUs
+   We propose three designs for scalable IOVA assign-          The IOMMU mediates accesses to main memory by I/O
+ment (§ 4), listed in decreasingly radical order: First, dy-   devices, much like the MMU mediates the memory ac-
+namic identity mapping eliminates IOVA allocation alto-        cesses performed by instructions. IOMMUs impose a
+gether by using a buffer’s physical address for its IOVA.      translation process on each device DMA. The IOMMU
+Consequently, however, maintaining the IOMMU page              interprets the target address of the DMA as an I/O vir-
+tables requires more synchronization than in the other         tual address (IOVA) [32], and attempts to translate it to
+designs. Second, IOVA-kmalloc eliminates only the spe-         a physical address using per-device address translations
+cialized IOVA allocator by allocating IOVAs using the          (or mappings) previously installed by the OS. If a trans-
+kernel’s optimized kmalloc subsystem. This simple and          lation exists, the DMA is routed to the correct physical
+efficient design is based on the observation that we can       address; otherwise, it is blocked.
+treat the addresses that kmalloc returns as IOVA page             In the following, we provide a high-level description
+numbers. Finally, per-core IOVA caching keeps the IOVA         of Intel’s x86 IOMMU operation [27]. Other architec-
+allocator, but prevents it from becoming a bottleneck by       tures are conceptually similar [2, 6, 24].
+using magazines [11] to implement per-core caches of
+                                                               IOMMU translations The OS maintains a page table
+free IOVAs, thereby satisfying allocations without ac-
+                                                               hierarchy for each device, implemented as a 4-level radix
+cessing the IOVA allocator.
+                                                               tree (as with MMUs). Each radix tree node is a 4 KB
+IOTLB invalidation Destroying an IOMMU mapping                 page. An inner node (page directory) contains 512 point-
+requires invalidating relevant entries in the IOTLB, a         ers (page directory entries, or PDEs) to child radix-tree
+TLB that caches IOMMU mappings. The Linux IOMMU                nodes. A leaf node (page table) contains 512 pointers
+subsystem amortizes the invalidation cost by batching          (page table entries, or PTEs) to physical addresses. PTEs
+multiple invalidation requests and then performing a sin-      also encode the type of access rights provided through
+gle global invalidation of the IOTLB instead. The batch-       this translation, i.e., read, write or both.
+ing data structure is lock-protected and quickly becomes          The virtual I/O address space is 48-bit addressable.
+The 36 most significant bits of an IOVA are its page                        must unmap the DMA address, at which point the map-
+frame number (PFN), which the IOMMU uses (when it                           ping is destroyed and the IOVA range deallocated.
+receives a DMA request) to walk the radix tree (9 bits                         High throughput I/O workloads can create and destroy
+per level) and look up the physical address and access                      such dynamic IOMMU mappings [12] millions of times
+rights associated with the IOVA. If no translation exists,                  a second, on multiple cores concurrently, and thereby put
+the IOMMU blocks the DMA and interrupts the proces-                         severe pressure on the IOMMU management subsystem
+sor. Unlike the analogous case in virtual memory, this                      implementing the DMA API.
+is not a page fault that lets the OS install a new map-
+ping and transparently resume operation of the faulting                     3     Performance Analysis of Present Designs
+access. Instead, the DMA is simply dropped. The I/O de-                     Here we analyze the performance of current IOMMU
+vice observes this and may not be able to recover. 1                        management designs under I/O workloads with high
+                                                                            throughput and concurrency. We use Linux/Intel-x86 as
+IOTLB translation caching The IOMMU maintains
+                                                                            a representative study vehicle; other OSes have similar
+an IOTLB that caches IOVA translations. If the OS mod-
+                                                                            designs (§ 3.4). Our test workload is a highly parallel RR
+ifies a translation, it must invalidate (or flush) any TLB
+                                                                            benchmark, in which a netperf [28] server is handling
+entries associated with the translation. The IOMMU sup-
+                                                                            270 concurrent TCP RR requests arriving on a 10 Gb/s
+ports individual invalidations as well as global ones,
+                                                                            NIC. § 6 fully details the workload and test setup.
+which flush all cached translations. The OS requests
+IOTLB invalidations using the IOMMU’s invalidation                             To analyze the overhead created by IOMMU manage-
+queue, a cyclic buffer in memory into which the OS adds                     ment (shown in Figure 1), we break down the execution
+invalidation requests and the IOMMU processes them                          time of the parallel RR workload on 16 cores (maximum
+asynchronously. The OS can request to be notified when                      concurrency on our system) into the times spent on the
+an invalidation has been processed.                                         subtasks required to create and destroy IOMMU map-
+                                                                            pings. Figure 2 shows this breakdown. For comparison,
+2.1     IOMMU protection                                                    the last 3 bars show the breakdown of our scalable de-
+                                                                            signs (§§ 4–5).
+IOMMUs can be used to provide inter- and intra-OS
+                                                                               We note that this parallel workload provokes patholog-
+protection [3, 43, 45, 47]. IOMMUs are used for inter-
+                                                                            ical behavior of the stock Linux IOVA allocator. This be-
+OS protection in virtualized setups, when the host as-
+                                                                            havior, which does not exist in other OSes, causes IOVA
+signs a device for the exclusive use of some guest. The
+                                                                            allocation to hog ≈ 60% of the execution time. The re-
+host creates a static IOMMU translation [45] that maps
+                                                                            cent EiovaR optimization [35] addresses this issue, and
+guest physical pages to the host physical pages backing
+                                                                            we therefore use Linux with EiovaR as our baseline. We
+them, allowing the guest VM to directly program de-
+                                                                            discuss this further in § 3.1.
+vice DMAs. This mode of operation does not stress the
+                                                                               In the following, we analyze each IOMMU man-
+IOMMU management code and is not the focus of this
+                                                                            agement subtask and its associated overhead in the
+work.
+                                                                            Linux design: IOVA allocation (§ 3.1), IOTLB in-
+   We focus on intra-OS protection, in which the OS uses
+                                                                            validations (§ 3.2), and IOMMU page table manage-
+the IOMMU to restrict a device’s DMAs to specific phys-
+                                                                            ment (§ 3.3).
+ical memory locations. This protects the system from er-
+rant devices [18, 29], malicious devices [8, 13, 46], and                   3.1    Linux IOVA Allocation
+buggy drivers [7, 15, 22, 31, 41, 44].
+                                                                            In Linux, each device is associated with an IOVA allo-
+   Intra-OS protection is implemented via the DMA
+                                                                            cator that is protected by a coarse-grained lock. Each
+API [12, 32, 37] that a device driver uses when program-
+                                                                            IOVA allocation and deallocation for the device acquires
+ming the DMAs. To program a device DMA to a physical
+                                                                            its allocator’s lock, which thus becomes a sequential bot-
+buffer, the driver must pass the buffer to the DMA API’s
+                                                                            tleneck for frequent concurrent IOVA allocate/deallocate
+map operation. The map operation responds with a DMA
+                                                                            operations. Figure 2 shows that IOVA allocation lock
+address, and it is the DMA address that the driver must
+                                                                            acquisition time in the baseline accounts for 31.9% of
+program the device to access.
+                                                                            the cycles. In fact, this is only because IOVA alloca-
+   Internally, the map operation (1) allocates an IOVA                      tions are throttled by a different bottleneck, IOTLB inval-
+range the same size as the buffer, (2) maps the IOVA                        idations (§ 3.2). Once we address the invalidations bot-
+range to the buffer in the IOMMU, and (3) returns the                       tleneck, the IOVA allocation bottleneck becomes much
+IOVA to the driver. Once the DMA completes, the driver                      more severe, accounting for nearly 70% of the cycles.
+   1 I/O page fault standardization exists, but since it requires support      This kind of design—acquiring a global lock for each
+from the device, it is not widely implemented or compatible with legacy     operation—would turn IOVA allocation into a sequential
+devices [2, 38, 39].                                                        bottleneck no matter which allocation algorithm is used
+                100                                                                                                     2500
+
+
+
+
+                                                                                                                                trans/sec [thousands]
+                80                                                                                                      2000
+ % cpu cycles
+
+
+
+                60                                                                                                      1500
+
+
+                40                                                                                                      1000
+
+
+                20                                                                                                      500
+
+
+                 0                                                                                                      0
+                               stock       eiovar       eiovar+scal.       dynamic     iova-kmalloc   magazine
+                                                        invalidation       identity                    caches
+
+
+                  iova allocation locks                    invalidation locks                         page table management
+                  iova allocation work                     invalidation work                          throughput achieved
+
+Figure 2. Throughput and cycle breakdown of time spent in IOMMU management on a 16-core parallel netperf RR workload.
+Stock Linux is shown for reference. Our baseline is Linux with EiovaR [35], which addresses a performance pathology in the
+stock Linux IOVA allocation algorithm (see § 3.1). In this baseline, the IOTLB invalidation bottleneck masks the IOVA allocation
+bottleneck, as evidenced by the third bar, which shows the breakdown after applying scalable IOTLB invalidations (§ 5) to the
+EiovaR baseline. Our designs are represented by the last three bars, nearly eliminating lock overhead.
+
+
+once the lock is acquired. We nevertheless discuss the                       the IOVA allocator lock.
+Linux IOVA allocation algorithm itself, since it has im-
+plications for IOMMU page table management.                                  3.2      Linux IOTLB Invalidation
+   The IOVA allocator packs allocated IOVAs as tightly                       Destroying an IOMMU mapping requires invalidating
+as possible towards the end of the virtual I/O address                       the IOTLB entry caching the mapping, both for correct-
+space. This minimizes the number of page tables re-                          ness and for security. For correctness, if the unmapped
+quired to map allocated IOVAs—an important feature,                          IOVA gets subsequently remapped to a different physi-
+because Linux rarely reclaims a physical page that gets                      cal address, the IOMMU will keep using the old trans-
+used as an IOMMU page table (§ 3.3).                                         lation and misdirect any DMAs to this IOVA. Security-
+   To achieve this, the IOVA allocator uses a red-black                      wise, destroying a mapping indicates the device should
+tree that holds pairwise-disjoint ranges of allocated vir-                   no longer have access to the associated physical mem-
+tual I/O page numbers. This allows a new IOVA range                          ory. If the translation remains present in the IOTLB, the
+to be allocated by scanning the virtual I/O address space                    device can still access the memory.
+from highest range to lowest range (with a right-to-left                        Unfortunately, waiting for the invalidation to complete
+traversal of the tree) until finding an unallocated gap that                 prior to returning control from IOVA unmapping code is
+can hold the desired range. Linux attempts to minimize                       prohibitively expensive (§ 6). In addition to the added
+such costly linear traversals through a heuristic in which                   latency of waiting for the invalidation to complete, is-
+the scan starts from some previously cached tree node.                       suing the invalidation command requires writing to the
+This often finds a desired gap in constant time [35]. 2                      IOMMU invalidation queue—an operation that must be
+   Unfortunately, the IOVA allocation patterns occurring                     serialized and thus quickly becomes a bottleneck.
+with modern NICs can cause the heuristic to fail, result-
+                                                                                As a result, Linux does not implement this strict in-
+ing in frequent long linear traversals during IOVA alloca-
+                                                                             validation policy by default. Instead, it implements a
+tions [35]. The EiovaR optimization avoids this problem
+                                                                             deferred invalidation policy that amortizes the cost of
+by adding a cache of recently freed IOVA ranges that can
+                                                                             IOTLB invalidation across multiple unmappings. Here,
+satisfy most allocations without accessing the tree [35].
+                                                                             an unmap operation buffers an invalidation request for its
+IOVA allocation time in Linux/EiovaR is thus compara-
+                                                                             IOVA in a global flush queue data structure and returns
+ble, if not superior, to other OSes. However, IOVA al-
+                                                                             without waiting for the invalidation to complete. Peri-
+location remains a sequential bottleneck with EiovaR as
+                                                                             odically (every 10 ms) or after batching 250 invalidation
+well (Figure 2), since the EiovaR cache is accessed under
+                                                                             requests, Linux performs a single global IOTLB invali-
+   2 We refer the reader to [35] for the exact details of the heuristic,     dation that empties the entire IOTLB (possibly flushing
+which are irrelevant for our purpose.                                        valid entries as well). Once the global invalidation com-
+pletes, the IOVA allocator is invoked to deallocate each            Updating page directories is more complex, since each
+IOVA range buffered in the flush queue.                          page directory entry (PDE) may map multiple IOVA
+   Thus, deferred invalidation maintains correctness, but        ranges (any range potentially mapped by a child page
+trades off some security—creating a window of time in            table), and multiple cores may be concurrently map-
+which a device can access unmapped IOVAs—in ex-                  ping/unmapping these ranges. A new child page table is
+change for performance. In practice, unmapped phys-              allocated by updating an empty PDE to point to a new
+ical pages rarely get reused immediately upon return-            page table. To synchronize this action in a parallel sce-
+ing from the unmap function. For example, a driver               nario, we allocate a physical page P and then attempt to
+may unmap multiple pages—possibly triggering a global            point the PDE to P using an atomic operation. This at-
+invalidation—before returning control to the system.             tempt may fail if another core has pointed the PDE to its
+Thus, deferred invalidation appears to be a pragmatic            own page table in the mean time, but in this case we sim-
+trade-off, and other OSes use similar mechanisms (§ 3.4).        ply free P and use the page table installed by the other
+   While deferred invalidation amortizes the latency of          core. Deallocation of page tables is more complex, and
+waiting for invalidations to complete, the flush queue is        is discussed in the following section.
+protected by a single (per IOMMU) invalidation lock. As             The bottom line, however, is that updating page ta-
+with the IOVA allocation lock, this is a non-scalable de-        bles is relatively cheap. Page directories are updated in-
+sign that creates a bottleneck—21.7% of the cycles are           frequently and these updates rarely experience conflicts.
+spent waiting for the invalidation lock in our experiment.       Similarly, last-level page table updates are cheap and
+                                                                 conflict free. As a result, page table updates account for
+Masking the IOVA allocator bottleneck Interest-
+                                                                 about 2.8% of the cycles in the system (Figure 2).
+ingly, the IOTLB invalidation bottleneck throttles the rate
+of IOVA allocation/deallocation operations, and thereby          3.3.2    Page Table Reclamation
+masks the severity of the IOVA allocator bottleneck.             To reclaim a page table, we must first be able to remove
+Deallocations are throttled because they occur while             any reference (PDE) to it. This requires some kind of
+processing the flush queue—i.e., under the invalidation          synchronization to atomically (1) determine that the page
+lock—and are therefore serialized. Allocations (map-             table is empty, (2) remove the pointer from the parent
+pings) are throttled because they are interleaved with           PDE to it, (3) prevent other cores from creating new en-
+unmappings. Since unmapping is slow because of the               tries in the page table in the mean time. In addition, be-
+IOTLB bottleneck, the interval between mappings in-              cause the IOTLB could cache PDEs [27], we can only
+creases and their frequency decreases.                           reclaim the physical page that served as the now-empty
+   Once we eliminate the IOTLB invalidation bottleneck,          page table after invalidating the IOTLB. Before that, it
+however, pressure on the IOVA allocation lock increases          is not safe to reclaim this memory or to map any other
+and with it the severity of its performance impact. In-          IOVA in the range controlled by it.
+deed, as Figure 2 shows, adding scalable deferred IOTLB             Due to this complexity, the Linux design sidesteps this
+invalidation (§ 5) to Linux/EiovaR increases IOVA lock           issue and does not reclaim page table memory, unless the
+waiting time by 2.1×.                                            entire region covered by a PDE is freed in one unmap ac-
+3.3     Linux Page Table Management                              tion. Thus, once a PDE is set to point to some page P, it is
+                                                                 unlikely to ever change, which in turn reduces the num-
+IOMMU page table management involves two tasks: up-              ber of updates that need to be performed for PDEs. This
+dating the page tables when creating/destroying map-             simple implementation choice is largely enabled by the
+pings, and reclaiming physical pages that are used as            IOVA allocation policy of packing IOVA ranges close to
+page tables when they become empty.                              the top of the address space. This policy results in re-
+3.3.1   Updating Page Tables                                     quiring a minimal number of page tables to map the allo-
+                                                                 cated IOVA ranges, which makes memory consumption
+We distinguish between updates to last-level page ta-
+                                                                 by IOMMU page tables tolerable.
+bles (leafs in the page table tree) and page directories (in-
+ner nodes).                                                      3.4     IOMMU Management in Other OSes
+    For last-level page tables, the Linux IOVA alloca-
+                                                                 This section compares the Linux/Intel-x86 IOMMU
+tor enables synchronization-free updates. Because each
+                                                                 management design to the designs used in the FreeBSD,
+mapping is associated with a unique IOVA page range,
+                                                                 Solaris3 , and Mac OS X systems. Table 1 summarizes
+updates of distinct mappings involve distinct page table
+                                                                 our findings, which are detailed below. In a nutshell, we
+entries. Further, the OS does not allow concurrent map-
+                                                                 find that (1) all OSes have scalability bottlenecks sim-
+ping/unmapping of the same IOVA range. Consequently,
+it is safe to update entries in last-level page tables without     3 Our source code references are to illumos, a fork of OpenSolaris.
+
+locking or atomic operations.                                    However, the code in question dates back to OpenSolaris.
+                                  IOVA allocation                        IOTLB invalidation        PT management
+                                 Allocator                   Scales?     Strict?  Scales?        Scales? Free mem?
+  Linux/Intel-      Red-black tree: linear time (made          7            7        7             3       Rarely
+  x86 (§§ 3.1–      constant by EiovaR).
+  3.3)
+  FreeBSD [20]      Red-black tree: logarithmic time           7           3          7             7          Yes
+  Solaris [21]      Vmem [11]: constant time                   7           7          7             7          No
+  Mac OS X [4]      Buddy allocator/red-black tree             7           7          7             7          No
+                    (size dependent): logarithmic time
+
+                       Table 1. Comparison of IOMMU management designs in current OSes
+
+
+ilar to—or worse than—Linux, (2) none of the OSes               a global lock. Solaris uses a more fine-grained technique,
+other than FreeBSD reclaim IOMMU page tables, (3)               protecting each page table with a read/write lock. How-
+FreeBSD is the only OS to implement strict IOTLB in-            ever, the root page table lock is acquired by every oper-
+validation. The other OSes loosen their intra-OS protec-        ation and thus becomes a bottleneck, since even acquisi-
+tion guarantees for increased performance. The last ob-         tions of a read/write lock in read mode create contention
+servation supports our choice of optimizing the Linux           on the lock’s shared cache line [33]. Finally, Mac OS
+deferred invalidation design in this work. Our scal-            X updates page tables under a global lock when using
+able IOMMU management designs (or simple variants               the buddy allocator, but outside of the lock—similarly to
+thereof) are thus applicable to these OSes as well.             Linux—when allocating from the red-black tree.
+IOVA allocation All systems use a central globally-             Page table reclamation Similarly to Linux, Solaris
+locked allocator, which is invoked by each IOVA alloca-         does not detect when a page table becomes empty and
+tion/deallocation operation, and is thus a bottleneck. The      thus does not attempt to reclaim physical pages that serve
+underlying allocator in FreeBSD is a red-black tree of          as page tables. Mac OS X bounds the number of IOMMU
+allocated ranges, similarly to Linux. However, FreeBSD          page tables (and therefore the size of I/O virtual memory
+uses a different traversal policy, which usually finds a        supported) and allocates them on first use while hold-
+range in logarithmic time [35]. Solaris uses the Vmem           ing the IOVA allocator lock. Mac OS X does not re-
+resource allocator [11], which allocates in constant time.      claim page tables as well. Only FreeBSD actively man-
+Mac OS X uses two allocators, both logarithmic—a                ages IOMMU page table memory; it maintains a count
+buddy allocator for small (≤ 512 MB) ranges and a               of used PTEs in each page table, and frees the page table
+red/black tree allocator for larger ranges.                     when it becomes empty.
+IOTLB invalidation FreeBSD is the only OS that im-              4      Scalable IOVA Allocation
+plements strict IOTLB invalidations, i.e., waits until the
+                                                                Here we describe three designs for scalable IOVA assign-
+IOTLB is invalidated before completing an IOVA un-
+                                                                ment, exploring several points in this design space: (1)
+map operation. The other OSes defer invalidations, al-
+                                                                dynamic identity mapping (§ 4.1), which does away with
+though differently than Linux: Solaris does not invalidate
+                                                                IOVA allocation altogether, (2) IOVA-kmalloc (§ 4.2)
+the IOTLB when unmapping. Instead, it invalidates the
+                                                                which implements IOVA allocation but does away with
+IOTLB when mapping an IOVA range, to flush any previ-
+                                                                its dedicated allocator, and (3) scalable IOVA alloca-
+ous stale mapping. This creates an unbounded window of
+                                                                tion (§ 4.3), which uses magazines [11] to alleviate con-
+time in which a device can still access unmapped mem-
+                                                                tention on the IOVA allocator using per-core caching of
+ory. An unmap on Mac OS X buffers an IOTLB invali-
+                                                                freed IOVA ranges.
+dation request in the cyclic IOMMU invalidation queue
+and returns without waiting for the invalidation to com-        4.1     Dynamic Identity Mapping
+plete. All these designs acquire the lock protecting the
+                                                                The fastest code is code that never runs. Our dynamic
+IOMMU invalidation queue for each operation, and thus
+                                                                identity mapping design applies this principle to IOVA
+do not scale.
+                                                                allocation. We observe that ordinarily, the buffers that
+Page table management Linux has the most scalable               a driver wishes to map are already physically contigu-
+IOMMU page table management scheme—exploiting                   ous. We thus propose to use such a physically contigu-
+IOVA range disjointness to update last-level PTEs with-         ous buffer’s physical address as its IOVA when map-
+out locks and inner PDEs with atomic operations. In con-        ping it, resulting in an identity (1-to-1) mapping in the
+trast, FreeBSD performs page table manipulations under          IOMMU. Due to intra-OS protection reasons, when the
+driver unmaps a buffer we must destroy its identity map-       should not happen during the normal course operation
+ping. We therefore refer to this scheme as dynamic iden-       for a properly functioning device and should be detected
+tity mappings—while the same buffer will always use the        and blocked.
+same mapping, this mapping is dynamically created and              To solve this problem, we exploit the fact that current
+destroyed to enforce protection of the buffer’s memory.        x86 processors support 48-bit I/O virtual memory ad-
+   Dynamic identity mapping eliminates the work and            dresses, but only 46-bits of physical memory addresses.
+locking involved in managing a distinct space of IOVAs,        The two most significant bits in each IOVA are thus
+replacing it with the work of translating a buffer’s ker-      “spare” bits, which we can use to differentiate mappings
+nel virtual address to a physical address. In most OSes,       with conflicting access permissions. Effectively, we par-
+this is an efficient and scalable operation—e.g., adding a     tition the identity mapping space into regions: three re-
+constant to the kernel virtual address. However, while dy-     gions, for read, write and read/write mappings, and a
+namic identity mapping completely eliminates the IOVA          fourth fallback region that contains addresses that cannot
+allocation bottleneck, it turns out to have broader impli-     be mapped with identity mappings—as discussed next.
+cations for other parts of the IOMMU management sub-           Non-contiguous buffers Some mapping operations
+system, which we now discuss.                                  are for physically non-contiguous buffers. For exam-
+Page table entry reuse Standard IOVA allocation as-            ple, Linux’s scatter/gather mapping functions map non-
+sociates each mapping with a distinct IOVA. As a re-           consecutive physical memory into contiguous virtual I/O
+sult, multiple mappings of the same page (e.g., for dif-       memory. Since identity mappings do not address this use
+ferent buffers on the same page) involve different page        case, we fall back to using the IOVA allocator in such
+table entries (§ 3.3). Dynamic identity mapping breaks         cases. To avoid conflicts with the identity mappings, IO-
+this property: a driver—or concurrent cores—mapping a          VAs returned by the IOVA allocator are used in the fourth
+previously mapped page will need to update exactly the         fallback region.
+same page table entries (PTEs).                                PTE reference count overflow We fall back to stan-
+   While repeated mapping operations will always write         dard IOVA allocation for mappings in which the 10-bit
+the same value (i.e., the physical address of the mapped       reference count overflows. That is, if we encounter a PTE
+page), unmapping operations pose a challenge. We need          whose reference count cannot be incremented while cre-
+to detect when the last unmapping occurs, so we can            ating a dynamic identity mapping, we abort (decrement-
+clear the PTE. This requires maintaining a reference           ing the references of any PTEs previously incremented
+count for each PTE. We use 10 of the OS-reserved bits          in the mapping process) and create the mapping using an
+in the last-level PTE structure [27] to maintain this refer-   IOVA obtained from the IOVA allocator.
+ence count. When the reference count hits zero, we clear
+the PTE and request an IOTLB invalidation.                     Page table memory Because physical addresses
+                                                               mapped by drivers are basically arbitrary, we lose the
+   Because multiple cores may concurrently update the
+                                                               property that IOVAs are densely packed. Consequently,
+same PTE, all PTE updates—including reference count
+                                                               more memory may be required to hold page tables. For
+maintenance—require atomic operations. In other words,
+                                                               example, if the first 512 map operations are each for a
+we need to (1) read the PTE, (2) compute the new PTE
+                                                               single page, IOVA allocation will map them all through
+value, (3) update it with an atomic operation that verifies
+                                                               the same last-level page table. With physical addresses,
+the PTE has not changed in the mean time, and (4) repeat
+                                                               we may need at least a page table per map operation. Un-
+this process if the atomic operation fails.
+                                                               fortunately, the physical pages used to hold these page
+Conflicting access permissions A second problem                tables will not get reclaimed (§ 3.3). In the worst case,
+posed by not having unique PTEs for each mapping is            page table memory consumption may keep increasing as
+how to handle mappings of the same physical page with          the system remains active.
+conflicting access permission (read, write, or both). For
+example, two buffers may get allocated by the network          4.2    IOVA-kmalloc
+stack on the same page—one for RX use, which the NIC           Our IOVA-kmalloc design explores the implications of
+should write to, and one for TX, which the NIC should          treating IOVA allocation as a general allocation prob-
+only read. To maintain intra-OS protection, we must sep-       lem. Essentially, to allocate an IOVA range of size R, we
+arately track mappings with different permissions, e.g.,       can allocate a block of R bytes in physical memory using
+so that once all writable mappings of a page are de-           the system’s kmalloc allocator, and use the block’s ad-
+stroyed, no PTE with write permissions remains. Further-       dress as an IOVA (our actual design is much less waste-
+more, even when a mapping with write permissions ex-           ful, as discussed below). The addresses kmalloc returns
+ists, we want to avoid promoting PTEs that should only         are unique per allocation, and thus IOVA-kmalloc main-
+be used to read (and vice-versa), as this kind of access       tains the efficient conflict-free updates of IOMMU page
+tables enabled by the original IOVA allocator.                 ory, unbounded blowup cannot occur.
+   One crucial difference between kmalloc and IOVA al-            To summarize, IOVA-kmalloc represents a classic
+location is that IOVAs are abstract—essentially, opaque        time/space trade-off—we relinquish memory in ex-
+integers—whereas kmalloc allocates physically con-             change for the efficiency and scalability of kmalloc,
+tiguous memory. It might therefore seem that the IOVA-         which is highly optimized due to its pervasive use
+kmalloc approach unacceptably wastes memory, since             throughout the kernel. Notably, these advantages come
+allocating R bytes to obtain an R-byte IOVA range dou-         for free, in terms of implementation complexity, debug-
+bles the system’s memory consumption. Fortunately, we          ging and maintenance, since kmalloc is already there,
+observe that the IOVA allocator need only allocate vir-        performs well, and is trivial to use.
+tual I/O page frame numbers (PFNs), and not arbitrary
+                                                               Handling IOVA collisions IOVAs are presently 48
+ranges. That is, given a physical buffer to map, we need
+                                                               bits wide [27]. x86 hardware presently supports 46-bits
+to find a range of pages that contains this buffer. This
+                                                               of physical address space [26]. Thus, because we treat
+makes the problem tractable: we can treat the physi-
+                                                               kmalloc addresses as virtual I/O PFNs, IOVA-kmalloc
+cal addresses that kmalloc returns as PFNs. That is,
+                                                               may allocate two addresses that collide when interpreted
+to map a range of R bytes, we kmalloc dR/4096e
+                                                               as PFNs in the 48-bit I/O virtual address space. That is,
+bytes and interpret the address of the returned block B
+                                                               we have 236 possible IOVA PFNs since pages are 4 KB,
+as a range of PFNs (i.e., covering the IOVA range of
+                                                               but kmalloc allocates from a pool of up to 246 bytes of
+[4096B, 4096(B + dR/4096e)].
+                                                               physical memory.
+   While this still wastes physical memory, the overhead
+                                                                  Such collisions are mathematically impossible on sys-
+is only 1 byte per virtual I/O page, rounded up to 8 bytes
+                                                               tems with at most 64 GB of physical memory (whose
+(the smallest unit kmalloc allocates internally). By com-
+                                                               physical addresses are 36-bit). To avoid these collisions
+parison, the last-level PTE required to map a page is itself
+                                                               on larger systems, IOVA allocations can invoke kmalloc
+8 bytes, so the memory blowup caused by IOVA-kmalloc
+                                                               with the GFP DMA flag. This flag instructs kmalloc to sat-
+allocating actual physical memory is never greater than
+                                                               isfy the allocation from a low memory zone whose size
+the memory overhead incurred by stock Linux for page
+                                                               we can configure to be at most 64 GB.4
+table management.
+   In fact, being a full-blown memory allocator that man-      Why allocate addresses? We could simply use a
+ages actual memory (not abstract integers) might actually      mapped buffer’s kernel virtual address as its IOVA PFN.
+turn out to be advantageous for kmalloc, as this prop-         However, we then lose the guarantee that different map-
+erty enables it to use the many techniques and optimiza-       pings obtain different IOVA PFNs (e.g., as the same
+tions in the memory allocation literature. In particular,      buffer can be mapped twice). This is exactly the problem
+kmalloc implements a version of slab allocation [10],          dynamic identity mapping tackles, only here we do not
+a fast and space-efficient allocation scheme. One aspect       have “spare” bits to distinguish mappings with different
+of this technique is that kmalloc stores the slab that con-    access rights as the virtual address space is 48 bits.
+tains metadata associated with an allocated address in the
+page structure of the address. This allows kmalloc to          4.3     Scalable IOVA Allocation with Maga-
+look up metadata in constant time when an address gets                 zines
+freed. In contrast, the Linux IOVA allocator has to main-      Our final design addresses the IOVA allocator bottleneck
+tain metadata externally, in the red-black tree, because       head-on, turning it into a scalable allocator. The basic
+there is no physical memory backing an IOVA. It must           idea is to add a per-core cache of previously deallocated
+thus access the globally-locked tree on each deallocation.     IOVA ranges. If most allocations can be satisfied from
+Page table memory blowup The main downside of                  the per-core cache, the actual allocator—with its lock—
+IOVA-kmalloc is that we have no control over the allo-         will be invoked rarely.
+cated addresses. Since kmalloc makes no effort to pack            Per-core caching poses several requirements. First, the
+allocations densely, the number of page tables required        per-core caches should be bounded. Second, they should
+to hold all the mappings will be larger than with the          efficiently handle producer/consumer scenarios observed
+Linux IOVA allocator. Moreover, if the same physical           in practice, in which one core continuously allocates IO-
+address is mapped, unmapped, and then mapped again,            VAs, which are later freed by another core. In a trivial de-
+IOVA-kmalloc may use a different IOVA when remap-              sign, only the core freeing IOVAs will build up a cache,
+ping. Because Linux does not reclaim page table mem-           while the allocating core will always invoke the under-
+ory, the amount of memory dedicated to page tables can            4 In theory, the GFP DMA memory zone must be accessible to legacy
+grow without bound. In contrast, dynamic identity map-         devices for DMA and thus addressable with 24 bits. But as we have
+ping always allocates the same IOVA to a given physical        an IOMMU, we only need to ensure that the IOVA ranges mapped to
+buffer. However, in an OS that manages page table mem-         legacy devices fall into the 24-bit zone.
+lying non-scalable allocator. We require that both cores           The remaining source of contention in this design is
+avoid interacting with the IOVA allocator.                      the serialization of writes to the cyclic IOMMU invali-
+   Magazines [11] provide a suitable solution. A maga-          dation queue—which is protected by a lock—in order to
+zine is an M-element per-core cache of objects—IOVA             buffer global IOTLB invalidation requests. Fortunately,
+ranges, in our case—maintained as a stack of objects.           accesses to the invalidation queue are infrequent, with at
+Conceptually, a core trying to allocate from an empty           most one invalidation every 250 invalidations or 10 ms,
+magazine (or deallocate into a full magazine) can re-           and short, as an invalidation request is added to the buffer
+turn its magazine to a globally-locked depot in exchange        and the lock is released; the core waits for the IOMMU to
+for a full (or empty) magazine. Magazines actually em-          process its queued invalidation without holding the lock.
+ploy a more sophisticated replenishment policy which               Security-wise, while we now might batch 250 invali-
+guarantees that a core can satisfy at least M allocations       dation requests per core, a destroyed IOVA range map-
+and at least M deallocations from its per-core cache be-        ping will usually be invalidated in the IOTLB just as
+fore it must access the depot. Thus, a core’s miss rate is      quickly as before. The reason is that some core per-
+bounded by 1/M.                                                 forms a global IOTLB invalidation, on average, every
+   We implement magazines on top of the original Linux          250 global invalidation requests. Thus, we do not sub-
+IOVA allocator, maintaining separate magazines and de-          stantially increase the window of time in which a device
+pots for different allocation sizes. Thus, this design still    can access an unmapped physical page. Unmapped IOVA
+controls page table blowup, as the underlying allocator         ranges may, however, remain in a core’s flush queue and
+densely packs allocated IOVAs.                                  will not be returned to the IOVA allocator for a longer
+                                                                time than the baseline design—they will be freed only
+5     Scalable IOTLB Invalidation                               when the core itself processes its local flush queue. We
+This section describes a scalable implementation of de-         did not observe this to be a problem in practice, espe-
+ferred IOTLB invalidations. Recall that Linux maintains         cially when the system experiences high IOMMU man-
+a flush queue containing a globally ordered list of all         agement load.
+IOVA ranges pending invalidation. We observe, how-
+ever, that a global flush queue—with its associated lock        6     Evaluation
+contention—is overkill. There is no real dependency be-         Here we evaluate our designs (§§ 4–5) and explore the
+tween the invalidation process of distinct IOVA ranges.         trade-offs they involve. We study two metrics: the per-
+Our only requirements are that until an entire IOVA range       formance obtained (§ 6.1), and the complexity of imple-
+mapping is invalidated in the IOTLB:                            menting the designs (§ 6.2).
+
+    1. The IOVA range will not be released back to the          6.1      Performance
+       IOVA allocator, to avoid having it allocated again       Experimental setup We implement the designs in
+       before the old mapping is invalidated.                   Linux 3.17.2. Our test setup consists of a client and a
+                                                                server, both Dell PowerEdge R430 rack machines. Each
+    2. The page tables that were mapping the IOVA range
+                                                                machine has dual 2.4 GHz Intel Xeon E5-2630 v3 8-core
+       will not be reclaimed. Since page directory entries
+                                                                processors, for a total of 16 cores per machine (hyper-
+       are also cached in the IOTLB, such a reclaimed page
+                                                                threading is disabled). Both machines are equipped with
+       table might get reused and data that appears as a
+                                                                32 GB 2133 MHz memory. The server is equipped with
+       valid page table entry be written to it, and this data
+                                                                a Broadcom NetXtreme II BCM57810 10 Gb/s NIC.
+       might then be used by the IOMMU.
+                                                                The client is equipped with an Intel 82599 10 Gb/s NIC
+Our approach We satisfy these requirements in a                 and runs an unmodified Ubuntu 3.13.0-45 Linux kernel.
+much more scalable manner by batching invalidation re-          The client’s IOMMU is disabled for all evaluations. The
+quests locally on each core instead of globally. Imple-         client and the server NICs are cross-connected to avoid
+menting this approach simply requires replicating the           network interference.
+current flush queue algorithm on a per-core basis. With         Methodology To obtain the best scalability, we (1)
+this design, the lock on a core’s flush queue is almost al-     configure the NIC on the server to use 15 rings, which is
+ways acquired by the owning core. The only exception is         the maximum number supported by the Broadcom NIC,
+when the queue’s global invalidation timeout expires—           allowing cores to interact with the NIC with minimal
+the resulting callback, which acquires the lock, may be         lock contention (no ring contention with < 16 cores),
+scheduled on a different core. However, not only does           and (2) distribute delivery of interrupts associated with
+such an event occur rarely (at most once every 10 ms),          different rings across different cores.5 Benchmarks are
+but it suggests that the IOMMU management subsystem
+is not heavily used in the first place.                             5 Default delivery is to core #0, which overloads this core.
+executed in a round-robin fashion, with each benchmark                               no iommu                       iova-kmalloc                                eiovar
+                                                                                     dynamic identity               magazines                                   stock linux
+running once for 10 seconds for each possible number of
+cores, followed by all benchmarks repeating. The cycle                                          absolute results                                        normalized results
+
+
+
+
+                                                                                                                        throughput (normalized)
+                                                                                     2500
+
+
+
+
+                                                             trans/sec [thousands]
+is run five times and the reported results are the medians                                                                                         1
+of the five runs.                                                                    2000
+                                                                                                                                                  0.8
+                                                                                     1500                                                         0.6
+Benchmarks In our benchmarks, we aim to use con-
+                                                                                     1000                                                         0.4
+current workloads that stress the IOMMU management
+                                                                                      500                                                         0.2
+subsystem.
+   Our first few benchmarks are based on netperf [28],                                     0                                                       0
+                                                                                                2 4 6 8 10 12 14 16                                     2 4 6 8 10 12 14 16
+a prominent network analysis tool. In our highly parallel                                            cores                                                    cores
+RR (request-response) benchmark, we run 270 instances
+of the netperf TCP RR test on the client, and limit the                                        Figure 3. Highly parallel RR throughput
+server side of netperf to the number of cores we wish to                             160
+                                                                                                        no iommu
+test on. Each TCP RR instance sends a TCP packet with                                140                dynamic identity
+
+
+
+
+                                                             average latency (µs)
+1 byte of payload to the server and waits for a 1 byte                                                  iova-kmalloc
+                                                                                     120                magazines
+response before sending the next one. In all, our bench-                             100                eiovar
+                                                                                                        stock linux
+mark has 270 ongoing requests to the netperf server                                  80
+at any given time, which bring the server close to 100%                              60
+CPU utilization even with IOMMU disabled. We report
+                                                                                     40
+the total number of such request-response transactions
+                                                                                     20
+the server responds to during the testing period.
+                                                                                      0
+   The second benchmark we use netperf for is a paral-                                           2      4       6         8    10                          12      14        16
+lel latency test. To achieve that, we run the netperf TCP                                                                cores
+RR test with as many instances as we allow server cores.        Figure 4. 1 netperf TCP RR instance per core latency test
+This allows each netperf request-response connection
+to run on its own dedicated core on both the client and      management), it only achieves 23% of the No-IOMMU
+the server.                                                  throughput at 16 cores.
+   Our third benchmark is memcached [19], a key-value           Our designs all perform at 93%–95% of No-IOMMU
+store service used by web applications to speed up           on a single core and scale far better than EiovaR, with
+read operations on slow resources such as databases          16-core throughput being 93% (magazines and dynamic
+and remote API calls. To avoid lock contention within        identity mapping) and 94% (IOVA-kmalloc) of the No-
+memcached, we run multiple instances, each pinned to         IOMMU results. Because of the overhead dynamic iden-
+run on a specific core. We measure memcached through-        tity mapping adds to page table updates, it does not out-
+put using memslap [1], which distributes requests among      perform the IOVA allocating designs—despite not per-
+the memcached instances. We configure memslap to run         forming IOVA allocation at all.
+on the client with 16 threads and 256 concurrent requests
+                                                                To summarize, in our designs IOMMU overhead is
+(16 per thread). We use memslap’s default configuration
+                                                             essentially constant and does not get worse with more
+of a 64-byte key, 1024-byte value and a ratio of 10%/90%
+                                                             concurrency. Most of this overhead consists of page ta-
+SET/GET operations.
+                                                             bles updates, which are essential when managing the
+   We note that network bandwidth benchmarks would           IOMMU in a transient manner.
+be less relevant here, as a single core can saturate the
+                                                                In our parallel latency test, shown in Figure 4, we see
+network on our machines. As an example, netperf TCP
+                                                             that Linux’s latency increases with multiple cores, even
+STREAM, which makes use of the NIC’s offloading fea-
+                                                             without IOMMU, from 29µs with one instance to 41µs
+tures, is able to saturate the network using 22% CPU time
+                                                             with 16 instances, each with its own core. While Eio-
+on a single core even running under EiovaR-Linux.
+                                                             vaR starts within 1.2µs of Linux’s latency on one core,
+Results Figure 3 depicts the throughput achieved by          the contention caused by its locks causes a 10µs gap at
+our highly parallel RR benchmark. Without an IOMMU,          16 cores. For the most part, our designs are on par with
+Linux scales nicely and obtains 14.4× TPS with 16 cores      Linux’s performance, actually achieving slightly shorter
+than with a single core. Because of the IOMMU manage-        latency than No-IOMMU Linux on 16 cores.
+ment bottlenecks, EiovaR-Linux does not scale as well,          The evaluation of memcached in Figure 5 paints a sim-
+obtaining only a 3.8× speedup. In particular, while Eio-     ilar picture to Figure 3 with up to 12 cores. The IOMMU
+vaR obtains 86% of the No-IOMMU throughput with 1            subsystem is indifferent to the different packet size in this
+core (due to the single-threaded overheads of IOMMU          workload (1052 bytes here, 1 byte in TCP RR) as the
+                         no iommu                    iova-kmalloc                                  eiovar                                no iommu                  iova-kmalloc                                eiovar
+                         dynamic identity            magazines                                     stock linux                           dynamic identity          magazines                                   stock linux
+                                  absolute results                                         normalized results                                   absolute results                                       normalized results
+
+
+
+
+                                                         throughput (normalized)
+
+
+
+
+                                                                                                                                                                       throughput (normalized)
+                         1200                                                                                                            2500
+trans/sec [thousands]
+
+
+
+
+                                                                                                                 trans/sec [thousands]
+                                                                                      1                                                                                                           1
+                         1000                                                                                                            2000
+                                                                                    0.8                                                                                                          0.8
+                          800
+                                                                                    0.6                                                  1500                                                    0.6
+                          600
+                                                                                    0.4                                                  1000                                                    0.4
+                          400
+                          200                                                       0.2                                                  500                                                     0.2
+                              0                                                       0                                                     0                                                     0
+                                  2 4 6 8 10 12 14 16                                      2 4 6 8 10 12 14 16                                  2 4 6 8 10 12 14 16                                    2 4 6 8 10 12 14 16
+                                       cores                                                     cores                                               cores                                                   cores
+
+                                    Figure 5. memcached throughput                                               Figure 7. Highly parallel netperf txns/sec with strict IOTLB
+                         iova-kmalloc                magazines                                     stock linux   invalidation
+                         dynamic identity            eiovar
+                              without iova-kmalloc                                          with iova-kmalloc    both of them, as well as stock Linux, allocate most page
+                        3mb                                                        900mb                         tables at NIC initialization, when all RX rings are allo-
+page table memory
+
+
+
+
+                                                         page table memory
+
+
+
+
+                                                                                   800mb
+                                                                                   700mb                         cated and mapped, as well as all TX/RX descriptors and
+                        2mb                                                        600mb                         other metadata.
+                                                                                   500mb
+                                                                                   400mb                            Our magazine-based design consumes 1.2× more
+                        1mb                                                        300mb
+                                                                                   200mb                         page table memory than stock Linux, because the cores
+                                                                                   100mb                         cache freed IOVAs in their per-core caches instead of re-
+                        0mb                                                          0mb
+                              0 20 40 60 80 100                                            0 20 40 60 80 100     turning them to the global allocator, requiring other cores
+                                  iteration                                                    iteration         to allocate new IOVAs from the allocator and thus in-
+                                                                                                                 creasing page table use.
+                                  Figure 6. Page table memory over time
+                                                                                                                    While dynamic identity mapping does not guarantee
+mappings are done per page and no data copying takes                                                             an upper bound on the number of IOVAs it utilizes over
+place. Starting at 12 cores, all of our designs achieve                                                          time, it turns out that the APIs used by the driver to
+line rate and therefore close the gap with No-IOMMU                                                              allocate buffers use caching themselves. Consequently,
+performance. Here, too, IOVA-kmalloc demonstrates the                                                            mapped addresses repeat across the iterations and the
+best performance out of our designs by a small mar-                                                              number of page tables does not explode. Still, 3.4× more
+gin (in all but 2 cores and > 12 cores, where they all                                                           page tables than stock Linux are allocated, since the ad-
+achieve line rate), as it is the most highly optimized of                                                        dresses are not packed.
+the three. With a single core, all of our designs are be-                                                           In contrast to the other schemes, IOVA-kmalloc ex-
+tween 89% (dynamic identity) and 91% (IOVA-kmalloc)                                                              hibits a blowup of page table memory use. Since the ad-
+of No-IOMMU performance. At 9 cores, after which                                                                 dresses IOVA-kmalloc receives from kmalloc are influ-
+No-IOMMU Linux throughput begins to near line rate,                                                              enced by system-wide allocation activity, IOVA-kmalloc
+our designs’ relative throughput is between 89.5% (dy-                                                           uses a much wider and constantly changing set of IOVAs.
+namic identity) and 91.5% (IOVA-kmalloc). EiovaR also                                                            This causes its page table memory consumption to grow
+stops scaling well before 16 cores, but as opposed to our                                                        in an almost linear fashion. We conclude that while
+designs, it does not do that due to achieving line rate,                                                         IOVA-kmalloc is the best performing design, by a slight
+plateauing at 40% of it, starting with 9 cores.                                                                  margin, its use must be accompanied by memory recla-
+                                                                                                                 mation of unused page tables. This underscores the need
+Page table memory consumption Linux rarely re-                                                                   for managing the IOMMU page table memory in a scal-
+claims a page used as an IOMMU page table (§ 3.3).                                                               able manner—§ 3.3 describes the challenges involved.
+Figure 6 illustrates the memory consumption dynamics
+this policy creates. We run 100 iterations of our parallel                                                       Strict invalidation Figure 7 shows the parallel RR
+RR benchmark and plot the number of IOMMU page ta-                                                               benchmark throughput with strict IOTLB invalidation,
+bles (in all levels) that exist in the system before the tests                                                   i.e., full intra-OS protection. As invalidations are not de-
+start (but after system and NIC initialization) and after                                                        ferred, our scalable IOTLB invalidation optimization is
+each iteration.                                                                                                  irrelevant for this case. While we observe very minor
+   Both EiovaR and our magazine-based design, which                                                              throughput difference between the IOVA allocation de-
+are based on Linux’s current IOVA allocator, minimize                                                            signs when using a small number of cores, even this dif-
+page table memory consumption by packing allocated                                                               ference is no longer evident when more than 6 cores
+IOVAs at the top of the address space. As Figure 6 shows,                                                        are used, with all designs obtaining about 1/6 the TPS
+                                Lines              Impl.      tual memory has simpler semantics than standard vir-
+       Design                              Files
+                              add    del            time      tual memory, which allows us to explore simpler de-
+    Dynamic        identity   +397 -92      1      Weeks      signs. In particular, (1) IOVA ranges cannot be partially
+    mapping (§ 4.1)                                           unmapped, unlike standard mmap()ed ranges, and (2)
+    IOVA-kmalloc (§ 4.2)      +56    -44    1      Hours      IOVA mappings can exploit the preexisting address of the
+    IOVA allocation with      +362   -79    3      Days       mapped buffers (as in dynamic identity mapping), while
+    magazines (§ 4.3)                                         creation of a virtual memory region can occur before the
+    Scalable IOTLB in-        +97    -37    1      Hours      allocation of the physical memory backing it.
+    validation (§ 5)                                             Bonwick introduced magazines to improve scalability
+                                                              in the Vmem resource allocator [11]. Since Vmem is a
+    Table 2. Implementation complexity of our designs         general allocator, however, it does not minimize page ta-
+                                                              ble memory consumption of allocated IOVAs, in contrast
+                                                              to the specialized Linux allocator. Our IOVA-kmalloc
+of No-IOMMU Linux by 16 cores. In all designs, the
+                                                              design additionally shows that a dedicated resource allo-
+contention over the invalidation queue lock becomes the
+                                                              cator may not be required in the first place. Finally, part
+dominating factor (§ 3.2). Thus, strict IOTLB invalida-
+                                                              of our contribution is the re-evaluation of magazines on
+tion appears incompatible with a scalable implementa-
+                                                              modern machines and workloads.
+tion.
+6.2     Implementation Complexity                             8    Conclusion
+Table 2 reports the source code changes required to im-       Today, IOMMU-based intra-OS protection faces a per-
+plement our designs in Linux 3.17.2. The table also es-       formance challenge in high throughput and highly con-
+timates the time it would take us to re-implement each        current I/O workloads. In current OSes, the IOMMU
+approach from scratch. IOVA-kmalloc is the simplest           management subsystem is not scalable and creates a pro-
+design to implement, essentially replacing calls to the       hibitive bottleneck.
+IOVA allocator with a kmalloc() call. Most of the line           Towards addressing this problem, we have explored
+changes reported for IOVA-kmalloc are due to techni-          the design space of scalable IOMMU management
+cal changes, replacing the struct representing an IOVA        approaches. We proposed three designs for scalable
+with an integer type. Implementation of the magazines         IOVA assignment—dynamic identity mapping, IOVA-
+design is a bit more complex, requiring an implementa-        kmalloc, and per-core IOVA caching—as well as a scal-
+tion of a magazine-based caching layer on top of the ex-      able IOTLB invalidation scheme. Our designs achieve
+isting IOVA allocator, as well as optimizing its locking      88.5%–100% of the performance obtained without an
+strategy. Dynamic identity mapping is the most compli-        IOMMU.
+cated and intrusive of our IOVA assignment designs, as           Our evaluation demonstrates the trade-offs of the dif-
+it calls for a surgical modification of page table manage-    ferent designs. Namely, (1) the savings dynamic identity
+ment itself, maintaining mapping book-keeping within          mapping obtains from not allocating IOVAs are negated
+the table itself and synchronizing updates to the same        by its more expensive IOMMU page table management,
+mapping from multiple cores in parallel.                      making it perform comparably to scalable IOVA alloca-
+                                                              tion, and (2) IOVA-kmalloc provides a simple solution
+7     Related Work                                            with high performance, but suffers from unbounded page
+Most work addressing the poor performance associ-             table blowup. This emphasizes the importance of manag-
+ated with using IOMMUs tackles only sequential per-           ing the IOMMU page table memory in a scalable manner
+formance [3, 9, 14, 34, 42, 45, 47, 35], for example by       as well, which is interesting future work.
+reducing the number of mapping operations [45], defer-
+                                                              References
+ring or offloading IOTLB invalidation work [3], and im-
+proving the IOVA allocator algorithm [14, 35, 42]. Cas-        [1] A KER , B. Memslap - load testing and benchmarking a server.
+                                                                   http://docs.libmemcached.org/bin/memslap.html. lib-
+cardo [14] does consider multicore workloads, but his              memcached 1.1.0 documentation.
+proposal improves only the sequential part of the IOVA
+                                                               [2] AMD I NC .      AMD IOMMU architectural specification,
+allocator. In contrast, our work identifies and attacks the        rev 2.00. http://developer.amd.com/wordpress/media/
+scalability bottlenecks in current IOMMU management                2012/10/488821.pdf, Mar 2011.
+designs. In addition, our scalable IOVA allocation is or-      [3] A MIT, N., B EN -Y EHUDA , M., T SAFRIR , D., AND S CHUSTER ,
+thogonal to sequential improvements in the IOVA alloca-            A. vIOMMU: efficient IOMMU emulation. In USENIX Annual
+tor, since it treats it as a black box.                            Technical Conference (ATC) (2011), pp. 73–86.
+   Clements et al. propose designs for scalable manage-        [4] A PPLE     C OMPUTER.          IOPCIFamily/IOPCIFamily-
+ment of process virtual address spaces [16, 17]. I/O vir-          196.3/vtd.c, Source Code File of Mac OS X.       http:
+     //www.opensource.apple.com/source/IOPCIFamily/                       [21] G ARRETT D’A MORE. i86pc/io/immu dvma.c, Source Code File
+     IOPCIFamily-196.3/vtd.c. (Accessed: Jan 2015).                            of illumos. https://github.com/illumos/illumos-gate/
+ [5] A PPLE I NC .     Thunderbolt device driver program-                      blob/master/usr/src/uts/i86pc/io/immu_dvma.c. (Ac-
+     ming guide: Debugging VT-d I/O MMU virtualiza-                            cessed: Jan 2015).
+     tion.         https://developer.apple.com/library/                   [22] H ERDER , J. N., B OS , H., G RAS , B., H OMBURG , P., AND
+     mac/documentation/HardwareDrivers/Conceptual/                             TANENBAUM , A. S. Failure resilience for device drivers. In
+     ThunderboltDevGuide/DebuggingThunderboltDrivers/                          IEEE/IFIP Annual International Conference on Dependable Sys-
+     DebuggingThunderboltDrivers.html, 2013. (Accessed:                        tems and Networks (DSN) (2007), pp. 41–50.
+     May 2014).                                                           [23] H ILL , B. Integrating an EDK custom peripheral with a LocalL-
+ [6] ARM H OLDINGS. ARM system memory management unit                          ink interface into Linux. Tech. Rep. XAPP1129 (v1.0), XILINX,
+     architecture specification — SMMU architecture version 2.0.               May 2009.
+     http://infocenter.arm.com/help/topic/com.arm.                        [24] IBM C ORPORATION. PowerLinux servers — 64-bit DMA con-
+     doc.ihi0062c/IHI0062C_system_mmu_architecture_                            cepts. http://pic.dhe.ibm.com/infocenter/lnxinfo/
+     specification.pdf, 2013.                                                  v3r0m0/topic/liabm/liabmconcepts.htm.         (Accessed:
+ [7] BALL , T., B OUNIMOVA , E., C OOK , B., L EVIN , V., L ICHTEN -           May 2014).
+     BERG , J., M C G ARVEY, C., O NDRUSEK , B., R AJAMANI , S. K.,       [25] IBM C ORPORATION. AIX kernel extensions and device support
+     AND U STUNER , A. Thorough static analysis of device drivers.             programming concepts.   http://public.dhe.ibm.com/
+     In ACM EuroSys (2006), pp. 73–85.                                         systems/power/docs/aix/71/kernextc_pdf.pdf, 2013.
+ [8] B ECHER , M., D ORNSEIF, M., AND K LEIN , C. N. FireWire: all             (Accssed: May 2015).
+     your memory are belong to us. In CanSecWest Applied Security         [26] I NTEL C ORPORATION.   Intel 64 and IA-32 Architectures
+     Conference (2005).                                                        Software Developers Manual, Volume 3: System Program-
+ [9] B EN -Y EHUDA , M., X ENIDIS , J., O STROWSKI , M., R ISTER ,             ming Guide.    http://download.intel.com/products/
+     K., B RUEMMER , A., AND VAN D OORN , L. The price of safety:              processor/manual/325384.pdf, 2013.
+     Evaluating IOMMU performance. In Ottawa Linux Symposium              [27] I NTEL C ORPORATION. Intel Virtualization Technology for
+     (OLS) (2007), pp. 9–20.                                                   Directed I/O, Architecture Specification - Architecture Specifica-
+[10] B ONWICK , J. The Slab allocator: An object-caching kernel                tion - Rev. 2.3. http://www.intel.com/content/dam/www/
+     memory allocator. In USENIX Summer Annual Technical Con-                  public/us/en/documents/product-specifications/
+     ference (1994), pp. 87–98.                                                vt-directed-io-spec.pdf, Oct 2014.
+                                                                          [28] J ONES , R. A. A network performance benchmark (revision 2.0).
+[11] B ONWICK , J., AND A DAMS , J. Magazines and Vmem: Extend-
+                                                                               Tech. rep., Hewlett Packard, 1995. http://www.netperf.
+     ing the Slab allocator to many CPUs and arbitrary resources. In
+                                                                               org/netperf/training/Netperf.html.
+     USENIX Annual Technical Conference (ATC) (2001), pp. 15–44.
+                                                                          [29] K ADAV, A., R ENZELMANN , M. J., AND S WIFT, M. M. Toler-
+[12] B OTTOMLEY, J. E. Dynamic DMA mapping using the generic
+                                                                               ating hardware device failures in software. In ACM Symposium
+     device. https://www.kernel.org/doc/Documentation/
+                                                                               on Operating Systems Principles (SOSP) (2009), pp. 59–72.
+     DMA-API.txt. Linux kernel documentation.
+                                                                          [30] L EITAO , B. H. Tuning 10Gb network cards on Linux. In Ottawa
+[13] C ARRIER , B. D., AND G RAND , J. A hardware-based memory
+                                                                               Linux Symposium (OLS) (2009), pp. 169–189.
+     acquisition procedure for digital investigations. Digital Investi-
+     gation 1, 1 (Feb 2014), 50–60.                                       [31] L E V ASSEUR , J., U HLIG , V., S TOESS , J., AND G ÖTZ , S. Un-
+                                                                               modified device driver reuse and improved system dependability
+[14] C ASCARDO , T.    DMA API performance and con-                            via virtual machines. In USENIX Symposium on Operating Sys-
+     tention on IOMMU enabled environments.      http:                         tem Design and Implementation (OSDI) (2004), pp. 17–30.
+     //events.linuxfoundation.org/images/stories/
+     slides/lfcs2013_cascardo.pdf, 2013.                                  [32] Documentation/intel-iommu.txt, Linux 3.18 documentation
+                                                                               file.   https://www.kernel.org/doc/Documentation/
+[15] C HOU , A., YANG , J., C HELF, B., H ALLEM , S., AND E NGLER ,            Intel-IOMMU.txt. (Accessed: Jan 2015).
+     D. An empirical study of operating systems errors. In ACM Sym-
+     posium on Operating Systems Principles (SOSP) (2001), pp. 73–        [33] L IU , R., Z HANG , H., AND C HEN , H. Scalable Read-mostly
+     88.                                                                       Synchronization Using Passive Reader-Writer Locks. In USENIX
+                                                                               Annual Technical Conference (ATC) (2014), pp. 219–230.
+[16] C LEMENTS , A. T., K AASHOEK , M. F., AND Z ELDOVICH ,
+     N. Scalable Address Spaces Using RCU Balanced Trees. In              [34] M ALKA , M., A MIT, N., B EN -Y EHUDA , M., AND T SAFRIR , D.
+     ACM International Conference on Architectural Support for Pro-            rIOMMU: Efficient IOMMU for I/O devices that employ ring
+     gramming Languages and Operating Systems (ASPLOS) (2012),                 buffers. In ACM International Conference on Architectural Sup-
+     pp. 199–210.                                                              port for Programming Languages and Operating Systems (ASP-
+                                                                               LOS) (2015), pp. 355–368.
+[17] C LEMENTS , A. T., K AASHOEK , M. F., AND Z ELDOVICH , N.
+                                                                          [35] M ALKA , M., A MIT, N., AND T SAFRIR , D. Efficient Intra-
+     RadixVM: Scalable Address Spaces for Multithreaded Applica-
+                                                                               Operating System Protection Against Harmful DMAs.       In
+     tions. In ACM EuroSys (2013), pp. 211–224.
+                                                                               USENIX Conference on File and Storage Technologies (FAST)
+[18] C RISWELL , J., G EOFFRAY, N., AND A DVE , V. Memory safety               (2015), pp. 29–44.
+     for low-level software/hardware interactions. In USENIX Secu-
+                                                                          [36] M AMTANI , V.         DMA directions and Windows.
+     rity Symposium (2009), pp. 83–100.
+                                                                               http://download.microsoft.com/download/a/f/d/
+[19] F ITZPATRICK , B. Distributed caching with memcached. Linux               afdfd50d-6eb9-425e-84e1-b4085a80e34e/sys-t304_
+     Journal 2004, 124 (Aug 2004).                                             wh07.pptx, 2007. (Accessed: May 2014).
+[20] F REE BSD F OUNDATION. x86/iommu/intel gas.c, source code            [37] M ILLER , D. S., H ENDERSON , R., AND J ELINEK , J. Dy-
+     file of FreeBSD 10.1.0. https://github.com/freebsd/                       namic DMA mapping guide. https://www.kernel.org/doc/
+     freebsd/blob/release/10.1.0/sys/x86/iommu/intel_                          Documentation/DMA-API-HOWTO.txt. Linux kernel docu-
+     gas.c. (Accessed: Jan 2015).                                              mentation.
+[38] PCI-SIG. Address translation services revision 1.1. https:         [44] W ILLIAMS , D., R EYNOLDS , P., WALSH , K., S IRER , E. G.,
+     //www.pcisig.com/specifications/iov/ats, Jan 2009.                      AND S CHNEIDER , F. B. Device driver safety through a reference
+
+[39] ROEDEL , J.     IOMMU Page Faulting and MM Integra-                     validation mechanism. In USENIX Symposium on Operating Sys-
+     tion.   http://www.linuxplumbersconf.org/2014/ocw/                      tem Design and Implementation (OSDI) (2008), pp. 241–254.
+     system/presentations/2253/original/iommuv2.pdf.
+     Linux Plumbers Conference 2014.                                    [45] W ILLMANN , P., R IXNER , S., AND C OX , A. L. Protection strate-
+                                                                             gies for direct access to virtualized I/O devices. In USENIX An-
+[40] S ESHADRI , A., L UK , M., Q U , N., AND P ERRIG , A. SecVi-            nual Technical Conference (ATC) (2008), pp. 15–28.
+     sor: A tiny hypervisor to provide lifetime kernel code integrity
+     for commodity OSes. In ACM Symposium on Operating Systems          [46] W OJTCZUK , R. Subverting the Xen hypervisor. In Black
+     Principles (SOSP) (2007), pp. 335–350.                                  Hat (2008). http://www.blackhat.com/presentations/
+[41] S WIFT, M., B ERSHAD , B., AND L EVY, H. Improving the reli-            bh-usa-08/Wojtczuk/BH_US_08_Wojtczuk_Subverting_
+     ability of commodity operating systems. ACM Transactions on             the_Xen_Hypervisor.pdf. (Accessed: May 2014).
+     Computer Systems (TOCS) 23, 1 (Feb 2005), 77–110.
+[42] T OMONORI , F. DMA representations sg table vs. sg ring IOM-       [47] YASSOUR , B.-A., B EN -Y EHUDA , M., AND WASSERMAN , O.
+     MUs and LLD’s restrictions. In USENIX Linux Storage and                 On the DMA mapping problem in direct device assignment. In
+     Filesystem Workshop (LSF) (2008). https://www.usenix.                   ACM International Systems and Storage Conference (SYSTOR)
+     org/legacy/events/lsf08/tech/IO_tomonori.pdf.                           (2010), pp. 18:1–18:12.
+
+[43] WALDSPURGER , C., AND ROSENBLUM , M. I/O virtualization.
+     Communications of the ACM (CACM) 55, 1 (Jan 2012), 66–73.
+

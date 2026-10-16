@@ -1,0 +1,1456 @@
+ Rethinking Page Table Structure for Fast Address Translation in
+             GPUs: A Fixed-Size Hashed Page Table
+                   Sungbin Jang                                            Junhyeok Park                                  Osang Kwon
+           Sungkyunkwan University                                 Sungkyunkwan University                         Sungkyunkwan University
+               Republic of Korea                                       Republic of Korea                               Republic of Korea
+             sunbi3361@skku.edu                                       vzx00770@skku.edu                               osang915@skku.edu
+
+                                                Yongho Lee                                       Seokin Hong
+                                       Sungkyunkwan University                           Sungkyunkwan University
+                                           Republic of Korea                                 Republic of Korea
+                                          jhyn205@skku.edu                                   seokin@skku.edu
+
+Abstract                                                                             CCS Concepts
+GPU memory virtualization has become essential for efficient pro-                    • Computing methodologies → Graphics processors; • Soft-
+gramming, memory management, and address space sharing among                         ware and its engineering → Virtual memory.
+computing devices in heterogeneous systems. Conventional GPU
+virtual memory systems use multi-level Radix Page Tables (RPTs) to                   Keywords
+store virtual-to-physical address mapping in device (GPU) memory.                    GPGPU, Virtual Memory, Page Tables
+When a TLB miss occurs, a page table walker accesses each level
+of the page table sequentially to find the desired mapping. These                    ACM Reference Format:
+                                                                                     Sungbin Jang, Junhyeok Park, Osang Kwon, Yongho Lee, and Seokin Hong.
+sequential accesses significantly degrade performance, adding pres-
+                                                                                     2024. Rethinking Page Table Structure for Fast Address Translation in GPUs:
+sure to the GPU memory hierarchy. To make matters worse, recent
+                                                                                     A Fixed-Size Hashed Page Table. In International Conference on Parallel
+computing systems now support five-level RPTs, further increasing                    Architectures and Compilation Techniques (PACT ’24), October 14–16, 2024,
+the number of memory accesses required per page table walk.                          Long Beach, CA, USA. ACM, New York, NY, USA, 13 pages. https://doi.org/
+   To tackle this problem, we propose a novel framework called                       10.1145/3656019.3676900
+Fixed-Size HPT (FS-HPT), which employs Hashed Page Tables (HPTs)
+instead of traditional RPTs. Our framework is motivated by two key                   1    Introduction
+observations. First, a GPU’s local page table is primarily responsi-                 Modern GPUs supports memory virtualization to enable multi-
+ble for storing the Page Table Entries (PTEs) of pages currently in                  tenancy [38, 45], sharing address space with CPUs [48, 49], and
+GPU memory. Second, most remote mappings are only live for a                         demand paging [1, 27, 47]. However, the benefits provided by mem-
+short time and account for a small portion of the page table during                  ory virtualization do not come for free. To support memory virtual-
+program execution. Motivated by these observations, FS-HPT uses                      ization, GPUs employ hardware components such as a Translation
+a large fixed-size hash table as the GPU’s local page table. In the                  Lookaside Buffer (TLB) and a GPU MMU (GMMU). Before accessing
+proposed framework, the page table size does not grow. Thus, our                     data pages, the GPU must translate a virtual address to a physical
+approach fundamentally avoids page table resizing, a critical limita-                address. For this translation, the GPU first accesses the TLB, and
+tion of HPTs. Instead, FS-HPT strategically evicts rarely-used PTEs                  when the translation request is missed in the TLB, it looks up a page
+from the page table to reduce hash collisions. FS-HPT employs a                      table. A discrete GPU typically has its own page table in the device
+step table to provide fast table lookups and a victim buffer to mini-                memory that maintains the virtual-to-physical mappings. Conven-
+mize the impact of PTE eviction on performance. These additional                     tional GPU page tables use a multi-level tree structure known as
+components incur negligible overhead. Our experimental results                       Radix Page Tables (RPTs) [36, 37].
+demonstrate that for irregular memory-intensive workloads, FS-                          Due to GPUs experiencing frequent TLB misses, the address
+HPT and FS-HPT integrated with the state-of-the-art page table                       translation process can become a significant performance bottle-
+walk technique outperform RPTs by an average of 27.8% and 61.7%,                     neck. Over the years, many efforts have been made to mitigate
+respectively.                                                                        these address translation overheads in GPUs. Increasing TLB reach
+                                                                                     by coalescing TLB entries or page promotion can effectively reduce
+                                                                                     address translation overhead [6, 29, 42]. Li et al. and Baruah et al.
+                                                                                     exploited locality within or between Cooperative Thread Arrays
+                                                                                     (CTAs) to increase the TLB hit rate [8, 31]. Several prior works have
+                                                                                     attempted to reduce page table lookup overhead as the current GPU
+This work is licensed under a Creative Commons Attribution International
+4.0 License.                                                                         page table design (i.e., RPTs) involves sequential pointer-chasing
+                                                                                     accesses, known as page table walk, which causes severe perfor-
+PACT ’24, October 14–16, 2024, Long Beach, CA, USA                                   mance degradation. Shin et al. reduced the TLB miss penalty by
+© 2024 Copyright held by the owner/author(s).
+ACM ISBN 979-8-4007-0631-8/24/10                                                     scheduling page table walk requests [48] and by coalescing page
+https://doi.org/10.1145/3656019.3676900                                              table walks into a single memory access [49].
+
+
+
+
+                                                                               325
+PACT ’24, October 14–16, 2024, Long Beach, CA, USA                                 Sungbin Jang, Junhyeok Park, Osang Kwon, Yongho Lee, and Seokin Hong
+
+
+                                                                                                                                 ➋
+    However, all these techniques use the inefficient multi-level RPTs          SMs                     Scratchpad                                     Shared L2 TLB                  MSHR
+                                                                                                                                                                                             ➌
+as the baseline. Although it is possible to use Page Walk Caches                  CU                     Memory
+
+                                                                                                    Coal.                            GMMU
+(PWCs) [7, 9, 10, 21] to replace these sequential pointer-chasing op-              CU                            L1 Cache
+                                                                                                                                         Page Walk Queue
+
+
+
+
+                                                                                       •••
+erations with an MMU cache lookup, PWCs do not work effectively                                                   L1 TLB
+                                                                                   CU               Coal.
+                                                                                                             ➊          MSHR
+for emerging memory-intensive workloads with large memory foot-
+                                                                                                                                         Page Table Walker
+prints and irregular memory access patterns [41, 50, 54]. To make                            Shared L2 Cache                         ➎
+                                                                                                                                           PTW0       PTW1       PTW2       •••    PTW15
+matters worse, recent computing systems now support five-level                 Device memory                                                                       ➍
+                                                                                                                                         Page Walk Cache
+RPTs, expanding the virtual and physical address space [24] and                  Page
+                                                                                             Data                                                Lv.4 idx   Lv.3 idx    Lv.2 idx     PA
+further increasing page table walk overheads.                                   Table
+                                                                                                                                                  0x000      XXX         XXX       0x00E0
+                                                                                                                                          Lv.4
+    In this paper, we propose a novel framework, called Fixed-Size             Page Table                                                         0x001      XXX         XXX       0x00E8
+
+                                                                                             Lv.4     Lv.3       Lv.2     Lv.1                    0x000      0x02A       XXX       0x0FA0
+HPT (FS-HPT), which aims to tackle the fundamental limitation of                                                                          Lv.3
+                                                                                                                                                  0x001      0x13C       XXX       0x0FA8
+current RPT-based GPU virtual memory. FS-HPT adopts Hashed                                                                                        0x000      0x02A      0x006      0x74B0
+                                                                                                                                          Lv.2
+Page Tables (HPTs) instead of RPTs for the GPU page table. Since                PTBR                                                              0x001      0x13C      0x17D      0x2280
+
+HPTs use a hash function to calculate a hash value and directly use
+                                                                                                                    Interconnect (PCIe/NVLink) ➏ ➑
+this as the table index, the HPT lookup requires only a memory
+                                                                                                                   ➐ GPU Driver (CPU side)
+reference (if there is no hash collision). This fast lookup mecha-
+                                                                                                    Figure 1: Baseline GPU architecture
+nism of HPTs can eliminate the expensive pointer-chasing memory
+accesses required by conventional RPTs.
+    Several recent works have proposed HPTs in the CPU do-                 factor) below a target level. With this remote PTE eviction policy,
+main [50, 51, 54]. State-of-the-art HPT designs [50, 51] reduce            the GPU driver [39] evicts rarely-used remote mappings from the
+address translation overheads by an average of 41%. They elab-             page table and stores them in a victim buffer implemented as a radix
+orately designed the HPTs to effectively manage hash collisions,           tree structure for scalability.
+one of the critical challenges when using HPTs [54]. However, prior           The main contributions of this paper are as follows:
+HPT designs are primarily optimized for CPUs, so it is not straight-           • We propose a novel framework, called FS-HPT, to improve
+forward to simply apply those designs to GPUs. They necessitate                  GPU virtual memory. FS-HPT employs a fixed-size hashed
+adjustments in the page table size to manage hash collisions, which              page table to enable rapid page table lookup. In most cases,
+requires migrating Page Table Entries (PTEs) and frequently relies               FS-HPT can retrieve page table entries with a single memory
+on OS support. The PTE migrations can significantly increase mem-                reference by using a step table and step cache. To the best
+ory allocation time, and frequent OS interventions decrease GPU                  of our knowledge, this paper is the first work to study the
+performance [29]. In addition, state-of-the-art HPT design issues                effectiveness of using HPTs as the GPU’s page table.
+multiple memory requests simultaneously for a page table walk                  • We address a limitation regarding remote mappings by em-
+to exploit memory-level parallelism. This can lead to performance                ploying a remote PTE eviction policy and victim buffer.
+degradation since GPUs are more bandwidth-sensitive than CPUs.                 • We evaluate the performance of FS-HPT using a detailed
+    We exploit two key observations to efficiently adopt HPTs in                 GPU simulator. For irregular memory-intensive workloads,
+GPU’s virtual memory subsystems. First, there is an upper bound                  FS-HPT and FS-HPT integrated with the state-of-the-art
+for the number of PTEs the GPU’s page table can hold because                     page table walk technique outperform RPTs by an average
+the page table is responsible primarily for maintaining the PTEs of              of 27.8% and 61.7%, respectively.
+pages currently stored in the GPU memory. Second, the number of
+remote mappings stored in the GPU page table accounts for only             2 Background and Motivation
+a small portion of total entries. Recent GPUs allow direct access
+to remote pages in the other devices [16, 47, 53]. To support direct       2.1 GPU Virtual Memory
+remote access, the GPU’s page table needs to hold the PTEs for both        Recent GPU systems have adopted the virtual memory [2, 36, 43,
+local and remote pages, which increases the load factor as the page        44, 47] to share a virtual memory space between GPUs and CPUs.
+table stores more remote mappings. However, we found that only             There are two typical ways to enable shared virtual memory in GPU
+a few remote mappings will be accessed again because frequently            systems. One is sharing a page table between the CPUs and GPUs
+accessed remote mappings become local mappings.                            via I/O Memory Management Unit (IOMMU) hardware [43, 44].
+    Motivated by these two key observations, the FS-HPT framework          This approach is typically applied to integrated GPUs that share
+employs a fixed-size hashed page table whose size is sufficiently          the main memory with CPUs [48, 49]. The second way is to let
+large to mostly avoid the hash collisions, thereby eliminating dy-         CPUs and GPUs manage their own page tables separately. The CPU
+namic resizing. FS-HPT uses open-addressing to handle hash col-            page tables have the entire information, while the GPUs only retain
+lisions during PTE allocation and stores open-addressing steps in          certain parts of the address translation information in their distinct
+a step table to enable fast PTE accesses during address translation.       (local) page tables [32]. This organization is beneficial when GPUs
+Accessing the step table can incur additional memory references as         have their own distinct memory (VRAM) with a GMMU since GPUs
+the table exists in the device’s memory. To address this issue, we         can then perform address translation without communication with
+repurpose the existing MMU cache (PWCs) as a step cache for stor-          the CPUs (via the IOMMU) [29, 30, 32, 45]. In this paper, we select
+ing recently accessed step table entries. We also propose a remote         the latter approach (i.e., address translation using a GMMU and
+PTE eviction policy to keep the occupancy of the HPT (i.e., load           distinct GPU page tables) as the baseline architecture.
+
+
+
+
+                                                                     326
+Rethinking Page Table Structure for Fast Address Translation in GPUs: A Fixed-Size Hashed Page Table                     PACT ’24, October 14–16, 2024, Long Beach, CA, USA
+
+
+                 GPU            GPU                 CPU            CPU                         47:39            38:30             29:21              20:12               11:0
+              Page Table       Memory              Memory       Page Table                VA PML4 offset      PDP offset         PD offset          PT offset         Page offset
+                           ③              ②                                                                                                                     PT
+                PTE 0          Page 0                                                                                                         PD
+                PTE 1          Page 1                                                                                      PDP
+                                                                                                           PML4
+                PTE 2          Page 2                                                                                                                  +        PTE
+                                          ④                                                                        +      PDPE      +         PDE
+                PTE 3          Page 3
+   Access ①                                                                  ⑤                         +   PML4E
+                                                   Page 4          PTE 4
+   PTE 4
+                                                   Page 5          PTE 5                        PTBR
+
+                                                                                                                       (a) Radix Page Table
+                                                                                                                          47:12                                           11:0
+         Figure 2: PTE eviction and allocation in GPUs                                     VA                            VPN tag                                       Page offset
+                                                                                                                                        HPT
+
+Address translation: Figure 1 depicts the address translation pro-                                                        H
+cess in GPUs. Each Streaming Multiprocessor (SM) has a private                                                            +
+                                                                                                                              idx
+                                                                                                                                    tag PTE                ≠
+                                                                                                                                                                       Hash
+L1 TLB. When the SM issues memory instructions (load/store), it                                                                                                       Collision!
+
+generates address translation requests to get a physical address.                               PTBR
+Before the requests are forwarded to the L1 TLB, a coalescer merges                                                    (b) Hashed Page Table
+these requests into a single translation request if they fall into a
+single page range (4KB, 64KB, or 2MB) (❶). Upon an L1 TLB miss,                          Figure 3: Radix page tables and hashed page tables (a) Radix
+Miss Status Holding Registers (MSHRs) merge missed requests, and                         page tables (RPTs) (b) Hashed page tables (HPTs).
+these merged requests are sent to the shared L2 TLB (❷).                                 example shown in the figure 2, there is not enough space in GPU
+    If an L2 TLB miss occurs, it sends the translation requests to the                   memory, so the driver selects a victim page using a page eviction
+GMMU, which is shared across all SMs (❸). The GMMU enqueues                              policy [15]. In the example, Page 0 is evicted from GPU memory
+arrived requests into a page walk queue. Then, a page table walker                       and migrated to the CPU (②). Since Page 0 is evicted, the driver
+pops the translation requests from the queue, and the walker looks                       invalidates PTE 0 in the GPU’s page table and populates the CPU’s
+up the page table on the GPU side by sending memory requests to                          page table with PTE 0 (③). After the GPU driver migrates Page 4
+the cache hierarchy (❺). Since all SMs generate multiple address                         from CPU to GPU memory (④). Also, the driver invalidates PTE 4
+translation requests simultaneously, there are tens of page table                        in the CPU’s page table and populates the GPU’s page table with
+walkers in the GMMU to increase parallelism [44]. We use four-                           PTE 4 (⑤). Unlike the CPU, the GPU does not necessarily maintain
+level Radix Page Tables (RPTs) [18] as a baseline [30, 37, 45, 48].                      the PTEs of the pages swapped out to the CPU (invalid PTEs) since
+To mitigate sequential memory access of RPTs, the GMMU equips                            the CPU’s page table maintains PTEs of swapped-out pages [39].
+PWCs [7] to cache the physical address of an intermediate page table
+(except the last-level page table). As a result, the page table walker                   2.2      Multi-Level Radix Page Tables
+accesses PWCs before sending requests to the cache hierarchy, and                        Conventional CPUs and GPUs typically adopt RPTs [18, 21, 23, 24]
+if it hits, the walker can skip memory accesses (❹).                                     to maintain virtual-to-physical translation information. Figure 3a
+Page fault handling: Basically, GPUs with the UVM system offer                           depicts a four-level RPT. The page table walk process for four-level
+the demand paging scheme [15]. Even though the GPUs have per-                            RPTs is as follows. The upper 36 bits of a Virtual Address (VA) is
+formed the whole address translation process (❶-❺), the address                          the Virtual Page Number (VPN), and this VPN is then divided into
+translation information (i.e., the virtual-to-physical mapping) may                      four 9-bit fields that represent an index for each of the four levels
+not exist in the GPU local page table. This situation indicates that                     in the page table. The translation process starts with the Page Table
+the desired page is not in GPU local memory, so the GMMU gen-                            Base Register (PTBR), which stores a Page Map Level-4 (PML4)
+erates a far fault and sends an interrupt signal to the CPU [1] (❻).                     base address. We can access a PML4 entry, which contains a base
+On the CPU side, the GPU driver [1] walks the host-side page table                       address of the Page Directory Pointer (PDP), by adding the value
+to get the required PTE and accesses the data page using that PTE                        in the PTBR to the upper 9 bits (i.e., VA[47:39]) of the VPN. Now,
+(❼). Then, the GPU driver sends the data page to the GPU’s local                         we have a PDP base address and can get the address of the next
+memory and populates the corresponding PTE in the GPU’s page                             level page table (PD) by adding the PDP base address to the next 9
+table using the interconnect (PCIe or NVLink [35, 36]). Finally, the                     bits (i.e., VA[38:30]) of the VPN. This process continues and ends
+address translation is replayed on the GPU side (❽).                                     when the page table walker reaches the PTE, which contains the
+Managing GPU page tables: The GPU driver on the CPU side                                 data page’s Physical Page Number (PPN).
+manages the GPU’s page table before launching the kernel and                                As described above, a single memory instruction results in five
+handling any page faults. Basically, the GPU’s page table stores                         memory accesses (four accesses for address translation and one
+valid page table entries for pages in the device (GPU) memory,                           access for data). This stalls the core for a long time and adds signifi-
+and the CPU’s page table stores valid PTEs for pages in the host                         cant pressure to the GPU memory hierarchy [6, 7, 29, 42, 48, 49, 54].
+(CPU) memory [39, 47]. Figure 2 depicts how the PTEs are managed                         In the worst case, all five memory accesses on the L2 cache could
+between the GPU’s and CPU’s page tables. When the GPU tries to                           be missed, resulting in five sequential DRAM accesses.
+access PTE 4 for Page 4, the GMMU incurs a page fault because                            Limitations of radix page tables: Emerging workloads (e.g.,
+Page 4 is not in the device (GPU) memory (①). Next, the GPU                              graph processing [13, 34], bioinformatics [11, 33], and large lan-
+driver migrates Page 4 from CPU to GPU memory. However, in the                           guage models [52]) show irregular memory access patterns with
+
+
+
+
+                                                                                 327
+PACT ’24, October 14–16, 2024, Long Beach, CA, USA                                                                                            Sungbin Jang, Junhyeok Park, Osang Kwon, Yongho Lee, and Seokin Hong
+
+
+              0.5                                                                                                                   is used as an offset of the page table. We can get the physical ad-
+  Miss Rate
+
+
+
+
+              0.4
+              0.3                                                                                                                   dress of the PTE for the requested page by adding the hash value to
+              0.2
+              0.1                                                                                                                   the PTBR value. As HPTs can directly generate the PTE’s physical
+                0
+                                       SYK                                                                                          address, they can potentially offer faster address translation com-
+                                             BC
+
+
+
+
+                                                                                             CC
+
+                                                                                                  KC
+                     ATX
+
+                           GEV
+
+                                 MVT
+
+
+
+
+                                                  BFS
+
+
+
+
+                                                                    Avg.
+                                                        SP
+
+                                                              NW
+
+
+
+
+                                                                                 BIC
+
+                                                                                       COR
+
+
+
+
+                                                                                                       HOT
+
+                                                                                                             PF
+
+                                                                                                                  LU
+
+                                                                                                                       Avg.
+                                                                           2DC
+                                                                                                                                    pared to the RPTs, which may require multiple memory references.
+                                         Irregular                                            Regular
+                                                                                                                                    Therefore, by using HPTs, we can achieve significant performance
+                                 Figure 4: Miss rate of level-2 PWC                                                                 gains comparable to the ideal PWCs.
+                                                                                                                                       However, due to the inherent nature of hash functions, distinct
+                                                        RPT        Ideal PWC
+              1.6
+                                                                                                                                    hash keys (i.e., the input of the hash function) may yield identical
+              1.4                                                                                                                   hash values, known as a hash collision. In a general hash table, a
+              1.2
+  Speedup
+
+
+
+
+                1                                                                                                                   hash key is a unique identifier derived from the processed data. In
+              0.8
+              0.6                                                                                                                   HPTs, the VPN tag serves as the hash key. For precise translation,
+              0.4
+              0.2
+                0                                                                                                                   we must store the hash key in each hash slot and compare the hash
+                                 MVT
+
+
+
+
+                                                                                             CC
+                           GEV
+
+
+
+                                       SYK
+
+                                             BC
+
+
+
+
+                                                                    Avg.
+                     ATX
+
+
+
+
+                                                  BFS
+
+
+
+                                                              NW
+
+
+
+
+                                                                                 BIC
+
+                                                                                       COR
+
+
+
+                                                                                                  KC
+
+                                                                                                       HOT
+
+                                                                                                             PF
+
+                                                                                                                  LU
+
+                                                                                                                       Avg.
+                                                        SP
+
+
+
+
+                                                                           2DC
+
+
+
+
+                                                                                                                                    key with the input virtual address’s VPN tag. If the hash key and
+                                         Irregular                                            Regular                               VPN tag do not match, we must handle this collision. Handling
+                                                                                                                                    hash collisions adds complexities to HPT design, so managing these
+  Figure 5: Performance of four-level RPT and ideal PWC                                                                             collisions is one of the key challenges of HPTs.
+                                                                                                                                    Hashed page tables in the CPU domain: State-of-the-art HPT
+large memory footprints. These workloads frequently incur TLB                                                                       techniques [50, 51] have been proposed to resolve the hash collision
+misses, leading to numerous page table walks. In addition, due to the                                                               issue efficiently. Skarlatos et al. [50] proposed an Elastic Cuckoo
+inherent parallelism of GPUs, these workloads typically generate                                                                    Page Table (ECPT) that prevents frequent hash collisions by re-
+multiple simultaneous page table walk requests, putting significant                                                                 sizing the page table during program execution. The ECPT can
+pressure on the cache hierarchy. [43, 44, 48, 49]. Caching these                                                                    operate effectively with OS support and outperforms RPTs. How-
+frequently and simultaneously generated page table walk requests                                                                    ever, this approach requires resizing the page table during program
+within a small PWC structure is difficult, resulting in more than                                                                   execution, which is very cumbersome for GPUs. Resizing the page
+one memory access per page table walk.                                                                                              table necessitates rehashing all its entries, leading to migration of
+   Figure 4 shows the miss rates of a level-2 PWC for various bench-                                                                the page table entries and requiring frequent support from the OS.
+marks. Since each entry in the level-4 and level-3 PWC covers 512GB                                                                 These PTE migrations and frequent OS interventions prolong the
+and 1GB logical region, respectively, the hit rate for these levels                                                                 time it takes to handle PTE allocation within the GPU domain [1].
+is almost 100%. Therefore, we focus on the miss rate of a level-2
+PWC. The benchmarks and simulation environment are described                                                                        2.4      Motivation: Why Are HPTs a Good Choice
+in Section 5.1. We categorize the benchmarks based on their level-2
+                                                                                                                                             for GPU Page Tables?
+PWC miss rates. Workloads with a level-2 PWC miss rate exceed-
+ing 20% are categorized as irregular, showing an average miss rate                                                                  Dynamic resizing of the page table is not necessary: The rea-
+of 33.8%. In contrast, workloads with a level-2 PWC miss rate of                                                                    sons are twofold. First, the local page table primarily holds the
+20% or less are categorized as regular, with an average miss rate of                                                                (local) mappings for the pages stored in GPU memory, allowing a
+0.4%. To measure the impact of PWC misses on performance, we                                                                        load factor1 of the hashed page table can be maintained without
+compare the performance between a four-level RPT and an ideal                                                                       resizing the table. A lower load factor reduces the likelihood of
+PWC configuration, where every page table walk hits at PWCs. Fig-                                                                   hash collisions. As described in Section 2.1, since the CPU’s page
+ure 5 shows the speedup of an ideal PWC over RPT. Since irregular                                                                   table maintains any evicted PTEs from the GPU, the GPU’s page
+workloads suffer from frequent PWC misses, the ideal PWC shows                                                                      table only needs to store valid PTEs of the pages currently stored in
+a speedup of 29% over RPT. This result demonstrates that reducing                                                                   the device memory. Thus, the number of valid PTEs in the GPU’s
+PWC misses can significantly enhance overall performance.                                                                           page table reaches a saturation point when the device memory is
+   One might suggest that scaling TLBs or PWCs could mitigate                                                                       almost full, obviating the need for resizing the page table.
+page table walk overheads in RPTs. However, since TLBs and PWCs                                                                        Second, the number of live remote mappings in the GPU’s local
+serve as the SRAM cache, they are hard to scale in terms of latency                                                                 page table will become saturated, and thereby, the page table’s load
+and area [29, 50, 54]. Additionally, with the upcoming five-level                                                                   factor does not keep increasing even when it stores remote map-
+RPTs, it becomes more challenging to scale them [24, 28, 50, 51, 54].                                                               pings. Recent GPUs support remote access to host memory or peer
+                                                                                                                                    GPU memory by storing remote mappings in the GPU’s local page
+2.3                 Hashed Page Tables                                                                                              table [3, 36]. Especially, recent NVIDIA GPUs [36, 38] use a page
+                                                                                                                                    access counter to prevent page migration of rarely accessed pages.
+To reduce the substantial overheads associated with address trans-
+                                                                                                                                    With the access counter, the GPU driver stores remote mappings
+lation using RPTs, previous studies have explored Hashed Page
+                                                                                                                                    in the GPU’s page table and migrates only the pages whose access
+Tables (HPTs). They have been implemented HPTs as an alternative
+                                                                                                                                    counter value reaches a certain threshold. Even if this mechanism
+page table structure in some commercial CPUs [18–20, 50, 51, 54]
+                                                                                                                                    effectively avoids the migration of rarely accessed pages [30], it can
+since the HPTs do not need sequential page table walks.
+   Figure 3b illustrates the basic structure of HPTs. A hash function                                                               1 The load factor [14] of a hash table is a metric indicating the ratio of occupied entries
+takes all bits of the VPN as input, and the output (a hash value)                                                                   to the total number of slots available in the table.
+
+
+
+
+                                                                                                                              328
+Rethinking Page Table Structure for Fast Address Translation in GPUs: A Fixed-Size Hashed Page Table                                                                             PACT ’24, October 14–16, 2024, Long Beach, CA, USA
+
+
+                                                                                                                                          GPU
+                                                                                                                                              SMs         L2 Cache                 L2 TLB                 GMMU
+                                                                                                                                                                                                          Page Walk Queue
+                                                                                                                                           Device Memory
+                                                                                                                                            Hashed Page Table     Victim Buffer
+                                                                                                                                                HPT Entry 0
+                                                                                                                                                HPT Entry 1
+                                                                                                                                                                   Lv.4   Lv.3         Lv.2    Lv.1
+                                                                                                                                                                                                      ⓓ Page Table Walker
+                                                                                                                                                HPT Entry 2                                                 PTW0      PTW1     PTW2   •••   PTW15
+
+                                                                                                                                                                                                                              ⓐ
+
+
+
+
+                                                                                                                                                    •••
+                                                                                                                                                                  Step Table                              Step Cache
+                                                                                                                                          ⓒ                        VPN Tag               Step              VPN Tag       Step
+                                                                                                                                                HPT Entry k                                           ⓑ
+                                                                                                                                                                   VPN Tag                    •••          VPN Tag 0 2 1    •••       4     32 entries
+Figure 6: The number of live remote mappings of BFS [34].
+
+
+
+
+                                                                                                                                                    •••
+
+
+
+
+                                                                                                                                                                                                                         •••
+                                                                                                                                                                                 •••
+                        1
+                                                                                                                                                          Local Data                                               Hash Generator
+ Avg. Ratio of Live
+
+
+
+
+                      0.8
+  Remote PTEs
+
+
+
+
+                      0.6
+                      0.4
+                      0.2                                                                                                                                                 Interconnect (PCIe/NVLink)
+                        0
+                                                                                                                                          CPU
+                                                    BC
+
+
+
+
+                                                                    NW
+
+
+                                                                                2DC
+
+
+
+
+                                                                                                       KC
+                                                                                                            PF
+                                                                                                                 HOT
+                            ATX
+                                  GEV
+                                        MVT
+
+
+
+
+                                                                                                                       LU
+                                              SYK
+
+
+
+
+                                                                         Avg.
+
+
+
+
+                                                                                                                            Avg.
+                                                         BFS
+
+
+
+
+                                                                                      BIC
+                                                                                            COR
+                                                               SP
+
+
+
+
+                                                                                                  CC
+                                                                                                                                           Host Memory                                   GPU Driver
+                                               Irregular                                           Regular                                                      Host Page                HPT Map ⓔ                        Remote PTE LRU Counter ⓕ
+                                                                                                                                              Host Data
+                                                                                                                                                                  Table                                     •••            LRU      •••    MRU
+
+Figure 7: Average ratio of live remote mappings throughout
+                                                                                                                                                                   Figure 8: FS-HPT overview
+program execution.
+
+increase the load factor of the page table as the GPU must store                                                                         address space due to the sequential table lookup process required
+remote mappings, causing more hash collisions.                                                                                           by their hierarchical structure. HPTs are a viable alternative due to
+   However, we have found that a GPU’s page table does not need                                                                          their ability to quickly look up the desired page table entry using
+to store all remote mappings. Figure 6 shows the liveness of re-                                                                         a hash function. With the observation that GPUs do not need to
+mote mappings during the execution of BFS [34]. The "liveness"                                                                           resize page tables dynamically, we apply HPTs to the GPU memory
+of a remote mapping is defined as the duration from the initial                                                                          system using a fixed-size page table. In this section, we present
+access (first touch) of the remote mapping to its final access (last                                                                     the Fixed-Size Hashed Page Table (FS-HPT), a novel GPU virtual
+touch). We measure liveness using the access counter-based page                                                                          memory framework that adopts Hashed Page Tables (HPTs) to
+migration [39]. As shown in the figure, the number of live remote                                                                        address the fundamental limitation of the conventional page table
+mappings decreases during program execution. This is because                                                                             structure (i.e., RPTs).
+frequently accessed remote mappings (hot remote PTEs) quickly                                                                            Challenges and solutions: In order to adopt HPTs in GPU ar-
+become local PTEs as the corresponding pages are migrated to                                                                             chitectures, we need to address two key challenges. First, hash
+the GPU memory, and the infrequently accessed remote mappings                                                                            collisions could occur even if we set a large page table size, so we
+(cold remote PTEs) tend to fall into disuse after their initial period                                                                   have to resolve them efficiently. To handle hash collisions, we adopt
+of activity. Figure 7 shows the average proportion of live remote                                                                        open-addressing as it is simple to implement in the GPU driver and
+mappings relative to the total number of page table entries for all                                                                      GMMU at a low cost [14]. Hash collision handling with the open-
+the benchmarks. The ratio of the live remote mappings ranges from                                                                        addressing scheme does lead to multiple memory accesses due to
+0% to 20% for the various benchmarks (with an average of 0.16%).                                                                         the sequential probing scheme. We tackle this issue with a step table
+These results indicate that the number of live remote mappings                                                                           and step cache (Section 3.3-3.5). With these, FS-HPT can look up
+does not gradually increase in the GPU’s page table throughout the                                                                       the page table with only one memory access.
+execution of the programs.                                                                                                                  Second, remote mappings can increase the load factor of the page
+The page table occupies a small portion of GPU memory: For                                                                               table. As described in Section 2.4, live remote mappings occupy a
+a 4KB base page size, the associated PTE size is eight bytes [37].                                                                       tiny fraction of total PTEs. Thus, if we store only hot remote map-
+Therefore, GPUs that use RPTs require only 0.2% of total GPU                                                                             pings in the page table, we can reduce hash collisions. To this end,
+memory to store PTEs for pages that reside in GPU memory. If                                                                             we propose a remote PTE eviction policy, which strategically evicts
+we adopt HPTs for the GPU’s page table, we need a larger page                                                                            rarely-used remote mappings from the page table (Section 3.6).
+table than when using RPTs to avoid hash collisions. Since the                                                                           However, if the evicted mapping is used in the future, it will cause a
+page table size for storing all the mappings of the pages in GPU                                                                         costly page fault. Thus, we also introduce the victim buffer to hold
+memory accounts for a small portion of the GPU memory, even if                                                                           evicted remote mappings in the device memory (Section 3.7). The
+we increase the page table size, the area overhead is negligible. For                                                                    GMMU first looks up the step cache and step table, and if there
+example, the page table, which is 2.5x times larger (for a target load                                                                   are no matching entries, it accesses the victim buffer to get the
+factor of 0.4) than RPTs, only requires 0.5% of total GPU memory.                                                                        requested remote mappings.
+                                                                                                                                            Figure 8 depicts the overall architecture of our FS-HPT frame-
+3 Fixed-Size Hashed Page Table                                                                                                           work. The device memory contains the hashed page table, step
+                                                                                                                                         table, and victim buffer. In the GMMU, we repurpose the remaining
+3.1 Overview                                                                                                                             PWCs to use as the step cache and add a hash generator. When an
+Key idea - Adopting HPTs as the GPU’s page table structure:                                                                              L2 TLB miss occurs, the page table walker first accesses the step
+As described in Section 2.2, RPTs incur significant performance                                                                          cache (○).
+                                                                                                                                                 a If there is no entry in the step cache, the walker accesses
+degradation, and they also show poor scalability with increasing                                                                         the step table and fills the step cache (○).
+                                                                                                                                                                                  b After, the walker looks up
+
+
+
+
+                                                                                                                                   329
+PACT ’24, October 14–16, 2024, Long Beach, CA, USA                                             Sungbin Jang, Junhyeok Park, Osang Kwon, Yongho Lee, and Seokin Hong
+
+
+                          47:21                        20:12         11:0                                            47:21                 20:12            11:0
+  VA                     VPN tag                     PTE offset   Page offset           VA                          VPN tag              PTE offset      Page offset
+                            H                                                                𝑆𝑡𝑒𝑝 × 𝑆𝑡𝑟𝑖𝑑𝑒      +     H
+                                                                                                                                    HPT Map Entry
+                  PTBR      +      𝑆𝑡𝑒𝑝 × 𝑆𝑡𝑟𝑖𝑑𝑒                                                             HPT Map          VPN tag      Unused           Val. Del.
+                                                                                                              Tag V D
+ HPT                                                                                                         0x02 1 0          27 bits          3 bits     1 bit 1 bit
+ Entry    PTE 0     PTE 2       PTE 3                •••              PTE 511                                0x38 1 1
+                                                                                                                                          4 Bytes
+ Addr.     8B        8B            8B                                    8B
+
+
+
+
+                                                                                                                •••
+                                           4KB                                                               0x00 0 0
+
+                     Figure 9: HPT entry format                                                     Figure 10: PTE allocation with HPT Map
+
+the page table with the value derived from the step table entry (○).
+                                                                  c                   the key using a specific probing sequence. In our implementation,
+If there is no matching entry in the step table, the walker accesses                  the table index of the next candidate entry for the key is calcu-
+the victim buffer to get the remote mappings (○). d Finally, if there                 lated using 𝑆𝑡𝑟𝑖𝑑𝑒 and 𝑆𝑡𝑒𝑝. During the iterative probing for an
+are no matching mappings in the victim buffer, the GMMU incurs                        empty entry, the driver increments the 𝑆𝑡𝑒𝑝 until the empty one
+a page fault, and the GPU driver populates the GPU’s page table by                    is found (𝑛𝑒𝑤 𝑖𝑛𝑑𝑒𝑥 = ℎ𝑎𝑠ℎ 𝑣𝑎𝑙𝑢𝑒 + 𝑆𝑡𝑟𝑖𝑑𝑒 × 𝑆𝑡𝑒𝑝). The 𝑆𝑡𝑟𝑖𝑑𝑒 is
+referencing an HPT Map (○). e If there is no space for storing new                    pre-determined by the GPU driver when creating the page table.
+PTE, the driver evicts a remote mapping from the page table using
+a remote PTE LRU counter maintained by the driver (○).   f                            3.4     PTE Allocation
+                                                                                      When the GPU requires data pages that are not currently in GPU
+3.2      HPT Entry Format                                                             memory, it causes a page fault, and the GPU driver on the CPU
+The naive implementation of HPTs shown in Figure 3b causes some                       side allocates the appropriate PTEs and migrates the data pages
+problems. First, there will be a notable decrease in the spatial locality             to the GPU. To deal with PTE allocation, we introduce a software-
+of the PTEs [50, 54]. This is because allocating a PTE for each HPT                   defined data structure called the HPT Map in the driver. The HPT
+entry does not ensure the spatial locality of PTEs in cacheline                       Map maintains allocation information on the HPT stored in device
+granularity. Second, since the GPU driver evicts pages with a 2MB                     memory; each HPT entry has a corresponding entry in the HPT
+Virtual Address Block granularity [1, 27], evicting pages from the                    map. As illustrated in Figure 10, an HPT Map entry consists of
+GPU incurs 512 lookups in the hashed page table to remove the                         a VPN tag, a valid bit, and a deleted bit. The VPN tag is used to
+PTEs for the evicted pages. Finally, it is difficult to support various               verify whether the accessed entry is the correct one for the given
+page sizes simultaneously because the number of address bits used                     VA, and the valid bit indicates whether the corresponding HPT
+as a VPN tag varies depending on page sizes. For example, if a GPU                    entry is valid. The deleted bit indicates that the corresponding HPT
+uses 4KB and 2MB page sizes at the same time, the GMMU has                            entry is no longer valid and is part of a probing sequence. In open
+to access the page table twice with different VPN tags: VA[47:12]                     addressing, simply deleting an entry and leaving it empty (invalid)
+for the 4KB page size and VA[47:21] for the 2MB page size. This                       can disrupt the continuity of the probing sequence. The deleted bit
+dual-access approach is necessary because the page size cannot be                     simply addresses this challenge. Note that the driver can reuse the
+determined with only a given VA.                                                      deleted entry to allocate a new HPT entry because its valid bit is
+   To address these problems, we propose the new HPT entry for-                       invalid. In other words, if there is a deleted entry before finding
+mat. Figure 9 shows a proposed HPT entry format. We cluster 512                       an invalid entry, the driver allocates a new HPT entry in the same
+PTEs of contiguous pages in a single hash table entry so that each                    place as the deleted entry.
+entry represents a contiguous 2MB memory region. The PTEs in                              Algorithm 1 describes the PTE allocation process. First, the GPU
+an HPT entry are indexed with a PTE offset obtained from the                          driver accesses the HPT Map entry, which is pointed to by the index
+VA[20:12]. This design ensures locality among PTEs and requires                       calculated by adding the hash value and HPT Map base address
+only a single HPT lookup during page eviction. In addition, with                      (line 4). If the accessed entry is valid, the driver compares the new
+this HPT entry format, the VPN tag remains the same across all                        PTE’s VPN tag with the tag in the accessed HPT Map entry (lines
+supported page sizes (i.e., 4KB, 64KB, and 2MB [37]). Therefore, the                  5-6). If the tag matches, the driver allocates a PTE at the existing
+virtual address is translated using only one access to the table, even                HPT entry (line 7). Otherwise, the driver increments the 𝑆𝑡𝑒𝑝 and
+when various page sizes are supported in the GPU virtual memory.                      accesses the next entry of the HPT Map (line 10). If the deleted
+                                                                                      bit of the accessed entry is set, the driver increments the 𝑆𝑡𝑒𝑝 and
+3.3      Hash Collision Resolution                                                    accesses the next entry of the HPT Map (line 16). To reuse a deleted
+There are several methods to resolve hash collisions, such as chain-                  entry, the driver keeps the address of the first accessed deleted
+ing [14], open-addressing [14], and cuckoo hashing [40]. Among                        entry (lines 13-14). If the accessed entry is invalid, it means there
+these, we employ the open addressing scheme, which is simple                          are no allocated HPT entries for the requested VA. Then, the driver
+and thus can be implemented effectively in the GMMU and the                           checks whether oversubscription has occurred or if the number of
+GPU driver. When inserting a new key-value pair, a hash function                      HPT entries has reached the threshold to guarantee enough space
+calculates an index based on the key. If the entry associated with                    for the data page and PTEs. If oversubscription occurs, the driver
+the calculated index is empty, the key-value pair is inserted. If the                 evicts a local HPT entry (lines 18-19). If the number of HPT entries
+entry is already occupied by a different key (indicating a collision),                reaches the threshold, the driver evicts a remote entry (lines 20-21).
+the open addressing scheme seeks an alternative empty entry for                       Remote PTE eviction will be described in the section 3.6. Before
+
+
+
+
+                                                                                330
+Rethinking Page Table Structure for Fast Address Translation in GPUs: A Fixed-Size Hashed Page Table                           PACT ’24, October 14–16, 2024, Long Beach, CA, USA
+
+
+Algorithm 1 PTE Allocation                                                                                              47:21                          20:12                 11:0
+                                                                                          VA                           VPN tag                       PTE offset           Page offset
+ 1: 𝑆𝑡𝑒𝑝 ← 0
+                                                                                                                                                                    VA [24:21]
+ 2: 𝐷𝑒𝑙 𝐴𝑑𝑑𝑟 ← 𝑛𝑢𝑙𝑙                                                                                          H                                                      Step offset
+                                                                                                                                VA [47:25]
+ 3: while 𝑡𝑟𝑢𝑒 do                                                                                                           Step Table Tag
+                                                                                                                    𝑆𝑡𝑒𝑝                          VA [47:30]
+ 4:    𝐶𝑢𝑟𝑟𝑒𝑛𝑡 𝐴𝑑𝑑𝑟 ← 𝐵𝑎𝑠𝑒 𝐴𝑑𝑑𝑟 + 𝐻𝑎𝑠ℎ 𝑉 𝑎𝑙𝑢𝑒 + (𝑆𝑡𝑒𝑝 × 𝑆𝑡𝑟𝑖𝑑𝑒 )                                                                         H        Step Cache Tag
+                                                                                               PTBR          +       ×
+ 5:    if 𝑉 𝑎𝑙𝑖𝑑 then                                                                                              𝑆𝑡𝑟𝑖𝑑𝑒                         VA [29:25]
+ 6:        if 𝑉 𝑃 𝑁 𝑡𝑎𝑔 == 𝑇 𝑎𝑔 then                                                                                           STBR      +        Step Cache Idx.
+ 7:            Allocate PTE                         ⊲ HPT entry already exists
+ 8:            𝑏𝑟𝑒𝑎𝑘                                                                           Device Memory                                      GMMU
+ 9:        else                                                                                     HPT                      Step Table                      Step Cache
+10:            𝑆𝑡𝑒𝑝 ← 𝑆𝑡𝑒𝑝 + 1                                   ⊲ Tag mismatch                  512 PTEs                Tag        Steps              Tag           Steps
+11:        end if                                                                                        •••            0x0A 1 0 X X ••• 0 1          0x84      1 0 X X ••• 0 X
+12:    else if 𝐷𝑒𝑙𝑒𝑡𝑒𝑑 then                                                                              •••            0x21 1 X X 0 ••• X 5          0x21      1 X X 0 ••• X 5     32
+                                                                                                         •••            0x84 1 0 0 X ••• 1 X                                      Entries
+
+
+
+
+                                                                                                                                                                    •••
+13:        if 𝐷𝑒𝑙 𝐴𝑑𝑑𝑟 == 𝑛𝑢𝑙𝑙 then
+14:            𝐷𝑒𝑙 𝐴𝑑𝑑𝑟 ← 𝐶𝑢𝑟𝑟𝑒𝑛𝑡 𝐴𝑑𝑑𝑟        ⊲ Save first deleted entry address                                                                      0xFF     X 0 X X ••• X 3
+
+
+
+
+                                                                                                                                  •••
+                                                                                                       •••
+15:        end if                                                                                        •••            0xFF    X 0 X X ••• X 3                      16 Steps
+16:        𝑆𝑡𝑒𝑝 ← 𝑆𝑡𝑒𝑝 + 1                                       ⊲ Deleted entry
+17:    else if 𝑛𝑜𝑡 𝑉 𝑎𝑙𝑖𝑑 then
+18:        if Oversubscription then
+19:            Page eviction
+                                                                                                                 Figure 11: PTE access with step table
+20:        else if 𝐶𝑢𝑟𝑟𝑒𝑛𝑡 𝐻 𝑃𝑇 𝑒𝑛𝑡𝑟𝑖𝑒𝑠 ≥ 𝑀𝑎𝑥 . 𝐻 𝑃𝑇 𝑒𝑛𝑡𝑟𝑖𝑒𝑠 then
+21:            Remote PTE eviction                                                       and 16 step values (48 bits = 3×16). Each entry of the step cache
+22:        end if                                                                        is designated for 16 HPT entries allocated to a 32MB contiguous
+23:        if 𝐷𝑒𝑙 𝐴𝑑𝑑𝑟 ! = 𝑛𝑢𝑙𝑙 then                                                     region. As a result, the page table walker accesses the step cache
+24:            𝐶𝑢𝑟𝑟𝑒𝑛𝑡 𝐴𝑑𝑑𝑟 ← 𝐷𝑒𝑙 𝐴𝑑𝑑𝑟                     ⊲ Reuse deleted entry
+25:        end if                                                                        before accessing the step table. Since the step cache covers a 1GB
+26:        𝑉 𝑎𝑙𝑖𝑑 ← 𝑡𝑟𝑢𝑒                             ⊲ Allocate new HPT entry            region, its hit rate is nearly 100%, ensuring that PTEs are mostly
+27:        Allocate PTE
+28:        𝑏𝑟𝑒𝑎𝑘                                                                         retrievable with only a single memory access. It is worth noting
+29:    end if                                                                            that the step cache substantially outperforms PWCs in terms of
+30: end while                                                                            area efficiency as it covers a 2MB region only using 3 bits, while
+                                                                                         the PWC covers a 2MB region using 64 bits.
+allocating a new HPT entry, the driver replaces the current address                      PTE access: Figure 11 also shows the page table access process. For
+with the deleted address if it exists (lines 23-24). Finally, the driver                 each page table walk request, the page table walker first looks up
+allocates a new HPT entry and a new PTE (lines 26-27).                                   the step cache. If there is no matching entry in the step cache, the
+3.5     PTE Access with Step Table                                                       walker accesses the step table with an index calculated by adding
+                                                                                         the value in the Step Table Base Register (STBR) and the hash
+Step table: The page table walker can access the HPT with a single                       value from VA[47:25]. Next, it fills the step cache. If there is no
+memory reference if there are no hash collisions. However, if hash                       matching entry in the step table, the GMMU incurs a page fault.
+collisions occur, the walker needs to perform a probing sequence,                        Otherwise, if there is a matching entry, the walker accesses the HPT
+necessitating multiple sequential memory accesses to the HPT. To                         by adding the value in the Page Table Base Register (PTBR), the
+tackle this issue with open addressing, we employ a step table. This                     hash value from VA[47:21], and the 𝑆𝑡𝑒𝑝 × 𝑆𝑡𝑟𝑖𝑑𝑒. The GPU driver
+is designed to store the open-addressing steps for each HPT entry.                       pre-determines the 𝑆𝑡𝑟𝑖𝑑𝑒 value, while the 𝑆𝑡𝑒𝑝 value is derived
+When the GPU driver populates the GPU’s page table, the driver                           from the step cache. Finally, the walker gets the requested PTE
+also stores the 𝑆𝑡𝑒𝑝 value in the step table. The step table resides                     from the HPT entry using the PTE offset (VA[20:12]) field.
+in device memory and is implemented as a hash table.
+   Figure 11 shows the design of the step table. A step table entry
+stores a tag (VA[47:25]) and open-addressing steps for 16 HPT                            3.6     Remote PTE Eviction Policy
+entries in a contiguous 32MB region. We limit the maximum open-                          Remote mappings can mitigate page migration overheads and page
+addressing step value to eight, so each step table entry comprises                       thrashing issues in discrete GPU systems [16, 30, 47, 53]. How-
+23 bits for the tag and an additional 48 bits (16×3 bits) for the step                   ever, if the number of remote mappings stored in the GPU’s page
+values of 16 HPT entries. This setup guarantees that every entry                         table increases, its load factor can also keep increasing, leading
+in the step table can represent a 32MB region using just 9 bytes of                      to frequent hash collisions in the page allocation process. As de-
+information. Given the compact size of each entry in the step table,                     scribed in Section 2.4, live remote mappings occupy only a small
+we configure the step table’s size to achieve a low load factor of                       fraction of the total page table capacity during program execution.
+0.01. This notably diminishes the frequency of hash collisions in                        Consequently, by storing only the live (or hot) remote mappings
+the step table. Despite maintaining this low load factor, a step table                   in the page table, we can effectively prevent the load factor from
+of this size requires only 0.001% of device memory capacity.                             continually increasing.
+   However, when using the step table, the page table walker ac-                            Figure 12 shows the concept of the remote PTE eviction policy
+cesses the memory twice for every HPT lookup: once for the step                          we propose to constrain the load factor of FS-HPT. The upper side
+table and once more for the HPT. To address this issue, we repurpose                     of the figure shows the page eviction policy current GPU drivers
+the existing PWCs as a step cache to store recently accessed step                        already use [15, 39]. When oversubscription occurs, the GPU driver
+table entries. As illustrated in Figure 11, the step cache is designed                   selects a victim page from the front of the Least Recently Used
+as a direct-mapped cache structure. It has 32 entries, each com-                         (LRU) list and evicts it (lines 18-19 in Algorithm 1). The LRU list is
+prising an 18-bit tag derived from VA[47:30] of the virtual address                      updated for every time a page fault is handled.
+
+
+
+
+                                                                                   331
+PACT ’24, October 14–16, 2024, Long Beach, CA, USA                                             Sungbin Jang, Junhyeok Park, Osang Kwon, Yongho Lee, and Seokin Hong
+
+
+                                                                   Page 4                  Even if a step cache is indeed more compact than PWCs, it still
+                                LRU                       MRU
+   Page Eviction                                                                       experiences scaling issues as the application’s memory footprint
+                     Evict    Page 0    Page 1   Page 2   Page 3
+   Policy
+                                                                                       grows. In fact, FS-HPT can operate without the step cache if the
+                                LRU                       MRU
+   Remote PTE
+                                                                                       page table size is sufficiently large so that hash collisions rarely
+                     Evict     PTE 0    PTE 1    PTE 2    PTE 3
+   Eviction Policy                                                                     occur. If hash collisions do not occur in the page allocation process,
+                                                                   PTE 4               the Step value will be zero for all HPT entries, eliminating the need
+                                                                                       to read the Step value from the step table.
+   Figure 12: Page replacement and remote PTE eviction
+                                                                                           By exploiting this insight, we propose an alternative design, Step
+   We extend this replacement policy to evict remote mappings                          Cache-Less FS-HPT. This approach excludes the step cache in the
+from the GPU’s page table. The lower side of the figure shows                          GMMU while using a large HPT. Even if this approach increases the
+the proposed remote PTE eviction policy. When allocating a new                         area overhead of the page table, the impact of this area overhead is
+HPT entry, if the load factor of the GPU’s page table reaches the                      trivial because the page table still basically occupies a small portion
+designated load factor threshold, the driver selects a victim entry                    of the device memory, as discussed in section 2.4.
+front of the LRU list and evicts that entry from the page table.                           To implement the step cache-less design, we need a small modi-
+The GPU driver can update the LRU list since the GMMU tracks                           fication to FS-HPT. In that design, a hash collision can occur while
+the access frequency of each remote mapping [16, 47, 53]. Also,                        accessing the HPT. This is because a home HPT entry, whose index
+the following equation (1) shows the calculation to determine the                      is ℎ𝑎𝑠ℎ 𝑣𝑎𝑙𝑢𝑒 +𝑆𝑡𝑟𝑖𝑑𝑒 × 0, is always accessed first as we assume that
+load factor threshold used, where 𝑚 is a multiplicative factor. For                    the Step is zero for the given VA. We store a VPN tag in each HPT
+example, if there is no oversubscription, we simply set 𝑚 as 1.0,                      entry to handle hash collisions. Since there are enough unused bits
+and the page table can accommodate all required PTEs. On the                           in a PTE [35, 40, 54], we can store the VPN tag in each HPT entry.
+other hand, if there is an oversubscription, we can adjust the 𝑚                           If the requested translation is found in the home HPT entry (no
+to be greater than 1.0. If 𝑚 is 1.2, the page table can store PTEs of                  hash collision), the page table walker finishes the lookup with only
+pages that cover 120% of the device’s memory size. FS-HPT sets the                     one memory reference. Otherwise, the page table walker reads a
+default 𝑚 as 1.2, but 𝑚 can be adjusted in some cases. We evaluate                     Step value from the step table and then accesses the page table
+the effects of varying 𝑚 in Section 5.3.                                               again using the calculated index. Even if the step cache-less design
+                                                                                       incurs three memory references per page table walk on a hash
+                                       # 𝑚𝑎𝑥 . 𝑙𝑜𝑐𝑎𝑙 𝐻𝑃𝑇 𝑒𝑛𝑡𝑟𝑖𝑒𝑠                       collision, it achieves similar performance to the step cache-based
+  𝑙𝑜𝑎𝑑 𝑓 𝑎𝑐𝑡𝑜𝑟 𝑡ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑 = 𝑚 ×                                             (1)
+                                          # 𝑡𝑜𝑡𝑎𝑙 𝐻𝑃𝑇 𝑒𝑛𝑡𝑟𝑖𝑒𝑠                          design because hash collisions are rare when using a larger HPT.
+                                                                                       The impact of step cache-less design will be discussed in Section 5.4.
+3.7     Victim Buffer
+With our remote PTE eviction policy, the GPU driver invalidates                        4.2    Implementation Overheads
+remote mappings evicted from the GPU’s page table. However, if                         Hardware overheads: FS-HPT requires a small amount of addi-
+an evicted remote mapping is accessed again, a page fault occurs. In                   tional memory space and a few minor changes in the GMMU unit.
+this case, the GPU driver populates the page table with that mapping                   The hashed page table accounts for 0.5% of device memory, while a
+again. Even if page faults caused by re-accessing the previously                       corresponding step table with a maximum load factor of 0.01 occu-
+evicted remote entries are infrequent, when they occur, the GPU                        pies 0.001% of device memory. The memory space requirements for
+undertakes costly page fault handling [1].                                             the victim buffer vary depending on the memory access patterns of
+   To minimize the performance impact of the remote PTE replace-                       the applications, but it can be freely resized since it uses a multi-
+ment, we propose a victim buffer that maintains the evicted remote                     level radix tree structure. Also, Employing the step cache incurs no
+mappings in device memory. With the victim buffer, we can prevent                      area overhead compared to the baseline architecture because we
+page faults caused by re-accessing previously evicted remote map-                      repurpose existing PWCs as the step cache.
+pings. Since the number of remote mappings evicted from the HPT                        Software overheads: FS-HPT requires small changes to the GPU
+(primary page table) varies across applications, we design the victim                  driver. To support a GPU with an 80GB memory [38], the HPT Map
+buffer to be more scalable by using a radix tree structure. While this                 occupies only 200MB of memory space in the host memory. Since
+radix-tree design can lead to sequential memory accesses, it offers                    the GPU driver spends about 80% of page fault handling time for
+significant benefits in managing the victim buffer. Furthermore, the                   page migration and page unmapping (invalidating) from host page
+victim buffer is rarely accessed because the hot remote mappings                       table [1, 27], the time spent for HPT Map searching is negligible.
+mostly remain in the HPT. Therefore, the performance impact of                         Our remote PTE eviction policy requires maintaining an LRU list
+sequential accesses to the buffer is trivial (Section 5.3).                            of remote mappings. The GPU driver can maintain and update this
+                                                                                       LRU list by exploiting an existing Access Counter [16, 39, 47].
+4 Discussion
+4.1 Step Cache-Less Design                                                             5 Evaluation
+Our design uses an MMU cache, called the step cache, to store                          5.1 Experimental Environment
+open-addressing steps of recently accessed HPT entries. While this                     Simulation Setup: To evaluate the proposed technique, we used
+design is similar to PWCs, the step cache is more efficient than                       GPGPU-sim v4.0 [26] configured as similar to an RTX 3070
+PWCs as it stores steps instead of physical addresses of the PTEs.                     GPU [38]. The detailed experimental setup is summarized in Table 1.
+
+
+
+
+                                                                                 332
+Rethinking Page Table Structure for Fast Address Translation in GPUs: A Fixed-Size Hashed Page Table                                                PACT ’24, October 14–16, 2024, Long Beach, CA, USA
+
+                     Table 1: Experimental Setup
+                                                                                                                                                    RPT     FS-HPT          Ideal PWC
+        Component                                 Parameter                                                      1.6
+                                                                                                                 1.4
+                                                                                                                 1.2
+
+
+
+
+                                                                                             Speedup
+         # of SMs                                    46                                                            1
+      Clock frequency                             1500MHz                                                        0.8
+                                                                                                                 0.6
+                                  32 entries, fully associative, 20 cycles,                                      0.4
+      L1 TLB (private)                                                                                           0.2
+                                             32 MSHR entries                                                       0
+
+
+
+
+                                                                                                                                   MVT
+
+                                                                                                                                         SYK
+
+                                                                                                                                               BC
+
+
+
+
+                                                                                                                                                                     Avg.
+
+
+
+
+                                                                                                                                                                                              CC
+                                                                                                                       ATX
+
+                                                                                                                             GEV
+
+
+
+
+                                                                                                                                                     BFS
+
+
+
+                                                                                                                                                                NW
+
+
+
+
+                                                                                                                                                                                  BIC
+
+                                                                                                                                                                                        COR
+
+
+
+                                                                                                                                                                                                   KC
+
+                                                                                                                                                                                                        HOT
+
+                                                                                                                                                                                                              PF
+
+                                                                                                                                                                                                                   LU
+
+                                                                                                                                                                                                                        Avg.
+                                                                                                                                                           SP
+
+
+
+
+                                                                                                                                                                            2DC
+                                     1024 entries, 16 ways, 80 cycles,
+       L2 TLB (shared)
+                                            128 MSHR entries                                                                               Irregular                                           Regular
+         L1 cache                        128KB per SM, 40 cycles
+         L2 cache                       4MB, 16 ways, 180 cycles                                                  Figure 13: Speedup of FS-HPT over four-level RPT
+         Memory                  GDDR6, 16 channels, 448GB/s bandwidth
+                                                                                                                                                    RPT     FS-HPT          Ideal PWC
+
+
+
+
+                                                                                           # Mem. Refs per PTW
+              Structure                  4-level radix page table
+  RPT                                                                                                            1.4
+         Page walk cache              32 entries, per-level, 4 cycles                                            1.2
+           Hash collision                    Open addressing                                                       1
+                                                                                                                 0.8
+  HPT        Step cache                     32 entries, 4 cycles                                                 0.6
+                                                                                                                 0.4
+           Page table size               0.5% of working set size                                                0.2
+                                                                                                                   0
+     Page table walker                    16 page table walkers
+
+
+
+
+                                                                                                                             GEV
+
+
+
+                                                                                                                                         SYK
+                                                                                                                       ATX
+
+
+
+                                                                                                                                   MVT
+
+
+
+                                                                                                                                               BC
+
+
+
+
+                                                                                                                                                                     Avg.
+
+
+
+
+                                                                                                                                                                                        COR
+
+                                                                                                                                                                                              CC
+
+                                                                                                                                                                                                   KC
+                                                                                                                                                     BFS
+
+                                                                                                                                                           SP
+
+                                                                                                                                                                NW
+
+
+
+
+                                                                                                                                                                                  BIC
+
+
+
+
+                                                                                                                                                                                                        HOT
+
+                                                                                                                                                                                                              PF
+
+                                                                                                                                                                                                                   LU
+
+                                                                                                                                                                                                                        Avg.
+                                                                                                                                                                            2DC
+     Page prefetching                  16 consecutive pages (64KB)
+                                                                                                                                           Irregular                                           Regular
+
+
+We faithfully extended the simulator to support RPT-based address                        Figure 14: Number of memory references per page table walk
+translation by implementing multilevel TLBs, page table walkers,                                                                                    RPT     FS-HPT          Ideal PWC
+
+
+
+
+                                                                                             Norm. PTW Latency
+page walk caches, and a radix page table. In our simulated GMMU,                                                   1
+we modeled highly threaded page table walkers [44] and PWCs                                                      0.8
+with 32 entries [7]. We also modeled the behavior of FS-HPT in the                                               0.6
+                                                                                                                 0.4
+simulator by adding the step table, step cache, victim buffer, and                                               0.2
+remote PTE eviction policy. We do not consider demand paging                                                       0
+
+
+
+
+                                                                                                                                   MVT
+
+                                                                                                                                         SYK
+
+                                                                                                                                               BC
+
+
+
+
+                                                                                                                                                                     Avg.
+
+
+
+
+                                                                                                                                                                                              CC
+                                                                                                                       ATX
+
+                                                                                                                             GEV
+
+
+
+
+                                                                                                                                                     BFS
+
+
+
+                                                                                                                                                                NW
+
+
+
+
+                                                                                                                                                                                  BIC
+
+                                                                                                                                                                                        COR
+
+
+
+                                                                                                                                                                                                   KC
+
+                                                                                                                                                                                                        HOT
+
+                                                                                                                                                                                                              PF
+
+                                                                                                                                                                                                                   LU
+
+                                                                                                                                                                                                                        Avg.
+                                                                                                                                                           SP
+
+
+
+
+                                                                                                                                                                            2DC
+overhead in the same way as related works [22, 25, 29] since FS-HPT
+focuses on reducing page table walk overhead. To determine the                                                                             Irregular                                           Regular
+
+size of the page table, we assumed that GPU memory capacity is                                                          Figure 15: Average page table walk latency.
+equal to the working set size of the benchmarks. Based on this
+assumption, we configured the HPT size to cover a memory space                           speedups of 35.4%, 26.6%, 34.9%, and 35.8%, respectively. For the
+that is 2.5 times larger than the benchmark’s memory footprint. Set-                     regular workloads, performance is comparable across RPT, FS-HPT,
+ting up this way, the HPT consumes only 0.5% of the GPU memory.                          and ideal PWC because most page walk requests hit in the PWC.
+We modeled a prefetching scheme that prefetches 16 consecutive                           The number of memory references per page table walk: To
+pages to the GPU memory when a page fault occurs [15].                                   understand why FS-HPT offers a significant speedup comparable
+Benchmarks: We selected diverse benchmarks from Graphbig [34]                            to an ideal PWC, we examine the behavior of the page table walk
+(BC, BFS, SP, CC, KC), Rodinia [12] (NW, HOT, PF) and Poly-                              process. Figure 14 shows the number of memory references per
+bench [17] (ATX, GEV, MVT, SYK, 2DC, BIC, COR, LU). The bench-                           page table walk for each benchmark running with RPT, FS-HPT,
+marks exhibiting a level-2 PWC miss rate greater than 20% are                            or ideal PWC configuration. For all benchmarks, FS-HPT involves
+categorized as irregular, while those with miss rates lower than 20%                     much fewer memory references per page table walk than RPT. For
+fall into the regular category. This classification enables a compre-                    irregular workloads especially, the number of memory references
+hensive analysis of the proposed technique’s efficacy across diverse                     per page table walk for RPT is an average of 1.35, while for FS-HPT
+workloads. The memory footprint of the benchmarks is ranging                             it is only 1.01, which is very close to the ideal case.
+from 864MB to 2306MB. To mitigate the issue of impractically long                            Since FS-HPT effectively resolves hash collisions with the step
+simulation times tied to large memory footprints, we constrained                         table and step cache, it can achieve fewer memory references per
+the working set size of the benchmarks to between 214 and 1024MB.                        page table walk. The step cache achieves an over 99% hit rate for all
+                                                                                         benchmarks, while conventional PWCs offer only a 65% hit rate on
+5.2     Performance Analysis                                                             average for irregular benchmarks. This is because an entry of the
+Performance comparison: Figure 13 shows the relative perfor-                             step cache covers a region 16 times larger (32MB) than an entry of
+mance of four-level RPT, FS-HPT, and ideal PWC. For the irregular                        the PWCs. This high hit rate of the step cache makes the average
+benchmarks, FS-HPT achieves a speedup of 15.8-35.8% (with an                             number of memory references per page table walk almost one.
+average of 27.8%) compared to the four-level RPT. This significant                       Average page table walk latency: Figure 15 shows the average
+performance improvement with FS-HPT is comparable to the ideal                           page table walk latency for each benchmark running on RPT, FS-
+PWC, where we assume all page walks involve only a single memory                         HPT, and ideal PWC. All results are normalized to RPT. For irregular
+access. Typically, as the PWC miss rate increases, the performance                       workloads, FS-HPT shows a 22.2% reduction on average in page
+gain also increases. For example, BC and SP, which have relatively                       table walk latency compared to RPT, which is close to the perfor-
+low PWC miss rates compared to other irregular workloads, show                           mance of an ideal PWC (23.5%). Since FS-HPT reduces the number
+speedups of 15.8% and 18.3%, respectively. On the other side, ATX,                       of memory references per page table walk, 1) the overall queueing
+GEV, MVT, and BFS, whose PWC miss rates are about 40%, achieve                           latency for a page walk and 2) the memory access latency per page
+
+
+
+
+                                                                                 333
+PACT ’24, October 14–16, 2024, Long Beach, CA, USA                                                          Sungbin Jang, Junhyeok Park, Osang Kwon, Yongho Lee, and Seokin Hong
+
+
+                                                     1.0    1.1   1.2    1.3   1.4    1.5   No Oversub.          0.4 Buffer
+                                                                                                               Victim 0.44 Access
+                                                                                                                             0.48 Rate
+                                                                                                                                    0.52   0.56    0.6
+
+
+
+
+                                                                                                                                                                            Victim Buf. Access Rate
+            1.6                                                                                                                                                       16%
+            1.4                                                                                                                                                       14%
+            1.2                                                                                                                                                       12%
+  Speedup
+
+
+
+
+              1                                                                                                                                                       10%
+            0.8                                                                                                                                                       8%
+            0.6                                                                                                                                                       6%
+            0.4                                                                                                                                                       4%
+            0.2                                                                                                                                                       2%
+              0                                                                                                                                                       0%
+                    ATX    GEV   MVT   SYK      BC         BFS    SP       NW        Avg.     2DC     BIC       COR     CC       KC      HOT      PF     LU    Avg.
+                                             Irregular                                                                        Regular
+
+                          Figure 16: Speedup of FS-HPT over RPTs with 150% oversubscription varying multiplicative factor
+
+                                                           RPT    0.5%     1.0%      2.0%   4.0%     FS-HPT      0.5%     1.0%
+                                                                                                                  Collision Ratio 2.0%   4.0%
+            1.6                                                                                                                                                       40%
+            1.4                                                                                                                                                       35%
+
+
+
+
+                                                                                                                                                                            Collision Rate
+            1.2                                                                                                                                                       30%
+  Speedup
+
+
+
+
+              1                                                                                                                                                       25%
+            0.8                                                                                                                                                       20%
+            0.6                                                                                                                                                       15%
+            0.4                                                                                                                                                       10%
+            0.2                                                                                                                                                       5%
+              0                                                                                                                                                       0%
+                    ATX    GEV   MVT   SYK      BC         BFS    SP       NW        Avg.     2DC     BIC       COR     CC       KC      HOT      PF     LU    Avg.
+                                             Irregular                                                                        Regular
+
+                                                         Figure 17: Performance of Step Cache-less design
+
+table walk queue both decreases. As a result, the average page table                           case. Some benchmarks (NW and KC) show lower performance
+walk latency decreases, reducing the stall time for each SM due to                             than RPT with this multiplicative factor because of the high victim
+address translation.                                                                           buffer access rate. On the other hand, with 𝑚 = 1.5, the GPU’s page
+                                                                                               table can store all the PTEs of pages in the working set with 150%
+5.3               Impact of Victim Buffer                                                      oversubscription. Therefore, the victim buffer access rate becomes
+We measure the performance of all benchmarks running at 150%                                   zero, and FS-HPT achieves comparable performance to in the no
+oversubscription to evaluate the impact of the victim buffer. For                              oversubscription case. Since the probing time for open addressing
+150% oversubscription, we set the device memory size to 66.6% of                               accounts for a small portion of the long page fault handling times,
+each benchmark’s working set size to avoid extremely long simula-                              the impact of increasing the multiplicative factor on performance
+tion times. Figure 16 shows the speedup of FS-HPT over RPT both                                is trivial. Rather, a high multiplicative factor reduces the number
+with and without 150% oversubscription, respectively, varying the                              of accesses to the victim buffer, providing near-ideal performance.
+multiplicative factor 𝑚 (bar graph). As mentioned in Section 3.6,
+the default 𝑚 is 1.2. With 𝑚 = 1.2, for irregular workloads, FS-HPT                            5.4      Performance of Step Cache-Less Design
+offers slightly lower performance gains in 150% oversubscription                               We evaluate the performance of the step cache-less design discussed
+scenarios compared to the case with no oversubscription. The av-                               in Section 4.1. Figure 17 shows the performance of the step cache-
+erage speedup with 𝑚 = 1.2 is 21.5%, while the average speedup                                 less design and its hash collision rate for page table access with
+is 27.8% without oversubscription. The small reduction in perfor-                              varying sizes of the page table. Each bar graph depicts the speedup
+mance improvement is mainly due to oversubscription requiring                                  of FS-HPT with the step cache-less design for different page table
+accessing of the victim buffer to retrieve cold remote mappings.                               sizes compared to RPT. The line graph shows the hash collision
+   Figure 16 also shows the victim buffer access rate as a proportion                          rate on page table lookup. Starting from the base page table size
+of total page table accesses for all workloads (line graph). With                              (0.5% of total memory), which is our default configuration, we
+𝑚 = 1.2, GEV, SYK, BFS, SP, and NW show over 1% victim buffer                                  gradually increase the size of the page table to 1%, 2%, and then
+access rates (1.4-4.4%). Nevertheless, NW, which has the highest                               4% of device memory. As expected, while accessing the HPT, the
+victim buffer access rate (4.4%), still shows a speedup of 11% over                            hash collision rate decreases as the page table size increases. With
+RPT. These results demonstrate that while the performance gain                                 the 0.5% configuration, the performance decreases by an average
+from using FS-HPT is slightly reduced with oversubscription, it still                          of 2.2% compared to RPT due to the high collision rate. However,
+provides a substantial performance gain compared to RPT.                                       the step cache-less design with page table sizes of 1%, 2%, and 4%
+Sensitivity analysis: We evaluate the performance of FS-HPT                                    of device memory shows an average 10%, 19%, and 24.4% speedup
+under condition of 150% memory oversubscription by varying the                                 over RPTs for irregular workloads, respectively. These results imply
+multiplicative factor to assess the impact of different load factor                            that using a large HPT can achieve near-ideal performance without
+thresholds. For each multiplicative factor (1.0, 1.1, 1.2, 1.3, 1.4, and                       the need for an SRAM cache in the GMMU.
+1.5), FS-HPT achieves average speedups of 11.7%, 17.7%, 21.5%,
+25.3%, 26.6%, and 27.8%, over RPT, respectively. With 𝑚 = 1.0, all                             5.5      Impact of Large Page Size
+remote accesses result in victim buffer lookups after the load factor                          Figure 18 shows the speedup for benchmarks running on RPT, FS-
+reaches its threshold. Therefore, the average speedup over RPT with                            HPT, and ideal PWC over RPT with a 64KB base page size. For
+𝑚 = 1.0 is 11.7%, which is smaller than in the no oversubscription                             irregular workloads, FS-HPT achieves a speedup of 24.5% over RPT,
+
+
+
+
+                                                                                        334
+Rethinking Page Table Structure for Fast Address Translation in GPUs: A Fixed-Size Hashed Page Table                                                        PACT ’24, October 14–16, 2024, Long Beach, CA, USA
+
+
+                                                  RPT     FS-HPT          Ideal PWC                                                FS-HPT because our technique focuses on reducing page table walk
+              1.6                                                                                                                  overheads and can support multiple page sizes.
+              1.4
+              1.2
+    Speedup
+
+
+
+
+                1                                                                                                                  Reducing page table walk overhead: Shin et al. [48] proposed
+              0.8
+              0.6                                                                                                                  an efficient page table walk scheduling policy by exploiting SIMD
+              0.4
+              0.2                                                                                                                  execution characteristics. They scheduled page table walk requests
+                0
+                                                                                                                                   using the "shortest-job-first" principle and "batch" processing. Also,
+                                             BC
+
+
+
+
+                                                                                                 KC
+                                                              NW
+
+
+
+
+                                                                                                      HOT
+                                                                                                            PF
+                     ATX
+                           GEV
+                                 MVT
+
+
+
+
+                                                                                                                 LU
+                                       SYK
+
+
+
+
+                                                                   Avg.
+                                                                          2DC
+                                                                                BIC
+                                                                                      COR
+                                                                                            CC
+
+
+
+
+                                                                                                                      Avg.
+                                                   BFS
+                                                         SP                                                                        Shin et al. [49] reduced the page table walk overhead by coalescing
+                                        Irregular                                            Regular
+                                                                                                                                   multiple page table walk requests that fall into a single cacheline.
+Figure 18: Speedup of FS-HPT over RPT for 64KB page size                                                                           Since FS-HPT ensures the spatial locality of PTEs in cacheline
+                                                                                                                                   granularity, coalescing page table walk requests is compatible with
+                     RPT         RPT+NHA            FS-HPT         FS-HPT+NHA               Ideal PWC+NHA
+              2.5
+                                                                                                                                   FS-HPT.
+                2                                                                                                                  Virtual memory in multi-chip systems: Pratheek et al. [46] tried
+    Speedup
+
+
+
+
+              1.5                                                                                                                  to mitigate address translation overhead in Multi-Chip-Module
+                1
+              0.5                                                                                                                  GPUs (MCM GPUs) [5, 55, 56] by exploiting the aggregated ca-
+                0                                                                                                                  pacity of L2 TLB while reducing remote accesses, which causes
+                                                                                                 KC
+                     ATX
+
+
+
+
+                                             BC
+
+
+
+
+                                                              NW
+
+
+
+
+                                                                                                            PF
+                           GEV
+                                 MVT
+                                       SYK
+
+
+
+
+                                                                   Avg.
+                                                                          2DC
+                                                                                BIC
+                                                                                      COR
+                                                                                            CC
+
+
+                                                                                                      HOT
+
+
+                                                                                                                 LU
+                                                                                                                      Avg.
+                                                   BFS
+                                                         SP
+
+
+
+
+                                                                                                                                   the NUMA effect. In MCM designs, handling multiple memory
+                                        Irregular                                            Regular                               references during a page table walk can significantly increase the
+                                                                                                                                   occurrence of remote accesses. From this perspective, our FS-HPT
+Figure 19: Speedup of FS-HPT combined with a state-of-the-                                                                         design is a promising solution, as it offers substantial benefits for
+art page table walk optimization over RPT.                                                                                         future multi-chip GPUs.
+which is a slight decrease compared to the 4KB page size (27.8%).
+Since using a large page size increases the TLB reach and thus                                                                     7   Conclusions
+reduces the number of page table walks, the performance gain of                                                                    In this paper, we rearchitect GPU virtual memory to tackle its
+FS-HPT is slightly reduced. However, using a large page is not a                                                                   current address translation overheads by replacing multi-level Radix
+panacea since it consumes more PCIe bandwidth [6]. For irregular                                                                   Page Tables (RPTs) with Hashed Page Tables (HPTs). We discovered
+workloads, using large pages causes internal fragmentation issues                                                                  that GPU page tables primarily store translation information for
+because certain workloads may use only a small portion of the re-                                                                  pages in device memory. Thus, these page tables do not continue
+quired pages. Moreover, FS-HPT is expected to deliver performance                                                                  to grow without bounds and remain substantially smaller than
+enhancements even with large pages, as current large pages may                                                                     the device memory’s capacity. Leveraging this characteristic, we
+become small pages for emerging workloads.                                                                                         introduce a Fixed-Size Hashed Page Table (FS-HPT). FS-HPT does
+                                                                                                                                   not dynamically increase its page table size and thus avoids any
+5.6                 Comparison and Compatibility with Other                                                                        overheads from resizing the page table, avoiding a critical limitation
+                    Techniques                                                                                                     in HPTs. Instead, FS-HPT strategically evicts rarely-used Page Table
+We compare the performance of FS-HPT with a state-of-the-art                                                                       Entries (PTEs) to maintain a target load factor. FS-HPT employs
+technique [49] called Neighborhood-Aware Address Translation                                                                       a step table to provide fast table lookups by avoiding sequential
+(NHA). Figure 19 shows the speedups of RPT, RPT with NHA, FS-                                                                      probing operations when the open addressing scheme is used for
+HPT, FS-HPT with NHA, and ideal PWC with NHA over RPT. FS-                                                                         collision resolution. To minimize the performance impact of PTE
+HPT shows an average speedup of 5.8% over RPT with NHA for                                                                         eviction, FS-HPT uses a victim buffer, which is slow but scalable,
+irregular workloads. RPT with NHA shows no speedup for ATX,                                                                        to hold evicted PTEs. Our experimental results show that FS-HPT
+GEV, and MVT since there is non-spatial-locality among the page                                                                    achieves a 27.8% performance improvement on average over RPT
+table walks. On the other hand, RPT with NHA gets a speedup                                                                        for irregular memory-intensive workloads.
+for some regular workloads (CC and KC). This is because, unlike
+FS-HPT, RPT with NHA can reduce the number of page table walks                                                                     Acknowledgments
+by coalescing the page table walks that fall into the same cacheline.                                                              This work was partly supported by the National Research Founda-
+   The strength of FS-HPT comes from its orthogonality to other                                                                    tion of Korea (NRF) grant (No. 2022R1C1C1012154, 80%), Institute of
+techniques. Since FS-HPT guarantees the locality of PTEs within                                                                    Information & communications Technology Planning & Evaluation
+2MB granularity, FS-HPT can be applied with NHA. FS-HPT with                                                                       (IITP) grant funded by the Korea government (MSIT) (No.2021-
+NHA shows an average speedup of 61.7% over RPT, which is near                                                                      0-00863, 10%), the Ministry of Science and ICT (MSIT) under the
+the performance of ideal PWC with NHA.                                                                                             Information Technology Research Center (ITRC) support program
+                                                                                                                                   (IITP-2021-0-02052, 10%) supervised by the Institute for Informa-
+6             Related Works                                                                                                        tion & Communications Technology Planning & Evaluation (IITP),
+Optimizing TLB: There are several works [6, 29, 42] focused on in-                                                                 Samsung Electronics Co., Ltd (IO220902-02337-01), and the BK21
+creasing TLB reach by merging TLB entries and using large page [4].                                                                FOUR Project. Sungbin Jang, Junhyeok Park, Yongho Lee, Osang
+Baruah et al. [8] tried to increase the TLB hit rate by exploiting                                                                 Kwon, and Seokin Hong are with the Department of Electrical and
+locality among thread blocks by probing another L1 TLB and by                                                                      Computer Engineering at Sungkyunkwan University. Seokin Hong
+prefetching L1 TLB entries. These techniques could be applied with                                                                 is the corresponding author.
+
+
+
+
+                                                                                                                             335
+PACT ’24, October 14–16, 2024, Long Beach, CA, USA                                                    Sungbin Jang, Junhyeok Park, Osang Kwon, Yongho Lee, and Seokin Hong
+
+
+References                                                                                  [24] Corbet Jonathan. 2017. Five-Level Page Tables. (2017). https://lwn.net/Articles
+ [1] Tyler Allen and Rong Ge. 2021. In-Depth Analyses of Unified Virtual Memory                  /717293/
+     System for GPU Accelerated Computing. In Proceedings of the International              [25] Vasileios Karakostas, Jayneel Gandhi, Furkan Ayar, Adrián Cristal, Mark D Hill,
+     Conference for High Performance Computing, Networking, Storage and Analysis.                Kathryn S McKinley, Mario Nemirovsky, Michael M Swift, and Osman Ünsal.
+     1–15.                                                                                       2015. Redundant Memory Mappings for Fast Access to Large Memories. ACM
+ [2] AMD 2012. AMD GRAPHICS CORES NEXT (GCN) ARCHITECTURE. AMD.                                  SIGARCH Computer Architecture News 43, 3S (2015), 66–78.
+     https://www.amd.com/Documents/GCN_Architecture_whitepaper.pdf                          [26] Mahmoud Khairy, Zhesheng Shen, Tor M Aamodt, and Timothy G Rogers. 2020.
+ [3] AMD 2015. AMD APP SDK OpenCL Optimization Guide. AMD. https://www.                          Accel-Sim: An Extensible Simulation Framework for Validated GPU Modeling. In
+     amd.com/content/dam/amd/en/documents/radeon-tech-docs/programmer-                           2020 ACM/IEEE 47th Annual International Symposium on Computer Architecture
+     references/AMD_OpenCL_Programming_Optimization_Guide2.pdf                                   (ISCA). IEEE, 473–486.
+ [4] Andrea Arcangeli. 2010. Transparent Hugepage Support. In KVM forum, Vol. 9.            [27] Hyojong Kim, Jaewoong Sim, Prasun Gera, Ramyad Hadidi, and Hyesoon Kim.
+ [5] Akhil Arunkumar, Evgeny Bolotin, Benjamin Cho, Ugljesa Milic, Eiman Ebrahimi,               2020. Batch-Aware Unified Memory Management in GPUs for Irregular Work-
+     Oreste Villa, Aamer Jaleel, Carole-Jean Wu, and David Nellans. 2017. MCM-GPU:               loads. In Proceedings of the Twenty-Fifth International Conference on Architectural
+     Multi-Chip-Module GPUs for Continued Performance Scalability. ACM SIGARCH                   Support for Programming Languages and Operating Systems. 1357–1370.
+     Computer Architecture News 45, 2 (2017), 320–332.                                      [28] Osang Kwon, Yongho Lee, and Seokin Hong. 2022. Pinning Page Structure
+ [6] Rachata Ausavarungnirun, Joshua Landgraf, Vance Miller, Saugata Ghose, Jayneel              Entries to Last-Level Cache for Fast Address Translation. IEEE Access 10 (2022),
+     Gandhi, Christopher J Rossbach, and Onur Mutlu. 2017. Mosaic: A GPU Mem-                    114552–114565.
+     ory Manager with Application-Transparent Support for Multiple Page Sizes. In           [29] Jiwon Lee, Ju Min Lee, Yunho Oh, William J Song, and Won Woo Ro. 2023.
+     Proceedings of the 50th Annual IEEE/ACM International Symposium on Microarchi-              SnakeByte: A TLB Design with Adaptive and Recursive Page Merging in GPUs.
+     tecture. 136–150.                                                                           In 2023 IEEE International Symposium on High-Performance Computer Architecture
+ [7] Thomas W Barr, Alan L Cox, and Scott Rixner. 2010. Translation Caching: Skip,               (HPCA). IEEE, 1195–1207.
+     Don’t Walk (the Page Table). ACM SIGARCH Computer Architecture News 38, 3              [30] Bingyao Li, Yanan Guo, Yueqi Wang, Aamer Jaleel, Jun Yang, and Xulong Tang.
+     (2010), 48–59.                                                                              2023. IDYLL: Enhancing Page Translation in Multi-GPUs via Light Weight
+ [8] Trinayan Baruah, Yifan Sun, Saiful A Mojumder, José L Abellán, Yash Ukidave,                PTE Invalidations. In Proceedings of the 56th Annual IEEE/ACM International
+     Ajay Joshi, Norman Rubin, John Kim, and David Kaeli. 2020. Valkyrie: Leveraging             Symposium on Microarchitecture. 1163–1177.
+     Inter-TLB Locality to Enhance GPU Performance. In Proceedings of the ACM               [31] Bingyao Li, Yueqi Wang, and Xulong Tang. 2023. Orchestrated Scheduling and
+     International Conference on Parallel Architectures and Compilation Techniques.              Partitioning for Improved Address Translation in GPUs. In 2023 60th ACM/IEEE
+     455–466.                                                                                    Design Automation Conference (DAC). IEEE, 1–6.
+ [9] Ravi Bhargava, Benjamin Serebrin, Francesco Spadini, and Srilatha Manne. 2008.         [32] Bingyao Li, Jieming Yin, Anup Holey, Youtao Zhang, Jun Yang, and Xulong Tang.
+     Accelerating Two-Dimensional Page Walks for Virtualized Systems. In Proceed-                2023. Trans-FW: Short Circuiting Page Table Walk in Multi-GPU Systems via
+     ings of the 13th international conference on Architectural support for programming          Remote Forwarding. In 2023 IEEE International Symposium on High-Performance
+     languages and operating systems. 26–35.                                                     Computer Architecture (HPCA). IEEE, 456–470.
+[10] Abhishek Bhattacharjee. 2013. Large-Reach Memory Management Unit Caches.               [33] Nika Mansouri Ghiasi, Jisung Park, Harun Mustafa, Jeremie Kim, Ataberk Ol-
+     In Proceedings of the 46th Annual IEEE/ACM International Symposium on Microar-              gun, Arvid Gollwitzer, Damla Senol Cali, Can Firtina, Haiyu Mao, Nour Almad-
+     chitecture. 383–394.                                                                        houn Alserr, et al. 2022. GenStore: A High-Performance in-Storage Processing
+[11] Damla Senol Cali, Konstantinos Kanellopoulos, Joël Lindegger, Zülal Bingöl,                 System for Genome Sequence Analysis. In Proceedings of the 27th ACM Inter-
+     Gurpreet S Kalsi, Ziyi Zuo, Can Firtina, Meryem Banu Cavlak, Jeremie Kim,                   national Conference on Architectural Support for Programming Languages and
+     Nika Mansouri Ghiasi, et al. 2022. SeGraM: A Universal Hardware Accelerator for             Operating Systems. 635–654.
+     Genomic Sequence-to-Graph and Sequence-to-Sequence Mapping. In Proceedings             [34] Lifeng Nai, Yinglong Xia, Ilie G Tanase, Hyesoon Kim, and Ching-Yung Lin.
+     of the 49th Annual International Symposium on Computer Architecture. 638–655.               2015. GraphBIG: Understanding Graph Computing in the Context of Industrial
+[12] Shuai Che, Michael Boyer, Jiayuan Meng, David Tarjan, Jeremy W Sheaffer, Sang-              Solutions. In Proceedings of the International Conference for High Performance
+     Ha Lee, and Kevin Skadron. 2009. Rodinia: A Benchmark Suite for Heterogeneous               Computing, Networking, Storage and Analysis. 1–12.
+     Computing. In 2009 IEEE international symposium on workload characterization           [35] NVIDIA 2016. NVIDIA TESLA P100. NVIDIA. https://images.nvidia.com/conten
+     (IISWC). IEEE, 44–54.                                                                       t/pdf/tesla/whitepaper/pascal-architecture-whitepaper.pdf
+[13] Wei-Lin Chiang, Xuanqing Liu, Si Si, Yang Li, Samy Bengio, and Cho-Jui Hsieh.          [36] NVIDIA 2017. NVIDIA TESLA V100 GPU ARCHITECTURE. NVIDIA. https:
+     2019. Cluster-GCN: An Efficient Algorithm for Training Deep and Large Graph                 //images.nvidia.com/content/volta- architecture/pdf /volta- architecture-
+     Convolutional Networks. In Proceedings of the 25th ACM SIGKDD international                 whitepaper.pdf
+     conference on knowledge discovery & data mining. 257–266.                              [37] NVIDIA 2020. Pascal MMU Format Changes. NVIDIA. https://nvidia.github.io/o
+[14] Thomas H Cormen, Charles E Leiserson, Ronald L Rivest, and Clifford Stein. 2022.            pen-gpu-doc/pascal/gp100-mmu-format.pdf
+     Introduction to Algorithms. MIT press.                                                 [38] NVIDIA 2021. NVIDIA AMPERE GA102 GPU ARCHITECTURE. NVIDIA. https:
+[15] Debashis Ganguly, Ziyu Zhang, Jun Yang, and Rami Melhem. 2019. Interplay                    //www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-
+     between Hardware Prefetcher and Page Eviction Policy in GPU-GPU Unified                     whitepaper-v2.pdf
+     Virtual Memory. In Proceedings of the 46th International Symposium on Computer         [39] NVIDIA 2024. NVIDIA Linux Open GPU Kernel Module Source. NVIDIA. https:
+     Architecture. 224–235.                                                                      //github.com/NVIDIA/open-gpu-kernel-modules
+[16] Debashis Ganguly, Ziyu Zhang, Jun Yang, and Rami Melhem. 2020. Adaptive                [40] Rasmus Pagh and Flemming Friche Rodler. 2004. Cuckoo Hashing. Journal of
+     Page Migration for Irregular Data-Intensive Applications under GPU Memory                   Algorithms 51, 2 (2004), 122–144.
+     Oversubscription. In 2020 IEEE International Parallel and Distributed Processing       [41] Chang Hyun Park, Ilias Vougioukas, Andreas Sandberg, and David Black-Schaffer.
+     Symposium (IPDPS). IEEE, 451–461.                                                           2022. Every Walk’s a Hit: Making Page Walks Single-Access Cache Hits. In
+[17] Scott Grauer-Gray, Lifan Xu, Robert Searles, Sudhee Ayalasomayajula, and John               Proceedings of the 27th ACM International Conference on Architectural Support for
+     Cavazos. 2012. Auto-Tuning a High-Level Language Targeted to GPU Codes. In                  Programming Languages and Operating Systems. 128–141.
+     2012 innovative parallel computing (InPar). IEEE, 1–10.                                [42] Binh Pham, Viswanathan Vaidyanathan, Aamer Jaleel, and Abhishek Bhattachar-
+[18] Jerry Huck and Jim Hays. 1993. Architectural Support for Translation Table                  jee. 2012. Colt: Coalesced large-reach tlbs. In 2012 45th Annual IEEE/ACM Inter-
+     Management in Large Address Space Machines. In Proceedings of the 20th annual               national Symposium on Microarchitecture. IEEE, 258–269.
+     international symposium on computer architecture. 39–50.                               [43] Bharath Pichai, Lisa Hsu, and Abhishek Bhattacharjee. 2014. Architectural
+[19] IBM. 2005. PowerPC Microprocessor Family: The Programming Environments                      Support for Address Translation on GPUs: Designing Memory Management
+     Manual for 64 and 32-Bit Microprocessors.                                                   Units for CPU/GPUs with Unified Address Spaces. ACM SIGARCH Computer
+[20] Intel. 2010. Intel Itanium Architecture Software Developer’s Manual. (2010).                Architecture News 42, 1 (2014), 743–758.
+     https://www.intel.sg/content/dam/doc/manual/itanium-architecture-vol-1-2-              [44] Jason Power, Mark D Hill, and David A Wood. 2014. Supporting x86-64 Address
+     3-4-reference-set-manual.pdf                                                                Translation for 100s of GPU Lanes. In 2014 IEEE 20th International Symposium on
+[21] Intel. 2023. Intel 64 and IA-32 Architectures Software Developer’s Manual. (2023).          High Performance Computer Architecture (HPCA). IEEE, 568–578.
+     https://cdrdv2.intel.com/v1/dl/getContent/671200                                       [45] B Pratheek, Neha Jawalkar, and Arkaprava Basu. 2021. Improving GPU Multi-
+[22] Aamer Jaleel, Eiman Ebrahimi, and Sam Duncan. 2019. Ducati: High-Performance                Tenancy with Page Walk Stealing. In 2021 IEEE International Symposium on
+     Address Translation by Extending TLB Reach of GPU-Accelerated Systems. ACM                  High-Performance Computer Architecture (HPCA). IEEE, 626–639.
+     Transactions on Architecture and Code Optimization (TACO) 16, 1 (2019), 1–24.          [46] B Pratheek, Neha Jawalkar, and Arkaprava Basu. 2022. Designing Virtual Mem-
+[23] Corbet Jonathan. 2005. Four-Level Page Tables Merged. (2005). https://lwn.net/              ory System of MCM GPUs. In 2022 55th IEEE/ACM International Symposium on
+     Articles/117749/                                                                            Microarchitecture (MICRO). IEEE, 404–422.
+                                                                                            [47] Nikolay Sakharnykh. 2018. Everything You Need to Know about Unified Memory.
+                                                                                                 https://www.nvidia.com/en- us/on- demand/session/gtcsiliconvalley2018-
+
+
+
+
+                                                                                      336
+Rethinking Page Table Structure for Fast Address Translation in GPUs: A Fixed-Size Hashed Page Table                        PACT ’24, October 14–16, 2024, Long Beach, CA, USA
+
+
+     s8430/                                                                                        You Need. Advances in neural information processing systems 30 (2017).
+[48] Seunghee Shin, Guilherme Cox, Mark Oskin, Gabriel H Loh, Yan Solihin, Ab-                [53] Yueqi Wang, Bingyao Li, Aamer Jaleel, Jun Yang, and Xulong Tang. 2024. GRIT:
+     hishek Bhattacharjee, and Arkaprava Basu. 2018. Scheduling Page Table Walks                   Enhancing Multi-GPU Performance with Fine-Grained Dynamic Page Placement.
+     for Irregular GPU Applications. In 2018 ACM/IEEE 45th Annual International                    In 2024 IEEE International Symposium on High-Performance Computer Architecture
+     Symposium on Computer Architecture (ISCA). IEEE, 180–192.                                     (HPCA). IEEE.
+[49] Seunghee Shin, Michael LeBeane, Yan Solihin, and Arkaprava Basu. 2018.                   [54] Idan Yaniv and Dan Tsafrir. 2016. Hash, Don’t Cache (the Page Table). ACM
+     Neighborhood-Aware Address Translation for Irregular GPU Applications. In                     SIGMETRICS Performance Evaluation Review 44, 1 (2016), 337–350.
+     2018 51st Annual IEEE/ACM International Symposium on Microarchitecture (MI-              [55] Shiqing Zhang, Mahmood Naderan-Tahan, Magnus Jahre, and Lieven Eeckhout.
+     CRO). IEEE, 352–363.                                                                          2023. SAC: Sharing-Aware Caching in Multi-Chip GPUs. In Proceedings of the 50th
+[50] Dimitrios Skarlatos, Apostolos Kokolis, Tianyin Xu, and Josep Torrellas. 2020.                Annual International Symposium on Computer Architecture (ISCA). Association
+     Elastic cuckoo page tables: Rethinking virtual memory translation for parallelism.            for Computing Machinery, New York, NY, USA. https://doi.org/10.1145/3579371.
+     In Proceedings of the Twenty-Fifth International Conference on Architectural Support          3589078
+     for Programming Languages and Operating Systems. 1093–1108.                              [56] Xia Zhao, Magnus Jahre, Yuhua Tang, Guangda Zhang, and Lieven Eeckhout.
+[51] Jovan Stojkovic, Namrata Mantri, Dimitrios Skarlatos, Tianyin Xu, and Josep                   2023. NUBA: Non-Uniform Bandwidth GPUs. In Proceedings of the 28th ACM
+     Torrellas. 2023. Memory-Efficient Hashed Page Tables. In 2023 IEEE International              International Conference on Architectural Support for Programming Languages and
+     Symposium on High-Performance Computer Architecture (HPCA). IEEE, 1221–                       Operating Systems (ASPOLOS), Volume 2. Association for Computing Machinery,
+     1235.                                                                                         New York, NY, USA, 544–559. https://doi.org/10.1145/3575693.3575745
+[52] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+     Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. Attention Is All
+
+
+
+
+                                                                                        337
+

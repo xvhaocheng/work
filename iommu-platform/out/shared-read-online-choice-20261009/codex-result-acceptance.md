@@ -1,0 +1,11 @@
+# §71 Execution evidence and restricted acceptance
+
+50 real executions: 40 complete-copy PASS (32 adaptive / 8 fixed-share §70 controls), 10 strict actual-cutover rejections. No watchdog failure observed. Actual source AR/R and 256 target W/full2048bytes checked for every PASS. Every bound adaptive choice independently recalculated from frozen H/M/C/E/cursor and rule. First22 runs exactly reproduce the selected §70 fixed route CSV/oldmetrics; rule0 and geometricrule1 choose identically in initial11 conditions. Thus the geometric formula has not shown a distinct benefit in these conditions.
+
+Local samples are causal source-service observations, not a pure DDR bandwidth measurement; include arbitration/PTW contention indirectly and skid/private/target holds. Excluding first R also excludes each child's first handshake from H. They do not predict future A stalls. At B512 the independent choice has V≈69652 whereas fixed-share can finish materially earlier; no universal protection or optimum claim.
+
+Critical source review found a legal-interface odd-E/MaxB2 prefix-to-joint counterexample candidate: a V NEW qW spanning E may precede A resident prefix and create a missing-R dependency. Eight targeted delayed-B fixed-share DUT runs did not reproduce it in the current uniform-B model. The hand-derived interface sequence is not an observed DUT failure. Shared path's general progress acceptance remains restricted pending the §72 both-prefix clipping and raw-W-debt-complete join gate. See critical-online-binding-review.md, directly read by root.
+
+The10 failed corner runs all completed the underlying sequence but rejected +cutover-require=1 because no cutover occurred; their terminal NATURAL flags are false, so they are excluded from40PASS. A helper import failed before RTL execution due to missing argv guard, fixed mechanically; it is not a DUT execution. Baseline ordinary p2p/multicast/threshold methods remain established prior art; a new timer or formula name is not a contribution.
+
+Codex personally designed/implemented/reviewed/executed/audited this prototype. A DeepSeek audit call failed through the ordinary sandbox proxy; no draft returned. A separately authorized network-mode positive-proposal task is pending. No production, Linux, BIT, board or synthesis change.

@@ -1,0 +1,7 @@
+# §69 Root result: strongest ordinary parallel independent READ challenges sharing
+
+Two builds/15 completecopyPASS:4candidateCSV/nestedmetrics exactlyregress§68;11ordinaryshare0controlsstrictR512,full256W/2048bytes eachdestination. Sameoldprefix/full independentREAD+resident NEWAW+MaxB2 window; oneadditionalregisteredVcontinuationARofferbit, noadditionalpayload, actualareaunknown. Driverindependentmacrostrict512onlyforShareRepairSuffix0; sourcecandidateexpectE+256unchanged. Originaltargetbytes/physicalLAST/parentB checksretained.
+
+E160:shared4550/4541 R416 vsordinaryindependent3883/4547 R512:traffic−18.75%,V+17.2%delay,Aroughlyequal. PressureE112:shared9824/9833 R368 vsindependent7800/9833 R512:traffic−28.1%,V+25.9%,Asame. E256actualCSVsameordinaryparallelbehavior; itcannotprovideindependentsharedgain. These showdecoder/consumercoupling, notonlybandwidth. BecausecurrentstrongordinarycontrolwinsjointcompletionorParetoinmanypoints, cannotclaimperformanceinnovationfromparallelrepairalone. Reducingtrafficandlatencyarenotinterchangeable; nextcheckread-servicepressureandonlinepolicywithexplicitVprogressobjective, plusaccuratepriorsearch.
+
+Rootcardinality/byte/exactregressionchecksrun; separatecriticalsourceproofmustbeattached whenavailable. Singlejob/static success/behavioralDDRonly, noMIG/board/permanentUARTworkflow/productionPNclaim.

@@ -1,0 +1,9 @@
+# §63: Strong ordinary capacity-envelope admission
+
+Root Codex design after reading CTC2009 author's primary §3/4. Not named as a new independent mechanism. Existing peer-start admission requires start_new<=peeractualW, reservesQ even if native childshort. New ordinary policy3 instead requires actual nextchildend <= peeractualW+WriteQuantum. Uses 64bit arithmetic for Q256 so no 9bit creditwrap; same Q+1 real perDMA FIFO, no new state/payload. Own current WRITE permission remains mandatory; when no futureWRITEprefetch, both policy1 and3 retain common successfulWRITE-frontier childclipping to avoid targetpermission cycle. With prefetch, native page grid remains.
+
+Proof: at private-full sharedRblock r=w_i+Q, every alreadyfirstVALID W-head has end<=peerW_at_creation+Q<=r, so required payload can arrive before the blocking condition; eventualservice clearshead. OwnchildpreviousB makesownprefixmonotonic. Skid hasonebeattransientmembership skew, and rawW may reside inTC, so claim excludes missing-payload sustainedcycle, notphysicalquiescence orunconditionaldownstreamservice. FullQ child rule exactlysameasoldpeerstart; shortnativepages maybemorepermissive. Same original sourceR256, realtwoindependentREADs plus targetWRITEfirst/nextrecipe, normalimmutable2KiB.
+
+Add only policy3inexisting2bitinput/strictCLIlimit/holdcomparison and no crossmodule productionchange. Copy §62 sealed after37exec. First build Q8/B9 and evaluatefour F1/127/128/255 normal, F1/F128 pressure, then delay/no-prefetch cases if ordinaryequalorbetter. Samecost firstVALIDcritical; no retractingheldAW/R/W.
+
+If policy3 matches/improvescandidate, consumption-credit interpretation explains residual difference against resident and stops independentpeerclaim. Further research must find a property or safe earliercommit absentfromstandardcredit, notrenameenvelope.

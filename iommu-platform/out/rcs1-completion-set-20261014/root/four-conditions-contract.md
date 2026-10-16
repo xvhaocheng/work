@@ -1,0 +1,32 @@
+# RCS1 finite conditions, frozen before any run
+
+New conditional model, not an old RTL / trace rerun. Exactly four conditions, all policy programs fixed in advance. No sweeps, seed searches, extra warmup, capacity changes, artificial delays, added data buffer or walker. Complete whole-episode timing begins with cold IOTLB and the first legitimate producer work at tick0.
+
+## Work: one producer and three consumers
+
+Same trusted current address space for native sources0/1; formal keys a,b,p0..p13,q,r:18. Read/write access uses the same 4KiB key but distinct aligned 64B blocks. No data alias races: copies read a stable block and write a separate destination block; consumer output blocks in q differ. DMA data buffer limits stay source0/1=512 beats and only one sequential native copy per source (at most 64B payload resident per copy here). Registration of four logical multi-copy tasks is a paid software/descriptor contract, not an existing generic hardware gate. Task counts are tied to real producer and consumer receipts, never to each copy for scoring.
+
+Producer T0, oldest, source0, owns 32 copies:
+1. A real within-a 64B initialization copy; this output is consumed later.
+2. Within p0..p6, one real64B copy per key; then one real within-b64B initialization copy; then within p7..p13 one real64B copy per key. The b output is consumed later. This exact work order is frozen before execution; native masked-PLRU, rather than an LRU approximation, requires this mapping for the SJF decision witness.
+3. One 64B p13-to-q publication copy. After successful B and a one-tick producer-stage receipt, the consumer tasks may issue; T0 still has its tail below. This is a true data dependency, not an all-pages-hit gate.
+4. Within each p0..p13 followed by r, one 64B tail copy, then a one-tick final consumer/owner receipt. T0=2+14+1+15=32 copies.
+
+T1, age1, source1: fifteen 64B within-p0..p13 then within-r copies; it requires a producer-stage publication receipt before issue. T2, age2, source1: two 64B a-to-q copies. T3, age3, source1: two 64B b-to-q copies. Original source1 software order is T1,T2,T3, each task and copy sequential. Final task receipt/release costs one tick after its last B; publication costs a separate one-tick stage receipt. T0 and T1 role-owned source/destination blocks are distinct even when they share a formal page key. Consumer q output blocks are distinct from each other and the producer's q block. No data race, bypassed permission, or consumer release shortcut.
+
+51 copies, 3264 payload bytes read and3264 written in every condition and rule (plus exact PTE bytes separately). First16 keys a,p0..p6,b,p7..p13 are filled by actual producer data work; no cache preload. At q's fullwalk completion, producer's last q lookup is prospectively accounted, U0=U1={p0..p13,r}, U2={a,q}, U3={b,q}. Both big tasks still miss r, whereas both small tasks can become completely resident by evicting any p. Eighteen total declared keys are the original planning bound; no17key performance run or later footprint search.
+
+## Four conditions
+
+- C1: above real shared task/key incidence; one shared memory service for all three dependent PTE reads per Sv39 full walk and every data R/W beat; one service tick per 8B PTE/data beat, B delivered by the model's ordinary fixed response step. PTE contents become available only at their actual response. FIFO by acceptance, no fixed per-walk delay. Policy selection latency must be explicit; use the same paid one-tick choice pipeline for all fixed rules, with the candidate's exact E_q filtered-reference implementation and added fanout/AND/missing-set logic counted separately; that common model clock meeting timing is conditional, Fmax unmeasured. Model cycle count is conditional.
+- C2 adjacent negative: same copies/bytes/keys/dependencies/service and physical capacity; disable only exact live task-set registry feedback to all rules. Candidate follows ordinary PLRU. Registration preparation already paid remains accounted. This tests dependence on the proposed information rather than removing the workload.
+- C3: freeze rules and exchange producer/consumer task IDs and registration ages, retaining real role-owned work/dependencies. No rule sees the role as an oracle. Source paths and capacity remain the same; report completion by role as well as ID.
+- C4: freeze work and rules, reverse producer tail p0..p13 to p13..p0 (r stays last) and permit each copy's write-address translation after its first returned read beat, while data W consumes only actually received R beats and per-copy R-before-W ownership is preserved; C1 waits for its full R burst before write-address translation. No prefix/warmup/pressure or task-boundary change. This is a frozen alternate request interleaving, not a later search.
+
+If conditional model simplifications cannot preserve these obligations, stop the model entry and record the missing point. Zero experimental error injections: all PTE/data/B responses are OKAY in these four conditions; errors counted0, injected-error termination remains unvalidated, never implied by quiet. Area, Fmax, hardware/FPGA performance, measured software cycles and application gain stay null.
+
+## Accounting and scope of the conditional engine
+
+Per source one active64B copy, original same-ID order and held requests. AllPTE reads are sequential dependent levels of one walker (Sv39 S1/4KiB), no PWC or fixed walk latency. All data AR/R, AW/W/B and PTE AR/R traverse a single FIFO service abstraction, not a real DDR timing model. Cache hits cost one lookup/permission tick and walk successes take one ordinary result/permission tick before TC handoff; selection adds the stated policy ticks. A normal inserted walk gets the native post-fill hit touch; no gratuitous new hit-history rule. All successful copies transfer8 R +8 W beats and1B; payload values are checked at final consumers. Model normal-success error obligations terminate with OKAY / error_count0; fault injection and production error handling remain unvalidated.
+
+C2 masks exact registry eligibility off to every optimized rule but keeps trusted task lifecycles and producer dependencies operational for conservation. It keeps each rule's fixed paid decision latency (candidate1, ordinary1); missing info does not create an uncharged speed path. Final quiet includes empty service FIFO, no walker, pending policy/result, held requests, R/W/B, task/consumer/release obligations.

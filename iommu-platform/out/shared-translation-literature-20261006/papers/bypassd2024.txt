@@ -1,0 +1,1390 @@
+BypassD: Enabling fast userspace access to shared SSDs
+               Sujay Yadalam                                     Chloe Alverti                              Vasileios Karakostas
+      University of Wisconsin-Madison                  National Technical University of                       University of Athens
+         Madison, Wisconsin, USA                                   Athens                                       Athens, Greece
+        sujayyadalam@cs.wisc.edu                               Athens, Greece                                 vkarakos@di.uoa.gr
+                                                         xalverti@cslab.ece.ntua.gr
+
+                                       Jayneel Gandhi                                     Michael Swift
+                                           Meta                                 University of Wisconsin-Madison
+                                 Menlo Park, California, USA                       Madison, Wisconsin, USA
+                                    jayneel@meta.com                                   swift@cs.wisc.edu
+
+Abstract                                                                        ACM Reference Format:
+Modern storage devices, such as Optane NVMe SSDs, offer                         Sujay Yadalam, Chloe Alverti, Vasileios Karakostas, Jayneel Gandhi,
+                                                                                and Michael Swift. 2024. BypassD: Enabling fast userspace access to
+ultra-low latency of a few microseconds and high bandwidth
+                                                                                shared SSDs. In 29th ACM International Conference on Architectural
+of multiple gigabytes per second. At these speeds, the ker-                     Support for Programming Languages and Operating Systems, Volume
+nel software I/O stack is a substantial source of overhead.                     1 (ASPLOS ’24), April 27-May 1, 2024, La Jolla, CA, USA. ACM, New
+Userspace approaches avoid kernel software overheads but                        York, NY, USA, 17 pages. https://doi.org/10.1145/3617232.3624854
+face challenges in supporting shared storage without major
+changes to file systems, the OS or the hardware.                                1    Introduction
+   We propose a new I/O architecture, BypassD, for fast,
+userspace access to shared storage devices. BypassD takes                       Operating system storage stacks were developed in the era
+inspiration from virtual memory: it uses virtual addresses                      of spinning disk drives with latencies in the range of millisec-
+to access a device and relies on hardware for translation                       onds, but modern SSDs, such as Intel Optane, provide access
+and protection. Like memory-mapping a file, the OS ker-                         latencies as low as 4𝜇s and bandwidth close to 7 GB/s [28].
+nel constructs a mapping for file contents in the page ta-                      Software overheads that were acceptable for slow devices
+ble. Userspace I/O requests then use virtual addresses from                     are instead becoming the dominant cost in file access. For
+these mappings to specify which file and file offset to ac-                     example, an Optane SSD can return a 4KB block in 4𝜇s, while
+cess. BypassD extends the IOMMU hardware to translate                           reading the block through standard Linux kernel takes al-
+file offsets into device Logical Block Addresses. Existing                      most 8𝜇s. Prior efforts to reduce these software overheads fall
+applications require no modifications to use BypassD. Our                       into two main categories: i) optimizations to kernel storage
+evaluation shows that BypassD reduces latency for 4KB ac-                       stacks, and ii) userspace file/storage access.
+cesses by 42% compared to standard Linux kernel and per-                           In the OS kernel, researchers have optimized I/O sched-
+forms close to userspace techniques like SPDK that do not                       uling [10, 26, 66], overlapped asynchronous operations [37],
+support device sharing. By eliminating software overheads,                      and used polling instead of interrupts [10, 64]. While these
+BypassD improves performance of real workloads, such as                         approaches greatly reduce overheads, they still require con-
+the WiredTiger storage engine, by ∼20%.                                         text switches to enter and leave the kernel, and security miti-
+                                                                                gations make these switches more costly [25, 57]. Dedicating
+CCS Concepts: • Hardware → External storage; • Soft-                            a kernel thread to poll for requests from user mode [54]
+ware and its engineering → File systems management;                             removes these switches but at the cost of an extra core.
+• Information systems → Storage virtualization.                                    SPDK and others [34, 49, 65] reduce latency by directly ac-
+                                                                                cessing an SSD from userspace. This reduces access latency
+Keywords: I/O performance, low latency, direct access, shar-
+                                                                                but has limitations. First, it burdens application developers
+ing, userspace, SSD, storage systems
+                                                                                with replacing the kernel block layer and file system, and
+                                                                                managing atomicity and crash consistency. Second, sharing
+                                                                                a device securely between applications/users is challenging:
+                                                                                devices are unaware of file layout or permissions, and con-
+This work is licensed under a Creative Commons Attribution International        sequently, userspace code gets access to all blocks on the
+4.0 License.                                                                    device. Hence, a malicious process can read or corrupt the
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+                                                                                entire disk.
+© 2024 Copyright held by the owner/author(s).
+ACM ISBN 979-8-4007-0372-0/24/04.
+                                                                                   The need for device sharing is increasing. Within data
+https://doi.org/10.1145/3617232.3624854                                         centers, operators run multiple applications on the same
+                                                                                system to increase utilization [14, 23, 50], meaning there are
+
+
+
+                                                                           35
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                                                                            Yadalam et al.
+
+
+often many workloads simultaneously seeking low-latency                                                  Time (ns)   % of total time
+access to storage. Virtual machines (VMs) and containers                       Kernel user mode switch         160               2%
+share not only CPUs and memory but also storage devices                        VFS + ext4                    2,810              36%
+such as NVMe SSDs. Some workloads may share access to                          Block I/O layer                 540               7%
+same files [15, 20, 45, 52].                                                   NVMe driver                     220               3%
+                                                                               Device time                   4,020              51%
+   Thus, systems must provide low-latency access while al-
+                                                                               User kernel mode switch         100               1%
+lowing applications to share a device. Unfortunately, most
+existing userspace storage solutions [10, 34, 65] do not sat-                  Total                         7,850
+isfy both requirements. Those systems that do [11, 33, 51],             Table 1. Latency breakdown of 4KB read() on Optane SSD.
+come with the cost of significant changes to devices, access
+protocol, and file systems. They rely on moving the entire file             • Modest modifications to the IOMMU hardware to en-
+system [33] or parts [11, 51] to the device. This burdens de-                 sure fast access and permission checks without kernel
+vices that have limited compute power and memory, limiting                    mediation.
+their performance.                                                          • An implementation of BypassD which includes a user
+   In this paper, we propose BypassD, a new I/O architecture                  library, extensions to the Linux ext4 file system, and a
+that provides protected access to files directly from userspace.              model of the hardware modifications.
+BypassD offloads permission checks to the hardware, ensur-                  • Evaluation of BypassD across a variety of micro-bench-
+ing a process can only access data with appropriate permis-                   marks, real-world applications, and comparison to
+sions. Our design builds on the key insight that the IOMMU                    state-of-the-art approaches.
+hardware, currently used for translating virtual memory ad-
+dresses to physical addresses, can be repurposed to translate           2   Background and Motivation
+file offsets to logical block offsets in the SSD. Much like NVM         New media technologies such as 3D XPoint [28] and low-
+file systems rely on memory mapping for low-latency access              latency NAND flash [13] have led to devices that offer sub-
+to data in NVM [6, 32], BypassD constructs page tables in               ten microseconds access latency and up to 1.6 million IOPS[4,
+application address spaces that map virtual addresses to file           13, 27]. They leverage high-speed I/O mechanisms to remove
+data locations, and the SSD uses the IOMMU to check access              hardware overheads in data access.
+and retrieve these mappings without kernel involvement.                 NVMe. The NVMe protocol was designed for low-latency
+   File access in BypassD follows two paths. Metadata opera-            storage requests [3]. It uses in-memory queue pairs for com-
+tions such as open and append are processed by in-kernel file           munication between host CPUs and devices. A queue pair
+systems. File reads and writes are sent directly to the device          comprises a Submission Queue (SQ) on which requests are
+from a userspace library. During file open, the kernel maps             sent to the device and a Completion Queue (CQ) from which
+the file contents into the application address space. Userspace         completions are processed. NVMe supports up to 64K queue
+read/write requests contain virtual addresses corresponding             pairs per device, each with up to 64K queued requests. Queue
+to file data. BypassD makes only minimal changes to existing            pairs can be mapped into user-mode memory, allowing di-
+file system code to map block addresses into address spaces;            rect submission and completion of requests from application
+the IOMMU to support a new translation type; and SSDs                   code without kernel involvement.
+to request translations of block addresses from the IOMMU.              IOMMU and DMA protection. Storage devices perform
+The entire mechanism is transparent to applications.                    DMA to read/write data from/to main memory. Using phys-
+   We implement BypassD in the Linux kernel with the ext4               ical address for DMA make systems vulnerable to rogue
+file system. We evaluate the performance of BypassD using a             devices and buggy drivers which could wrongly perform
+set of microbenchmarks and storage-intensive applications,              DMAs to arbitrary memory locations. To avoid this, proces-
+and observe that BypassD exposes the true latency of a device           sors use an IO Memory Management Unit (IOMMU) that
+to applications with <0.8𝜇s overhead. BypassD performs                  supports DMAs with IO virtual addresses (IOVA) instead of
+almost as fast as SPDK which lacks support for sharing,                 physical addresses. Devices issue DMA using IOVA which
+and 25% better on average than a standard Linux kernel.                 the IOMMU translates to a physical address before accessing
+Compared to a recent work that embeds application code                  memory. IOMMUs use special page tables set up by the OS to
+into the kernel for lower latency [70], BypassD improves the            translate IOVAs. With Shared Virtual Addressing (SVA) [41],
+throughput of storage-intensive workloads by 9.6%.                      a feature of modern processors, IOMMUs can access process
+   In summary, the main contributions of this paper are:                page tables along with the IOMMU-specific page tables.
+     • An end-to-end storage architecture that enables fast             Software is the new I/O bottleneck. Modern SSDs, such as
+        userspace access to shared devices called BypassD. By-          Intel Optane SSD [27], Samsung Z-SSD [13], and Toshiba’s
+        passD performs metadata operations in kernel and data           XL-Flash [4], provide access latencies under 10𝜇s. With such
+        operations in userspace allowing for a clean design             fast devices, the time spent in the kernel I/O software stack
+        that avoids any application modifications.                      is no longer negligible compared to the device access time.
+
+
+
+                                                                   36
+BypassD: Enabling fast userspace access to shared SSDs                                                                               ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+                                                                                                            Userspace                            Kernel space
+                                                           Application                                                                                                     Hardware
+Application                Application                                                                                                                   New path
+                                                                                                           Application               Metadata
+                                                                                                                                                         Existing path
+                                                                                                                                                                                             DRAM
+                           User lib/FS                     User lib/FS                                                              ops (open,                             IOMMU
+      Metadata ops                                                                                                                   append)                                                           2
+       Read/write                                                          Metadata ops               UserLib       File info                      File system              IOTLB
+                             Metadata ops                                                                                                 1                                            5
+                                                                                                                         Queues
+               Kernel FS     Read/Write        Kernel FS       Read/Write Kernel FS                        DMA                                       Driver                                 File Tables
+                                                                                                          buffers                                                        DMA
+                                                                          (Coordinate sharing)                                             Device Management
+                                                                                                          data operations                                                +ATS         DMA
+                                                                                                                                3           (create queues)
+                                                                                                            (read/write)
+                                                                                                                                                                         4
+                                                                                                                                                                                              DMA
+         SSD                             SSD                             SSD     (protection)
+                                                                                                                                                                                             buffers
+                                                                                                                                    IOMMU                                       SSD
+                                                                                                       Hardware          SSD                           DRAM
+  a) Kernel access              b) User-level FS                 c) Hybrid FS
+
+   Figure 1. Different approaches for accessing an SSD.                                                     Figure 2. BypassD components (shown in green).
+
+Figure 1a gives a high-level view of a traditional kernel file                                        temporarily suspend permission checking [11]. If the device
+system used to manage and access the data on the device.                                              exhausts memory and is unable to cache all permission data,
+Typically, accessing the device through the kernel involves                                           MonetaD relies on an expensive miss handling procedure
+multiple storage layers as shown in Table 1. The table shows                                          that involves both the userspace library and the kernel to
+the time spent in each of these layers during 4KB reads to                                            access the missing permission data. This can increase the
+Optane P5800X SSD [27]: device processing is ∼50% of access                                           I/O latency by 8x [11].
+time and the remainder is software overhead. As devices get
+faster, the relative overhead will only worsen. It is there-                                          3     BypassD Overview
+fore important to develop new techniques to reduce these                                              BypassD is an I/O architecture that provides low-latency
+software overheads and expose devices’ full performance to                                            access to shared devices. BypassD’s main goals are to:
+applications [9].                                                                                         1. Eliminate the software stack overheads and provide
+Userspace access is challenging. Direct userspace access                                                     low latency access to devices.
+to storage as shown in Figure 1b is promising as it offers re-                                            2. Securely share devices between multiple applications.
+duced overheads. However, the main challenge to userspace                                                 3. Support unmodified POSIX-compatible applications.
+device access is permission checks for sharing. When access-
+                                                                                                      These sharing and POSIX-compatibility goals ensure By-
+ing a file through the kernel, the kernel relies on process
+                                                                                                      passD is widely usable. In achieving these goals, we follow
+credentials, file permission metadata and/or access-control
+                                                                                                      four guiding principles:
+lists (ACLs) to check whether a process has permission to
+access a file. With userspace solutions such as SPDK [65] that                                            1. Kernel bypass: For low latency, bypass the kernel and
+bypass the kernel, there is no trusted entity that can enforce                                               provide direct access to the device from userspace.
+such permission checks. Applications can therefore access                                                 2. Leverage existing file systems and drivers: Make use
+and modify from userspace all blocks on the device. There-                                                   of existing mature and well-tested kernel file systems
+fore, a device cannot be shared securely between multiple                                                    and device drivers with only minimal changes.
+applications with approaches such as SPDK.                                                                3. Offload permission checks to hardware: Enforce file sys-
+Protection in hardware. One way to overcome the chal-                                                        tem access rules by offloading checks to hardware.
+lenge of userspace access is to offload the permission checks                                             4. Co-exist with kernel: Ensure file access is available
+to the hardware as shown in Figure 1c. Prior designs em-                                                     through both BypassD and the kernel to handle corner-
+power the device to perform permission checks by copying                                                     cases and avoid performance regressions.
+permission data to the device [11, 33, 51] or by splitting the
+device into partitions with unsafe user-level sharing [49].                                           3.1 Design overview
+Drawbacks of protection in device. Enforcing permission                                               Above principles push towards a design that leverages exist-
+checks on the device has several challenges. Prior designs [11,                                       ing OS and hardware mechanisms by only offloading latency-
+33, 51] make significant changes to the device and access                                             critical file data accesses to userspace. BypassD adopts a split
+protocol to store permission information, yet suffer from                                             architecture, wherein latency-critical data operations such
+several drawbacks (1) high reliance on the device’s computa-                                          as read() and write() are handled directly in userspace, and
+tional power to perform both I/O processing and permission                                            file operations that modify the file metadata such as open()
+book-keeping, (2) burden on the device’s memory to store                                              and appends are processed by the kernel. We call the direct
+permission data especially when the device is busy, and (3)                                           path from userspace to device the BypassD interface, and the
+high costs of updating permission information which could                                             default path through the kernel, the kernel interface.
+lead to starvation in some cases [11].                                                                   While accessing data through the BypassD interface, the
+   The above drawbacks may also lead to unpredictable per-                                            permission checks are performed in the hardware. The ker-
+formance including sudden drops in throughput and high                                                nel file system is responsible for policy decisions that the
+tail latencies. For instance, in MonetaD, while the device is                                         hardware enforces during device accesses. Unlike prior de-
+updating permission data, it has to stop serving requests or                                          signs [11, 33, 51], BypassD performs permission checks on
+
+
+
+                                                                                                 37
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                                                                            Yadalam et al.
+
+
+     a) Regular PTE        Ignored Rsvd. Page Frame Number   … R/W            UserLib also tracks information about open files such as
+     b) Proposed                                                           flags, offset, size and the starting VBA. It also tracks a list of
+                            DevID FT Logical Block Address … R/W
+        File Table Entry                                                   ongoing partial-writes (more in Section 4.5)
+              Figure 3. Format of File Table Entry.                        Hardware. The kernel offloads permission checks to the
+                                                                           hardware. BypassD builds on existing IOMMU translation
+                                                                           and protection mechanisms for IO Virtual Addresses (IOVA).
+the host (CPU) hardware, thereby avoiding the drawbacks of
+                                                                           BypassD proposes minor enhancements to the IOMMU hard-
+enforcing protection on the device (discussed in Section 2).
+                                                                           ware: as shown in Figure 2, in addition to translating IO
+   BypassD seeks inspiration from virtual memory and ad-
+                                                                           Virtual Address (IOVA) of DMA buffers, the IOMMU in By-
+dress translation. With virtual memory, processes access
+                                                                           passD translates VBAs to LBAs and performs read/write
+memory using virtual addresses that are translated to phys-
+                                                                           permission checks. To do so, the IOMMU walks the page
+ical addresses by the Memory Management Unit (MMU).
+                                                                           tables of the requesting process to access the attached file
+Along with the translation, MMU ensures that processes
+                                                                           table entries (FTEs).
+have the correct permissions to access memory. Similarly,
+                                                                               4 - 5 SSDs communicate with the IOMMU to translate
+in BypassD, processes access data on a device using virtual
+                                                                           VBA in incoming requests and perform permission checks.
+addresses, termed Virtual Block Addresses (VBA) that are
+                                                                           After receiving translated LBAs, SSDs complete the I/O re-
+mapped to Logical Block Addresses (LBA) using page tables.
+                                                                           quests just like they do in systems today.
+Enhanced IOMMU hardware translates Virtual Block Ad-
+                                                                              BypassD is the first system to enforce permission checks
+dresses in requests to Logical Block Addresses and ensures
+                                                                           on the host hardware. BypassD avoids significant hardware
+the process has permissions to access the blocks.
+                                                                           changes and tries to reuse existing translation and protection
+                                                                           mechanisms. As shown in Section 6, VBA translation can
+3.2 BypassD components                                                     take as less as 550ns. With such minimal overheads and mi-
+Figure 2 shows the key components in BypassD. We briefly                   nor hardware enhancements, BypassD achieves low latency
+describe these components and then discuss how they inter-                 direct access from userspace and device sharing.
+act to achieve the goals of BypassD.
+Kernel file system and device driver. BypassD reuses the                   3.3 BypassD interface
+kernel file system and device driver to manage the device.                 BypassD provides a new interface enabling processes to ac-
+ 1 All file operations that modify the file system metadata                cess devices directly from userspace. Setting up the interface
+are handled by the kernel. Unlike prior designs [11, 33, 51],              consists of three steps: i) setting up queue pairs to the device,
+the file system metadata is present only inside the kernel                 ii) allocating DMA buffers, and iii) setting up file tables.
+and not shared with either userspace libraries or the device.                  UserLib requests the kernel driver to create new queues
+This avoids complexities involved in maintaining metadata                  and map it into the userspace. Upon receiving such a request,
+consistently across multiple layers.                                       the kernel driver creates new queues and registers them with
+   In addition to the regular responsibilities, the kernel file            the device. Crucially, while registering with the device, we
+system in BypassD is responsible for virtualizing block ad-                propose that the driver links the Process Address Space ID
+dresses. In this regard, BypassD supports a new fmap() sys-                (PASID) with each queue. This PASID (like ASIDs in TLBs) is
+tem call that creates VBA to LBA mappings for the process.                 later used by the IOMMU to identify the proper page table to
+fmap() is akin to mmap(): kernel maps the file to the process              walk when translating VBAs to LBAs during data requests.
+address space and returns a virtual address (Virtual Block                     UserLib also allocates pinned DMA pages for passing data
+Address). 2 Additionally, the kernel creates file tables (see              to and from the device. This is similar to SPDK [65] which
+Section 3.4): file table entries that map a single file. File Table        likewise allocates huge pages during initialization for DMA.
+Entries (FTEs) are special page table entries that hold LBAs                   When UserLib intercepts a file open(), it not only forwards
+in place of Page Frame Numbers. The kernel attaches these                  it to the kernel but also issues fmap() requesting the kernel
+file table entries to process’ address space during fmap().                to setup the VBA to LBA mappings and attach the file table
+Userspace library. BypassD’s UserLib is a shim library that                entries to process page tables. After a file is successfully
+intercepts system calls. UserLib handles data operations in                fmap()-ed, the BypassD interface is initialized and UserLib
+userspace and forwards metadata operations to the kernel.                  can then issue I/O requests directly from userspace.
+It is transparent to applications so requires no effort to use
+BypassD. The library adds minimal software overhead during                 3.4 File tables
+data operations thereby achieving low latency access.                      Special page table entries in the process page table tree map
+   UserLib maintains queues and DMA buffers required for                   VBAs to the target file’s Logical Block Addresses (LBAs). We
+interacting with the device. 3 When the library intercepts                 name these file table entries. The kernel attaches file table
+data operations such as read()/write(), it uses the queues to              entries to a process’ page table during fmap(). Figure 3 shows
+submit requests to the device and polls them for completion.               their structure. A file table entry stores LBA (instead of PFN),
+
+
+
+                                                                      38
+BypassD: Enabling fast userspace access to shared SSDs                                        ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+the device ID (DevID), and a special bit (File Table–FT) to                             Component                 Lines of code
+                                                                                        Kernel changes                 517 lines
+differentiate it from a regular page table entry. DevID is used
+                                                                                        ext4 changes                  1303 lines
+to identify the device containing the file. This ensures that                           Device driver changes          885 lines
+a malicious process does not use the VBA to access files on                             UserLib                       1496 lines
+another device. Prior work [36] has used similar entries for             Table 2. Total lines of code added/modified in BypassD.
+hardware paging.
+                                                                                                            DRAM
+3.5 Translation and protection in the hardware                                                                               VFS cache
+                                                                            Process A                       PTE          Inode2
+                                                                                                  PMD
+When the device receives a request with VBA, directly from                              PUD                                   PMD
+userspace, it issues a translation request to the IOMMU.                    PGD
+                                                                                                                                 PTE   PTE
+Along with the VBA, the translation request includes op-
+eration (read/write), I/O size and PASID linked to the queue                                          R
+                                                                                                                                       Inode1
+on which the request arrived. With SVA [41], the IOMMU                                                                            PTE LBA
+                                                                                                                                       … 0
+uses PASID to walk the page tables of the process and trans-                Process B             PMD
+                                                                                                                                       LBA511
+
+lates VBA to LBA using the attached file table entries. During                          PUD
+                                                                                                      R/W
+the translation process, IOMMU ensures that the permissions                 PGD                                         Inode1         2MB file
+are met. Upon successful translation, IOMMU returns the
+LBAs to the device which proceeds to serve the request.                                                                LBA0-16           LBA258-511
+                                                                                                                          LBA17-256          LBA257
+
+3.6 Revoking BypassD interface
+                                                                        Figure 4. Attaching file table fragments to processes address
+At any point, the kernel can revoke a process’ ability to               spaces via the fmap() call.
+access a file through the BypassD interface. The kernel does
+this under scenarios discussed in Section 4.5 using the below           BypassD interposes on file system access using LD_PRELOAD.
+mechanism:                                                              Programmers can select whether a file is accessed using By-
+    1. Kernel detaches FTEs corresponding to the file(s) that           passD interface or the default kernel interface. Files requiring
+       it wants to revoke access to.                                    low latency can be accessed using the BypassD interface.
+    2. Requests issued directly from userspace to such a file              Table 3 summarizes how BypassD handles common file
+       fail because the IOMMU cannot translate the VBA                  operations. Below, we discuss important actions performed
+       without the file table entries.                                  in BypassD and then discuss sharing/concurrency scenarios.
+    3. When an I/O fails, UserLib issues an fmap() again re-
+       questing the kernel to re-attach the file tables.                4.1 Creating file table entries
+    4. Kernel rejects the request returning a VBA of 0. An
+                                                                        During fmap(), the kernel allocates a region in the calling
+       empty VBA indicates to UserLib that the file can no
+                                                                        process’ virtual address space that equals or exceeds the file’s
+       longer be accessed directly from userspace.
+                                                                        size and attaches the file table entries. The kernel returns
+    5. Thereafter the process falls back to the kernel interface
+                                                                        the starting virtual block address of this virtual region from
+       for all subsequent I/O.
+                                                                        fmap(). If the kernel decides that a file is not eligible for being
+As we shall see, this is a powerful mechanism that removes
+                                                                        accessed directly from the userspace, it returns a VBA of 0.
+the need to handle complex but rare sharing cases in userspace;
+                                                                           The file system creates the file table entries by retrieving
+instead BypassD falls-back to the kernel.
+                                                                        the Logical Block Addresses (LBAs) of the file blocks. We
+Race between access revocation and I/O access. When the
+                                                                        call this a cold fmap(). If the block mappings are cached in
+kernel revokes direct access for a process, there could be
+                                                                        memory (e.g., ext4’s extent status tree), obtaining LBAs is
+on-going I/O for this file. A problem arises when the kernel
+                                                                        inexpensive. If not, the file system issues I/Os to read the file
+deallocates blocks of a file and reallocates them to another.
+                                                                        to block mapping from the device. We discuss the overheads
+There is a race when the SSD has already translated addresses
+                                                                        of creating these file tables in Section 6.
+but not yet performed flash accesses, as invalidations will not
+                                                                        Pre-populating file table entries. Prior research has stud-
+cancel the requests. This race is very small, and is handled
+                                                                        ied the overheads of setting up page tables [6, 24, 36, 47]. To
+by delaying re-allocation of blocks until a sync point (e.g.,
+                                                                        avoid the overheads of creating private file table entries for
+fsync()) that forces completion of all pending I/Os.
+                                                                        every process that opens the same file, BypassD uses shared
+                                                                        pre-populated file table entries. File table entries can be pre-
+4    BypassD Implementation                                             populated because the entries’ content (LBAs) are known
+We implemented BypassD with ext4 without data journaling.               upfront and change slowly over time. A similar strategy is al-
+BypassD currently supports NVMe storage devices. The table              ready implemented for persistent memory file mappings [6].
+below shows the size of implementation.                                 Note that BypassD does not support CoW (copy on write)
+
+
+
+                                                                   39
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                                                                                            Yadalam et al.
+
+
+       File operation                               Userlib actions                                               Kernel FS actions
+                              Forward to kernel and issue fmap()
+    open()                                                                                  Attach file table entries to process page table.
+                              indicating intent to access file through BypassD interface.
+                              Create NVMe read/write request: VBA in request formed
+    read()/write()
+                              by adding offset to Starting VBA of file.
+    (incl. variants)
+                              Issue request on SQ and poll CQ for completion.
+                                                                                            Allocate block, update file metadata.
+    appends (write
+                              Forward to kernel.                                            Create new file table entries and attach to page table.
+    to end of file)
+                                                                                            Issue write to new block directly to device without buffering.
+                                                                                            Allocate/de-allocate blocks. Zero out newly allocated blocks.
+    fallocate()/ftruncate()   Forward to kernel.
+                                                                                            Attach/detach file table entries corresponding to the blocks.
+                              Flush all queues (NVMe flush) to make data durable, then      Update file modified timestamps.
+    fsync()/fdatasync()
+                              forward to kernel.                                            Flush file metadata to disk.
+    close()                   Forward to kernel.                                            Detach file table entries.
+Table 3. Actions performed by UserLib and kernel FS (in addition to normal actions) in BypassD during common file operations.
+
+filesystems such as btrfs since the offset to block mapping                           The file system ensures that newly allocated blocks are
+changes on every write.                                                            zeroed out, and applications must be aware of zero padding
+   As files commonly grow or shrink starting at their final                        at the end of a file if writes do not complete. Security dictates
+block and in a dense manner, we use entries of page table                          the blocks must be zeroed, as otherwise the application could
+radix-trees to store the LBAs, building them in a bottom-up                        read the previous data in those blocks.
+manner. Figure 4 shows how a single FTE leaf can store all
+the LBAs of a 2MB file. BypassD maintains file table entries                       4.2 Issuing requests through BypassD interface
+in the file’s cached VFS inode. Their lifetime equals the time                     UserLib intercepts all variations of read (read()/pread()) and
+that the inode remains cached. The file system also tracks                         write (write()/pwrite()) system calls. It issues all non-metadata-
+all processes accessing a file in the file’s cached inode.                         modifying operations (all reads and selected writes) to the
+   BypassD leverages the cached file table entries to accel-                       device directly from userspace. UserLib converts the offset
+erate fmap() by attaching them in almost constant time to                          into an equivalent VBA and copies data between the user
+the calling process address space (warm fmap()). The ker-                          buffer and the DMA buffer.
+nel builds the page tables of the calling process up to an                         Handling reads. Since reads do not modify metadata, they
+intermediate level and attaches the cached file table entries                      are issued directly from userspace.
+using simple pointer update operations during the fmap()                           Handling writes. UserLib handles overwrites and appends
+call. BypassD maps the entire file (no partial maps). Since the                    differently. Overwrites to existing blocks of a file do not
+attachment can happen only at the intermediate granulari-                          modify any file metadata, so UserLib issues them directly
+ties of the page table radix-tree (e.g., PUD or PMD), BypassD                      to the device from userspace. Appends to the end of a file
+allocates a virtual region for the file at the same granularity                    have to be handled carefully as they require allocation of
+(multiples of 1GB or 2MB). If the allocated virtual region is                      new blocks and modify file metadata. UserLib detects such
+greater than the file size, the remaining virtual space can be                     appends using stored file size and routes them to the kernel.
+used to extend the mapping in place if the file grows in size.                     The kernel issues appends directly to the device without
+Since BypassD maps files completely, no page faults occur                          buffering them in the page cache.
+during file access.                                                                    UserLib does not provide zero-copy I/O. Instead, UserLib
+   BypassD file table entries are shared between processes                         uses pinned DMA buffers over user buffers for two reasons:
+opening the same file. The shared file table entries have the                      i) to avoid the cost of pinning and unpinning user pages, and
+maximum access rights preset (the R/W bit is always set) by                        ii) ensuring correctness. When user buffers are used for I/O,
+default. To support different read/write access permissions                        programs must ensure that other program threads do not
+per open, BypassD sets the permission bit in the private                           free those buffers during an I/O. UserLib could adopt Demik-
+part of the process’s page table trees, where the entries are                      ernel’s [67] strategy of allocating memory to an application
+attached, similar to [6, 24]. Figure 4 shows how two processes                     from a DMA-capable heap to support zero-copy I/O.
+open the same file with different permissions.
+Extending or truncating files. When new blocks are allo-                           4.3 Hardware enhancements
+cated to a file, the kernel attaches new FTEs corresponding                        In BypassD, the IOMMU hardware is entrusted to perform
+to the new blocks so that the process can access these blocks                      VBA translations and permission checks during device access.
+directly from userspace. Similarly, when blocks are deallo-                        The proposed modifications are modest.
+cated, corresponding FTEs are detached to deny access to                           Device changes. Devices receive read/write requests that
+those blocks from the userspace.                                                   contain VBA instead of LBA. They then send VBA translation
+                                                                                   request to the IOMMU through PCIe Address Translation
+
+
+
+                                                                              40
+BypassD: Enabling fast userspace access to shared SSDs                                     ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+Service (ATS) [48]. For reads, VBA translation and DMA are               4.5.1 Intra-process sharing. Since BypassD provides a
+serialized because the device needs block addresses before               synchronous interface, all data operations complete only
+reading from the blocks. For writes, the translation request             after the device accepts them. All metadata operations com-
+and DMA are sent simultaneously because the data is first                plete after the kernel returns. Therefore, the device acts as
+copied into device memory and then written to the block.                 the point of coherence for data operations and the kernel
+Writes therefore do not experience any VBA translation                   for metadata operations. As all threads of a process share
+overheads.                                                               UserLib, it provides a consistent view of file information,
+IOMMU changes. The IOMMU in commercially available                       such as starting VBA, size, and file offset.
+processors translates virtual addresses from I/O requests to                BypassD supports sharing a device and files between threads
+physical addresses in memory. With BypassD, we propose                   of a process. However, special care has to be taken while
+that the IOMMU is enhanced to also handle translation re-                handling partial writes that do not completely overwrite the
+quests for VBAs. The IOMMU translates VBA just like it                   smallest block size provided by the device.
+translates virtual memory addresses. It walks the page tables            Serializing partial writes. UserLib handles such writes by
+as usual but interprets the contents of leaf entries differently.        reading the old block data, modifying and writing it back.
+BypassD adds a new bit to the PTE, FT, to distinguish regular            Without synchronization, two threads may clobber each
+page table entries from file table entries, as shown in Figure 3.        other’s writes. UserLib serializes partial writes to the same
+If the bit is set, the IOMMU interprets the contents of the              file to avoid data inconsistencies. It maintains a list of offsets
+entry as a LBA instead of a PFN and will only use it for block           of ongoing partial writes for each open file. When another
+address translations. The IOMMU also compares DevID in                   thread issues a write, UserLib looks up for matching offsets
+the FTE to requester ID in the translation request to ensure             in the list. If a match exists, it delays the later write.
+that the process is accessing the files on the correct device.
+                                                                         4.5.2 Inter-process sharing. BypassD interface supports
+   The IOMMU could receive requests for regions larger than
+                                                                         multiple processes performing reads and overwrites to the
+a single page, both for memory buffers and with BypassD
+                                                                         same file but cannot support operations on shared files that
+for blocks. Current IOMMUs walk the page table once for
+                                                                         modify metadata. The kernel revokes direct access (see Sec-
+each page to fetch multiple entries. Similarly, in BypassD
+                                                                         tion 3.6) when it identifies multiple processes changing a
+the IOMMU responds to large VBA translation requests with
+                                                                         file’s metadata.
+multiple pairs of (LBA, length) and coalesces them if possible.
+                                                                         Concurrent access through BypassD and kernel inter-
+   Often there is no temporal locality in block accesses, so the
+                                                                         face. It could happen that a file is opened through BypassD
+IOMMU does not cache FTEs in the IOTLB, thereby prevent-
+                                                                         interface in one process and through kernel interface in an-
+ing IOTLB pollution. However, the higher level entries of the
+                                                                         other. Achieving coherency and consistency is challenging.
+page table are cached in IOMMU’s translation caches. By-
+                                                                         BypassD avoids this scenario by not supporting concurrent
+passD would therefore benefit from larger translation caches
+                                                                         access through both BypassD and kernel interfaces. If a file
+but not necessarily a larger IOTLB.
+                                                                         is already open through the kernel interface, fmap() returns
+4.4 BypassD guarantees                                                   zero. Likewise, if a file is mapped for userspace access and
+                                                                         then opened for kernel access, BypassD revokes a process’
+Our implementation of BypassD is POSIX-compliant and
+                                                                         direct access to the file using the mechanism described in
+provides the consistency guarantees of traditional kernel file
+                                                                         Section 3.6.
+systems such as ext4. Similar to ext4 without data journaling,
+BypassD provides metadata crash consistency but not data
+consistency. Currently, BypassD only supports synchronous
+                                                                         5   Discussion
+operations, i.e., all operations are considered complete when            5.1 Enhancements to BypassD
+the corresponding call returns to the user application.                  Appends from the userspace. Appends are routed through
+Accessed and modified timestamps. BypassD deviates                       the kernel since they modify file metadata. To accelerate fre-
+slightly from POSIX semantics when it comes to updating                  quent appends, BypassD could pre-allocate blocks using fal-
+the accessed and modified timestamps. When a file has been               locate() and then issue overwrites to the pre-allotted blocks.
+accessed or written to, the file metadata in the kernel will not         We implement this as an optimized append operation. An
+reflect it immediately. The timestamps are updated when the              alternate but more intrusive approach is to adopt the relink
+file is closed or during fsync()/fdatasync(). This strategy is           operation of SplitFS [32] that can atomically swap newly
+similar to memory-mapped files and allowed by POSIX [1, 2].              appended blocks from a staging file into the target file.
+                                                                         Non-blocking writes. Currently, BypassD only supports
+4.5 Sharing and concurrency                                              synchronous writes that return after data is written to the
+One of the primary goals of BypassD is to enable device shar-            device. To improve write latency and throughput, BypassD
+ing between multiple applications. In this section, we explain           could be modified to support non-blocking writes, i.e., writes
+how BypassD handles intra- and inter-process sharing.                    do not wait for data to be written out to the device. However,
+
+
+
+                                                                    41
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                                                                        Yadalam et al.
+
+
+this change incurs synchronization and consistency over-                access the blocks from userspace thereafter. Therefore, a pro-
+heads to ensure that reads always see the latest data which             cess can only access files after they are successfully opened
+could be buffered in an unprocessed write request. With this            through the kernel and before they are closed.
+approach, the per-inode range-based locking of CrossFS [51]                BypassD guarantees confidentiality of user’s data even
+can be used to increase concurrency.                                    when blocks are reallocated to another user’s file. BypassD
+Alternate data structures. BypassD stores VBA transla-                  zeros a block during allocation, thereby ensuring that direct
+tions in page tables, which adds cost to fmap() for large files.        accesses to the file does not return the previously stored data.
+Using a different data structure with a new hardware walker             As mentioned in Section 3.6, BypassD avoids race between
+(e.g., rIOMMU [42]) could reduce this cost.                             direct I/O and block reallocation by delaying the reuse of a
+                                                                        block until a sync point.
+5.2 BypassD in virtualized environments
+Containers. BypassD supports sharing an SSD securely be-                6   Evaluation
+tween multiple containers without requiring additional mod-             We answer the following questions about BypassD:
+ifications. Container environments use mount namespaces                   1. How does BypassD perform while accessing a low
+to provide processes an isolated view of the device. The ker-                latency SSD? How does it compare to the standard
+nel ensures that a containerized application can only open                   Linux kernel, SPDK and state-of-the-art solutions?
+and access files within its namespace. Since BypassD relies               2. What are the overheads in BypassD?
+on the kernel for access control and metadata operations,                 3. Can a device be shared efficiently between multiple
+BypassD works readily with containers.                                       applications?
+Virtual Machines (VMs). BypassD can also enable direct                    4. How does performance of real world applications im-
+userspace access from processes within a VM. BypassD re-                     prove with BypassD?
+quires similar hardware virtualization support for direct ac-
+cess to devices required by a guest OS, namely SR-IOV [30]              6.1 Methodology
+or Scalable-IOV [29]. When a process inside a VM accesses               Experimental setup. We run all our experiments on an Intel
+the device directly, the IOMMU performs a nested address                Xeon Gold 5317 CPU with 12 cores (24 with Hyper-Threading
+translation to translate VBAs to LBAs. As isolation between             enabled) and 96GB memory, connected to an Intel Optane
+VMs is provided at the block level by Scalable-IOV or SR-               P5800X SSD. We use Ubuntu 20.04 with Linux 5.4. We disable
+IOV, this design does not support file sharing across virtual           turbo boost and frequency scaling (C states).
+machines.                                                               Workloads. We run 3 sets of workloads to evaluate By-
+                                                                        passD’s performance. We use micro-benchmarks to study the
+5.3 Qualitative security evaluation                                     latency and throughput, real world workload to understand
+BypassD assumes a threat model in which the user process,               BypassD benefits in production systems, and state-of-the-art
+including UserLib, could be malicious while the kernel and              research workloads to understand the maximum potential
+the hardware (device and IOMMU) are part of the trusted                 of BypassD.
+computing base (TCB). In BypassD, a malicious process can
+only read and write files it has permissions for; it cannot             6.2 VBA translation modeling
+access any other files owned by other users, exactly the same           BypassD proposes minor enhancements to the IOMMU en-
+as normal file access.                                                  abling it to translate Virtual Block Addresses (VBAs) to Log-
+   BypassD ensures that a process can only access blocks of             ical Block Addresses (LBAs). Since commercially available
+files for which it has right permissions. Much like virtual             processors do not have this feature, we emulate the over-
+memory, processes are required to accesses blocks using                 heads of VBA translation by adding a delay while issuing
+VBAs instead of LBAs. If a process tries to access a block              requests from UserLib. VBA translation overhead includes
+using a LBA or an invalid VBA, the VBA translation fails in             two costs: PCIe bus latency and IOMMU translation latency.
+the IOMMU and the SSD returns an error code to the process
+without completing the I/O. A process can therefore only                PCIe round-trip latency. To capture the round-trip latency
+access blocks with valid VBAs.                                          across PCIe, we composed an experiment that repeatedly
+   VBAs are valid if corresponding file table entries (FTEs) ex-        reads 64 bytes from the Optane SSD device register. On av-
+ist in the process page tables. A valid VBA only exists when            erage, the PCIe round trip latency was about 345ns (similar
+the file has been successfully opened through the kernel; a             to [21, 46]). We assume that the measured PCIe latency is
+valid VBA implies that the kernel has approved the process’             symmetric. Address Translation Service (ATS) requests can
+access to the file. When a file is closed or when blocks of a           be reordered with respect to other requests. Therefore under
+file are deallocated, the kernel detaches the FTEs from the             contention, translation requests can be prioritized to limit
+process page tables, invalidating the VBAs. A process cannot            the total VBA translation overheads.
+
+
+
+                                                                   42
+BypassD: Enabling fast userspace access to shared SSDs                                                                     ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+
+
+                                                                                Read latency (us)
+                       Experiment configuration            Latency
+                                                                                                                sync              spdk                 128KB
+                                                                                                     40         libaio            bypassd
+         IOMMU off                                          1120 ns
+                                                                                                     30
+                                                                                                                io_uring                             64KB
+         IOMMU on; constant src and dest (IOTLB hit)        1134 ns
+                                                                                                                                        32KB
+         IOMMU on; varying src, const dest (IOTLB miss)     1317 ns                                  20               16KB
+                                                                                                                8KB
+Table 4. IOMMU translation overheads experiment: IOAT                                                10
+                                                                                                          4KB
+
+DMA copy latency.
+                                                                                                          0.5          1.0             1.5     2.0          2.5       3.0   3.5
+                 250                                                                                                              Read bandwidth (GB/s)
+ overhead (ns)
+    IOMMU
+
+
+
+
+                                                                                Write latency (us)
+                 200                                                                                                                                          128KB
+                                                                                                     40         sync              spdk
+                                                                                                                libaio            bypassd
+                                                                                                                                                     64KB
+                 150                                                                                 30         io_uring
+                          2         4       6       8       10        12                                                               32KB
+                              Number of translations per request                                     20                    16KB
+                                                                                                                8KB
+                                                                                                          4KB
+                                                                                                     10
+Figure 5. IOMMU overhead versus number of translations
+per ATS request.                                                                                          0.5              1.0         1.5     2.0          2.5       3.0   3.5
+                                                                                                                                  Write bandwidth (GB/s)
+  PCIe latencies not only depend on the generation but also
+depend on the host CPU and the device. We believe that fu-                                 Figure 6. FIO single threaded random-access latency.
+ture systems will have lower latencies to support low-latency
+CXL memories [39, 43]. This would benefit BypassD as the
+VBA translation overhead would be lower.                                           sync: Baseline Linux with synchronous system calls.
+                                                                                   libaio: Linux’s native asynchronous I/O interface [19].
+IOMMU translation latency. We measured the IOMMU                                   io_uring: Newer async I/O interface that avoids context
+translation costs in modern processors using Intel’s I/O Ac-                    switches by using ring buffers to communicate between user
+celeration Technology (IOAT) DMA engine, similar to [7].                        and kernel [54]. We use fixed buffers and enable submission
+The IOAT engine uses the IOMMU to translate buffer vir-                         queue polling by the kernel for maximum performance.
+tual addresses to physical addresses. We ran experiments                           spdk [65]: Userspace driver to access storage directly
+with different configurations as shown in Table 4 to mea-                       from userspace without a file system.
+sure translations overheads. We forced IOTLB hits by using a
+fixed buffer for the DMAs and forced IOTLB misses by chang-                     Latency. Figure 6 shows single-threaded read and write
+ing the buffer virtual addresses. First, we noticed that the                    latency and throughput for different block sizes. BypassD
+translation overhead is negligible if the IOMMU is enabled                      achieves lower latency and higher bandwidth than all kernel
+and the translation hits in the IOTLB (1134ns vs 1120ns).                       approaches. Compared to sync and libaio, BypassD improves
+Second, an IOTLB miss resulting in a page walk adds about                       the read latency by 30.5% on average and write latency by
+183ns (1317ns instead of 1134ns). Third, we noticed that                        27.8%. BypassD avoids context switches, bypasses the VFS
+the IOMMU translation overhead does not increase signif-                        and file system layer in the kernel, uses polling instead of
+icantly with number of translations per request. Figure 5                       interrupts and has an optimized software stack.
+shows the IOMMU translation overhead for different num-                            io_uring avoids context switches by using a kernel thread
+ber of translations with contiguous virtual addresses. We see                   that polls for I/O requests. Figure 6 shows that io_uring
+a slight increase going from 2 to 3 translations per request.                   improves latency over sync and libaio but cannot perform
+Thereafter, the translation overheads does not increase with                    as well as userspace approaches. The latency overhead in
+the number of translations. This is mostly because a single                     io_uring can be attributed to the kernel software stack.
+cacheline (64B) fits 8 page table entries. Therefore, a single                     BypassD’s performance is very close to that of SPDK. By-
+cacheline read could translate an address range of 32KB.                        passD has slightly higher latency due to VBA translations.
+   In our experiments, we emulate PCIe latency and IOMMU                           Figure 7 shows the amount of time spent in user, kernel
+translation overheads by adding a delay in UserLib (nop()                       and device while performing random reads. In the sync base-
+loop) . The delay added depends on the translation size with                    line, the amount of time spent in the kernel is significant
+a minimum delay of 550ns.                                                       for small reads which is exactly what BypassD aims to over-
+                                                                                come. In BypassD, very little time is spent in the UserLib
+6.3 Microbenchmarks                                                             while accessing the device. The majority of the time is spent
+We use fio tester benchmark [8] to measure the latency and                      in copying data between user and DMA buffer.
+throughput benefits of BypassD. For all experiments, we
+issue direct I/O (O_DIRECT) and set queue depth to 1. We                        VBA translation latency sensitivity study. As mentioned
+compare BypassD against the following approaches:                               in Section 6.1, we estimated VBA translation overheads in
+
+
+
+                                                                           43
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                                                                                                                                 Yadalam et al.
+
+
+                                                                                                                                4500
+
+
+
+
+                                                                                                             bandwidth (MB/s)
+                                                                                                              Aggregate write
+               40                 device
+Latency (us)
+
+                                                                                                                                                sync            io_uring
+                                  kernel
+                                                                                                                                3000            libaio          bypassd
+                                  user
+               20
+                                                                                                                                1500
+
+                0                                                                                                                    0
+                                                                                                                                               1               2               4        8
+                       s nc
+                    byp pdk
+
+
+                       s c
+                    byp pdk
+
+
+                       s c
+                    byp pdk
+
+
+                       s c
+                    byp pdk
+
+
+                       s c
+                    byp pdk
+
+
+                       s c
+                    byp pdk
+                           d
+
+
+
+                           d
+
+
+
+                           d
+
+
+
+                           d
+
+
+
+                           d
+
+
+
+                           d
+                       syn
+
+
+
+                       syn
+
+
+
+                       syn
+
+
+
+                       syn
+
+
+
+                       syn
+                                                                                                                                                             # of processes
+                       ass
+
+
+
+                       ass
+
+
+
+                       ass
+
+
+
+                       ass
+
+
+
+                       ass
+
+
+
+                       ass
+                       sy
+
+
+
+
+                                 4KB          8KB     16KB          32KB    64KB        128KB                Figure 10. Aggregate write bandwidth when device is shared
+                                      Block size                                                             between multiple writer processes.
+                    Figure 7. Random read latency breakdown.
+
+
+
+
+                                                                                                             4KB rand read
+                                                                                                              latency (us)
+                                                                                                                                             sync            bypassd
+                                                                                                                                10
+Read bandwidth
+
+
+
+
+                                    No delay               950ns
+                    3                                                                                                           5
+                                    350ns                  1350ns
+    (MB/s)
+
+
+
+
+                    2               550ns                  sync
+                                                                                                                                0
+                                                                                                                                         1               2         4       8       12       16
+                    1
+                                                                                                                                                    # of background readers
+                    0
+                                 4KB          8KB         16KB      32KB         64KB     128KB              Figure 11. I/O scheduling in the device: Random read latency
+                                                          Block size                                         with multiple background reader processes.
+Figure 8. Effect of VBA translation latency on single thread                                                 with past research [62] on Optane SSD that suggests that the
+read bandwidth.                                                                                              overall load needs to be moderated to achieve low latency.
+                                                                                                                Performance of io_uring drops drastically after 12 threads.
+                             sync               spdk
+                                                                                                             This is because io_uring requires additional cores on which
+Latency (us)
+
+
+
+
+               15            libaio             bypassd                     16
+                                                                     12                         20
+                             io_uring
+                                                          8                                                  kernel threads poll for I/O requests [16]. io_uring needs twice
+                             2           4
+               10       1                                                                                    as many cores to achieve performance close to BypassD.
+                                                                                                                Unlike kernel approaches, BypassD observes constant ac-
+               5
+                                                                                                             cess latency until the device is saturated (threads>8). This is
+                            200         400     600           800    1000    1200       1400     1600        because UserLib avoids synchronization costs by allocating
+                         IOPS (K)                                                                            private queues and buffers to each thread. BypassD would
+Figure 9. Random read latency and IOPS with increasing                                                       incur very small overheads due to synchronization if multi-
+number of threads. Number of threads is indicated by anno-                                                   ple threads had to share queues and/or DMA buffers.
+tations on the graph.
+                                                                                                             Device sharing. Figure 10 shows the total write through-
+BypassD to be around 550ns. However, translation over-                                                       put when multiple processes are accessing the device. Read
+heads could vary across systems. The latency of access in-                                                   performance is similar. Each process accesses a private file
+creases with slower translations. Figure 8 shows the effect                                                  to avoid any contention. Notice that there are no bars for
+of translation latency on the single thread read bandwidth.                                                  SPDK since multiple processes cannot access the device si-
+As expected, increase in translation latency causes a slight                                                 multaneously with SPDK. On the contrary, in BypassD, each
+decrease in bandwidth. Even with a translation latency of                                                    process can access the device directly from its userspace.
+1.3us, BypassD achieves significantly higher bandwidth than                                                  Therefore, each process experiences lower I/O access latency
+the baseline.                                                                                                and the total throughput improves. Furthermore, all pro-
+   This experiment also shows caching FTEs in the IOTLB                                                      cesses achieve identical latency and throughput. In short,
+is not critical: The difference in bandwidth when FTEs are                                                   BypassD provides the performance benefits even when the
+cached (350ns) versus not cached (550ns) is minimal.                                                         device is being shared between multiple processes.
+                                                                                                                It is important to achieve fairness while sharing a de-
+Scaling. Figure 9 shows I/O latency and IOPS scaling with                                                    vice. Kernel I/O schedulers distribute the device throughput
+threads. For lower thread counts, SPDK and BypassD achieve                                                   among applications. Since BypassD bypasses the kernel, it
+lower latency than kernel approaches. At higher thread count                                                 relies on the I/O scheduling in the device to balance device
+(>12), the device reaches saturation at which point the I/O                                                  time among different applications. Figure 11 shows the aver-
+latency is dominated by the device time and the software                                                     age latency of 4KB random read latency when sharing the
+overheads become negligible. BypassD does not provide any                                                    device with different number of reader processes. BypassD
+benefits when accessing an overloaded device. This aligns                                                    achieves latency lower than the baseline even when there
+
+
+
+                                                                                                        44
+BypassD: Enabling fast userspace access to shared SSDs                                                                        ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+                                                                                                                     YCSB A        sync        xrp          bypassd       YCSB B
+Throughput
+
+             800                                             kernel interface                              900
+                                                                                                                                                     600
+  (MB/s)
+                                                                                                                                                     400
+             600       Bypassd interface                                                                   600
+                                                                                                                                                     200
+             400                                                                                           300
+                                 access revoked                                                              0                                         0
+             200
+
+
+
+
+                                                                                     Throughput (kops/s)
+                                                                                                                            YCSB C                                        YCSB D
+                   0       1     2         3    4      5      6      7      8                              600                                       1200
+                                                                                                                                                      800
+                                           Runtime (s)                                                     400
+                                                                                                           200                                        400
+                                                                                                             0                                          0
+Figure 12. Read throughput of a process over time. Process
+                                                                                                                            YCSB E                                        YCSB F
+starts with BypassD interface. At 5s, its access gets revoked                                               90                                       600
+
+and switches to kernel interface.                                                                           60                                       400
+                                                                                                            30                                       200
+                                                                                                            0                                          0
+                                                                                                                 1      2      4     8    12                1         2     4      8   12
+                           Default     Open + Warm         Open + Cold
+             File size                                                                                                                         Threads
+                          open (us)     fmap (us)           fmap (us)
+             4KB               1.28             1.96               2.68                  Figure 13. WiredTiger throughput scaling with threads.
+             1MB               1.38             1.96               3.67
+             64MB              1.74             2.76              85.51              This adds memory overheads in a system with thousands
+             256MB             1.59             5.79             333.93              of files. Each file table entry is the same size as a regular
+             1GB               1.80            17.94            1330.75              page table entry which is 8 bytes long. A 4KB page can hold
+             16GB              2.10           259.94           21197.88              512 file table entries. Optane SSD uses a page size of 4KB,
+                   Table 5. fmap() overheads in BypassD.                             so 512 FTEs would map 2MB of a file. In other words, every
+                                                                                     2MB of a file adds a modest memory overhead of 4KB ( 0.2%
+are 16 other process reading from the device. NVMe devices                           overhead).
+implement a round-robin scheduling across queues. These
+results show that this device-side I/O scheduling is good                            6.4 Production workload
+enough to balance the load. If necessary, devices could im-                          WiredTiger. WiredTiger is a NoSQL storage engine used by
+plement more sophisticated schedulers [59] to achieve better                         MongoDB [5]. It uses an LSM tree to store data in multiple
+fairness when accessing device directly from userspace.                              levels and each level is a single file. The files are indexed using
+   Figure 12 depicts the behaviour of a system when direct                           a B-tree with the key-value pairs stored in the leaf nodes.
+access is revoked (Section 4.5). A reader process initially                          WiredTiger caches the B-tree in memory to avoid issuing an
+accesses the device through BypassD interface. During its                            I/O on every access. WiredTiger issues multiple I/Os to read
+execution, another process opens the file in buffered mode,                          multiple pages in the B-tree chain while traversing it.
+and the kernel revokes the direct access for the first process.                         We configure the WiredTiger B-tree page size to 512B
+The reader process then accesses the device through the                              which is equal to Optane SSD’s block size. We create a store
+default kernel interface and experiences a drop in throughput.                       with 1 billion key-value pairs, key and value sizes set to 16B,
+                                                                                     resulting in a database of 46GB. We set the cache size to 6GB.
+fmap() overheads. In BypassD, the UserLib fmap()s a file                                We compare the performance of BypassD against XRP,
+before accessing it from userspace. If the file table entries are                    a state-of-the art research proposal that overcomes kernel
+cached in DRAM, then the kernel only has to attach them                              software stack overheads [70]. XRP uses eBPF scripts to run
+to page tables during fmap() (warm fmap). As explained in                            user-defined storage functions from a hook in the kernel
+Section 4.1, the file system populates the file tables if they                       driver. XRP accelerates operations, such as index lookups
+do not already exist (cold fmap). Table 5 shows the latency                          and aggregation, that issue back-to-back I/Os.
+of warm and cold fmap() for different file sizes in BypassD.                            Figure 13 shows the throughput of baseline, XRP and
+The overhead of warm fmap is negligible unless the file is                           BypassD for different YCSB workloads. BypassD improves
+huge (GBs). Cold fmap()s are costly even for files that are                          throughput by 18% on average over baseline and 13% over
+a few MB in size. The cost of a cold fmap() is amortized                             XRP. The improvement is larger at smaller thread count.
+by the low-latency direct I/O accesses. For instance, with                           At higher thread count, although BypassD improves I/O la-
+a 16GB file, BypassD benefits an application issuing more                            tency, the WiredTiger cache becomes the point of contention
+than ∼5000 I/Os. The delay of cold fmap() could be hidden                            which hides the benefits of faster I/O. BypassD does not pro-
+by issuing kernel-interface operations during startup until                          vide benefits for YCSB D workload which is an insert heavy
+fmap() completes, and then switching to BypassD-interface                            workload. YCSB D follows a distribution where the newly in-
+operations or by building partial file tables. We do not cur-                        serted key-value pairs are the most popular ones. Therefore,
+rently implement this.                                                               it spends very little time on I/O. With YCSB E, a single I/O
+                                                                                     returns multiple key-value pairs and consecutive I/Os are not
+Memory overheads. To avoid the cost of a cold fmap(), By-                            issued. XRP cannot therefore improve performance. BypassD
+passD caches pre-populated file table entries in memory.                             is able to accelerate all I/O and improves performance.
+
+
+
+                                                                                45
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                                                                                                                                                                             Yadalam et al.
+
+
+                                              YCSB A              sync             xrp          bypassd       YCSB B                     Figure 15 shows the average and 99.9th percentile latency
+                                   1.2                                                    1.2                                         for retrieving objects from the key value store. As expected,
+ Normalized Throughput (kops/s)
+
+
+
+                                  1.0                                                    1.0
+                                  0.8
+                                  0.6
+                                                                                         0.8
+                                                                                         0.6
+                                                                                                                                      the Linux baseline has the highest latency. XRP goes through
+                                                                                                                                      the kernel software stack only once and issues subsequent
+                                                        YCSB C                                            YCSB D
+                                   1.2                                                    1.2
+                                                                                                                                      I/Os from the driver. BypassD does not have to go to the
+                                  1.0
+                                  0.8
+                                                                                         1.0
+                                                                                         0.8
+                                                                                                                                      kernel even once so achieves slightly lower latency than XRP.
+                                  0.6                                                    0.6                                          Compared to SPDK, BypassD takes an additional 550ns for
+                                                        YCSB E                                            YCSB F                      VBA translation on every request. For a lookup involving 7
+                                   1.2
+                                  1.0
+                                                                                          1.2
+                                                                                         1.0
+                                                                                                                                      I/Os, BypassD takes about 4us more than SPDK.
+                                  0.8
+                                  0.6
+                                                                                         0.8
+                                                                                         0.6
+                                                                                                                                         On average, BypassD improves the throughput (not shown
+                                              1        2          4          6                  1         2         4   6
+                                                                                                                                      in Figure) by 72% over baseline and 9.6% over XRP.
+                                                                            Cache size (GB)
+Figure 14. WiredTiger single-thread throughput with dif-                                                                              KVell. KVell [38] is a fast persistent key-value store designed
+ferent cache sizes, relative to synchronous kernel I/O.                                                                               to take full advantage of modern storage device character-
+                                                                                                                                      istics. KVell leverages random access performance to avoid
+                                                                                                                                      sorted data on disk and batches I/O operations to utilize the
+                                                       sync              spdk
+                                                                                                                                      high throughput that these devices offer. KVell compares
+Latency (us) Latency (us)
+
+
+
+
+                                                       xrp               bypassd
+               Average
+
+
+
+
+                                         50                                                                                           favorably against production KVs, including RocksDB and
+                                                                                                                                      WiredTiger.
+                                         25
+                                                                                                                                         We initialize a KVell database with 50 million objects, and
+                                         75
+                                                                                                                                      set the key size to 16B and value size to 1024B resulting
+                                                                                                                                      in a database of size 54GB. We evaluate the performance
+   p99.9
+
+
+
+
+                                         50                                                                                           using YCSB read/write workloads. By default, KVell uses
+                                         25                                                                                           asynchronous I/O (libaio) to perform I/O. We measure the
+                                                                                                                                      performance of KVell with a queue depth of 1 (KVell_1) and
+                                              0               5                  10             15             20           25
+                                                                                   Threads                                            64 (KVell_64). We also implemented a synchronous I/O in-
+                                                                                                                                      terface and evaluated the performance of BypassD.
+                              Figure 15. Avg and p99.9 request latency in BPF-KV.                                                        Figure 16 shows the throughput and latency of requests.
+                                                                                                                                      BypassD achieves more throughput than KVell_1 but lesser
+                                                                                                                                      than KVell_64. KVell_64 achieves high throughput at the
+   Figure 14 shows WiredTiger throughput normalized to                                                                                cost of latency. BypassD improves the latency over KVell_64
+baseline for different cache sizes. As the cache size increases,                                                                      by two orders of magnitude. For YCSB A, which is a 50/50
+fewer B-tree pages miss in the cache while traversing the                                                                             read/write workload, BypassD achieves throughput close to
+B-tree. The benefits of XRP therefore decreases as it cannot                                                                          that of KVell_64 while reducing the latency. This is because
+issue consecutive I/Os bypassing the kernel software stack,                                                                           of a bottleneck in ext4 while handling concurrent writes to
+whereas BypassD accelerates every I/O operation providing                                                                             the same file [44, 51]. BypassD avoids this bottleneck since
+consistent improvements irrespective of cache size.                                                                                   writes are issued directly from userspace. For YCSB B and
+
+6.5 Research prototypes
+We experiment on state-of-the-art research prototypes that                                                                                                                               YCSB A       kvell_1           kvell_64        bypassd
+achieve much better performance than production software                                                                                                    2000                                                                        103
+                                                                                                                                                             1500
+when using more advanced I/O methods.                                                                                                                       1000                                                                        102
+                                                                                                                                                              500
+                                                                                                                                      Throughput (kops/s)
+
+
+
+
+                                                                                                                                                                0
+BPF-KV. It is a key-value store designed to evaluate the
+                                                                                                                                                                                                                                              Latency (us)
+
+
+
+
+                                                                                                                                                                                           YCSB B
+performance of XRP [70]. It uses a B+-tree to locate objects                                                                                                3000
+                                                                                                                                                                                                                                        102
+in the store which are stored in an unsorted log. The index                                                                                                 2000
+                                                                                                                                                            1000
+and log are stored in a single large file.                                                                                                                                                                                              101
+
+   BPF-KV is configured to have fixed-sized keys (8B) and                                                                                                                                  YCSB C
+values (64B). Each index node in BPF-KV is 512B. We create                                                                                                  3000
+                                                                                                                                                            2000                                                                        102
+a store with 920 million objects that results in a 6-level index.                                                                                           1000
+                                                                                                                                                                                                                                        101
+We disable caching to focus on the overheads of reading data                                                                                                        2   4   6   8 10 12 14 16     1   2         4   8      12      16
+from disk. Each object lookup requires 7 I/Os, 6 for reading
+an index node at each level of the B+-tree and one for reading                                                                                                                          Threads
+the final data.                                                                                                                                             Figure 16. KVell throughput and latency for YCSB.
+
+
+
+
+                                                                                                                                 46
+BypassD: Enabling fast userspace access to shared SSDs                                           ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+                                                              No device        latency when the permission check misses in the table on
+                                      Low latency   Sharing
+                                                              overheads        the device. BypassD overcomes the above limitations and
+Kernel file system [10, 26, 37, 66]       ✗           ✓          ✓             achieves the same goals through a less intrusive design.
+Userspace drivers [34, 65]                ✓           ✗          ✓                Arrakis [49] uses SR-IOV [30] to achieve device sharing.
+Hybrid solutions [11, 33, 51]             ✓           ✓          ✗             A device presents itself as a Virtual Function (VF) to each
+BypassD                                   ✓           ✓          ✓             VM. Arrakis proposes significant changes to the device, and
+ Table 6. Comparison of BypassD with prior approaches.                         trusts applications with metadata updates or to serve file
+                                                                               operations that may be unsafe in many environments.
+                                                                                  uFS [40] accesses devices from userspace using a file sys-
+C workloads, which are read heavy, BypassD outperforms                         tem micro-kernel. It uses a trusted process to submit requests
+KVell_1 by 33% and 24% respectively.                                           to the device. Similar to io_uring, uFS requires additional
+                                                                               cores on which uServer threads are pinned for high perfor-
+7    Related work                                                              mance. Demikernel [67] proposes a flexible datapath archi-
+Recent advancements in storage technology such as NVM [28]                     tecture for kernel-bypass devices.
+and low-latency SSDs [4, 13, 27] have placed a spotlight on                    Device file systems. A third approach to avoiding the kernel
+the kernel overheads and motivated researchers to address                      overheads is to push the file system to the device [33, 51].
+the I/O architecture. Table 6 summarizes prior approaches.                     Since the file system resides on the device, processes can
+Kernel optimizations. The most straight-forward approach                       access the device directly from userspace. These designs
+to overcoming the software bottleneck is to optimize the                       offer good performance but require significant changes to
+kernel I/O software stack. Researchers have proposed several                   the device firmware and rely heavily on devices’ compute
+optimizations to the kernel I/O stack: i) reduce interrupt                     power and memory. BypassD does not require any significant
+overheads [10, 58], ii) optimize the block layer [10, 26, 66],                 compute power on the device.
+and iii) overlap computations with device activity [37]. These                 Near-storage compute. A completely different way to avoid
+solutions improve the performance of a specific layer in the                   the kernel is to reduce the number of times processes go to
+I/O stack, but they cannot eliminate the overheads entirely.                   the device. Several systems propose offloading their storage
+For instance, these solutions have to pay the price of context                 functions to the device [17, 22, 31, 53, 55, 56, 61, 68]. These
+switching and the overheads of the VFS layer in the kernel.                    solutions rely heavily on the computing capabilities of the
+Userspace access. Another approach is to access devices                        device. They also require rewriting applications.
+from userspace without going through the kernel software                       XRP. XRP [70] pushes the storage function to the kernel
+stack [11, 18, 32, 34, 35, 49, 60, 63, 65, 69]. These solutions                device driver. It uses BPF scripts to run user defined func-
+avoid the high cost of context switching and generally pro-                    tions in the driver. XRP accelerates applications that perform
+vide high performance compared to traditional kernel file                      chained IO, for example B-tree traversal. XRP requires sig-
+systems. Some of these designs require byte-addressable                        nificant effort for porting new applications and only works
+storage such as NVM [18, 32, 35, 60, 63, 69] and do not sup-                   with data structures that have a fixed layout on disk.
+port block storage devices. SPDK [65] and NVMeDirect [34]
+provide a userspace I/O framework for NVMe devices but                         8   Conclusion
+require developers to implement own file systems. More im-                     With devices getting faster, software overheads dominate the
+portantly, they do not support device sharing as the driver is                 access latencies. BypassD overcomes the bottleneck by pro-
+mapped into a user process which has complete control over                     viding direct access from userspace. Unlike prior userspace
+the device. For example, SpanDB [12] uses a low latency SSD                    solutions [34, 65], BypassD allows multiple users or applica-
+to store LSM tree and write-ahead logs. It builds a file system                tions to share the device securely by offloading permission
+called TopFS on top of SPDK to access low latency SSDs                         checks to the IOMMU hardware. BypassD improves I/O la-
+and sacrifices device shareability. Applications like SpanDB                   tency by up to 45% compared to Linux and performs close
+can benefit from BypassD as it provides low latency access                     to SPDK which is known to achieve the lowest latency.
+without requiring new file systems and allows the device to
+be shared.                                                                     Acknowledgments
+   MonetaD [11] is the closest work to BypassD. Like By-                       We would like to thank our shepherd Huaicheng Li and other
+passD, MonetaD accesses the device from userspace and                          anonymous reviewers for their feedback. We would like to
+enforces protection in the hardware. The kernel installs per-                  thank Dr. Arkaprava Basu for his support and guidance.
+mission records into a table on the device. The device uses                    This work was supported in part by PRISM, one of seven
+this table to validate accesses from userspace. However, i)                    centers in JUMP 2.0, a Semiconductor Research Corporation
+updating the permission data on the device is expensive as                     (SRC) program sponsored by DARPA, and by NSF grant CNS
+the device pauses servicing requests, ii) MonetaD performs                     1900758.
+poorly under fragmentation, and iii) it suffers from high tail
+
+
+
+                                                                          47
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                                                                                                  Yadalam et al.
+
+
+References                                                                              [22] Boncheol Gu, Andre S Yoon, Duck-Ho Bae, Insoon Jo, Jinyoung Lee,
+ [1] [n. d.]. File timestamps. https://www.gnu.org/software/coreutils/                       Jonghyun Yoon, Jeong-Uk Kang, Moonsang Kwon, Chanho Yoon,
+     manual/html_node/File-timestamps.html.                                                  Sangyeun Cho, et al. 2016. Biscuit: A framework for near-data pro-
+ [2] [n. d.]. mmap(2) — Linux manual page. https://man7.org/linux/man-                       cessing of big data workloads. (2016).
+     pages/man2/mmap.2.html.                                                            [23] Tejun Heo, Dan Schatzberg, Andrew Newell, Song Liu, Saravanan
+ [3] [n. d.]. NVMe specifications. https://nvmexpress.org/specifications/.                   Dhakshinamurthy, Iyswarya Narayanan, Josef Bacik, Chris Mason,
+ [4] [n. d.]. Toshiba XL-Flash. https://www.kioxia.com/en-jp/about/news/                     Chunqiang Tang, and Dimitrios Skarlatos. 2022. IOCost: block IO
+     2019/20190806-1.html.                                                                   control for containers in datacenters. In Proceedings of the 27th ACM
+ [5] [n. d.]. WiredTiger storage engine. https://www.mongodb.com/docs/                       International Conference on Architectural Support for Programming
+     manual/core/wiredtiger/.                                                                Languages and Operating Systems (ASPLOS).
+ [6] Chloe Alverti, Vasileios Karakostas, Nikhita Kunati, Georgios Goumas,              [24] Jian Huang, Anirudh Badam, Moinuddin K. Qureshi, and Karsten
+     and Michael Swift. 2022. DaxVM: Stressing the Limits of Memory as a                     Schwan. 2015. Unified Address Translation for Memory-Mapped SSDs
+     File Interface. In 55th IEEE/ACM International Symposium on Microar-                    with FlashMap. In Proceedings of the 42nd Annual International Sympo-
+     chitecture (MICRO).                                                                     sium on Computer Architecture (ISCA).
+ [7] Nadav Amit, Muli Ben-Yehuda, and Ben-Ami Yassour. 2010. IOMMU:                     [25] Jack Tigar Humphries, Kostis Kaffes, David Mazières, and Christos
+     Strategies for mitigating the IOTLB bottleneck. In International Sym-                   Kozyrakis. 2021. A case against (most) context switches. In Proceedings
+     posium on Computer Architecture (ISCA).                                                 of the Workshop on Hot Topics in Operating Systems (HotOS).
+ [8] Jens Axboe. 2005. Fio-flexible i/o tester synthetic benchmark. URL                 [26] Jaehyun Hwang, Midhul Vuppalapati, Simon Peter, and Rachit Agar-
+     https://github. com/axboe/fio (Accessed: 2015-06-13) (2005).                            wal. 2021. Rearchitecting Linux Storage Stack for 𝜇s Latency and High
+ [9] Luiz Barroso, Mike Marty, David Patterson, and Parthasarathy Ran-                       Throughput.
+     ganathan. 2017. Attack of the killer microseconds. Commun. ACM                     [27] Intel Corp . [n. d.].      Intel Optane P5800X SSD.               https:
+     (2017).                                                                                 //ark.intel.com/content/www/us/en/ark/products/201859/intel-
+[10] Adrian M. Caulfield, Arup De, Joel Coburn, Todor I. Mollow, Rajesh K.                   optane-ssd-dc-p5800x-series-1-6tb-2-5in-pcie-x4-3d-xpoint.html.
+     Gupta, and Steven Swanson. 2010. Moneta: A High-Performance Stor-                  [28] Intel Corp. [n. d.].            Intel Optane Persistent Memory.
+     age Array Architecture for Next-Generation, Non-volatile Memories.                      https://www.intel.com/content/www/us/en/architecture-and-
+     In 43rd Annual IEEE/ACM International Symposium on Microarchitec-                       technology/optane-dc-persistent-memory.html.
+     ture (MICRO).                                                                      [29] Intel Corp. 2018. Intel Scalable I/O Virtualization. https://www.intel.
+[11] Adrian M. Caulfield, Todor I. Mollov, Louis Alex Eisner, Arup De, Joel                  com/content/www/us/en/developer/articles/technical/introducing-
+     Coburn, and Steven Swanson. 2012. Providing Safe, User Space Access                     intel-scalable-io-virtualization.html.
+     to Fast, Solid State Disks. In Proceedings of the Seventeenth International        [30] Intel Corp. 2018.        Recent Enhancements in Intel Virtualiza-
+     Conference on Architectural Support for Programming Languages and                       tion Technology for Directed I/O (Intel VT-d).                    https:
+     Operating Systems (ASPLOS).                                                             //01.org/blogs/ashokraj/2018/recent-enhancements-intel-
+[12] Hao Chen, Chaoyi Ruan, Cheng Li, Xiaosong Ma, and Yinlong Xu.                           virtualization-technology-directed-i/o-intel-vt-d.
+     2021. {SpanDB}: A fast,{Cost-Effective} {LSM-tree} based {KV}                      [31] Yanqin Jin, Hung-Wei Tseng, Yannis Papakonstantinou, and Steven
+     store on hybrid storage. In 19th USENIX Conference on File and Storage                  Swanson. 2017. KAML: A flexible, high-performance key-value SSD.
+     Technologies (FAST 21). 17–32.                                                          In IEEE International Symposium on High Performance Computer Ar-
+[13] Samsung Corp. [n. d.]. Samsung Z-SSD.               https://semiconductor.              chitecture (HPCA).
+     samsung.com/ssd/z-ssd/.                                                            [32] Rohan Kadekodi, Se Kwon Lee, Sanidhya Kashyap, Taesoo Kim,
+[14] Eli Cortez, Anand Bonde, Alexandre Muzio, Mark Russinovich, Marcus                      Aasheesh Kolli, and Vijay Chidambaram. 2019. SplitFS: Reducing soft-
+     Fontoura, and Ricardo Bianchini. 2017. Resource central: Understand-                    ware overhead in file systems for persistent memory. In Proceedings of
+     ing and predicting workloads for improved resource management                           the 27th ACM Symposium on Operating Systems Principles (SOSP).
+     in large cloud platforms. In Proceedings of the 26th Symposium on                  [33] Sudarsun Kannan, Andrea C Arpaci-Dusseau, Remzi H Arpaci-
+     Operating Systems Principles (SOSP).                                                    Dusseau, Yuangang Wang, Jun Xu, and Gopinath Palani. 2018. De-
+[15] Jeffrey Dean and Sanjay Ghemawat. 2008. MapReduce: simplified data                      signing a true direct-access file system with DevFS. In 16th USENIX
+     processing on large clusters. Commun. ACM 53, 1 (2008).                                 Conference on File and Storage Technologies (FAST).
+[16] Diego Didona, Jonas Pfefferle, Nikolas Ioannou, Bernard Metzler, and               [34] Hyeong-Jun Kim, Young-Sik Lee, and Jin-Soo Kim. 2016. NVMeDirect:
+     Animesh Trivedi. 2022. Understanding modern storage APIs: a sys-                        A user-space I/O framework for application-specific optimization on
+     tematic study of libaio, SPDK, and io_uring. In Proceedings of the 15th                 NVMe SSDs. In 8th USENIX Workshop on Hot Topics in Storage and File
+     ACM International Conference on Systems and Storage (SYSTOR).                           Systems (HotStorage).
+[17] Jaeyoung Do, Sudipta Sengupta, and Steven Swanson. 2019. Pro-                      [35] Youngjin Kwon, Henrique Fingler, Tyler Hunt, Simon Peter, Emmett
+     grammable solid-state storage in future cloud datacenters. Commun.                      Witchel, and Thomas Anderson. 2017. Strata: A cross media file system.
+     ACM (2019).                                                                             In Proceedings of the 26th Symposium on Operating Systems Principles
+[18] Mingkai Dong, Heng Bu, Jifei Yi, Benchao Dong, and Haibo Chen. 2019.                    (SOSP).
+     Performance and protection in the ZoFS user-space NVM file system. In              [36] Gyusun Lee, Wenjing Jin, Wonsuk Song, Jeonghun Gong, Jonghyun
+     Proceedings of the 27th ACM Symposium on Operating Systems Principles                   Bae, Tae Jun Ham, Jae W. Lee, and Jinkyu Jeong. 2020. A Case for
+     (SOSP).                                                                                 Hardware-Based Demand Paging. In ACM/IEEE 47th Annual Interna-
+[19] Daniel Ehrenberg. [n. d.]. The Asynchronous Input/Output (AIO)                          tional Symposium on Computer Architecture (ISCA).
+     interface. https://github.com/littledan/linux-aio.                                 [37] Gyusun Lee, Seokha Shin, Wonsuk Song, Tae Jun Ham, Jae W Lee, and
+[20] Exim Internet Mailer [n. d.]. Exim Internet Mailer. http://www.exim.                    Jinkyu Jeong. 2019. Asynchronous I/O stack: A low-latency kernel
+     org/.                                                                                   I/O stack for ultra-low latency SSDs. In USENIX Annual Technical
+[21] Donghyun Gouk, Sangwon Lee, Miryeong Kwon, and Myoungsoo Jung.                          Conference (ATC).
+     2022. Direct access,{High-Performance} memory disaggregation with                  [38] Baptiste Lepers, Oana Balmau, Karan Gupta, and Willy Zwaenepoel.
+     {DirectCXL}. In 2022 USENIX Annual Technical Conference (USENIX                         2019. Kvell: the design and implementation of a fast persistent key-
+     ATC 22). 287–294.                                                                       value store. In Proceedings of the 27th ACM Symposium on Operating
+
+
+
+
+                                                                                   48
+BypassD: Enabling fast userspace access to shared SSDs                                                   ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+     Systems Principles (SOSP).                                                          support for system call security. In 2020 53rd Annual IEEE/ACM Inter-
+[39] Huaicheng Li, Daniel S Berger, Lisa Hsu, Daniel Ernst, Pantea Zar-                  national Symposium on Microarchitecture (MICRO).
+     doshti, Stanko Novakovic, Monish Shah, Samir Rajadnya, Scott Lee,              [58] Amy Tai, Igor Smolyar, Michael Wei, and Dan Tsafrir. 2021. Optimiz-
+     Ishwar Agarwal, et al. 2023. Pond: CXL-based memory pooling sys-                    ing Storage Performance with Calibrated Interrupts. In 15th USENIX
+     tems for cloud platforms. In Proceedings of the 28th ACM International              Symposium on Operating Systems Design and Implementation (OSDI).
+     Conference on Architectural Support for Programming Languages and              [59] Arash Tavakkol, Mohammad Sadrosadati, Saugata Ghose, Jeremie
+     Operating Systems, Volume 2. 574–587.                                               Kim, Yixin Luo, Yaohua Wang, Nika Mansouri Ghiasi, Lois Orosa,
+[40] Jing Liu, Anthony Rebello, Yifan Dai, Chenhao Ye, Sudarsun Kannan,                  Juan Gómez-Luna, and Onur Mutlu. 2018. FLIN: Enabling fairness
+     Andrea C Arpaci-Dusseau, and Remzi H Arpaci-Dusseau. 2021. Scale                    and enhancing performance in modern NVMe solid state drives. In
+     and performance in a filesystem semi-microkernel. In Proceedings of the             2018 ACM/IEEE 45th Annual International Symposium on Computer
+     ACM SIGOPS 28th Symposium on Operating Systems Principles (SOSP).                   Architecture (ISCA). IEEE, 397–410.
+[41] LWN.net. 2021. Shared Virtual Addressing. https://lwn.net/Articles/            [60] Haris Volos, Sanketh Nalli, Sankarlingam Panneerselvam,
+     747230/.                                                                            Venkatanathan Varadarajan, Prashant Saxena, and Michael M
+[42] Moshe Malka, Nadav Amit, Muli Ben-Yehuda, and Dan Tsafrir. 2015.                    Swift. 2014. Aerie: Flexible file-system interfaces to storage-class
+     rIOMMU: Efficient IOMMU for I/O devices that employ ring buffers.                   memory. In Proceedings of the Ninth European Conference on Computer
+     ACM SIGPLAN Notices 50, 4 (2015), 355–368.                                          Systems (EuroSys).
+[43] Hasan Al Maruf, Hao Wang, Abhishek Dhanotia, Johannes Weiner,                  [61] Mark Wilkening, Udit Gupta, Samuel Hsia, Caroline Trippel, Carole-
+     Niket Agarwal, Pallab Bhattacharya, Chris Petersen, Mosharaf Chowd-                 Jean Wu, David Brooks, and Gu-Yeon Wei. 2021. RecSSD: near data
+     hury, Shobhit Kanaujia, and Prakash Chauhan. 2023. TPP: Transparent                 processing for solid state drive based recommendation inference. In
+     page placement for CXL-enabled tiered-memory. In Proceedings of the                 Proceedings of the 26th ACM International Conference on Architectural
+     28th ACM International Conference on Architectural Support for Pro-                 Support for Programming Languages and Operating Systems (ASPLOS).
+     gramming Languages and Operating Systems, Volume 3. 742–755.                   [62] Kan Wu, Andrea Arpaci-Dusseau, and Remzi Arpaci-Dusseau. 2019.
+[44] Changwoo Min, Sanidhya Kashyap, Steffen Maass, and Taesoo Kim.                      Towards an unwritten contract of Intel Optane SSD. In 11th USENIX
+     2016. Understanding manycore scalability of file systems. In USENIX                 Workshop on Hot Topics in Storage and File Systems (HotStorage).
+     Annual Technical Conference (ATC).                                             [63] Jian Xu and Steven Swanson. 2016. NOVA: A Log-structured File Sys-
+[45] MySQL [n. d.]. MySQL. https://www.mysql.com/.                                       tem for Hybrid Volatile/Non-volatile Main Memories. In 14th USENIX
+[46] Shweta Pandey, Aditya K Kamath, and Arkaprava Basu. 2023. Scoped                    Conference on File and Storage Technologies (FAST 16).
+     Buffered Persistency Model for GPUs. In Proceedings of the 28th ACM            [64] Jisoo Yang, Dave B Minturn, and Frank Hady. 2012. When poll is
+     International Conference on Architectural Support for Programming                   better than interrupt.. In 10th USENIX Conference on File and Storage
+     Languages and Operating Systems, Volume 2. 688–701.                                 Technologies (FAST).
+[47] Anastasios Papagiannis, Giorgos Xanthakis, Giorgos Saloustros, Mano-           [65] Ziye Yang, James R Harris, Benjamin Walker, Daniel Verkamp, Chang-
+     lis Marazakis, and Angelos Bilas. 2020. Optimizing Memory-mapped                    peng Liu, Cunyin Chang, Gang Cao, Jonathan Stern, Vishal Verma, and
+     I/O for Fast Storage Devices. In USENIX Annual Technical Conference                 Luse E Paul. 2017. Spdk: A development kit to build high performance
+     (ATC).                                                                              storage applications. In 2017 IEEE International Conference on Cloud
+[48] pcisig.com. 2021. Address Translation Services. https://members.                    Computing Technology and Science (CloudCom).
+     pcisig.com/wg/PCI-SIG/document/download/8255.                                  [66] Young Jin Yu, Dong In Shin, Woong Shin, Nae Young Song, Jae Woo
+[49] Simon Peter, Jialin Li, Irene Zhang, Dan RK Ports, Doug Woos, Arvind                Choi, Hyeong Seog Kim, Hyeonsang Eom, and Heon Young Yeom.
+     Krishnamurthy, Thomas Anderson, and Timothy Roscoe. 2015. Arrakis:                  2014. Optimizing the block I/O subsystem for fast storage devices.
+     The operating system is the control plane. ACM Transactions on                      ACM Transactions on Computer Systems (TOCS) (2014).
+     Computer Systems (TOCS) (2015).                                                [67] Irene Zhang, Amanda Raybuck, Pratyush Patel, Kirk Olynyk, Jacob
+[50] Charles Reiss, Alexey Tumanov, Gregory R Ganger, Randy H Katz, and                  Nelson, Omar S Navarro Leija, Ashlie Martinez, Jing Liu, Anna Korn-
+     Michael A Kozuch. 2012. Heterogeneity and dynamicity of clouds at                   feld Simpson, Sujay Jayakar, et al. 2021. The demikernel datapath os
+     scale: Google trace analysis. In Proceedings of the third ACM symposium             architecture for microsecond-scale datacenter systems. In Proceedings
+     on cloud computing.                                                                 of the ACM SIGOPS 28th Symposium on Operating Systems Principles
+[51] Yujie Ren, Changwoo Min, and Sudarsun Kannan. 2020. CrossFS: A                      (SOSP).
+     cross-layered direct-access file system. In 14th USENIX Symposium on           [68] Jian Zhang, Yujie Ren, and Sudarsun Kannan. 2022. FusionFS: Fus-
+     Operating Systems Design and Implementation (OSDI).                                 ing I/O Operations using CISCOps in Firmware File Systems. In 20th
+[52] RocksDB [n. d.]. RocksDB. http://rocksdb.org/.                                      USENIX Conference on File and Storage Technologies (FAST).
+[53] Zhenyuan Ruan, Tong He, and Jason Cong. 2019. INSIDER: Designing               [69] Shengan Zheng, Morteza Hoseinzadeh, and Steven Swanson. 2019.
+     In-Storage Computing System for Emerging High-Performance Drive.                    Ziggurat: A Tiered File System for Non-Volatile Main Memories and
+     In USENIX Annual Technical Conference (ATC).                                        Disks. In 17th USENIX Conference on File and Storage Technologies
+[54] Samsung. [n. d.]. Samsung Z-SSD. https://lwn.net/ml/linux-fsdevel/                  (FAST).
+     20190112213011.1439-1-axboe@kernel.dk/.                                        [70] Yuhong Zhong, Haoyu Li, Yu Jian Wu, Ioannis Zarkadas, Jeffrey Tao,
+[55] Robert Schmid, Max Plauth, Lukas Wenzel, Felix Eberhardt, and An-                   Evan Mesterhazy, Michael Makris, Junfeng Yang, Amy Tai, Ryan
+     dreas Polze. 2020. Accessible near-storage computing with FPGAs. In                 Stutsman, et al. 2022. XRP: In-Kernel Storage Functions with eBPF. In
+     Proceedings of the Fifteenth European Conference on Computer Systems                16th USENIX Symposium on Operating Systems Design and Implemen-
+     (EuroSys).                                                                          tation (OSDI).
+[56] Sudharsan Seshadri, Mark Gahagan, Sundaram Bhaskaran, Trevor
+     Bunker, Arup De, Yanqin Jin, Yang Liu, and Steven Swanson. 2014.
+     Willow: A User-Programmable SSD. In 11th USENIX Symposium on
+     Operating Systems Design and Implementation (OSDI).
+[57] Dimitrios Skarlatos, Qingrong Chen, Jianyan Chen, Tianyin Xu, and
+     Josep Torrellas. 2020. Draco: Architectural and operating system
+
+
+
+
+                                                                               49
+ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA                                                                              Yadalam et al.
+
+
+A      Artifact Appendix                                                       • Archived (provide DOI)?: BypassD artifact is divided
+A.1 Abstract                                                                     across 3 components:
+                                                                                 1. Main repository with scripts: https://doi.org/10.5281/zenodo.
+This artifact includes the source code of BypassD which                             10069841
+includes three components: Linux kernel, a kernel module                         2. BypassD kernel and module: https://doi.org/10.5281/zenodo.
+and the user library (UserLib). Table 2 summarizes the lines                        10038719
+of coded added/modified in BypassD. Changes related to                           3. UserLib: https://doi.org/10.5281/zenodo.10038717
+the file system and file table entries are part of the Linux
+kernel. The kernel module supports allocating DMA buffers                  A.3 Description
+and mapping NVMe queue pairs to the userspace. UserLib is
+                                                                           A.3.1 How to access. The artifact is publicly available
+a shim library that intercepts system calls and handles file
+                                                                           on GitHub at https://github.com/multifacet/Bypassd. This
+reads and writes directly from userspace.
+                                                                           repository contains all of the source code related to BypassD
+   This artifact also includes the scripts and tools to evaluate
+                                                                           and links (submodules) to dependencies. The repository is
+BypassD and reproduce some of the key results in this paper.
+                                                                           also archived on Zenodo and can be accessed at https://doi.
+We open-source this artifact to allow other researchers and
+                                                                           org/10.5281/zenodo.10069841.
+developers to use and improve it in their own work. In Sec-
+tion A.7, we describe the steps to use BypassD with a new
+                                                                           A.3.2 Hardware dependencies. While BypassD itself is
+workload. In this appendix, we briefly describe the steps to
+                                                                           not tied to any particular hardware architecture, the scripts
+compile and install BypassD, and to reproduce the results.
+                                                                           in the repository are written for an Intel CPU. The preferred
+                                                                           hardware configuration for evaluation would be similar to
+                                                                           that described in Section 6: Intel Xeon CPU with atleast
+A.2     Artifact check-list (meta-information)                             24 cores (with Hyper-threading) and 32GB of memory, in-
+      • Compilation: BypassD includes several software compo-              terfacing a low latency Intel P5800X SSD. The source code
+        nents, each of which is compiled separately. All of them use       (repository) and dependencies require 12GB of storage space.
+        make build tool along with gcc/g++. The scripts for compi-            The experiments have to be carried out a bare-metal ma-
+        lation handle the dependencies required for compilation.           chine after installing the custom Linux kernel included in
+      • Data set: No external dataset. The experimental setup will
+                                                                           the repository. It is recommended to turn off CPU frequency
+        create some arbitrary files with garbage data.
+      • Hardware: Preferably Intel Xeon CPU with atleast 24 cores
+                                                                           scaling and run the cores at maximum frequency. This arti-
+        (including Hyper-Threading) with atleast 32GB of memory,           fact includes scripts to turn off CPU frequency scaling for
+        and importantly, an Intel Optane P5800X NVMe SSD.                  Intel CPUs (except those using p-states).
+      • Run-time environment: Experiments are carried out on
+        a bare-metal instance. All experiments are to be run on the        A.3.3 Software dependencies. BypassD has been built
+        custom Linux kernel included in the repository.                    with Linux-5.4 (included in the artifact). However, the changes
+      • Execution: The repository contains scripts to generate the         can be applied to more recent Linux versions but will require
+        results presented in the paper. Running the experiments is         manual effort. This artifact has been tested on Ubuntu-20.04
+        as simple as launching a script.                                   which includes gcc-9.4 and binutils-2.34.
+      • Output: Output of all experiments are stored under a results/         The artifact contains links to external code-bases including
+        sub-directory that is created by the scripts. The output con-
+                                                                           SPDK [65] and fio tester suite [8]. These packages in-turn
+        tains stats about I/O latency and throughput. The scripts will
+                                                                           have other dependencies. Please refer to their documentation
+        also plot graphs similar to the ones in the paper. The graphs
+        are saved as pdfs under the experiment’s sub-directory.            for more details.
+      • Experiments: Using storage I/O workloads with FIO tester              The graphs are plotted with Python3 using matplotlib.
+        suite [8], the experiments exhibit the performance benefits
+        (latency and bandwidth) that can be achieved using BypassD         A.4 Installation
+        under different scenarios.
+                                                                           The README.md in the repository lists the steps to setup
+      • How much disk space required (approximately)?: About
+        12GB for the source code and about 16GB for experiment
+                                                                           BypassD and run experiments which is summarized below.
+        files on the NVMe device used for evaluation.                         1. Clone the repository and initialize the submodules.
+      • How much time is needed to prepare workflow (ap-
+                                                                                 $> git clone https://github.com/multifacet/Bypassd
+        proximately)?: <30 minutes.
+      • How much time is needed to complete experiments
+                                                                                 $> cd Bypassd
+        (approximately)?: About 60 minutes.                                      $> git submodule update –init –recursive
+      • Publicly available?: Yes, all of the source code relating to          2. Build and install the custom Linux kernel included in
+        BypassD is publicly available at https://github.com/multifacet/          the repository. The repository also includes a sample
+        Bypassd and also archived on Zenodo.                                     config file for reference.
+      • Code licenses (if publicly available)?: GNU GPL.                         $> bash utils/build_Linux_kernel.sh
+
+
+
+                                                                      50
+BypassD: Enabling fast userspace access to shared SSDs                                 ASPLOS ’24, April 27-May 1, 2024, La Jolla, CA, USA
+
+
+   3. Build dependencies: fio and SPDK.                               A.6 Evaluation and expected results
+      $> bash utils/build_fio.sh                                      The scripts inside the evaluation directory will generate
+      $> bash utils/build_spdk.sh                                     graphs that are very similar to the ones in the paper. There
+   4. Reboot into the built custom kernel.                            could be slight variations due to the performance of the
+      $> sudo grub-reboot "Advanced options for                       device, CPU performance and CPU operating frequency.
+      Ubuntu>Ubuntu, with Linux 5.4.0"                                  Results can vary significantly for some reasons:
+      $> sudo reboot
+                                                                         1. CPU frequency scaling is not disabled.
+   5. The final step is to build and load the kernel module.
+                                                                         2. Instead of a low latency SSD such as the Intel Optane
+      This is optional as the evaluation scripts take care of
+                                                                            P5800X, an SSD with higher latency is used.
+      loading and unloading the module.
+                                                                         3. The system doesn’t have enough cores (atleast 20).
+      $> cd kernel/module
+      $> make                                                         A.7 Experiment customization
+      $> sudo insmod bypassd.ko
+                                                                      One could use the repository in a stand-alone fashion to
+A.5 Experiment workflow                                               run BypassD with any application to improve its I/O perfor-
+                                                                      mance. This can be done by configuring and compiling the
+The artifact_evaluation/ directory in the repository con-
+                                                                      UserLib separately. Refer to utils/enable_bypassd.sh for
+tains scripts to run experiments and generate the graphs.
+                                                                      more information on compiling the UserLib. You can then
+These scripts configure and compile the kernel module and
+                                                                      run any workload with these steps:
+UserLib. They also mount/unmount the device and enable
+or disable cpu frequency scaling. They launch all experi-                1. Ensure the custom kernel is installed.
+ment runs needed for one figure. The results are generated               2. Load the BypassD kernel module using sudo insmod
+in results/ sub-directory. The scripts finally plot graphs                  bypassd.ko.
+similar to those in the paper.                                           3. Run any application with the UserLib as the shim li-
+                                                                            brary: sudo LD_PRELOAD=./libshim.so <app>
+    1. Run the scripts by providing the device file under /dev
+       and a mountpoint to mount the device.
+       $> bash run_exp.sh /dev/nvme0n1 /mnt/bypassd
+
+
+
+
+                                                                 51
+

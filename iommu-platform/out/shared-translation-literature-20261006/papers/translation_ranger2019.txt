@@ -1,0 +1,1128 @@
+                    Translation Ranger: Operating System Support for
+                                 Contiguity-Aware TLBs
+                                           Zi Yan                                                                     Daniel Lustig
+                          Rutgers University & NVIDIA                                                                     NVIDIA
+                                ziy@nvidia.com                                                                      dlustig@nvidia.com
+
+                                   David Nellans                                                              Abhishek Bhattacharjee
+                                      NVIDIA                                                                         Yale University
+                                dnellans@nvidia.com                                                               abhishek@cs.yale.edu
+
+ABSTRACT                                                                                      KEYWORDS
+Virtual memory (VM) eases programming effort but can suffer from                              Translation Lookaside Buffers; Memory defragmentation; Operat-
+high address translation overheads. Architects have traditionally                             ing system; Heterogeneous memory management
+coped by increasing Translation Lookaside Buffer (TLB) capacity;                              ACM Reference Format:
+this approach, however, requires considerable hardware resources.                             Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee. 2019.
+One promising alternative is to rely on software-generated trans-                             Translation Ranger: Operating System Support for Contiguity-Aware TLBs.
+lation contiguity to compress page translation encodings within                               In The 46th Annual International Symposium on Computer Architecture (ISCA
+the TLB. To enable this, operating systems (OSes) have to assign                              ’19), June 22–26, 2019, Phoenix, AZ, USA. ACM, New York, NY, USA, 13 pages.
+spatially-adjacent groups of physical frames to contiguous groups                             https://doi.org/10.1145/3307650.3322223
+of virtual pages, as doing so allows compression or coalescing of
+these contiguous translations in hardware. Unfortunately, modern                              1    INTRODUCTION
+OSes do not currently guarantee translation contiguity in many                                Virtual memory (VM) eases programming in many ways. It abstracts
+real-world scenarios; as systems remain online for long periods of                            the complexity of physical memory, provides memory protection
+time, their memory can and does become fragmented.                                            and process isolation, and facilitates communication between cores
+   We propose Translation Ranger, an OS service that recov-                                   and/or compute units through a shared virtual address space. Vir-
+ers lost translation contiguity even where previous contiguity-                               tual memory is used today not just for CPUs but also increasingly
+generation proposals struggle with memory fragmentation. Trans-                               for GPUs and other accelerators [3, 19, 47]. Figure 1 shows an ex-
+lation Ranger increases contiguity by actively coalescing scat-                               ample system with a group of CPUs, GPUs, and other accelerators,
+tered physical frames into contiguous regions and can be leveraged                            where each type of device can directly access both its own memory
+by any contiguity-aware TLB without requiring changes to applica-                             as well the memory of other devices via the virtual memory system.
+tions. We implement and evaluate Translation Ranger in Linux                                      High performance virtual memory can be achieved by embed-
+on real hardware and find that it generates contiguous memory                                 ding a Translation Lookaside Buffer (TLB) in each computation
+regions 40× larger than the Linux default configuration, permit-                              unit to cover all physical memory. However, since covering all of
+ting TLB coverage of 120GB memory with typically no more than                                 physical memory would require considerable translation storage
+128 contiguous translation regions. This is achieved with less than                           overheads [18, 45], vendors today choose to implement TLBs that
+2% run time overhead, a number that is outweighed by the TLB                                  cover only a portion of the total memory space. For example, Intel
+coverage improvements that Translation Ranger provides.                                       has been (approximately) doubling its CPU TLB resources every
+                                                                                              generation from Sandybridge through Skylake [20], resulting in
+                                                                                              TLBs with thousands of entries today. Vendors like AMD imple-
+CCS CONCEPTS
+                                                                                              ment even larger TLBs for their GPUs [28, 49], but these large
+• Computer systems organization → Heterogeneous (hybrid)                                      TLBs consume non-trivial area and power [5, 12, 24, 36] and are
+systems; • Software and its engineering → Virtual memory.                                     ill-suited for other types of accelerators with limited hardware
+                                                                                              resources [18, 41, 45].
+                                                                                                  Recent studies focusing on the address translation wall [7] pro-
+                                                                                              pose using translation contiguity to mitigate VM overheads [4, 9, 23,
+                                                                                              37, 39]. A contiguous region maps a set of contiguous virtual pages
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed         to a corresponding group of spatially-adjacent physical frames.
+for profit or commercial advantage and that copies bear this notice and the full citation     Contiguous regions are desirable for emerging TLB designs that
+on the first page. Copyrights for components of this work owned by others than ACM            can compress these translations into a single TLB entry. Ideally, a
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior specific permission and/or a   contiguous region of N pages can be stored with just a single TLB
+fee. Request permissions from permissions@acm.org.                                            entry rather than N entries. Figure 2 shows the general concept
+ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA                                                  of contiguity [9, 39], and is representative of several aggressive
+© 2019 Association for Computing Machinery.
+ACM ISBN 978-1-4503-6669-4/19/06. . . $15.00                                                  proposals to exploit contiguity with range TLBs [23], devirtualizing
+https://doi.org/10.1145/3307650.3322223                                                       memory [18], and direct segments [4]. These approaches, combined
+ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA                                                   Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee
+
+
+                                              CPUs                                                                                 Page Table
+         GPU                                 CPUs
+                                             CPUs                                 GPU
+                                                                      Non
+          TLB           Cache-                    TLB                Cache-
+                                                                                    TLB                                                                       Traditional TLB
+                       coherent                                                                                                    V0        P4
+                                                                    coherent
+                         Link                                                                                                      V1        P5                V0    →   P4
+                                                                      Link                      Contiguity-aware TLB
+
+
+
+
+                                                                                                                                                    …
+                                                                                                                                   V2        P6
+
+
+
+
+                                                                                                                                                                     …
+   GPU Memory                             CPU Memory                           GPU Memory            [V0-V3] → [P4-P7]             V3        P7
+    (e.g., 32GB)                           (e.g., 1TB)                          (e.g., 32GB)                                                                   V3    →   P7
+
+
+
+
+                                                                                                                                          …
+     Memory addressable to                                                                         [V12-V15] → [P8-P11]                                        V12   →   P8
+ all CPUs, GPUs, and accelerators                                                                                                   V12     P8
+
+
+
+
+                                                                                                                                                                     …
+                                                                                                                                                    …
+                                    TLB     TLB         TLB   TLB                                                                   V13     P9
+                                                                                                                                    V14    P10                 V15   →   P11
+                                          Accelerators
+                                                                                                                                    V15    P11
+
+Figure 1: Hypothetical system comprised of CPUs, GPUs,
+and other accelerators utilizing a single shared virtual and
+                                                                                               Figure 2: A contiguity-aware TLB (left) uses two entries to
+physical address space.
+                                                                                               cache four translations each, while a traditional TLB (right)
+                                                                                               requires eight entries.
+with traditional huge page techniques [32, 40, 46], may be able to
+drive address translation overheads to near zero in future systems.
+   Although influential, existing translation contiguity proposals                                 (2) We implement Translation Ranger in the Linux v4.16
+typically require either specific amounts of contiguity (e.g., discrete                                kernel to assess the feasibility of our approach. Our real-
+page-sized contiguity for huge pages [12, 35, 44]), restricted types                                   system implementation sheds light on the subtle challenges
+of contiguity (e.g. where virtual and physical pages must be identity                                  of building Translation Ranger within real OSes. Chief
+mapped [18]), or serendipitously-generated contiguity (e.g., TLB                                       among them are the challenges of reducing page migration
+coalescing [39]). Others still require large swaths of contiguity that                                 overheads, dealing with the presence of pages deemed non-
+can be created only at memory (pre)allocation time (e.g., direct                                       movable by the kernel, and understanding the impact of page
+segments and ranges [4, 23]). The question of how OSes can ac-                                         coalescing on user application performance. We demonstrate
+tively generate unrestricted and general-purpose contiguity from any                                   that it is useful to coalesce pages not only at allocation time,
+arbitrary starting condition (e.g., after active use) remains open.                                    but also post-allocation in highly-fragmented systems. This
+   Our goal is to develop OS support for creating general-purpose                                      observation goes beyond prior work which generally avoids
+translation contiguity in a robust manner across all execution en-                                     post-allocation defragmentation because of its presumed
+vironments. This means that unlike prior work [4, 18], we cannot                                       overheads [4, 12, 18, 23, 39]. To encourage further research
+generate contiguity only during initial memory allocations; we                                         on translation contiguity and coalescing TLBs, we have open-
+must also generate it throughout the workload’s lifetime. It means                                     sourced our kernel implementation. 1
+that we must be able to generate contiguity on real-world systems                                  (3) We show that Translation Ranger generates significant
+with long uptimes, where memory may be (heavily) fragmented                                            contiguity (> 90% of 120GB application footprints are cov-
+by diverse workloads that are spawned and terminated over time.                                        ered using only 128 contiguous regions, compared to < 1%
+Further, we cannot not rely on OS/application customization via                                        without coalescing). It does so with low overhead (< 2% of
+mechanisms like identity mappings [18] or programmer-specified                                         overall application run time while coalescing 120GB mem-
+segments [4] which can preclude important OS features like copy-                                       ory), thereby ensuring that the performance gain delivered
+on-write or paging to disk, and may affect security features like                                      via coalescing is a net win for applications.
+address space layout randomization (ASLR) [18].
+   To achieve this, we propose Translation Ranger, a new OS                                    2     BACKGROUND
+service that actively coalesces fragmented pages from the same virtu-                          The increasing overheads of address translation and virtual memory
+ally contiguous range to generate unrestricted amounts of physical                             have prompted research on techniques to mitigate their cost [4, 9,
+memory contiguity in realistic execution scenarios. This enables any                           12, 18, 23, 37–39, 49]. We summarize these efforts in Table 1 and
+previously proposed TLB optimization—e.g., from COLT [9, 12, 39],                              discuss them before describing Translation Ranger in detail.
+to direct segments [4], to Range TLB [23], to hybrid coalescing
+TLBs [37] to devirtualizing memory [18]—to compress information                                2.1      Using Translation Contiguity
+about address translations into fewer hardware TLB entries. The                                The earliest approaches to exploiting translation contiguity focused
+contributions of this work are:                                                                on huge pages [32, 40, 46]. OSes form huge pages by allocating
+    (1) We propose active OS page coalescing to generate unbounded                             groups of spatially-adjacent physical frames to a spatially-adjacent
+        amounts of translation contiguity in all execution environ-                            group of virtual pages in discrete-sized chunks at aligned memory
+        ments regardless of the amount of memory fragmentation                                 boundaries. For example, the x86-64 architecture supports 2MB and
+        in the system. Because it does not depend on custom hard-                              1GB huge pages if the OS can allocate 512 or 262,144 contiguous 4KB
+        ware support, Translation Ranger is widely applicable in                               virtual pages and physical frames aligned to 2MB or 1GB address
+        any system with TLB support for contiguity, whether that                               boundaries, respectively. This permits x86-64 compliant TLBs to use
+        system is already commercially available [9, 39] or relies on
+        emerging research proposals such as range TLBs [18, 23].                               1 https://github.com/ysarch-lab/translation_ranger_isca_2019
+Translation Ranger: Operating System Support for Contiguity-Aware TLBs                                                              ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA
+
+                                  Techniques                           Software Requirements                   Hardware Requirements                   Coverage Limits
+                                                      Buddy Allocator        Reservation Page Table
+                    hugetlbfs                         Separate pools         Required     No change           2MB & 1GB page size TLB       2MB and 1GB
+                    THP&khugepaged                    2MB pages              None         No change           2MB page size TLB             2MB
+                    COLT [39]                         Contiguous pages       None         No change           Coalesced TLB                 Up to 8× 4KB
+                    Dir Segments [4]                  Not related            Required     Segment table       Direct Segment registers      Any size
+                    Redundant Memory                  Increase max order,
+                                                                             None         Range table         Range TLB                     Any size in HW, but limited by SW
+                    Mappings [23]                     eager paging
+                    Hybrid TLB [37]                   Contiguous pages       None         Anchor page table   Hybrid TLB                    N × 4KB or 2MB
+                    Devirtualizing                    Increase max order,                 A new page table                                  4KB, 2MB, or 1GB in HW, but limited by
+                                                                             None                             Access validation cache
+                    Memory [18]                       eager paging                        entry                                             SW
+                    Table 1: Techniques used or proposed by industrial or academic research groups for high performance address translation.
+Num of 1GB contiguous regions
+
+
+
+
+                                120                                                                           reserving memory at boot time [27]. Allocations for 2MB or 1GB
+                                100                                                                           pages are satisfied from these reserved memory pools. Similarly, de-
+                                 80
+                                                                                                              vice drivers often use customized memory allocators that perform
+                                                                                                              similar reservation in advance [11].
+                                 60
+                                                                                                                  Other approaches in Table 1 target contiguous allocations at run
+                                 40                                                                           time. Prior work achieves this by making changes to the widely-
+                                 20                                                                           used buddy memory allocator [25]. The buddy allocator can be a
+                                  0
+                                                                                                              source of translation contiguity because it groups contiguous free
+                                      1   2   3   4   5     6 7 8 9 10 11 12 13 14 15 16 17                   memory into free page pools of different sizes, from 1 to 2N pages,
+                                                          Rounds of benchmark execution
+                                                                                                              where N is called the max order of the buddy allocator. Standard
+                                      503.postencil   553.pclvrleaf    563.pswim    graph500-omp   gups
+                                                                                                              allocations will thus contain a maximum of 2N contiguous pages.
+                                                                                                              For example, Linux’s buddy allocator supports maximum contigu-
+ Figure 3: There is plenty of contiguity available at boot time,                                              ous allocations of 4MB. However, because the buddy allocator must
+ but memory becomes fragmented soon thereafter.                                                               support fast insertions and deletions, free pages are stored in un-
+                                                                                                              ordered lists. This means that one or more memory allocations
+a single entry to cache what would otherwise take 512 or 262,144                                              cannot guarantee contiguity greater than 2N pages even if two or
+entries..                                                                                                     more contiguous 2N pages are available in the same free list.
+   Although huge pages can be effective, they only offer discrete                                                 Prior work creates allocation-time contiguity by increasing the
+chunks of contiguity. As memory capacities continue to grow, trans-                                           max order of the buddy allocator [18, 23]. However, this creates
+lation contiguity amounts in excess of 1GB or sizes between the                                               multiple problems. First, Linux’s sparsemem (used to support dis-
+discrete page sizes of 2MB and 1GB will be useful. For this rea-                                              contiguous physical address spaces, which is common in modern
+son, recent work has considered translation contiguity approaches                                             systems) requires each contiguous physical address range to be
+complementary to traditional huge pages. All of these techniques                                              aligned to 2N [50]. This means that if the max order is increased to
+require hardware support from the TLB, as outlined in Table 1. For                                            support contiguous free ranges of 1GB, many gigabytes of memory
+example, direct segments [4], uses programmer-OS coordination                                                 may be wasted. Second, increasing the max order does not solve
+to mark gigabyte- to terabyte-sized primary segments of memory                                                the problem of fragmentation; it only allows programs to obtain
+that are guaranteed to be mapped using contiguous translations.                                               large allocations in low fragmentation scenarios. Fragmentation
+While this approach can substantially reduce TLB misses, direct                                               does not directly affect the contiguity of in-use memory ranges, but
+segments can be challenging to use for real-world workloads which                                             it does affect the amount of contiguity available at allocation time.
+need more than one primary direct segment (to allocate contiguous
+segments in different parts of their address space) and because of                                            2.3    Memory Fragmentation
+the need for explicit programmer intervention. Redundant memory                                               To quantify the problem of fragmentation, we ran a set of bench-
+mappings [23] support arbitrary translation ranges in TLBs, but re-                                           marks multiple times starting with a fresh-booted system with
+quire invasive OS changes to produce these contiguous translation                                             128GB of memory (see Table 2) and we increased the max order of
+ranges. Devirtualizing memory [18] extends the concepts of direct                                             the buddy allocator to allocate large contiguous regions [18, 23].
+segments for area-constrained accelerators, but works under the                                               Figure 3 shows that all benchmarks have >80% of their footprint
+optimistic assumption that OSes can always offer large contiguous                                             covered by 1GB contiguous regions (not to be confused with 1GB
+memory regions for devirtualization.                                                                          pages, which must also be aligned) on their first execution imme-
+                                                                                                              diately after boot. However, as the benchmarks keep running, the
+ 2.2                                  Allocation-Time Contiguity                                              number of 1GB contiguous regions drops to only 20%. With Trans-
+ One way to create allocation-time contiguity is to reserve the mem-                                          lation Ranger, we enable better contiguity in both fresh-booted
+ ory in advance of application run. Libhugetlbfs achieves this by                                             systems and heavily-fragmented systems.
+ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA                                     Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee
+
+
+                                                                                                     VMA1
+                                                                                                    V0 V1 V2 V3
+    P0 P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 P11 P12 P13 P14 P15 P16
+
+                                                                                         P0 P1 P2 P3 P4 P5 P6 P7     … P93 P94 P95 P96 P97 P98 P99
+(a) In-use page fragmentation prevents 8-page contiguity even though there are
+10 free pages available. Filled blocks are in-use pages.
+                                                                                          (Begin)            Physical Frames                 (End)
+
+
+                                                                                            Memory compaction
+         P0-P511
+      Non-moveable
+                         P512-P1023        P1024-P1535        P1536-P2047                                                       VMA1
+                          Moveable        Non-moveable         Moveable
+      Free Page Pool                                                                                                           V0 V1 V2 V3
+                        Free Page Pool    Free Page Pool     Free Page Pool
+
+(b) Moveable/non-moveable free page pool fragmentation prevents user space               P0 P1 P2 P3 P4 P5 P6 P7     … P93 P94 P95 P96 P97 P98 P99
+getting contiguity beyond 512 pages.
+                                                                                          (Begin)            Physical Frames                 (End)
+
+       Figure 4: Some possible types of fragmentation.
+                                                                                 Figure 5: Defragmentation via memory compaction (e.g., in
+                                                                                 Linux) might destroy in-use contiguity as an unintended
+   Large contiguous regions are often fragmented in long-running                 side effect of creating more free memory contiguity.
+systems for several reasons. For example, in-use pages can prevent
+otherwise-free buddy pages from being promoted to a larger free
+page pool for allocation. We show an example of this in Figure 4a. In-           or malloc. Physical frames are allocated and assigned to virtual
+use pages allocated are non-movable (also called wired in FreeBSD                pages lazily when the virtual page is accessed for the first time. This
+or non-paged in Windows [30, 42]), which means that they cannot                  means that contiguous regions are created when contiguous virtual
+be defragmented [34]. The use of non-moveable free page pools,                   pages in a VMA are assigned contiguous physical frames. However,
+which are dedicated for kernel page allocations, can minimize the                since the OS may assign any physical frame to a faulting virtual
+interleaving of kernel pages with user pages, as shown in Figure 4b;             page, contiguous virtual pages in a VMA are typically mapped to
+this avoids non-movable page fragmentation, but prevents large                   non-contiguous physical frames as shown in Figure 6.
+contiguous regions beyond each pool size from being formed [34].                    Translation Ranger’s approach to generating translation con-
+This also explains why benchmarks in Figure 3 lose 1GB contiguous                tiguity is to rearrange the system’s physical memory mappings
+regions over multiple rounds of executions.                                      such that each VMA can be covered by as few contiguous regions
+   Surprisingly, existing OS memory compaction techniques can                    as possible, with regions that are as large as possible. Ideally, a
+sometimes harm contiguity. As shown in Figure 5, Linux uses mem-                 single VMA would constitute one contiguous region, and could be
+ory compaction to move in-use pages to one end of physical address               tracked using just one TLB entry. To minimize region counts and
+space, leaving the other end with contiguous free frames. However                maximize region sizes, Translation Ranger does the following:
+compaction moves only base pages and not transparent huge pages                     (1) It assigns an anchor point to each VMA. An anchor point is a
+(THP) because existing TLBs, which cannot coalesce contiguous                           virtual page (VPN) and physical frame (PFN) pair, (Vanchor ,
+THPs into a single hardware entry, are unable to benefit from higher                    Panchor ), that acts as a reference around which Transla-
+contiguity. Compaction is also unaware of the contiguity of in-use                      tion Ranger builds contiguity using all pages in this VMA.
+pages, so if a set of contiguous in-use pages are moved to a set of                 (2) It actively coalesces memory within each VMA based on the
+scattered free pages, the original contiguity may be destroyed.                         assigned anchor point. Figure 6 shows an example of active
+                                                                                        coalescing for the case where (V0, P4) is the anchor point. The
+3     TRANSLATION RANGER                                                                VMA is coalesced by 1 migrating P2 to P4, 2 exchanging
+We design Translation Ranger with several goals in mind. Trans-                         P5 with P9, 3 exchanging P7 with P6, 4 exchanging P7
+lation Ranger should go beyond the restricted amount of conti-                          with P3, ultimately leading to V0-V3 mapping to P4-P7.
+guity offered by techniques like huge pages; it should support arbi-                (3) As a background daemon, it periodically iterates over all
+trarily sized contiguity whenever possible. This contiguity should                      active VMAs in the system to maintain contiguity during
+be generated even on systems with high load and memory fragmen-                         the course of VMA allocations, expansions, and contractions,
+tation after page allocation. Finally, contiguity generation should                     which occur naturally through the lifetime of an application.
+be robust to system behavior no matter how many workloads have                      We detail each of these steps in the next three subsections.
+spawned, have died, or are executing on that system.
+                                                                                 3.2    Per-VMA Anchor Point Assignment
+3.1     Design Overview                                                          To achieve large regions of contiguity, Translation Ranger has
+Translation Ranger creates contiguity from both virtual pages                    to select anchor points carefully. It is natural to consider using the
+and physical frames. Contiguity in virtual pages depends upon the                translation corresponding to the first in-use virtual page of a VMA
+layout of a process’s virtual address space. Most OSes organize each             as a good candidate for the anchor point when no anchor point has
+process’s virtual address space as multiple non-overlapping virtual              been selected for this VMA. However, to make this anchor point
+address ranges. In Linux, each virtual address range is described                useful, the OS has to allocate the physical frames for these virtual
+by a struct vm_area_struct, or virtual memory area (VMA).                        pages to satisfy several requirements. The question of how multiple
+Applications obtain virtually-contiguous address ranges via mmap                 VMAs interact is central to this issue. Consider, for example, Figure
+Translation Ranger: Operating System Support for Contiguity-Aware TLBs                         ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA
+
+
+             VMA                                    VMA
+            [V0, V3]         Page frame            [V0, V3]                                   VMA1                      VMA2
+          V0 V1 V2 V3        coalescing          V0 V1 V2 V3                                  [V0, V3]                 [V12, V15]
+                                                                                             V0 V1 V2 V3             V12 V13 V14 V15
+
+
+ … P2 P3 P4 P5 P6 P7 P8 P9 …            … P2 P3 P4 P5 P6 P7 P8 P9 …
+                                                                                   … P2 P3 P4 P5 P6 P7 P8 P9 P10 P11 P12 P13 P14 …
+       Physical Frames                        Physical Frames
+                                                                                                   Physical Frames
+Figure 6: Coalescing the pages in a Virtual Memory Area                                          (a) Avoiding interference
+(VMA): after coalescing page frames, virtual pages V0–V3
+map to contiguous physical frames P4–P7. Filled page frame                                    VMA1                      VMA2
+boxes denotes those mapped by V0–V3, marked boxes de-                                         [V0, V3]                 [V12, V15]
+notes the frames mapped by other VMAs, and blank boxes                                       V0 V1 V2 V3             V12 V13 V14 V15
+denotes free frames. The VMA’s Anchor Point is (V0, P4).
+
+                                                                                   … P2 P3 P4 P5 P6 P7 P8 P9 P10 P11 P12 P13 P14 …
+7a, where VMA1 contains V0-V3, while VMA2 contains V12-V15.
+If VMA1 and VMA2 use (V0, P4) and (V12, P8) as their respective                                    Physical Frames
+anchor points, each VMAs can maximize the contiguity it achieves.
+                                                                                             (b) Interference during coalescing
+    On the other hand, Figure 7b shows that a less fortunate an-
+chor point selection of (V12, P6) for VMA2 damages contiguity
+                                                                          Figure 7: Anchor points (shown with red arrows) must be
+formation because this anchor point selections causes inter-VMA
+                                                                          chosen carefully to prevent inter-VMA interference.
+overlap of physical frames. In this situation, coalescing VMA2 will
+wipe out (some of) VMA1’s contiguity and vice-versa. Even worse,
+when these VMA sizes change, we have to revisit these mappings,           3.3    Intra-VMA Page Coalescing
+which can dramatically increase the number of page migrations             After the anchor point of a VMA is selected based on the steps
+needed to compensate for the inter-VMA interference and increase          described above, Translation Ranger coalesces pages within the
+Translation Ranger’s overheads.                                           VMA to create contiguity. Figure 6 shows how coalescing proceeds
+    To avoid interference between regions during coalescing, Trans-       after an anchor point selection within each VMA. When performing
+lation Ranger tracks the physical address space as coalesced and          coalescing within a VMA, Translation Ranger has to handle
+uncoalesced regions. Translation Ranger assigns newly allo-               several practical issues:
+cated VMAs to the uncoalesced physical region whenever possible.
+                                                                          In-Use Page Frames. Target physical frames may be in one of two
+When the translations within a VMA are coalesced, this region is
+                                                                          states: free or in-use. If a target page frame Pn is free, Translation
+marked as coalesced. To find uncoalesced regions for new alloca-
+                                                                          Ranger use Linux’s page migration mechanism to move the source
+tions, Translation Ranger simply uses an algorithm similar to
+                                                                          frame’s data to the target frame. If a target page frame Pn is in use,
+first-fit [53], i.e., scan linearly through all coalesced regions and
+                                                                          we cannot simply clobber it. One solution would be to move the con-
+stop at the first sufficiently large hole between any two such regions.
+                                                                          tents of the in-use frame to an intermediate physical frame before
+When no such hole is found, Translation Ranger tries to accom-
+                                                                          migrating the source frame to the target frame, but this suffers from
+modate it by removing the smallest VMA’s anchor point; otherwise,
+                                                                          extra storage and copy time overhead. In addition, under memory
+it skips this VMA. This approach avoids inter-VMA interference,
+                                                                          pressure, allocating a new intermediate physical frame can trigger
+and thus substantially mitigates Translation Ranger overheads
+                                                                          the page reclamation process, leading to significant performance
+by minimizing page migrations caused by the interference. This
+                                                                          degradation.
+also provides useful information for tackling the problem of VMA
+                                                                              Therefore, we directly exchange two pages by unmapping the
+size changes, which we discuss further in Section 3.4.
+                                                                          two pages at the same time, exchanging the content of the two pages,
+    Another consideration for anchor point placement is physical
+                                                                          and finally remapping these two pages [54]. Instead of copying data
+page alignment. In general, virtual page and physical frame align-
+                                                                          into new pages, this patch transfers data between source and target
+ment are chosen based on the needs of TLB implementations. Tra-
+                                                                          pages using CPU registers as the temporary storage for in-flight
+ditional TLBs assume that virtual pages and physical frames are
+                                                                          iterative data exchange operations. This approach requires no extra
+aligned based on page size. For example, TLBs that can cache 2MB
+                                                                          storage or page allocation and even supports the exchange of THPs.
+huge pages require that the virtual page and physical frame of the
+                                                                          It supports exchanging between two anonymous pages as well as
+huge page begin at 2MB address boundaries. For such cases, we
+                                                                          between one anonymous page and one file-backed page, but it does
+ensure that anchor points are aligned to the largest architectural
+                                                                          not support exchange of two file-backed pages (due to complicated
+page size smaller than or equal to the region in question. For ex-
+                                                                          file system locking and their rare occurrence).
+ample, a 6MB region will be 2MB-aligned so that it can be in-place
+promoted to three 2MB large pages. On the other hand, newer               Non-Movable Pages. Another issue that Translation Ranger
+contiguity-aware TLBs like range TLBs lift this restriction and do        must handle is the presence of non-movable pages. Some exam-
+not require any form of alignment in the contiguous regions [23].         ples of non-movable pages are those in use by the kernel (e.g., for
+ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA                                  Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee
+
+
+                                                                              two is moved. On the other hand, if no overlapping occurs, the
+                      VMA1                           VMA2                     new addition to the VMA will also be coalesced and the VMA’s
+                      [V0, V6]                      [V12, V15]                coalesced region size will be adjusted accordingly.
+             V0 V1 V2 V3 V4 V5 V6               V12 V13 V14 V15                  Translation Ranger is also designed to coalesce large impor-
+                                                                              tant VMAs and ignore smaller shorter-lived VMAs (< 2MB) such as
+                                                                              those used to map data structures like thread stacks. The rationale is
+      … P2 P3 P4 P5 P6 P7 P8 P9 P10 P11 P12 P13 P14 …                         that these VMAs tend to be sufficiently small such that that coalesc-
+                            Physical Frames                                   ing their page frames them yields little additional contiguity relative
+                                                                              to the overhead of the necessary page migrations. We believe more
+   (a) VMA1 grows its size at the end. Its new virtual pages V4, V5, and V6
+   overlap with VMA2 during memory coalescing.                                sophisticated strategies, e.g., consolidating multiple thread stacks,
+                                                                              or lazy VMA deallocation to lengthen VMA lifetimes, could further
+                                                                              decrease coalescing overhead and generate even larger contiguous
+                     VMA1                            VMA2                     regions, but we leave these for future work.
+                     [V0, V1]                       [V12, V15]
+                  V0 V1 V2 V3                   V12 V13 V14 V15
+
+                                                                              3.5    Additional Implementation Challenges
+      … P2 P3 P4 P5 P6 P7 P8 P9 P10 P11 P12 P13 P14 …                         Synonyms and Copy-on-Write. To handle synonyms, Trans-
+                                                                              lation Ranger coalesces a physical range based on the anchor
+                            Physical Frames
+                                                                              point from the first created VMA, and ignores the anchor points
+   (b) VMA1 shrinks its size at the end. The freed virtual pages V2 and V3    of the synonym VMAs. This can be done efficiently in Linux by
+   leave a physical page gap and fragment memory.
+                                                                              checking anon_vma for anonymous VMAs and address_space for
+                                                                              file-backed VMAs. Care needs to be taken when generating contigu-
+Figure 8: VMA size changes: VMA growth and shrinkage.
+                                                                              ity on pages created by copy-on-write (COW) to avoid unnecessary
+They cause inter-VMA interference and memory fragmen-
+                                                                              coalescing work. Translation Ranger skips forked VMAs that
+tation, respectively
+                                                                              share the same physical pages, the same way it does for skipping
+                                                                              synonym VMAs. After COW, Translation Ranger creates a new
+slab allocations, page tables, or other kernel data structures). Alter-
+                                                                              anchor point with the COW physical page for that VMA.
+nately, a page may be marked as busy because it is involved in I/O
+operations, migration, dirty page writeback, or DMA. We handle                Reducing Runtime Overheads. Excessive page migration dur-
+each of these non-movable page types in different ways. Since ker-            ing coalescing can incur high runtime overheads. To avoid this,
+nel pages usually have a long lifetime and limited OS support for             Translation Ranger selects anchor points to avoid inter-VMA
+page migration, we simply skip them during the coalescing process.            interference (see Figure 7). Furthermore, it focuses on large and
+However, busy pages are usually ephemeral; therefore, even if these           long-lived VMAs to avoid wasting coalescing effort (see Section
+pages cannot be moved currently, Translation Ranger will try                  3.4). Moreover, we enable users or system administrators to con-
+to coalesce them again in the future using iterative coalescing. If           trol Translation Ranger’s runtime impact through a tunable
+Translation Ranger must skip a non-movable frame, it will con-                parameter. We envision that this tunable will be used the same way
+tinue coalescing the remaining frames using the originally selected           as the vast majority of other existing operating system services
+anchor point. We investigated the value of creating new anchor                like khugepaged. That is, if there is hardware to take advantage of
+points following non-movable pages, but we found that doing so                contiguity (via TLB optimizations like range TLBs), we can expect
+yields little benefit. Generating additional anchor points needlessly         administrators to run Translation Ranger more frequently to
+splits a large contiguous region into two smaller contiguous regions          aggressively generate contiguity, though we will reflect on a sane
+should a busy page (the cause of a new anchor) become non-busy                default in Section 5.3. Finally, we design Translation Ranger as
+in the future.                                                                a background daemon that is not on the critical path of application
+                                                                              execution and can “steal” idle CPU cycles. This is similar in spirit
+3.4    Iterative Page Frame Coalescing                                        to the design of already-existing daemons like khugepaged.
+Applications can grow and shrink their VMAs over time. This is
+problematic if a VMA grows so that its physically contiguous region
+overlaps and interferes with another VMA, or if a VMA shrinks                 4     EXPERIMENTAL METHODOLOGY
+enough that the freed physical frames become a free memory frag-              Translation Ranger is widely deployable on systems with and
+ment. We show both cases in Figure 8. To avoid this problem, Trans-           without fragmentation and can leverage any previously-proposed
+lation Ranger tracks per-VMA size along with each VMA’s co-                   TLB hardware that supports translation contiguity [4, 18, 23, 37, 39].
+alesced region size during each coalescing iteration. If, on future           Naturally, Translation Ranger’s performance benefits will vary
+iterations, Translation Ranger discovers a VMA that has now                   depending on the target system’s fragmentation levels and the
+grown and overlaps with another VMA (by examining coalesced                   contiguity-aware TLBs that leverage it. To achieve good perfor-
+region information), Translation Ranger relocates the coalesced               mance, Translation Ranger must generate enough translation
+region of one of the two VMAs by assigning a new anchor point.                contiguity for contiguity-aware TLBs to offset any runtime over-
+To minimize page frame relocation overheads, the smaller of the               heads from Translation Ranger’s page movement operations.
+Translation Ranger: Operating System Support for Contiguity-Aware TLBs                                  ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA
+
+
+                         Experimental Environment                                      Suite      Description             Benchmark        Footprint
+                     2-socket Intel E5–2650v4 (Broadwell),                                                                503.postencil       121GB
+   Processors
+                     24 cores/socket, 2 threads/core, 2.2 GHz                                                             551.ppalm           121GB
+                                                                                                  Compute & memory        553.pclvrleaf       121GB
+                     4KB pages: 64-entry, 4-way set assoc.
+                                                                                                  intensive               555.pseismic        120GB
+   L1 DTLB           2MB pages: 32-entry, 4-way set assoc.                             SPEC
+                                                                                                  multi-threaded          556.psp             113GB
+                     1GB pages: 4-entry, 4-way set assoc.                              ACCEL
+                                                                                                  workloads using         559.pmniGhost       120GB
+                     4KB pages: 128-entry, 4-way set assoc.                                       OpenMP                  560.pilbdc          121GB
+   L1 ITLB
+                     2MB pages: 8-entry, fully assoc.                                                                     563.pswim           117GB
+                     4KB&2MB pages: 1536-entry, 6-way set assoc.                                                          570.pbt             119GB
+   L2 TLB
+                     1GB pages: 16-entry, 4-way set assoc.                                        Generation and search
+                                                                                                                          Graph500            122GB
+   Memory            128GB DDR4 (per socket)                                           HPC        of graphs
+
+   OS                Debian Buster — Linux v4.16.0                                                Random access
+                                                                                                                          GUPS                128GB
+                                                                                                  benchmark
+Table 2: System configurations and per-core TLB hierarchy.
+                                                                                                                          bc-kron             121GB
+                                                                                                                          bc-urand            122GB
+                                                                                       GAP
+4.1     Evaluation Platform                                                                       Common graph            cc-kron             116GB
+                                                                                       Bench-
+                                                                                                  processing kernels      cc-urand            116GB
+We implement Translation Ranger in Linux kernel v4.16 and eval-                        marks
+                                                                                                                          pr-kron             116GB
+uate it on a two-socket Intel server (see Table 2). We run a variety of                                                   pr-urand            116GB
+benchmarks from SPEC ACCEL [22], the GAP benchmark suite2 [6],
+                                                                                     Table 3: Benchmark descriptions and memory footprints.
+graph500 [31], and GUPS [43] (see Table 3). Translation Ranger
+running as a service daemon is collocated with applications in the
+same memory node and tuned to periodically coalesce application                     rely on serendipitously generated contiguity [37–39]. We also com-
+memory; to produce contiguity statistics, application memory is                     pare against an enhanced buddy allocator with its max order in-
+scanned every 5 seconds to retrieve the virtual-to-physical map-                    creased to 20, permitting 2GB contiguous region allocations. This
+pings of each page belonging to the application. This statistics                    Large Max Order is representative of approaches from prior work
+collection is engineered to have negligible impact on runtime and                   like redundant memory mappings and devirtualizing memory be-
+would not be present in production deployments.                                     cause it relies on generating contiguity at allocation time and hence
+   A central insight from our work is that system load and frag-                    serves as a valuable point of comparison to our approach [18, 23].
+mentation levels is critical to the question of how much contiguity                 Furthermore, we compare Translation Ranger to Enhanced
+can be generated. The success of contiguity-aware TLBs rests on                     khugepaged, which is another technique Linux uses to generate
+the OSes ability to generate contiguity robustly across a wide va-                  contiguity by collapsing scattered 4KB pages into a new THP. To
+riety of scenarios. To stress-test whether Translation Ranger                       conservatively assess Translation Ranger’s relative benefits, we
+indeed generates contiguity in heavily fragmented environments,                     tune khugepaged to scan the entire application footprint every 5s
+we go beyond prior work [4, 18, 38–40] to use a methodology that                    as opposed to its default of defragmenting only 16MB of memory
+preconditions memory before our evaluations.                                        every 60s.
+   We first use an existing methodology used by kernel developers                      Finally, when profiling Translation Ranger, we quantify the
+to artificially fragment the free memory lists as if our system was                 results when coalescing every 5 seconds, and every 50 seconds to
+long-running system with all its free lists randomized [52]. We then                showcase the relationship between runtime overheads and Trans-
+further load the system by run a synthetic benchmark, memhog, an                    lation Ranger’s ability to generate contiguity. For all five config-
+application that allocates memory throughout the physical address                   urations, THPs are enabled by default and the buddy allocator uses
+space, and has been used in prior studies to create fragmentation.                  Linux’s default max order 11 to allow a maximum 4MB contiguous
+Together, these steps ensure that memory is in a fragmented state                   page allocation, except for Large Max Order.
+similar to a realistic steady state shown in Figure 3, which prevents
+applications obtaining unrealistic contiguity from sequential mem-                  4.3    Contiguity Metrics
+ory accesses. We also configure our benchmarks to use 95% of total                  We focus on two metrics to evaluate the effectiveness of Transla-
+free memory similar to many datacenter and HPC environments.                        tion Ranger on real systems. First, we count the total number of
+                                                                                    contiguous regions needed to cover the entire application memory
+4.2     Experimental Configurations                                                 footprint (TotalNumContigRegions ). Our goal is to reduce the total
+To understand Translation Ranger’s effectiveness on improv-                         number these regions such that their total amount is comparable to
+ing memory contiguity, we use Linux’s default buddy allocator                       the most aggressive eager paging and identity mapping techniques
+configuration (Linux Default) as our baseline. This baseline is                     from prior work (e.g., direct segments, range TLBs, devirtualizing
+what has been used by prior contiguity-aware TLB designs that                       memory [4, 18, 23]).
+2 We scaled up two synthetic input graphs, Kron and Urand, and run three kernels,
+                                                                                       We calculate the percentage of total application footprint cov-
+Between Centrality (bc), Connected Components (cc), and PageRank (pr) with these    ered by the largest 32 contiguous regions (MemCoverage32Regions )
+two input graphs.                                                                   and the percentage of total application footprint covered by the
+ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA                                                                                                Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee
+
+                                           503.postencil           551.ppalm              553.pclvrleaf            555.pseismic           556.psp           559.pmniGhost           560.pilbdc           563.pswim           570.pbt
+                                                                                  40000
+                                   30000                                                                                                                                                                             3e+05
+                                                                                                                                  60000             40000
+                                                           40000                                                                                                                                 60000
+                                                                                  30000                   60000
+                                                                                                                                                                            40000
+                                                           30000                                                                                    30000
+                                   20000                                                                                                                                                                             2e+05
+                                                                                                                                  40000
+                                                                                                                                                                                                 40000
+Num of regions (lower is better)
+
+
+
+
+                                                                                  20000                   40000
+                                                           20000                                                                                    20000
+                                                                                                                                                                            20000
+                                   10000                                                                                          20000                                                                              1e+05
+                                                                                  10000                   20000                                                                                  20000
+                                                           10000                                                                                    10000
+
+                                      0                       0                      0                        0                      0                 0                       0                    0                0e+00
+                                           graph500-omp              gups                   bc-kron                 bc-urand              cc-kron             cc-urand               pr-kron             pr-urand
+                                                           40000                                          150000
+                                                                                 150000
+                                                                                                                                  75000                                                          75000
+                                                                                                                                                    90000                   75000
+                                   40000                   30000
+                                                                                 100000                   100000
+                                                                                                                                  50000             60000                   50000                50000
+                                                           20000
+                                   20000                                                                  50000
+                                                                                  50000                                                                                                          25000
+                                                           10000                                                                  25000             30000                   25000
+
+
+                                      0                       0                      0                        0                      0                 0                       0                    0
+
+
+                                                                                                                                                            Translation Ranger        Translation Ranger
+                                                                               Linux Default       Large Max Order             Enhanced khugepaged
+                                                                                                                                                            (every 5s)                (every 50s)
+
+
+                                               Figure 9: Total number of contiguous regions covering entire application memory (TotalNumContigRegions ).
+
+
+largest 128 contiguous regions (MemCoverage128Regions ). Our goal                                                                           thickness of a violin plot indicates how often the values from y-axis
+is to show that even small 32-128 entry contiguity-aware TLBs                                                                               occur. The arithmetic mean of all values is shown as a diamond
+can capture the majority of the application footprint. This metric                                                                          symbol within each plot.
+has been previously used by prior work [18, 23] to understand                                                                                  Figure 9 shows the TotalNumContigRegions distributions for all
+contiguity improvements.                                                                                                                    benchmarks. We observe that most benchmarks show
+                                                                                                                                            TotalNumContigRegions aggregating in one primary area, which re-
+4.4                                        System Overheads                                                                                 flects their bulk memory allocation behavior; the number of regions
+Translation Ranger can add overhead to systems because pages                                                                                does not change much over time. On the other hand, 556.psp and
+undergoing migration are not accessible to applications and require                                                                         570.pbt, which allocate memory recurrently, have their
+TLB invalidations and shootdowns. Naturally, these overheads will                                                                           TotalNumContigRegions spread across a range of values along the y-
+be offset by improved TLB hit rates. Nevertheless, to mitigate even                                                                         axis due to frequent small allocations.
+the cost of page migration, we present all benchmark runtimes                                                                                  Among the five configurations, Linux Default and Enhanced
+for the five measured configurations in the conservative scenarios                                                                          khugepaged require many more contiguous regions (violin plots
+where contiguity-aware TLBs are absent. We normalize these run-                                                                             are thick at the top of each plot) to cover each application’s memory
+times to our baseline, Linux Default. Our platform supports discrete                                                                        footprint. This is primarily because they are both limited by the
+page sizes (4KB and 2MB) but does not take advantage of other                                                                               buddy allocator, which yields contiguity regions up to 4MB. The
+kinds of contiguity, so excess application runtime due to coalescing                                                                        Large Max Order configuration can generate much larger, and thus
+can be viewed as the software tax of our system. Ultimately, we                                                                             fewer contiguous regions, since it modifies the buddy allocator to
+will show that Translation Ranger generates contiguity compa-                                                                               provide up to 2GB contiguous regions. However, Translation
+rable to the most aggressive prior proposals, while simultaneously                                                                          Ranger (at either frequency) is able to coalesce memory more
+incurring such low overheads that the benefits will come virtually                                                                          effectively and needs far fewer contiguous regions to cover each
+“for free” on most systems.                                                                                                                 application footprint; i.e., it is the most successful technique for
+                                                                                                                                            generating contiguity.
+5                                     EXPERIMENTAL RESULTS                                                                                     Figure 10 shows the coverage of each technique when using
+                                                                                                                                            the largest 32 or 128 contiguous regions. The plots tend to cluster
+We begin by showing translation contiguity results for all bench-                                                                           together. This is because TLB coverage is influenced by the size of
+marks, followed by highlighting two interesting cases to provide                                                                            the largest contiguous regions present in the system and not just the
+more detail about how applications behave over time. Finally, we                                                                            total number of regions. Among all five OS configurations, Linux
+show system runtime overheads and discuss Translation Ranger’s                                                                              Default and Enhanced khugepaged can typically only cover < 1%
+applicability to other OSes.                                                                                                                of each application footprint (with either 32 or 128 regions), since
+                                                                                                                                            they can achieve at most 4MB contiguous regions. The Large Max
+5.1                                        Overall Translation Contiguity Results                                                           Order configuration can typically cover up to 40% of the application
+To concisely show individual results, we show several metrics, in-                                                                          footprint, but is also limited by 2GB contiguous regions from its
+cluding TotalNumContigRegions , MemCoverage32Regions , and                                                                                  buddy allocator modifications. Theoretically, the Large Max Order
+MemCoverage128Regions in Figure 9 and Figure 10 using violin plots [51].                                                                    configuration should be able to cover all application footprints with
+Violin plots aggregate all numbers over application runtime into a                                                                          128 contiguous regions, if each region is at least 1GB. However,
+distribution represented by a“violin plot” parallel to the y-axis. The
+Translation Ranger: Operating System Support for Contiguity-Aware TLBs                                                                                               ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA
+
+
+                                                                        503.postencil    551.ppalm      553.pclvrleaf     555.pseismic    556.psp      559.pmniGhost       560.pilbdc      563.pswim   570.pbt
+                                                                  100
+                                                                   90
+                                                                   80
+                                                                   70
+                                                                   60
+                                                                   50
+                                                                   40
+                                                Largest 32 regions
+
+
+
+
+                                                                   30
+                                                                   20
+                                                                   10
+Percentage of total memory (higher is better)
+
+
+
+
+                                                                    0
+                                                                        graph500-omp       gups           bc-kron          bc-urand       cc-kron         cc-urand          pr-kron         pr-urand
+                                                                  100
+                                                                   90
+                                                                   80
+                                                                   70
+                                                                   60
+                                                                   50
+                                                                   40
+                                                                   30
+                                                                   20
+                                                                   10
+                                                                    0
+
+                                                                        503.postencil    551.ppalm      553.pclvrleaf     555.pseismic    556.psp      559.pmniGhost       560.pilbdc      563.pswim   570.pbt
+                                                                  100
+                                                                   90
+                                                                   80
+                                                                   70
+                                                                   60
+                                                                   50
+                                                                   40
+                                                Largest 128 regions
+
+
+
+
+                                                                   30
+                                                                   20
+                                                                   10
+                                                                    0
+                                                                        graph500-omp       gups           bc-kron          bc-urand       cc-kron         cc-urand          pr-kron         pr-urand
+                                                                  100
+                                                                   90
+                                                                   80
+                                                                   70
+                                                                   60
+                                                                   50
+                                                                   40
+                                                                   30
+                                                                   20
+                                                                   10
+                                                                    0
+
+                                                                                                                                                    Translation Ranger     Translation Ranger
+                                                                                        Linux Default   Large Max Order      Enhanced khugepaged
+                                                                                                                                                    (every 5s)             (every 50s)
+
+
+
+Figure 10: The percentage of total application footprint covered by the largest 32 contiguous regions (MemCoverage32Regions )
+is shown in the top and percentage of total application footprint covered by the largest 128 contiguous regions (
+MemCoverage128Regions ) is shown in the bottom.
+
+
+due to memory fragmentation, not all contiguous regions obtained                                                                           which allocates memory in bulk and 556.psp, which allocates and
+from the buddy allocator are maximally-sized.                                                                                              frees memory frequently.
+   Translation Ranger (at all the frequencies we studied; we                                                                                   503.postencil Figure 11a shows the contiguity results over the
+show 5s and 50s frequencies in our graphs) consistently creates                                                                            runtime of 503.postencil, which first creates a huge address region,
+much larger contiguous regions that can cover the majority of each                                                                         fills it with physical frames, then processes all data in memory.
+application’s footprint. Utilizing 128 contiguous regions, Trans-                                                                          The left most plot in Figure 11a shows the TotalNumContigRegions
+lation Ranger can typically cover > 90% of a 120GB application                                                                             over application runtime for the 5 contiguity producing approaches.
+footprint. In comparison, the last level TLB of a CPU today typically                                                                      This plot shows the same data as the left most plot of Figure 9, but
+contains 1536 entries and hence even when they exclusively use                                                                             spreads time out over the x-axis, thereby showing how the contigu-
+THPs (2MB) they can only cover 2GB of footprint. Thus Transla-                                                                             ity changes over time. To translate between them, first consider the
+tion Ranger combined with existing coalescing TLB proposals can                                                                            left most plot of Figure 11a. We can see TotalNumContigRegions for
+typically improve TLB coverage by over 30× as shown in Table 4.                                                                            Linux Default increases from 0 to about 32,000 during the first 40%
+Meanwhile, TLB storage could be reduced by 85% from a 1536-entry                                                                           of application runtime and becomes stable for the remaining 60%
+traditional TLB to a 128-entry range cache, where the former uses                                                                          runtime. In the left most plot of Figure 9, the Linux Default violin
+about 13.5KB3 and the latter uses 2KB [48].                                                                                                plot is thickest around the value of 32,000, then is fairly uniformly
+                                                                                                                                           distributed between 0 and 32,000.
+5.2                                                           Notable Individual Benchmarks                                                    From the leftmost plot in Figure 11a, we see several interesting
+In order to provide more insight into how Translation Ranger                                                                               trends. For example, with Translation Ranger more frequent
+achieves contiguity, we highlight two workloads: 503.postencil,                                                                            invocation (every 5 seconds) is able to generate large contiguous
+                                                                                                                                           regions more quickly than the less frequent invocation (every 50
+3 We assume the TLB use 36bit (or 4.5B) tag for VPN and 36bit (or 4.5B) data for PFN                                                       seconds). However, after application memory allocations become
+and permission bits, so 4.5B × 2 × 1536/1024 = 13.5KB.
+ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA                            Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee
+
+
+                                                                        Large Max Order, or Enhanced khugepaged. The middle and right
+                    Cmax of       Largest 32        Largest 128
+                                                                        plots in Figure 11b show that using the largest 32 or 128 contiguous
+                     a 1536-       regions            regions
+ Benchmark                                                              regions, Linux Default and Enhanced khugepaged can cover < 1%
+                      entry
+                                         Cavд               Cavд        of the application footprint. Large Max Order does a little better,
+                      TLB       Cavд               Cavд
+                                         boost              boost       covering about 8% initially, but decreases to < 2% because of the
+                                                                        frequent memory allocations and deallocations.
+ 503.postencil        3GB       70GB      23×     86GB       29×
+                                                                           In contrast, Translation Ranger (with frequency set to every
+ 551.ppalm            3GB       87GB      29×     104GB      35×
+                                                                        50 seconds) can cover more than 64% of the application footprint
+ 553.pclvrleaf        3GB       94GB      31×     117GB      39×
+                                                                        with the largest 32 contiguous regions and the coverage is over 72%
+ 555.pseismic         3GB       96GB      32×     114GB      38×
+                                                                        during the bulk of application runtime; increasing the number of
+ 556.psp              3GB       55GB      18×     56GB       19×
+                                                                        regions to 128 further improves the coverage of the application’s
+ 559.pmniGhost        3GB       92GB      30×     117GB      39×
+                                                                        footprint to 75%. Additional improvements can come from running
+ 560.pilbdc           3GB       81GB      27×     102GB      34×
+                                                                        Translation Ranger more frequently but do not seem necessary
+ 563.pswim            3GB       92GB      31×     111GB      37×
+                                                                        in most cases.
+ 570.pbt              3GB       90GB      30×     114GB      38×
+ graph500-omp         3GB       83GB      28×     99GB       33×
+ gups                 3GB       100GB     33×     121GB      40×
+ bc-kron              3GB       106GB     35×     118GB      39×        5.3    Translation Ranger Overheads
+ bc-urand             3GB       107GB     36×     118GB      39×
+                                                                        So far we have shown that Translation Ranger creates systemat-
+ cc-kron              3GB       102GB     34×     111GB      37×
+                                                                        ically larger and dramatically fewer contiguous regions compared
+ cc-urand             3GB       97GB      32×     111GB      37×
+                                                                        to other approaches, but we must also consider its "software tax".
+ pr-kron              3GB       104GB     35×     113GB      38×
+                                                                        Figure 12 shows the application execution time across all five con-
+ pr-urand             3GB       102GB     34×     112GB      37×
+                                                                        figurations normalized to our baseline, Linux Default, averaged
+ Average              3GB       92GB      31×     107GB      36×        across 5 runs to account for variation. Large Max Order, which
+Table 4: Translation coverage (C) comparison between a                  on average adds 1.1% runtime overhead, incurs very minor slow-
+1536-entry traditional TLB and a contiguity-aware TLB us-               downs due to zeroing every free large page at allocation time. The
+ing Translation Ranger (every 50s) with largest 32 regions              overhead of Enhanced khugepaged is negligible; although it runs
+and 128 regions.                                                        very frequently (every 5 seconds), the majority of each workload’s
+                                                                        memory is already THPs, leaving few base pages for it to convert
+                                                                        to THPs. This also explains its small improvements in contiguity
+stable (at approximately 40% of the application runtime), the less      for most workloads. Finally, we show that Translation Ranger
+frequent invocation eventually results in a similar number of con-      adds, on average, 1.7% overhead when run every 50 seconds.
+tiguous regions being produced for the remainder of the execution.         bc-kron provides an interesting study, because it actually runs
+   In the middle and right plots plots of Figure 11a we observe that    faster than expected with Enhanced khugepaged and Translation
+the Linux Default and Enhanced khugepaged configurations can            Ranger. bc-kron cannot allocate as many THPs as possible at page
+cover very little (< 1%) of the application footprint throughout the    allocation time, which causes Linux Default and Large Max Or-
+application lifetime. The Large Max Order configuration is a sub-       der suffer, whereas both Enhanced khugepaged and Translation
+stantial improvement with 12.5% of the application footprint being      Ranger are able to generate more THPs out of fragmented in-use
+covered with the largest 32 contiguous regions and 32.3% with the       pages after page allocation time. This improves the application per-
+largest 128 contiguous regions respectively. However Translation        formance by reducing TLB misses and page table walk overheads
+Ranger can cover at least 80% of application footprint with just        thanks to TLB support for huge pages on our test system.
+32 contiguous regions, and over 95% of the 121GB footprint using           When Translation Ranger is tuned to run more aggressively,
+128 contiguous regions after just several iterations of coalescing.     every 5 seconds, it also produces more contiguity. We measure an
+To summarize, contiguity-aware TLB designs will attain about 3×         average runtime overhead of of 2.3%, which is 0.6% more than run-
+TLB coverage (or could reduce their hardware resources propor-          ning Translation Ranger every 50 seconds. This small overhead
+tionally), if they simply use Translation Ranger instead of their       buys more pronounced contiguity with over 90% of application foot-
+own software enhancements.                                              print consistently covered with just 32 contiguous chunks through
+   556.psp Figure 11b shows the contiguity results for 556.psp,         application runtime. We conclude that Translation Ranger has
+which frequently allocates and deallocates memory. The left most        minimally invasive software overheads comparable to prior solu-
+plot of Figure 11b shows high volatility across all configurations      tions that are so small that it will will be more than offset by the
+for TotalNumContigRegions because frequent memory allocations add       performance improvements achieved via TLB efficiency, reported
+many fragmented small pages and deallocations remove existing           at 20-30% in prior proposals [18, 23, 39]. Because Translation
+contiguous regions. All five experimental configurations suffer from    Ranger generates substantially more contiguity than those studies,
+this type of application memory allocation pattern.                     we also expect to see more performance, but an exhaustive study
+   Because Translation Ranger iteratively coalesces memory              of numerous contiguity-aware TLB designs is beyond the scope
+to generate contiguous regions, it requires 40% fewer contiguous        of this comprehensive OS implementation of software support for
+regions to cover the entire application footprint than Linux Default,   contiguity aware TLBs.
+Translation Ranger: Operating System Support for Contiguity-Aware TLBs                                                                                         ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA
+
+
+
+                            Total num of regions                                                            Largest 32 regions                                                                 Largest 128 regions
+
+
+
+
+                                                                            Percentage of total mem
+
+
+
+
+                                                                                                                                                               Percentage of total mem
+                                                                                                      100                                                                                100
+                    30000                                                                              90                                                                                 90
+
+
+
+
+                                                                                (higher is better)
+
+
+
+
+                                                                                                                                                                   (higher is better)
+(lower is better)
+Num of regions
+
+
+
+
+                                                                                                       80                                                                                 80
+                                                                                                       70                                                                                 70
+                    20000                                                                              60                                                                                 60
+                                                                                                       50                                                                                 50
+                                                                                                       40                                                                                 40
+                    10000                                                                              30                                                                                 30
+                                                                                                       20                                                                                 20
+                                                                                                       10                                                                                 10
+                       0                                                                                0                                                                                  0
+                             0      20        40      60        80    100                                    0      20       40       60         80      100                                    0      20       40       60        80   100
+                                         Runtime (percentage)                                                            Runtime (percentage)                                                               Runtime (percentage)
+                                                                                                                                                Translation Ranger                              Translation Ranger
+                                                   Linux Default     Large Max Order                              Enhanced khugepaged
+                                                                                                                                                (every 5s)                                      (every 50s)
+                                                                                        (a) Contiguity results over time for 503.postencil.
+
+
+                            Total num of regions                            Percentage of total mem
+                                                                                                            Largest 32 regions                                                                 Largest 128 regions
+
+
+
+
+                                                                                                                                                               Percentage of total mem
+                                                                                                      100                                                                                100
+                                                                                                       90                                                                                 90
+                                                                                (higher is better)
+
+
+
+
+                                                                                                                                                                   (higher is better)
+                    60000
+(lower is better)
+Num of regions
+
+
+
+
+                                                                                                       80                                                                                 80
+                                                                                                       70                                                                                 70
+                    40000                                                                              60                                                                                 60
+                                                                                                       50                                                                                 50
+                                                                                                       40                                                                                 40
+                    20000                                                                              30                                                                                 30
+                                                                                                       20                                                                                 20
+                                                                                                       10                                                                                 10
+                       0                                                                                0                                                                                  0
+                             0      20        40      60        80    100                                    0      20       40       60         80      100                                    0      20       40       60        80   100
+                                         Runtime (percentage)                                                            Runtime (percentage)                                                               Runtime (percentage)
+                                                                                                                                                Translation Ranger                              Translation Ranger
+                                                   Linux Default     Large Max Order                              Enhanced khugepaged
+                                                                                                                                                (every 5s)                                      (every 50s)
+                                                                                                      (b) Contiguity results over time for 556.psp.
+
+
+Figure 11: Total number of contiguous regions covering entire application memory (TotalNumContigRegions ) is shown in the
+left most plot; percentage of total application footprint covered by the largest 32 contiguous regions (MemCoverage32Regions )
+is shown in the middle plot; percentage of total application footprint covered by the largest 128 contiguous regions (
+MemCoverage128Regions ) is shown in the right most plot.
+
+
+5.4                    Discussion                                                                                                 NUMA Effects. This initial study focuses on only one memory
+Applicability to other OSes. The Translation Ranger concept                                                                       node in our system as a tractable configuration to thoroughly un-
+is not Linux specific and is compatible with other OSes like Win-                                                                 derstand Translation Ranger. Translation Ranger can easily
+dows and FreeBSD, which maintain VMA-like data structures per                                                                     be extended to multi-node NUMA systems, though Translation
+process. For example, FreeBSD uses vm_map_entry to identify a                                                                     Ranger’s cross-socket traffic overheads will have to be integrated
+contiguous virtual address range instead of a VMA, vm_object                                                                      with previously-proposed NUMA paging policies, like autoNUMA,
+to represent a group of physical frames from one memory ob-                                                                       Carrefour-LP, and Ingens [10, 15, 26] to minimize overheads.
+ject instead of anon_vma for an anonymous memory object and
+address_mapping for a file in Linux. To port Translation Ranger                                                                   6    RELATED WORK
+to FreeBSD, we can generate contiguity on each vm_map_entry and                                                                   Prior work on memory allocation has studied ways to increase
+assign one anchor point to it instead of each VMA.                                                                                contiguity and reduce memory fragmentation [8, 21, 33] and is
+Permission Checks. All recent work on contiguous regions, in-                                                                     discussed in Table 1.
+cluding ours, assumes that contiguous regions belong to single                                                                    Memory Allocation. Internal and external memory fragmenta-
+VMAs with uniform permissions for all their virtual pages. If the                                                                 tions are two major problems for memory allocations. To mitigate
+permission of a virtual address range in this VMA is changed, the                                                                 internal memory fragmentation, the SLAB allocator and others (e.g.,
+VMA will be broken into two or more new VMAs with correspond-                                                                     jemalloc and tcmalloc) pack small memory objects with the same
+ing updated permissions and the page table entries will be updated                                                                size together in one or more pages to avoid wasting space [8, 14, 16].
+respectively. This also breaks one contiguous region into multiple                                                                For external memory fragmentation, OSes use buddy allocators
+regions, and contiguity-aware TLBs will need additional entries                                                                   to achieve fast memory allocation and restrict external fragmen-
+to address the original memory address range. To mitigate this                                                                    tation [25]. Linux developers separate kernel and user memory
+problem, new address translation designs [1, 4] that can decou-                                                                   allocations to further reduce external fragmentation [17]. Addi-
+ple permission checks from virtual-to-physical address translation,                                                               tionally, peripheral devices often require access to physically con-
+could be helpful, as they allow the TLB to maintain the original                                                                  tiguous memory. Linux accommodates these devices with drivers
+contiguous region entry but with additional permission subsections.                                                               that use boot-time allocation and reserve contiguous memory be-
+                                                                                                                                  fore others can request memory via Contiguous Memory Allocators
+                                                                                                                                  (CMAs) [11]. CMAs use memory compaction to migrate fragmented
+ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA                                                                                                                                                                                                      Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee
+
+
+                 1.1
+                                                                                                                                                                                                                                                  minimize address translation overhead for all computation units in
+                 1.0                                                                                                                                                                                                                              heterogeneous systems. Accelerators in particular will benefit, as
+Normalized runtime
+
+
+
+
+                 0.9
+                 0.8                                                                                                                                                                                                                              they often have limited hardware resources for address translation.
+                 0.7                                                                                                                                                                                                                              Translation Ranger can scale easily with increasing memory
+                 0.6
+                 0.5                                                                                                                                                                                                                              sizes regardless of the limitations imposed by modern memory allo-
+                 0.4                                                                                                                                                                                                                              cators. With less than 2% runtime overhead, Translation Ranger
+                 0.3
+                 0.2                                                                                                                                                                                                                              generates contiguous regions covering more than 90% of 120GB
+                 0.1
+                 0.0
+                                                                                                                                                                                                                                                  application footprints with at most 128 regions, which can be fully
+                                                                                                                                                                                                                                                  cached by contiguity-aware TLBs to minimize address translation
+                                                                                              559.pmniGhost
+
+
+
+
+                                                                                                                                                 graph500-omp
+                         503.postencil
+
+
+
+
+                                                                     555.pseismic
+                                                     553.pclvrleaf
+
+
+
+
+                                                                                                                                                                                                                                                  overhead. To address ever-increasing memory sizes, contiguity-
+                                                                                                                           563.pswim
+                                         551.ppalm
+
+
+
+
+                                                                                                              560.pilbdc
+
+
+
+
+                                                                                                                                                                                                                                        geomean
+                                                                                                                                                                                  bc-urand
+
+
+                                                                                                                                                                                                       cc-urand
+
+
+                                                                                                                                                                                                                             pr-urand
+                                                                                    556.psp
+
+
+
+
+                                                                                                                                       570.pbt
+
+
+
+
+                                                                                                                                                                        bc-kron
+
+
+                                                                                                                                                                                             cc-kron
+
+
+                                                                                                                                                                                                                   pr-kron
+                                                                                                                                                                gups                                                                              aware TLBs provide promising hardware support and Transla-
+                                                                                                                                                                                                                                                  tion Ranger is the software cornerstone needed to enable these
+                                                                                                                              Benchmarks                                                                                                          designs.
+                                                                                                                                                                       Translation Ranger                         Translation Ranger
+                     Linux Default                           Large Max Order                                  Enhanced khugepaged
+                                                                                                                                                                       (every 5s)                                 (every 50s)
+
+
+                                                                                                                                                                                                                                                  ACKNOWLEDGMENTS
+Figure 12: Benchmark runtime for all five configurations:
+                                                                                                                                                                                                                                                  The authors thank Ján Veselý and Guilherme Cox for their input
+Linux Default, Large Max Order, Enhanced khugepaged, and
+                                                                                                                                                                                                                                                  on aspects of this work. This work was partially funded by NSF
+Translation Ranger with two running frequency. All run-
+                                                                                                                                                                                                                                                  awards 1319755 and 1916817.
+time is normalized to Linux Default.
+
+
+pages and offer large contiguous physical memory for devices use,
+                                                                                                                                                                                                                                                  REFERENCES
+                                                                                                                                                                                                                                                   [1] Reto Achermann, Chris Dalton, Paolo Faraboschi, Moritz Hoffmann, Dejan Milo-
+especially for DMA data transfer [33]. These approaches try to                                                                                                                                                                                         jicic, Geoffrey Ndu, Alexander Richardson, Timothy Roscoe, Adrian L. Shaw, and
+preserve contiguity for future use, but cannot prevent large free                                                                                                                                                                                      Robert N. M. Watson. 2017. Separating Translation from Protection in Address
+memory blocks from being broken into small ones when memory                                                                                                                                                                                            Spaces with Dynamic Remapping. In Proceedings of the 16th Workshop on Hot
+                                                                                                                                                                                                                                                       Topics in Operating Systems (HotOS ’17). ACM, New York, NY, USA, 118–124.
+requests are small in sizes.                                                                                                                                                                                                                           https://doi.org/10.1145/3102980.3103000
+                                                                                                                                                                                                                                                   [2] Neha Agarwal and Thomas F. Wenisch. 2017. Thermostat: Application-
+Huge pages. Significant prior work has gone into improving huge                                                                                                                                                                                        transparent Page Management for Two-tiered Main Memory. In Proceedings
+pages. For example, a huge pages have one access bit, causing mem-                                                                                                                                                                                     of the Twenty-Second International Conference on Architectural Support for Pro-
+                                                                                                                                                                                                                                                       gramming Languages and Operating Systems (ASPLOS ’17). ACM, New York, NY,
+ory access imbalance problems in NUMA systems [15]. Several                                                                                                                                                                                            USA, 631–644. https://doi.org/10.1145/3037697.3037706
+proposals try to manage huge page wisely by restricting huge page                                                                                                                                                                                  [3] AMD Corporation. 2014. Compute Cores. https://www.amd.com/Documents/
+creation and splitting huge pages when they cause utilization im-                                                                                                                                                                                      Compute_Cores_Whitepaper.pdf. [Online; accessed 04-Aug-2018].
+                                                                                                                                                                                                                                                   [4] Arkaprava Basu, Jayneel Gandhi, Jichuan Chang, Mark D. Hill, and Michael M.
+balance issues [15, 26]. These utilization issues could also happen                                                                                                                                                                                    Swift. 2013. Efficient Virtual Memory for Big Memory Servers. In Proceedings of
+on contiguous regions created by Translation Ranger, thus in-                                                                                                                                                                                          the 40th Annual International Symposium on Computer Architecture (ISCA ’13).
+tegrating these policies with Translation Ranger could further                                                                                                                                                                                         ACM, New York, NY, USA, 237–248. https://doi.org/10.1145/2485922.2485943
+                                                                                                                                                                                                                                                   [5] Arkaprava Basu, Mark D. Hill, and Michael M. Swift. 2012. Reducing Memory
+improve application performance in NUMA systems.                                                                                                                                                                                                       Reference Energy with Opportunistic Virtual Caching. In Proceedings of the
+   In heterogeneous memory systems, classifying hot and cold                                                                                                                                                                                           39th Annual International Symposium on Computer Architecture (ISCA ’12). IEEE
+                                                                                                                                                                                                                                                       Computer Society, Washington, DC, USA, 297–308. http://dl.acm.org/citation.
+pages to determine how to move them between fast/slow memories                                                                                                                                                                                         cfm?id=2337159.2337194
+is important. Previous work by Thermostat analyzes huge page                                                                                                                                                                                       [6] Scott Beamer, Krste Asanovic, and David A. Patterson. 2015. The GAP Benchmark
+utilization by sampling sub-pages in each huge page and migrates                                                                                                                                                                                       Suite. CoRR abs/1508.03619 (2015). arXiv:1508.03619 http://arxiv.org/abs/1508.
+                                                                                                                                                                                                                                                       03619
+these cold sub-pages to slow memory to make efficient use of fast                                                                                                                                                                                  [7] Abhishek Bhattacharjee. 2017. Preserving Virtual Memory by Mitigating the
+memory [2]. Thermostat could provide useful utilization informa-                                                                                                                                                                                       Address Translation Wall. IEEE Micro 37, 5 (September 2017), 6–10. https:
+tion to Translation Ranger to assess page hotness in identifying                                                                                                                                                                                       //doi.org/10.1109/MM.2017.3711640
+                                                                                                                                                                                                                                                   [8] Jeff Bonwick. 1994. The Slab Allocator: An Object-caching Kernel Memory Allo-
+which VMAs are particularly worth coalescing.                                                                                                                                                                                                          cator. In Proceedings of the USENIX Summer 1994 Technical Conference on USENIX
+   The high cost of huge page allocation has been a problem for                                                                                                                                                                                        Summer 1994 Technical Conference - Volume 1 (USTC’94). USENIX Association,
+                                                                                                                                                                                                                                                       Berkeley, CA, USA, 6–6. http://dl.acm.org/citation.cfm?id=1267257.1267263
+Linux and can lead to application performance degradation [13,                                                                                                                                                                                     [9] Mike Clark. 2016. A new x86 core architecture for the next generation of com-
+29]. Recent work on Linux prevents free page fragmentation and                                                                                                                                                                                         puting. In 2016 IEEE Hot Chips 28 Symposium (HCS). 1–19. https://doi.org/10.
+eliminates most huge page allocation costs by aggregating kernel                                                                                                                                                                                       1109/HOTCHIPS.2016.7936224
+                                                                                                                                                                                                                                                  [10] Jonathan Corbet. 2012. AutoNUMA: the other approach to NUMA scheduling.
+page allocations [34]. With the help of this work, Translation                                                                                                                                                                                         http://lwn.net/Articles/488709/. [Online; accessed 04-Aug-2018].
+Ranger could also improve in-use page fragmentation and free                                                                                                                                                                                      [11] Jonathan Corbet, Alessandro Rubini, and Greg Kroah-Hartman. 2005. Linux
+page fragmentation, generating even larger contiguous regions.                                                                                                                                                                                         Device Drivers, 3rd Edition. O’Reilly Media, Inc.
+                                                                                                                                                                                                                                                  [12] Guilherme Cox and Abhishek Bhattacharjee. 2017. Efficient Address Translation
+                                                                                                                                                                                                                                                       for Architectures with Multiple Page Sizes. In International Conference on Archi-
+7                      CONCLUSIONS                                                                                                                                                                                                                     tectural Support for Programming Languages and Operating Systems (ASPLOS).
+                                                                                                                                                                                                                                                  [13] Nelson Elhage. [n.d.]. Disable Transparent Hugepages. https://blog.nelhage.com/
+Translation Ranger is an effective low-overhead technique for                                                                                                                                                                                          post/transparent-hugepages/. [Online; accessed 04-Aug-2018].
+coalescing scattered physical frames and generating translation                                                                                                                                                                                   [14] Jason Evans. 2011.              Scalable memory allocation using jemal-
+                                                                                                                                                                                                                                                       loc.                   https://www.facebook.com/notes/facebook-engineering/
+contiguity. The enormous contiguous regions created by Transla-                                                                                                                                                                                        scalable-memory-allocation-using-jemalloc/480222803919.             [Online; ac-
+tion Ranger can be used by emerging contiguity-aware TLBs to                                                                                                                                                                                           cessed 04-Aug-2018].
+Translation Ranger: Operating System Support for Contiguity-Aware TLBs                                             ISCA ’19, June 22–26, 2019, Phoenix, AZ, USA
+
+
+[15] Fabien Gaud, Baptiste Lepers, Jeremie Decouchant, Justin Funston, Alexandra              ’18). ACM, New York, NY, USA, 679–692. https://doi.org/10.1145/3173162.3173203
+     Fedorova, and Vivien Quéma. 2014. Large Pages May Be Harmful on NUMA Sys-           [35] Myrto Papadopoulou, Xin Tong, Andre Seznec, and Andreas Moshovos. 2015.
+     tems. In Proceedings of the 2014 USENIX Conference on USENIX Annual Technical            Prediction-based superpage-friendly TLB designs. In 2015 IEEE 21st International
+     Conference (USENIX ATC’14). USENIX Association, Berkeley, CA, USA, 231–242.              Symposium on High Performance Computer Architecture (HPCA). 210–222. https:
+     http://dl.acm.org/citation.cfm?id=2643634.2643659                                        //doi.org/10.1109/HPCA.2015.7056034
+[16] Sanjay Ghemawat and Paul Menage. 2009. Tcmalloc: Thread-caching malloc.             [36] Mayank Parasar, Abhishek Bhattacharjee, and Tushar Krishna. 2018. SEESAW:
+     http://goog-perftools.sourceforge.net/doc/tcmalloc.html. [Online; accessed 04-           Using Superpages to Improve VIPT Caches. In 2018 ACM/IEEE 45th Annual
+     Aug-2018].                                                                               International Symposium on Computer Architecture (ISCA). 193–206. https://doi.
+[17] Mel Gorman and Andy Whitcroft. 2006. The what, the why and the where to of               org/10.1109/ISCA.2018.00026
+     anti-fragmentation. In Linux Symposium. 369–384.                                    [37] Chang Hyun Park, Taekyung Heo, Jungi Jeong, and Jaehyuk Huh. 2017. Hybrid
+[18] Swapnil Haria, Mark D. Hill, and Michael M. Swift. 2018. Devirtualizing                  TLB Coalescing: Improving TLB Translation Coverage Under Diverse Fragmented
+     Memory in Heterogeneous Systems. In Proceedings of the Twenty-Third Inter-               Memory Allocations. In Proceedings of the 44th Annual International Symposium
+     national Conference on Architectural Support for Programming Languages and               on Computer Architecture (ISCA ’17). ACM, New York, NY, USA, 444–456. https:
+     Operating Systems (ASPLOS ’18). ACM, New York, NY, USA, 637–650. https:                  //doi.org/10.1145/3079856.3080217
+     //doi.org/10.1145/3173162.3173194                                                   [38] Binh Pham, Abhishek Bhattacharjee, Yasuko Eckert, and Gabriel H. Loh. 2014.
+[19] HSA Foundation. 2014.               HSA Platform System Architecture Speci-              Increasing TLB reach by exploiting clustering in page translations. In 2014 IEEE
+     fication - Provisional 1.0.              http://www.slideshare.net/hsafoundation/        20th International Symposium on High Performance Computer Architecture (HPCA).
+     hsa-platform-system-architecture-specification-provisional-verl-10-ratifed.              558–567. https://doi.org/10.1109/HPCA.2014.6835964
+     [Online; accessed 04-Aug-2018].                                                     [39] Binh Pham, Viswanathan Vaidyanathan, Aamer Jaleel, and Abhishek Bhattachar-
+[20] Intel. 2018. Intel 64 and IA-32 Architectures Optimization Reference Manual.             jee. 2012. CoLT: Coalesced Large-Reach TLBs. In Proceedings of the 2012 45th
+[21] Mark S. Johnstone and Paul R. Wilson. 1998. The Memory Fragmentation Problem:            Annual IEEE/ACM International Symposium on Microarchitecture (MICRO-45).
+     Solved?. In Proceedings of the 1st International Symposium on Memory Management          IEEE Computer Society, Washington, DC, USA, 258–269. https://doi.org/10.
+     (ISMM ’98). ACM, New York, NY, USA, 26–36. https://doi.org/10.1145/286860.               1109/MICRO.2012.32
+     286864                                                                              [40] Binh Pham, Jan Vesely, Gabriel Loh, and Abhishek Bhattacharjee. 2015. Large
+[22] Guido Juckeland, William Brantley, Sunita Chandrasekaran, Barbara Chapman,               Pages and Lightweight Memory Management in Virtualized Environments: Can
+     Shuai Che, Mathew Colgrove, Huiyu Feng, Alexander Grund, Robert Henschel,                You Have it Both Ways. In International Symposium on Microarchitecture (MICRO).
+     Wen-Mei W. Hwu, Huian Li, Matthias S. Müller, Wolfgang E. Nagel, Maxim              [41] Bharath Pichai, Lisa Hsu, and Abhishek Bhattacharjee. 2014. Architectural
+     Perminov, Pavel Shelepugin, Kevin Skadron, John Stratton, Alexey Titov, Ke               Support for Address Translation on GPUs: Designing Memory Management
+     Wang, Matthijs van Waveren, Brian Whitney, Sandra Wienke, Rengan Xu, and                 Units for CPU/GPUs with Unified Address Spaces. In International Conference
+     Kalyan Kumaran. 2015. SPEC ACCEL: A Standard Application Suite for Measuring             on Architectural Support for Programming Languages and Operating Systems
+     Hardware Accelerator Performance. In High Performance Computing Systems.                 (ASPLOS). 743–758.
+     Performance Modeling, Benchmarking, and Simulation, Stephen A. Jarvis, Steven A.    [42] Mark E. Russinovich, David A. Solomon, and Alex Ionescu. 2012. Windows
+     Wright, and Simon D. Hammond (Eds.). Springer International Publishing, Cham,            Internals, Part 2: Covering Windows Server 2008 R2 and Windows 7 (Windows
+     46–67.                                                                                   Internals). Microsoft Press, Redmond, WA, USA.
+[23] Vasileios Karakostas, Jayneel Gandhi, Furkan Ayar, Adrián Cristal, Mark D. Hill,    [43] V. Saxena, Y. Sabharwal, and P. Bhatotia. 2010. Performance evaluation and
+     Kathryn S. McKinley, Mario Nemirovsky, Michael M. Swift, and Osman Ünsal.                optimization of random memory access on multicores with high productivity.
+     2015. Redundant Memory Mappings for Fast Access to Large Memories. In                    In 2010 International Conference on High Performance Computing. 1–10. https:
+     Proceedings of the 42Nd Annual International Symposium on Computer Architecture          //doi.org/10.1109/HIPC.2010.5713168
+     (ISCA ’15). ACM, New York, NY, USA, 66–78. https://doi.org/10.1145/2749469.         [44] Andre Seznec. 2004. Concurrent support of multiple page sizes on a skewed
+     2749471                                                                                  associative TLB. IEEE Trans. Comput. 53, 7, 924–927. https://doi.org/10.1109/TC.
+[24] Vasileios Karakostas, Jayneel Gandhi, Adrian Cristal, Mark Hill, Kathryn McKin-          2004.21
+     ley, Mario Nemirovsky, Michael Swift, and Osman Unsal. 2016. Energy-efficient       [45] Yakun Sophia Shao, Sam Xi, Viji Srinivasan, Gu-Yeon Wei, and David Brooks.
+     address translation. In 2016 IEEE International Symposium on High Performance            2015. Toward Cache-Friendly Hardware Accelerators. In HPCA Sensors and Cloud
+     Computer Architecture (HPCA). 631–643. https://doi.org/10.1109/HPCA.2016.                Architectures Workshop (SCAW) (2015-02-07). http://www.eecs.harvard.edu/
+     7446100                                                                                  ~shao/papers/shao2015-scaw.pdf
+[25] Kenneth C. Knowlton. 1965. A Fast Storage Allocator. Commun. ACM 8, 10 (Oct.        [46] M. Talluri and M. D. Hill. 1994. Surpassing the TLB Performance of Superpages
+     1965), 623–624. https://doi.org/10.1145/365628.365655                                    with Less Operating System Support. In Proceedings of ASPLOS.
+[26] Youngjin Kwon, Hangchen Yu, Simon Peter, Christopher J. Rossbach, and Emmett        [47] Vijay Tatkar. [n.d.]. What Is the SPARC M7 Data Analytics Accelerator? https:
+     Witchel. 2016. Coordinated and Efficient Huge Page Management with Ingens.               //community.oracle.com/docs/DOC-994842. [Online; accessed 04-Aug-2018].
+     In 12th USENIX Symposium on Operating Systems Design and Implementation             [48] Mohit Tiwari, Banit Agrawal, Shashidhar Mysore, Jonathan Valamehr, and Tim-
+     (OSDI 16). USENIX Association, Savannah, GA, 705–721. https://www.usenix.                othy Sherwood. 2008. A Small Cache of Large Ranges: Hardware Methods
+     org/conference/osdi16/technical-sessions/presentation/kwon                               for Efficiently Searching, Storing, and Updating Big Dataflow Tags. In Pro-
+[27] Adam Litke. [n.d.]. libhugetlbfs. https://lwn.net/Articles/171451/. [Online;             ceedings of the 41st Annual IEEE/ACM International Symposium on Microarchi-
+     accessed 04-Aug-2018].                                                                   tecture (MICRO 41). IEEE Computer Society, Washington, DC, USA, 94–105.
+[28] Jason Lowe-Power. [n.d.].                   Inferring Kaveri’s Shared Virtual            https://doi.org/10.1109/MICRO.2008.4771782
+     Memory        Implementation.                    http://www.lowepower.com/jason/    [49] Jan Vesely, Arkaprava Basu, Mark Oskin, Gabriel H. Loh, and Abhishek Bhat-
+     inferring-kaveris-shared-virtual-memory-implementation.html.             [Online;        tacharjee. 2016. Observations and opportunities in architecting shared vir-
+     accessed 04-Aug-2018].                                                                   tual memory for heterogeneous systems. In 2016 IEEE International Symposium
+[29] MongoDB Manual. [n.d.]. Disable Transparent Hugepages (THP). https://docs.               on Performance Analysis of Systems and Software (ISPASS). 161–171. https:
+     mongodb.com/manual/tutorial/transparent-huge-pages/. [Online; accessed 04-               //doi.org/10.1109/ISPASS.2016.7482091
+     Aug-2018].                                                                          [50] Andy Whitcroft. [n.d.]. sparsemem memory model. https://lwn.net/Articles/
+[30] Marshall Kirk McKusick and George V. Neville-Neil. 2004. The Design and                  134804/. [Online; accessed 04-Aug-2018].
+     Implementation of the FreeBSD Operating System. Pearson Education.                  [51] Wikipedia. [n.d.]. Violin plot. https://en.wikipedia.org/wiki/Violin_plot. [Online;
+[31] Richard C. Murphy, Kyle B. Wheeler, Brian W. Barrett, and James A. Ang. 2010.            accessed 04-Aug-2018].
+     Introducing the Graph 500. In Cray User’s Group.                                    [52] Dan Williams. 2018. Randomize free memory. https://lwn.net/Articles/767614/.
+[32] Juan Navarro, Sitararn Iyer, Peter Druschel, and Alan Cox. 2002. Practical,              [Online; accessed 07-Dec-2018].
+     Transparent Operating System Support for Superpages. SIGOPS Oper. Syst. Rev.        [53] Paul R. Wilson, Mark S. Johnstone, Michael Neely, and David Boles. 1995. Dy-
+     36, SI (Dec. 2002), 89–104. https://doi.org/10.1145/844128.844138                        namic storage allocation: A survey and critical review. In Memory Management,
+[33] Michal Nazarewicz. [n.d.]. A deep dive into CMA. https://lwn.net/Articles/               Henry G. Baler (Ed.). Springer Berlin Heidelberg, Berlin, Heidelberg, 1–116.
+     486301/. [Online; accessed 08-Jul-2018].                                            [54] Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee. 2019. Nimble
+[34] Ashish Panwar, Aravinda Prasad, and K. Gopinath. 2018. Making Huge Pages                 Page Management for Tiered Memory Systems. In Proceedings of the Twenty-
+     Actually Useful. In Proceedings of the Twenty-Third International Conference on          Fourth International Conference on Architectural Support for Programming Lan-
+     Architectural Support for Programming Languages and Operating Systems (ASPLOS            guages and Operating Systems (ASPLOS ’19). ACM, New York, NY, USA. https:
+                                                                                              //doi.org/10.1145/3297858.3304024
+

@@ -1,0 +1,250 @@
+# 独立正向提案：三条可判定的新规则（非审计、非 §71 复述）
+
+**先声明边界（很重要）**：我没有联网、没有检索任何文献库。下面所有"最强已有机制如何覆盖"的判断，**只基于你给出的三份 primary**（Torrent 2512.17589 的四阶段 description、DMA-Latte 2511.06605v3、Intel US20200402198A1 Fig14-19 描述）以及你 context 里对它们的描述。我**不主张**"无前作"，也不声明任何"全检索"结论。凡是我判断可能被前作覆盖的，我都直接写出来并要求降级为"必要条件/加固"，而不是包装成创新。
+
+**不主张的东西**：odd-E / phase3 V-prefix clip 的"环"我**不做诊断、不当作创新**（Codex 正在复现）。下面三个机制都**不依赖**该 bug 的修法；M2/M3 的实验必须在该环被定位之后才具备干净的可观测性（第 5 节给出顺序建议）。
+
+**排序（我的判断）**：M1（授权/权限平面契约）> M3（错误/中止扇出契约）> M2（成员集在 retirement 边界上的状态机）。M2 最容易被判为"工程加固"，但如果你的目标是**让在线 join 在真实背压下可用**，它是唯一能让 §71 的"一选定终身"松开一条结构性缺口的规则。
+
+---
+
+## M1（权限平面）：**Co-validated Join Permit（CJP）——同一代授权交集上的 join 许可证**
+
+### 1.1 新规则原文
+
+> **R-M1.1** 一个 shared child 覆盖区间 `[J, J+L)` 时，只有在**两侧成员的当前有效授权（grant）在整段区间上代数一致且区间被双方授权范围共同覆盖**时才可发出：
+> `permit = (gen_0 == gen_1) && (J+L ≤ grant_end_0) && (J+L ≤ grant_end_1) && attr_eq_0_1`
+> 其中 `attr_eq` 是**授权属性**元组（PA、读/写权限、cache/prot/region/qos/user、有效页范围），不是请求端的 AXI 通道字段。
+> **R-M1.2** `permit` **在每个未 offer 的 child 之前重算**，不是一次粘住整个 suffix。
+> **R-M1.3（不可重新武装）** 一旦在本 job 内观测到 `gen_0 != gen_1`（或任一侧被 invalidate）**且此前已有一个 beat 通过 shared child 送达过**，则本 job **永不再 join**：其余下字节只能由各自自己的 AR 私有完成。理由见 1.5——两个成员的前缀可能落在不同授权世代上，混合世代会破坏"消费方是否有权消费该 payload"的前提，而这与数据是否相同无关。
+
+### 1.2 完整当下信息
+
+* 今天真正参与判定的量：`cache_valid_i[f][0]`（读 recipe 有效）、`cache_pa_i[f][0]`（PA）、`parent_q[f][0].{cache,prot,qos,region,user}`。
+* 判定点：`shared_pretl_read.sv:288-294`（cutover 时的属性比较）与 `:369-375`（mode0 共享 child 的比较）。
+* **关键实证**：这个比较比的是 `parent_q[f][0]`，而 `parent_q[f][0]` 是源单元自己从 `s_ar_i` 抓下来的**请求通道**（`shared_pretl_read.sv:251`）。harness 只向源单元暴露 `reuse_cache_valid/failed/pa`（`multi_actual_dma_top.sv:1132`），**没有**暴露任何 per-slot 的**授予权限/授予范围**。所以现状是"两个请求看起来一样"，不是"两个设备都被授权覆盖这段字节"。
+
+### 1.3 状态 transition
+
+新增：`gen_i[1:0]`（每成员 recipe 世代，来自授权平面）、`grant_end_i[1:0]`（每成员当前授予范围端点，beat 计）、派生 `permit`、粘性 `join_poisoned_q`。
+
+* `inval_gen_f`（任一成员的 recipe 被 invalidate / 被新一次翻译失败取代）→ `gen_f` 变；若 `!skid_q && !offered_q && !busy_q && !old_v_busy_q` 则下一个 child 走**成员私有**分支（既有独立续读路径 `shared_pretl_read.sv:312-318`、`:385-402`）；在飞的 child **不动**（firstVALID AR/W/R/B 不可撤）。
+* `merge_seen && gen 失配` → `join_poisoned_q <= 1`，此后所有 candidate join 点被拒。
+
+### 1.4 安全 fallback
+
+`!permit` → 私有 child（各自 AR，长度按 `read_quantum`）；`permit` 缺失或采样不完整一律等价于 §71 的 "E256 independently completes"（`codex-design-before-run.md:9`）。不新增 payload，不改变任何在飞请求。
+
+### 1.5 反例（这条规则**自己**会被什么打穿）
+
+* **反例 A（在飞窗口不可救）**：invalidate 在 shared child 的 AR 已 offer、R 尚未回来的窗口内到达。此时该 child 的 beat 按 R-M1.1 已经合法发出，无法撤回；R-M1.2 的重算只能保护*后续* child。因此 R-M1.1 单独**不充分**，必须与"shared child 在飞跨度有界"（`read_quantum ≤ 256`、`closure_target` 有界，见 `shared_pretl_read.sv:113-125`）联合才成立。这一点我明确写成"契约的前提条件"，不写成"规则解决"。
+* **反例 B（同 PA 不同权的合法场景被拒）**：两个设备对同一 PA 有不同的授予长度（A 的 `dst_offset=4088` 使 A 的首个 raw parent 只有 1 beat，`run05-result.json:26,33-34`）——按 R-M1.1 + R-M1.2，join 只能在交集内推进，可能把 shared child 压到 1 beat，AR 数暴涨、收益被吃掉。所以 M1 是**准入与安全**机制，不是性能机制；它必须与"交集内的 coalescing/按成员分组合并交付"配合（既有 `multi_actual_dma_top.sv:717-742` 的裁剪逻辑是这类能力的雏形，但只覆盖 phase2/3 的写侧）。
+* **反例 C（误伤）**：若你的建模里 `gen` 只在 DDT/IOTLB invalidation 时变，而同 PA 的重新翻译（无 invalidation）也 bump `gen`，则 R-M1.3 会让一个其实安全的 job 永久退化为独立——代价是资源 R 从 352 变 512（`run05-result.json:43` / `run10-result.json:43`），收益丢失。所以 `gen` 的语义必须钉死为"授权有效性世代"，**不是**"翻译发生次数"。这是一个必须先定的定义。
+
+### 1.6 最强已有机制覆盖 & 具体未覆盖条件
+
+* **Intel US20200402198A1 Fig14-19**：在 arbiter 层做 read scoreboard 跨 arbiter merge、dynamic latency-efficiency window、multicast return。它的合并依据是**物理地址**（同一互连/一致性域内），没有"这个消费者是否有权消费这笔 payload"的问题，因为发起请求者各自都有权。**未覆盖条件**：两个**独立授权**的消费者，其中一个消费的 payload 是**用另一个消费者的翻译**取回来的（本设计里 carrier 用 `parent_q[1][0]` 模板，`shared_pretl_read.sv:338-339`，成员集 `2'b11`），于是出现 Intel 模型里不存在的问题——*授权在时间上可分歧*。
+* **Torrent 2512.17589**：cfg → 全 Grant → Data → Finish，所有消费者在 Data 之前已知且被 grant。**未覆盖条件**：本设计的第二个成员是在 data 中途才到（late join），且 grant **不可撤**——不存在"全 grant 后再 data"的窗口，也不存在 revoke 手段。
+* **DMA-Latte 2511.06605v3**：软件 bcst、一读双写、按 size 选 pcpy，整段传输的 pair 固定、由软件持有双方缓冲。**未覆盖条件**：软件方并不承担"两设备授予权限不同/中途失效"的判定；且 pair 固定意味着无 late join、无世代问题。
+* 结论：M1 的**可主张部分**是"独立异步授权 + 不可撤 firstVALID 下，join 的准入必须是**授权交集的世代一致谓词**，且失配后不可重新武装"。这比"加一个 TLB tag"强的地方在于 R-M1.3 的**行为规则**（不可重新武装），它改变了 join 的可达集合，而不只是加检查。
+
+### 1.7 预期真实场景
+
+* 两加速器/SR-IOV VF 共享同一输入缓冲，各自 ATC/IOTLB 独立；一边被 `ATC.INV`/S2 权限收回或换页，另一边继续跑。生产里这是**安全**问题（越权读），不是性能问题。TCP 式的"数据一样就没事"在这里不成立。
+* 也覆盖：两设备映射同一 PA 但 S2 权限不同（一读一读写）——今天靠请求 `prot/cache/...` 相等来近似（`:288-294`），CJP 把它换成授权范围与世代的真判定。
+
+### 1.8 最小 RTL 实验（不新增模块、不新增 payload）
+
+在 `shared_pretl_read.sv` 加两个**输入端口**（由 top 提供，测试期可驱动），并在两个 shared-child offer 点加门：
+
+```systemverilog
+parameter bit GrantJoin = 0;
+input logic [1:0][7:0] recipe_gen_i;        // 授权世代
+input logic [1:0][8:0] recipe_grant_end_i;  // 该成员被授权覆盖的 beat 端点
+logic permit, merge_seen_q, join_poisoned_q;
+
+assign permit = !GrantJoin || (
+    recipe_gen_i[0] == recipe_gen_i[1] &&
+    (child_offset_q + child_beats_q) <= recipe_grant_end_i[0] &&
+    (child_offset_q + child_beats_q) <= recipe_grant_end_i[1]);
+
+// 门 1：repair/suffix 共享 child（现 ~L334-345）
+// 门 2：mode0 共享 child（现 ~L363-384）
+// 条件里增加：permit && !join_poisoned_q
+
+always_ff @(posedge clk_i or negedge rst_ni)
+  if (!rst_ni) begin join_poisoned_q <= 0; merge_seen_q <= 0; end
+  else begin
+    if (merged_count_o != 0) merge_seen_q <= 1;
+    if (GrantJoin && merge_seen_q && recipe_gen_i[0] != recipe_gen_i[1])
+        join_poisoned_q <= 1;                       // R-M1.3
+    if (join_poisoned_q && merged_count_o != 0 && permit && 1'b0)
+        $fatal(1,"SR72 grant-epoch re-arm forbidden"); // 断言位（Codex 决定形式）
+  end
+```
+
+**验收**（沿用 §71 acceptance 的严格口径，`codex-design-before-run.md:11`）：
+
+1. `gen` 相等、grant 覆盖：必须**逐字复现** §70 对应 CSV 与旧 metrics（run05 应为 source R=352、V 5460/A 5453，`run05-result.json:43,81-91`；REPAIR-ONLINE 应仍为 M=488/C=0/H=75/share=1，`:198-207`）。
+2. 在 cutover 前把 `gen_1` bump：必须走私有续读，source R=512、两目标各 256 beat 全 2048 字节验证，`merged_count=0`，无 `$fatal`。
+3. 在 cutover 后 bump：在飞 child 必须正常收完（RLAST 断言 `:417-422` 不炸），此后不再出现共享 child，`join_poisoned_q` 置位。
+4. **不要**用测量到的 R 数去决定期望（§71 acceptance 已明确禁止，`codex-design-before-run.md:11`）。
+
+**未知/依赖**：`gen`/`grant_end` 的真实来源在 IOMMU（`i_sys` 内、`rv_iommu_banked_ctl`/`i_tl`）里，属于跨模块改动，Codex 领域；本实验只用 top 级测试输入模拟。真实 invalidation 通路（IOMMU→源单元）我未见，属未覆盖依赖。可顺带观测 `n_ptw_ar=15 / n_iotlb_hit=0 / n_tl_accept=5`（`run05-result.json:69-75`、`run10-result.json:69-75`）作为"翻译平面是否值得做共享填充"的**未来**方向——但那改变"四个独立成功授权"的前提，**超出你给的代码范围，不建议本轮做**。
+
+---
+
+## M2（payload/成员集平面）：**Retirement-Boundary Membership（RBM）——无计时器的成员集状态机**
+
+### 2.1 新规则原文
+
+> **R-M2.1（边界律）** `child_members_q` 只能在 **retirement 边界**改变：`retire = !skid_q && !offered_q && !busy_q && !old_v_busy_q`。
+> **R-M2.2（容量强制退出的唯一条件）** 成员 f 被移出共享集，当且仅当 f 阻塞且**它的借位余量已耗尽**：`blocked_f && (returned_q[f]-raw_written_i[f] >= 2)`（借位上限来自 `shared_pretl_read.sv:162-163` 的 B3/q2 规则）；**不允许**任何计数器/超时窗口触发退出。
+> **R-M2.3（重入的 offset 证据）** f 只能在 retirement 边界重入，且必须 `returned_q[f] == child_offset_q`（它的游标正好等于共享流的起点）。否则 f 先用自己的 AR 私有推进到该点，再重入。
+> **R-M2.4（退出的前置条件）** 只有当 `cache_valid_i[f][0]` 为真（f 还有自己可发的 AR 覆盖剩余字节）时才允许把 f 移出；否则必须保持成员身份并 hold。
+> **R-M2.5（不变量）** 任意时刻 `skid_q ⇒ (skid_pending_q & ~child_members_q) == 0`。
+
+### 2.2 完整当下信息
+
+`pause_i`、`skid_q/skid_pending_q/skid_data_q`、`child_members_q`、`offered_q/busy_q/old_v_busy_q`、`returned_q[f]`、`raw_written_i[f]`（借位余量）、`cache_valid_i[f][0]`、`promised_write_end_i[f]`、`detached_q`、`s_r_ready_i`（单一返回通道 ready）、`child_offset_q`。
+
+### 2.3 状态 transition
+
+`JOINED → (容量强制) EXIT_PENDING → DROPPED(@retire) → (offset 证据成立) JOINED(@retire) → …`；所有箭头都带 `retire`。今天代码里已经有**结构性**退出（不是计时器）：`detach_pending_q/detached_q` 由 `promised_write_end_i[1]` 关闭驱动（`shared_pretl_read.sv:257-273`），RBM 只是把这条"义务驱动"的思想从**永久退出**扩展到**瞬时背压**，并把边界律写成规则。
+
+### 2.4 安全 fallback
+
+* f 无 recipe（`cache_valid_i[f][0]==0`）→ 保持成员、hold（R-M2.4）。
+* 双成员同时阻塞 → 无法补偿：skid 占满、`m_r_ready_o` 拉低，共享 child 在源侧停住（在飞 R beat 不可撤，这是硬约束）。规则不假装能解决联合阻塞。
+* 退出后最坏代价 = f 私读其剩余字节 ≤256 beat，即**退化为独立预算（512 beat）**，无无界代价、无无界重读。
+
+### 2.5 反例
+
+* **反例 A**：`MaxOutstanding=1`、Q=2、借位上限 2（`q_write_splitter.sv:150-151`、`shared_pretl_read.sv:162-163`），所以超过 ≈2 beat 的停顿就必然触发退出+重读。RBM 在**短停顿**上有效，在长停顿上退化为"独立"，收益趋零。必须如实报告，不能声称"背压下仍保共享收益"。
+* **反例 B**：f 的 job 正在被 teardown（abort/launch_cancel），退出后重入会向已释放的地址继续写。→ R-M2.4 不够，需要 M3 的中止语义先行；否则 RBM 不安全。
+* **反例 C**：返回通道只有一个 `s_r_ready_i`（`:178`），`return_owner = !skid_pending_q[0]` 使成员 0 优先。若 mux 不能对该接口给出 per-ID 背压，`blocked_f` 这个谓词无法被本地准确判定——**这是本机制最脆弱的一点**，属于明确未知，需要 Codex 确认 mux 语义（`multi_actual_dma_top.sv:1166-1172` 只有一个 `tr_r_ready`）。
+
+### 2.6 最强已有机制覆盖 & 具体未覆盖条件
+
+* **Intel Fig14-19**：有窗口/merge/multicast return，但没有"消费者持有不可撤写承诺、且**不允许**撤回"这一约束——它的合并单元可以选择不返回或重排；本设计中已 offer 的 AW/W/R/B 一个都不能撤（`codex-design-before-run.md:9`）。**未覆盖条件**：成员集变更只能发生在 child retirement 边界，且退出必须由容量（借位耗尽）而非计时/效率窗口决定。
+* **Torrent 四阶段**：Data 阶段成员集在 Grant 之后固定。**未覆盖条件**：data 中途的成员进退。
+* **DMA-Latte**：pair 由软件整段固定。**未覆盖条件**：同上，且它没有"一读双写"下单个消费者的背压反馈环。
+* 老实说：**"leave-with-drain"在多播/IGMP 语境中是旧概念**。RBM 唯一站得住的差异化是：这里的 drain 代价与合法性被**不可撤的写侧承诺 + ≤2 借位槽**完全限定，且退出/重入的合法性判据是**游标 offset 证据**（R-M2.3），不是时间。如果评审把"无计时器的结构性成员变更"视为工程加固，请把它降级为 §71 的必要条件，不要单独作为创新主张。
+
+### 2.7 预期真实场景
+
+两设备共享输入缓冲，其中一个的目的地短暂背压（低优先级内存区间、ECC scrub、NoC 拥塞、小 outstanding 窗口）。今天只剩两档：等双方（强耦合，§70 显示 V 会付出 6.8%~26%，`codex-result-acceptance.md:19`）或整个尾部独立（多读 256 beat）。RBM 给出中间档，且**不需要超时**——这对确定性系统（车载/实时 DMA）是关键，因为它的最坏代价有界且可静态说明。
+
+### 2.8 最小 RTL 实验
+
+* 放开 `shared_pretl_read.sv:223` 的 `$fatal("SR54 successful-frontier fixture excludes external pause")`（改成参数 `AllowPause`），加 R-M2.1/2.5 的门与断言：
+
+```systemverilog
+wire retire = !skid_q && !offered_q && !busy_q && !old_v_busy_q;
+// blocked_1 需 Codex 定：候选为 skid_pending_q[1] && !s_r_ready_i && (returned_q[1]-raw_written_i[1] >= 1)
+if (AllowPause && retire && blocked_1 && (returned_q[1]-raw_written_i[1] >= 2)
+    && cache_valid_i[1][0]) child_members_q[1] <= 1'b0;
+if (AllowPause && retire && !child_members_q[1] && cache_valid_i[1][0]
+    && returned_q[1] == child_offset_q) child_members_q[1] <= 1'b1;
+if (skid_q && (skid_pending_q & ~child_members_q) != 0)
+    $fatal(1,"SR72 skid pending for non-member");
+```
+
+* 在 phase3 共享 suffix 期间给 `pause_a_i` 打脉冲（top `multi_actual_dma_top.sv:77,1005` → `pause_i`）。
+* 观测：source R 应满足 `352 ≤ R ≤ 512`（对比 `run05-result.json:43` 与 `run10-result.json:43`），两目标各 256 W beat / 2048 字节验证，`REPAIR71-OBS` 的 `decided/M/C/H` 不变，`QW B credit overflow`（`q_write_splitter.sv:139-140`）不触发。**必须同时报告 joint makespan 落在共享与独立之间哪个位置**，不预设它是 Pareto 改进。
+
+**未知**：`blocked_f` 的准确谓词依赖"返回通道是否对单 ID 提供背压"，我无法从所给文件判定。这个实验有可能不是因为 RBM 不成立、而是因为 fixture 的"successful frontier"定义本身排除 pause 而失败（`:223-224` 相邻还有 SR57 的约束）——属于已知风险。
+
+---
+
+## M3（例外平面）：**Join 的错误/中止扇出契约（Poison-Fanout vs Abort-Split）**
+
+### 3.1 新规则原文
+
+> **R-M3.1（守恒律）** 对每一个 beat index i，凡在 i 被 **offer** 时属于 `child_members_q` 的成员，必须恰好收到一次逻辑 R（或一次定义明确的错误终止）。可由 `returned_q[f]` + 综合 R 的计数断言。
+> **R-M3.2（错误 → 综合带错误响应）** shared child 的某个 beat `m_r_i.resp != 0` 时，**不允许** `$fatal` 收场（现状 `shared_pretl_read.sv:424`）；必须给每个仍需该 index 的成员各发一份 `resp != 0` 的逻辑 R，保持该成员自己的 beat 序号连续，使其写侧 parent 能合法 WLAST。
+> **R-M3.3（中止 → 绝不伪造数据）** 成员 job 被 abort/teardown 时，只允许在下一个 retirement 边界把该成员移出（`retire` 定义同 R-M2.1）；**禁止**为它综合任何 payload，其残留 B 义务交给该 DMA 既有 abort 路径；存活成员从下一个 child 起私有继续。
+> **R-M3.4** 错误路径同样受 `retire` 边界保护：不允许在一个 child 的 R 序列中途改变成员集。
+
+### 3.2 完整当下信息
+
+`m_r_valid_i/m_r_ready_o/m_r_i.resp/.last`、`required[1:0]`、`beat_index`、`child_members_q`、`skid_q/skid_pending_q`、`returned_q[f]`、`done_q[f]`、`job_done_i/job_fire_i`、`pause_i`、以及 q writer 的 `error_q`（`q_write_splitter.sv:27,65,128`）。
+
+### 3.3 状态 transition
+
+`OK → CHILD_ERR(index) → 每成员各发一次错误 R（顺序保持） → 该 child 收尾 → 该 job 后续 child 可继续或按上层策略终止`；`OK → MEMBER_ABORT → 等 retire → child_members 清零该位 → 存活成员私有续读`。两条路径都**不改变任何在飞请求**。
+
+### 3.4 安全 fallback
+
+* 若成员已无能力接收（其源侧通路已关闭）→ **不得**综合 R；直接以错误终止该 job，并把未完成字节/错误上报（宁可失败也不伪造）。
+* 若只发生"部分错误"（一个 2-beat child 的其中 1 beat 出错）→ 允许综合错误 R，但**必须**声明目的地址区间是被写入 poison 还是保持原值。
+
+### 3.5 反例
+
+* **反例 A**：部分错误 + 目的端已经写了半份数据。若综合错误 R 而 DMA 的 W strobe/poison 语义未知（**明确未知：所给文件未包含 `dma_core_wrap` 的 W 侧 poison/strobe 处理**），则可能向目的地写入垃圾并返回 OK。→ R-M3.2 必须附带"目的侧 poison 语义已定义"这一前提，否则只能 fail-stop，不能"继续且正确"。
+* **反例 B**：成员 abort 与错误同时发生（abort 在先、错误在后）：若先按 R-M3.2 综合错误 R 给已被 abort 的成员，就变成向已释放资源投递 → 违反 R-M3.3。→ 所以 R-M3.3 的优先级必须**高于** R-M3.2，顺序必须写进规则。
+* **反例 C**：错误 beat 的两份逻辑 R 由同一 skid 通路分两拍发出（`:178-182` 用 `return_owner` 交替），若第二份因返回通道背压长期发不出，则 `skid_q` 长期为 1，共享 child 停顿 → 错误路径本身变成新的耦合点。因此 R-M3.2 需要"错误 R 不占用共享 child 的推进"或"允许 child 在被 abort 前先完成错误扇出"的显式顺序说明。
+
+### 3.6 最强已有机制覆盖 & 具体未覆盖条件
+
+* 三份 primary 我都没有看到对"**一份物理 R 服务两个持有不可撤写承诺的消费者**时的错误/中止扇出"的处理：Torrent 的 Finish 阶段是 grant 收尾；Intel 的 scoreboard/merge 讨论的是合并与 latency-efficiency；DMA-Latte 是软件一读双写、由软件负责错误。**未覆盖条件**：错误/中止发生在"两消费者都已有在飞、不可撤的写 parent AW/W"的时刻，且不允许撤回任何一方。
+* 这是一条**契约型**贡献：它的价值在于让共享在真实（ECC/poison、PCIe UR/CA、VF reset、ACS fault）环境里可部署，而不是提升某次 makespan。要如实这样表述。
+
+### 3.7 预期真实场景
+
+ECC 不可纠错、poison、PCIe Unsupported Request/Completer Abort、IOMMU fault（S2 permission fault 在传输中途被触发）、SR-IOV VF function-level reset、设备热拔。这些都是**必须**有定义行为的生产路径，而当前原型用 `$fatal` 明确排除（`:424`）与（`：423` 的 RLAST 断言同区）。
+
+### 3.8 最小 RTL 实验
+
+* 在 top 的 comp R 路径注入错误：`multi_actual_dma_top.sv:993-994` 处 `pre_raw_r.resp = comp_r_resp`，测试期可把某个 beat 的 `comp_r_resp` 强制为非 0（需确认 harness 的 R 模型是否可注入；若不可，最小方案是在该 `always_comb` 里加一个 test-only `inject_err_i`，不改 DUT 行为）。
+* 断言：(a) `shared_pretl_read.sv:424` 的 `$fatal` 在 `AllowErrFlow` 下不再触发；(b) 守恒律 R-M3.1：每成员 `returned_q` + 错误 R 计数 == 256；(c) job 级 B `resp != 0`（`q_write_splitter.sv:64-65`）；(d) 目的缓冲区比较结果**允许不同**并必须记录，不得断言"数据正确"。
+* abort 路径：在 phase3 触发成员 A 的 abort，断言 R-M3.3（A 不再收到任何综合 R，B 计数不再增长）、存活成员完成 2048 字节、source R ≤ 512。
+
+---
+
+## 4. 我判定为"旧/改名"、因此**不**作为机制的方向（明确列出，避免自欺）
+
+1. **把 §71 的 M/C/H 判据换成另一个测量量**（例如成员速率比、B outstanding、缓冲占用、每 child 边际等待）。这是把 dynamic window / latency-efficiency window 换信号，Intel Fig14-19 与一般自适应合并已覆盖。**不作为机制**。
+2. **把共享/复制的粒度做细**（每 child、每段、每页决策）。粒度细化 ≠ 新规则；§71 的 rule0/rule1 已经是这个形状（`codex-design-before-run.md:7`）。
+3. **把 B3 的借位上限 2 改成 k**、把 `read_quantum` 调大调小、把 `closure_target` 的取整换法。阈值改名。**不作为机制**（但可作为 M2 实验的敏感性扫描）。
+4. **"可中止的等待预算"（你 context 里点出的方向）**：只要判据是"等了 N 个周期/N 拍"或任何计时/阈值窗口，就落在"dynamic window 已旧"里。我给出的是**把决定量换掉**（M1：决定量是授权世代交集；M2：决定量是容量与游标证据；M3：决定量是错误/中止优先级），而不是给同一个决定量换阈值。
+5. **增加预取/credit/广播/流水线的模块级改造**。除 M1 需要 IOMMU 侧提供 `gen`（我明确标为跨模块、Codex 领域）外，三机制均**不新增模块、不新增 payload**。
+
+---
+
+## 5. 与 native odd-E / phase3 V-prefix clip 的关系、以及实验顺序（重要）
+
+* 我**不做**该环的诊断，也**不主张**任何机制修了它。实证线索只作为"实验会被污染"的提示：`run10-result.json:187-190` 显示 `vcut_beats=94 < oldend_beats=96`（非 q2 对齐的部分切点），而 `closure_target` 在 `shared_pretl_read.sv:113-119` 被 `(x+1)&9'h1fe` 取整——你提到的"奇数 E"就在这一带。Codex 诊断归 Codex。
+* **顺序建议**：
+  1. 先让 odd-E/phase3 的环进入**确定性的、可判定的失败**（或排除）——否则 M2 的 pause 实验、M3 的 error 实验都会在同一批状态（`cutover_phase_q==3` 且 `returned_q[0] < v_cut_q` 的 clip 路径，`:109`、`:150`、`:725-731`）上产生无法归因的观测。
+  2. M1 的实验**可以先做**且与环无关：它只在 offer 点加门，`gen` 相等时应当逐字复现 §70 CSV（§71 acceptance 已给出这条口径，`codex-design-before-run.md:11`）。
+  3. M3 在 M2 之前做更好：M3 定义了"成员不可再收"的语义，M2 的 `blocked_f`/重入合法性会用到它（反例 B）。
+* 任何收益声明都必须在环修好之后**重测**；不要拿修复前/后的差异当机制收益。
+
+---
+
+## 6. 未知与依赖（明确清单）
+
+| 项 | 状态 |
+|---|---|
+| `gen` / `grant_end` 的真实来源（IOMMU/ATC/TLB 失效通路） | 未在所给文件内；跨模块，Codex 领域 |
+| harness 是否对单一 ID 返回通道给出 per-ID 背压 | **未知**（`multi_actual_dma_top.sv:1166-1172` 只见一个 `tr_r_ready`）；决定 M2 的 `blocked_f` 是否能本地判定 |
+| `dma_core_wrap` 的 W 侧 poison/strobe 语义 | **未知**（未提供该文件）；决定 M3 反例 A 是否可用"综合错误 R" |
+| harness 内存模型能否注入 R 错误 | 推测可在 `multi_actual_dma_top.sv:993-994` 处加 test-only 注入；未验证 |
+| fixture 是否因"successful frontier"定义本身而排除 pause | 已知风险（`shared_pretl_read.sv:223-224`） |
+| §70/§71 全部数字的最终归属 | 引用自两份 run json 与 acceptance 表；未复核 CSV 明细 |
+| 任何"无前作"结论 | **不做任何此类主张**；我未检索、未浏览 |
+
+---
+
+## 7. 证据索引（行号）
+
+* §70 数值与结论：`out/shared-read-memory-service-20261009/codex-result-acceptance.md:11`（interval8/K16，-19.04%，source R 352/512）、`:14`（interval8/K2，-24.01%）、`:15`（interval32/K2，-39.00%，source R 280/512）、`:16-17`（stress=1，-24.56%/-26.88%）、`:19`（区间 16/32 时共享 completion 低 28–30%、A 略慢；**不得混淆** reads/mean/makespan/Pareto）、`:21`（下一个正向测试：在第一笔 A repair AR 前绑定，且不得读 interval 旋钮）。
+* §71 规则与验收：`out/shared-read-online-choice-20261009/codex-design-before-run.md:5`（M/C/H 定义、start_cutover 前冻结、排除每 child 首个 R 延迟、不加 payload）、`:7`（rule0/rule1 原文）、`:9`（一次绑定、不可变、短样本保守选独立）、`:11`（严格 R 公式 shared E+256 / independent 512；选中固定路线应精确复现 §70 CSV）。
+* 源单元状态机与其缺口：`shared_pretl_read.sv:113-125`（closure_target 取整与 start_cutover 条件）、`:146-177`（required/eligible_r/借位 2 拍）、`:208-216`（M/C/H 采样）、`:217`（SR71 route rebound 不可变断言）、`:223`（**pause 被排除**）、`:257-273`（结构性 detach）、`:274-303`（cutover 动作 + 属性比较）、`:288-294`/`:369-375`（比的是 `parent_q` 请求通道）、`:312-318`（独立 V 续读）、`:334-345`（共享 suffix child，成员 `2'b11`，用 A 的 parent 模板）、`:405-413`（AR 接受/child_count）、`:417-422`（RLAST 断言）、`:424`（**READ 错误被排除**）、`:428-440`（skid 双成员交付）、`:178-182`（返回 owner 交替）。
+* 写侧义务信号：`q_write_splitter.sv:37-44`（`raw_written`/`promised_end`/`next_end`）、`:51`（`pending`）、`:55-65`（B 综合与 `error_q` 合并）、`:86-92`（parent AW 契约）、`:96-110`（child 发起与 peer 组）、`:125-132`（B 处理与 job 级 B 置位）、`:139-140`（B credit overflow）、`:150-151`（MaxOutstanding 仅 1 或 2）。
+* 顶层结构：`multi_actual_dma_top.sv:50-52`（AdaptiveRepair/RepairChoiceRule/ParallelPrefixRepair 参数）、`:383-499`（i_dma0=V DEVICE_ID 10 / i_dma1=A DEVICE_ID 11）、`:697-759`（q writer 与 `write_child_quantum`）、`:717-742`（phase2/3 写侧裁剪 + peer-leader `:740`）、`:1046-1065`（recipe 映射与 prefetch 断言）、`:1115-1124`（harness 参数）、`:1194-1218`（comp 端口 tc/direct 拆分）、`:993-994`（comp R 打包处，错误注入点）。
+* run05：`:43`（v_src_r_beats 352）、`:56-62`（rstall 110）、`:65-76`（n_iotlb_hit 0 / n_ptw_ar 15 / n_tl_accept 5）、`:81-91`（V 5460 / A 5453）、`:187-195`（vcut 96、oldend 96、期望公式 oldend/8+(want−cut/8)=352）、`:198-207`（decided=1 share=1 M=488 C=0 H=75 cursor=81 E=96）。
+* run10：`:43`（v_src_r_beats 512）、`:56-62`（rstall_vsrc 5017）、`:81-91`（V 7628 / A 12759）、`:122-123`（memory_b_delay 64、memory_backpressure 1）、`:187-195`（vcut 94、oldend 96、期望 2*want）、`:198-207`（decided=1 share=0 M=60 C=1454 H=88 cursor=94 E=96）。
+
+**给 Codex 的一句话**：M1 是可先做、可逐字复现旧 CSV 的那条；M3 应先于 M2；M2 的最大不确定性是"返回通道是否为单 ID 提供背压"，若不能，请把 M2 的规则改为"由 `promised_write_end`/`cache_valid` 等结构性谓词触发"，而不是靠阻断谓词。

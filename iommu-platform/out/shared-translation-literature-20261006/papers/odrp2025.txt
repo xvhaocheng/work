@@ -1,0 +1,1156 @@
+            ODRP: On-Demand Remote Paging
+               with Programmable RDMA
+Zixuan Wang, Xingda Wei, Jinyu Gu, Hongrui Xie, Rong Chen, and Haibo Chen,
+Institute of Parallel and Distributed Systems, SEIEE, Shanghai Jiao Tong University
+
+          https://www.usenix.org/conference/nsdi25/presentation/wang-zixuan
+
+
+
+
+                This paper is included in the
+       Proceedings of the 22nd USENIX Symposium on
+       Networked Systems Design and Implementation.
+                   April 28–30, 2025 • Philadelphia, PA, USA
+                                 978-1-939133-46-5
+
+
+
+                                          Open access to the Proceedings of the
+                                         22nd USENIX Symposium on Networked
+                                          Systems Design and Implementation
+                                                    is sponsored by
+ODRP: On-Demand Remote Paging with Programmable RDMA
+                  Zixuan Wang, Xingda Wei, Jinyu Gu, Hongrui Xie, Rong Chen, Haibo Chen
+              Institute of Parallel and Distributed Systems, SEIEE, Shanghai Jiao Tong University
+
+A BSTRACT                                                         is not supported by one-sided RDMA. Even worse, dynamic
+                                                                  allocation necessitates registering memory to the RNIC, an
+Memory disaggregation with OS swapping is becoming pop-
+                                                                  RDMA control path operation that is not optimized for per-
+ular for next-generation datacenters. RDMA is a promising
+                                                                  formance and can only be performed by the CPU. As a re-
+technique for achieving this. However, RDMA does not sup-
+                                                                  sult, naively performing memory (de)allocation in the data
+port dynamic memory management in the data path. Current
+                                                                  path would significantly degrade application performance
+systems rely on RDMA’s control path operations, which are
+                                                                  and overwhelm the wimpy MNode CPU (§2.3).
+designed for coarse-grained memory management. This re-
+sults in a trade-off between performance and memory uti-             Due to the above limitation of RDMA, previous sys-
+lization and also requires significant CPU usage, which is a      tems [19, 11, 40, 25] have chosen to over-provision remote
+limited resource on memory nodes.                                 memory with large memory slabs (1 GB or larger) to amor-
+                                                                  tize the memory (de)allocation overhead and reduce CPU us-
+   This paper introduces On-Demand Remote Paging, the
+                                                                  age on MNodes. However, using large memory slabs would
+first system that smartly chains native RDMA data path
+                                                                  significantly reduce the memory utilization of MNodes due
+primitives to offload all memory access and management op-
+                                                                  to internal fragmentation. Therefore, current RDMA-based
+erations onto the RDMA-capable NIC (RNIC). However, ef-
+                                                                  memory disaggregation systems face a fundamental trade-off
+ficiently implementing these operations is challenging due
+                                                                  between high remote memory utilization, no MNode CPU
+to the limited capability of RNIC. ODRP leverages the se-
+                                                                  usage and high performance.
+mantics of OS swapping and adopts a client-assisted prin-
+ciple to address the efficiency and functionality challenges.        This paper demonstrates that it is possible to achieve high
+Compared to the state-of-the-art system, ODRP can achieve         memory utilization, no MNode CPU usage, and high perfor-
+significantly better memory utilization, no CPU usage while       mance on commodity RDMA hardware. It describes the de-
+introducing only a 0.8% to 14.6% performance overhead in          sign and implementation of On-Demand Remote Paging, al-
+real-world applications.                                          lowing CNodes to swap pages to the MNode with 4 KB allo-
+                                                                  cation granularity—the same as Linux swapping granularity
+                                                                  for ideal memory utilization. ODRP achieves fine-grained
+1   I NTRODUCTION                                                 remote memory management in the data path by efficiently
+Memory-intensive applications [4, 6, 9, 44] have been widely      offloading memory access and (de)allocation operations to
+deployed in modern datacenters. However, accurately pre-          the MNode’s RNIC, bypassing its CPU. Our key insight is to
+dicting their memory requirements is challenging due to fluc-     fully exploit a less-explored chaining feature of RDMA that
+tuations over time [37, 27]. Over-provisioning memory for         allows developers to combine various one-sided primitives
+host servers would significantly decrease memory utiliza-         to offload complex functionalities onto the RNIC (§2.4).
+tion. To address this issue, memory disaggregation has been          Although RDMA offloading has recently been proven to
+proposed [32, 19, 11, 37, 21, 22, 14, 36, 29, 18, 26, 43]. This   be Turing complete in theory [34], meaning that it can of-
+architecture separates the CPU and memory resources into          fload arbitrary programs, efficiently offloading the complex
+CPU and memory pools. Applications running on the CPU             functionalities of a swap device presents challenges due to
+pool (CNodes) can dynamically allocate and access memory          the following three issues: First, a function may require of-
+in the memory pool (MNodes) on demand, thereby improv-            floading multiple RDMA work requests (WRs) for imple-
+ing overall memory utilization.                                   mentation. However, offloading performance decreases as
+   RDMA is a popular interconnect for bridging CNodes and         the number of WRs increases. Therefore, we need to design
+MNodes. It provides efficient data path primitives, namely        data structures and operations that minimize the number of
+one-sided RDMA, which allow RNICs to directly read and            offloaded WRs. Second, RDMA primitives are primarily de-
+write to MNode memory without involving their CPUs. This          signed for networking and have limited semantics. Conse-
+is particularly beneficial for memory disaggregation because      quently, it is challenging or even impossible to implement
+MNodes often have limited or no CPU resources to ensure           certain functions efficiently with a relatively small number
+better cost efficiency [45]. Unfortunately, RDMA is not a         of WRs, such as the modulo operation. Finally, RNIC drains
+panacea for memory disaggregation, which requires more            the offloaded WRs after execution. Re-executing them re-
+than simple memory access. CNodes need to dynamically al-         quires proactive refilling with the help of the MNode CPU.
+locate and deallocate remote memory during runtime, which         However, the MNode CPU has limited processing power and
+
+
+
+USENIX Association                        22nd USENIX Symposium on Networked Systems Design and Implementation            1101
+can therefore become a performance bottleneck.                    limited (or no) CPU power. It is worth noting that some sys-
+   To address the aforementioned issues, first, ODRP adopts       tems adopt a symmetric architecture (i.e., a node can be both
+a client-assisted principle, which splits the offloaded func-     a CNode and an MNode at the same time). ODRP could be
+tions and shifts part of the computation to the CNode for         extended to support this symmetric architecture.
+better performance (§4.3). Choosing how to split the func-           RDMA is a popular interconnect for CNodes to access
+tions is non-trivial, because we need to minimize the compu-      MNode memory. One-sided primitives enable direct read,
+tation and storage overhead added to the CNode, as well as        write, compare-and-swap (CAS), and fetch-and-add (FAA)
+cope with compromised CNodes. Second, we propose uti-             operations on MNode memory, bypassing the MNode CPU.
+lizing the novel features offered by recent RNICs to effi-        Two-sided primitives (i.e., SEND and RECV) facilitate mes-
+ciently implement several high-level primitives (referred to      sage exchanges between CNodes and MNodes.
+as meta WR) (§4.2). These include modulo and endianness
+                                                                  Our target: Swap-based memory disaggregation. We tar-
+conversion operators, which are critical for offloading com-
+                                                                  get a setup where CNodes leverage Linux’s swap subsystem
+plex functions. Finally, we discover that the RNIC only “log-
+                                                                  for memory disaggregation [19, 11, 28, 43, 39, 33, 40]. This
+ically” drains WRs, meaning that we can reactivate them by
+                                                                  approach offers the advantage of transparency compared to
+properly updating the RNIC’s driver data structures. We are
+                                                                  other alternatives [16, 17, 36, 21]. In this setup, if a CNode
+the first to propose a method to recycle executed WRs with-
+                                                                  faces memory pressure, the kernel will swap out cold pages
+out requiring additional WRs or CPU intervention (§4.4).
+                                                                  to the MNode. Likewise, if the application needs to read a
+   We have implemented ODRP on Linux as a standard swap
+                                                                  swapped-out page, the kernel retrieves it from the MNode.
+backend, making it transparent to applications. Compared to
+the state-of-the-art swap-based memory disaggregation sys-        2.2   RDMA Alternatives to Implement Swap-
+tem, namely Fastswap [11], ODRP achieves 1.72× to 12×                   based Memory Disaggregation
+better memory utilization with zero MNode CPU usage, and
+                                                                  To support swap-based memory disaggregation, we need to
+at the cost of slight performance overhead (up to 14.2%) on
+                                                                  implement the following functionalities on the MNode: (1)
+real-world applications including Quicksort, Kmeans, Mem-
+                                                                  Read and write memory pages. (2) Verify the validity of the
+cached, GAPBS, and VoltDB. Moreover, it demonstrates su-
+                                                                  page address, i.e., whether the CNode has permission to ac-
+perior performance, memory utilization, and scalability com-
+                                                                  cess the page and (3) Memory allocation and deallocation.
+pared to other RDMA alternatives.
+                                                                  RNIC has been optimized for (1) and (2) through its data path
+   In summary, this paper makes the following contributions:
+                                                                  one-sided primitives and memory region registration (MRR).
+• We identify the issues with memory utilization and              However, it does not have efficient native support for (3).
+  MNode CPU usage in existing RDMA alternatives for               Specifically, MRR is a control path operation, which is inef-
+  realizing swap-based memory disaggregation. (§2).               ficient and requires intensive CPU involvement. Therefore,
+• We present a novel system design to efficiently offload         current RDMA hardware only provides the following alter-
+  memory management onto the RNIC, achieving better               natives for existing systems to implement swap-based mem-
+  memory utilization and zero MNode CPU usage. (§4).              ory disaggregation.
+• An implementation and evaluation of ODRP to demon-              • One-sided (Static). The MNode registers coarse-grained
+  strate its effectiveness and efficiency. (§5).                    memory slabs (e.g., 1 GB or the same size as the
+                                                                    CNode’s swap device) and allocates them to CNodes
+   Although we focus on swap-based memory disaggrega-               statically [11, 19, 40, 25, 33]. CNodes can directly access
+tion, we believe that the methodology and principle sum-            remote memory with one-sided primitives and require
+marized in our work can provide guidance for future of-             few or no memory allocation operations during runtime,
+floading functions onto the RNIC. ODRP is available at              making this approach highly efficient. However, this leads
+https://github.com/SJTU-IPADS/ODRP.                                 to poor memory utilization on the MNode due to severe
+                                                                    internal fragmentation and the lack of elasticity.
+2     BACKGROUND AND M OTIVATION
+                                                                  • One-sided (Dynamic). To improve memory utilization and
+2.1    Memory Disaggregation with RDMA                              support elasticity, the MNode can register its memory as
+Memory disaggregation is a promising paradigm to improve            fine-grained (e.g., 1 MB) memory regions (MRs) in ad-
+overall memory utilization in datacenters [19, 11, 37, 21, 22,      vance and dynamically allocate them to CNodes. Specifi-
+14, 36, 29, 18, 26]. It separates servers into a CPU pool and a     cally, if a CNode requires more (or less) remote memory, it
+memory pool, namely CNodes and MNodes. When CNodes                  can send an RPC message to the MNode using two-sided
+require additional memory, they can allocate it on MNodes           primitives. The MNode then allocates (or frees) an MR
+and access it as needed. We focus on the asymmetric archi-          and returns its metadata (i.e., address and rkey) to the CN-
+tecture, in which CNodes have powerful CPUs but limited             ode. Afterwards, the CNode can use one-sided primitives
+memory, while MNodes have a large amount of memory but              to access the allocated memory like in the first approach.
+
+
+
+1102   22nd USENIX Symposium on Networked Systems Design and Implementation                               USENIX Association
+Table 1: A comparison between ODRP and other RDMA                                                 One-sided (Static)                        One-sided (Dynamic)                             Two-sided
+
+
+
+
+                                                                    Memory Utilization (%)
+alternatives. Util: utilization.                                                         100                                       100                                             400
+
+
+
+
+                                                                                                                                                                  Execution time (s)
+                                                                                                                       CPU usage (%)
+                  Memory. Util      No CPU      Efficiency                                                                                                                         300
+
+      Static      Poor              4           Optimal                                      50                                        50                                          200
+
+      Dynamic     Medium            8           Medium                                                                                                                             100
+      Two-sided   Good              8           Poor                                         0                                         0                                               01
+                                                                                                  1 4 8 12 16 20                            1     4     8    12                             4 8 12 16 20
+      ODRP        Good              4           Good                                               # ConcurrentTasks                         # ConcurrentTasks                           # ConcurrentTasks
+
+                                                                               Figure 1: A comparison of RDMA alternatives in terms of
+  Note that a freed MR must be re-registered before being                      (a) remote memory utilization, (b) remote CPU usage, and
+  allocated to other CNode for safety.                                         (c) execution time.
+  However, determining the appropriate memory allocation                       fault handler for memory allocation, which is orders of mag-
+  granularity is challenging due to the inefficiency of                        nitude slower than one-sided primitives. In our experiment,
+  RDMA’s control path (i.e., memory registration) and the                      it even fails to complete the application benchmark.
+  limited CPU power of MNodes. For example, registering
+  a 4 KB or 1 MB MR takes about 80 µs or 600 µs, respec-                       High MNode CPU usage of One-sided (Dynamic) and
+  tively. Using a smaller memory slab size can improve                         Two-sided. Figure 1(b) shows that as the number of running
+  remote memory utilization but incurs higher management                       tasks increases, CNodes send more frequent allocation and
+  overhead on MNodes and necessitates more frequent                            swap requests, causing One-sided (dynamic) and Two-sided
+  memory allocation requests from CNodes. Additionally,                        to quickly saturate the MNode CPU. As a result, the MNode
+  the limited CPU power of the MNode may become a                              CPU becomes the bottleneck and consequently slows down
+  performance bottleneck in the system.                                        application performance due to request queuing.
+                                                                               Poor application performance of One-sided (Dynamic)
+• Two-sided. To minimize the cost of remote memory
+                                                                               and Two-sided. As shown in Figure 1(c), the average exe-
+  (de)allocation, CNodes can utilize two-sided primitives in
+                                                                               cution time for 20 Quicksort tasks in One-sided (dynamic)
+  the data path. The MNode CPU can always mediate the
+                                                                               and Two-sided is 1.82× and 4.18× longer than One-sided
+  memory accesses from CNodes and then manage the re-
+                                                                               (static), respectively. The performance degradation in One-
+  mote memory at a fine granularity. However, this approach
+                                                                               sided (dynamic) can be attributed to the extra latency from
+  suffers from poor performance as two-sided primitives are
+                                                                               waiting for memory allocation requests to complete. More-
+  less efficient than one-sided primitives [41] and requires
+                                                                               over, Two-sided faces even more competition for the MNode
+  more intensive involvement of the MNode CPU.
+                                                                               CPU as every swap request needs to be queued up.
+2.3    Issues with RDMA Alternatives for Swap-                                 2.4                  Programmable RDMA
+       based Memory Disaggregation                                             This section presents necessary background for how to of-
+This section conducts an experiment to analyze the issues of                   fload complex functionalities onto the RNIC.
+aforementioned alternatives. Detailed setup can be found in                    Offloading arbitrary logic onto RNIC with WR chains.
+§5. Figure 1 shows the results of running increasing num-                      RNICs are designed to execute simple primitives posted by
+bers of Quicksort tasks (each with 50% local memory) on 4                      the CPU, known as work requests (WRs). These WRs can
+CNodes. For One-sided (dynamic), we adopt a 1 MB allo-                         be linked together by recording the address of the next WR
+cation granularity. Table 1 summarizes the comparison be-                      in the next field. When the RNIC executes the first WR,
+tween ODRP and other RDMA alternatives.                                        it will proceed to the next one in the chain. As a result, de-
+Poor memory utilization of One-sided (Static). Figure 1                        velopers can chain multiple WRs together to offload more
+(a) illustrates the memory utilization of different alternatives.              complex function onto the RNIC. We refer to a function of-
+Memory utilization is measured as the ratio of actually used                   floaded to the RNIC as a WR chain. RDMA provides WAIT
+remote memory to allocated remote memory. As expected,                         and ENABLE WRs to control execution timing. By linking a
+One-sided (static) has the lowest utilization because MNode                    WAIT WR and an ENABLE WR after the first RECV WR in
+memory is pre-allocated based on the CNodes’ swap space                        a chain, the RNIC will automatically execute the WR chain
+size. While One-sided (dynamic) alleviates this problem, the                   after receiving an RDMA SEND, bypassing the CPU.
+average remote memory utilization is still 24% lower than                         An interesting property of the WR chain is its Turing com-
+Two-sided due to larger allocation granularity (1 MB vs.                       pleteness [34], which means we can offload arbitrary logic
+4 KB). It is worth noting that recent RNIC provides an on-                     onto the RNIC, bypassing the CPU. Intuitively, the CAS
+demand-paging (ODP) MR [5] feature that provides trans-                        WR provides branching, and the READ/WRITE WRs han-
+parent dynamic memory allocation for One-sided (static).                       dle state reads and writes. Finally, we can implement while
+However, this feature relies on the in-kernel driver’s page                    loops by reusing previously executed WR chains, i.e., after
+
+
+
+USENIX Association                         22nd USENIX Symposium on Networked Systems Design and Implementation                                                                                    1103
+    Pseudocode       WR chain executed by the RNIC             Control
+                                                                                                                         DRAM
+ 1 Input x,y
+                            1         2        3           4
+                                                               flow
+                                                                                        … Applications User
+   res = 0
+                                          NOOP/                Data flow                                                     5
+ 2 if(x == y)        RECV       CAS                WRITE       Conditional                                                 Meta data
+     res = 1                              WRITE                Data flow           Linux swap system      Kernel
+ 3 else                                                                                                                    §
+     noop
+                                                                                                        2      PCIe Pages ( 4.1)
+                                                                              1                                                            4
+ 4 WRITE(res)
+                      OP: CAS             OP: y | NOOP         OP: WRITE          ODRP backend (§4.3)               RNIC WR chains(§4.2)
+    OP: RECV          old: x | NOOP       data: 1              data: 0                                          3
+    dst0: &WR2.old    new: WRITE                                                    Compute Nodes       RDMA NIC      Memory Node
+    dst1: &WR3.op     dst: &WR3.op        dst: &WR4.data       dst: Client        Figure 3: An overview of system components of ODRP.
+Figure 2: An illustration of how to execute the pseudocode with              pages are allocated from the free page queue and mapped in
+four RDMA WRs. For simplicity, we omit the WAIT and ENABLE.                  CNodes’ translation tables on demand.
+RNIC finishes executing the last WR chain in the work queue                     When the CNode’s backend receives swap commands
+(WQ), it wraps around to execute the first one again.                        from the swap system (¶), it sends these requests to the
+                                                                             MNode with swap addresses (·). The MNode’s RNIC then
+Example. Figure 2 depicts how to offload a simple con-                       serves these requests by executing the pre-programmed logic
+ditional execution program onto the RNIC with a 4-WR                         (i.e., WR chains) stored in work queues (WQs) (¸). Each
+chain (not counting WAIT and ENABLE). The chain checks                       type of WR chain implements a specific high-level function
+whether x is equal to y using a CAS WR. Since the values                     (see Table 2). The WR chains leverage the swap metadata
+of x and y are arguments and unknown to the WR chain be-                     (¹) to perform address translation (swap address to page ad-
+fore execution, the RECV WR will receive them and fill the                   dress), page access, and page (de)allocations (º). Since all
+old field of the CAS and the op field of the third WR with                   requests are handled by WR chains, there is no need for CPU
+x|N OOP and y|N OOP , respectively. Then, we can com-                        intervention on the MNode.
+pare them with CAS. If x is equal to y, the CAS changes the
+third WR’s op field (i.e., opcode) from NOOP to WRITE1 ,                     Offloading challenges and solutions overview. While
+causing the first branch to execute and update the final result              RDMA offloading presents opportunities for bypassing the
+(WR4.data). Otherwise, the third WR remains NOOP, and                        CPU in fine-grained memory management, it is challenging
+the RNIC takes no action (the second branch). Finally, the                   to implement these logics efficiently and achieve full-fledged
+WRITE WR writes the result back to a client-side buffer.                     programmability due to the limited RDMA WR semantics.
+                                                                              C#1. Efficiency. Executing a new WR requires the RNIC
+3      ODRP OVERVIEW                                                         to retrieve it from the work queue (WQ) in host memory via
+Design goals. ODRP is a kernel-space swapping sys-                           PCIe, which is relatively slow. There are two main sources
+tem that can transparently swap cold pages to the MNode.                     of overhead that can degrade the performance of WR chains.
+It has three main design goals: (1) Fine-grained memory                      First, more complex logic requires more WRs per chain. Sec-
+management on the MNode, allocating and deallocating re-                     ond, the execution of each chain consumes all its WRs. To
+mote memory at page granularity to improve remote mem-                       serve future requests, existing work [34] necessitates addi-
+ory utilization; (2) No remote CPU usage, preventing the                     tional FAA and READ WRs to reactivate the executed WRs.
+wimpy MNode CPU from becoming a performance bot-                                To minimize the number of WRs per chain, ODRP adopts
+tleneck and realizing true disaggregation; (3) Good per-                     a client-assisted principle, as detailed in §4.4. Specifically, to
+formance, achieving comparable performance to existing                       eliminate the need for the WR chain to calculate the address
+coarse-grained memory management solutions.                                  of the translation table entry (tt addr) corresponding to a
+System architecture and high-level execution flow. Fig-                      CNode’s swap address, the MNode shares the base address
+ure 3 presents the system components of ODRP. On the CN-                     of the CNode’ translation table (tt base) with it. Then the
+ode side, ODRP provides a Linux swap backend that faith-                     CNode can calculate and directly use tt addr as an argu-
+fully implements the Linux frontswap [3] API (see Table 2).                  ment when invoking WR chains. To simplify the design of
+On the MNode side, ODRP registers all of its provisioned                     the page store WR chain, we categorize it into two cases
+memory as a large MR at initialization. The MNode main-                      based on whether the swap address is mapped or not (see Ta-
+tains two types of swap metadata (detailed in §4.1): (1) it                  ble 2), and have the CNode’s backend determine which WR
+divides provisioned memory into 4 KB pages and manages                       chain should be invoked. Additionally, we use the CNode as
+them with a free page queue; (2) it maintains a translation                  a helper to reactivate executed WR chains.
+table, initially unmapped, for each CNode that maps CNode                     C#2. Functionality. Although RDMA offloading is theoret-
+swap addresses to page addresses. During runtime, memory                     ically Turing complete, it is non-trivial to offload complex
+1 Note that for the RNIC to read the updated WR, we need an ENABLE WR        logic onto the RNIC. First, the RNIC lacks support for the
+ before the modified WR. For simplicity, we omit the ENABLE throughout       modulo operation (%), which is critical for avoiding over-
+ the paper without losing generality.                                        flow during computation. Second, the RNIC’s endianness
+
+
+
+1104     22nd USENIX Symposium on Networked Systems Design and Implementation                                           USENIX Association
+                             Table 2: The CNode API and the corresponding implementation on the RNIC.
+    CNode frontswap API (§4.4)     RNIC Implemented Functions (§4.3)                  Descriptions of the Implemented Functions
+    load(swap_addr) ->page         load(swap_addr) ->page                             Swap in a page from the MNode with swap_addr.
+    store(swap_addr, page)         mapped store(swap_addr, page)                      Swap out a page to swap_addr.
+                                   unmapped store(swap_addr, page)                    Allocate a page, map it to swap_addr and store the data in that page.
+    invalidate(swap_addr)          invalidate(swap_addr)                              Free and unmap the page of swap_addr on the MNode.
+
+
+     Memory pages                              ...                              (a)                                                              dst0: addr2 + 7     (c)
+
+
+
+
+                                                                                                 EndianSwap
+                                                                                                                                    OP: READ     size: 1 // 1B
+
+
+
+
+                                                                        }
+                                                                                *addr1:                                   *addr2:   src: addr1
+         swap_addr                  Head                                4KB      0x12345678                   0x7856341200000000    dst: &sge
+
+
+
+
+                                                                                                                                                          …
+                                                Free addr                                                                                        8 sges
+                                    Free
+
+
+
+                                                            Free addr
+        Per-CNode                   Page
+     Translation table                                                          (b)    OP: READ                   OP: READ           8 WRs          OP: READ
+                         tt_base    Queue                                Tail
+                                                                                       src: addr1                 src: addr1 +1
+                                                                                                                                      ...           src: addr1 +7
+     Figure 4: An illustration of the MNode-side data structures.                      size: 1 // 1B              size: 1 // 1B                     size: 1 // 1B
+                                                                                       dst: addr2 +7              dst: addr2 +6                     dst: addr2
+
+mismatches that of the host, meaning that the RNIC cannot                       Figure 5: (a) An overview of EndianSwap meta WR. (b) A naive
+directly use its computed value as an address to access host                    implementation using an 8 READ WRs. (c) ODRP utilizes 8 scat-
+memory.                                                                         ter/gather entries to achieve EndianSwap with one READ WR.
+   To address these challenges, ODRP has implemented two
+built-in chains as Meta WRs, as detailed in §4.2: one for                       Pages are allocated from the free page queue and mapped to
+the modulo operation and one for endianness conversion. By                      the TT on demand during CNode runtime. The TT is neces-
+leveraging new RNIC features [2], we show that these op-                        sary to ensure memory isolation, as each WR chain can ac-
+erators can be supported efficiently, greatly simplifying the                   cess all the MNode memory to enable fine-grained memory
+offloading of complex logic onto the RNIC.                                      management and sharing (i.e., a freed page can be allocated
+                                                                                and mapped to another CNode’s swap space). Moreover, we
+4      D ESIGN AND I MPLEMENTATION                                              use a single-level page table design for efficient offloading:
+                                                                                it requires only one READ WR for address translation (see
+4.1     Data Structures at the MNode                                            Figure 6). Finally, since the swap requests are initiated by
+Free Page Queue. As shown in Figure 4, the MNode di-                            the Linux swap subsystem in a coordinated manner (i.e., a
+vides its memory into 4 KB pages and organizes them with                        CNode’s concurrent swap requests will not target the same
+a FIFO free page queue. During initialization, it inserts all                   swap address), ODRP does not need to coordinate concur-
+the free pages into that queue. The queue is implemented as                     rent operations targeting the same TT entry.
+a fixed-sized ring buffer, determined by the number of pages                    4.2       Meta WRs
+the MNode can provide, and has one head pointer and one
+tail pointer. Each queue element is 8 bytes (8 B) in size, hold-                Before diving into the details of WR chains, we first describe
+ing the address of a free page. When allocating a free page                     the design and implementation of two meta WRs that are es-
+to a CNode, ODRP performs a dequeue operation to obtain                         sential for the WR chains. Although these operations could
+a free page address, i.e., leverages the RDMA atomic FAA                        be performed by the MNode CPU, this approach would re-
+WR on the queue head pointer. When a page is freed, ODRP                        quire an interrupt from the RNIC to the CPU, which is less
+performs an enqueue operation, i.e., uses atomic FAA on the                     efficient. Therefore, we choose to implement these opera-
+queue tail pointer and stores the page address in the fetched                   tions within the WR chains as meta WRs.
+queue element.                                                                  The modulo WR. The modulo (%) operation is crucial to
+   This results in O(1) complexity for (de)allocation opera-                    prevent overflow in the enqueue and dequeue operations of
+tions, making it well-suited for the WR chain. In contrast,                     ring buffer. However, without proper hardware support, it
+using other structures like bitmap to maintain free pages re-                   is impossible to implement the modulo operator with just a
+quires a more complex WR chain, which would harm effi-                          few WRs. Fortunately, recent RNICs provide an Enhanced
+ciency. For example, allocating a page with a bitmap requires                   Atomic Operations [10] feature, which includes a Masked-
+multiple RDMA WRs to search for a free bit and a CAS WR                         FAA WR that allows users to split the target value into mul-
+to update the free bit.                                                         tiple fields of selectable length for addition. By using this
+                                                                                feature, we can mask the upper bits of the value to imple-
+Translation Table (TT). ODRP provides each CNode with
+                                                                                ment FAA with modulo support.
+a swap space and maintains a TT for it, which records the
+mapping between swap addresses and allocated page ad-                           The endianness conversion WR (EndianSwap). Network
+dresses on the MNode. Each entry in the TT starts out empty.                    protocols, including RDMA [1], traditionally use big-endian
+
+
+
+USENIX Association                            22nd USENIX Symposium on Networked Systems Design and Implementation                                                  1105
+                                         1               2              3                                                              1                       2                   3           4
+1 Input tt_addr,                                                            1 Input tt_addr,page_content,
+  CN_buffer              OP: RECV            OP: READ        OP: WRITE        signal_addr                           OP: RECV
+                                                                                                                                            OP: READ               OP: WRITE           OP: WRITE
+                         dst0: &WR2.src      src: 0          src: 0                                                 dst0: &WR2.src
+2 addr = READ(tt_addr)                                                      2 addr = READ(tt_addr)                                          src: 0                 src: page_buf       data: 1
+3 WRITE(CN_buffer, addr) dst1: &WR3.dst      dst: &WR3.src   dst: 0         3 WRITE(addr, page_content)             dst1: page_buf
+                                                                                                                                            dst: &WR3.src          dst: 0              dst: 0
+                                                                            4 WRITE(signal_addr, 1)                 dst2: &WR4.dst
+       Load                                                                       Mapped Store
+
+1 Input tt_addr,page_content,                                1     w/ Modulo      2                            3                   4                       5                6      Control
+  signal addr                                                    OP: FAA
+
+
+
+
+                                                                                      EndianSwap
+                                                OP: RECV                                                                                                           OP: WRITE       flow
+                                     Unmapped                    val: 8                            OP: WRITE       OP: READ                OP: WRITE
+2   queue_head = FAA(Head)
+                                     Store      dst0: &WR3.dst                                                                             src: page_buf           data: 1         Data flow
+3   free_addr = READ(queue_head)                                 src: HEAD                         src: 0          src: 0
+4   WRITE(tt_addr, free_addr)                   dst1: page_buf                                                                             dst: 0                  dst: 0
+                                                                 dst0: &WR3.src                    dst: 0          dst: &WR5.dst
+5   WRITE(free_addr, page_content)
+                                                dst2: &WR6.dst                                                                                                                     Meta WR
+6   WRITE(signal_addr, 1)                                        dst1: &WR4.src
+
+
+Figure 6: A simplified illustration of the WR chain design in ODRP. We omit fields like size and WAIT and ENABLE WRs. In the Load,
+Mapped Store, and Unmapped Store WR chains, the number of omitted WAIT and ENABLE WRs is 3, 4, and 5, respectively. The WRITE
+writes the memory from src to dst.
+
+format, which differs from the little-endian format used by                                         ode’s buffer—CN buffer (¸). To look up the page ad-
+most host CPUs (e.g., x86-64). This mismatch can lead to                                            dress, the RECV fills the source field of the next READ with
+subtle issues in RDMA offloading. For example, the FAA                                              tt addr. The READ then places the result of address trans-
+WR performed on the host memory returns the result in little-                                       lation (i.e., the page address on the MNode) in the source of
+endian format (e.g., the fetched value of the queue head                                            the subsequent WRITE. Finally, the WRITE writes the page
+pointer). However, a READ WR expects its source field in                                            data back from the MNode memory to the destination buffer,
+big-endian format. As a result, the fetched value of the queue                                      which has been set to CN buffer by the RECV.
+head pointer by FAA cannot be directly used for a subsequent
+                                                                                                    Mapped page store. The WR chain receives a tt addr
+READ WR without endianness conversion.
+                                                                                                    and stores the received page data (page content) at the
+   To efficiently address this issue without involving the
+                                                                                                    address specified in that entry. The WRs used in this chain
+MNode CPU, we designed an EndianSwap WR to sim-
+                                                                                                    are similar to page load: the RECV (¶) fills the source
+plify endianness conversion. A naive implementation would
+                                                                                                    field of the next READ with tt addr and places the
+involve using N READ WRs to convert an N -bytes value.
+                                                                                                    page content in a temporary page buffer (page buf).
+Figure 5 (b) shows an example of converting an 8-byte value
+                                                                                                    Then, the READ WR looks up the page address (·) stored
+from little-endian to big-endian: the first WR moves the first
+                                                                                                    in the TT entry. Subsequently, the next WRITE writes the
+byte to the last byte, and so on. However, this approach is in-
+                                                                                                    page content to that page from page buf (¸). Finally, we
+efficient due to the excessive use of WRs. ODRP leverages
+                                                                                                    use an additional WRITE (¹) to notify the CNode of the
+the scatter-gather entry (SGE) feature provided by RNICs to
+                                                                                                    completion of this request by writing a magic number to a
+reduce the number of WRs to just one. As presented in Fig-
+                                                                                                    CNode-provided buffer (signal addr).
+ure 5 (c), the RNIC can scatter a continuous memory block
+into multiple destination buffers using SGEs. By filling the                                        Unmapped page store. This is the most complicated WR
+dst fields of multiple SGEs in reverse order, we can achieve                                        chain in ODRP, which is responsible for allocating a free
+endianness conversion with just one READ WR.                                                        page, mapping it in the TT, and storing the received page.
+                                                                                                       At a high level, this WR chain receives a tt_addr and
+4.3       MNode-side WR Chains
+                                                                                                    allocates a page from the free page queue (·). It then maps
+Figure 6 presents the pseudocode and WR chains of of-                                               the allocated page address to the TT entry (¸) and stores
+floaded functions (see Table 2). When CNodes need to swap                                           the received page data (page content) in the newly allo-
+in or out a page, they use RDMA SEND with arguments                                                 cated page (¹–º). To pop a free page address from the page
+to trigger these WR chains. We assume the arguments are                                             queue, the chain uses an atomic FAA with modulo support
+valid for now. Handling invalid arguments will be detailed                                          to increment the head pointer by 8 (head = head + 8). The
+in §4.5. Notably, instead of directly providing the swap ad-                                        fetched old value of the head pointer (old head) points to the
+dress, we request CNodes to compute the TT entry address                                            allocated queue element that contains a free page address.
+(tt base+swap addr/P AGE SIZE) as an argument to all                                                   Note that the FAA retrieves old head in little-endian for-
+WR chains. This approach eliminates the need for an addi-                                           mat, which is consistent with that of a typical host CPU (e.g.,
+tional FAA and an EndianSwap WR in the WR chain to per-                                             x86-64). However, the subsequent WRs assume that their
+form this calculation. This optimization incurs zero memory                                         src or dst fields are in big-endian format. To correctly read
+overhead for the CNode, as each CNode only needs to store                                           the allocated page address (∗old head), we use the afore-
+its own tt base.                                                                                    mentioned EndianSwap WR to convert it to big-endian for-
+Page load. Page load takes a TT entry address (tt addr)                                             mat. Given the free page address, it is straightforward to map
+(¶), looks up the page address stored in that entry (·),                                            it in the TT entry (¸) and store the page content with
+and writes the page stored at that address back to the CN-                                          WRITE (¹–º). Finally, we notify the CNode with another
+
+
+
+1106        22nd USENIX Symposium on Networked Systems Design and Implementation                                                                                     USENIX Association
+WRITE (»), similar to the mapped page store WR chain.              have been previously stored. However, store lacks this in-
+Page invalidation. Due to space limitations, we omit this          formation. A naive approach would be to add extra logic in
+chain in Figure 6, which is similar to the unmapped page           the WR chain to look up the TT and allocate a page if the
+store WR chain. At a high level, we first read the address         target swap address is unmapped. However, it is inefficient
+of the page to be released from the TT entry. Next, we             due to the extra WRs per chain. Our observation is that a
+insert the address back to the page queue by increment-            CNode’s swap backend actually has full knowledge of the re-
+ing the tail pointer with FAA (tail = tail + 8) and us-            mote allocation status: (1) the entire swap space is unmapped
+ing WRITE to store the freed page address to the old tail          initially (i.e., the whole TT starts out empty), and (2) an al-
+(∗old tail = page addr). Finallyt, we unmap this page in           located page can only be freed by the CNode’s page invali-
+the CNode’s TT by setting the TT entry to zero.                    dation request, meaning the CNode controls the unmapping
+                                                                   operation. Therefore, each CNode can maintain a bitmap to
+Handling empty free page queue and crashed CNodes.                 record the allocation state of each page in its swap space.
+There are two corner cases in ODRP: all memory pages               With this information,store can determine whether the tar-
+on the MNode are allocated (i.e., the free page queue is           get swap address is mapped and invoke the appropriate WR
+empty) and a CNode crashes unexpectedly. First, we use an          chain (mapped page store or unmapped page store).
+invalidation-based mechanism to detect the empty free page
+queue and abort the allocation if necessary. Specifically, af-     CNode-assisted MNode WR recycle. After a WR chain
+ter each allocation, we clear the allocated queue element          is executed, the WRs in it are logically dequeued from the
+(∗old head = 0). As a result, the first allocation attempt         WQ. To serve future requests, an intuitive approach is to
+on the empty queue will return a null page address, causing        post new WRs with the CPU. However, this would cause un-
+the subsequent WRs to throw an RDMA protection error. To           expected stalls in the RNIC’s processing pipeline since the
+this end, we add a WRITE WR after the fifth WRITE WR               wimpy MNode CPU can only post asynchronously at a rela-
+(º) of the unmapped store chain to set the queue element to        tively low rate. To bypass the MNode CPU, ODRP makes a
+zero. A limitation of this approach is that if such an error oc-   key observation that executed WRs are not physically erased
+curs, we need to use the MNode CPU to recover the state of         from the WQs. Thus, by modifying the WR metadata, which
+the free page queue (i.e., reset the head pointer to the correct   is stored in WQs, we can reactivate executed WRs2 .
+value), as page invalidation requests may continue pushing            More specifically, to make the RNIC wrap around to the
+free pages into the corrupted page queue.                          beginning of the WQ, we only need to modify the index field
+   Second, when a CNode crashes unexpectedly, ODRP                 of the RNIC’s ordering primitives, namely WAIT and EN-
+needs to recycle the resources allocated to it, including mem-     ABLE. This field indicates the index of the WR affected by
+ory pages and its TT. In ODRP, the MNode detects crashed           these ordering primitives. Special attention needs to be paid
+CNodes via heartbeat signals. Upon detecting a crashed CN-         to the RECV WR, which serves as the triggering WR of each
+ode, the MNode scans its TT and releases the pages con-            WR chain. We discovered that to inform the RNIC that the
+tained in the mapped TT entries. Then, the MNode releases          consumed RECV is ready for re-execution, it is only neces-
+the crashed CNode’s TT.                                            sary to modify the doorbell record value of the WQ.
+                                                                      Putting it all together, to recycle executed WRs without in-
+4.4   CNode-side ODRP Backend                                      volving the MNode CPU, a straightforward way is to inject
+For each type of WR chain, the CNode backend has an                additional FAA and EndianSwap WRs in the chain to update
+RDMA connection to the MNode, and the MNode-side work              the index field [34] and the doorbell record. However, this
+queue (WQ) is pre-populated with corresponding WR chains           adds extra WRs to the WR chains and introduces a perfor-
+to handle requests.                                                mance penalty. To avoid using additional WRs for index cal-
+Swap API implementation. ODRP provides a Linux                     culation and updating, we shift this calculation to CNodes.
+frontswap [3] backend, which operates as a swap device at          To be specific, the CNode will piggyback the calculated val-
+the CNode. The API implementation is as follows:                   ues with other arguments when sending requests. The RECV
+                                                                   WR in the WR chain will use these values to update the in-
+ • load: The backend calculates the tt addr based on               dex field and the doorbell record. As a result, no extra WR is
+   the swap address and invoke the page load WR chain by           needed for recycling.
+   posting an RDMA SEND.
+ • store: The backend checks whether the swap address              4.5   Correctness under Benign and Malicious CN-
+   is mapped. If it is, the mapped page store chain is called;           odes
+   otherwise, the unmapped page store chain is invoked.            We define the correctness of ODRP in two aspects. First,
+ • invalidate: The backend invokes the page invalida-              the TTs and the free page queue must always be consistent.
+   tion chain.                                                     2 RedN [34] proposed WQ recycling to implement unbounded loops. How-
+In the cases of load and invalidate operations, the                ever, to the best of our knowledge, no one has found a solution to recycle
+swap address has a valid mapping in the TT because it must         RECV. RedN’s open-source code also does not implement their strategy.
+
+
+
+
+USENIX Association                         22nd USENIX Symposium on Networked Systems Design and Implementation                       1107
+Specifically, these data structures are consistent if and only     try to exhaust the memory resources of the MNode by con-
+if (1) the free pages in the free page queue cannot be mapped      tinuously sending unmapped store requests. We show that
+to any TTs, and (2) each allocated page can only be mapped         malicious CNodes requests will be rejected by the MNode.
+in exactly one TT. Second, requests from different CNodes
+                                                                   Correctness under illegal requests. Such requests can be
+must be isolated; i.e., a load or store can only access the page
+                                                                   categorized into two types: one with an illegal operand code
+mapped in the CNode’s own TT, even in the presence of ma-
+                                                                   (e.g., an RDMA READ instead of SEND) or one with an
+licious CNodes.
+                                                                   invalid argument. For the first one, we can configure the
+4.5.1   Correctness under Benign CNodes                            RDMA connection permission such that they will be rejected
+                                                                   by the RNIC. For the latter, we only need to handle the in-
+Consistency. We informally argue that our WR chains can            valid tt_addr, as the WRs manipulate TTs and the free
+ensure consistency via induction. We first initialize the          page queue based on it (see Figure 6). Specifically, an invalid
+MNode to a consistent state by ensuring each page exists           tt_addr can be (1) misaligned, (2) out-of-range and (3) be-
+exactly once in the free page queue, and leave all the TTs         ing unmapped in a request that assumes mapped tt_addr.
+empty. We then demonstrate that the execution of CNode             For (1), we can configure the RECV WR to only use the
+requests will maintain the consistency of these data struc-        upper bits of the tt_addr to efficiently avoid misaligned
+tures. This is straightforward when not considering concur-        tt_addr. For (2), we use RDMA’s memory registration to
+rent requests. Executing a load or a mapped store operation,       ensure that all the WRs in WR chains can only access the
+which does not modify the TT and the free page queue, natu-        CNode’s own TT. For (3), we ensure the unmapped TT en-
+rally preserves this consistency. For the unmapped store op-       tries are zero through proper initialization and clean-up. As
+eration, since it faithfully performs a dequeue operation, we      a result, such an argument will cause an RDMA protect error
+only need to ensure that the free page address popped from         due to null access, which will abort execution. Additionally,
+the queue is consistent with the address written to the TT         we insert a conditional check similar to the one described in
+entry, which is obvious under our assumption of benign CN-         Figure 2 to rule out unmapped tt_addr in page invalida-
+odes. Finally, page invalidation is the reverse operation of an    tion operations.
+unmapped store, so the argument is the same.
+   For concurrent unmapped store and invalidation opera-           Fairness. To ensure fairness, we follow existing works [11,
+tions, we use RDMA’s atomic FAA to avoid race conditions,          19] that set a budget for the maximum allocated memory for
+similar to other concurrent queues [31]. Concurrent load/-         CNodes. If the budget is exhausted, the MNode will reject al-
+store operations targeted on the same tt_addr are inher-           location requests from the CNode to maintain fairness. The
+ently avoided due to the semantics of the swap subsystem.          challenge is how to keep track of each CNode’s usage. Exist-
+One tricky case is when the unmapped store and invalidation        ing systems can leverage the CPU to actively record it before
+operations are executed concurrently. Ideally, there is no race    allocating memory to a CNode. However, in ODRP, we by-
+condition between them because the ummapped store oper-            pass the MNode CPU in memory allocation. To address this,
+ation only modifies the queue head, while the invalidation         we leverage a lazy detection method to periodically check
+modifies the queue tail. However, a potential race condition       whether a CNode exceeds its budget. Specifically, we use
+emerges when the queue is empty, i.e., the queue head and          one CPU core at the MNode to monitor the memory usage
+tail point to the same address. In this scenario, an unmapped      of each CNode. The challenge is how to efficiently perform
+store operation may read the queue head while an invalida-         this bookkeeping. A naive solution would be scanning the
+tion operation concurrently writes to this head. We require        TTs, which would incur significant CPU overhead. Fortu-
+RDMA to provide atomic 8 B read and write for correct-             nately, we can leverage the RDMA hardware counters [35]
+ness, which is ensured by hardware with cache-aligned ac-          for this calculation. These counters record the completion of
+cesses [15, 16, 30, 42]. With this atomicity guarantee, the un-    WRs in the unmapped store and invalidation WR chains. By
+mapped store operation will either get the latest invalidated      comparing these counters, we can efficiently get the number
+page or a null address. Both cases are correct.                    of allocated pages of a CNode.
+
+Isolation. Since all load and store requests can only access       5     E VALUATION
+pages mapped in the CNode’s own TT, requests from differ-
+ent CNodes are isolated as long as their TTs are consistent,       5.1   Evaluation Setup.
+which has been demonstrated above.                                 Testbed. Our experiments are conducted on a cluster with
+                                                                   one MNode and up to 8 CNodes, all connected with an Infini-
+4.5.2   Handling Malicious CNodes                                  Band switch. Each node has a 12-core Intel Xeon E5-2650
+Security model. We assume MNodes are trustworthy, while            CPU (hyper-threading is disabled), 128 GB DDR4 RAM,
+CNodes can be compromised, the same as existing sys-               and a 100 Gbps Mellanox ConnectX-5 RNIC. Each node
+tems [11, 19, 22]. A malicious CNode might send illegal re-        runs Mellanox OFED 4.9 and Linux 4.15. Each CNode is
+quests with invalid arguments (e.g., invalid tt_addr), or          configured with 12 GB swap space.
+
+
+
+1108    22nd USENIX Symposium on Networked Systems Design and Implementation                                USENIX Association
+                                                              One-sided (Static)                                                One-sided (Dynamic)                                                 Two-sided                                   ODRP                                          One-sided (Dynamic/4KB)
+     Memory utilization
+
+
+
+
+                                                                         Memory utilization
+
+
+
+
+                                                                                                                                      Memory utilization
+
+
+
+
+                                                                                                                                                                                             Memory utilization
+
+
+
+
+                                                                                                                                                                                                                                                               Memory utilization
+
+
+
+
+                                                                                                                                                                                                                                                                                                                         Memory utilization
+                                          optimal                                                             optimal                                                      optimal                                                       optimal                                                        optimal                                                   optimal
+                          1.0                                                                 1.0                                                          1.0                                                    1.0                                                               1.0                                                       1.0
+
+
+                          0.5                                                                 0.5                                                          0.5                                                    0.5                                                               0.5                                                       0.5
+
+
+                          0.0                                                                 0.0                                                          0.0                                                    0.0                                                               0.0                                                       0.0
+                                    75%            50%                                                  75%            50%                                           75%            50%                                         75%             50%                                           75%              50%                                       75%              50%
+                          1.0                                                                 1.0                                                          1.0                                                    1.0                                                               1.0                                                       1.0
+     CPU utilization
+
+
+
+
+                                                                         CPU utilization
+
+
+
+
+                                                                                                                                      CPU utilization
+
+
+
+
+                                                                                                                                                                                             CPU utilization
+
+
+
+
+                                                                                                                                                                                                                                                               CPU utilization
+
+
+
+
+                                                                                                                                                                                                                                                                                                                         CPU utilization
+                                          upper                                                               upper                                                        upper                                                      upper                                                         upper                                                        upper
+                                           limit                                                               limit                                                        limit                                                      limit                                                         limit                                                        limit
+                          0.5                                                                 0.5                                                          0.5                                                    0.5                                                               0.5                                                       0.5
+
+
+
+                          0.0
+                                0     0       0      0                                        0.0
+                                                                                                    0     0       0      0                                 0.0
+                                                                                                                                                                 0     0       0      0                           0.0
+                                                                                                                                                                                                                            0     0         0      0                                0.0
+                                                                                                                                                                                                                                                                                          0     0          0      0                           0.0
+                                                                                                                                                                                                                                                                                                                                                     0     0          0     0
+                                    75%            50%                                                  75%            50%                                           75%            50%                                         75%             50%                                           75%              50%                                       75%              50%
+                     350                                                         1000                                                                 500                                                              80                                                      200                                                              50
+Execution time (s)
+
+
+
+
+                                                            Execution time (s)
+
+
+
+
+                                                                                                                                 Execution time (s)
+
+
+
+
+                                                                                                                                                                                                  Execution time (s)
+
+
+
+
+                                                                                                                                                                                                                                                          Execution time (s)
+
+
+
+
+                                                                                                                                                                                                                                                                                                                              TPS (Thousands)
+                     300                                                                                                                                                                                               70
+                                                                                       800                                                            400                             Fail                             60                                                      160                                                              40
+                     250
+                                                     Fail                                                                                             300                                                              50                                                                                                                       30
+                     200                                                               600                                                                                                                                                                                     120                                Fail
+                                                                                                                                                                                                                       40         Fail             Fail                                          Fail                                                          Fail             Fail
+                     150                                                               400                                                            200                                                              30                                                           80                                                          20
+                                                                                                                         Fail
+                     100                                                                                                                                                                                               20
+                                                                                       200                                                            100                                                                                                                           40                                                          10
+                      50                                                                                                                                                                                               10
+                       0                                                                       0                                                            0                                                           0                                                            0                                                          0
+                                    75%            50%                                                  75%            50%                                           75%            50%                                         75%             50%                                           75%              50%                                       75%              50%
+                            In-Memory Working Set                                               In-Memory Working Set                                        In-Memory Working Set                                      In-Memory Working Set                                         In-Memory Working Set                                      In-Memory Working Set
+                                  Quicksort                                                           K-means                                                     Memcached                                              Betweenness Centrality                                             Page Rank                                                   VoltDB
+Figure 7: Remote memory utilization (higher is better), remote CPU usage (lower is better), and the execution time (throughput)
+of ODRP and other four baseline systems under different workloads with 8 CNodes accessing one shared MNode.
+
+Baselines. We compare ODRP with four baselines as de-                                                                                                                                                                  cause of its coarse-grained static allocation. One-sided (dy-
+scribed in § 2.2: 1) One-sided (static), pre-registering 12 GB                                                                                                                                                         namic) can significantly improve remote memory utilization
+of remote memory for each CNode; 2) One-sided (dynamic),                                                                                                                                                               by adopting fine-grained allocation. However, it still can-
+preparing 1 MB MRs in advance while allocating them to the                                                                                                                                                             not achieve ideal utilization because of the fragments within
+CNode on-demand; 3) Two-sided, using two-sided RDMA                                                                                                                                                                    1 MB memory slabs. It achieves about 95% remote mem-
+operations in the data path to implement 4 KB-granularity                                                                                                                                                              ory utilization for workloads where internal fragmentation is
+memory management; 4) One-sided (dynamic/4KB), same                                                                                                                                                                    not significant, such as Kmeans, betweenness centrality, and
+as One-sided (dynamic) but performing 4 KB allocation. The                                                                                                                                                             page rank. More severe internal fragmentation can lead to
+MNode only uses one CPU core to simulate the weak pro-                                                                                                                                                                 worse remote memory utilization. For example, One-sided
+cessing power, unless otherwise specified. We implement                                                                                                                                                                (dynamic) can only achieve 55% remote memory utilization
+all the baselines based on Fastswap [11] and compare them                                                                                                                                                              in the case of Quicksort with 50% local memory.
+to ODRP, aiming to demonstrate that ODRP outperforms                                                                                                                                                                      In contrast, thanks to the page-granularity memory man-
+baselines regarding application performance, remote mem-                                                                                                                                                               agement, ODRP, Two-sided, and One-sided (dynamic/4KB)
+ory utilization, and remote CPU usage.                                                                                                                                                                                 can achieve ideal remote memory utilization (100%). This
+Evaluated applications. We evaluate the applications used                                                                                                                                                              results in up to 1.82× improvement over One-sided (dy-
+in prior memory disaggregation studies [19, 11, 43]. 1)                                                                                                                                                                namic) and a 1.72× to 12× enhancement compared to One-
+Quicksort with a 4 GB working set; 2) Kmeans with a 2 GB                                                                                                                                                               sided (static).
+working set; 3) Memcached v1.4.25 with Facebook ETC                                                                                                                                                                    Remote CPU usage. As shown in the second row of Fig-
+workload [12] (4 GB working set), a server thread and four                                                                                                                                                             ure 7, both One-sided (dynamic) and Two-sided reach the up-
+client threads; 4) Page rank (PR) and 5) betweenness cen-                                                                                                                                                              per limit of one MNode CPU core in all workloads. The sat-
+trality (BC) from GAPBS [13] on a Twitter dataset [24], 4                                                                                                                                                              urated MNode CPU turns into a performance bottleneck, as
+threads and a 14 GB working set; 6) VoltDB with TPC-C [8],                                                                                                                                                             discussed in more detail in § 5.3. Some workloads even fail
+8 threads and a 7 GB working set.                                                                                                                                                                                      to complete in One-sided (dynamic/4KB). If we use a single-
+                                                                                                                                                                                                                       CNode evaluation setup, One-sided (dynamic) results in a
+5.2                             Application Benchmarks
+                                                                                                                                                                                                                       maximum of 67% remote CPU usage because the MNode
+We run the applications on all available hardware in our clus-                                                                                                                                                         CPU needs to serve memory (de)allocation requests. Two-
+ter, which consists of 8 CNodes and one shared MNode. This                                                                                                                                                             sided requires higher remote CPU usage because it involves
+cluster setup aligns with the typical deployment of memory                                                                                                                                                             the MNode CPU in every swap in/out request. In Kmeans
+disaggregation, such as in cloud environments [26].                                                                                                                                                                    and graph processing workloads, which involve more fre-
+Memory utilization. The first row of Figure 7 illustrates the                                                                                                                                                          quent swap operations, Two-sided leads to 86% and 99% re-
+average remote memory utilization during application run-                                                                                                                                                              mote CPU usage, respectively.
+time, which is measured as the ratio of actually used remote                                                                                                                                                              For One-sided (dynamic/4KB), we removed the restriction
+memory to allocated remote memory. One-sided (static) can                                                                                                                                                              of providing only one MNode CPU core, otherwise the appli-
+only achieve up to 58.3% remote memory utilization be-                                                                                                                                                                 cations fail to complete. One-sided (dynamic/4KB) requires
+
+
+
+USENIX Association                                                                                                           22nd USENIX Symposium on Networked Systems Design and Implementation                                                                                                                                                                           1109
+                   One-sided (Static)              Two-sided                         One-sided (Dynamic)-sufficient-CPU            One-sided (Static)                      Two-sided     One-sided (Dynamic)-sufficient-CPU
+                                                   ODRP                              Two-sided-sufficient-CPU                      One-sided (Dynamic)                     ODRP          Two-sided-sufficient-CPU
+                   One-sided (Dynamic)
+                                                                                                                                      400
+
+
+
+
+                                                                                                                                   Execution Time (s)
+                                                                                    600
+                 1600
+
+
+
+
+                                                               Execution time (s)
+                                                                                                                                                        300
+ CPU usage (%)
+
+
+
+
+                                                                                    500
+                 1200                                                               400                                                                 200
+                 800                                                                300
+                                                                                                                                                        100
+                                                                                    200
+                 400
+                                                                                    100                                                                   0
+                   0                                                                                                                                          0   200    400   600     800   1000    1200    1400
+                        1   2   3    4   5     6   7   8
+                                                                                      0 1   2   3    4   5     6   7   8
+                                    # CNodes                                                        # CNodes
+                                                                                                                                                                        Swap Throughput (kops/s)
+
+Figure 8: The impact of increasing the number of CNodes                                                                    Figure 9: The average swap throughput (i.e., the number of
+(each with 4 Quicksort tasks) on (a) Remote CPU usage and                                                                  swap in/out requests per second) and the application execu-
+(b) Execution time                                                                                                         tion time increase as the number of CNodes (each running 4
+                                                                                                                           Quicksort tasks) increases from 1 to 8.
+the most intensive MNode CPU involvement and can use up
+to 3 MNode CPU cores in the single-CNode setup. In the 8-                                                                  and 11.5% compared to One-sided (static), respectively. It
+CNode setup, some applications even fail to complete due to                                                                can outperform One-sided (dynamic) by up to 15.4%. For
+poor performance.                                                                                                          VoltDB, ODRP reduces throughput by 4.1% compared to
+   In contrast, One-sided (static) does not require the MNode                                                              One-sided (static). Regarding transaction latency, ODRP
+CPU during runtime due to its static allocation (i.e., all re-                                                             modestly elevates both the average and maximum latencies
+mote memory is provisioned at initialization time). ODRP                                                                   by less than 1% and 4.9%, respectively.
+implements all of its memory management logic through
+RDMA offloading, thereby also bypassing the MNode CPU.                                                                     5.3   Scalability Analysis
+                                                                                                                           In this section, we analyze the scalability of ODRP by in-
+Performance. The third row of Figure 7 presents the ap-
+                                                                                                                           creasing the number of CNodes and compare it to other
+plication performance (execution time or throughput). The
+                                                                                                                           baselines. We choose Quicksort because its swap frequency
+red line indicates the performance with 100% local mem-
+                                                                                                                           is relatively high, which can more effectively demonstrate
+ory (optimal). For Quicksort, compared to One-sided (static),
+                                                                                                                           the sensitivity of ODRP under different scales of swap fre-
+ODRP shows a modest performance overhead of 9.7%. In
+                                                                                                                           quency.
+contrast, One-sided (dynamic) experiences a 24.3% perfor-
+mance overhead because the MNode CPU becomes satu-                                                                         Scalability with the increasing number of CNodes. Fig-
+rated, causing allocation requests to queue up. Two-sided                                                                  ure 8 shows the average execution time and remote CPU us-
+encounters substantial performance degradation, primarily                                                                  age as we increase the number of CNodes from 1 to 8, each
+due to significantly slower remote access and swap request                                                                 running four Quicksort tasks (50% local memory). Despite
+queuing. resulting in a 142.4% overhead. One-sided (dynam-                                                                 achieving ideal remote memory utilization, Two-sided ex-
+ic/4KB) shows the worst performance due to frequent MR                                                                     hibits the poorest performance and scalability. The MNode
+registering. It introduces an 80.1% performance overhead                                                                   CPU has been saturated with just one CNode. With 8 CN-
+with 75% local memory, and the application fails to com-                                                                   odes (i.e., 32 Quicksort tasks), it results in a 505% perfor-
+plete with 50% local memory.                                                                                               mance overhead compared to One-sided (static). Although
+   For Kmeans, reducing the in-memory working set has a                                                                    One-sided (dynamic) can attain up to 77% remote memory
+more severe impact on its execution time because it triggers                                                               utilization, it also overwhelms the MNode CPU with just one
+the most frequent major page faults that need swap opera-                                                                  CNode and introduces a 234% performance overhead at 8
+tions in all evaluated workloads, averaging 6,400 times per                                                                CNodes compared to One-sided (static). In contrast, ODRP
+second (46.7% higher than Quicksort). Compared to One-                                                                     offloads all memory management operations to the RNIC
+sided (static), ODRP experiences slightly higher swapping                                                                  and is not limited by the wimpy MNode CPU. Consequently,
+latency due to more frequent swap requests, as detailed in                                                                 ODRP demonstrates superior performance and scalability
+§ 5.4. In this swapping-intensive workload, ODRP intro-                                                                    compared to Two-sided and One-sided (dynamic).
+duces a 14.2% performance overhead compared to One-                                                                        Throughput-latency. To demonstrate that ODRP can scale,
+sided (static).                                                                                                            we measure the overall swap throughput with respect to the
+   For Memcached, both ODRP and One-sided (dynamic)                                                                        application execution time. As shown in Figure 9, both One-
+demonstrate negligible performance overhead when local                                                                     sided (static) and ODRP reach a saturation point for the
+memory is decreased, because the swap operations are less                                                                  swap throughput at 8 CNodes, with ODRP achieving 87.3%
+frequent. ODRP incurs a 7.2% performance overhead com-                                                                     of the swap throughput of One-sided (static). Consequently,
+pared with One-sided (static). Additionally, in terms of the                                                               ODRP incurs performance overheads of 5.7% and 14.6% at
+query latency, the average and maximum latency increases                                                                   4 and 8 CNodes, respectively. Nevertheless, ODRP signif-
+introduced by ODRP always remain below 2%.                                                                                 icantly improves remote memory utilization, achieving 3 ×
+   For BC and PR, ODRP’s performance overhead is 6.3%                                                                      better utilization than One-sided (static).
+
+
+
+1110                    22nd USENIX Symposium on Networked Systems Design and Implementation                                                                                                        USENIX Association
+       Page Load                                Mapped Page Store                 One-sided (Static)                      555
+       Unmapped Page Store                      Page Load (I/O depth = 10)                                                                  1 worker                 24 concurrent workers
+                               12
+           Throughput (GB/s)
+                                                                                                                          550
+                               10                                                                                         140
+
+
+
+
+                                                                                                           Latency (us)
+                                8
+                                                                                                                          135
+                                6                                                                                          20
+                                4                                                                                          15
+                                2
+                                                                                                                           10
+                                0
+                                    0   4   8     12     16     20    24     28       32                                    5
+                                                 # CNode threads
+                                                                                                                            0
+Figure 10: The throughput of different data path operations                                                                     One-sided
+                                                                                                                                 (Static)
+                                                                                                                                            Allocation
+                                                                                                                                            (Dynamic)
+                                                                                                                                                         Two-sided     ODRP
+                                                                                                                                                                       Load
+                                                                                                                                                                                 ODRP
+                                                                                                                                                                                  Store
+                                                                                                                                                                                            ODRP
+                                                                                                                                                                                            Store
+                                                                                                                                                                                (mapped) (unmapped)
+in ODRP and One-sided (static).
+                                                                                                       Figure 11: Latency of various data path operations.
+Microbenchmark analysis. To further analyze the scalabil-                                              Allocation refers to acquiring a 1 MB memory slab (i.e.,
+ity of ODRP, we evaluate the throughput of various data                                                MR) in One-sided (dynamic).
+path operations in ODRP and One-sided (static). As shown                                               most frequent operations, namely load and mapped store,
+in Figure 10, the throughput of page load operation with                                               have latencies of 5.5 µs and 4.6 µs, respectively. Note that
+high I/O depth reaches 92.1% of the throughput achieved                                                such an increase in latency can be mitigated by the swap
+by RDMA READ/WRITE operations, i.e., data path oper-                                                   system, e.g., with page prefetching and asynchronous page
+ations in One-sided (static). The unmapped page store oper-                                            store. In comparison, the data path operations in Two-sided
+ation exhibits the lowest throughput because the throughput                                            have significantly higher latency, 3.8× than that of the native
+of RDMA atomic FAA, which is required by it, is an order of                                            one-sided operations. Note that One-sided (dynamic) also
+magnitude lower than that of RDMA READ/WRITE [34].                                                     utilizes native one-sided operations in the data path, and the
+   Even though ODRP introduces overhead to swap re-                                                    latency of Allocation is not excessive. This explains why
+quests, application performance in ODRP is still on par with                                           One-sided (dynamic) does not introduce substantial perfor-
+that in One-sided (static). This can be attributed to two rea-                                         mance overhead when the MNode CPU is not overly over-
+sons. First, page load requests account for the majority of                                            whelmed.
+all requests (more than 60% of the swap requests are page                                                 When there are 24 concurrent workers issuing requests,
+load) and they are sent by the CNode’s swap backend in a                                               there is an order of magnitude increase in the latency of
+batched manner due to page prefetching, where the perfor-                                              Allocation and Two-sided data path operations due to
+mance of ODRP and One-sided (static) is similar. Mean-                                                 the overloaded MNode CPU. This explains why both One-
+while, the least efficient unmapped page store operation only                                          sided (static) and Two-sided experience a sharp decrease in
+accounts for approximately 10% of the requests. Second, the                                            performance as the number of CNode rises (see Figure 8).
+RNIC supports a high throughput of RDMA requests, such
+that even applications with high swap frequency can barely                                             The effect of ODRP optimizations. To quantify ODRP’s
+saturate it (see Figure 9).                                                                            optimizations for WR chains, we break down the execu-
+                                                                                                       tion time of the unmapped page store WR chain. The naive
+Comparisons with baselines with sufficient MNode CPU.                                                  unmapped page store exhibits an unacceptable latency of
+We further include two baselines where enough MNode CPU                                                35.9 µs. StoreDecision (§ 4.4) splits the page store op-
+cores are provisioned to One-sided (dynamic) and Two-                                                  eration into mapped page store and unmapped page store
+sided. As shown in Figure 8, Two-sided costs up to 16                                                  to avoid an if statement in the WR chain, saving one
+MNode CPU cores, but it still cannot achieve the throughput                                            CAS and one WRITE and reducing the latency by 1.9 µs.
+of ODRP and incurs up to a 67.3% performance overhead                                                  CalcTTAddr (§ 4.3) avoids calculating tt_addr in the
+compared to ODRP. One-sided (dynamic), being less de-                                                  WR chain, saving one FAA WR and one EndianSwap
+manding on the MNode CPU, can achieve higher throughput                                                WR and reducing latency the by 2.4 µs. RecycleHelper
+with up to 10 MNode CPU cores. Nevertheless, it remains                                                (§ 4.4) prevents the use of additional FAA and EndianSwap
+46.4% slower compared to ODRP at 8 CNodes due to addi-                                                 WRs for reactivating WR chains, reducing the latency by
+tional time spent on memory (de)allocation. This is because                                            16 µs. Finally, EndianSwap (§ 4.2) reduces the number of
+the (de)allocation operations are costly when executed with                                            WRs needed for the endian conversion from 8 READ to 1
+the MNode CPU, and they are not rare during execution, oc-                                             READ with 8 SGEs, further reducing the latency by 6.2 µs.
+curring on average 3,000 times per second.
+5.4   Factor Analysis                                                                                  6    D ISCUSSION
+Figure 11 shows the latency of various data path operations                                            Extensibility. We implemented ODRP’s CNode backend
+in ODRP and baseline systems. When there is only one                                                   and the WR chain offloading (based on the RedN frame-
+worker issuing requests (without resource competition), the                                            work [34]) with about 1,300 and 2,400 lines of C code, re-
+one-sided RDMA READ/WRITE in One-sided (static) ex-                                                    spectively. Our prototype implementation only considers a
+hibits the lowest latency, measuring at 2.9 µs. In ODRP, the                                           setup where multiple CNodes share one MNode. However,
+
+
+
+USENIX Association                                                         22nd USENIX Symposium on Networked Systems Design and Implementation                                                       1111
+                                                                  However, none of these studies fully utilize remote memory
+                                                                  due to their static and coarse-grained remote memory man-
+                                                                  agement. ODRP focuses on providing fine-grained memory
+                                                                  management with RDMA offloading.
+                                                                  Fine-grained Remote Memory Management. CoRM [38]
+                                                                  reduces memory fragmentation by leveraging Mellanox’s
+Figure 12: Analysis of ODRP optimizations to the average          ODP feature [5] to achieve remote memory compaction.
+latency of unmapped store.                                        However, CoRM requires intensive CPU involvement to
+ODRP can be easily extended to support a multi-CNode-             compact memory, which is not suitable for wimpy MNode
+multi-MNode setup. To achieve this, a CNode only needs to         CPU cores. Programmable hardware devices have also been
+partition its swap space across different MNodes and then         adopted to support complex computation offloading, such as
+locates the respective MNodes accordingly during runtime.         SmartNICs and FPGAs. Clio [21] relies on dedicated FP-
+   Furthermore, ODRP supports configurable allocation and         GAs and network to virtualize and manage remote memory
+access granularity, making it compatible for integration with     at a 4 MB granularity. TDMem [22] also utilizes specialized
+other memory disaggregation systems [36, 43, 20, 33] that         FPGAs and backbone network to support fine-grained and
+focus on optimizing CNode runtime. ODRP can improve               secure memory disaggregation. However, utilizing such spe-
+their remote memory utilization while preserving the ben-         cialized programmable hardware comes with higher costs,
+efits of an optimized CNode runtime.                              additional maintenance burdens, and longer deployment cy-
+                                                                  cles [7]. ODRP aims to provide fine-grained memory man-
+Memory Overhead of Translation Table. In ODRP, the                agement on commodity RNICs.
+MNode maintains a TT for each CNode that connects to it.
+The TT size depends on the size of the swap space provi-          RDMA Offloading. Hyperloop [23] was the first to demon-
+sioned to CNodes. Each TT entry stores an 8 B free page           strate that offloading complex functionality to RNICs can
+address. For a 32 GB swap space, the TT only occupies 64          be achieved by combining native RDMA WRs. It lever-
+MB of memory (0.2% memory overhead). Furthermore, this            ages this offloading capability to eliminate CPU’s involve-
+memory overhead can be alleviated by registering TTs as           ment from the critical path of replicated transactions in stor-
+On-Demand-Paging MRs [5].                                         age systems. Furthermore, RedN [34] has recently proven
+                                                                  that RDMA is actually Turing-complete by carefully chain-
+Suggestions to Future RNIC Vendors. Currently, the                ing self-modifying and data-dependent RDMA WRs. RedN
+RNIC can only fetch and execute WRs one-by-one from               provides a blueprint for offloading arbitrary computation
+the WQ in host memory if preceding WRs need to update             logic onto RNICs, and demonstrates its effectiveness and
+subsequent WRs. This hampers efficiency when offloading           efficiency with two simple use cases: hash lookup and list
+complex functionalities. In the future, RNICs could incorpo-      traversal. ODRP utilizes RDMA offloading to provide fine-
+rate a prefetching mechanism to speed up the execution of         grained and efficient remote memory management, bringing
+the self-modifying WR chains. Additionally, we encourage          ideal remote memory utilization.
+RNIC vendors to provide primitives with richer semantics.
+We have demonstrated that implementing this would not be          8   C ONCLUSION
+overly challenging based on the current RNIC hardware. By         ODRP demonstrates the viability of fully offloading a com-
+introducing more powerful WRs, the length of WR chain can         plex system (remote swap device) to RNIC, which achieves
+be reduced, and the development effort can be saved.              nearly zero remote CPU usage, high remote memory utiliza-
+                                                                  tion, and low performance overhead. We highlight the ad-
+7   R ELATED W ORK                                                vantages and limitations of RDMA offloading and, more im-
+RDMA-based Remote Swapping. Previous research stud-               portantly, we propose the use of client-assisted principle to
+ies have adopted RDMA remote memory as a swap back-               mitigate many of the limitations.
+end [19, 11, 33, 28, 43, 40]. Infiniswap [19] places frequently
+accessed area of its swap space in remote memory to boost         ACKNOWLEDGMENT
+performance. Fastswap [11] further improves swapping per-         We sincerely thank all the anonymous reviewers, whose
+formance by utilizing frontswap [3] interfaces. It makes          reviews, feedbacks, and suggestions have significantly
+non-critical operations asynchronous and creates a dedicated      strengthened our work. This research was supported in part
+thread for asynchronous page reclamation. Leap [28] designs       by the National Natural Science Foundation of China (No.
+a more efficient page prefetching policy suited for remote        62202292), the National Key Research & Development Pro-
+memory, which is based on majority-based pattern detection.       gram of China (No. 2022YFB4500700), the Fundamental
+DiLOS [43] proposes to use a single address space operat-         Research Funds for the Central Universities, and research
+ing system (SASOS) to reduce kernel-user switching over-          grants from Huawei Technologies and Intel. Corresponding
+head and improve performance with user-space semantics.           author: Jinyu Gu (gujinyu@sjtu.edu.cn).
+
+
+
+1112   22nd USENIX Symposium on Networked Systems Design and Implementation                                USENIX Association
+R EFERENCES                                                            scale computing. In 49th Annual IEEE/ACM Interna-
+                                                                       tional Symposium on Microarchitecture, MICRO 2016,
+ [1] Enabling the Modern Data Center – RDMA for the En-                Taipei, Taiwan, October 15-19, 2016, pages 6:1–6:13.
+     terprise. https://www.infinibandta.org/.                          IEEE Computer Society, 2016.
+ [2] Extended Atomics Support. https://docs.nvidia.com/           [16] Aleksandar Dragojević, Dushyanth Narayanan, Miguel
+     networking/display/rdmacore50/Extended+Atomics.                   Castro, and Orion Hodson. FaRM: Fast remote mem-
+ [3] Frontswap. https://www.kernel.org/doc/html/v5.5/vm/               ory. In 11th USENIX Symposium on Networked Sys-
+     frontswap.html.                                                   tems Design and Implementation (NSDI 14), pages
+ [4] memcached - a distributed memory object caching sys-              401–414, Seattle, WA, April 2014. USENIX Associ-
+     tem. https://memcached.org/.                                      ation.
+ [5] RDMA On-Demand-Paging (ODP).                        https:   [17] Aleksandar Dragojević, Dushyanth Narayanan, Ed-
+     //docs.nvidia.com/networking/display/                             mund B. Nightingale, Matthew Renzelmann, Alex
+     OFEDv501000/Optimized+Memory+Access#                              Shamis, Anirudh Badam, and Miguel Castro. No com-
+     OptimizedMemoryAccess-On-Demand-Paging(ODP).                      promises: Distributed transactions with consistency,
+                                                                       availability, and performance. In Proceedings of the
+ [6] Redis. https://redis.io/.
+                                                                       25th Symposium on Operating Systems Principles,
+ [7] Shop End-to-End High-Speed Ethernet and InfiniBand                SOSP ’15, page 54–70, New York, NY, USA, 2015.
+     Solutions. https://store.nvidia.com/en-us/networking/.            Association for Computing Machinery.
+ [8] TPC-C is an On-Line Transaction Processing Bench-            [18] Donghyun Gouk, Sangwon Lee, Miryeong Kwon, and
+     mark. https://www.tpc.org/tpcc/.                                  Myoungsoo Jung. Direct access, High-Performance
+ [9] VoltDB. Volt Active Data. https://github.com/VoltDB/              memory disaggregation with DirectCXL. In 2022
+     voltdb.                                                           USENIX Annual Technical Conference (USENIX ATC
+[10] Advanced transport.              https://docs.nvidia.com/         22), pages 287–294, Carlsbad, CA, July 2022.
+     networking/display/OFEDv502180/Advanced+                          USENIX Association.
+     Transport, 2023.                                             [19] Juncheng Gu, Youngmoon Lee, Yiwen Zhang,
+[11] Emmanuel Amaro, Christopher Branner-Augmon, Zhi-                  Mosharaf Chowdhury, and Kang G. Shin. Efficient
+     hong Luo, Amy Ousterhout, Marcos K. Aguilera, Au-                 memory disaggregation with infiniswap.         In 14th
+     rojit Panda, Sylvia Ratnasamy, and Scott Shenker. Can             USENIX Symposium on Networked Systems Design
+     far memory improve job throughput? In Proceedings of              and Implementation (NSDI 17), pages 649–667,
+     the Fifteenth European Conference on Computer Sys-                Boston, MA, March 2017. USENIX Association.
+     tems, EuroSys ’20, New York, NY, USA, 2020. Asso-            [20] Zhiyuan Guo, Zijian He, and Yiying Zhang. Mira: A
+     ciation for Computing Machinery.                                  program-behavior-guided far memory system. In Pro-
+[12] Berk Atikoglu, Yuehai Xu, Eitan Frachtenberg, Song                ceedings of the 29th Symposium on Operating Systems
+     Jiang, and Mike Paleczny. Workload analysis of a                  Principles, SOSP ’23, page 692–708, New York, NY,
+     large-scale key-value store. In Proceedings of the 12th           USA, 2023. Association for Computing Machinery.
+     ACM SIGMETRICS/PERFORMANCE Joint Interna-                    [21] Zhiyuan Guo, Yizhou Shan, Xuhao Luo, Yutong
+     tional Conference on Measurement and Modeling of                  Huang, and Yiying Zhang. Clio: A hardware-software
+     Computer Systems, SIGMETRICS ’12, page 53–64,                     co-designed disaggregated memory system. In Pro-
+     New York, NY, USA, 2012. Association for Comput-                  ceedings of the 27th ACM International Conference
+     ing Machinery.                                                    on Architectural Support for Programming Languages
+[13] Scott Beamer, Krste Asanovic, and David A. Patterson.             and Operating Systems, ASPLOS ’22, page 417–433,
+     The GAP benchmark suite. CoRR, abs/1508.03619,                    New York, NY, USA, 2022. Association for Comput-
+     2015.                                                             ing Machinery.
+[14] Irina Calciu, M. Talha Imran, Ivan Puddu, Sanidhya           [22] Taekyung Heo, Seunghyo Kang, Sanghyeon Lee, Soo-
+     Kashyap, Hasan Al Maruf, Onur Mutlu, and Aasheesh                 jin Hwang, and Jaehyuk Huh. Hardware-assisted
+     Kolli. Rethinking software runtimes for disaggregated             trusted memory disaggregation for secure far memory.
+     memory. In Proceedings of the 26th ACM International              CoRR, abs/2108.11507, 2021.
+     Conference on Architectural Support for Programming          [23] Daehyeok Kim, Amirsaman Memaripour, Anirudh
+     Languages and Operating Systems, ASPLOS ’21, page                 Badam, Yibo Zhu, Hongqiang Harry Liu, Jitu Pad-
+     79–92, New York, NY, USA, 2021. Association for                   hye, Shachar Raindel, Steven Swanson, Vyas Sekar,
+     Computing Machinery.                                              and Srinivasan Seshan.       Hyperloop: Group-based
+[15] Alexandros Daglis, Dmitrii Ustiugov, Stanko No-                   nic-offloading to accelerate replicated transactions in
+     vakovic, Edouard Bugnion, Babak Falsafi, and Boris                multi-tenant storage systems. In Proceedings of the
+     Grot. Sabres: Atomic object reads for in-memory rack-
+
+
+
+USENIX Association                        22nd USENIX Symposium on Networked Systems Design and Implementation          1113
+     2018 Conference of the ACM Special Interest Group on     [32] Nathan Pemberton. Exploring the disaggregated mem-
+     Data Communication, SIGCOMM ’18, page 297–312,                ory interface design space. In Workshop on Resource
+     New York, NY, USA, 2018. Association for Computing            Disaggregation (WORD), 2019.
+     Machinery.                                               [33] Yifan Qiao, Chenxi Wang, Zhenyuan Ruan, Adam
+[24] Haewoon Kwak, Changhyun Lee, Hosung Park, and                 Belay, Qingda Lu, Yiying Zhang, Miryung Kim,
+     Sue Moon. What is Twitter, a social network or a news         and Guoqing Harry Xu.          Hermit: Low-Latency,
+     media? In WWW ’10: Proceedings of the 19th interna-           High-Throughput, and transparent remote memory via
+     tional conference on World wide web, pages 591–600,           Feedback-Directed asynchrony. In 20th USENIX Sym-
+     New York, NY, USA, 2010. ACM.                                 posium on Networked Systems Design and Implemen-
+[25] Youngmoon Lee, Hasan Al Maruf, Mosharaf Chowd-                tation (NSDI 23), pages 181–198, Boston, MA, April
+     hury, Asaf Cidon, and Kang G. Shin. Hydra : Resilient         2023. USENIX Association.
+     and highly available remote memory. In 20th USENIX       [34] Waleed Reda, Marco Canini, Dejan Kostić, and Simon
+     Conference on File and Storage Technologies (FAST             Peter. RDMA is turing complete, we just did not know
+     22), pages 181–198, Santa Clara, CA, February 2022.           it yet! In 19th USENIX Symposium on Networked Sys-
+     USENIX Association.                                           tems Design and Implementation (NSDI 22), pages 71–
+[26] Huaicheng Li, Daniel S. Berger, Lisa Hsu, Daniel              85, Renton, WA, April 2022. USENIX Association.
+     Ernst, Pantea Zardoshti, Stanko Novakovic, Monish        [35] Benjamin Rothenberger, Konstantin Taranov, Adrian
+     Shah, Samir Rajadnya, Scott Lee, Ishwar Agarwal,              Perrig, and Torsten Hoefler. ReDMArk: Bypassing
+     Mark D. Hill, Marcus Fontoura, and Ricardo Bianchini.         RDMA security mechanisms. In 30th USENIX Security
+     Pond: Cxl-based memory pooling systems for cloud              Symposium (USENIX Security 21), pages 4277–4292.
+     platforms. In Proceedings of the 28th ACM Interna-            USENIX Association, August 2021.
+     tional Conference on Architectural Support for Pro-      [36] Zhenyuan Ruan, Malte Schwarzkopf, Marcos K. Aguil-
+     gramming Languages and Operating Systems, Volume              era, and Adam Belay. AIFM: High-Performance,
+     2, ASPLOS 2023, page 574–587, New York, NY, USA,              Application-Integrated far memory. In 14th USENIX
+     2023. Association for Computing Machinery.                    Symposium on Operating Systems Design and Imple-
+[27] Chengzhi Lu, Kejiang Ye, Guoyao Xu, Cheng-Zhong               mentation (OSDI 20), pages 315–332. USENIX Asso-
+     Xu, and Tongxin Bai. Imbalance in the cloud: An anal-         ciation, November 2020.
+     ysis on alibaba cluster trace. In 2017 IEEE Interna-     [37] Yizhou Shan, Yutong Huang, Yilun Chen, and Yiying
+     tional Conference on Big Data (Big Data), pages 2884–         Zhang. LegoOS: A disseminated, distributed OS for
+     2892, 2017.                                                   hardware resource disaggregation. In 13th USENIX
+[28] Hasan Al Maruf and Mosharaf Chowdhury. Effec-                 Symposium on Operating Systems Design and Imple-
+     tively prefetching remote memory with leap. In 2020           mentation (OSDI 18), pages 69–87, Carlsbad, CA, Oc-
+     USENIX Annual Technical Conference (USENIX ATC                tober 2018. USENIX Association.
+     20), pages 843–857. USENIX Association, July 2020.       [38] Konstantin Taranov, Salvatore Di Girolamo, and
+[29] Hasan Al Maruf, Hao Wang, Abhishek Dhanotia, Jo-              Torsten Hoefler. Corm: Compactable remote memory
+     hannes Weiner, Niket Agarwal, Pallab Bhattacharya,            over rdma. In Proceedings of the 2021 International
+     Chris Petersen, Mosharaf Chowdhury, Shobhit Kanau-            Conference on Management of Data, SIGMOD ’21,
+     jia, and Prakash Chauhan. Tpp: Transparent page               page 1811–1824, New York, NY, USA, 2021. Associa-
+     placement for cxl-enabled tiered-memory. In Proceed-          tion for Computing Machinery.
+     ings of the 28th ACM International Conference on Ar-     [39] Chenxi Wang, Haoran Ma, Shi Liu, Yuanqi Li,
+     chitectural Support for Programming Languages and             Zhenyuan Ruan, Khanh Nguyen, Michael D. Bond,
+     Operating Systems, Volume 3, ASPLOS 2023, page                Ravi Netravali, Miryung Kim, and Guoqing Harry Xu.
+     742–755, New York, NY, USA, 2023. Association for             Semeru: A Memory-Disaggregated managed runtime.
+     Computing Machinery.                                          In 14th USENIX Symposium on Operating Systems De-
+[30] Jacob Nelson-Slivon, Reilly Yankovich, Ahmed Has-             sign and Implementation (OSDI 20), pages 261–280.
+     san, and Roberto Palmieri. Brief announcement: Rome:          USENIX Association, November 2020.
+     Wait-free objects for rdma. In Proceedings of the 36th   [40] Chenxi Wang, Yifan Qiao, Haoran Ma, Shi Liu, Wen-
+     ACM Symposium on Parallelism in Algorithms and Ar-            guang Chen, Ravi Netravali, Miryung Kim, and Guo-
+     chitectures, SPAA ’24, page 371–373, New York, NY,            qing Harry Xu. Canvas: Isolated and adaptive swap-
+     USA, 2024. Association for Computing Machinery.               ping for Multi-Applications on remote memory. In
+[31] Ruslan Nikolaev. A scalable, portable, and memory-            20th USENIX Symposium on Networked Systems De-
+     efficient lock-free fifo queue. Schloss Dagstuhl –            sign and Implementation (NSDI 23), pages 161–179,
+     Leibniz-Zentrum für Informatik, 2019.                        Boston, MA, April 2023. USENIX Association.
+
+
+
+
+1114   22nd USENIX Symposium on Networked Systems Design and Implementation                        USENIX Association
+[41] Xingda Wei, Zhiyuan Dong, Rong Chen, and Haibo
+     Chen. Deconstructing rdma-enabled distributed trans-
+     actions: Hybrid is better! In 13th USENIX Sympo-
+     sium on Operating Systems Design and Implementa-
+     tion, OSDI ’18, pages 233–251, 2018.
+[42] Xingda Wei, Jiaxin Shi, Yanzhe Chen, Rong Chen, and
+     Haibo Chen. Fast in-memory transaction processing
+     using rdma and htm. In Proceedings of the 25th Sympo-
+     sium on Operating Systems Principles, SOSP ’15, page
+     87–104, New York, NY, USA, 2015. Association for
+     Computing Machinery.
+[43] Wonsup Yoon, Jisu Ok, Jinyoung Oh, Sue Moon, and
+     Youngjin Kwon. Dilos: Do not trade compatibility for
+     performance in memory disaggregation. In Proceed-
+     ings of the 18th European Conference on Computer
+     Systems, EuroSys ’23, Rome, Italy, May 2023.
+[44] Matei Zaharia, Mosharaf Chowdhury, Tathagata Das,
+     Ankur Dave, Justin Ma, Murphy McCauly, Michael J.
+     Franklin, Scott Shenker, and Ion Stoica. Resilient dis-
+     tributed datasets: A fault-tolerant abstraction for in-
+     memory cluster computing. In Steven D. Gribble and
+     Dina Katabi, editors, Proceedings of the 9th USENIX
+     Symposium on Networked Systems Design and Imple-
+     mentation, NSDI 2012, San Jose, CA, USA, April 25-
+     27, 2012, pages 15–28. USENIX Association, 2012.
+[45] Pengfei Zuo, Jiazhao Sun, Liu Yang, Shuangwu Zhang,
+     and Yu Hua. One-sided rdma-conscious extendible
+     hashing for disaggregated memory. In 2021 USENIX
+     Annual Technical Conference (USENIX ATC 21), pages
+     15–29. USENIX Association, July 2021.
+
+
+
+
+USENIX Association                      22nd USENIX Symposium on Networked Systems Design and Implementation   1115
+

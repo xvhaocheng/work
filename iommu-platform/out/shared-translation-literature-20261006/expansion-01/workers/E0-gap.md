@@ -1,0 +1,480 @@
+# 共享地址翻译/IOMMU 研究线：增量文献缺口分析报告
+
+**任务定位**：本报告是"72 项独立工作"专题（`iommu-platform/docs/shared-translation-literature-20261006.md`）的**增量扩展缺口分析**，不是新综述，不宣称任何创新点已成立，也不宣称任何方向"全领域空白"。所有新增候选均为**记忆线索**，字段一律标注不确定性与置信度，**须由 Codex 逐项联网核验题名、作者、年份、venue、DOI、可获取全文**。本 worker 无浏览/执行工具，未做任何网络访问、下载或验证。
+
+**输入与引用路径**
+- `iommu-platform/out/shared-translation-literature-20261006/records/baseline-works.json`（72 项基线，逐行 id 见下）
+- `iommu-platform/docs/shared-translation-literature-20261006.md`（专题主图）
+- `iommu-platform/docs/research-landscape-20261005.md`（广域地图，36 项 + 官方文档）
+- `iommu-platform/out/research-landscape-20261005/source-manifest.json`（取得记录）
+
+**必须先说清的两个计数口径问题（避免"充数"）**
+1. 72 项专题（baseline-works.json）与广域地图（research-landscape-20261005.md §5，L58–L126）**不是同一集合**。广域地图中已有 UCP（L79）、KPart（L80）、DAE（L66）、Mosaic（L113）、PagedAttention（L114）、vAttention（L116）、vTensor（L117）、GMLake（L118）、OASIS（L125）等，**尚未进入 72 专题**。下文中凡属此类，我单列"已在广域地图、未入72专题"，供 Codex 决定是并入专题还是保持分离，避免重复计数。
+2. 广域地图 §7.2（L164–L167）已把 **Pond / HELM / CDFD / SoftWalker** 标为"仅相邻分支/边界索引、未全文审查"。它们正是本报告 Tier A 的补全文与深挖重点，**不是新发现**，而是"已知但未读透"。
+
+---
+
+## 0. 置信度与不确定字段标注约定
+
+- **高**：题名+venue+年份 三者我有较强记忆，且部分已在现有文档被引用（如 Pond）。
+- **中**：题名或 venue 之一不确定，年份可能有 ±1 年漂移。
+- **低**：仅有主题记忆，题名/作者/年份均需检索确认；**不得据此推断机制**。
+- 每条明示"不确定字段"。**任何"与现有 id 的演进链"都是待核假设，不是已证事实。**
+
+---
+
+## 1. 新增候选线索（44 项，分级）
+
+### Tier A — 直接关联（多设备共享翻译 / CXL 存储 / IOV / 观测，14 项）
+
+**A1. Pond: CXL-Based Memory Pooling Systems for Cloud Platforms**
+- 作者（不确定）：Huaicheng Li 等（微软）。
+- 可能年份：ASPLOS 2023。
+- 关键词：`CXL memory pooling`, `memory tiering`, `capacity stranding`, `cloud`.
+- 演进链：接 CATO(`cato2026`)、CLAP(`clap2025`)、HDPAT(`hdpat2026`) 的"远端/池化内存 + 中央翻译"前提。
+- 不确定字段：作者列表；是否只有官方 PDF 一个版本。
+- 备注：**已在广域地图 L164 边界索引，未入 72 专题**。主题图称其为"相邻分支"，Codex 应确认它是否值得升入主专题。置信：高（题名/venue），中（作者）。
+
+**A2. DirectCXL: Direct Access to Disaggregated Memory**
+- 作者（不确定）：Donghyun Gouk 等。
+- 可能年份：USENIX ATC 2022。
+- 关键词：`CXL disaggregated memory`, `direct load/store`, `memory blade`.
+- 演进链：Pond(A1) 的硬件对照实现；接 SPARTA(`sparta2020`) memory-side 放置问题。
+- 不确定字段：venue（ATC 或 MICRO 需核）；是否有 TLB/翻译侧讨论。
+- 置信：中。
+
+**A3. Clio: A Hardware-Software Co-Designed Disaggregated Memory System**
+- 作者（不确定）：Zhiyu Guo 等。
+- 可能年份：ASPLOS 2022。
+- 关键词：`disaggregated memory`, `remote memory`, `compute-side/protocol`.
+- 演进链：Pond(A1)、TMO(A4)；与 `dvm2018` 的"去虚拟化"形成对照（Clio 讨论的是内存侧，非设备翻译）。
+- 不确定字段：作者/年份。置信：中。
+
+**A4. TMO: Transparent Memory Offloading in Datacenters**
+- 作者（不确定）：Johannes Weiner 等（Meta）。
+- 可能年份：ASPLOS 2022。
+- 关键词：`memory offloading`, `PSI`, `proactive reclaim`, `offload thrash`.
+- 演进链：接 `idyll2023`、`observuvm2026` 的"驱逐/迁移代价"；与 `contiguitas2023`(L295–L325) 的内存 contiguity 话题相邻。
+- 不确定字段：作者顺序。置信：中。
+- 备注：与 `contiguitas2023` 作者名单有重叠线索（Weiner/van Riel），但**不得据此推断同一机制**。
+
+**A5. TPP: Transparent Page Placement for CXL-Enabled Tiered-Memory**
+- 作者（不确定）：Hasan Al Maruf 等。
+- 可能年份：ASPLOS 2023。
+- 关键词：`tiered memory`, `page placement`, `NUMA hint`, `CXL DRAM as tier`.
+- 演进链：接 `grit2024`、`granularity2018`、`idyll2023` 的放置+失效链。
+- 不确定字段：作者列表；是否含翻译更新成本分析。置信：中。
+
+**A6. Memtis: Efficient Memory Tiering with Dynamic Page Classification and Page Size Determination**
+- 作者（不确定）：Taehyung Lee 等。
+- 可能年份：SOSP 2023。
+- 关键词：`memory tiering`, `huge page`, `page classification`.
+- 演进链：接 `translation_ranger2019`、`contiguitas2023` 的大页/覆盖讨论；`clap2025` 的页大小权衡。
+- 不确定字段：作者/venue。置信：中。
+
+**A7. HeMem: Scalable Tiered Memory Management for Big Data Applications and Real NVM**
+- 作者（不确定）：Amanda Raybuck 等。
+- 可能年份：SOSP 2021。
+- 关键词：`tiered memory`, `sampling`, `access count`, `NVM`.
+- 演进链：接 `observuvm2026`（采样观测）、`batch_uvm2020`（驱逐）。
+- 不确定字段：作者列表；副标题。置信：中。
+
+**A8. Hermit: Low-Latency, High-Throughput, and Transparent Remote Memory via Feedback-Directed Asynchrony**
+- 作者（不确定）：Yifan Yan 等。
+- 可能年份：ASPLOS 2024。
+- 关键词：`remote memory`, `feedback-directed`, `asynchrony`, `RDMA`.
+- 演进链：与 `hdpat2026`、`wafertrans2026` 的"远端翻译探测"形成"远端数据 vs 远端翻译"对照。
+- 不确定字段：作者/年份。置信：低–中。
+
+**A9. CXL-ANNS: Software-Hardware Collaborative Memory Disaggregation and Computation for Billion-Scale Approximate Nearest Neighbor Search**
+- 作者（不确定）：Junhyeok Jang 等。
+- 可能年份：USENIX ATC 2023。
+- 关键词：`CXL near-memory`, `ANNS`, `disaggregated compute`.
+- 演进链：接 `sparta2020` memory-side 放置；近存计算分支。
+- 不确定字段：作者/venue。置信：中。
+
+**A10. Intel Scalable IOV（PASID/共享工作队列）**
+- 作者（不确定）：Intel 白皮书/规范，非典型会议论文；是否被整理成正式论文需核。
+- 可能年份：约 2019。
+- 关键词：`Scalable IOV`, `PASID`, `shared work queue`, `ENQCMD`, `device assignment`.
+- 演进链：接 `riommu2015`、`iommu_scalable2015`、`riscvsva2025`。**device ATS/PASID 生命周期主线的关键工业侧语义来源**。
+- 不确定字段：是否存在可引用正式论文；这是**规范/白皮书**，按专题 §6（L128–L139）惯例应单列"非论文"。
+- 置信：中（存在），低（可作为论文引用）。
+
+**A11. vIOMMU: Efficient IOMMU Emulation**
+- 作者（不确定）：Muli Ben-Yehuda 等（作者集合与 `riommu2015` 有重叠线索）。
+- 可能年份：USENIX ATC 2011。
+- 关键词：`vIOMMU`, `DMA remapping`, `virtualization`, `shadow page table`.
+- 演进链：接 `riommu2015`(`iommu-platform/out/.../baseline-works.json` L1246–L1270)、`iommu_scalable2015`(L756–L780)，是"IOMMU 虚拟化"经典前作。
+- 不确定字段：年份/venue（ATC 2011 为记忆，需核）。置信：中。
+
+**A12. HELM（fault telemetry → locality metrics）**
+- 现状：**已在广域地图 L165 边界索引**（SC 2025，真实 Titan V，指标离线计算）。
+- 关键词：`fault telemetry`, `locality metrics`, `GPU observability`.
+- 演进链：接 `observuvm2026`(L1112–L1135) 的"运行时观测不足"卡点。
+- 本报告动作建议：**升入 72 专题全文审查**，而非当作新发现。置信：高（已存在）。
+
+**A13. CDFD（粗复制 + 细去重，利用 NVLink 与空闲显存）**
+- 现状：**已在广域地图 L166 边界索引**（ISCA 2026）。
+- 关键词：`coarse-grain replication`, `fine-grain dedup`, `NVLink`, `idle memory`.
+- 演进链：接 `clover2026`（页表副本存储量）、`hdpat2026`（晶圆规模副本）、`mgvm2022`（粗放置热点）。
+- 不确定字段：作者 PDF 是否可得；摘要数字是否普适。
+- 本报告动作建议：全文审查后再判断是否与 `clover2026` 形成直接竞争。置信：高（已存在）。
+
+**A14. SoftWalker（SM 软件 walk warp 借计算资源）**
+- 现状：**已在广域地图 L167 边界索引**（MICRO 2025）。
+- 关键词：`software page walk`, `warp specialization`, `compute units`.
+- 演进链：**与 `cuptw2026`(L382–L407) 直接竞争/互补**（cuPTW 用空闲 CU 并行 PTW）。
+- 不确定字段：完整限制与评估（广域地图明确"待读"）。
+- 本报告动作建议：与 `cuptw2026` 成对深读，这是"翻译执行位置"主线（专题 L67）最强近邻之一。置信：高（已存在）。
+
+### Tier B — 机制近邻（共享 TLB / 缓存 QoS / 页表更新与回收，16 项）
+
+> 注意：B1、B2 已在广域地图出现、未入 72 专题。
+
+**B1. UCP: Utility-Based Cache Partitioning**
+- ASPLOS/MICRO 2006（广域地图 L79 记为 MICRO 2006）；作者 G. E. Suh / L. Rudolph（不确定顺序，文档 L79 指向 Qureshi 题名——**此处存在线索冲突，必须核**）。
+- 关键词：`utility-based partitioning`, `UMON`, `cache QoS`.
+- 演进链：接 `mask2018`(L921–L949)、`walk_stealing2021`(L1922–L1945) 的"利用率 vs 可预测性"卡点（广域地图卡点 2，L39–L40）。
+- 不确定字段：**作者/venue 与文档 L79 链接指向不一致，高优先核**。置信：中。
+
+**B2. KPart（真实 LLC way-partitioning + 聚类 + DynaWay）**
+- HPCA 2018（广域地图 L80）；作者线索含 D. Sanchez 组。
+- 关键词：`way partitioning`, `clustering`, `speedup curve`, `real hardware`.
+- 演进链：`mask2018`、`walk_stealing2021`；广域地图称其显示"per-app way partition 粒度粗、associativity 低"。
+- 不确定字段：作者列表。置信：中。
+
+**B3. DIP/AIP（Bimodal / Adaptive Insertion Policy）**
+- 作者（不确定）：Moinuddin Qureshi 等。可能年份：ISCA 2007。
+- 关键词：`insertion policy`, `LIP`, `DIP`, `set dueling`.
+- 演进链：TLB/翻译缓存替换策略的近邻基础；接 `colt2012`(L269–L293) 的结构设计讨论。
+- 不确定字段：年份。置信：中。
+
+**B4. RadixVM: Scalable Address Spaces for Multithreaded Applications**
+- 作者（不确定）：Austin T. Clements 等。可能年份：EuroSys 2013。
+- 关键词：`radix tree`, `per-address locking`, `mmap scalability`, `page table lock`.
+- 演进链：**软件页表更新/并发**主线的经典前作；接 `mitosis2020`(L976–L1001)、`vmitosis2021`(L1838–L1864)。
+- 不确定字段：作者/年份。置信：中。
+
+**B5. DAMON: Data Access MONitor**
+- 作者（不确定）：SeongJae Park 等。可能年份：SIGMOD 2021（best paper 线索）。
+- 关键词：`DAMON`, `region-based access monitoring`, `lightweight profiling`.
+- 演进链：接 `observuvm2026`、`ssr2018`(L1540–L1564) 的观测成本卡点。
+- 不确定字段：venue/年份。置信：中。
+
+**B6. MGLRU（Multi-Gen LRU，Linux 页回收）**
+- 作者（不确定）：Yu Zhao。可能年份：Linux 6.1 合入（约 2022），**是否作为正式论文发表不确定**。
+- 关键词：`multi-generational LRU`, `page reclaim`, `working set`.
+- 演进链：接 `bypassd2024`(L163–L188)、`idyll2023`、`observuvm2026` 的软件生命周期与回收。
+- 不确定字段：**无稳定论文出处**，可能只能引用内核文档/补丁系列；按 §6 应单列"生产实现"。
+- 置信：中（存在），低（可作论文引用）。
+
+**B7. AutoNUMA: Optimizing NUMA Scheduling and Memory Placement**
+- 作者（不确定）：Jonathan Corbet 线索 / 学术版由 Z. Zhong 等（ATC 2012 线索）。可能年份：2012。
+- 关键词：`AutoNUMA`, `NUMA hinting`, `page migration`, `placement`.
+- 演进链：接 `granularity2018`(L567–L590)、`grit2024`(L624–L649)、`TPP`(A5)。
+- 不确定字段：作者/出处（内核实现 vs 论文双源）。置信：低–中。
+
+**B8. MemGuard: Memory Bandwidth Reservation System for Efficient Performance Isolation**
+- 作者（不确定）：Heechul Yun 等。可能年份：RTSS 2013。
+- 关键词：`memory bandwidth QoS`, `isolation`, `real-time`, `bank-aware`.
+- 演进链：**QoS 近邻主线**；接 `bermuda2025`(L112–L135)（SMMUv2 干扰实测）、`spimpact2025`(L1513–L1538)。
+- 不确定字段：作者/venue。置信：中。
+
+**B9. Fairness via Source Throttling（FST）**
+- 作者（不确定）：Eiman Ebrahimi 等。可能年份：ISCA 2010。
+- 关键词：`source throttling`, `fairness`, `memory system`, `multi-core`.
+- 演进链：接 `mask2018`、`walk_stealing2021`(DWS++) 的公平性维度（广域地图卡点 2）。
+- 不确定字段：作者/年份。置信：中。
+
+**B10. Thread Cluster Memory Scheduling（TCM）**
+- 作者（不确定）：Yoongu Kim 等。可能年份：MICRO 2010。
+- 关键词：`thread cluster memory scheduling`, `fairness vs throughput`, `DRAM`.
+- 演进链：QoS/调度近邻；与 B9 同一"公平-吞吐"张力线。
+- 不确定字段：年份。置信：中。
+
+**B11. ATLAS: A Scalable and High-Performance Scheduling Algorithm for Multiple Memory Controllers**
+- 作者（不确定）：Yoongu Kim 等。可能年份：HPCA 2010。
+- 关键词：`multiple memory controllers`, `scheduling`, `NUMA memory`.
+- 演进链：分布式内存节点调度近邻；接 `nocstar2018`(L1086–L1110)。
+- 不确定字段：作者。置信：中。
+
+**B12. PALLOC / 实时缓存着色（cache coloring for real-time）**
+- 关键词：`cache coloring`, `PALLOC`, `real-time`, `predictable`. 作者/年份不确定（线索指向 TU Dortmund 组）。
+- 演进链：接 `bermuda2025`、`spimpact2025` 的隔离/QoS；广域地图卡点 4（L65）。
+- 不确定字段：**题名与作者均低置信**，仅作检索方向。置信：低。
+
+**B13. TLB shootdown 实证研究（"An Empirical Study of TLB Shootdowns" 类）**
+- 关键词：`TLB shootdown`, `invalidation latency`, `many-core`, `measurement`. 作者/年份不确定。
+- 演进链：接 `didi2011`(L409–L438)、`site2017`(L1380–L1405)、`latr2018`(L865–L893)、`shadowupdate2026`(L1297–L1324)。
+- 不确定字段：题名/作者/venue 全不确定；可能是多篇。置信：低。
+- 说明：这是**需要专门检索确认存在性**的开链，不预设已存在。
+
+**B14. 推测 TLB（"SpecTLB"/speculative TLB 类）**
+- 关键词：`speculative TLB`, `translation speculation`, `rollback`. 作者/年份不确定。
+- 演进链：接 `avatar2024`(L29–L57)、`revelator2026v2`(L1214–L1244) 的推测-验证主线。
+- 不确定字段：全不确定。置信：低。
+- 说明：可能存在同名不同工作，Codex 需甄别。
+
+**B15. Page-walk cache（PWC）专文**
+- 关键词：`page walk cache`, `translation cache hierarchy`, `PWC`, `walk locality`. 作者/年份不确定。
+- 演进链：接 `translation_cache2010`(L1700–L1723)、`walk_scheduling2018`(L1893–L1920)。
+- 不确定字段：全不确定。置信：低。
+
+**B16. Range/coalesced TLB 失效接口研究**
+- 关键词：`range TLB invalidation`, `TLB coalescing`, `ASID`, `PCID`. 作者/年份不确定。
+- 演进链：接 `colt2012`、`site2017`、`shadowupdate2026` 的"失效范围 vs 成本"。
+- 不确定字段：全不确定。置信：低。
+
+### Tier C — 应用桥接（GPU/LLM/近存，14 项）
+
+> C5–C9 **已在广域地图、未入 72 专题**，列出是为了防止把"翻译需求"当新现象。
+
+**C1. vDNN: Virtualized Deep Neural Networks for Scalable, Memory-Efficient Neural Network Design**
+- 作者（不确定）：Minsoo Rhu 等。可能年份：MICRO 2016。
+- 关键词：`vDNN`, `GPU memory virtualization`, `memory offloading`, `DNN`.
+- 演进链：接 `vattention`(C6)、`GMLake`(C8)、`vTensor`(C7) 的显存虚拟化谱系。
+- 不确定字段：年份。置信：中。
+
+**C2. ZeRO-Offload: Democratizing Billion-Scale Model Training**
+- 作者（不确定）：Jie Ren 等。可能年份：USENIX ATC 2021。
+- 关键词：`ZeRO-Offload`, `CPU offload`, `optimizer state`, `memory footprint`.
+- 演进链：接 `batch_uvm2020`(L84–L110)、`observuvm2026`；形成"CPU↔GPU 搬运压力"应用侧。
+- 不确定字段：作者。置信：中。
+
+**C3. ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning**
+- 作者（不确定）：Samyam Rajbhandari 等。可能年份：SC 2021。
+- 关键词：`ZeRO-Infinity`, `NVMe offload`, `memory wall`.
+- 演进链：接 C2、`bypassd2024`（用户态共享 SSD 路径）。
+- 不确定字段：venue。置信：中。
+
+**C4. SwapAdvisor: Pushing Deep Learning Beyond the GPU Memory Limit via Smart Swapping**
+- 作者（不确定）：Chien-Chin Huang 等。可能年份：ASPLOS 2020。
+- 关键词：`swap`, `beyond GPU memory`, `operator scheduling`, `DNN`.
+- 演进链：接 C1、`suv2024`(L1594–L1619)（静态分析引导 UVM）。
+- 不确定字段：年份。置信：中。
+
+**C5. PagedAttention / vLLM**
+- 现状：**已在广域地图 L114，未入 72 专题**；SOSP 2023。
+- 关键词：`PagedAttention`, `KV cache`, `block table`, `copy-on-write`.
+- 演进链：接 `vattention`(C6)、`vTensor`(C7) 的 KV cache 管理对撞线（广域地图卡点 1）。
+- 本报告动作建议：作为 `vattention` 对照基线并行审查。置信：高（已存在）。
+
+**C6. vAttention（ASPLOS 2025 正式版）**
+- 现状：**已在广域地图 L116，未入 72 专题**。
+- 关键词：`vAttention`, `CUDA VMM`, `page-group`, `dynamic KV cache`.
+- 演进链：接 C5、`mosaic2017`(L1003–L1030) 的多页大小、`grit2024`。
+- 本报告动作建议：其"64 KiB–2 MiB page-group + 保留虚拟连续"直接关联翻译粒度，建议升入 72 专题。置信：高（已存在）。
+
+**C7. vTensor（解耦内存管理与 compute kernel）**
+- 现状：**已在广域地图 L117，未入 72 专题**；arXiv 2024。
+- 关键词：`vTensor`, `virtual memory management`, `CPU-side`, `FlexInfer`.
+- 演进链：接 C5/C6。
+- 置信：高（已存在）。
+
+**C8. GMLake（VMS 缝合物理块，训练碎片整理）**
+- 现状：**已在广域地图 L118，未入 72 专题**；ASPLOS 2024。
+- 关键词：`GMLake`, `virtual memory stitching`, `fragmentation`, `training`.
+- 演进链：接 `mosaic2017` 的原地合并/拆分、`contiguitas2023` 的物理连续性。
+- 置信：高（已存在）。
+
+**C9. OASIS（object-aware page management）**
+- 现状：**已在广域地图 L125，未入 72 专题**；HPCA 2025。
+- 关键词：`object-aware`, `page migration policy`, `MGPUSim`.
+- 演进链：接 `idyll2023`、`grit2024`、`observuvm2026` 的粒度不一致卡点（广域地图卡点 1）。
+- 置信：高（已存在）。
+
+**C10. Benchmarking a New Paradigm: An Experimental Analysis of a Real Processing-in-Memory Architecture（UPMEM）**
+- 作者（不确定）：Juan Gómez-Luna 等。可能年份：arXiv 2021（后续期刊/会议版本不确定）。
+- 关键词：`UPMEM`, `processing-in-memory`, `near-memory computing`, `benchmarking`.
+- 演进链：接 `sparta2020` memory-side 放置；近存计算主线（本任务第 3 点要求）。
+- 不确定字段：正式出版状态。置信：中。
+
+**C11. HBM-PIM / 商用量产 PIM（ISSCC/ISCA 线索）**
+- 关键词：`HBM-PIM`, `processing-in-memory`, `Samsung`, `Aquabolt-XL`. 作者/年份不确定（ISSCC 2021 线索）。
+- 演进链：近存翻译的硬件前提；接 `sparta2020`、C10。
+- 不确定字段：题名/venue。置信：低。
+
+**C12. TensorDIMM: A Practical Near-Memory Processing Architecture for Embeddings and Tensor Operations in Deep Learning**
+- 作者（不确定）：Youngeun Kwon 等。可能年份：MICRO 2019（**与线索 RecNMP 年份接近，需核**）。
+- 关键词：`near-memory`, `DIMM`, `embedding`, `tensor`.
+- 演进链：近存计算分支；接 C13。
+- 不确定字段：年份（MICRO 2019 vs ISCA 2019）。置信：中。
+
+**C13. RecNMP: Accelerating Personalized Recommendation with Near-Memory Processing**
+- 作者（不确定）：Liu Ke 等。可能年份：ISCA 2020。
+- 关键词：`near-memory processing`, `recommendation`, `DIMM`.
+- 演进链：接 C12。
+- 不确定字段：年份。置信：中。
+
+**C14. RDMA 内存注册/撤销缓存（memory registration cache & invalidation）**
+- 关键词：`RDMA memory registration`, `MR cache`, `memory windows`, `invalidation`, `deregistration`.
+- 演进链：广域地图 L188–L190 明确列"RDMA 注册缓存/撤销"为**未覆盖范围**；接 `bypassd2024`、`iommu_scalable2015` 的映射生命周期。
+- 不确定字段：**典型代表论文待定**——这是开放检索方向，可能是 `FaRM`(NSDI 2014)、`LITE`(OSDI 2018) 等，但**哪篇真正讨论注册撤销开销需逐篇核**。置信：低。
+
+**Tier 合计：14 + 16 + 14 = 44 项**，落于 30–50 目标区间。
+
+---
+
+## 2. 值得深挖的引用链（8 条）
+
+格式：链 → 现有工作**可能已解决什么** → 后续工作**具体克服了哪个假设** → **不能凭标题推断的瓶颈**。所有"已解决/克服"均为**待核假设**，须核验原文。
+
+### 链 1：共享容量 → 分布式 TLB
+`shared1993`(baseline L1326) → `synergistic2010`(L1647) → `slltlb2011`(L1406) → `icc2010`(L703) → `nocstar2018`(L1085) → `leasttlb2021`(L894)/`transfw2023`(L1671)
+- **可能已解决**：多核剔除重复翻译、借用容量、跨核预取。
+- **后续克服的假设**：从"共享总线/低延迟对称 CMP"→"NoC 远端命中昂贵"。NoCstar 这一环正是把远端 TLB 命中代价显式化。
+- **不能凭标题推断**：共享项的**一致性/失效语义**是否被处理；**跨地址空间**共享是否合法；**更新成本**是否计入收益。专题 L59、L75 已点明"共享收益与成本一起增长"，但未闭合。
+- 待核：`shared1993` 仅摘要（`shared1993` fulltext_available=false）；`synergistic2010` 仅摘要。**先补这两项全文再断言链条连续性。**
+
+### 链 2：翻译缓存层级 → 推测 → OS 协同哈希
+`translation_cache2010`(L1700) → `colt2012`(L269) → `victima2023`(L1808) → `avatar2024`(L29) → `revelator2026v2`(L1214) → (`cuptw2026` L382 / `cato2026` L190)
+- **可能已解决**：部分翻译缓存可跳过层级；coalesced TLB 覆盖；把 L2 cache block 复用作 TLB 集群。
+- **后续克服的假设**：推测翻译假设 VA→PA 可**预测**；Revelator 进一步假设 OS 可参与**分层哈希分配**让地址更可预测（广域地图 L72 明确此点）。
+- **不能凭标题推断**：验证/回退成本、误推测率、以及**借用空闲计算资源的资源机会成本**（专题 L67 已警示"不能把隐藏延迟当取消工作"）。
+
+### 链 3：严格 I/O 保护与失效成本
+`riommu2015`(L1246) → `iommu_scalable2015`(L756) → `iotlb_wall2023`(L782) → `fastsafe2024`(L492) → `bermuda2025`(L112)
+- **可能已解决**：ring 合并 IOTLB、可扩展 IOVA 分配与 per-core 延迟失效、hugepage 缓解 IOTLB miss、严格保护下保留有效中间页表缓存。
+- **后续克服的假设**：ring 顺序假设（rIOMMU）；延迟失效窗口假设（scalable 2015）。
+- **不能凭标题推断**：F&S 的保留缓存是否在**设备侧 ATS/PRI**（设备自发起请求）下仍安全；**尾延迟与多设备**如何交互。专题 L39、L65 已标"不能等同 lazy 撤销""分区不能推出 PTW/互连也隔离"。
+- 补强候选：A10（Scalable IOV）、A11（vIOMMU）、C14（RDMA 注册撤销）。
+
+### 链 4：翻译一致性 / 失效协议空间
+`unitd2010`(L1751) → `didi2011`(L409) → `hatric2017`(L651) → `site2017`(L1380) → `latr2018`(L865) → `idyll2023`(L728) → `shadowupdate2026`(L1297)
+- **可能已解决**：共享 TLB 目录（DiDi）、虚拟化下的硬件翻译一致性（HATRIC）、自失效条目（SITE）、惰性一致（LATR）、PTE 目录过滤不必要失效（IDYLL）。
+- **后续克服的假设**：广播失效假设；惰性一致的时间界假设。
+- **不能凭标题推断**：**在途（in-flight）请求**处理、**内存回收义务**、惰性一致是否有**可证明上界**。专题 L63、L79 已提示 ShadowUpdate 处理在途迁移放行，但正文未读。
+- 补强候选：B13（shootdown 实证）、B16（range invalidation）、`shadowupdate2026` 全文补全。
+
+### 链 5：多 GPU / 多模块页表放置
+`griffin2020`(L592) → `leasttlb2021`(L894) → `mgvm2022`(L951) → `transfw2023`(L1671) → `barre2024`(L59) → `idyll2023`(L728) → `grit2024`(L624) → `clap2025`(L217) → `clover2026`(L244) → `hdpat2026`(L677) → `wafertrans2026`(L1866)
+- **可能已解决**：硬件-软件协同迁移、共享/溢出感知 TLB、MCM 虚拟内存设计、远端转发、per-chiplet VM。
+- **后续克服的假设**：点对点 GPU 链路、集中式页表。
+- **不能凭标题推断**：页表**副本一致性**、**跨 chiplet shootdown 可达域**、presence 信息是否足以判断权限（专题 L49、L50 明确"presence ≠ 完整 PTE/权限一致""一致性细节待正文"）。
+- 补强候选：A13（CDFD）、C9（OASIS），以及 `clover2026`/`hdpat2026` 全文。
+
+### 链 6：GPU 翻译并发与调度
+`mask2018`(L921) → `walk_scheduling2018`(L1893) → `walk_stealing2021`(L1922) → `orchestrated2023`(L1164) → `star2024`(L1566)/`avatar2024`(L29) → `latpc2025`(L836) → `cuptw2026`(L382) → `nbwalker2026`(L1032) / `softwalker`(A14)
+- **可能已解决**：bypass/token、SIMT 感知 walk 排序、动态 walker 偷取、调度+分区联合。
+- **后续克服的假设**：静态划分 walker 会 under-utilization（DWS）；PTW 必须阻塞。
+- **不能凭标题推断**：**公平性保证**是否存在（DWS++ 牺牲吞吐）；多实例/多租户隔离下收益是否保持。**NB-Walker 与 SoftWalker、cuPTW 三者是否互相覆盖，必须全文对比。**
+
+### 链 7：加速器翻译卸载 / memory-side
+`border2015`(L137) → `accelerator_translation2017`(L2) → `ontable2017`(L1137) → `socdma2018`(L1459) → `sparta2020`(L1485) → `dvm2018`(L467) → (`cryptommu2023` L356) → `sharemmu2026`(L1352)
+- **可能已解决**：加速器沙箱、每加速器小 TLB + 共享 L2 TLB、片上 walk、MMU 感知 DMA、memory-side per-partition TLB、去虚拟化。
+- **后续克服的假设**：去虚拟化假设设备间不共享映射；共享假设设备可信。
+- **不能凭标题推断**：**权限追踪器成本**、**脏写回/flush 确认**（专题 L49 明确 ShareMMU 仍需这些）。**注意：安全线按用户要求不作主线**，本链只用于确认"共享语义边界"，不用于展开安全新方向。
+
+### 链 8：分层/CXL 放置 → 翻译更新成本
+`pond`(A1) → `TPP`(A5) → `memtis`(A6) → `idyll2023`(L728) → `observuvm2026`(L1112) → (`HELM` A12)
+- **可能已解决**：池化容量浪费、分层放置策略、迁移；IDYLL 真机剖析失效开销；ObservUVM 采样观测。
+- **后续克服的假设**：内存是本地同质 DRAM。
+- **不能凭标题推断**：**CXL 延迟不对称对页表遍历的影响**、**池化内存的一致性**、**翻译元数据应放在哪一层**。这些都是**尚未读透**的开放点，**不等于无人研究**——Pond/HELM 仅边界索引，须先补全文。
+
+---
+
+## 3. 五个重点方向的缺口与线索（对应用户第 3 点）
+
+### 3.1 CXL / 内存分解 / 近存计算翻译
+- **72 专题现状**：仅 `cato2026`（CXL 分层内存争用感知 PTW 卸载，仅摘要）、`sparta2020`（memory-side 分区 TLB）触及；无 CXL 全栈。
+- **缺口**：CXL 池化内存的**页表/PTE 物理放置**、**CXL 延迟不对称下的 walk 成本模型**、**近存翻译（memory-side walker）在分解架构中的语义**。
+- **候选**：A1–A9、A12、C10–C13。
+- **不能从标题推断**：Pond 类工作是否讨论**翻译结构**（可能只讨论数据分页）；SPARTA 的 per-partition TLB 与 CXL 池化是否语义兼容。
+- **明确边界**：广域地图 L186 已声明本平台（CVA6+四 iDMA+RISC-V IOMMU/Linux/Genesys2）**不能直接支持 CXL 全栈结论**。本方向属"阅读与条件分析"扩展，**不预设上板**。
+
+### 3.2 设备 ATS/PASID 及 I/O 映射生命周期
+- **72 专题现状**：`riommu2015`、`iommu_scalable2015`、`iotlb_wall2023`、`fastsafe2024`、`bypassd2024`、`riscvsva2025`、`shadowupdate2026`（仅摘要）。
+- **缺口**：**PASID 语义**（多进程共享设备队列）、**ATS/PRI 的设备自发起翻译**与平台侧失效的交互、**nested translation**（虚拟 IOMMU + 设备 ATS）、**注册/撤销生命周期**（含 RDMA 类）。
+- **候选**：A10（Scalable IOV）、A11（vIOMMU）、C14（RDMA 注册撤销，方向性）。
+- **非论文语义源建议补入 §6**：PCIe ATS/PRI 规范、Arm SMMUv3 规范、Intel VT-d 规范（专题 L128–L139 已有 RISC-V IOMMU/CUDA allocator/HMM/SVA，可增列）。
+- **不能从标题推断**：设备侧 issued translation 与平台 shootdown 的**时序保证**；ATScale IOV 的性能是否来自共享队列而非翻译本身。
+
+### 3.3 软件页表更新 / 撤销 / 回收
+- **72 专题现状**：`mitosis2020`、`vmitosis2021`（页表复制/放置）、`idyll2023`、`shadowupdate2026`、`translation_ranger2019`（仅摘要）、`contiguitas2023`。
+- **缺口**：**并发页表修改的可扩展性**（RadixVM 谱系）、**反查/rmap 与回收**、**多代 LRU 类回收**、**页表内存本身的回收与大页降级**。
+- **候选**：B4（RadixVM）、B5（DAMON）、B6（MGLRU）、B13（shootdown 实证）、B16（range invalidation）。
+- **不能从标题推断**：回收策略对**翻译缓存有效性**的影响；DAMON 的 region 粒度与 TLB 粒度是否对齐（与广域地图卡点 1"粒度不一致"呼应）。
+- **注意**：MGLRU 可能**无正式论文**，须确认可引用形式，否则只能作"生产实现"引用。
+
+### 3.4 GPU 迁移 / 观测 / 应用内存语义
+- **72 专题现状**：`griffin2020`、`idyll2023`、`grit2024`、`observuvm2026`、`suv2024`、`batch_uvm2020`、`shadowupdate2026`。
+- **缺口**：**应用侧语义如何约束迁移决策**（LLM 动态增长 vs 图/稀疏）、**观测信息与策略的闭环证据**、**多 GPU 真实观测稀缺**。
+- **候选**：C1–C9（应用桥接），A12（HELM 观测）。
+- **不能从标题推断**：vAttention 等是否**真正降低翻译开销**（广域地图 L116 明确其 decode 与最优 PagedAttention 持平，收益看阶段）——**不能把应用层收益直接归因到翻译**。
+
+### 3.5 经典共享 TLB 与 QoS 近邻
+- **72 专题现状**：`shared1993`、`synergistic2010`、`slltlb2011`、`icc2010`、`nocstar2018`、`didi2011`、`mask2018`、`walk_stealing2021`。
+- **缺口**：**形式化 QoS/隔离界**（相对 IOMMU）、**共享结构与公平性的可证明分离**、**IOMMU 专属 QoS（RISC-V IOMMU QoS 身份，专题 L20 已提）**。
+- **候选**：B1（UCP）、B2（KPart）、B8（MemGuard）、B9（FST）、B10（TCM）、B11（ATLAS）、B12（cache coloring）。
+- **不能从标题推断**：这些缓存 QoS 工作**能否直接迁移到 IOTLB/PTW/命令队列**。广域地图卡点 2（L39–L40）与专题 L65 已明确"静态分区可能牺牲利用率、动态共享可能牺牲可预测性"且"未建立跨平台统一保证"。
+
+---
+
+## 4. 原库缺全文 13 项的补全优先级
+
+来源：`records/baseline-works.json` 中 `fulltext_available=false` 的全部 13 项。优先级依据：**是否卡住主线的机制级比较** + **是否是可能否证过宽说法的强前作** + **时效**。**这是我的建议排序，非既定事实；Codex 应按实际可得性调整。**
+
+**P0（最高，直接卡住 2026 前沿主线比较）**
+1. `shadowupdate2026`（ISCA 2026；baseline L1297–L1324；机构摘要，作者 PDF 按钮无有效目标，见 L1321）。**理由**：更新/失效/在途迁移主线唯一可补的 2026 正文。
+2. `cato2026`（MICRO 2026；L190–L215；大会题录已核，作者页搜索缓存，实时页面 404）。**理由**：CXL 争用感知卸载，Tier A/链 8 必需。
+3. `nbwalker2026`（MICRO 2026；L1032–L1058；题录/artifact 已核，正文未得）。**理由**：与 `cuptw2026`、SoftWalker 三者关系未定（链 6）。
+
+**P1（机制细节缺失，强前作竞争必需）**
+4. `clap2025`（MICRO 2025；L217–L242；作者摘要，出版社 403）。**理由**：chiplet 局部性与页大小联合取舍，与 `barre2024`/`clover2026` 直接竞争。
+5. `latpc2025`（MICRO 2025；L836–L863；机构摘要，PDF 403）。**理由**：TLB 预取 + MSHR 压缩 + 批量 PTW，链 2/链 6。
+6. `clover2026`（CAL 2026；L244–L267；机构摘要）。**理由**：晶圆级页表副本存储/跳数取舍，与 CDFD(A13) 竞争。
+7. `lamp2025`（HPCC 2025；L808–L834；仅官方节目题录）。**理由**：多租户 TLB 共享，链 6。
+
+**P2（基础/间接，但有否证价值）**
+8. `translation_ranger2019`（ISCA 2019；L1725–L1749；本地下载失败）。**理由**：contiguity-aware TLB 基础，影响大页讨论与 `clap2025` 判断。
+9. `synergistic2010`（MICRO 2010；L1647–L1670；仅摘要）。**理由**：共享 TLB 容量/迁移/复制的经典前作，链 1 起点。
+10. `snakebyte2023`（HPCA 2023；L1432–L1457；机构摘要）。**理由**：GPU TLB 递归页合并，与多页大小线相邻。
+
+**P3（较低，安全/早期/边缘）**
+11. `cryptommu2023`（MICRO 2023；L356–L380；仅摘要）。**理由**：第三方可信加速器访问控制——**用户明确要求安全不自动作主线**，故降级；仅在链 7 语义边界需要时补。
+12. `ontable2017`（TECS 2017；L1137–L1162；ETH/机构/出版社均 403）。**理由**：加速器片上 walk，链 7 早期环。
+13. `shared1993`（1993；L1326–L1350；仅机构题录摘要）。**理由**：最早前史，专题 L1347 已注"早期共享 TLB 思想前史，不等同当代设备 IOMMU"。
+
+**补全渠道建议（未验证，供 Codex 尝试）**：作者主页/机构仓库（IISc `csa.iisc.ac.in/~arkapravab`、SKKU COMPASS、Yonsei Pure、CMU PDL）；会议 program/attached PDF；arXiv 同名预印本；出版社 author-izer。**注意**：`shadowupdate2026`/`clover2026`/`lamp2025`/`cato2026`/`nbwalker2026` 的"可获取性"本身不确定，**不得假定一定可得**。
+
+---
+
+## 5. 假设、未决项与给 Codex 的验收检查
+
+### 5.1 本报告的工作假设（须验证）
+1. 72 专题与广域地图**是分离集合**，A12/A13/A14/B1/B2/C5–C9 属"已在广域地图、未入 72 专题"。
+2. 所有 Tier A–C 候选的题名/作者/年份/venue 均**未经本 worker 验证**；置信度仅表示记忆强度。
+3. 8 条引用链的"已解决/克服假设"是**待核命题**，不是结论。
+
+### 5.2 明确不能成立的说法（延续专题/广域地图边界）
+- 不能宣称任何方向"全领域空白"；广域地图 L188–L190 已列未覆盖面（CXL 完整放置/一致性、编译器布局与稀疏格式、RDMA 注册撤销、实时 QoS/形式化界）。
+- 不能把"多个设备共享一个 TLB"单独当创新（专题 L7、L75）。
+- 不能把共享/复制/IOTLB 分区当作新机制（专题 L71–L81 的表）。
+- 不能把安全共享／不可信加速器（`sharemmu2026`、`cryptommu2023`）自动升为主线。
+- 不能把应用层收益（LLM/KV cache）直接归因到翻译。
+- 本报告未做任何实验、复现、RTL/Linux 修改、构建或上板。
+
+### 5.3 给 Codex 的验收检查（逐项可执行）
+1. **口径核验**：确认 A12/A13/A14/B1/B2/C5–C9 在 72 专题中的去重状态（对照 `baseline-works.json` 全部 id），决定并入还是保持分离。
+2. **候选核验**：对 44 项逐条核验题名/作者/年份/venue/DOI/可获取性；产出"命中/修正/证伪"三态表；**证伪项直接删除并记录**。
+3. **冲突核验**：B1（UCP）作者/venue 与广域地图 L79 链接疑似不一致，需专项核对。
+4. **链核验**：8 条链中，凡依赖 `shadowupdate2026`/`clap2025`/`cato2026`/`nbwalker2026` 的环节，**必须等全文到手**才能确认连续性。
+5. **13 项补全**：按 P0→P3 尝试获取；每项记录尝试 URL、HTTP 状态、是否得全文（沿用 `source-manifest.json` 的 `previous_attempts` 结构）。
+6. **未覆盖方向**：C14（RDMA 注册撤销）、B12–B16（低置信）需**先确认工作是否存在**，避免把检索方向当论文。
+7. **平台适用性**：任何新增方向若涉及 CXL 全栈/多 GPU UVM/wafer-scale/不可信 ATS，须按广域地图 L186 标注"当前平台不可直接支持结论"。
+
+### 5.4 未决/需 Codex 领导的问题
+- "共享 → 复制 → 远端 → 本地"的**切换决策**是否已有强前作（链 1/链 5）——需跨 `nocstar2018`/`transfw2023`/`mgvm2022`/`clover2026` 全文比对，属复杂调试/架构判断，**建议 Codex 主导**。
+- 多设备**翻译一致性与回收义务**的形式化边界（链 4）——涉及并发与内存序，属需 Codex 领导的范围。
+- **粒度切换成本**（对象 vs 页 vs 区域）是否被 `OASIS`/`memtis`/`vAttention` 覆盖——需三方全文。
+
+---
+
+## 附：本报告直接引用的输入锚点
+- 72 项基线：`iommu-platform/out/shared-translation-literature-20261006/records/baseline-works.json`（如 `riommu2015` L1246、`shadowupdate2026` L1297、`cuptw2026` L382、`hdpat2026` L677、`wafertrans2026` L1866）。
+- 专题主图：`iommu-platform/docs/shared-translation-literature-20261006.md`（六脉络 L24–L31；最新前沿表 L37–L51；六个卡点 L55–L69；强前作对照 L71–L81；补全文优先项 L89）。
+- 广域地图：`iommu-platform/docs/research-landscape-20261005.md`（六研究线 L15–L22；演变脉络 L26–L30；六卡点 L34–L52；36 项索引 L62–L126；官方语义 L130–L139；边界分级 L164–L167；平台适用 L186；未覆盖面 L188–L190）。
+- 取得记录：`iommu-platform/out/research-landscape-20261005/source-manifest.json`（`pond2023` L448–L454 为 403）。
+
+**本报告结束。所有新增候选待 Codex 逐项网络核验；未核验项不得进入正式文献计数或作为创新性裁决依据。**

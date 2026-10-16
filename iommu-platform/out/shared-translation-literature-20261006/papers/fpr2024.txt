@@ -1,0 +1,1113 @@
+                                           Skip TLB flushes for reused pages within mmap’s
+                                                           Frederic Schimmelpfennig†, André Brinkmann†, Hossein Asadi‡, Reza Salkhordeh†
+                                                                      Johannes Gutenberg University Mainz†, Sharif University of Technology‡
+
+
+
+
+                                            Abstract—Memory access efficiency is significantly enhanced          Flushes are limited to large portions or even the entire buffer,
+                                         by caching recent address translations in the CPUs’ Translation         even if only individual entries become invalid. Therefore, the
+                                         Lookaside Buffers (TLBs). However, since the operating system           impact of a TLB flush includes not only the time for the flush
+                                         is not aware of which core is using a particular mapping,
+                                         it flushes TLB entries across all cores where the application           operation itself, but also an indirect slowdown for rebuilding
+                                         runs whenever addresses are unmapped, ensuring security and             unnecessarily lost entries by falling back to the page table.
+arXiv:2409.10946v1 [cs.OS] 17 Sep 2024
+
+
+
+
+                                         consistency. These TLB flushes, known as TLB shootdowns, are            Furthermore, the OS does not only flushes the TLB of the
+                                         costly and create a performance and scalability bottleneck. A key       invalidating core, but also sends interrupts to all cores, that
+                                         contributor to TLB shootdowns is memory-mapped I/O, partic-             have possibly accessed the address, to make them flush their
+                                         ularly during mmap-munmap cycles and page cache evictions.
+                                         Often, the same physical pages are reassigned to the same process       TLBs. These TLB shootdowns become more problematic as
+                                         post-eviction, presenting an opportunity for the operating system       the number of cores used by an application increases.
+                                         to reduce the frequency of TLB shootdowns. We demonstrate,                 Many shootdowns are associated with mapping memory
+                                         that by slightly extending the mmap function, TLB shootdowns            for I/O, using mmap() and munmap(), or when the OS
+                                         for these ”recycled pages” can be avoided.
+                                            Therefore we introduce and implement the ”fast page                  swaps out memory mapped pages during page cache eviction.
+                                         recycling” (FPR) feature within the mmap system call. FPR-              The former is common in the Apache web server [15], the
+                                         mmaps maintain security by only triggering TLB shootdowns               latter happens within databases and key-value stores such
+                                         when a page exits its recycling cycle and is allocated to a different   as LMDB [6]. LevelDB [12] mixes both access patterns.
+                                         process. To ensure consistency when FPR-mmap pointers are               During page cache evictions, the kswapd process batches
+                                         used, we made minor adjustments to virtual memory manage-
+                                         ment to avoid the ABA problem. Unlike previous methods to               the least recently used pages and merges the CPU masks
+                                         mitigate shootdown effects, our approach does not require any           of its processes, resulting in shootdowns that target a high
+                                         hardware modifications and operates transparently within the            number of cores. TLB shootdowns are increasingly affecting
+                                         existing Linux virtual memory framework.                                the performance of those applications. The use of faster storage
+                                            Our evaluations across a variety of CPU, memory, and                 devices increases the rate at which data pages are swapped out
+                                         storage setups, including persistent memory and Optane SSDs,
+                                         demonstrate that FPR delivers notable performance gains, with           and into memory, resulting in more shootdowns, especially for
+                                         improvements of up to 28% in real-world applications and                fast read accesses.
+                                         92% in micro-benchmarks. Additionally, we show that TLB                    Figure 1 shows the impact that a single I/O thread per-
+                                         shootdowns are a significant source of bottlenecks, previously          forming mmap→read→munmap cycles has on independent
+                                         misattributed to other components of the Linux kernel.
+                                                                                                                 compute threads of the same application. The compute threads
+                                                                I. I NTRODUCTION                                 do not access the data of the I/O thread. However, the OS
+                                                                                                                 considers the possibility that the compute threads might access
+                                            Leveraging parallel CPU resources results in significant             pages being unmapped by the I/O thread. Therefore, all the
+                                         performance improvements across a wide range of applica-                compute threads are affected by the received TLB shootdowns
+                                         tions. This works well with advances in memory and storage              initiated by the single I/O thread. This results in up to 30%
+                                         solutions, such as persistent memory or Optane SSDs [10],               waste of the overall compute throughput, with the absolute
+                                         which have significantly reduced access times. However, as              numbers increasing for higher thread counts.
+                                         core counts increase and latencies decrease, operating system
+                                         (OS) overhead becomes more pronounced [23], [31].
+                                            The management of Translation Lookaside Buffers (TLBs),
+                                                                                                                                                                                                           TLB shtdwns. rec. [M/sec]
+
+
+
+
+                                                                                                                                                1.00                                                   3
+                                                                                                                      Throughput[ops/t] norm.
+
+
+
+
+                                         e.g., has a significant impact on the performance of CPU                                                          compute throughput (w/o TLB shtdwns.)
+                                         architectures [8]. A TLB caches virtual-to-physical address                                            0.75       compute throughput
+                                                                                                                                                           TLB shootdowns                              2
+                                         mappings for its CPU core to reduce the number of page table                                           0.50
+                                         walks. When a memory mapping becomes invalid, the OS                                                                                                          1
+                                         removes that mapping from the TLBs to ensure security and                                              0.25
+                                         consistency. Without any protection, a process could otherwise                                         0.00                                                   0
+                                                                                                                                                       1    2    3      4   5    6     7    8      9
+                                         retain access to a physical memory location that it should no                                                               # Compute Threads
+                                         longer have access to, or reuse stale data.
+                                            The TLB is tightly embedded in the hardware, and its                 Fig. 1. TLB shootdowns and compute performance for increasing number of
+                                         management by the operating system is rather coarse-grained.            compute threads and a single I/O thread.
+   Several previous approaches attempted to redesign the           limited to data within the program, FPR should only be used
+Linux memory management to reduce TLB shootdowns by                after an application has been successfully debugged and does
+identifying cases where one can be sure that an entry does not     not produce segmentation faults.
+exist in a TLB, thus allowing shootdowns to be skipped [1],           We implemented FPR in recent Linux kernels and evaluate
+[3], [14], [21], [24], [26], [30]. These approaches either add     it using Intel and AMD multi-core machines with various con-
+overhead to all TLB misses or required major changes to the        figurations of memory and storage, such as Optane persistent
+Linux kernel. A second category of previous research focused       memory (pmem), Optane NVMe SSDs, and traditional NVMe
+on smaller optimizations of the Linux memory management,           SSDs. Using real-world applications, we achieve performance
+many of which are already part of the current mainline Linux       improvements of up to 28% (munmap), 4% (eviction), and
+kernel, such as batching [20], [28], lazy shootdowns [5], and      12% (a combination of both). We also developed a compre-
+overlapping local and remote flushes [2].                          hensive set of micro-benchmarks covering different patterns of
+   Despite these efforts, TLB shootdowns continue to signif-       mmap I/O accesses combined with compute operations. Within
+icantly impact the performance of data-intensive applications      micro benchmarks, we are able to improve throughput by up
+which use mmap for I/O. Furthermore, prior studies mainly          to 92% for munmap and up to 8.5% in eviction scenarios. Our
+focused on the impact of TLB shootdowns on I/O operations          benchmarks provide new insights into shootdown bottlenecks,
+themselves, while TLB shootdowns caused by I/O operations          particularly in the eviction path of the Linux kernel. Both the
+also affect compute-intensive application threads.                 FPR and our benchmarks will be made publicly available.
+   The main insight used in this work is that the OS often recy-      Our main contributions are as follows:
+cles physical pages after munmap() or page cache evictions         1) The introduction of FPR to effectively eliminate mmap
+and reassigns them to the same application. From a security            TLB shootdowns for cases of page recycling during mmap.
+perspective, TLB shootdowns can be avoided when pages              2) A benchmark suite on the impact of TLB shootdowns
+are reused by the same application, and TLB shootdowns                 for various mmap usage patterns, allowing for specific
+only need to be sent when pages leave this recycling path.             optimizations of scalability bottlenecks.
+However, TLB shootdowns also ensure consistency, and we            3) The evaluation of FPR using benchmarks and real-world
+need to adjust the mmap internals to ensure that a new mapping         applications on recent hardware configurations.
+assigned to the same virtual address as a previously unmapped         The remainder of this paper is structured as follows. Section
+one cannot be accessed by an old, invalid TLB entry, which         II presents the background. The related work is discussed in
+would lead to the ABA problem [9].                                 Section III. The concept of FPR is introduced in Section IV
+   We propose a new flag MAP_FPR for the mmap() call that          and evaluated in Section V. Finally, Section VI concludes the
+instructs the kernel to perform ”fast page recycling” within       paper.
+user-defined mmaps, and present a lightweight implementation
+in the Linux kernel. FPR avoids TLB shootdowns without                                   II. BACKGROUND
+compromising security and consistency by tracking pages               In this section, we provide an overview of memory manage-
+using an id that uniquely represents a user-defined recycling      ment, mmap()-operations, and TLB shootdowns in the Linux
+environment. Possible contexts are a single flagged mmap, all      kernel for the x86 architecture. Next, we present the Linux
+flagged mmaps of a process, and custom setups. A shootdown         memory allocation mechanism and highlight the management
+is only sent when a page belonging to a flagged mmap leaves        of pages, which we use in our FPR-approach to minimize the
+its recycling path. Both sources of TLB shootdowns, manual         number of shootdowns.
+munmaps and page cache evictions, are targeted.
+   FPR is a lightweight extension to the current API. In our       A. Memory management and mmap
+Linux implementation, FPR and unflagged, standard mmaps               Processes perform memory operations using virtual ad-
+share the same page and memory management. Standard                dresses that must be translated into physical addresses before
+mmaps without our new flag work as usual based on their            the CPU can access them. The virtual-to-physical mappings,
+standard semantics. FPR can be selectively enabled for indi-       which are specific to each process, are stored in a page
+vidual mappings, and developers can actively relieve their I/O     table in main memory. In the x86 processor architecture, the
+bottlenecks. Optionally, we also provide an interception library   operating system manages the page table entries, while the
+that automatically adds the MAP_FPR flag to all mmap() calls       CPU cores use these entries to translate virtual addresses to
+for user-defined I/O paths. This allows our new feature to be      physical addresses through hardware page table walks. If the
+used without recompiling existing applications.                    corresponding memory page for a virtual address does not
+   The FPR design ensures that no application can access           exist in the page table, a page fault is raised. The operating
+data from another process, and that every correct program          system then allocates a memory page, loads its contents based
+can directly use our interception library without changing         on existing memory mappings, and updates the page table.
+any application properties other than performance. However,        The CPU then retries the address translation.
+programs producing segmentation faults without FPR can                The mmap() syscall adds a mapping to the virtual ad-
+access stale data when a core accesses a page that has             dress space of a process. Applications use anonymous page
+been unmapped by another core. Although those accesses are         mappings to allocate volatile memory. mmap() can also be
+                     CPU       MMU TLB                       Memory                       a single entry is almost the same as removing many entries.
+                      ...
+                               virt phys           page tables          pages
+     instructions
+                      ...
+                                ...   ...               lk
+                                                                                          Linux also keeps a bitmap of the CPU cores running each
+                     load mem                       e wa
+                                      ... miss pag
+                                ... TLB                                             ...
+                                                                                          application, and only sends shootdowns for an application to
+                    store access
+                                ...   ...
+                      ...
+                                ...   ...      inse
+                                                    rt                ph...ys ...   ...
+                                                                                          cores that are running it.
+                                                                             ss
+                      ...                                             acce
+                                                                                             Linux also lazily delays shootdowns when the core is
+                           Fig. 2. Interaction of the TLB and memory.
+                                                                                          running a kernel task. The core then does not access user
+                                                                                          addresses directly, so invalid TLB entries are not used. When
+                                                                                          returning to user space, all received shootdowns are processed
+used to map a range of virtual addresses to the contents of                               together. Fig. 3 shows a thread T1 causing shootdowns, with
+a file or (block) device. File mappings allow an application                              threads T2 and T3 receiving them. T2, which runs mostly in
+to operate on the mapped file using memory operations to                                  user space, is more affected by incoming shootdowns than
+change file contents. The mapped file can be larger than                                  Process T3, which runs mostly in the kernel.
+the available memory, and memory management operations                                       The x86 architecture supports process context identifiers
+like swapping and syncing are used by the OS to provide a                                 (PCIDs), which allow a subset of tagged TLB entries to be
+transparent view of the file. Users can choose between two                                used for address translation [16]. In Linux, they are used
+mapping modes. Shared mappings keep the state of the file                                 to distinguish between user and kernel space entries, e.g.
+consistent and private mappings do not persist modifications                              in the context of some KAISER/Meltdown fixes. However,
+back to persistent storage.                                                               PCIDs are limited to 4096 values, and they cannot help for
+   Memory mappings can be removed via munmap() and                                        shootdowns within a process.
+dirty pages are flushed to storage. Finally, the allocated mem-
+                                                                                          C. Memory allocation
+ory pages are freed. Memory pages are also removed by the
+kswapd daemon in case of memory pressure. kswapd iterates                                    Linux uses a global buddy allocator to handle free memory
+over the least recently used pages and releases batches of 32                             [17]. A buddy allocator partitions free memory into n lists
+evictable, e.g., non-anonymous pages. This is known as page                               {0, 1, ..., n − 1} and all free memory blocks of size 2i · m
+eviction or reclamation.                                                                  bytes are stored in list i. m is the minimum size that can be
+                                                                                          allocated through the buddy allocator, and is typically set to
+B. The Translation Lookaside Buffer (TLB)                                                 the page size of the processor (e.g., 4 kB for x86 processors),
+   Most CPU architectures cache virtual-to-physical mappings                              while 2n−1 · m is the maximum size of contiguous memory
+in a hardware Translation Lookaside Buffer (TLB) within the                               that can be allocated.
+Memory Management Unit (MMU) to prevent frequent and                                         Linux tries to fulfill an allocation request by picking a free
+costly page table walks. Each physical core has a dedicated                               block from the best-fitting list. If no such block exists, the
+TLB that can hold up to 2,048 entries (x86) [11]. All memory                              next larger free block is recursively split or smaller blocks
+accesses pass through the TLB and only fall back to a page                                are collected, until they can serve the allocation. Splitting a
+table walk in case of a TLB miss (see Figure 2). When                                     block leads to two smaller blocks of the same size which are
+the CPU accesses a memory location, it queries the TLB to                                 called buddies. If a block is freed and its buddy is also free,
+translate the virtual address into the physical address. If the                           they are (recursively) merged back into bigger free memory
+mapping is not found (TLB miss), it traverses the process page                            blocks, before they are added to the according free list. The
+table and inserts the mapping into the TLB.                                               buddy allocator uses locking that limits scalability.
+   The operating system removes invalid TLB entries via                                      Each CPU, therefore, maintains an own list of free pages
+interprocessor interrupts (IPIs). Invalidations sent to all cores                         used for paged-sized memory requests in a fast path without
+running an application are called TLB shootdowns and take                                 acquiring a lock. If a CPU’s list becomes empty, a large
+a significant amount of time to process. Most processor                                   chunk of pages is allocated through the buddy allocator
+architectures, including x86, support multiple TLB flush gran-                            (slow path). If the global buddy allocator cannot serve the
+ularities [16]. Full TLB flushes are fast, but also remove valid                          requests, pages will be removed from other CPUs’ lists. Many
+entries, reduce the TLB hit ratio, and require reinsertion of                             applications constantly allocate and free pages from their CPU
+unnecessarily lost entries. Restricted address range flushes, on                          lists. In the context of memory mappings, this means that
+the other hand, are slower per IPI.                                                       mmap-munmap cycles and re-allocations following page cache
+   TLB shootdowns are triggered by the operating system
+when a munmap() system call removes a page mapping or
+when a page is evicted from the page cache by the kswapd                                   T1 munmap()    munmap()       evict()    munmap()   munmap()
+
+daemon. Additionally, the OS sends a shootdown if a page
+                                                                                           T2 User                        Kernel     User
+is migrated between different NUMA nodes and it, therefore,
+changes its physical address.                                                              T3 Kernel                    User       Kernel
+   Linux uses several optimizations to reduce the shootdown
+overhead. First, it tries to batch requests to reduce the number                          Fig. 3. Varying impact of TLB shootdowns from thread T1 for T2, mostly
+of shootdowns, since the overhead of a shootdown to remove                                in user space, and T3 mostly in kernel space.
+evictions mostly use the same set of physical pages. In this            LATR [18] avoids reusing virtual addresses so that TLB
+paper, we will exploit this re-using of pages to reduce the          shootdowns can be prevented. TLB invalidation is then per-
+number of TLB shootdowns.                                            formed during context switches by the core itself, thus, re-
+                                                                     moving the need for expensive IPIs. Unfortunately, the kernel
+                     III. R ELATED W ORK                             has no control over the usage of virtual addresses during
+A. Hardware approaches                                               page eviction and LATR does not cover this scenario. The
+                                                                     underlying idea has been used in [2] to batch shootdowns
+   Self-invalidating TLB entries (SITE) add an expiration time       while the mmap semaphore is acquired, as virtual address
+to each TLB entry and expired entries are considered as invalid      cannot be re-used during this time period. EcoTLB makes
+by the CPU [3]. The OS does not need to send shootdowns              LATR compatible with the way Linux uses PCIDs for the
+for such expired TLB entries, reducing shootdowns by up to           lazy shootdown optimisations and to support disaggregated
+65%. DiDi includes hardware bookkeeping of all insertions            memory [19].
+and deletions of TLB entries to reduce the number of cores              Fastmap [21] addresses performance and scalability prob-
+receiving shootdowns [30]. ATTC maintains an inverse map-            lems of page eviction by re-designing mmap. A part of their
+ping table to eliminate shootdowns with minimal hardware             improvements reduces the number of TLB shootdowns. How-
+changes in virtualized environments [14]. HATRIC uses cache          ever, their implementation requires a pre-allocated memory
+coherence protocols to piggyback information during page             region and cannot operate within the current Linux memory
+migrations to reduce the number of TLB shootdowns and also           subsystem. Additionally, it breaks the current mmap interface
+targets virtualized environments [32]. Mosaic Pages use com-         and cannot be used transparently. To further investigate the
+pressed TLB entries to increase the overall TLB range [13].          impact of TLB shootdowns on mmap, we also compare
+The presented HW approaches can reduce the performance               Fastmap with our scheme.
+impact of TLB shootdowns but require (significant) changes
+to current processor architectures.
+                                                                                     IV. FAST PAGE RECYCLING
+B. Software approaches
+   The impact of TLB shootdowns can be decreased if multiple            In this section, we introduce FPR and how it reduces the
+shootdowns are batched into a single inter-processor interrupt       number of TLB shootdowns for data-intensive applications
+(IPI), either through the syscall interface [28], [29] or directly   that employ mmap(). FPR is an extension to the standard
+in the kernel [2]. Furthermore, shootdowns can be batched and        mmap that is enabled for specific mappings by passing the
+performed lazily if the memory consistency protocol is relaxed       new flag MAP_FPR to a mmap() call. It integrates seamlessly
+and an additional communication channel is introduced [5].           with the default mmap.
+   Several software approaches reduce the number of TLB                 The main idea behind FPR is that shootdowns can be
+shootdowns by tracking pages that are accessed from more             delayed if a page is recycled. Recycling means that a page
+than one CPU core and only send shootdowns for such pages.           is reused in the same context that unmapped it before. We
+The Access-Based Invalidation System (ABIS) uses the access          therefore define recycling as a passive state that describes
+bit of page table entries to track whether more than one CPU         the reuse of the physical page. Every page can exit the
+core accesses a page [1]. It therefore temporarily changes           recycling state at any time due to an allocation to a different
+the cr3 register to a fake page table to load the address            mapping (e.g., a default non-FPR mapping or an unrelated
+mapping into the first accessing core. Then it uses the access       FPR mapping). Also, the kernel does not actively force pages
+bit to detect a second CPU core accessing it. The tracking           within FPR mappings to be recycled.
+needs to be enabled globally and imposes up to 9% general               We will show in the evaluation section that FPR can
+performance overhead, whereas it can improve performance             eliminate nearly all TLB shootdowns for mmap()-heavy ap-
+by up to 78% for multi-core applications. Unfortunately, the         plications that perform read or copy-on-write operations. FPR
+implementation is not compatible with newer Linux kernels            ensures the following security and consistency guarantees:
+and requires heavy code updates. z-READ [22] has employed            1) Security: Processes can never access a stale TLB entry for
+a similar approach to accelerate read operations and to avoid            a page after a TLB flush has been skipped if this page has
+the copying of data.                                                     left the recycling path and has been reallocated to another
+   Amit el. al have identified several performance limitations           process.
+in the TLB shootdown path and have shown that aggressive             2) Consistency: Applications cannot access a stale page entry
+batching can lead to correctness issues [2]. They instead                in the TLB after an unmap operation for an FPR-enabled
+optimized the time for TLB shootdowns by improving the                   mapping if the same access would not have produced a
+underlying protocols. These optimizations are orthogonal to              segmentation fault without using FPR.
+our proposed architecture, which reduces the number of TLB              Security is achieved by tracking pages and sending a
+shootdowns. They also identified specific situations like copy-      shootdown if a page leaves the recycling path and consistency
+on-write, where shootdowns can be safely removed. The                is achieved by extending the virtual address assignment and
+underlying code is unfortunately not available.                      kswapd changes.
+     (a) default Linux                    (b) FPR                 free                        time
+                                                                  pages                      (a) skipped shootdown w/o pointer incrementation
+          free pages
+                                                   g                                           T1 mmap(f1)     (...) munmap(f1) mmap(f2)     (...)
+                                                 in allocation
+                                               cl t                                                  -> 0xaa                       -> 0xaa
+                                             cy ex (page fault)
+                             sh TLB        re ont
+                               oo            c                             unmap               T2     (...)  *0xaa=1         (...)         *0xaa=1
+                                 tdo
+                                     wn                page        yes
+                                                    recycling?
+                                                                                            (b) FPR
+                                              no
+             ation                                                                            T1 mmap(f1)     (...) munmap(f1) mmap(f2)     (...)
+     alloc fault)                                                  thread 1
+        p a g e                                                    thread 2   app
+      (           unmap                                                                             -> 0xaa                       -> 0xab
+                                                                                              T2    (...)   *0xaa=1         (...)         *0xab=1
+                       app          sh TLB                           OS       kernel
+                                      oo
+                                        tdo
+                                           wn           app x       apps      space
+     thread 1 thread 2
+                                                                                       Fig. 5. Usage of stale TLB entries during mmap-munmap cycles and FPR’s
+                                                                                       virtual address iteration.
+Fig. 4. FPR: Recycling pages are reused without shootdowns. They still are
+managed by the default OS internals.
+                                                                                          FPR therefore extends the virtual memory management and
+                                                                                       increments the virtual addresses that the kernel chooses for
+A. Security: Tracking page recyclings
+                                                                                       new mappings, instead of returning the same ones repeatedly
+   We have modified the kernel so that the operating system                            (see Fig. 5 b). This is achieved by remembering the last
+assigns an additional ID to each physical page frame that                              assigned virtual address per process, so that searches for free
+represents a recycling context. This ID is retained even when                          virtual address ranges do not start from the lowest address.
+a page is returned to the allocator’s empty page pool. The                             In the special case that the user forces a virtual address to be
+IDs are initially set to zero, indicating that no recycling is                         used by mmap, a shootdown is sent to comply with the request
+expected. If a page is allocated for any non-FPR use, its ID is                        without changing the behavior of the system.
+set to zero. Only the IDs of pages allocated by an FPR-flagged                            There is exactly one situation where the semantics of FPR-
+mapping are set to their recycling context.                                            based mmaps differ from the standard mmap implementation.
+   When a page is unmapped by munmap, the TLB shootdown                                Again, suppose that two processes T1 and T2, running on
+is skipped if its ID is not equal to zero, indicating a page                           different cores, concurrently access a mapping f1, and then
+that is expected to be recycled within the same context again.                         f1 is unmapped by T1. If T2 accesses f1 after the unmap op-
+This allows us to avoid unnecessary TLB shootdowns when                                eration, this would cause a segmentation error in the standard
+pages are continuously recycled. For these pages, we move                              implementation. However, when using FPR-based mmaps, T2
+the shootdown logic from the release phase to the allocation                           would be accessing an out-of-date physical page, which could
+phase.                                                                                 lead to silent data corruption. Therefore, it is safe to add the
+   A change of the ID from a non-zero value during allocation                          MAP_FPR flag to all mmap calls after successfully debugging
+indicates that the page has left a particular recycling context. In                    an application but care must be taken as long as the application
+this case, a TLB shootdown is initiated to prevent erroneous                           might throw segmentation errors.
+memory accesses. This also means that for non-FPR pages,                                  kswapd requires a different handling because TLB shoot-
+the default shootdown process still applies during the release                         downs for pages evicted by kswapd cannot be skipped until a
+phase. Fig. 4 compares standard Linux page mapping with                                recycling-ending allocation, and because the virtual addresses
+FPR, which prevents TLB shootdowns in mmap page recycling                              can only be incremented within an mmap-call. We therefore
+scenarios.                                                                             avoid shootdowns for pages getting recycled before an explicit
+B. Consistency of applications using FPR                                               munmap by lowering the eviction frequency and increasing
+                                                                                       the batch size for pages in a recycling context. Therefore, we
+   Sending shootdowns when pages are leaving their recycling
+                                                                                       do not evict FPR pages in a recycling context in case that
+contexts ensures security but cannot guarantee the consistent
+                                                                                       kswapd works between the low and high memory watermark.
+execution of a process at the same time. Linux reassigns
+                                                                                       Instead, we evict FPR pages in a recycling context only when
+previously used virtual addresses during both, mmap-munmap
+                                                                                       the free memory reaches the min watermark. In this case,
+cycles or through the page cache. Fig. 5 (a) shows an example,
+                                                                                       we construct a huge batch of pages to be evicted, to free
+where thread T1 first frees a page for mapping f1 and Linux
+                                                                                       memory back to the high watermark. For this huge evict, a
+then reallocates a different physical page to the same virtual
+                                                                                       single shootdown must be sent.
+address at the next mmap-call of the same thread T1 for
+mapping f2. In this case, FPR would not have sent any
+                                                                                       C. Design and implementation details
+shootdowns to other cores running the same process. Now
+let us assume that the threads T1 and T2 concurrently access                              The following subsection discusses further design choices
+the same mappings. In this case, T2 would not update its                               and implementation details.
+corresponding TLB when accessing f2 for the first time, as                                1) Targeted use cases: FPR optimizes fast and frequent
+no page fault is produced based on the valid TLB entry and T2                          I/O accesses through mmap, both mmap-munmap cycles and
+would access the wrong physical page. This so-called ABA-                              evictions of larger mappings. Especially read accesses tend to
+problem is then leading to consistency errors [9], [27].                               be impacted by TLB shootdowns, as there is no costly syn-
+chronisation or write-back, that could be executed concurrently       former buddies. When the buddy allocator performs a split,
+to the TLB flushes.                                                   we copy the tracking data to the split buddies.
+   FPR also supports anonymous memory and private mmap                   5) Further optimizations: TLB shootdowns can be merged
+writes. However, FPR does not further optimize performance            when several pages leave recycling. We, therefore, add a global
+for anonymous mmap-munmap cycles (essentially cycles of               counter, which is incremented for each global shootdown. The
+malloc and free), because the malloc implementation in libc           current value of this counter is set in the version field of
+already includes optimized user-space caches. Also, private           our tracking data when a recycled page is freed. During a
+mmap writes at frequencies as high as in read scenarios are           following reallocation, we only send a shootdown if the page
+rare due to the underlying copy-on-write mechanisms.                  is leaving recycling and its version value matches the global
+   2) Extended recycling contexts: In this paper, we only             counter. Otherwise, a global shootdown before freeing this
+discussed recycling contexts for a single process. However,           page has already removed all invalid entries from the TLBs.
+FPR also supports larger user-defined contexts:                       This eliminates the necessity of requiring shootdowns for each
+1) One recycling context per FPR mmap (tracking ID =                  single page leaving a recycling.
+    (pid << sizeof (mmap id)) + mmap id). Recycling is                   When a process is forked, no additional operations are
+    restricted to page cache evictions, as mmap-munmap are            performed if the forked mappings stay within the recycling
+    using multiple consecutive mappings.                              context. If this is not the case, a single TLB shootdown for
+2) One recycling context for all FPR mmaps of a process, so           the corresponding pages can be issued, before the forked pro-
+    that tracking ID = pid.                                           cesses are considered as new recycling contexts. Additionally,
+3) One recycling context for all FPR mmaps of a process’              NUMA-rebalancing using FPR is supported by checks during
+    child processes (tracking ID = parent pid). Enables               the allocation of the target page-frame and future reallocation
+    FPR for shared mappings within the child processes.               of the old source page-frame.
+4) One recycling context for all FPR mmaps of all processes              6) Kernel implementation and memory footprint: The
+    of a user (tracking ID = uid). Enables FPR for shared             changes made to the kernel are lightweight. Most functions
+    mappings within all processes of the user.                        are outsourced into a single header-file (∼400LOC), to be
+   The latter two settings require the user to trust the processes,   used and inlined within filemap.c, memory.c, mmap.c,
+as extending the context of an FPR mapping beyond a single            mmu_gather.c, page_alloc.c and vmscan.c. Within
+process allows a process to create stale entries to physical          these files, a total of ∼60LOCs are modified. The kernel
+pages which can be used to access data from other processes.          interfaces remain unchanged.
+   3) Enabling FPR: We designed FPR as an opt-in solution                For each data page, we maintain 8 bytes (0.5% overhead
+using the MAP_FPR flag, because the standard mapping is               for 4 kByte pages) to track pages. 2 bits are used for flags,
+required to catch and debug segmentation faults. Apart from           22 bits for the ID, and 40 bits for the version. We store the
+the basic way of using FPR via the MAP_FPR flag, we provide           tracking data in the same NUMA node as the corresponding
+an optional interception library that adds the flag automatically     pages.
+to all mmap() calls for user-defined paths (e.g., the database
+of a learning workflow). This way, existing applications can                                V. E VALUATION
+transparently make use of FPR without recompilation.
+   4) Interaction with other sources of shootdowns: Memory               This section evaluates FPR in munmap and eviction scenar-
+mappings can also be modified by other parts of the kernel.           ios using microbenchmarks and real-world applications. We
+Page migration, e.g., physically moves pages and modifies             also discuss how FPR performs in comparison with previous
+their page table entries [25]. Page migration can be explicitly       approaches.
+requested or is triggered automatically by the kswapd pro-               1) Experimental setup: The overhead of TLB shootdowns
+cess. We handle both cases in the same way and treat migration        depends on the CPU and therefore, we have evaluated FPR
+similarly to reallocating the migration target page. If the target    on different hardware configurations and employed three Intel-
+page leaves a recycling context, we perform the shootdown.            and AMD-based servers (see Table I). Two servers are dual-
+If the source page is within a recycling, we copy its tracking        socket to investigate the impact of inter-socket communication
+data to the new page. Freeing the source page is handled by           on shootdowns. The single-socket Intel server is equipped with
+kswapd, similar to evicted pages.                                     persistent memory to evaluate the impact of shootdowns for
+   We need to track recycling pages in all places they are            very fast storage.
+managed, and hence, we need to also track them if they are               We have implemented FPR in longterm Linux kernel 5.15
+freed and moved back from the per CPU page lists to the               and also ported it to to the most recent kernel 6.10. Unfor-
+buddy allocator. If two buddies are merged and one of them            tunately, not all servers were available to us at this time,
+is tracked as recycling, we also track the merged buddy in the        so we are showing the results for 5.15, unless otherwise
+same recycling context. If both of them are tracked, but with         mentioned. Compared to the kernel 6.10, FPR’s performance
+different IDs, we set the second flag in our tracking data to         improvements have remained the same in terms of quality.
+state that a shootdown should be always sent for this memory             We use the null block device driver (nullblk) in some
+region. The value of the version is set to the maximum of the         experiments to avoid any device latency. As nullblk cannot
+serve real-world applications, we additionally use the EXT4
+
+
+
+
+                                                                                                                                                                                                                           n
+                                                                                                                                                                                            2
+                                                                                                                                                                                   1
+                                                                                                                                                                        n
+                                                                                                                                                       1
+                                                                                                                          n
+                                                                                                     2
+                                                                                     1
+
+
+
+
+                                                                                                                                         1
+
+
+
+
+                                                                                                                                                                               ix
+
+
+
+
+                                                                                                                                                                                                         ix
+                                                                                                                                                                                        ix
+                                                                                                                                                   p
+
+
+
+
+                                                                                                                                                                     p
+                                                                             O
+
+
+
+
+                                                                                                                                        O
+                                                                                                    O
+
+
+
+
+                                                                                                                         O
+
+
+
+
+                                                                                                                                                                             m
+
+
+
+
+                                                                                                                                                                                                        m
+                                                                                                                                                                                       m
+                                                                                                                                                   m
+
+
+
+
+                                                                                                                                                                    m
+file system that has been mounted on a RAM disk.
+
+
+
+
+                                                                         I/
+
+
+
+
+                                                                                                                                     I/
+                                                                                                I/
+
+
+
+
+                                                                                                                        I/
+
+
+
+
+                                                                                                                                              co
+
+
+
+
+                                                                                                                                                                   co
+   2) Methodology: Pinpointing the overhead of shootdowns                                                   (...)                                       (...)
+
+to a fixed location is not possible, since part of the overhead
+belongs to the interrupt handling routine that spans over             Case 1: Only I/O threads                                     Case 2: Single I/O, many
+hardware and software. Additionally, shootdowns can cause                                                                          compute threads                                          (...)
+
+
+
+
+                                                                                                                                                                         m
+                                                                                                                                                              1
+                                                                                          1
+
+
+
+
+                                                                                                                          n
+
+
+
+
+                                                                                                                                               n
+the eviction of seemingly unrelated TLB entries, which might
+
+
+
+
+                                                                                                     1
+
+
+
+
+                                                                                                                                        1
+
+
+
+
+                                                                                                                                                                     p
+                                                                                                                                                           p
+                                                                                   p
+
+                                                                                                  O
+
+
+
+
+                                                                                                                                     O
+                                                                                                                           O
+
+
+
+
+                                                                                                                                               O
+
+
+
+
+                                                                                                                                                                     m
+                                                                                                                                                          m
+                                                                           m
+
+                                                                                                I/
+
+
+
+
+                                                                                                                                   I/
+                                                                                                                        I/
+
+
+
+
+                                                                                                                                             I/
+
+
+
+
+                                                                                                                                                                   co
+                                                                                                                                                       co
+                                                                        co
+increase the latency of other parts of an application. Therefore,                                           (...)                    (...)                 (...)
+we used the end-to-end runtime and throughput as evaluation
+metrics to consider all shootdowns effects.
+                                                                      Case 3: Single compute,                                      Case 4: many I/O, many                    Case 5: All mixed
+   We cleared all relevant caches and copied the source data          many I/O threads                                             compute threads                           I/O-compute threads
+from a predefined image to exactly the same location before
+each test to remove the side-effects of previous runs. The                                                     Fig. 6. mmap-munmap cases overview.
+memory usage and NUMA allocation strategies are the same
+across all experiments. We also cleared our tracking data and                                                                                                                 2
+
+
+
+
+                                                                                                                                                                                                    TLB shtdwns. [M/sec]
+                                                                         Throughput [M/sec]
+flushed TLBs and the page cache before each experiment when                                   1.0                                                          Linux I/Os
+                                                                                                                                                           FPR I/Os
+evaluating FPR.                                                                                                                                            Linux TLB shtdwns. 1
+   The standard deviation of our experiments is marginally                                                                                                 FPR TLB shtdwns.
+                                                                                              0.5
+small, and hence, omitted from the figures. All runs are                                                                                                                                       0
+performed at least three times for a sufficient duration (up to 2h
+                                                                                              0.0
+for the page eviction cases) to obtain stable results. We report                                        1           2          4    8      12 24 36                     48    72       96
+the average values of repeated experiments. FPR runs were                                                                               # I/O Threads
+performed with all security and consistency features enabled.
+The number of TLB shootdowns in the results denotes the sum                                         Fig. 7. munmap Case 1. Y-axis shifted for visibility.
+of the remote TLB flush requests received and executed.
+   Previous studies did not include scenarios to specifically
+                                                                     results. Therefore, part of the comparison must be indirect.
+analyze the impact of shootdowns on compute phases or on
+                                                                     Fastmap [21] is the only approach that runs on kernel version
+non-I/O threads [1], [8]. Some studies also claimed that the
+                                                                     4.14 and we, therefore, ported back FPR to it to provide a
+page eviction algorithm is slow and TLB shootdowns during
+                                                                     comparison with Fastmap.
+page eviction would not impact application performance [1],
+[21]. In contrast, our microbenchmarks also consider shoot-          A. mmap/munmap
+downs sent from a group of I/O threads to a set of compute              In this section, we evaluate the performance of our approach
+threads and investigate cases where all threads perform a            for mmap/munmap-heavy applications. First, we measured
+mixture of I/O and compute. Our microbenchmarks include              the performance using several microbenchmarks to show the
+both munmap and page eviction scenarios. In addition to the          effect of our optimizations. Next, we evaluated FPR using real-
+microbenchmarks, we have also evaluated FPR using the real-          world applications that heavily use mmap/munmap.
+world applications Apache web server, LevelDB, and LMDB.                1) Microbenchmarks: Our benchmarks include three types
+   The oldest kernel version running on our hardware is              of threads: 1) I/O threads performing loops of mmap-¿4k-
+Linux 4.14. We therefore cannot provide a direct comparison          access-¿munmap, 2) compute threads continuously executing
+of FPR with previous studies, which are only available for           an instruction accessing a register to simulate compute-heavy
+older Linux kernels (e.g., 4.5 [1] or 4.10 [18], [19]). Porting      functions, and 3) mixed threads which alternate performing
+their implementations to newer kernels requires a significant        I/O and compute to simulate a process accessing data and then
+engineering effort, since the Linux kernel included several          processing it. Since the results for the Intel and AMD servers
+major changes in recent years and comparing our results with         are similar, we only report the results for the Intel server. We
+the published results using different setups would not take          designed five combinations of these thread types and evaluated
+into account changes in the Linux kernel affecting the base          them on a shared mapped nullblk device. Fig. 6 provides an
+                                                                     overview of the examined use cases. To include the storage
+                              TABLE I                                device latencies, we also present results for additional storage
+                          H ARDWARE SETUP                            media.
+                                                                        Fig. 7 shows the throughput and the number of TLB
+  Server         CPU            Memory            Storage
+                                                                     shootdowns received for Case 1 that has been investigated in
+             Intel Xeon 9242                Intel P4511 NVMe 2T
+   Intel
+           96 cores, 2 socket
+                                 768G
+                                             Optane P4800X 375G
+                                                                     previous papers, e.g., based on the vm-scalability benchmark1 .
+            AMD Epyc 7413                                            In the experiments with up to 8 threads, FPR improves
+   AMD                           256G       Toshiba PM5 SAS 1T
+           48 cores, 2 socket                                        performance by up to 30% compared to the baseline kernel
+             Intel Xeon 5215
+   pmem                          192G    Optane DC NVMM 768G
+           10 cores, 1 socket                                          1 https://git.kernel.org/pub/scm/linux/kernel/git/wfg
+by eliminating nearly all TLB shootdowns. When increasing                                                                                                                               2
+                                                                                                                                  1.00                               Linux I/Os
+
+
+
+
+                                                                                                                                                                                                    TLB shtdwns. M/sec]
+                                                                                                            Throughput [M/sec]
+the number of threads, the benchmark triggers a scalability                                                                                                          FPR I/Os
+limitation of the kernel’s virtual memory management that                                                                         0.75                               Linux Compute
+                                                                                                                                                                     FPR Compute        1
+uses the buddy allocator after nearly every munmap and                                                                                                               Linux TLB shtdwns.
+                                                                                                                                  0.50                               FPR TLB shtdwns.
+the performance drops heavily independent of the number of
+                                                                                                                                  0.25                                                  0
+TLB shootdowns (see also [20]). Addressing this bottleneck
+is beyond the scope of this paper, whereas FPR will provide                                                                       0.00
+higher performance improvements after it has been resolved.                                                                                0   1     2   4    8 12 24 36 48 72 96
+                                                                                                                                                             # I/O threads
+   Real applications do not only mmap/munmap pages but
+also perform compute. Case 2, e.g., limits the number of                                                                         Fig. 9. munmap Case 3 with 1 compute and N I/O threads.
+I/O threads to one and adds additional compute threads. This
+case represents applications employing a dedicated thread to
+perform I/O while other threads process data. The I/O thread                                             equivalent to the compute performance of 6.1 cores compared
+does not suffer from the scalability limitations mentioned                                               to the baseline. The highest improvement belongs to cases
+in Case 1. Fig. 8 shows the throughput and the number                                                    with a high number of compute threads and a low number
+of shootdowns received for a varying number of compute                                                   of I/O threads. With an increasing number of I/O threads, the
+threads. The ideal compute baseline does not execute the                                                 improvements degrade similar to Case 1. The number of I/O
+I/O thread and the compute threads, therefore, do not suffer                                             operations is increased by up to 2.1× (not shown in Fig. 10).
+from shootdowns. FPR does not perform any shootdowns                                                        Case 5 mimics applications with mixed threads that perform
+and offers a performance very close to the ideal case. FPR                                               I/O and compute. Fig. 11 shows the throughput and the number
+improves compute performance by up to 21% compared to                                                    of received TLB shootdowns for various thread counts. By
+the baseline and significantly increases the number of I/O                                               comparing this figure and Fig. 7, we can see that the mixed
+operations. This is because the FPR I/O thread does not need to                                          threads are more affected by shootdowns than I/O threads. This
+wait for confirmations that the compute threads have finished                                            is because mixed threads currently running compute cannot
+the shootdowns. In contrast, the I/O throughput of the baseline                                          delay the handling of shootdowns until they return from an
+kernel significantly suffers from waiting for these confirma-                                            I/O function (see Figure 3). FPR improves performance by
+tions. Nevertheless, the FPR’s I/O drops when crossing NUMA                                              57% for 4 threads and still provides 31% higher performance
+domains at 24 cores and socket domains at 48 cores.                                                      than the baseline for more than 4 threads, when the VMA
+   Varying the number of I/O threads while having a single                                               starts to bottleneck.
+compute thread (Case 3) performs similarly to Case 1 (see                                                   2) Performance on storage devices: We re-run Case 2 for
+Fig. 9). For the case that the application contains one I/O                                              various storage devices to understand the impact of their
+and one computation thread, FPR achieves a 93% higher                                                    latencies. Fig. 12 shows the performance for different mmap
+performance for the I/O thread than the baseline kernel.                                                 access modes, performed as random accesses. Shared writes
+   Case 4 varies the number of I/O and compute threads at                                                that include a writeback after munmap are not bottlenecked
+the same time. The results for the Intel server have been                                                by TLB shootdowns, but by the memory management’s write
+either skewed towards compute or I/O when the number of                                                  back mechanics, also on the nullblk. FPR’s focus is mainly on
+threads was higher than the number of cores. We, therefore,                                              read and private-write accesses. In these cases, FPR improves
+used the AMD node for these experiments. Fig. 10 shows                                                   performance significantly. As expected, the number of I/Os
+the compute improvements of FPR over the baseline kernel,                                                drops compared to running on nullblk and TLB shootdowns
+which are normalized to a single core running computations                                               have a lower impact on performance. Nevertheless, we pro-
+without any I/O. A value of 6.1, e.g., denotes an improvement                                            vide around 18% performance improvement compared to the
+                                                                                                         baseline kernel for all target cases when using Optane SSDs.
+                                                                                                         Moving to slower SSDs, we see a drop in the speedup based
+                                                                              4
+                                          Linux I/Os       Ideal Compute
+    Compute Throughput [M/sec]
+
+
+
+
+                                                           Linux TLB shtdwns.
+     I/O Throughput [10K/sec]
+
+
+
+
+                                 15       FPR I/Os                                                                                                                                   6
+                                                                                                                                  48     6.1   2.3   0.7 0.0 0.0 0.0    0.6   0.7
+                                                                                  TLB shtdwns. [M/sec]
+
+
+
+
+                                          Linux Compute    FPR TLB shtdwns. 3
+                                                                                                                                                                                         [Raw Compute Cores]
+                                                                                                              # Compute Threads
+
+
+
+
+                                          FPR Compute                                                                             36     5.2   3.8   2.9 1.1 0.0 0.0    0.6   0.6
+                                                                                                                                                                                            FPR Perf. Gain
+
+
+
+
+                                 10
+                                                                                                                                  24     5.8   2.6   2.2 1.5 1.3 0.2    0.9   0.9    4
+                                                                              2                                                   12     3.0   2.5   1.6 1.4 1.2 0.3    0.8   0.9
+                                                                                                                                   8     2.0   1.8   1.3 1.0 1.0 0.4    0.6   0.7
+                                  5                                           1                                                    4     0.7   0.9   0.6 0.6 0.6 0.4    0.4   0.4    2
+                                                                                                                                   2     0.6   0.3   0.3 0.2 0.3 0.2    0.2   0.2
+                                                                                                                                   1     0.3   0.2   0.2 0.1 0.1 0.1    0.1   0.1    0
+                                  0                                           0                                                           1     2     4 8 12 24         36    48
+                                      0   1   2   4 8 12 24 36 48 72 96
+                                                  # Compute Threads                                                                                    # I/O Threads
+
+                    Fig. 8. munmap Case 2 with 1 I/O and N compute threads.                                                            Fig. 10. munmap Case 4. N I/O, N compute threads.
+                                                                                        2
+
+
+
+
+                                                                                                 TLB shtdwns. [M/sec]
+       Throughput [M/sec]
+                            0.4                                      Linux Mixed Ops                                          I/O   compute   I/O    compute    ...                    ...
+                                                                     FPR Mixed Ops                                                                                                     ...
+                                                                     Linux TLB shtdwns.                                               page cache      CF
+                                                                     FPR TLB shtdwns. 1                                                                         thread-local buffer   # threads
+                            0.2                                                                                                 memory-mapped file         PG
+
+                                                                                             0
+                            0.0                                                                                                            Fig. 14. Eviction case overview.
+                                    1      2    4       8    12 24 36      48    72     96
+                                                            # Threads
+
+                                        Fig. 11. munmap Case 5. N mixed threads.
+                                                                                                                           Fig. 13 shows the Apache throughput for different core
+                                                                                                                        numbers. FPR improves throughput starting at 12 threads and
+                                                                                                                        the peak throughput at 24 threads is improved by 22% and
+on slower I/Os.                                                                                                         28% for the Intel, AMD server, respectively. Scaling further
+   We also measured the performance on a 10-core server                                                                 decreases overall throughput whereas FPR is still 6% and 32%
+equipped with Optane persistent memory (not shown in                                                                    faster for Intel and AMD servers at 48 cores than the baseline.
+Fig. 12). FPR provides 38% and 12% performance improve-                                                                 B. Page eviction
+ment for nullblk and persistent memory, respectively on this
+server. Comparing these improvements to those of the Intel 96                                                              Our page eviction benchmark creates a file larger than the
+core server show that the relative improvement on persistent                                                            available memory and sets up a mmap. We then spawns threads
+memory is higher than for Optane SSDs and that our improve-                                                             randomly reading from the mapping. This forces kswapd to
+ments increase for faster storage devices.                                                                              evict pages to free space for new pages allocated during page
+                                                                                                                        faults. The file size has been set to at least 10× the memory
+   3) Apache: The Apache web server [15] performs mmap-
+                                                                                                                        size to reduce the effect of page cache hits and madvise
+read-munmaps for each request to stream contents from file
+                                                                                                                        has been set to random. Similar to Case 5 of the previous
+mappings. To evaluate FPR on Apache, we used Apache
+                                                                                                                        experiments, we have added compute operations between I/O
+version 2.4.53 and the Wrk workload generator2 accessing the
+                                                                                                                        accesses and scaled the amount of computation by a compute
+traditional SSDs and EXT4 . Similar to previous works [1],
+                                                                                                                        factor CF with 1CF=10K-ops. An optional main memory area
+[2], [18], we left Wrk parameters at the default of 6 generator
+                                                                                                                        for each thread, that is accessed during each compute operation
+threads using 400 connections. Apache also runs default
+                                                                                                                        can be configured in multiples of 4 kBytes (PG).
+settings, using the mpm_event module that runs multiple
+                                                                                                                           Fig. 14 shows how the operations are performed. A smaller
+server processes and threads. The duration of each test was
+                                                                                                                        CF leads to more time spent in the kernel and a higher number
+30 seconds. Wrk and Apache were pinned to separate cores.
+                                                                                                                        of lazy shootdowns, whereas higher CF lowers the number of
+ 2 HTTP benchmarking tool at https://github.com/wg/wrk                                                                  I/O operations. As the addresses for the PG buffer are not
+                                                                                                                        changing, shootdowns might negatively impact access times,
+                                                                                                                        because of the page walks forced by emptied TLBs.
+                                                                                                                           Fig. 15 shows the relative improvement of FPR (top num-
+                                                                                Shared Read
+       Throughput [K/sec]
+
+
+
+
+                            20                                                                                          bers in each cell) and the Linux baseline throughput (bottom
+                                                                                Private Read
+                                                                                Shared Write                            numbers). We scaled CF from 0.5 to 4.0 and either turned off
+                                                                                Private Write                           local buffers (PG-off) or set PG to 128. We spawned one thread
+                            10                                                                                          per available core that reads from a shared nullblk mapping
+                                                                                                                        and performed the compute phase alternating. The benchmark
+                             0                                                                                          reveals that CF and PG significantly affect performance. This
+                                    Linux FPR               Linux FPR       Linux        FPR                            shows a strong performance potential for saved TLB shoot-
+                                       NBLK                    Optane                 SSD
+                                                                                                                        downs in the eviction path.
+                                                                                                                           The effect of the computation time on our improvements is
+                                  Fig. 12. Access modes and devices on Intel server.
+                                                                                                                        not linear. It peaks at CF=1 and then reduces. This experiment
+                                                                                                                        reveals that applications performing I/O and compute en-
+                                                                                                                        counter unexpected performance degradation by shootdowns.
+   # Requests [K/sec]
+
+
+
+
+                                                                                                                        The local PG memory accesses during the compute phase also
+                            200                                                                                         affect our improvements. For the Intel server using an Optane
+                                                                                                                        SSD, enabling the PG accesses increases our improvements
+                            100                                        Linux on Intel 96core                            from 1.1% to 8.5%. On the pmem server, removing the
+                                                                       Linux on AMD 48core
+                                                                       FPR on Intel 96core                              memory accesses increases our improvements, because its
+                                                                       FPR on AMD 48core                                CPU runs at a higher frequency and the larger number of
+                                    1       2       4       8   12   24 36 48 72 96                                     operations lead to more shootdowns in the baseline. When we
+                                                                                                                        enable accesses to the PG buffer, the number of operations and
+                                                Fig. 13. Apache web server                                              shootdowns decreases because of the slower memory.
+            Intel   1.1% 0.0% 1.8% 2.3% 0.5%                                                                                                                                                                                              0.3
+                                                       8                             Intel 96c NBLK 0.3%  3.0% 0.8% 0.3% 0.3%         8
+                                                                                                                                                                                                   Linux NLBK
+
+
+
+
+                                                           FPR Perf. improvement [
+           NBLK     125k   125k   127k   127k   125k
+
+
+
+
+                                                                                                                                          FPR Perf. improvement [
+                                                                                                    126 k 128 k 90 k 61 k 46 k
+ PG off
+
+                                                                                                                                                                                                   FPR NBLK
+
+
+
+
+                                                                                                                                                                    Throughput [K/sec]
+
+
+
+
+                                                                                                                                                                                                                                                TLB shtds. [M/sec]
+            Intel   0.0% 1.1% 0.0% 0.0% 0.0%                                                      1.0% 8.5% 0.3% 0.1% 0.1%                                                               150                                              0.2
+            OPT     161k   162k   161k   161k   161k   6
+                                                                                       Intel 96c OPT 164 k 160 k 88 k 60 k 46 k       6
+                                                                                                                                                                                                   Linux TLB shtds. NBLK
+           Pmem     1.4% 3.4% 3.6% 3.5% 2.3%
+                                                                                                                                                                                                   Linux Optane
+                                                                                     Intel 48c NBLK 0.0%   2.3% 0.5% 0.3% 0.3%                                                                     FPR Optane                             0.1
+          NVMM      234k   217k   185k   158k   135k                                                 131 k 128 k 90 k 61 k 46 k                                                          100       Linux TLB shtds. Optane
+            Intel   0.3% 3.0% 0.8% 0.3% 0.3%           4                                                                              4                                                                                                   0.0
+           NBLK     126k   128k   90k    61k    46k                                   Intel 48c OPT 2.2%  5.0% 0.3% 0.7% 0.2%
+                                                                                                    168 k 153 k 86 k 59 k 45 k
+ PG=128
+
+
+
+
+            Intel   1.0% 8.5% 0.3% 0.1% 0.1%                                                                                                                                              50
+            OPT     164k   160k   88k    60k    46k    2                             AMD 48c NBLK 0.3%  0.3% 1.1% 1.6% 0.6%
+                                                                                                  106 k 106 k 107 k 92 k 48 k         2
+           Pmem     0.3% 0.1% 0.1% 0.1% 0.0%                                          AMD 48c SSD 1.7%  2.5% 1.2% 0.2% 0.0%                                                                0
+          NVMM      60k    32k    16k    11k    8k                                                 98 k   98 k   95 k   69 k   42 k                                                            1   2    4    8    12 24 36 48 72 96
+                                                       0                                                                              0
+comp.factor CF=0.5 CF=1 CF=2 CF=3 CF=4                                                  comp.factor CF=0.5 CF=1 CF=2 CF=3 CF=4                                                                                   # Threads
+
+               Fig. 15. Eviction: FPR improv.                                               Fig. 16. Eviction: Intel vs. AMD.                                                                  Fig. 17. Eviction: Scalability on Intel.
+
+
+
+   Note that the Optane SSD performs better than the nullblk                                                        running with 12 threads on an SSD and a RAM disk. Our
+device in this experiment. This anomaly can be partially                                                            improvements are higher for smaller thread numbers because
+explained by the lazy shootdown optimization, which prevents                                                        the scalability limitations prevent LevelDB from performing
+shootdowns while the thread is in the kernel and issues the                                                         more operations. For 12 threads on the RAM disk, we provide
+local TLB flush when the thread returns to user-space. The                                                          a 12.5% higher performance than the baseline. Increasing the
+Optane device has a higher latency, and therefore the duration                                                      number of threads and using slower storage devices decreases
+of read or write syscalls is longer than for nullblk. Fig. 17                                                       performance improvements. Note that the 96 threads result
+shows that nullblk is faster up to 48 cores, and that then the                                                      uses simultaneous multithreading (SMT) and was done for
+performance difference increases after adding a second socket.                                                      comparison to the following Intel results.
+   We performed the experiments on Intel and AMD servers.                                                              Fig. 20 shows the corresponding results for the Intel server.
+The AMD server only has 48 cores and we therefore added                                                             Increasing the number of threads also increases our improve-
+results for the Intel server for 48 cores with 24 processes                                                         ments. For 48 threads, we provide 20%, 48%, and 14%
+pinned to each socket (see Fig. 16). Reducing the number                                                            improvements for the RAM disk, Optane SSD, and traditional
+of cores, the peak still happens for the same configuration,                                                        SSD, respectively. This difference can originate from either the
+however, the improvements decrease. The baseline of the                                                             size of caches and TLBs in the CPUs or from employing dif-
+AMD server is lower than of the Intel server because of smaller                                                     ferent mechanisms for handling shootdowns and reducing their
+cache sizes and lower frequency. Therefore, the improvement                                                         overheads. When using all cores, we observe an unexpected
+peak is also smaller for the AMD server.                                                                            result. The performance of FPR is slightly reduced compared
+   We evaluated FPR also for different access modes in the                                                          to the previous thread count (48 threads) and the baseline
+eviction scenario. The difference between shared and private                                                        performance also significantly decreases. For 96 threads, the
+reads is negligible. For shared writes, FPR improves perfor-                                                        RAM disk under the baseline Linux is showing a performance
+mance by up to 1.5%. Private writes are not common at high                                                          degradation of 71% compared to 12 threads. Starting from 48
+frequencies, as they require keeping several versions of each                                                       threads, the Optane SSD also shows performance degradation.
+page, what would result in out-of-memory errors quickly.                                                            Our investigations show that this is based on the internal
+   Our benchmark suite has found different patterns, for which                                                      coherency mechanisms used in the CPUs. However, a full
+shootdowns have a significant performance impact. Addition-                                                         investigation of the reasons is beyond the scope of this paper.
+ally, it enables us to show peaks of the effect of shootdowns                                                       Nevertheless, the degradation is highly decreased using FPR
+when varying the amount and type of user-space processing.                                                          by reducing the number of shootdowns to only 2-15% of the
+   1) Memory mapped databases: Key-value stores like                                                                baseline (not shown in the figure).
+LMDB [6] and LevelDB [12] use large out-of-bound mmaps.                                                                Fig. 21 compares different YCSB workloads using LevelDB
+LMDB employs a large and sparse file to store the data                                                              on the Intel 10-core server. The load phase, consisting only
+and uses mmap to access it. If the file is larger than the                                                          of write accesses, shows an unchanged performance. FPR
+memory, kswapd needs to evict pages, causing shootdowns.                                                            improves the performance of YCSB-A (50% read, 50% write)
+LevelDB also accesses data through mmap but splits the                                                              on nullblk by 8%, while the performance on the SSD remains
+data into smaller files. Therefore, in addition to page evic-                                                       unchanged due to a more bottlenecked write path. The perfor-
+tion, munmaps are another source of shootdowns. We used                                                             mance of YCSB-B (95% read, 5% write) and YCSB-C (100%
+YCSB [7] to evaluate FPR for these databases. The YCSB                                                              read) are improved by 10% on nullblk and 5% on the SSD.
+workloads involve consistency checks and ran for several
+hours. First, we selected the read-heavy lookup workload                                                            C. FPR memory and performance overheads
+YCSB-C. Fig. 18 shows the LMDB throughput of the baseline                                                              The memory overhead of FPR for its metadata can be cal-
+Linux and FPR. The number of threads is set to the number                                                           culated to be 0.2%. To understand the performance overhead
+of available CPU cores. FPR provides 1.8% and 4.0% perfor-                                                          for tracking data, we designed two experiments. First, we
+mance improvement for Intel and AMD servers.                                                                        employed our modified Linux kernel, but without enabling
+   Fig. 19 shows the YCSB-C throughput of LevelDB using the                                                         the FPR for the memory mapping. This way, our overheads
+AMD server. All values are normalized to the Linux baseline                                                         on mmap-heavy applications that do not use FPR can be mea-
+Throughput [K/sec]                                                                  1.4                                                                 2.0
+
+
+
+
+                                                                 Norm. Throughput
+
+
+
+
+                                                                                                                                  Norm. Throughput
+                     30.0                           Linux                                           Linux RAM                                                        Linux RAM          FPR RAM                               load 100w         B 5w/95r
+
+
+
+
+                                                                                                                                                                                                  Norm. Throughput
+                                                                                                                                                                                                                     1.2
+                                                    FPR                                             FPR RAM                                                          Linux OPT          FPR OPT                               A 50w/50r         C 100r
+                                                                                                    Linux SSD                                           1.5          Linux SSD          FPR SSD
+                     27.5                                                           1.2             FPR SSD                                                                                                          1.1
+                     25.0                                                                                                                               1.0                                                          1.0
+                                                                                    1.0
+                     22.5                                                                                                                                                                                            0.9
+                                             AMD Intel                                        12      24     48       96                                        12        24       48      96                              Linux FPR      Linux FPR
+                                             48core 96core                                            # Threads                                                            # Threads                                           RAM             SSD
+
+                     Fig. 18. LMDB.                                                  Fig. 19. LevelDB on AMD.                                                 Fig. 20. LevelDB on Intel.                              Fig. 21. LevelDB Intel 10 core.
+
+
+
+                                             1.02              vanilla kernel                                                                                        experiments when the benchmarks are not run on the same
+                          Norm. Runtime
+
+
+
+
+                                                               FPR kernel                                                                                            kernel version. However, some of the optimizations from
+                                             1.00                                                                                                                    previous work like [1] are already included in 5.15, so that
+                                                                                                                                                                     our improvements are on top of their improvements.
+                                                        blacksch
+                                                                 oles                     canneal    fluidanim
+                                                                                                                ate eamcluster
+                                                                                                                   str
+                                                                                                                                                                        Fastmap compiles at least for a 4.14 kernel [20], running
+                                                                                                                                                                     on our 10-core Intel server, and we therefore ported FPR
+                                                               Fig. 22. PARSEC overhead.
+                                                                                                                                                                     back to it. Fastmap optimizes eviction performance by com-
+                                                                                                                                                                     pletely redesigning mmap, including a customized page cache.
+                                                                                                                         2.0                                         Unfortunately, Fastmap was not stable in case of frequent
+                                             0.8                                                       Kernel 4.18
+                                                                                                                                 TLB shtdwns. [M/sec]
+
+                                                                                                                                                                     munmaps and we were only able to run it for the page eviction
+                        Throughput [M/sec]
+
+
+
+
+                                                                                                       Kernel 5.15
+                                             0.6                                                       TLB shtdwns. 4.18 1.5                                         microbenchmark from Section V-B. In this case, Fastmap
+                                                                                                       TLB shtdwns. 5.15
+                                             0.4                                                                         1.0                                         provides 8% performance improvement, whereas FPR offers
+                                                                                                                                                                     2% improvement. The authors of Fastmap claim that 24% of
+                                             0.2                                                                           0.5
+                                                                                                                                                                     their improvement is from optimized TLB shootdowns, which
+                                             0.0                                                                           0.0                                       is on par with our improvements. In summary, a complete
+                                                    1      2     3                   4     5 6 7            8     9   10
+                                                                                          # Threads                                                                  redesign like Fastmap offers a high potential for performance
+                                                                                                                                                                     improvement for general mmap at the cost of compatibility,
+                                             Fig. 23. Performance of different kernels for Case 1.                                                                   whereas FPR offers immediate performance improvements
+                                                                                                                                                                     without breaking the standard Linux design.
+                                                                                                                                                                        We also ported FPR to the most recent kernel 6.10. The
+sured. FPR imposes at most 1% processing overhead for all                                                                                                            baseline results without FPR have changed slightly, both for
+experiments. For real-world applications, the overhead is even                                                                                                       the better and for the worse, depending on the exact scenario.
+lower than for the microbenchmarks (down to unmeasurable                                                                                                             However, the gain that FPR brought to the baseline has
+for Apache) and becomes nearly negligible.                                                                                                                           remained the same in terms of quality. As mentioned before,
+   In the second set of experiments, we selected several                                                                                                             we decided to show the results of 5.15 as we think it is more
+applications that do not rely on mmap or other sources of TLB                                                                                                        valuable, to present a broad varieties of hardware.
+shootdowns. We chose four applications from the PARSEC [4]
+benchmark suite that do not issue any shootdowns. Fig. 22
+shows the average of 25 normalized runtimes of the applica-                                                                                                                                 VI. C ONCLUSION
+tions. The overhead of FPR depends on the memory allocation
+pattern of the application. It is between 0% for blackscholes                                                                                                            TLB shootdowns degrade the performance of many data-
+and 1.2% for fluidanimate. Note that many applications allo-                                                                                                         intensive applications using mmapped I/O. Previous studies
+cate the memory only at the beginning of the execution, so                                                                                                           have proposed several approaches to mitigate this problem.
+that overhead is reduced for longer running applications.                                                                                                            However, they do not address the problem in a standardized
+                                                                                                                                                                     way and/or impose overhead on the system. By carefully
+D. Comparison with related work and between kernel versions                                                                                                          studying the impact of TLB shootdowns, we also uncovered
+   Fig. 23 shows Case 1 of the munmap benchmark for                                                                                                                  use cases that suffer from this problem that were not iden-
+baseline Linux 4.18 and 5.15. Kernel 5.15 is more scalable                                                                                                           tified by previous work. Based on our analysis, we propose
+and its performance is less degraded for higher threads counts.                                                                                                      FPR, a lightweight and transparent solution to mitigate TLB
+When both kernels are limited by the slow page allocator, the                                                                                                        shootdowns. FPR avoids shootdowns when pages are recycling
+5.15 can even double the performance, showing significant                                                                                                            by reoccurring allocations within mmaps. Our experimental
+optimizations. Interestingly, the raw number of shootdowns                                                                                                           results show that FPR improves performance by up to 92% in
+is higher than that of the kernel 4.18, which is explainable                                                                                                         microbenchmarks and 28% in real-world applications. Future
+by 5.15 not being completely bottlenecked. In summary, we                                                                                                            work will also investigate approaches to enable FPR to support
+cannot directly compare performance improvements between                                                                                                             virtualization.
+                              R EFERENCES                                        [20] A. Papagiannis, M. Marazakis, and A. Bilas, “Memory-mapped I/O on
+                                                                                      steroids,” in EuroSys ’21: Sixteenth European Conference on Computer
+                                                                                      Systems, Online Event, United Kingdom, April 26-28, 2021, 2021, pp.
+ [1] N. Amit, “Optimizing the TLB shootdown algorithm with page access                277–293.
+     tracking,” in 2017 USENIX Annual Technical Conference (ATC), Santa          [21] A. Papagiannis, G. Xanthakis, G. Saloustros, M. Marazakis, and A. Bi-
+     Clara, CA, USA, July 12-14, 2017, 2017, pp. 27–39.                               las, “Optimizing memory-mapped I/O for fast storage devices,” in 2020
+ [2] N. Amit, A. Tai, and M. Wei, “Don’t shoot down TLB shootdowns!”                  USENIX Annual Technical Conference (ATC), July 15-17, 2020, pp.
+     in Fifteenth EuroSys Conference (EuroSys), Heraklion, Greece, April              813–827.
+     27-30, 2020, pp. 35:1–35:14.                                                [22] J. Park, C. Min, H. Y. Yeom, and Y. Son, “z-read: Towards efficient and
+ [3] A. Awad, A. Basu, S. Blagodurov, Y. Solihin, and G. H. Loh, “Avoiding            transparent zero-copy read,” in 12th IEEE International Conference on
+     TLB shootdowns through self-invalidating TLB entries,” in 26th Interna-          Cloud Computing (CLOUD), Milan, Italy, July 8-13, 2019, pp. 367–371.
+     tional Conference on Parallel Architectures and Compilation Techniques      [23] P. Radojkovic, V. Cakarevic, J. Verdú, A. Pajuelo, R. Gioiosa, F. J.
+     (PACT), Portland, OR, USA, September 9-13, 2017, pp. 273–287.                    Cazorla, M. Nemirovsky, and M. Valero, “Measuring operating system
+ [4] C. Bienia, S. Kumar, J. P. Singh, and K. Li, “The PARSEC benchmark               overhead on CMT processors,” in 20th International Symposium on
+     suite: characterization and architectural implications,” in 17th Interna-        Computer Architecture and High Performance Computing, SBAC-PAD
+     tional Conference on Parallel Architectures and Compilation Techniques           2008, October 29 - November 1, 2008, Campo Grande, MS, Brazil, E. N.
+     (PACT), Toronto, Ontario, Canada, October 25-29, 2008, pp. 72–81.                Cácares, W. Cirne, and V. K. Prasanna, Eds. IEEE Computer Society,
+ [5] M.-S. Chang and K. Koh, “Lazy tlb consistency for large-scale multipro-          2008, pp. 133–140.
+     cessors,” in Proceedings of IEEE International Symposium on Parallel        [24] B. F. Romanescu, A. R. Lebeck, D. J. Sorin, and A. Bracy, “Unified in-
+     Algorithms Architecture Synthesis, Aizu-Wakamtsu, Japan, March 17-21,            struction/translation/data (UNITD) coherence: One protocol to rule them
+     1997, pp. 308–315.                                                               all,” in 16th International Conference on High-Performance Computer
+ [6] H. Chu, “Lightning memory-mapped database manager (LMDB),” 2020.                 Architecture (HPCA), Bangalore, India, 9-14 January, 2010, pp. 1–12.
+ [7] B. F. Cooper, A. Silberstein, E. Tam, R. Ramakrishnan, and R. Sears,        [25] J. H. Ryoo, L. K. John, and A. Basu, “A case for granularity aware
+     “Benchmarking cloud serving systems with YCSB,” in Proceedings of                page migration,” in Proceedings of the 32nd International Conference
+     the 1st ACM Symposium on Cloud Computing (SoCC), Indianapolis,                   on Supercomputing (ICS), Beijing, China, June 12-15, 2018, pp. 352–
+     Indiana, USA, June 10-11, 2010, 2010, pp. 143–154.                               362.
+ [8] A. Crotty, V. Leis, and A. Pavlo, “Are you sure you want to use             [26] D. Skarlatos, U. Darbaz, B. Gopireddy, N. S. Kim, and J. Torrellas,
+     MMAP in your database management system?” in 12th Conference                     “Babelfish: Fusing address translations for containers,” IEEE Micro,
+     on Innovative Data Systems Research (CIDR), Chaminade, CA, USA,                  vol. 41, no. 3, pp. 57–62, 2021.
+     January 9-12, 2022.                                                         [27] T. Stamler, D. Hwang, A. Raybuck, W. Zhang, and S. Peter, “zio: Accel-
+ [9] D. Dechev, P. Pirkelbauer, and B. Stroustrup, “Understanding                     erating io-intensive applications with transparent zero-copy IO,” in 16th
+     and effectively preventing the ABA problem in descriptor-based                   USENIX Symposium on Operating Systems Design and Implementation
+     lock-free designs,” in 13th IEEE International Symposium on                      (OSDI), Carlsbad, CA, USA, July 11-13, 2022, pp. 431–445.
+     Object/Component/Service-Oriented Real-Time Distributed Computing           [28] V. Uhlig, “Scalability of microkernel-based systems,” Ph.D. dissertation,
+     (ISORC), Carmona, Sevilla, Spain, 5-6 May, 2010, pp. 185–192.                    Karlsruhe Institute of Technology, Germany, 2005. [Online]. Available:
+                                                                                      http://digbib.ubka.uni-karlsruhe.de/volltexte/1000004020
+[10] B. V. Essen, R. A. Pearce, S. Ames, and M. B. Gokhale, “On the role of
+                                                                                 [29] V. Uhlig, “The mechanics of in-kernel synchronization for a scalable
+     NVRAM in data-intensive architectures: An evaluation,” in 26th IEEE
+                                                                                      microkernel,” ACM SIGOPS Oper. Syst. Rev., vol. 41, no. 4, pp. 49–58,
+     International Parallel and Distributed Processing Symposium (IPDPS),
+                                                                                      2007.
+     Shanghai, China, May 21-25, 2012, pp. 703–714.
+                                                                                 [30] C. Villavieja, V. Karakostas, L. Vilanova, Y. Etsion, A. Ramı́rez,
+[11] M. Evers, L. Barnes, and M. Clark, “The AMD next-generation ”zen 3”              A. Mendelson, N. Navarro, A. Cristal, and O. S. Unsal, “Didi: Mitigating
+     core,” IEEE Micro, vol. 42, no. 3, pp. 7–12, 2022.                               the performance impact of TLB shootdowns using a shared TLB
+[12] S. Ghemawat and J. Dean, “LevelDB, a fast and lightweight key/value              directory,” in International Conference on Parallel Architectures and
+     database library by Google,” 2014.                                               Compilation Techniques (PACT), Galveston, TX, USA, October 10-14,
+[13] K. Gosakan, J. Han, W. Kuszmaul, I. N. Mubarek, N. Mukherjee,                    2011, pp. 340–349.
+     K. Sriram, G. Tagliavini, E. West, M. A. Bender, A. Bhattacharjee,          [31] D. Wentzlaff and A. Agarwal, “Factored operating systems (fos): the
+     A. Conway, M. Farach-Colton, J. Gandhi, R. Johnson, S. Kannan, and               case for a scalable operating system for multicores,” ACM SIGOPS Oper.
+     D. E. Porter, “Mosaic pages: Big TLB reach with small pages,” in                 Syst. Rev., vol. 43, no. 2, pp. 76–85, 2009.
+     Proceedings of the 28th ACM International Conference on Architectural       [32] Z. Yan, J. Veselý, G. Cox, and A. Bhattacharjee, “Hardware translation
+     Support for Programming Languages and Operating Systems, Volume                  coherence for virtualized systems,” in Proceedings of the 44th Annual
+     3, ASPLOS 2023, Vancouver, BC, Canada, March 25-29, 2023, T. M.                  International Symposium on Computer Architecture (ISCA), Toronto,
+     Aamodt, N. D. E. Jerger, and M. M. Swift, Eds. ACM, 2023, pp.                    ON, Canada, June 24-28, 2017, pp. 430–443.
+     433–448.
+[14] H. Gugale, N. Gulur, Y. Marathe, and L. K. John, “ATTC (@c):
+     Addressable-tlb based translation coherence,” in International Confer-
+     ence on Parallel Architectures and Compilation Techniques (PACT),
+     Virtual Event, GA, USA, October 3-7, 2020, pp. 481–492.
+[15] Y. Hu, A. K. Nanda, and Q. Yang, “Measurement, analysis and perfor-
+     mance improvement of the apache web server,” in Proceedings of the
+     IEEE International Performance Computing and Communications Con-
+     ference (IPCCC), Phoenix/Scottsdale, Arizona, USA, 10-12 February,
+     1999, pp. 261–267.
+[16] Intel, Intel 64 and IA-32 Architectures Software Developer’s Manual
+     Volume 2 (2A, 2B, 2C, & 2D): Instruction Set Reference, A-Z, 2023.
+[17] K. C. Knowlton, “A fast storage allocator,” Commun. ACM, vol. 8,
+     no. 10, pp. 623–624, 1965.
+[18] M. Kumar, S. Maass, S. Kashyap, J. Veselý, Z. Yan, T. Kim, A. Bhat-
+     tacharjee, and T. Krishna, “LATR: lazy translation coherence,” in Pro-
+     ceedings of the Twenty-Third International Conference on Architectural
+     Support for Programming Languages and Operating Systems (ASPLOS),
+     Williamsburg, VA, USA, March 24-28, 2018, pp. 651–664.
+[19] S. Maass, M. K. Kumar, T. Kim, T. Krishna, and A. Bhattacharjee,
+     “ECOTLB: eventually consistent tlbs,” ACM Trans. Archit. Code Optim.,
+     vol. 17, no. 4, pp. 27:1–27:24, 2020.
+

@@ -1,0 +1,725 @@
+       Pitfalls of InfiniBand with On-Demand Paging
+                1st Takuya Fukuoka                                     2nd Shigeyuki Sato*                                          3rd Kenjiro Taura
+              The University of Tokyo                               The University of Tokyo                                     The University of Tokyo
+                                                                sato.shigeyuki@mi.u-tokyo.ac.jp                               tau@eidos.ic.i.u-tokyo.ac.jp
+
+
+
+
+   Abstract—InfiniBand is a popular high-performance intercon-                                  The On-Demand Paging (ODP) [17], [18] functionality of
+nect and offers Remote Direct Memory Access (RDMA), which                                   InfiniBand hardware developed by Mellanox serves the very
+enables low-latency communication based on kernel bypassing.                                thing. ODP implements automatic memory management with
+Although the conventional RDMA technology necessitates manual
+physical memory management, an emerging extension, On-                                      RDMA-triggered page faults on network devices. Developers
+Demand Paging (ODP), implements automatic memory man-                                       thus become free from hand-crafted physical memory man-
+agement based on RDMA-triggered page faults, which benefits                                 agement. Although page fault handling involves some runtime
+productivity. Although the existing studies said the overhead of a                          overhead, the existing study [17] reported that it merely costed
+page fault of ODP to be small enough, an in-depth investigation in                          several hundreds of microseconds per page fault and concluded
+various network situations including retransmission and timeout
+is missing. In this work, we conduct a comprehensive analysis                               it to be “small enough”.
+of the actual behaviors of ODP on different devices and reveal                                  Now, we are faced with a basic question: Is it always
+two awful performance pitfalls, which incur longer latencies 3–4                            small enough? ODP is for helping to develop general RDMA-
+orders of magnitude than a common-case page fault does. We                                  based software systems and should be amenable to different
+also experimentally demonstrate that the revealed pitfalls are
+harmful to existing software systems. This paper presents our                               sorts of communication. Particularly, the existing work [17],
+experimental analysis and lessons learned therefrom.                                        [19], [20] focused on the cost of page faults themselves and
+   Index Terms—InfiniBand, On-Demand Paging, Reliable Con-                                  little investigated that of retransmission derived from page
+nection, reverse-engineering, packet capturing                                              faults. To understand the actual cost of ODP, we need an in-
+                                                                                            depth investigation in various network situations, including the
+                      I. I NTRODUCTION
+                                                                                            retransmission and timeout of packets.
+   High-performance interconnects play a crucial role in real-                                  To answer this question, we conduct a comprehensive
+world computing. According to Mellanox’s report [1], data                                   investigation into the performance of ODP-enabled RDMA
+centers and supercomputers tend to choose InfiniBand for                                    of InfiniBand, which includes the reverse-engineering of the
+high-performance computing (HPC) and artificial intelligence                                hardware implementation of ODP. Then, we reveal two awful
+(AI) infrastructures, and high-speed Ethernet for cloud and                                 performance pitfalls: packet damming and packet flood. Packet
+hyperscale platforms.                                                                       damming is a situation wherein a stuck packet incurs a long
+   A key technology of these interconnects is remote direct                                 timeout of the Reliable Connection of InfiniBand, which
+memory access (RDMA), which enables kernel-bypassing and                                    incurred a latency of several hundreds of milliseconds. Packet
+zero-copy transfer of high bandwidth and ultra-low latency. As                              flood is massive repetitive retransmission incurred by a long
+RDMA over Ethernet, such as RoCE and iWARP, has become                                      delay of updating page statuses, which incurred a latency of a
+common [2]–[4], RDMA has become utilized for developing                                     few seconds. These resultant latencies are longer by 3–4 orders
+various distributed systems [5]–[10].                                                       of magnitude than the overhead of a network page fault itself
+   The kernel-bypassing nature of RDMA is crucial for low-                                  reported in [17]. We also demonstrate that the revealed pitfalls
+latency communication, whereas it incurs a large burden on                                  are actually harmful to existing software systems through
+system development because the standard RDMA primitives                                     experiments with SparkUCX [21] and ArgoDSM [22].
+cannot benefit from the memory paging by kernels. They
+                                                                                                This paper presents our experimental analysis and lessons
+necessitate manual registering of physical memory segments
+                                                                                            learned therefrom. We believe that these are beneficial from
+ready for RDMA into network devices. Moreover, this memory
+                                                                                            both the hardware and software standpoints. Our experimental
+registration is known to involve significant runtime overhead.
+                                                                                            analysis pinpoints hardware-level flaws, which would serve
+To balance the spatial cost of registered memory and the
+                                                                                            as good clues for hardware vendors. Our practice and lessons
+runtime cost of registration for the performance of RDMA-
+                                                                                            would be good hints to identify and/or avoid ODP-related per-
+based systems, we have to elaborate physical memory man-
+                                                                                            formance bugs for the developers of communication software
+agement [11]–[16]. To take both performance and productivity,
+                                                                                            that can enable ODP, such as MVAPICH2-X1 , UCX [23], and
+on-demand memory management based on page faults as in
+                                                                                            libfabric [24].
+kernels is promising and desirable.
+                                                                                                Our main contributions are summarized as follows.
+ This work was partially supported by JST ACT-I Grant Number JP-
+MJPR17UC and JSPS KAKENHI Grant Number 16H01715.
+ * Corresponding author                                                                        1 https://mvapich.cse.ohio-state.edu/
+
+
+
+ © 2021 IEEE. Personal use of this material is permitted. Permission from IEEE must be obtained for all other uses, in any current or future media, including reprinting/
+ republishing this material for advertising or promotional purposes, creating new collective works, for resale or redistribution to servers or lists, or reuse of any copyrighted
+ component of this work in other works.
+  • We present an in-depth experimental analysis of the             C. Retransmission Handling
+    actual behaviors of ODP (Section IV). To the best of               In RC, RNICs can detect packet loss through the timeout
+    our knowledge, our work is the first to analyze one-sided       of requests. When a request goes to be a timeout, RNICs
+    RDMA operations under ODP experimentally and actual             retransmit lost packets and guarantee the transmission of
+    timeouts on different InfiniBand devices quantitatively.        packets. Regarding timeout, QPs have two parameters: Local
+  • We identify two performance pitfalls of ODP [17] of In-         ACK Timeout CACK and Retry Count CRetry . Local ACK
+    finiBand, which we call packet damming (Section V) and          Timeout CACK is a 5-bit counter to define the timeout interval
+    packet flood (Section VI). We experimentally demonstrate        Ttr = 4.096 · 2cACK µs. Setting CACK = 0 means to disable the
+    that they can easily arise even under simple conditions.        timeout. The timeout interval Ttr defines the amount of time
+  • We evaluate the impacts of packet damming and packet            To that RNICs take to detect the timeout condition such that
+    flood on SparkUCX and ArgoDSM (Section VII). Our                Ttr  To  4Ttr . Practically, we have to set CACK , taking T o
+    experimental results show that they are actually harmful        into consideration. Retry Count CRetry is the maximum number
+    to existing software systems.                                   of retransmissions allowed for a request. A process aborts with
+                                                                    the IBV_WC_RETRY_EXC_ERR error when retransmission
+                       II. I NFINI BAND                             for a request fails CRetry times.
+                                                                       Note that we generally cannot set Ttr to 8.192 µs with
+   In this section, we briefly introduce the basic concepts of
+                                                                    CACK = 1 because the specification [25] says “The minimum
+InfiniBand, and then describe the retransmission mechanism,
+                                                                    acceptable value of Local ACK Timeout, other than zero,
+which is a key to the hardware implementation of ODP. See
+                                                                    shall be defined by the CA [RNIC] vendor.” More specifically,
+[25] for the details of the standard specification of InfiniBand.
+                                                                    letting c be set to CACK and c0 be the minimum acceptable
+   InfiniBand has four transport modes: Unreliable Datagram
+                                                                    value for an RNIC, Ttr is calculated with CACK = max(c, c0 ).
+(UD), Unreliable Connection (UC), Reliable Datagram (RD),
+                                                                       The specification [25] also says:
+and Reliable Connection (RC). In this paper, we focus on RC,
+which is the most commonly used, because the implementation               Because of variabilities in the fabric, scheduling
+of ODP for InfiniBand is based on RC [17].                                algorithms and architecture of the channel adapters
+                                                                          and many other factors, it is not possible, nor desir-
+                                                                          able, to time outstanding requests with a high degree
+A. Memory Registration
+                                                                          of precision.
+   To handle RDMA of kernel-bypassing transfers, InfiniBand         This statement implies that the minimum acceptable value of
+adapter cards, i.e., RDMA network interface cards (RNICs),          CACK may not be small in practice.
+manage translation tables from virtual addresses to physi-             InfiniBand verbs also provide a way of intentionally in-
+cal addresses. Memory registration is to register user-space        voking retransmission via the Receiver-Not-Ready (RNR)
+memory regions (e.g., communication buffers) into translation       Negative-Acknowledgment (NAK) packet, which is a special
+tables of RNICs. Kernels generally change virtual-to-physical       packet for the receiver of a concerned packet to ask the sender
+address mapping through paging or swapping, while the trans-        to retransmit it after a certain period. We can set the smallest
+lation tables of RNICs do not follow it because of the kernel-      period for which the sender has to wait via a verb parameter,
+bypassing nature. Therefore, memory registration generally          which we call minimal RNR NAK delay.
+involves pinning down a given region to guarantee to keep
+the translation tables of RNICs valid.                                                   III. O N -D EMAND PAGING
+                                                                       On-Demand Paging (ODP) [18] is an extension of Infini-
+B. InfiniBand Verbs                                                 Band verbs to allow us to be free from pinning down memory
+                                                                    regions for memory registration. Under ODP, RNICs raise
+   InfiniBand verbs are low-level communication interfaces
+                                                                    network page faults2 [17] and device drivers handle them to
+of RNICs for RDMA. They provide READ, WRITE, and
+                                                                    manage translation tables in RNICs automatically. The usage
+ATOMIC of one-sided communication and SEND and RECV
+                                                                    of ODP has two types Explicit ODP, which is to enable ODP
+of two-sided communication.
+                                                                    for registered memory regions, and Implicit ODP, which is to
+   Queue Pairs (QPs) are the endpoints of communication
+                                                                    enable ODP for the entire address space and make users free
+channels of InfiniBand verbs. Each QP consists of a Send
+                                                                    from memory registration. The difference in usage between
+Queue (SQ) and a Receive Queue (RQ). When issuing com-
+                                                                    them, however, does not matter in this paper.
+munication, an application posts a Work Request (WR) to a
+QP. QPs manage WRs as Work Queue Elements (WQEs) until              A. Basic Mechanism
+RNICs complete to process the WRs. When a WR completes,                We briefly review the basic mechanism of ODP according
+the corresponding Completion Queue Entry (CQE) gets in-             to the original paper [17].
+serted into a Completion Queue (CQ), which is associated               First, an RNIC checks, on the access to memory regions,
+with QPs, to notify applications of completion. Even if a WR        if a given virtual memory address is mapped into a physical
+fails, a CQE that contains the corresponding error code gets
+inserted into the CQ.                                                 2 In this paper, we call network page faults simply as page faults.
+memory address. If not mapped, the RNIC asks a driver to                                 Server-side ODP                                          Client-side ODP
+
+raise an interrupt to query for the kernel. Then, the kernel                      Clie                     Server                          Clie                   Server
+                                                                                                               Page Fa l
+returns the corresponding physical address by, e.g., allocating           Po                 Re   e                            Po                     Re   e
+                                                                      1    READ                                            1    READ
+pages or retrieving them from secondary storage. Lastly, the                                RNR NAK                                                  Re    on e
+
+driver passes the physical address to the RNIC, and the              RNR NAK dela
+                                                                     (abo 4.5 m )
+                                                                                            Re    on e                         Page Fa l
+
+                                                                                                                           (abo   0.5 m )
+translation table gets updated.
+                                                                                             Re    e                                                  Re    e
+   Pages registered in RNICs have to get invalidated when
+                                                                                             Re   on e                                               Re    on e
+kernels release them. The process of this page invalidation
+takes place in reverse order of that of page faults. When
+releasing a page, a kernel notifies a driver of the address               Fig. 1. Workflow of ODP with single READ observed with idbump.
+mapping to be invalidated. Then, the driver conveys it to an
+RNIC to flush the entry in the translation table. Lastly, the
+driver notifies the kernel of the completion of this invalidation.      In the server-side ODP, the server sent RNR NAK back to
+                                                                     the client in the face of the page fault. Then, the client waited
+B. Packet Handling                                                   about 4.5 ms and retransmitted a request, while discarding
+   The page fault handling and invalidation described above          responses sent back during the waiting time. We have found
+merely explain interactions between kernels and RNICs. They          no specific reason for discarding responses and conjecture it
+do not suffice for implementing ODP because RNICs commu-             to be related to the hardware-level matter of RNR NAK.
+nicate with remote RNICs. The implementation of ODP has                 In the client-side ODP, the retransmission of a request also
+to handle appropriately packets that result in page faults.          took place but was not based on RNR NAK. The client raised a
+   A primary technical issue is that RNICs have to manage a          page fault for a response and discarded the response because
+packet until its resultant page fault gets resolved, by using        of limited memory. Then, the client retransmitted a request
+a limited size of cache memory. To cope with this issue,             after about 0.5 ms regardless of the resolution of the page
+RNICs rely on the retransmission mechanism without storing           fault. That is, the client does not wait locally for the page
+pending packets locally. Specifically, RNICs leverage RNR            fault to get resolved. Therefore, the retransmission of the same
+NAK for suspending senders of a packet that causes a page            request takes place over and over if a page fault takes a long
+fault. Receivers do not have to store any dropped packets until      time to resolve. We conjecture that this implementation would
+RNR NAK reaches either because the reliability of InfiniBand         be due to a large burden on hardware when many requests to
+guarantees to leave them on the sender side.                         be retransmitted remain.
+
+            IV. O N -D EMAND PAGING IN R EALITY                      B. Timeout for the Worst Case
+   In this section, we experimentally analyze an actual imple-          The observations in Figure 1 merely show the common-
+mentation of ODPs. Table I summarizes the detailed informa-          case latency. Considering that the implementation of ODP
+tion of the InfiniBand RNICs used in our experiments. Table II       utilizes the retransmission mechanism, the worst-case scenario
+summarizes experimental environments.                                of resolving a page fault will incur the timeout of InfiniBand.
+                                                                     However, a quantitative analysis of the actual timeouts To of
+A. Actual Behaviors of ODP                                           different InfiniBand RNICs is missing. We have found merely
+   The original paper [17] on ODP clearly described why              a few articles [29], [30] on personal websites to complain
+RNR NAK and reliability enabled us to implement ODP with             about long delays in detecting anomalies.
+a limited memory. However, how to send RNR NAK and                      To understand the extreme case of ODP quantitatively,
+retransmit requests/response is not very clear, particularly for     we measured the actual To with various InfiniBand RNICs
+one-sided operations READ and WRITE. Then, to understand             as described in Table I. In this experiment, we deliberately
+the actual behavior of ODP with RDMA operations, we                  caused packet loss by specifying a wrong destination LID
+observe the InfiniBand traffic of a single READ through the          to a QP in the initialization phase. We set CRetry = 7 and
+packet capturing tool ibdump3 . For clarity, we here analyze         measured the time between the issue of the first request and
+the process of resolving a page fault in the client side and that    the abortion of the process with IBV_WC_RETRY_EXC_ERR.
+in the server side, separately. We call these one-side page fault    Therefore, letting t be the measurement time, we obtain
+resolutions with ODP, client-side ODP and server-side ODP,           To = t/(CRetry + 1) = t/8.
+respectively. We call a mixture of client-side ODP and server-          Figure 2 shows the results of To measured by varying CACK .
+side ODP, both-side ODP. We used KNL (private servers B)             We observed experimental lower limits of To to be around
+for this experiment, setting the minimal RNR NAK delay to            30 ms for the ConnectX-5 and to be around 500 ms for the
+be 1.28 ms.                                                          others. From these lower limits, we can estimate the minimum
+   Figure 1 illustrates the workflow of a single READ based          acceptable values of CACK to be 12 for the ConnectX-5 and
+on packets captured via ibdump and page fault counters.              to be 16 for the others.
+                                                                        We have two important observations from the experimental
+  3 https://github.com/Mellanox/ibdump                               results. One is, considering that the usual round trip latency
+                                                                 TABLE I
+            I NFINI BAND SYSTEMS AND DETAILS ON THEIR RNIC S , WHERE R EEDBUSH -H/L, ABCI, AND ITO ARE COMPUTING CLUSTERS .
+
+                          System name             PSID               Model name                 Driver version   Firmware version
+                          Private servers A       MT 1100120019      ConnectX-3 56Gbps FDR      5.0-2.1.8.0      2.42.5000
+                          Private servers B       MT 2170111021      ConnectX-4 56Gbps FDR      5.0-2.1.8.0      12.27.1016
+                          Reedbush-H [26]         MT 2160110021      ConnectX-4 56Gbps FDR      4.5-0.1.0        12.24.1000
+                          Reedbush-L [26]         MT 2180110032      ConnectX-4 100Gbps EDR     4.5-0.1.0        12.24.1000
+                          ABCI [27]               MT 0000000095      ConnectX-4 100Gbps EDR     4.4-1.0.0        12.21.1000
+                          ITO [28]                FJT2180110032      ConnectX-4 100Gbps EDR     4.4-1.0.0        12.23.1020
+                          Azure VM HCr Series     MT 0000000010      ConnectX-5 100Gbps EDR     4.7-3.2.9        16.26.0206
+                          Azure VM HBv2 Series    MT 0000000223      ConnectX-6 200Gbps HDR     5.0-2.1.8.0      20.26.6200
+
+
+                                                                     TABLE II
+                                                            E XPERIMENTAL ENVIRONMENT
+
+                  System name                CPU                                    # of logical cores    Memory
+                  KNL (Private servers B)    Xeon Phi CPU 7250 @ 1.40GHz            272                   196 GB + MCDRAM 16 GB
+                  Reedbush-H                 Xeon CPU E5-2695 v4 @ 2.10GHz          36 (= 18 ⇥ 2)         256 GB
+                  ABCI                       Xeon Gold 6148 CPU @ 2.40GHz           80 (= 20 ⇥ 4)         384 GB
+
+
+
+                                                                               1   init(local_buf, remote_buf, QP[num_QPs], ...);
+                                                                               2
+                                                                               3   for (i = 0; i < num_ops; i++) {
+                                                                               4     local = &local_buf[size * i];
+                                                                               5     remote = &remote_buf[size * i];
+                                                                               6     QP     = QPs[i % num_QPs];
+                                                                               7
+                                                                               8     post_rdma_read(local, remote, QP, size);
+                                                                               9     usleep(interval);
+                                                                              10   }
+                                                                              11   wait();
+
+
+                                                                              Fig. 3. Our micro-benchmark in simplified C code, which allows us to specify
+Fig. 2. To measured by varying CACK on different InfiniBand systems, where    size as the message size for each operation, num_ops as a number of READ
+systems other than Azure VM HCr Series (green) lie on almost the same line.   operations, num_qps as a number of QPs, and interval as time intervals
+                                                                              between communications. The wait function polls the CQ to check whether
+                                                                              all communications have been completed.
+of InfiniBand is about several µs, the timeout is tremendously
+and incomparably longer. The timeout is a disaster even if rare.
+The implementation of ODP should never incur it. The other is
+that a long timeout is ubiquitous. Even real-world computing
+clusters [26]–[28] and even the latest RNIC, the ConnectX-6
+200Gbps HDR, can suffer from it.
+                       V. PACKET DAMMING
+   In this section, we present the first performance pitfall of
+ODP: packet damming. Packet damming is a performance bug
+involving a delay of several hundreds of milliseconds, during                 Fig. 4. Average execution time of our micro-benchmark out of 10 trials with
+which the packets are dammed. This is caused by READ                          varying intervals between two communications. Two READ operations were
+                                                                              issued, and both-side ODP was adopted. Minimal RNR NAK delay was set
+operations and results in packet loss and a subsequent timeout.               to 1.28 ms.
+   We conducted experiments with a micro-benchmark to ex-
+plore the conditions under which packet damming occurs and
+analyzed the root cause using ibdump. For these experiments,                  completion of all the communications could be confirmed. The
+we used KNL (private servers B) described in Table I and                      communication buffer was aligned with 4096-byte boundaries,
+Table II, where the minimal timeout which can be configured                   considering the page size. In this section, we used a message
+is approximately 500 ms. We used RC as the transport type                     size of 100 bytes, a single QP, and both-side ODP, if not
+with CACK = 1 (minimal) and CRetry = 7.                                       specifically mentioned.
+   We created a micro-benchmark with InfiniBand verbs, in
+which we allocated two processes to two different machines,                   A. Pitfalls with Two READ Operations
+and the client process issued multiple READ operations to the                    First, we observed the execution time of the micro-
+server process as shown in Figure 3. We introduced a sleep                    benchmark with only two READ operations in Figure 4. The
+function to control the communication intervals. At the end                   execution took several hundred milliseconds with an interval
+of the benchmark, a blocking wait was inserted so that the                    of 100–4500 µs. This is surprising, given that the overhead of
+                                             Server-side ODP                                              Client-side ODP
+                                      Clie                         Server                          Clie                         Server
+Fa l                                                                   Page Fa l
+                          Po                   Req e     (1 )                          Po                   Req e     (1 )
+                      1    READ                                                    1    READ
+                                                 RNR NAK                                                   Re pon e (1 )
+                                                                                       Page Fa l
+                     RNR NAK dela             Re pon e (1 )
+                     (abo 4.5 m )                                                  (abo   0.5 m )
+                        Po                                                           Po
+                      2nd READ               Req e     (1 , 2nd)                   2nd READ               Req e     (1 , 2nd)
+
+
+                                             Re pon e (1
+                                                        ? onl )                                           Re pon e (1
+                                                                                                                     ? onl )
+                        Timeo                                                         Timeo
+                     (abo 500 m )                                                  (abo 500 m )
+
+                                               Req e    (2nd)                                               Req e     (2nd)
+                                                                                                                                         Fig. 7. Probability of timeout out of 10 trials with varying intervals of each
+                                              Re pon e (2nd)                                               Re pon e (2nd)
+                                                                                                                                         READ operations in the both-side ODP. The number of READ operations is
+                                                                                                                                         changed between 2 and 4. Minimal RNR NAK is set to 1.28 ms.
+
+                     Fig. 5. Workflow of ODP with two READ operations based on the packets
+                     obtained via ibdump.                                                                                                                                  Client-side ODP
+                                                                                                                                                                    Clie                          Server                              Cli
+                                                                                                                                                                                                      Page Fa l
+                                                                                                                                                           Po                 Req e    (1 )                                   Po
+                                                                                                                                                       1    READ                                                          1    READ
+                                                                                                                                                                               RNR NAK
+
+                                                                                                                                                     RNR NAK dela           Re pon e (1 )                             RNR NAK dela
+                                                                                                                                                     (abo 4.5 m )                                                     (abo 4.5 m )
+DP                                           Client-side ODP
+                                                                                                                                                         Po                                                                 Po
+     Server                           Clie                         Server                                                                                                                                                 2nd READ
+                                                                                                                                                       2nd READ            Req e     (1 , 2nd)
+         Page Fa l
+                          Po                      Re    e
+                      1    READ
+                                                 Re    on e                                                                                                                Re pon e (1
+                                                                                                                                                                                      ? onl )
+                          Page Fa l                                                                                                                                                                                      Timeo
+                                                                                                                                                         Po                  Req e     (3 d)                          (abo 500 m )
+                     (abo    0.5 m )                                                                                                                   3 d READ
+                                  (a) Server-side ODP                                     (b) Client-side ODP                                                          NAK (PSN Sequence Error)
+                                                  Re    e
+                     Fig. 6. Probability of occurrence of timeout out of 10 trials with varying                                                                            Req e     (2nd, 3 d)
+                                        Re on e
+                     intervals of two READ in the server-side ODP and client-side ODP. The
+                     value of the legend represents minimal RNR NAK delay.                                                                                                 Re pon e (2nd, 3 d)
+
+
+
+                                                                                                                                         Fig. 8. Workflow of ODP with three READ operations based on the packet
+                     ODP is mainly due to the page fault, which usually takes only                                                       captured with ibdump.
+                     several hundred microseconds. We also ran the same micro-
+                     benchmark with the client-side ODP and server-side ODP, and
+                     the long execution time was similarly observed.                                                                     during the first request’s pending period when preparing for
+                        To analyze this exceptional phenomenon, we captured In-                                                          retransmission.
+                     finiBand packets using ibdump. Figure 5 illustrates the oc-                                                                                        Server-side ODP
+                     currence based on the information from the packets and page                                                         B. Performance with More Than Two   READs
+                                                                                                                                                                                   Clie                      Server                   Cli
+                     fault counters. The figure shows that the long latency resulted                                                        Figure 7 shows the probability of the timeout, with vary-
+                                                                                                                                                                                               Page Fa l
+                     from the timeout of the second READ operation. The response                                                         ing numbers of READPo operations inRethee micro-benchmark.        Po
+                     of the second READ seemed to disappear for some reason,                                                             Increase in the number of READ RNR
+                                                                                                                                                               1 READ
+                                                                                                                                                                                 operations
+                                                                                                                                                                                    NAK     surprisingly 1 READ
+                     and it forced the client to wait for the timeout. We term this                                                      narrowed down the range of intervalsRe inonwhich
+                                                                                                                                                                                       e    the timeout Page Fa l
+                                                                                                                                                              RNR NAK dela
+                     phenomenon as packet damming because the transmission of                                                            occurred. This phenomenon
+                                                                                                                                                              (abo 4.5 mcan) be explained by the Packet (abo 0.5 m )
+                     packets is dammed for a long time.                                                                                  Sequence Number (PSN) management in RC. In InfiniBand,
+                                                                                                                                                                                  Re e
+                        To investigate exactly when packet damming occurred, we                                                          any packet contains a PSN to detect missing or out-of-
+                                                                                                                                                                                 Re on e
+                     measured the probability of timeout in the server-side ODP                                                          order packets. When the responder detects a packet with an
+                     and client-side ODP respectively. For the server-side ODP,                                                          unexpected PSN, it returns the NAK to the requester with a
+                     we changed the pending period specified by minimal RNR                                                              PSN sequence error.
+                     NAK delay. Figure 6a shows that in the case of minimal RNR                                                             Figure 8 depicts the process with three READ operations.
+                     NAK delay of 1.28 ms, the timeout occurred up to around the                                                         Even after the packet loss of the second READ operation, the
+                     interval of 4500 µs, which corresponded exactly to the actual                                                       server expected the second READ request to arrive. Therefore,
+                     RNR NAK delay represented in Figure 1. In addition, if the                                                          if the third READ request was issued from the client after
+                     pending period was changed, the range of intervals followed                                                         the packet loss, the server acknowledged the third request
+                     it. Figure 6b shows the result of the client-side ODP and                                                           as an unexpected request, and returned the NAK with the
+                     indicates that the timeout occurred up to around 500 µs of                                                          PSN sequence error. After the client received the NAK, it
+                     the interval, which corresponded to the retransmission interval                                                     retransmitted all the requests that were not completed. The
+                     of client-side ODP represented in Figure 1. In summary,                                                             noteworthy aspect is that the retransmission was conducted for
+                     packet damming occurred when the second request was posted                                                          the second and third READ operations immediately, and the
+timeout never happened. However, the timeout still occurred         of retransmissions occurred with the client-side ODP. This
+even with more than two operations when the interval was            observation implies that the page fault on the client side
+small enough for all the READ operations to fit into the            was not resolved for a long time, and retransmission from
+pending period of the first READ.                                   the client was repeated hundreds of times. We term this
+                                                                    performance issue with multiple QPs as packet flood because
+C. Experiments with Other Conditions                                of the tremendous number of packets involved. We conducted
+  To explore and analyze the packet damming, we conducted           the same experiment on different environments and confirmed
+experiments with other conditions and discovered the follow-        that it also occurred when using a ConnectX-6 adapter [31].
+ing.
+  • It occurred independent of other QPs. The QP still              B. Further Analysis
+     continued waiting for the timeout and caused a long               To further investigate the root cause of packet flood, we
+     latency even if new operations were posted in other QPs.       conducted another experiment with the same micro-benchmark
+  • It occurred regardless of whether the communication
+                                                                    to observe how each communication progresses. At this time,
+     buffer in each communication operation was on the same         we used a message size of 32 bytes and 128 QPs, and client-
+     page or not.                                                   side ODP was adopted. Therefore, the memory layout would
+  • It was not related to the page fault on the second (or later)
+                                                                    be as indicated in Figure 10.
+     communication. It occurred even when all the communi-             First, we focus on the result with 128 operations in Fig-
+     cation buffers were used and touched in advance, except        ure 11a. Because only one page was involved in this situation,
+     for the one for the first communication. Even it occurred      we could expect that all the communications were completed
+     when the second operation was WRITE or SEND.                   immediately as soon as the single page fault was resolved.
+  • It was irrelevant to the size of the communication buffer.
+                                                                    However, in reality, this was not the case. The result shows
+  • It occurred in various systems with ConnectX-4 servers,
+                                                                    that the communication began to complete around 1 ms, and
+     including Reedbush-H/L, ABCI, and ITO in Table I.              this can be interpreted as the resolution of the page fault
+     Nevertheless, we have not observed it with ConnectX-           in the RNIC. Nevertheless, the first 30 operations remained
+     6 servers with the micro-benchmark so far.                     unfinished until 6 ms, which implied that they were unaware
+                     VI. PACKET F LOOD                              of the resolution of the page fault for approximately 5 ms. In
+                                                                    other words, ODP with multiple QPs can cause update failure
+   In this section, we describe the second performance pitfall
+                                                                    of page statuses for a long time.
+of ODP: packet flood. Packet flood is a performance bug
+                                                                       During this period, the client kept repeating the retrans-
+involving a delay in the order of seconds, which is accom-
+                                                                    mission of the request, receiving the response, and discarding
+panied by a massive number of packets. It can occur when
+                                                                    it, assuming that the NIC did not have the corresponding
+READ operations are issued from multiple QPs and cause
+                                                                    entry. The period became longer and unacceptable when
+simultaneous page faults.
+                                                                    more operations and pages became involved, as shown in
+   As in the previous section, we reproduced the packet flood
+                                                                    Figure 11b. In summary, packet flood occurs when multiple
+with the same micro-benchmark represented in Figure 3 and
+                                                                    READ operations from multiple QPs cause simultaneous page
+analyzed it using ibdump. While the experiment in the previ-
+                                                                    faults followed by update failure of page statuses.
+ous section involved only one QP, this one involved multiple
+QPs. The experimental environment was also the same as that
+                                                                    C. Discussion
+introduced in the previous section. In this section, we set the
+minimal RNR NAK delay to be 1.28 ms and CACK = 18.                     The simultaneous page faults themselves could occur re-
+                                                                    gardless of whether they adopted server-side ODP or client-
+A. Impact of Packet Flood                                           side ODP, but packet flood occurred only with the client-side
+   Figure 9a shows how large impact the number of QPs had           ODP as shown in Figure 9b. This is because update failure
+on the performance when using the same number of READ               of page statuses occur only with the client-side ODP, which
+operations. When a small number of QPs were used, the ODP           is explained by the fact that clients are always responsible for
+performance was generally normal and acceptable, with the           retransmission.
+execution time almost falling in the range of the common               When a page fault occurs on the server side, all the servers
+overhead of page faults. When the number of QPs exceeded            should do is send RNR NAK back to the client, and the
+10, however, the ODP performance degraded drastically and           requests that cannot be processed can be completely ignored.
+became as much as 3,000 times worse than that for the case          On the other hand, client-side ODP works differently. When a
+without ODP.                                                        page fault occurs on the client side, the client itself should
+   To analyze this inexplicable performance degradation, we         retain the information about the communication for later
+also plotted the number of packets collected by ibdump as           retransmission. In other words, the client is stateful while the
+shown in Figure 9b. Surprisingly, the number of packets             server is stateless. This explains why the information about
+with the client-side ODP was hundreds of times greater              the page statuses was kept and not updated for a long time
+than that without ODP, which indicated that a large number          only with client-side ODP.
+        (a) Execution Time (s)                (b) Number of Packets                     (a) 128 Operations                  (b) 512 Operations
+Fig. 9. Effect of varying the number of QPs with the micro-benchmark in        Fig. 11. Number of completed operation per page. 128 QPs and a message
+Figure 3. We fixed the number of READ operations at 8192 and size of           size of 32 bytes is utilized and client-side ODP is adopted.
+communication at 100 bytes with 200 pages involved. The gray bar in the left
+figure shows the range of unavoidable overheads of ODP, assuming that each
+page fault in RNICs takes 250–1000 µs to be resolved in common cases.
+
+
+
+
+Fig. 10. Memory layout for communication buffer and assignment of QPs
+
+
+
+   Given this, a few aspects remain to be mentioned regarding
+Figure 9a. On the one hand, the performance of the both-side
+ODP and client-side ODP was able to be explained by packet                              (a) KNL (2 nodes)                (b) Reedbush-H (2 nodes)
+flood, while on the other hand, the performance degradation of                 Fig. 12. Execution time distribution when running simple ArgoDSM
+the server-side ODP was too large to ignore. We observed that                  benchmark which contains only argo::init() and argo::finalize() with ODP
+with a more detailed investigation, it resulted from the packet                disabled/enabled in each system. 10 MB was passed to argo::init() as the
+                                                                               memory size for the initialization.
+loss and consequent timeout explained in Section V. More
+interestingly, we found that the timeout interval lengthened
+with multiple QPs compared with the case when only a single
+QP was used. This can be explained by the fact that the client                 herency. It employs a home-node directory protocol without
+should handle the number of communications proportional to                     message handlers, and all the operations are performed by
+the number of QPs concurrently, and a high load is imposed                     RDMA over MPI RMA, which invokes UCX internally. By
+on the client by managing the RNR timer and retransmission.                    running a tutorial and test codes of ArgoDSM with ODP
+                                                                               enabled, we found that packet damming occurs in the ini-
+                VII. I MPACTS ON A PPLICATIONS
+                                                                               tialization phase of ArgoDSM, where first touches and page
+  In this section, we show that the two performance pitfalls                   faults are abundant.
+of ODP can affect applications in several environments and
+                                                                                  To illustrate this more quantitatively, we created a simple
+degrade the performance. Specifically, we show that packet
+                                                                               benchmark that contained only the initialization and finaliza-
+damming occurs in ArgoDSM and packet flood occurs in
+                                                                               tion of ArgoDSM and measured the execution time for 100
+SparkUCX. These systems do not use ODP in the default
+                                                                               trials. We plotted the result with a histogram as in Figure 12,
+configuration, but we enable it using environmental variables
+                                                                               which shows that the samples with enabling ODP can be
+of UCX [23] to evaluate the potential of ODP. The default
+                                                                               divided into two groups by the execution time in each system.
+configuration of UCX uses minimal RNR NAK delay of 0.96
+                                                                               We used ibdump to analyze the KNL and confirmed that
+ms and CACK = 18. The MPI library used in the experiments
+                                                                               the timeout actually appeared in the group with the longer
+of ArgoDSM was MPICH 3.3. The machines used in the
+                                                                               execution time, while it did not appear in the group with
+experiments are shown in Table II, and only KNL system allow
+                                                                               shorter execution time. The timeout was caused by one READ
+us to use sudo authority and ibdump.
+                                                                               operation followed by one SEND operation, whose packet
+A. ArgoDSM                                                                     dropped in the middle of communication when one node
+  ArgoDSM4 [22] is a software distributed shared memory                        tried to take the global lock and accessed the remote address.
+(DSM) system that utilizes RDMA to maintain cache co-                          Although we cannot analyze the Reedbush-H using ibdump,
+                                                                               we can make a similar conjecture that the group with the
+  4 https://github.com/etascale/argodsm                                        longer execution time also causes packet damming.
+                                  SparkTC                                         packets were retransmitted every several tens of milliseconds.
+                      QPs     Disable [s]     Enable [s]    Enable/Disable
+ KNL (2)              411      303 ± 20       473 ± 65                1.56        Although we are not permitted to use ibdump with sudo
+ Reedbush-H (2)       980     39.7 ± 0.38     256 ± 150               6.46        authority in Reedbush-H and ABCI systems, we can presume
+ ABCI (2)            2191      83.9 ± 2.4     84.9 ± 1.5              1.01        that the same phenomenon takes place in these systems.
+ ABCI (4)            2858      41.7 ± 1.4      59.3 ± 3               1.42
+                                                                                  The degree of performance degradation with ODP differs
+                                                                                  from each system and each example because packet flood is
+                      mllib.RecommendationExample
+                      QPs     Disable [s] Enable [s]        Enable/Disable        intimately related to the timing issue.
+ KNL (2)              210     100 ± 3.2   151 ± 67                    1.51
+ Reedbush-H (2)       980    21.9 ± 0.82  78.6 ± 46                   3.59                           VIII. R ELATED W ORK
+ ABCI (2)            2191     29 ± 0.55   31.2 ± 1.9                  1.07
+ ABCI (4)            1953    24.3 ± 0.64  28.6 ± 1.1                  1.18
+                                                                                  A. Memory Registration Methods
+                                                                                     Memory (de)registration of InfiniBand (or other RDMA-
+                       mllib.RankingMetricsExample                                capable interconnects) is known to involve considerable run-
+                       QPs    Disable [s]  Enable [s]       Enable/Disable        time overhead mainly because of the (un)pinning operation of
+  KNL (2)              389     517 ± 3.7   674 ± 140                  1.30
+  Reedbush-H (2)       980    46.6 ± 1.4    111 ± 56                  2.38        user-space pages, while leaving excessive memory registered
+  ABCI (2)            2191     107 ± 1.8    147 ± 1.6                 1.37        wastes physical memory directly. The standard approach to
+  ABCI (4)            2667    83.2 ± 3.4    197 ± 4.7                 2.37        balancing the runtime overhead and the spatial overhead is
+                                                                                  pin-down cache [16], which enables us to reuse pinned buffers
+Fig. 13. Comparison of execution time of SparkUCX with ODP enabled and            internally by postponing actual deregistration (i.e., unpinning).
+disabled. We conducted 10 trials and omitted the samples that failed to finish,   With the pin-down cache by Tezuka et al. [16], the actual
+especially with IBV_WC_RETRY_EXC_ERR when the retransmission count                deregistration of a buffer occurred in the least recently used
+exceeded the limit.
+                                                                                  (LRU) order when the total size of registered buffers exceeded
+                                                                                  the maximum size. Zhou et al. [15] introduced batched dereg-
+B. SparkUCX                                                                       istration to suppress the average cost of deregistring buffers.
+   Apache Spark is a distributed in-memory data processing                        Ou et al. [12], [32] developed a more sophisticated LRU-based
+framework widely used in industry and academia. Spark                             cache replacement scheme that divided the LRU stack into
+shuffling is a process to redistribute or re-partition data and                   three sections.
+is known to be costly in terms of CPU, memory, and net-                              Even in the presence of pin-down cache, several perfor-
+work. SparkUCX5 [21] is an RDMA acceleration plugin of                            mance tradeoffs are known to exist. The Unifier [14] caching
+Spark, which aims to accelerate the shuffling by utilizing                        system addressed a tradeoff between (de)registration cost and
+UCX. The SparkUCX-enabled Spark will be referred to as                            spatial cost. Larger pinned down buffers suppress on-demand
+SparkUCX from herein. In this experiment, we ran several                          pinning in dynamic registration, whereas they occupy more
+examples included in the Spark package and compared the                           physical memory, which other computations should have used.
+performance between the case enabled and disabled ODP.                            Frey and Alonso [11] argued a tradeoff between pinning (i.e.,
+We constructed our Spark cluster using standalone mode by                         newly registering) and copying. They experimentally showed
+starting a master process and worker processes by hand. For                       that for 256-KB or larger regions, it was more efficient to
+Reedbush-H and ABCI, we allocated one worker process to                           newly register by an order of magnitude.
+each worker machine and prepared two additional machines                             The breakdown of the memory registration process is also
+for the master process and the job-submission process. For                        important for efficient memory management. Mietke et al. [13]
+KNL, which we only possess two machines, we allocated                             analyzed the registration process inside the Mellanox Infini-
+the master process and one worker process to one machine                          Band driver and provided clues to improve it. For example,
+and one worker process and the job-submission process to                          it drastically reduced the cost of the mlock system call by
+the other machine. We separate the processes using numactl                        making a separate kernel thread zero-fill pages when they were
+with half of the cores assigned to each process. The examples                     not present.
+we chose are SparkTC, mllib.RecommendationExample and                             B. Performance Analysis of On-Demand Paging
+mllib.RankingMetricsExample, all of which include join op-
+erations of Spark, which issues READ operations internally.                          Only a few studies have analyzed the performance character-
+To configure SparkUCX, we adjusted the timeout of Spark,                          istics of ODP because it is an emerging technology. Lesokhin
+memory, and parallelism of executors for each environment.                        et al. [17] presented the first implementation of network
+   Table 13 shows that the examples created several hundreds                      page faults for InfiniBand and experimentally analyzed the
+to several thousands QPs, and enabling ODP degrades the                           overhead of page faults and invalidation. Their breakdowns
+performance by up to 6.46 times. We observed that SparkUCX                        showed that the overhead of page faults was dominated by
+sometimes got stuck intermittently for a few seconds with                         hardware-level interrupts and transmission resuming, while the
+ODP enabled. Packets in the middle of these period in the                         invalidation spent most of its time on updating page tables. Li
+KNL showed that packet flood occurred and many READ                               et al. [20] presented a performance analysis of Explicit ODP
+                                                                                  to design a memory-efficient MPI library. They compared
+  5 https://github.com/openucx/sparkucx                                           Explicit ODP with pin-down cache in latency and bandwidth
+and revealed that page faults incurred performance degradation      fully utilizing the RC mechanism. In particular, handling
+dominantly. Their results also indicated that the characteristics   concurrent page faults in the RNICs is technically difficult
+of page faults on the sender-side were different from those         because of their limited memory and functionality.
+on the receiver side and that prefetching on the receiver side
+effectively worked. In their later work [19] on Implicit ODP,       A. Lessons Learned
+they revealed that the overhead of page faults was able to             The pitfalls are naturally critical in terms of the super-
+mitigate through an elaborate tuning of the RNR NACK timer.         long latency, but they are problematic for the difficulty of the
+   These existing studies did not focus on retransmission           detection as well. First, they are related to retransmission and
+and timeout, relying upon the hardware-level reliability of         appear without spitting out the associated errors. Second, they
+InfiniBand. To the best of our knowledge, our work is the           are highly affected by the timing of communication operations,
+first to experimentally analyze the retransmission and timeout      which prevents us from reproducing them invariably. Detecting
+of packets derived from page faults.                                the pitfalls becomes extremely hard without observing the
+                                                                    raw packets, and in Section VII, we struggled to verify
+C. Reliability of InfiniBand                                        the occurrence of pitfalls in the non-sudo environments. In
+   There is some literature on analyzing the reliability of         addition, it is difficult to detect them from the application
+InfiniBand. Koop et al. [33] evaluated the cost of reliabil-        side because there are usually many software layers between
+ity by comparing the hardware-based implementation and              the application and InfiniBand verbs. In fact, it took several
+the software-based implementation. They implemented MPI             months for us to identify that the performance degradation
+over the UC transport and compared it experimentally with           resulted from ODP since we had encountered packet damming
+MPI over the RC and UD transports. They showed that a               with running high-level applications on top of UCX for the
+software-based approach was not only feasible but able to           first time. Why we took so long is partly because UCX
+achieve higher performance because of its smaller memory            prioritized ODP over direct memory registration by default,
+consumption. Meanwhile, they also showed that their UD-             and we were even unaware of the use of ODP in the first place.
+based implementation incurred no packet loss for NAS Parallel       This is the worst scenario possible, but we should manage to
+Benchmarks with 256 processes and for three applications with       cope with them by some means.
+1024 processes [34]. This was due to the reliability provided          However, changing and modifying the hardware currently
+by the link-layer protocol. Assuming this link-layer reliability,   deployed is not realistic. From here, we present workarounds
+Kalia et al. [8] developed remote procedure calls over the          for the pitfalls and guidelines for ODP from the software
+UD transport of InfiniBand. They designed it to detect packet       side. Regarding packet damming, we have two workarounds
+loss with coarse-grained timeouts of RPCs because they did          conceivable. First, we should set the smallest value to minimal
+not observe practically packet loss. For the same reason, the       RNR NAK delay to narrow down the range of the intervals
+key-value store HERD [10] was also designed to sacrifice            in which the timeout occurs. As shown in the previous study
+transport-level retransmission for common-case performance          [19], this setting can also reduce the resolution time of the
+at the cost of rare application-level retries.                      client-side ODP and, therefore, we should actively adopt it.
+   As seen from the literature above, even if we use unreliable     Second, we can avoid the long delay by posting an addi-
+transports, we are rarely faced with long timeouts of Infini-       tional communication. Section V-B has shown that increasing
+Band. Long timeouts were known to few practitioners [29],           the number of communication operations has provided more
+[30] but have never been a technical issue in research because      chances for the responder to detect the PSN Sequence Error
+of the rarity. To the best of our knowledge, through the case of    and, subsequently, reduced the possibility of the timeout. The
+packet damming under ODP, our work is the first to find that        naive way to achieve this functionality is by implementing a
+long timeouts can actually be harmful to InfiniBand systems.        software timer with appropriate granularity to issue a dummy
+                                                                    communication periodically.
+                IX. C ONCLUDING R EMARKS                               As for packet flood, issuing the same communication again
+   In this study, we have reverse-engineered the behavior of        might work because the page fault itself is actually solved
+ODP using ibdump and have found two severe retransmission-          during the packet flood, and the update failure of page statuses
+related performance pitfalls: packet damming and packet flood.      no longer applies to the new one. However, this is not a
+Packet damming occurs when a READ operation involves                straightforward solution and requires careful design of an addi-
+other operations within a certain interval, and its root cause      tional communication layer. As a guideline of ODP, occurrence
+is packet loss and subsequent timeout. Packet flood occurs          of packet flood should be kept in mind with multiple QPs,
+when READ operations invoke simultaneous page faults using          and ODP should be carefully applied for regions that can be
+multiple QPs, and its root cause is update failure of page          accessed from multiple QPs with a high probability.
+statuses. We have shown that they can appear in the software
+systems running on major computing clusters and degrade             B. Future Work
+their performance by up to 6.3 times.                                  Even with these pitfalls, the concept of ODP is still worthy
+   A high-level insight of this work is the hardness of the         to pursue. As shown in the previous study [17], the common-
+hardware implementation of network page fault handling by           case performance of ODP is surely acceptable as long as they
+are not involved. To overcome these flaws in the use of READ                      [8] A. Kalia, M. Kaminsky, and D. G. Andersen, “FaSST: Fast, scalable
+essentially, not only software-level workarounds described                            and simple distributed transactions with two-sided (RDMA) datagram
+                                                                                      RPCs,” in Proceedings of the 12th USENIX Symposium on Operating
+in the previous subsection, hardware-level improvement (or                            Systems Design and Implementation, ser. OSDI ’16. USENIX, 2016,
+bugfix) is needed.                                                                    pp. 185–201.
+   Packet damming can be easily solved with a short timeout,                      [9] ——, “Design guidelines for high performance RDMA systems,” in
+                                                                                      Proceedings of the 2016 USENIX Annual Technical Conference, ser.
+and therefore, we should investigate whether the lower limit                          USENIX ATC ’16. USENIX, 2016, pp. 437–450.
+can be changed easily or it encounters other big problems.                       [10] ——, “Using RDMA efficiently for key-value services,” in Proceedings
+Regarding packet flood, revealing mechanisms of interaction                           of the 2014 ACM conference on SIGCOMM, ser. SIGCOMM ’14. ACM,
+                                                                                      2014, pp. 295–306.
+between QPs and page statuses is urgent. To proceed with the                     [11] P. W. Frey and G. Alonso, “Minimizing the hidden cost of RDMA,” in
+investigation, cooperation with hardware vendors is necessary,                        Proceedings of 2009 29th IEEE International Conference on Distributed
+and, in fact, we have already reported the two pitfalls to                            Computing Systems, ser. ICDCS ’09. IEEE, 2009, pp. 553–560.
+                                                                                 [12] L. Ou, X. He, and J. Han, “MRRC: An effective cache for fast memory
+Mellanox for contributing to the improvement of ODP. They                             registration in RDMA,” in Proceedings of 14th NASA Goddard, 23rd
+have reported that packet damming is a problem derived from a                         IEEE Conference on Mass Storage Systems and Technologies, ser. MSST
+method specific to ConnectX-4 for processing page faults, and                         ’06, 2006.
+                                                                                 [13] F. Mietke, R. Rex, R. Baumgartl, T. Mehlan, T. Hoefler, and W. Rehm,
+it vanishes in later models. Nevertheless, considering that the                       “Analysis of the memory registration process in the Mellanox InfiniBand
+long timeout remains even in the latest InfiniBand cards, it is                       software stack,” in Euro-Par 2006 Parallel Processing, ser. Lecture
+still valuable to investigate other performance pitfalls related                      Notes in Computer Science, vol. 4128. Springer, 2006, pp. 124–133.
+                                                                                 [14] J. Wu, P. Wyckoff, D. Panda, and R. Ross, “Unifier: Unifying cache
+to the long timeout. Packet flood is more serious in that it                          management and communication buffer management for PVFS over
+remains in the latest InfiniBand cards, and we are waiting for                        InfiniBand,” in Proceedings of 2004 IEEE International Symposium on
+the investigation report from them.                                                   Cluster Computing and the Grid, ser. CCGrid ’04. IEEE, 2004, pp.
+                                                                                      523–530.
+                                                                                 [15] Y. Zhou, A. Bilas, S. Jagannathan, C. Dubnicki, J. F. Philbin, and
+                                                                                      K. Li, “Experiences with VI communication for database storage,”
+                        ACKNOWLEDGMENTS                                               in Proceedings 29th Annual International Symposium on Computer
+                                                                                      Architecture, ser. ISCA ’02. IEEE, 2002, pp. 257–268.
+   We would like to thank NVIDIA Corporation (formerly                           [16] H. Tezuka, F. O’Carroll, A. Hori, and Y. Ishikawa, “Pin-down cache: A
+Mellanox Technologies) for their beneficial feedback based                            virtual memory management technique for zero-copy communication,”
+                                                                                      in Proceedings of the First Merged International Parallel Processing
+on the in-depth investigation of the pitfalls. We thank Wataru                        Symposium and Symposium on Parallel and Distributed Processing, ser.
+Endo for his giving the starting point of this work through                           IPPS/SPDP ’98. IEEE, 1998, pp. 308–314.
+his system on top of UCX. We thank Shumpei Shiina for                            [17] I. Lesokhin, H. Eran, S. Raindel, G. Shapiro, S. Grimberg, L. Liss,
+                                                                                      M. Ben-Yehuda, N. Amit, and D. Tsafrir, “Page fault support for
+his comments on our manuscript useful for improving the                               network controllers,” in Proceedings of the Twenty-Second International
+presentation. We also acknowledge the feedback of anonymous                           Conference on Architectural Support for Programming Languages and
+reviewers.                                                                            Operating Systems, ser. ASPLOS ’17. ACM, 2017, pp. 449–466.
+                                                                                 [18] Understanding        On      Demand        Paging       (ODP),      Mel-
+                                                                                      lanox,          2019,          https://community.mellanox.com/s/article/
+                              R EFERENCES                                             understanding-on-demand-paging--odp-x.
+                                                                                 [19] M. Li, X. Lu, H. Subramoni, and D. K. Panda, “Designing registration
+                                                                                      caching free high-performance MPI library with implicit on-demand
+ [1] Mellanox, “Interconnect your future—enabling the best datacenter re-             paging (ODP) of InfiniBand,” in Proceedings of 2017 IEEE 24th
+     turn on investment,” https://www.mellanox.com/related-docs/solutions/            International Conference on High Performance Computing, ser. HiPC
+     hpc/TOP500-NOVEMBER-2019.pdf, 2019.                                              ’17. IEEE, 2017, pp. 62–71.
+ [2] R. Mittal, A. Shpiner, A. Panda, E. Zahavi, A. Krishnamurthy, S. Rat-       [20] M. Li, K. Hamidouche, X. Lu, H. Subramoni, J. Zhang, and D. K. Panda,
+     nasamy, and S. Shenker, “Revisiting network support for RDMA,” in                “Designing MPI library with on-demand paging (ODP) of InfiniBand:
+     Proceedings of the 2018 Conference of the ACM Special Interest Group             Challenges and benefits,” in Proceedings of the International Conference
+     on Data Communication, ser. SIGCOMM ’18. ACM, 2018, pp. 313–                     for High Performance Computing, Networking, Storage and Analysis,
+     326.                                                                             ser. SC ’16. IEEE, 2016, pp. 433–443.
+ [3] C. Guo, H. Wu, Z. Deng, G. Soni, J. Ye, J. Padhye, and M. Lipshteyn,        [21] P. Rudenko, “Sparkucx – rdma acceleration plugin for spark,” 2020,
+     “RDMA over commodity ethernet at scale,” in Proceedings of the 2016              2020 Virtual OFA Workshop.
+     ACM Conference on Special Interest Group on Data Communication,             [22] S. Kaxiras, D. Klaftenegger, M. Norgren, A. Ros, and K. Sagonas,
+     ser. SIGCOMM ’16. ACM, 2016, pp. 202–215.                                        “Turning centralized coherence and distributed critical-section execution
+ [4] Y. Zhu, H. Eran, D. Firestone, C. Guo, M. Lipshteyn, Y. Liron, J. Padhye,        on their head,” in Proceedings of the 24th International Symposium on
+     S. Raindel, M. Haj Yahia, and M. Zhang, “Congestion control for large-           High-Performance Parallel and Distributed Computing, ser. HPDC ’15.
+     scale RDMA deployments,” in Proceedings of the 2015 ACM Conference               ACM, 2015, pp. 3–14.
+     on Special Interest Group on Data Communication, ser. SIGCOMM ’15.          [23] P. Shamis, M. G. Venkata, M. G. Lopez, M. B. Baker, O. Hernandez,
+     ACM, 2015, pp. 323–536.                                                          Y. Itigin, M. Dubman, G. Shainer, R. L. Graham, L. Liss, Y. Shahar,
+ [5] J. Xue, Y. Miao, C. Chen, M. Wu, L. Zhang, and L. Zhou, “Fast                    S. Potluri, D. Rossetti, D. Becker, D. Poole, C. Lamb, S. Kumar,
+     distributed deep learning over RDMA,” in Proceedings of the 14th                 C. Stunkel, G. Bosilca, and A. Bouteiller, “UCX: An open source
+     EuroSys Conference 2019, ser. EuroSys ’19. ACM, 2019, pp. 1–14.                  framework for HPC network APIs and beyond,” in Proceedings of 2015
+ [6] X. Wei, Z. Dong, R. Chen, and H. Chen, “Deconstructing RDMA-                     IEEE 23rd Annual Symposium on High-Performance Interconnects, ser.
+     enabled distributed transactions: Hybrid is better!” in Proceedings of           HOTI ’15. IEEE, 2015, pp. 40–43.
+     the 13th USENIX Symposium on Operating Systems Design and Imple-            [24] P. Grun, S. Hefty, S. Sur, D. Goodell, R. D. Russell, H. Pritchard,
+     mentation, ser. OSDI ’18. USENIX, 2018, pp. 233–251.                             and J. M. Squyres, “A brief introduction to the OpenFabrics interfaces:
+ [7] Y. Lu, J. Shu, Y. Chen, and T. Li, “Octopus: an RDMA-enabled                     A new network API for maximizing high performance application
+     distributed persistent memory file system,” in Proceedings of the                efficiency,” in Proceedings of 2015 IEEE 23rd Annual Symposium on
+     2017 USENIX Annual Technical Conference, ser. USENIX ATC ’17.                    High-Performance Interconnects, ser. HOTI ’15. IEEE, 2015, pp. 34–
+     USENIX, 2017, pp. 773–785.                                                       39.
+[25] InfiniBand Architecture Specification Volume 1, Release 1.4 ed., Infini-
+     Band Trade Association, 2020, https://cw.infinibandta.org/document/dl/
+     8567.
+[26] “Introduction to the reedbush supercomputer system,” https://www.cc.
+     u-tokyo.ac.jp/en/supercomputer/reedbush/system.php.
+[27] “About ABCI: Computing resources,” https://abci.ai/en/about abci/
+     computing resource.html.
+[28] “Introduction of ITO,” https://www.cc.kyushu-u.ac.jp/scp/eng/system/
+     ITO/01 intro.html, 2018.
+[29] M.     Nakamura,      “Understanding     retransmission    control     in
+     infiniband,”       http://www.nminoru.jp/⇠nminoru/network/infiniband/
+     iba-retransmission.html, 2014, in Japanese.
+[30] B. Hudzia, “On allowing shorter timeout on mellanox cards and
+     other tips and tricks,” https://www.reflectionsofthevoid.com/2014/02/
+     on-allowing-shorter-timeout-on-mellanox.html, 2014.
+[31] T. Fukuoka, “Finding and analyzing performance pitfalls of on-demand
+     paging of infiniband,” Master’s thesis, The University of Tokyo, 2021.
+[32] L. Ou, X. He, and J. Han, “An efficient design for fast memory
+     registration in RDMA,” Journal of Network and Computer Applications,
+     vol. 32, no. 3, pp. 642–651, 2009.
+[33] M. J. Koop, R. Kumar, and D. K. Panda, “Can software reliability
+     outperform hardware reliability on high performance interconnects?:
+     A case study with MPI over InfiniBand,” in Proceedings of the 22nd
+     Annual International Conference on Supercomputing, ser. ICS ’08.
+     ACM, 2008, pp. 145–154.
+[34] M. J. Koop, S. Sur, Q. Gao, and D. K. Panda, “High performance MPI
+     design using unreliable datagram for ultra-scale InfiniBand clusters,” in
+     Proceedings of the 21st annual international conference on Supercom-
+     puting, ser. ICS ’07. ACM, 2007, pp. 180–189.
+

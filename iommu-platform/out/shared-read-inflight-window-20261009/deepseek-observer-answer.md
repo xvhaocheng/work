@@ -1,0 +1,153 @@
+## Scope actually changed
+
+One file only: `out/shared-read-inflight-window-20261009/shared_pretl_read.sv`.
+No new ports, no `$fatal`, no change to `m_r_ready_o` / `eligible_r` / `required` / `child_members_q` / header / `cutover_phase_q` / release / repair / hold. All additions are pure observers: 4 new `assign` wires read **only** by the new observer `always_ff` and the new `final` print, plus 21 new registers (188 FFs) and one new `final $display`.
+
+---
+
+## Focused unified diff
+
+```diff
+--- a/out/shared-read-inflight-window-20261009/shared_pretl_read.sv
++++ b/out/shared-read-inflight-window-20261009/shared_pretl_read.sv
+@@ -123,2 +123,26 @@
+     logic [1:0] skid_pending_q;
++    // §76 observation-only candidate windows. Pure predicates consumed only by
++    // the observer registers and the final WIDE76-OBS print below.
++    logic cursor_window, resident_window, prefix_logical_complete, no_a_child;
++    assign cursor_window = short_prefix_pending && !busy_q && !offered_q && !skid_q &&
++        !independent_v_offer_q && old_v_busy_q &&
++        (returned_q[0] == returned_q[1]) && (returned_q[1] == v_cut_q);
++    assign resident_window = cursor_window && repair_pair_authorized &&
++        (promised_write_end_i[0] <= v_cut_q) && (promised_write_end_i[1] <= v_cut_q) &&
++        (raw_written_i[0] <= v_cut_q) && (raw_written_i[1] <= v_cut_q) &&
++        ((v_cut_q - raw_written_i[0]) <= 9'd2) && ((v_cut_q - raw_written_i[1]) <= 9'd2);
++    assign no_a_child = !((busy_q || offered_q) && child_members_q[1]);
++    assign prefix_logical_complete = short_prefix_pending &&
++        (returned_q[1] == v_cut_q) && !skid_q && !skid_pending_q[1] && no_a_child;
++    // §76 observation-only registers: 21 declarations, 188 FFs, no functional reader.
++    logic [31:0] w76_cursor_cycles_q, w76_resident_cycles_q;
++    logic w76_resident_valid_q;
++    logic [8:0] w76_resident_rv_q, w76_resident_wv_q, w76_resident_wa_q,
++                w76_resident_pv_q, w76_resident_pa_q, w76_resident_j_q, w76_resident_e_q;
++    logic [1:0] w76_resident_phase_q;
++    logic w76_resident_mrv_q, w76_resident_mrr_q;
++    logic [7:0] w76_resident_mrid_q;
++    logic w76_pfx_valid_q;
++    logic [8:0] w76_pfx_rv_q, w76_pfx_wv_q, w76_pfx_wa_q, w76_pfx_j_q, w76_pfx_e_q;
++    logic [1:0] w76_pfx_phase_q;
+     logic [1:0] required;
+@@ -225,2 +225,13 @@
+             observed_old_busy_q <= 0; observed_pair_authorized_q <= 0;
++            w76_cursor_cycles_q <= '0; w76_resident_cycles_q <= '0;
++            w76_resident_valid_q <= 1'b0;
++            w76_resident_rv_q <= '0; w76_resident_wv_q <= '0; w76_resident_wa_q <= '0;
++            w76_resident_pv_q <= '0; w76_resident_pa_q <= '0;
++            w76_resident_j_q <= '0; w76_resident_e_q <= '0;
++            w76_resident_phase_q <= '0;
++            w76_resident_mrv_q <= 1'b0; w76_resident_mrr_q <= 1'b0; w76_resident_mrid_q <= '0;
++            w76_pfx_valid_q <= 1'b0;
++            w76_pfx_rv_q <= '0; w76_pfx_wv_q <= '0; w76_pfx_wa_q <= '0;
++            w76_pfx_j_q <= '0; w76_pfx_e_q <= '0; w76_pfx_phase_q <= '0;
+             repair_shared_q <= DeferredRepair ? 1 : ShareRepairSuffix; repair_decided_q <= 0; repair_wait_q <= 0;
+@@ -262,2 +262,32 @@
+             end
++
++            // §76 observation-only updates: reads pre-edge state, writes only
++            // the WIDE76-OBS registers. No functional signal observes them.
++            if (cursor_window && w76_cursor_cycles_q != 32'hffffffff)
++                w76_cursor_cycles_q <= w76_cursor_cycles_q + 32'd1;
++            if (resident_window && w76_resident_cycles_q != 32'hffffffff)
++                w76_resident_cycles_q <= w76_resident_cycles_q + 32'd1;
++            if (resident_window && !w76_resident_valid_q) begin
++                w76_resident_valid_q <= 1'b1;
++                w76_resident_rv_q <= returned_q[0];
++                w76_resident_wv_q <= raw_written_i[0];
++                w76_resident_wa_q <= raw_written_i[1];
++                w76_resident_pv_q <= promised_write_end_i[0];
++                w76_resident_pa_q <= promised_write_end_i[1];
++                w76_resident_j_q <= v_cut_q;
++                w76_resident_e_q <= old_end_q;
++                w76_resident_phase_q <= cutover_phase_q;
++                w76_resident_mrv_q <= m_r_valid_i;
++                w76_resident_mrr_q <= m_r_ready_o;
++                w76_resident_mrid_q <= 8'(m_r_i.id);
++            end
++            if (prefix_logical_complete && !w76_pfx_valid_q) begin
++                w76_pfx_valid_q <= 1'b1;
++                w76_pfx_rv_q <= returned_q[0];
++                w76_pfx_wv_q <= raw_written_i[0];
++                w76_pfx_wa_q <= raw_written_i[1];
++                w76_pfx_j_q <= v_cut_q;
++                w76_pfx_e_q <= old_end_q;
++                w76_pfx_phase_q <= cutover_phase_q;
++            end
+             // A causal sample of source availability, excluding each first-R latency.
+@@ -542,2 +542,9 @@
+ final $display("INDEPENDENT69-OBS shared_suffix=%0d V_AR_held=%0d",ShareRepairSuffix,independent_v_offer_q);
++    final $display("WIDE76-OBS cursor=%0d resident=%0d cursor_cycles=%0d resident_cycles=%0d resident_valid=%0d rV=%0d rawWV=%0d rawWA=%0d promiseV=%0d promiseA=%0d J=%0d E=%0d phase=%0d m_r_valid=%0d m_r_ready=%0d m_r_id=%0d prefix_valid=%0d pfx_rV=%0d pfx_rawWV=%0d pfx_rawWA=%0d pfx_J=%0d pfx_E=%0d pfx_phase=%0d",
++        cursor_window, resident_window, w76_cursor_cycles_q, w76_resident_cycles_q,
++        w76_resident_valid_q, w76_resident_rv_q, w76_resident_wv_q, w76_resident_wa_q,
++        w76_resident_pv_q, w76_resident_pa_q, w76_resident_j_q, w76_resident_e_q,
++        w76_resident_phase_q, w76_resident_mrv_q, w76_resident_mrr_q, w76_resident_mrid_q,
++        w76_pfx_valid_q, w76_pfx_rv_q, w76_pfx_wv_q, w76_pfx_wa_q,
++        w76_pfx_j_q, w76_pfx_e_q, w76_pfx_phase_q);
+ endmodule
+```
+
+All four hunks are additions only; no existing line is deleted or reordered (patch is `-0` lines per hunk).
+
+---
+
+## Predicate wiring (as requested, verbatim)
+
+Written after line 123 so every referenced identifier is already declared (`skid_pending_q` was the last one needed): `short_prefix_pending` (L87), `busy_q/offered_q` (L65), `skid_q` (L121), `independent_v_offer_q` (L96), `old_v_busy_q` (L78), `v_cut_q` (L73), `old_end_q` (L73), `returned_q` (L64), `raw_written_i`/`promised_write_end_i` (L15/L17), `repair_pair_authorized` (L104), `child_members_q` (L68), `cutover_phase_q` (L72), `skid_pending_q` (L123).
+
+* `cursor_window` = `short_prefix_pending && !busy_q && !offered_q && !skid_q && !independent_v_offer_q && old_v_busy_q && returned_q[0]==returned_q[1] && returned_q[1]==v_cut_q` — exact.
+* `resident_window` = `cursor_window && repair_pair_authorized && promised_write_end_i[·]<=v_cut_q && raw_written_i[·]<=v_cut_q && (v_cut_q-raw_written_i[·])<=2` — exact; parentheses added only for precedence clarity (`<=` already binds tighter than `&&` in Verilog). No `$fatal`, no hold, no join.
+* `J<E` is not re-checked: it is implied by `short_prefix_pending` (L88: `v_cut_q != 0 && v_cut_q < old_end_q`).
+* Extra observers:
+  * `no_a_child = !((busy_q || offered_q) && child_members_q[1])` — "no A child" (A = member bit 1). Accepts a V-only child (`2'b01`) or an `independent_v_offer_q` route, as intended.
+  * `prefix_logical_complete = short_prefix_pending && returned_q[1]==v_cut_q && !skid_q && !skid_pending_q[1] && no_a_child` — first *logical* prefix completion with no A child and no frozen skid beat. Deliberately **drops** `raw_written_i[1]==v_cut_q`, `!busy_q`, `!offered_q`, `old_v_busy_q` and `repair_pair_authorized` that the existing `short_prefix_release` (L90-91) requires, per the requested boundary.
+
+---
+
+## Observation boundary
+
+* Everything sampled is **pre-edge** state (combinational predicate + current FF values, read in the reset-`else` branch). Non-blocking updates mean the snapshot values are the cycle in which the window was true, not the cycle after.
+* The observers are inside the `always_ff @(posedge clk_i or negedge rst_ni)` reset-`else` branch, so reset clears them to `'0`; they cannot run while `rst_ni` is low.
+* No `$fatal`, no assignment to any pre-existing reg/output, no new term in any existing expression. `m_r_ready_o`, `m_r_valid_i`, `m_r_i.id` are read-only taps (`m_r_i.id` is already read at L174 and L499, so no new type dependency on `r_t`).
+* Cycle counters are **cycle counts, not event counts**: `cursor_cycles` = number of edges where `cursor_window` was true, `resident_cycles` = number of edges where `resident_window` was true (resident ⊆ cursor, so `resident_cycles <= cursor_cycles`). Both saturate at `32'hffffffff` (`!= 32'hffffffff` guard).
+* First-snapshot registers are sticky: `w76_resident_valid_q` is set on the first `resident_window` edge and payload fields are written only on that same edge; later `resident_window` edges only bump the counter. Same for `w76_pfx_valid_q` / `prefix_logical_complete`.
+* No event ⇒ `resident_valid=0` / `prefix_valid=0` and every payload field remains the reset `0`. The two printed predicate values `cursor`/`resident` are end-of-simulation combinational samples of the window itself (they are typically 0 at that point); the sticky evidence is the counters + valid bits.
+* `8'(m_r_i.id)`: id is truncated/zero-extended into an 8-bit observer field. Truncation only if a future `r_t` had an id wider than 8 bits (current `axi_tr4_r_chan_t` id width is 4).
+* **No inference of safety**: the predicate only records a *possible future bind instant*. It does not assert that the pair is legally joinable, does not wait for both rawW to reach J, and does not wait for B/A-write quiet. `resident_window` contains no B-response or `a_write_quiet_i` term, so a `resident_valid=1` event must not be read as "V/A write paths quiescent."
+
+---
+
+## New observer FF total
+
+* 2 × 32-bit saturating counters = **64 FFs**
+* resident first snapshot: `valid`(1) + `rV / rawWV / rawWA / promiseV / promiseA / J / E` (7 × 9 = 63) + `phase`(2) + `m_r_valid`(1) + `m_r_ready`(1) + `m_r_id`(8) = **76 FFs**
+* prefix-complete first snapshot: `valid`(1) + `rV / rawWV / rawWA / J / E` (5 × 9 = 45) + `phase`(2) = **48 FFs**
+
+Total **188 FFs in 21 newly declared registers**. Zero new ports, zero new functional bits.
+
+---
+
+## Assumptions and unresolved items
+
+1. "no A child" is taken as "no `busy_q`/`offered_q` child carrying A membership (`child_members_q[1]`)". If the intended meaning also excludes the independent V route offer (`independent_v_offer_q`), that term must be added — I left it in because the independent route carries no A membership. This is an interpretation, flagged for Codex.
+2. "no skid" is `!skid_q && !skid_pending_q[1]`. `skid_pending_q[1]` is logically implied by `!skid_q` (L518 clears `skid_q` exactly when the last pending bit clears), so it is redundant-but-explicit.
+3. A `cursor_cycles == 0` / `resident_cycles == 0` print is ambiguous between "window never held in this trace" and "realized later than the trace / route retired (`old_v_busy_q` fell before both cursors hit J with `busy_q==0`)". The observation cannot distinguish these; the counters are not an impossibility proof.
+4. The root predicate as supplied is preserved unchanged. On inspection it does **not** itself establish bind safety (no B-quiet/A-write-quiet term, no `a_write_quiet_i`, no test that the A raw-W suffix is already irrevocably offered at J); it is recorded as an observation of a *candidate* moment only, per instruction. If the parent later concludes this predicate is insufficient, the observation conditions should stay and the safety argument must come from elsewhere.
+5. No top/CPP/other RTL file needs or receives an edit: the module has no new ports and the `final` print is self-contained, so `multi_actual_dma_top.sv` (L1016-1044 instantiation) is untouched. `m_r_id` is printed in the top-level id space of the `axi_tr4_r_chan_t` passed in.
+6. `final $display` ordering relative to the existing SHORT75/EARLY74/DEFERRED72/SR50/PARALLEL68/REPAIR71/INDEPENDENT69 prints is unchanged; the new line is appended just before `endmodule`.
+
+## Suggested acceptance checks (not executed here)
+
+1. Diff hygiene: `git diff -U0 -- out/shared-read-inflight-window-20261009/shared_pretl_read.sv` must show `0 deletions` and only additions (4 hunks).
+2. Coupling check: `grep -n "cursor_window\|resident_window\|prefix_logical_complete\|no_a_child\|w76_" shared_pretl_read.sv` — every hit must be inside the §76 assign block (L124-146), the reset block (~L226-236), the §76 observer block (~L263-292), or the final print (~L543-549). Nothing else, in particular nothing inside the `always_comb` at L159-215.
+3. Lint/elaborate with the existing toolchain and the production parameterisation (`ShortPrefix=1, EarlyPrefix=1, PeerIndependentCutover=1, DeferredRepair=1, ParallelPrefixRepair=1`, mode 3) — expect no new warnings; the `initial` guards at L524-529 are unaffected.
+4. Run a `ShortPrefix=1` mode-3 trace and check the printed invariants: `resident_valid=1 ⇒ resident_j < resident_e`; `resident_cycles <= cursor_cycles`; counters monotone and `< 32'hffffffff` until saturation; `prefix_valid=1 ⇒ pfx_j < pfx_e`; with no window hit, `cursor_cycles=resident_cycles=resident_valid=prefix_valid=0` and all snapshot payload fields print `0`.
+5. Confirm the new line never appears as a functional influence by re-running an identical stimulus with the §76 observers removed — functional outputs (`detached_o`, `a_hold_o`, `v_hold_o`, `flow_ready_o`, `m_ar_valid_o`, `m_r_ready_o`, `s_r_valid_o`, counters) must be bit-identical.

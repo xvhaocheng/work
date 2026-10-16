@@ -1,0 +1,5 @@
+# §65 Root acceptance: closure choices, including odd endpoints
+
+38 new complete-copy executions passed: build01 run01–18 even geometries; build02 run19–38 repaired odd boundary contract. Source beat declarations independently match actual driver R and strict E+256 on each actualhandover; each target has256 real W and all2048bytes verified. K15/E105 andK127/E127 burst-end strategy requires129 Vchild AW vsminimal128, payload remains256. Two evenbuild02 regressions have byte-identicalCSV and all nestedmetrics tobuild01 ignoringtraceonly. Oldbuild01 source/binarysealed; no retroactiveodd-support claim. Rootdirectly reviewed odd promise guard, newchildphase1clip, physical/logicalLAST and critical review.
+
+Minimalclosure generally faster in tested sameactualE/FA cases, but equality of Rwork does not mean equal AW/B/cycle work or universalPareto guarantee. These deterministic points are not statistical replicas. J=E is ordinaryburstcatchup; no independentalgorithm claim from selectableboundary. Nextstrongcontrol is identicaltwo-Bpipeline for both. Out-only/static normal singlejob; nofault/invalidations/multi-job/board/synthesis.

@@ -1,0 +1,102 @@
+# 多设备共享地址翻译：经典、前沿与卡点（2026-10-06 深化版）
+
+> 本文只依据给定本地证据卡、分组报告、旧72项地图与 `expansion-01/ROOT_REVIEW.md` 撰写；未联网、未运行、未自行取文件。时间箭头只表示机制对照，不表示假引用或因果。本文不把 CPU 侧 TLB shootdown、NUMA 页表副本或 UVM 迁移直接当成 DMA/IOMMU 的完成保证。预计新目录约123项：原72 + 43项新全文独立工作 + 8项新题录 = 123；另2项旧题录 CLAP、Translation Ranger 补全文；104项全文/105个全文版本、19项题录/摘要；最终数字由 Codex 检查。3份新增全文复用先前广域地图本地文件，其余为网上取得，不冒称都是首次下载。
+
+## 结论与增量
+
+本轮不是再写“共享一个 TLB 就能省”的泛泛提案，也不是转安全主线，而是把“多设备共享地址翻译性能线”拓宽为七条可检验脉络：经典 IOMMU 成本、翻译表示与 OS 接口、执行并发调度、多 GPU 布局与迁移、近内存/CXL 解耦、更新生命周期正确性、可观测性与关键性。核心增量有四点：第一，经典成本已从 2007 的软件 `map/unmap`、锁、hypercall，推进到 2010 用 pseudo pass-through 和 I/OAT 微基准隔离软件成本后观察 IOTLB，再到 2024 F&S 降低每次 miss 成本并保留 PTcache；第二，翻译表示已从 radix、大页、contiguity，扩展到推测翻译、哈希页表、中间地址空间、OS 可扩展接口和 GPU 固定哈希页表；第三，执行位置已从硬件 PTW 扩展到软件 warp、idle CU、近存/CXL 设备侧 ATS/ATC 与 DRAM-TLB；第四，更新与观测成为真正卡点：CPU shootdown、NUMA 页表副本、reclaim context、迁移传播和在线关键性都有强前作，但“共享净收益是否覆盖更新维护”“翻译与计算资源竞争时的真实关键性”“语义与粒度如何闭环”仍缺组合条件证据。以下结论不声称全领域空白；“本批没看到”只表示本批证据未覆盖。
+
+## 七条脉络：机制变化、代价转移、评价条件
+
+### 1. 经典 IOMMU 成本：从软件映射到硬件 IOTLB，再回到 miss 成本与更新
+
+经典线先由 [The Price of Safety，2007](../out/shared-translation-literature-20261006/INDEX.md#iommu_cost2007) 把主要成本定位到 TCE `map/unmap`、锁、hypercall 与地址空间切换；[IOTLB Bottleneck，2010](../out/shared-translation-literature-20261006/INDEX.md#iotlb_bottleneck2010) 用 pseudo pass-through 固定恒等映射、消掉大部分软件映射，再用单 I/OAT 通道 DMA 微基准与 trace 驱动 IOTLB 模拟，把问题转到硬件 IOTLB 容量/冲突与 miss 服务成本。2011 年 [vIOMMU](../out/shared-translation-literature-20261006/INDEX.md#viommu2011) 把未修改 guest 的 IOMMU 模拟、乐观拆除和 sidecore 作为完成条件/模拟成本的优化；2018 年 [DAMN](../out/shared-translation-literature-20261006/INDEX.md#damn2018) 把保护边界从每 DMA `unmap` 上移到用户/内核边界，用永久映射与 OS 访问时复制换掉逐 DMA 失效；2024 年 [F&S](../out/shared-translation-literature-20261006/INDEX.md#fastsafe2024) 则明确不减少 IOTLB miss 数，而是降低每次 miss 成本、保留仍有效的 PTcache，并维持 strict 撤销。代价被转移到哪里？从 CPU 软件路径转到 IOTLB/PTcache 与失效队列，再转到“复制、保留与严格性”的语义折衷。评价方法从裸机/Xen 吞吐与 CPU 利用率，走到 DMA 微基准、trace 模拟、KVM 原型和现代实机尾延迟。条件很关键：2010 的单 I/OAT 微基准不是多设备共享 IOMMU 干扰的系统评估；DAMN 有适用范围限制；F&S 仍承认 strict 下 miss 不可避免。
+
+### 2. 翻译表示与 OS 接口：从大页/连续到推测、哈希与可扩展翻译对象
+
+经典问题是 radix 页表串行 walk、碎片化和 huge page 的收益/代价。2011 年 [SpecTLB](../out/shared-translation-literature-20261006/INDEX.md#spectlb2011) 用 reservation 对齐规律做 VA→PA 插值并并行验证，把代价转移到误预测、验证与 I/O 副作用防护；2016 年 [Ingens](../out/shared-translation-literature-20261006/INDEX.md#ingens2016) 把 contiguity 当资源，用 util/access bitvector、后台提升/降级与主动压缩，代价是 TLB invalidation、公平性与尾延迟治理；2019 年 [Translation Ranger](../out/shared-translation-literature-20261006/INDEX.md#translation_ranger2019) 做后分配碎片整理，代价是页面迁移、shootdown、单一 VMA 且权限一致的前提；2020 年 [CA paging + SpOT](../out/shared-translation-literature-20261006/INDEX.md#capaging2020) 把连续生成放到缺页分配路径，并用 PC 索引预测表推测嵌套翻译，代价是 best-effort、后台验证和安全缓解开销；2021 年 [Midgard](../out/shared-translation-literature-20261006/INDEX.md#midgard2021) 引入 VMA 粒度中间地址空间，把翻译拆成 V2M 与 M2P，代价是 OS 大改、VLB/MLB 硬件与 store rollback；2024 年 [DPT](../out/shared-translation-literature-20261006/INDEX.md#dpt2024) 把物理内存当无界哈希页表，用 SOA/CVA/CPD 解碰撞，代价是 CPD 迁移、PTE 页不可迁移、高利用率退化；2025 年 [EMT](../out/shared-translation-literature-20261006/INDEX.md#emt2025) 把 translation object/database/service 抽象给 MMU driver，代价是 OS 接入复杂度与 ECPT 的 kernel 指令开销。GPU 侧同样：2023 年 [Utopia](../out/shared-translation-literature-20261006/INDEX.md#utopia2023) 用 RestSeg+FlexSeg，2025 年 [NDPage](../out/shared-translation-literature-20261006/INDEX.md#ndpage2025) 在 NDP 中 bypass L1 并拍平 L2/L1，2024 年 [FS-HPT](../out/shared-translation-literature-20261006/INDEX.md#fshpt2024) 用固定大小 HPT、step table 与 remote PTE eviction。评价条件多为真机 Linux、QEMU/KVM、Sniper、GPGPU-Sim 与面积估计；EMT 明确不面向 IOMMU DMA，Midgard、Memento、DPT、EMT 都不是设备 SVA 方案。
+
+### 3. 执行并发与调度：从硬件 PTW 并行到软件 warp、idle CU 与 MSHR 扩容
+
+经典线关心 PTW 并发、队列干扰与公平。2024 年 [STAR](../out/shared-translation-literature-20261006/INDEX.md#star2024) 探索多实例 GPU 的 TLB 子项共享；2025 年 [SoftWalker](../out/shared-translation-literature-20261006/INDEX.md#softwalker2025) 把页表遍历搬到 SM 上的 PW Warp，用 In-TLB MSHR 把 L2 TLB entry 临时当 MSHR，并让 PW Warp 获得最高调度优先级；2026 年 [cuPTW](../out/shared-translation-literature-20261006/INDEX.md#cuptw2026) 在没有可发射 kernel wavefront 时发射翻译 wavefront，即利用 idle CU。ROOT_REVIEW 纠正：SoftWalker 最高优先级而 cuPTW idle，二者在本轮所获版本中无相互 actual 引用，不能制造引用链。代价被转移到 SM/CU 空闲资源、调度优先级、MSHR/TLB 条目占用、常规负载 slowdown 与硬件支持成本。证据条件：SoftWalker 完整设计主要 Accel-sim，实机仅 A2000 微基准/profile；cuPTW 主评估为模拟；二者都不能简单宣称“无硬件改动软件方案”。[NB-Walker](../out/shared-translation-literature-20261006/INDEX.md#nbwalker2026) 与 CATO 仍是 MICRO 2026 题录级，不能推断协议细节或性能。评价要同时看平均延迟、尾延迟、regular workload slowdown 和资源机会成本。
+
+### 4. 多 GPU 布局与迁移：chiplet 局部性、副本、迁移与加密同步
+
+经典线从 TLB 聚合、远端 PTE 访问走到多 chiplet/晶圆规模。2025 年 [CLAP](../out/shared-translation-literature-20261006/INDEX.md#clap2025) 按 GPU 数据结构的 chiplet locality 选页大小、预组织连续物理帧并用 TLB coalescing 扩 reach；ROOT_REVIEW 纠正：CLAP 已经评估结合迁移的扩展，不能把“静态布局+动态迁移”说成空白，但默认仍避免迁移，跨 kernel 复用需选择性迁移。2025 年 [OASIS](../out/shared-translation-literature-20261006/INDEX.md#oasis2025) 从 page 粒度转到 object 粒度，动态选择 on-touch、access counter、duplication；代价是对象 ID 位宽、O-Table 容量、oversubscription 误判和不优化 PTW。2026 年 [HDPAT](../out/shared-translation-literature-20261006/INDEX.md#hdpat2026) 做晶圆内分层缓存、重定向与主动交付翻译，但明确排除 GPU 间页迁移，也未评估 shootdown；[WaferTrans](../out/shared-translation-literature-20261006/INDEX.md#wafertrans2026) 用分布式 PTE 存在性信息定位远端翻译，但 presence 信息不等于完整 PTE/权限一致性；[Clover](../out/shared-translation-literature-20261006/INDEX.md#clover2026) 关注晶圆级页表副本存储与访问距离，仍需全文核验一致性细节；[LAEGIS](../out/shared-translation-literature-20261006/INDEX.md#laegis2026) 是 GPU 机密计算下 UVM 迁移加密的性能近邻，研究性能而非新安全漏洞。评价条件多为 GPGPU-Sim/MGPUSim、Verilog 面积、真机 profile 或模拟；跨论文数值不能直接排榜。
+
+### 5. 近内存与 CXL 解耦：翻译下沉设备侧，但实体与维护成本各异
+
+经典线把 VA→PA 或 node PA→FAM PA 下沉。2016 年 [IMPICA](../out/shared-translation-literature-20261006/INDEX.md#impica2016) 在 3D 堆叠内存逻辑层做 pointer chasing，用 region-based page table，但一致性靠只在 accelerator 内执行来简化；2017 年 [DIPTA](../out/shared-translation-literature-20261006/INDEX.md#dipta2017) 用 per-vault 倒排页表、限制关联度、page interleaving 与 way predictor，让翻译与取数并行；ROOT_REVIEW 核正：DIPTA 为 PACT 2017。2020 年 [VBI](../out/shared-translation-literature-20261006/INDEX.md#vbi2020) 把分配与 VBI→physical 翻译交给 memory controller 的 MTL，但 multi-node 未评估；2021 年 [DeACT](../out/shared-translation-literature-20261006/INDEX.md#deact2021) 解耦 access control 与 node PA→FAM PA，官方已核为 HPCA 2021；2022 年 [Clio](../out/shared-translation-literature-20261006/INDEX.md#clio2022) 在 disaggregated memory node 用 FPGA fast path 做 VA→PA、权限与硬件缺页；2023 年 [DTL](../out/shared-translation-literature-20261006/INDEX.md#dtl2023) 在 CXL controller 做 HPA→DPA 与迁移以省 DRAM 功耗；2025 年 [NDPage](../out/shared-translation-literature-20261006/INDEX.md#ndpage2025) 处理 NDP 页表 cache 行为与层级，正式程序为 DATE 2025；2024 年 [M2NDP](../out/shared-translation-literature-20261006/INDEX.md#m2ndp2024) 已核为 MICRO 2024，用 CXL.mem 承载 NDP 命令、设备侧依赖 ATS/ATC 并用 DRAM-TLB 扩 reach；[Pond](../out/shared-translation-literature-20261006/INDEX.md#pond2023) 是 CXL 内存池与 VM 放置，不是 IOMMU/SVA 共享页表。关键边界：DeACT、DTL、Pond、RDMA ODP/TeRM/ODRP 不是同一翻译实体；不能把资源池化、RNIC 页表缺页或 HPA→DPA 都混成“共享 IOMMU”。代价转移到 SRAM/DRAM 开销、低关联度 page fault、fabric/协议延迟、迁移失效与权限验证；评价包括 SST、gem5、FPGA 原型、真机功耗与模拟。
+
+### 6. 更新生命周期正确性：shootdown、副本、回收上下文与在途请求
+
+1989 年 [Mach shootdown](../out/shared-translation-literature-20261006/INDEX.md#shootdown1989) 确立“远端失效完成”是同步屏障，并已量化队列溢出、IPI 与线性增长；2013 年 [RadixVM](../out/shared-translation-literature-20261006/INDEX.md#radvm2013) 用 per-core page table 与 targeted shootdown，但 IPI 在 80 核仍近 1 ms，per-core 页表内存可达 13×；2016 年 [Shoot4U](../out/shared-translation-literature-20261006/INDEX.md#shoot4u2016) 让 VMM 直接失效被抢占 vCPU 的 guest TLB；2020 年 [Ptlbmalloc2](../out/shared-translation-literature-20261006/INDEX.md#ptlbmalloc2020) 从应用分配器减少 arena imbalance 引发的 shootdown；2024 年 [Hydra](../out/shared-translation-literature-20261006/INDEX.md#hydra2024) 做 NUMA 页表按需副本，并用“无副本则无本地 TLB 条目”过滤 shootdown；ROOT_REVIEW 纠正：Hydra 是 page-table 级 NUMA sharer，不是每 PTE/TLB 精确目录，也不能把其 CPU 条件直接外推到 DMA 设备。2024 年 [FPR](../out/shared-translation-literature-20261006/INDEX.md#fpr2024) 按 recycling context 跳过 mmap 回收页的 shootdown，但有语义限制：可能保留 stale 访问，不能用于依赖 segfault 的程序，也不优化匿名 malloc/free。2026 年 [ShadowUpdate](../out/shared-translation-literature-20261006/INDEX.md#shadowupdate2026) 处理迁移失效时传播新映射与在途迁移请求，但仍是机构摘要级。代价转移到 IPI/中断、队列容量、页表副本内存、stale 窗口、ABA、后台回收与回退。评价条件：真机多核/多 socket、KVM、少数模拟；本轮没有任何全文把 CPU shootdown 完成语义证明为 DMA 翻译失效保证，因此不能把 CPU 的迁移机制直接当 DMA 保证。
+
+### 7. 可观测性与关键性：从 hotness 到 per-page criticality 与设备侧观测
+
+2023 年 [Memtis](../out/shared-translation-literature-20261006/INDEX.md#memtis2023) 用 PEBS 采样页/子页访问、动态 hot/warm/cold 与 skewness-aware split，但 PEBS 对 rarely/never accessed 页区分不足；2025 年 [Soar/Alto](../out/shared-translation-literature-20261006/INDEX.md#soaralto2025) 用 AOL=Latency/MLP 直接论证“热页不一定是性能关键页”，Soar 离线对象排序、Alto 在线调节迁移强度；2026 年 [PACT](../out/shared-translation-literature-20261006/INDEX.md#pact2026) 用 PEBS + CHA/TOR queue occupancy 分解 per-tier MLP，做 20ms 在线页级 criticality 与 eager demotion/adaptive promotion。ROOT_REVIEW 纠正：Soar/Alto 与 PACT 已经给出关键性命题，不能把“按关键性调度”当新颖性；G13 中 Soar 行号逆序勿引用。2026 年 [ObservUVM](../out/shared-translation-literature-20261006/INDEX.md#observuvm2026) 把 PCIe access counters 反用于 GPU HBM 观测；[gpu_ext](../out/shared-translation-literature-20261006/INDEX.md#gpuext2025) 用 host/device 侧 eBPF hooks 暴露 GPU 内存与调度策略；[Bermuda](../out/shared-translation-literature-20261006/INDEX.md#bermuda2025) 实测 SMMUv2 共享翻译结构造成 DMA 干扰，但只是单平台特定条件。代价转移到采样开销、离线校准、阈值调参、策略反应滞后与设备侧可见性限制。评价要区分“有计数器”与“能及时支持决策”。
+
+## 仍值得研究的矛盾：强前作、已解决、剩余条件与停止条件
+
+| 矛盾 | 最强先行工作 | 已经解决什么 | 剩余组合条件/尚缺证据 | 怎样用实际证据推翻该问题（停止条件） |
+|---|---|---|---|---|
+| 共享净收益是否覆盖更新维护 | Trans-FW、MGvm、CLAP、HDPAT、ShadowUpdate、ShareMMU、F&S | 局部共享、远端转发、预取、副本、保留 PTcache 可在稳态降低 miss 或 miss 成本 | 高更新率、多设备、大规模共享、尾延迟同时出现时，共享节省的 miss 是否大于更新扇出、确认等待、失效队列与 stale 风险；缺真实负载的在线更新率与净收益分解 | 若在真实多设备负载中测得更新率超过阈值后共享净收益为负，且本地/复制/禁用共享更优，则该共享问题可停；反过来说明需给出受益条件 |
+| 翻译占用计算资源时的真实关键性 | SoftWalker、cuPTW、Soar/Alto、PACT | 软件 PTW、idle CU、离线对象级与在线页级 criticality 已有强前作 | SoftWalker 最高优先级可能伤害 regular；cuPTW 只在 idle 发射；阶段变化时在线估计能否跟上；翻译与计算竞争同一 SM/CU 的净损失不明 | 若真实应用阶段变化下翻译抢占计算导致净损失且简单阈值/静态保留无法避免，则停止；若能稳定在线识别并获益，则继续 |
+| 语义与粒度闭环 | CLAP、OASIS、DPT、Utopia、NDPage、DeACT、DTL、Pond、RDMA ODP/TeRM/ODRP | 页大小选择、对象级策略、限制映射、哈希页表、近存翻译、CXL 池化各有机制 | 多种粒度共存时权限变化、共享写、迁移、失效如何保持语义；DeACT/DTL/Pond/RDMA 不是同一翻译实体，不能混用证据；缺真实 SVA/PASID 多设备权限失效实验 | 若在真实 SVA/PASID 设备共享下，大页/对象粒度导致权限或失效不可满足，则停止该粒度组合；若可满足且有净收益，则继续 |
+| 多 GPU/多 chiplet 页表副本与远端访问 | CLAP、Clover、WaferTrans、HDPAT、Barre Chord、MGvm | chiplet locality、TLB coalescing、远端 presence、副本存储已有探索 | 副本一致性维护、跨 kernel 复用、迁移不频繁假设、故障/失效传播；Clover 待全文；缺动态迁移与高更新下的副本成本 | 若动态迁移和高更新下副本维护成本超过收益，或无法保证正确性，则停止；若能证明副本在真实阶段变化下仍净收益，则继续 |
+| 近内存/CXL 设备侧翻译的权限与协议 | DIPTA、DeACT、Clio、DTL、NDPage、M2NDP、SPARTA | 近存页表、设备侧 VA→PA、HPA→DPA、ATS/ATC、DRAM-TLB 已有机制与部分原型 | 多设备共享同一设备侧翻译/ATC 时权限、失效、队列、尾延迟；协议层证据多来自模拟或摘要；不能把 Pond 的 VM 放置当 IOMMU SVA | 若真实 CXL 多设备共享下 ATS/ATC 失效和权限无法闭环，则停止；若闭环且尾延迟可接受，则继续 |
+| CPU TLB shootdown/迁移能否保证 DMA | shootdown1989、Hydra、FPR、Shoot4U、LATR | CPU TLB 一致性、惰性、VMM assist、NUMA sharer 过滤已有强前作 | 设备 DMA 完成语义、PASID/ATC 失效确认、在途 DMA、命令队列与内存回收；本批无全文把 CPU 完成条件证明为设备完成条件 | 若把 CPU 机制移植到 DMA 后出现旧数据可见或无法确认在途 DMA，则停止；若设备失效协议能确认完成且性能可接受，则继续 |
+
+## 四个开放研究问题（概念可拓展，不宣称论文创新成立）
+
+1. **共享净收益（含更新维护）的统一成本模型。** 不是只问“共享 TLB 省多少 miss”，而是把命中收益、更新扇出、确认等待、失效队列、尾延迟和回退成本放在同一真实负载中在线决策共享/复制/本地。可检验条件：同一应用阶段内，更新率与设备数变化时，净收益是否可由可观测状态预测。
+2. **翻译与计算竞争下的真实关键性。** Soar/Alto 与 PACT 已给关键性，但翻译执行本身占用 SM/CU、MSHR、TLB、带宽时，关键性估计是否仍可靠、反应是否跟得上阶段变化，需要新的在线证据。避免只说分区/QoS/版本号/目录。
+3. **语义与粒度的闭环。** 在 SVA/PASID/多设备权限下，页大小、对象粒度、页表副本、更新粒度如何协同；DeACT/DTL/Pond/RDMA 不是同一翻译实体，必须分别定义身份、权限、失效与回收义务。
+4. **可观测性驱动的停止条件。** 设备侧/IOMMU 侧缺少哪些观测能区分容量、MSHR、PTW 服务率、链路拥塞、数据位置与软件供给；如何用实际证据及时证伪一个共享策略，而不是只看平均吞吐。
+
+## 分阶段必读清单（18篇，分4组）
+
+**第1组：经典能力边界（成熟区，先读）**
+- [shootdown1989](../out/shared-translation-literature-20261006/INDEX.md#shootdown1989)：理解远端失效完成与队列溢出。
+- [iommu_cost2007](../out/shared-translation-literature-20261006/INDEX.md#iommu_cost2007)：软件 map/unmap、锁、hypercall 成本。
+- [iotlb_bottleneck2010](../out/shared-translation-literature-20261006/INDEX.md#iotlb_bottleneck2010)：用微基准隔离软件成本后看 IOTLB。
+- [translation_ranger2019](../out/shared-translation-literature-20261006/INDEX.md#translation_ranger2019)：后分配 contiguity 与迁移税。
+- [spectlb2011](../out/shared-translation-literature-20261006/INDEX.md#spectlb2011)：推测翻译与验证边界。
+
+**第2组：共享后的代价与更新（成熟区到前沿）**
+- [hydra2024](../out/shared-translation-literature-20261006/INDEX.md#hydra2024)：NUMA 页表 sharer 过滤 shootdown，非 PTE/TLB 精确目录。
+- [fpr2024](../out/shared-translation-literature-20261006/INDEX.md#fpr2024)：recycling context 跳过 shootdown 及其语义限制。
+- [fastsafe2024](../out/shared-translation-literature-20261006/INDEX.md#fastsafe2024)：strict 安全下降低每次 IOTLB miss 成本。
+- [shadowupdate2026](../out/shared-translation-literature-20261006/INDEX.md#shadowupdate2026)：迁移失效传播与在途请求，待全文。
+- [radvm2013](../out/shared-translation-literature-20261006/INDEX.md#radvm2013)：per-core 页表、targeted shootdown 与 IPI 上限。
+
+**第3组：多 GPU 与近内存/CXL 规模（前沿）**
+- [clap2025](../out/shared-translation-literature-20261006/INDEX.md#clap2025)：chiplet locality、页大小选择、CLAP+migration 已有。
+- [oasis2025](../out/shared-translation-literature-20261006/INDEX.md#oasis2025)：对象级页管理策略与 oversubscription 边界。
+- [hdpat2026](../out/shared-translation-literature-20261006/INDEX.md#hdpat2026)：晶圆内分层缓存与主动交付，未评估 shootdown。
+- [dtl2023](../out/shared-translation-literature-20261006/INDEX.md#dtl2023)：CXL controller 内 HPA→DPA 与功耗迁移。
+- [deact2021](../out/shared-translation-literature-20261006/INDEX.md#deact2021)：access control 与 node PA→FAM PA 解耦，HPCA 2021 已核。
+- [ndpage2025](../out/shared-translation-literature-20261006/INDEX.md#ndpage2025)：NDP 页表 bypass/flatten，DATE 2025 正式程序。
+
+**第4组：执行并发、关键性与可观测（前沿，判断成熟区）**
+- [softwalker2025](../out/shared-translation-literature-20261006/INDEX.md#softwalker2025)：PW Warp 最高优先级与 In-TLB MSHR。
+- [cuptw2026](../out/shared-translation-literature-20261006/INDEX.md#cuptw2026)：idle CU 发射翻译 wavefront，与 SoftWalker 无相互 actual 引用。
+- [soaralto2025](../out/shared-translation-literature-20261006/INDEX.md#soaralto2025)：AOL 与 hotness 非关键性。
+- [pact2026](../out/shared-translation-literature-20261006/INDEX.md#pact2026)：在线页级 criticality，已给命题。
+- [memtis2023](../out/shared-translation-literature-20261006/INDEX.md#memtis2023)：PEBS、动态分类与 split 成本。
+- [observuvm2026](../out/shared-translation-literature-20261006/INDEX.md#observuvm2026) 与 [bermuda2025](../out/shared-translation-literature-20261006/INDEX.md#bermuda2025)：设备侧观测与单平台 DMA 干扰。
+
+## 需补全文重点与影响判断
+
+- **ShadowUpdate**：影响“高更新率/迁移失效时共享是否仍净收益”的判断；目前仅机构摘要，不能论证协议细节或性能。
+- **LATPC**：影响“GPU TLB 预取、MSHR 压缩与批量 PTW 是否已覆盖”的判断；仅机构摘要，不能只把 MSHR 当被忽略资源。
+- **Clover**：影响“晶圆级页表副本存储量与一致性维护成本”的判断；摘要级，复制并非越多越好。
+- **NBWalker**：影响“非阻塞 NUMA GPU PTW 是否已有直接前作”的判断；MICRO 2026 题录，未获全文。
+- **CATO**：影响“争用感知翻译卸载”的判断；题录/摘要级，不能仅凭标题推断性能或协议。
+- **CDFD**：影响“多 GPU 粗粒度复制后细粒度去重”的成熟度判断；metadata-only，不能论证协议细节/性能/成熟度。
+- **LIBRA**：影响“多 GPU 页预取与迁移协调”的成熟度判断；metadata-only，作者 PDF 404，无摘要可核。
+- **SagePTE**：影响“嵌套翻译 leaf 开销与 guest/host PTE 共置”的判断；MICRO 2026 接收尚待召开，手稿禁运至 2026-11-04，不能论证实现细节。另需注意 TRANS-FETCH、Maverick 也仅为 MICRO 2026 接收/题录级，LAEGIS 是性能近邻。
+
+## 阅读证据分级、限制与模型分工
+
+证据分级：全文实机/原型（如 Clio、DAMN、Hydra、FPR、Memtis、PACT、F&S 等）> 全文模拟/分析（如 DPT、NDPage、M2NDP、DPT、FS-HPT 等）> 机构摘要/题录（如 ShadowUpdate、LATPC、Clover、NBWalker、CATO、CDFD、LIBRA、SagePTE）> metadata-only（不得用于论证协议细节、性能或成熟度）。限制：未复现论文实验；未联网、未运行、未改 RTL/Linux；本批未覆盖不等于全领域无人做；跨论文数字不可直接排榜；不把 CPU 迁移机制直接当 DMA 保证。模型分工：DeepSeek 完成分组全文证据提取，Codex 完成原始来源检索、关键原文核查、题录/版本纠正与本地图综合；本文据此二次综合，不声称新的实验或创新点成立。

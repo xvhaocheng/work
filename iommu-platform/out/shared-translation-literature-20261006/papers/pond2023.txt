@@ -1,0 +1,1394 @@
+ Pond: CXL-Based Memory Pooling Systems for Cloud Platforms
+                    Huaicheng Li                                              Daniel S. Berger                                            Lisa Hsu
+                  Virginia Tech                                              Microsoft Azure                                             Unaffiliated
+            Carnegie Mellon University                                   University of Washington                                           USA
+                      USA                                                          USA
+
+                     Daniel Ernst                                            Pantea Zardoshti                                      Stanko Novakovic
+                    Microsoft Azure                                             Microsoft Azure                                             Google
+                         USA                                                         USA                                                     USA
+
+                    Monish Shah                                               Samir Rajadnya                                             Scott Lee
+                    Microsoft Azure                                             Microsoft Azure                                           Microsoft
+                         USA                                                         USA                                                    USA
+
+                  Ishwar Agarwal                                                 Mark D. Hill                                      Marcus Fontoura
+                             Intel                                         Microsoft Azure                                                 Stone Co
+                             USA                                   University of Wisconsin-Madison                                           USA
+                                                                                 USA
+
+                                                                            Ricardo Bianchini
+                                                                                Microsoft Azure
+                                                                                     USA
+ABSTRACT                                                                                          KEYWORDS
+Public cloud providers seek to meet stringent performance require-                                Compute Express Link; CXL; memory disaggregation; memory
+ments and low hardware cost. A key driver of performance and                                      pooling; datacenter; cloud computing.
+cost is main memory. Memory pooling promises to improve DRAM                                      ACM Reference Format:
+utilization and thereby reduce costs. However, pooling is challeng-                               Huaicheng Li, Daniel S. Berger, Lisa Hsu, Daniel Ernst, Pantea Zardoshti,
+ing under cloud performance requirements. This paper proposes                                     Stanko Novakovic, Monish Shah, Samir Rajadnya, Scott Lee, Ishwar Agarwal,
+Pond, the first memory pooling system that both meets cloud per-                                  Mark D. Hill, Marcus Fontoura, and Ricardo Bianchini. 2023. Pond: CXL-
+formance goals and significantly reduces DRAM cost. Pond builds                                   Based Memory Pooling Systems for Cloud Platforms. In Proceedings of the
+on the Compute Express Link (CXL) standard for load/store access                                  28th ACM International Conference on Architectural Support for Programming
+to pool memory and two key insights. First, our analysis of cloud                                 Languages and Operating Systems, Volume 2 (ASPLOS ’23), March 25–29,
+production traces shows that pooling across 8-16 sockets is enough                                2023, Vancouver, BC, Canada. ACM, New York, NY, USA, 14 pages. https:
+                                                                                                  //doi.org/10.1145/3575693.3578835
+to achieve most of the benefits. This enables a small-pool design
+with low access latency. Second, it is possible to create machine
+learning models that can accurately predict how much local and
+                                                                                                  1    INTRODUCTION
+pool memory to allocate to a virtual machine (VM) to resemble                                     Motivation. Many public cloud customers deploy their workloads
+same-NUMA-node memory performance. Our evaluation with 158                                        in the form of virtual machines (VMs), for which they get virtual-
+workloads shows that Pond reduces DRAM costs by 7% with per-                                      ized compute with performance approaching that of a dedicated
+formance within 1-5% of same-NUMA-node VM allocations.                                            cloud, but without having to manage their own on-premises data-
+                                                                                                  center. This creates a major challenge for public cloud providers:
+CCS CONCEPTS                                                                                      achieving excellent performance for opaque VMs (i.e., providers do
+• Computer systems organization → Cloud computing; •                                              not know and should not inspect what is running inside the VMs)
+Hardware → Emerging architectures.                                                                at a competitive hardware cost.
+                                                                                                     A key driver of both performance and cost is main memory. The
+                                                                                                  gold standard for memory performance is for accesses to be served
+                                                                                                  by the same NUMA node as the cores that issue them, leading
+Permission to make digital or hard copies of part or all of this work for personal or             to latencies in tens of nanoseconds. A common approach is to
+classroom use is granted without fee provided that copies are not made or distributed             preallocate all VM memory on the same NUMA node as the VM’s
+for profit or commercial advantage and that copies bear this notice and the full citation
+This
+on thework     is licensed
+        first page.        under
+                    Copyrights      a Creativecomponents
+                               for third-party  CommonsofAttribution
+                                                            this work must4.0beInterna-
+                                                                                honored.          cores. Preallocating and statically pinning memory also facilitate
+tional
+For      License.
+    all other  uses, contact the owner/author(s).                                                 the use of virtualization accelerators [4], which are enabled by
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                                              default, for example, on AWS and Azure [12, 14]. At the same time,
+© 2023 Copyright held by the owner/author(s).
+ACM ISBN 978-1-4503-9916-6/23/03.                                                                 DRAM has become a major portion of hardware cost due to its poor
+https://doi.org/10.1145/3575693.3578835                                                           scaling properties with only nascent alternatives [72]. For example,
+
+
+
+
+                                                                                            574
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada       Li, Berger, Hsu, Ernst, Zardoshti, Novakovic, Shah, Rajadnya, Lee, Agarwal, Hill, Fontoura, and Bianchini
+
+
+                                                                                                      Cache Miss                     Request (Req)
+DRAM can be 50% of server cost in Azure [7] and 40% of rack cost                Intel/AMD/ARM                         CXL                                    Memory
+at Meta [59].                                                                   Core/LLC/Fabric                       Port     Data Response (DRS)           Device
+   Through analysis of production traces from Azure, we identify                                   Cache Write Back
+                                                                                Intel/AMD/ARM                      CXL Request with Data (RwD) Memory
+memory stranding as a dominant source of memory waste and a                     Core/LLC/Fabric                     Port No Data Response (NDR) Device
+potential source of massive cost savings. Stranding happens when
+all cores of a server are rented (i.e., allocated to customer VMs)                                 CPU      Transaction &     Arb/      CXL &        PCIe
+but unallocated memory capacity remains and cannot be rented.                                     Fabric     Link Layers      Mux      PCIe PHY      Wires
+                                                                                Round-trip latency measured
+We find that up to 25% of DRAM becomes stranded as more cores                    on Intel Sapphire Rapids        4ns          2ns         19ns
+become allocated to VMs.                                                       Figure 1: CXL Request Flow (§2). CPU cache misses and write-
+Limitations of the state of the art. Despite this significant amount           backs to addresses mapped to CXL devices are translated to
+of stranding, reducing DRAM usage in the public cloud is challeng-             requests on a CXL port by the HDM decoder. Intel measures
+ing due to its stringent performance requirements. For example,                the round-trip port latency to be 25ns.
+existing techniques for process-level memory compression [50, 77]
+require page fault handling, which adds microseconds of latency,
+and moving away from statically preallocated memory.                           — while this concept does not hold for the uniform address spaces
+   Pooling memory via memory disaggregation is a promising ap-                 assumed in prior work (e.g., [50, 56]) — it does hold if we expose
+proach because stranded memory can be returned to the disag-                   pool memory to a VM’s guest OS as a zero-core virtual NUMA
+gregated pool and used by other servers. Unfortunately, existing               (zNUMA) node, i.e., a node with memory but no cores, like Linux’s
+pooling systems also have microsecond access latencies and require             CPU-less NUMA [51]. Our experiments show zNUMA effectively
+page faults or changes to the VM guest [50, 58].                               biases memory allocations away from the zNUMA node. Thus, a
+Our work. This work describes Pond, the first system to achieve                VM with a zNUMA sized to match its untouched memory will
+both same-NUMA-node memory performance and competitive cost                    indeed not see any performance impact.
+for public cloud platforms. To achieve this, Pond combines hard-                  Fourth, Pond can allocate CXL memory with same-NUMA-node
+ware and systems techniques. It relies on the Compute Express                  performance using correct predictions of a) whether a VM will be
+Link (CXL) interconnect standard [5], which enables cacheable                  latency-sensitive and b) a VM’s amount of untouched memory. For
+load/store (ld/st) accesses to pooled memory on Intel, AMD, and                incorrect predictions, Pond introduces a novel monitoring system
+ARM processors [11, 16, 23] at nanosecond-scale latencies. CXL                 that detects poor memory performance and triggers a mitigation
+access via loads/stores is a game changer as it allows memory to               that migrates the VM to use only same-NUMA-node memory. Fur-
+remain statically preallocated while physically being located in a             ther, we find that all inputs which are needed to train and run Pond’s
+shared pool. However, even with loads/stores, CXL accesses still               ML models can be obtained from existing hardware telemetry with
+face higher latencies than same-NUMA-node accesses. Pond intro-                no measurable overhead.
+duces systems support for CXL-based pooling that dramatically                  Artifacts. CXL is still a year from broad deployment. Meanwhile,
+reduces the impact of this higher latency.                                     deploying Pond requires extensive testing within Azure’s system
+    Pond is feasible because of four key insights. First, by analyzing         software and distributed software stack. We implement Pond on
+traces from 100 production clusters at Azure, we find that pool sizes          top of an emulation layer that is deployed on production servers.
+between 8-16 sockets lead to sufficient DRAM savings. The pool                 This allows us to prove the key concepts behind Pond by exercising
+size defines the number of CPU sockets able to use pool memory.                the VM allocation workflow, zNUMA, and by measuring guest
+Further, analysis of CXL topologies lead us to estimate that CXL will          performance. Additionally, we support the four insights from above
+add 70-90ns to access latencies over same-NUMA-node DRAM with                  by reporting from extensive experiments and measurements in
+a pool size of 8-16 sockets, and add more than 180ns for rack-scale            Azure’s datacenters. We evaluate the effectiveness of pooling using
+pooling. We conclude that grouping 8 dual-socket (or 16 single-                simulations based on VM traces from 100 production clusters. An
+socket) servers is enough to achieve most of the benefits of pooling.          open-source version of Pond’s emulation layer and a sample of VM
+    Second, by emulating either 64ns or 140ns of additional memory             traces are available at https://github.com/vtess/Pond.
+access overheads over same-NUMA-node memory latency, we find
+that 43% and 37% of 158 workloads are within 5% of the performance             Contributions. Our main contributions are:
+on same-NUMA-node DRAM when entirely allocated in pool mem-                    • The first public characterization of memory stranding and un-
+ory. However, more than 21% of workloads suffer a performance                    touched memory at a large public cloud provider.
+loss above 25%. This emphasizes the need for small pools and shows             • The first analysis of the effectiveness and latency of different
+the challenge with achieving same-NUMA-node performance. This                    CXL memory pool sizes.
+characterization also allows us to train a machine learning (ML)               • Pond, the first CXL-based full-stack memory pool that is practical
+model that can identify a subset of insensitive workloads ahead of               and performant for cloud deployment.
+time to be allocated on the Pond memory pool.                                  • An accurate prediction model for latency and resource manage-
+    Third, we observe through measurements at Azure that ∼50% of                 ment at datacenter scale. These models enable a configurable
+all VMs touch less than 50% of their rented memory. Conceptually,                performance slowdown of 1-5%.
+allocating untouched memory from the pool should not have any                  • An extensive evaluation that validates Pond’s design including
+performance impact even for latency-sensitive VMs. We find that                  the performance of zNUMA and our prediction models in a pro-
+
+
+
+
+                                                                         575
+Pond: CXL-Based Memory Pooling Systems for Cloud Platforms                                                                            ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+                       40                                                                                              100
+                                                                                                                                                  Percentage of pool memory
+
+
+
+
+                                                                                           Required Overall DRAM [%]
+ Stranded Memory [%]
+
+
+
+                                                          Outliers                                                                                  assigned to each VM
+                       30
+                                                                                                                       95                                      10%
+                                        95th Percentile
+                       20
+                            5th Percentile
+                                                                                                                                                               30%
+                       10                                                                                              90
+
+                       0
+                                60               70             80     90                                                                                      50%
+                                             Scheduled CPU Cores [%]                                                   85
+                                                                                                                             2   8   16         32                64
+Figure 2: Memory stranding (§3.1). Stranding increases sig-                                                                               Pool Size [CPU Sockets]
+nificantly as more CPU cores are scheduled. Error bars indi-
+cate the 5𝑡ℎ and 95𝑡ℎ percentiles (outliers in dots).                                 Figure 3: Impact of pool size (§3.1). Small pools of 32 sockets
+                                                                                      are sufficient to significantly reduce memory needs.
+           duction setting. Our analysis shows that we can reduce DRAM
+           needs by 7% with a Pond pool spanning 16 sockets, which corre-
+                                                                                      Pooling via CXL. CXL contains multiple protocols including ld/st
+           sponds to hundreds of millions of dollars cost-savings for a large
+                                                                                      memory semantics (CXL.mem) and I/O semantics (CXL.io). CXL.mem
+           cloud provider.
+                                                                                      maps device memory to the system address space. Last-level cache
+                                                                                      (LLC) misses to CXL memory addresses translate into requests on a
+2                      BACKGROUND                                                     CXL port whose reponses bring in the missing cachelines (Figure 1).
+Hypervisor memory management. Public cloud workloads are                              Similarly, LLC write-backs translate into CXL data writes. Neither
+virtualized. To maximize performance and minimize overheads,                          action involves page faults or DMAs. CXL memory is virtualized
+hypervisors perform minimal memory management and rely on                             using hypervisor page tables and the memory-management unit
+virtualization accelerators to improve I/O performance [4, 8, 55].                    and is thus compatible with virtualization acceleration. The CXL.io
+Examples of common accelerators are direct I/O device assignment                      protocol facilitates device discovery and configuration. CXL 1.1
+(DDA) [8] and Single Root I/O Virtualization (SR-IOV) [4]. Acceler-                   targets directly-attached devices, CXL 2.0 [6, 15] adds switch-based
+ated networking is enabled by default on AWS and Azure [12, 14]. As                   pooling, and CXL 3.0 [28, 69] standardizes switch-less pooling (§4)
+pointed out in prior work, virtualization acceleration requires stati-                and higher bandwidth.
+cally preallocating (or “pinning”) a VM’s entire address space [54].                     CXL.mem uses PCIe’s electrical interface with custom link and
+Memory stranding. Cloud VMs demand a vector of resources (e.g.,                       transaction layers for low latency. With PCIe 5.0, the bandwidth of
+CPUs, memory, etc.) [41, 47]. Scheduling VMs thus leads to a multi-                   a bidirectional ×8-CXL port at a typical 2:1 read:write-ratio matches
+dimensional bin-packing problem [32, 44, 47] which is complicated                     a DDR5-4800 channel. CXL request latencies are largely determined
+by constraints such as spreading VMs across multiple failure do-                      by the CXL port. Intel measures round-trip CXL port traversals
+mains. Additionally, it is difficult to provision servers that closely                at 25ns [68] which, when combined with expected controller-side
+match the resource demands of future incoming VM mixes at design                      latencies, leads to an end-to-end overhead of 70ns for CXL reads
+time. When the DRAM-to-core ratio of VM arrivals and the server                       in a basic topology, compared to NUMA-local DRAM reads. While
+resources do not match, tight packing becomes more difficult. We                      FPGA-based prototypes report higher latency [43, 59], 70ns-latency-
+define a resource as stranded when it is technically available to be                  overheads match industry-expectations for ASIC-based memory
+rented to a customer but is practically unavailable as some other                     controllers [28, 59, 68].
+resource has exhausted. The typical scenario for memory stranding
+is that all cores have been rented, but there is still memory available               3  MEMORY STRANDING & WORKLOAD
+in the server.                                                                           SENSITIVITY TO MEMORY LATENCY
+Reducing stranding. Multiple techniques can reduce memory                             3.1 Stranding at Azure
+stranding. For example, oversubscribing cores [30, 76] enables more                   This section quantifies the severity of memory stranding and un-
+memory to be rented. However, oversubscription only applies to                        touched memory at Azure using production data.
+a subset of VMs for performance reasons. Our measurements at
+                                                                                      Dataset. We measure stranding in 100 cloud clusters over a 75-day
+Azure (§3.1) include clusters that enable oversubscription and still
+                                                                                      period. These clusters host mainstream first-party and third-party
+show significant memory stranding.
+                                                                                      VM workloads. They are representative of the majority of the server
+   The approach we target is to disaggregate a portion of memory
+                                                                                      fleet. We select clusters with similar deployment years but spanning
+into a pool that is accessible by multiple hosts. This breaks the fixed
+                                                                                      all major regions on the planet. A trace from each cluster contains
+hardware configuration of servers. By dynamically reassigning
+                                                                                      millions of per-VM arrival/departure events, with the time, duration,
+memory to different hosts at different times, we can shift memory
+                                                                                      resource demands, and server-id.
+resources to where they are needed, instead of relying on each
+individual server to be configured for all cases pessimistically. Thus,               Memory stranding. Figure 2 shows the distribution of hourly
+we can provision servers close to the average DRAM-to-core ratios                     snapshots of the amount of stranded DRAM bucketed by the per-
+and tackle deviations via the memory pool.                                            centage of CPU cores that are scheduled to host VMs. We find that
+
+
+
+
+                                                                                576
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                      Li, Berger, Hsu, Ernst, Zardoshti, Novakovic, Shah, Rajadnya, Lee, Agarwal, Hill, Fontoura, and Bianchini
+
+
+                                              Slowdown: performance under all remote               Local: 115ns, remote: 255ns (222%)
+                                              memory relative to all local memory                  Local: 78ns, remote: 142ns (182%)
+      100
+                                             Spark        GAPBS                          TPC-H                          SPEC CPU 2017                                          2x
+
+
+                                         B
+                           ry
+Slowdown (%)
+
+
+
+
+                                                                                                                                                                            H
+                                        s
+                                    ltD
+               80
+                          ta
+
+
+
+
+                                                                                                                                                            C
+                                     di                                              Not run on red
+                                                                                                                                                                          AS
+
+
+
+
+                                                                                                                                                          SE
+                         rie
+
+
+                                Re
+
+                                 Vo                                                  conﬁguration,                                                                      L
+                    op
+
+
+
+
+                                                                                                                                                         R
+                                                                                                                                                                      SP
+
+
+
+
+                                                                                                                                                      PA
+                    Pr
+
+
+
+
+               60                                                                    insufﬁcient DRAM
+                                                                                     per NUMA node
+               40
+
+               20
+
+               0
+                    P1 → P13 YCSB A→F ML/Web, etc.     bc, bfs, cc, pr, sssp, tc      Queries 1 → 22             501.perlbench_r → 657.xz_s             facesim, vips, fft, etc.
+
+Figure 4: Performance slowdowns when memory latency increases by 182-222% (§3.3). Workloads have different sensitivity to
+additional latency (as in CXL). X-axis shows 158 representative workloads; Y is the normalized performance slowdown, i.e.,
+performance under higher (remote) latency relative to all local memory. “Proprietary” denotes production workloads at Azure.
+
+
+                                 CDF of slowdowns under CXL                                   the amount of DRAM that could be saved via pooling. Figure 3
+           1                                                                                  presents average reductions from pooling DRAM when VMs are
+         .8                                                                                   scheduled with a fixed percentage of either 10%, 30%, or 50% of
+                                                Three outliers under 255ns                    pool DRAM. The pool size refers to the number of sockets that can
+         .6                                     with >100% slowdowns
+                                                (max 124%)                                    access the same DRAM pool. As the pool size increases, the figure
+         .4                                                                                   shows that required overall DRAM decreases. However, this effect
+                                                                                              diminishes for larger pools. For example, with a fixed 50% pool
+         .2                                    Remote: 142ns (182%)                           DRAM, a pool with 32 sockets saves 12% of DRAM while a pool
+                                               Remote: 255ns (222%)
+           0                                                                                  with 64 sockets saves 13% of DRAM. Note that allocating a fixed
+                0 5             25           50             75                 100            50% of memory to pool DRAM leads to significant performance
+                                        Slowdown (%)                                          loss compared to socket-local DRAM (§6). Pond overcomes this
+                                                                                              challenge with multiple techniques (§4).
+Figure 5: CDF of slowdowns (§3.3). Higher remote latency
+(red) only slightly affects the head of the distribution (work-                               Summary and implications. From this analysis, we draw a few
+loads with less than 5% slowdown). The body and tail of the                                   important observations and implications for Pond:
+distribution see significantly higher slowdowns.                                              • We observe 3-27% of stranded memory in production at the 95𝑡ℎ
+                                                                                                percentile, with some outliers at 36%.
+                                                                                              • Almost all VMs fit into one NUMA node.
+6% of memory is stranded in the median snapshot (blue line) where                             • Pooling memory across 16-32 sockets can reduce cluster memory
+75% of CPU cores are scheduled for VMs. The median grows to over                                demand by 10%. This suggests that memory pooling can produce
+10% when ∼85% of CPU cores are allocated to VMs. This makes                                     significant cost reductions but assumes that a high percentage
+sense since stranding is an artifact of highly utilized nodes, which                            of DRAM can be allocated on memory pools. When implement-
+correlates with highly utilized clusters. The figure also indicates                             ing DRAM pools with cross-NUMA latencies, providers must
+outliers and error bars, representing 5𝑡ℎ and 95𝑡ℎ percentiles. Vari-                           carefully mitigate potential performance impacts.
+ability is largely due to different VM mixes. For example, the VM
+mix in some snapshots is biased towards compute-heavy VM types
+that do not require much DRAM. This can create high stranding,                                3.2      VM Memory Usage at Azure
+even at low utilization. At the 95𝑡ℎ percentile, stranding reaches                            We use Pond’s telemetry on opaque VMs (§4.2) to characterize the
+25% during high utilization periods. Individual outliers even reach                           percentage of untouched memory across our cloud clusters. Gener-
+30% stranding.                                                                                ally, we find that while VM memory usage varies across clusters, all
+                                                                                              clusters have a significant fraction of VMs with untouched memory.
+NUMA spanning. Many VMs are small and can fit on a single
+socket. On two-socket systems, the hypervisor at Azure seeks to                               Overall, the 50𝑡ℎ percentile is 50% untouched memory.
+schedule such that VMs fit entirely (cores and memory) on a single                            Summary and implications. From this analysis, we draw key
+NUMA node. In rare cases, we see NUMA spanning where a VM                                     observations and implications for Pond:
+has all of its cores on one socket and a small amount of memory
+                                                                                              • VM memory usage varies widely.
+from another socket. We find that spanning occurs for about 2-3%
+                                                                                              • In the cluster with the least amount of untouched memory, still
+of VMs and fewer than 1% of memory pages, on average.
+                                                                                                over 50% of VMs have more than 20% untouched memory. Thus,
+Savings from pooling. Azure currently does not pool memory.                                     there is plenty of untouched memory that can be disaggregated
+However, by analyzing its VM-to-server traces, we can estimate                                  at no performance penalty.
+
+
+
+
+                                                                                        577
+Pond: CXL-Based Memory Pooling Systems for Cloud Platforms                                                              ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+                                                                            8-socket Pond                                                                              Comparison: AMD Genoa
+• The challenges are (1) predicting how much untouched memory                          64 PCIe 5.0 lanes                       6 channels                                       CCD    CCD
+
+
+
+
+                                                                               ...
+                                                                                     (8 hosts w/ x8 CXL links)      EMC DDR5                        ≈1/2
+                                                                                                                                                           Geno
+  a VM is likely to have and (2) confining the VM’s accesses to               CPU
+                                                                             CPU
+                                                                            CPU
+                                                                                                                                                               a IOD            CCD    CCD
+                                                                                                                                                                                CCD    CCD
+                                                                                                                                                                                           12
+  local memory. Pond addresses both.                                        16-socket Pond
+                                                                                                                                                                                        channels
+                                                                                      128 PCIe 5.0 lanes                       12 channels
+                                                                                                                                                      ≈ Genoa IOD           128    IOD
+
+
+
+
+                                                                               ...
+                                                                              CPU
+                                                                             CPU
+                                                                            CPU
+                                                                                     (16 hosts w/ x8 CXL links)     EMC DDR5                                              PCIe 5.0
+                                                                                                                                                                                          DDR5
+                                                                                                                                                                                                 2
+                                                                                                                                                                          lanes CCD CCD 397mm
+3.3    Workload Sensitivity to Memory Latency                               32/64-socket Pond                                                                                    CCD CCD
+                                                                                                                  96 PCIe 5.0 lanes                                              CCD CCD
+To characterize the performance impact of CXL latency for typical                                                                   (
+                                                                                                                                  x8 4 EM
+
+
+
+
+                                                                               ...
+                                                                              CPU
+                                                                             CPU
+                                                                            CPU
+                                                                                     (8 hosts w/ x8 CXL links)
+                                                                                                                     Switch           CX Cs
+                                                                                                                                        L li w/
+workloads in Azure’s datacenters, we evaluate 158 workloads under                                                                           nk
+                                                                                                                                               s)
+                                                                                                                                                              64 PCIe 5.0 lanes
+                                                                                                                                                                              12 channels
+two scenarios of emulated CXL access latencies: 182% and 222%
+
+
+
+
+                                                                               ...
+                                                                              CPU
+                                                                             CPU
+                                                                            CPU                                      Switch                           (8 switches w/   EMC    DDR5
+increase in memory latency, respectively. We then compare the                                                                                          x8 CXL links)
+
+
+
+
+                                                                             ...
+
+
+
+
+                                                                                                                         ...
+
+
+
+
+                                                                                                                                                    ...
+workload performance to NUMA-local memory placement. Experi-
+mental details are in §6.1. Figures 4 and 5 show workload slowdowns         Figure 6: External memory controller (EMC) (§4.1). The EMC
+relative to NUMA-local performance for both scenarios.                      is multi-headed which allows connecting multiple CXL hosts
+   Under a 182% increase in memory latency, we find that 26% of             and DDR5 DIMMs. A 16-socket Pond requires 128 PCIe 5.0
+the 158 workloads experience less than 1% slowdown under CXL.               lanes and 12 DDR5 channels, which is comparable to the IO-
+An additional 17% of workloads see less than 5% slowdowns. At the           die (IOD) on AMD Genoa [10, 11]. Larger Pond configurations
+same time, some workloads are severely affected with 21% of the             combine a switch with the multi-headed EMC.
+workloads facing >25% slowdowns.
+   Different workload classes are affected differently, e.g., GAPBS
+                                                                            seeks to achieve a configurable PDM, e.g., 1%, for a configurable
+(graph processing) workloads generally see higher slowdowns.
+                                                                            tail-percentage (TP) of VMs, e.g., 98% (§3.1). To achieve this high
+However, the variability within each workload class is typically
+                                                                            performance, Pond uses a small but fast CXL pool (§4.1). As Pond’s
+much higher than across workload classes. For example, within
+                                                                            memory savings come from pooling instead of oversubscription,
+GAPBS even the same graph kernel reacts very differently to CXL
+                                                                            Pond must minimize pool fragmentation and wastage in its system
+latency, based on different graph datasets. Overall, every workload
+                                                                            software layer (§4.2).
+class has at least one workload with less than 5% slowdown and
+                                                                               To achieve (G2), Pond preallocates local and pool memory at VM
+one workload with more than 25% slowdown (except SPLASH2x).
+                                                                            start. Pond decides this allocation in its allocation, performance
+   Azure’s proprietary workloads are less impacted than the overall
+                                                                            monitoring, and mitigation pipeline (§4.3). This pipeline uses novel
+workload set. Of the 13 production workloads, 6 do not see notice-
+                                                                            prediction models to achieve the PDM (§4.4). Finally, Pond overcomes
+able impact (<1%); 2 see ∼5% slowdown; and the remaining half
+                                                                            VM-opaqueness (G3) and host-overheads (G4) using lightweight
+are impacted by 10–28%. This is in part because these production
+                                                                            hardware counter telemetry.
+workloads are NUMA-aware with data placement optimizations.
+   Under a 222% increase in memory latency, we find that 23% of
+                                                                            4.1          Hardware Layer
+the 158 workloads experience less than 1% slowdown under CXL.
+An additional 14% of workloads see less than 5% slowdowns. More             Hosts within a Pond pool have separate cache coherency domains
+than 37% of workloads face >25% slowdowns. Generally, we find               and run separate hypervisors. Pond uses an ownership model where
+that higher latency magnifies the effects seen under lower latency:         pool memory is explicitly moved among hosts. A new external
+workloads performing well under 182% latency also tend to perform           memory controller (EMC) ASIC implements the pool using multiple
+well under 222% latency; workloads severely affected by 182% are            DDR5 channels accessed through a collection of CXL ports running
+even more affected by 222%.                                                 at PCIe 5 speeds.
+
+Summary and implications. While some workloads are insensi-                 EMC memory management. The EMC offers multiple CXL ports
+tive to disaggregated memory latency, some are heavily impacted.            and appears to each host as a single logical memory device [6, 15].
+This motivates our design decision to include socket-local DRAM             In CXL 3.0 [28, 69], this configuration is standardized as multi-
+alongside pool DRAM to mitigate CXL latency impact for those                headed device (MHD) [28, §2.5]. The EMC exposes its entire capacity
+latency-sensitive workloads. Memory pooling solutions can be ef-            on each port (e.g., to hosts) via a Host-managed Device Memory
+fective if they are effective at identifying sensitive workloads.           (HDM) decoder. Hosts program each EMC’s address range but
+                                                                            treat them initially as offline. Pond dynamically assigns memory
+                                                                            at the granularity of 1GB memory slices. Each slice is assigned to
+4     POND DESIGN
+                                                                            at most one host at a given time and hosts are explicitly notified
+Our measurements and observations at Azure (§2–3) lead us to                about changes (§4.2). Tracking 1024 slices (1TB) and 64 hosts (6
+define the following design goals.                                          bits) requires 768B of EMC state. The EMC implements dynamic
+G1 Performance comparable to NUMA-local DRAM                                slice assignment by checking permission of each memory access,
+G2 Compatibility with virtualization accelerators                           i.e., whether requestor and owner of the cacheline’s slice match.
+G3 Compatibility with opaque VMs and guest OSes/applications                Disallowed accesses result in fatal memory errors.
+G4 Low host resource overhead                                               EMC ASIC design. The EMC offers multiple ×8-CXL ports, which
+   To quantify (G1), we define a performance degradation margin             communicate with DDR5 memory controllers (MC) via an on-chip
+(PDM) for a given workload as the allowable slowdown relative               network (NOC). The MCs must offer the same reliability, availabil-
+to running the workload entirely on NUMA-local DRAM. Pond                   ity, and serviceability capabilities [2, 3] as server-grade memory
+
+
+
+
+                                                                      578
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                                      Li, Berger, Hsu, Ernst, Zardoshti, Novakovic, Shah, Rajadnya, Lee, Agarwal, Hill, Fontoura, and Bianchini
+
+                                                     Latency assumptions
+
+
+
+
+                                                                                                                          Access Latency [ns]
+                                           CXL Port                                                   25ns                                             Switches only                     2 Switches
+Local DRAM (85ns)                          Flight time                                                5ns                                       300
+                                           Retimer                                                    20ns
+Core/LLC    MC &                           Address mapping, permission (ACL)                          5ns                                                        1 Switch
+ /Fabric    DRAM                           Network-on-chip (NOC)                                      10ns
+                                                                                                                                                                                       1 Switch
+                                           Switch arbitration (ARB)                                   10ns                                      200
+  40ns       45ns                          Core/LLC/Fabric                                            40ns                                            -36%
+                                           Memory Controller (MC) MC & DRAM                           45ns
+                                                                                                                                                                 No switches   Pond with multi-headed design
+8-socket Pond (155ns, 182%)                                                                                                                     100
+
+
+
+
+                                                                                                           <500mm
+                                                                                       CPU       CPU
+
+
+
+
+                                                           8-socket
+                          EMC
+
+
+
+
+                                                            Pond
+                                                                                       CPU       CPU
+                                                                               PM     EMC       EMC                                                                NUMA-local latency baseline
+Core/LLC CXL        CXL ACL MC &
+ /Fabric   Port     Port NOC DRAM
+                                                                                       CPU
+                                                                                       CPU
+                                                                                                 CPU
+                                                                                                 CPU                                              0
+   40ns    25ns 5ns 25ns 15ns 45ns                                                                                                                           1     8     16          32                   64
+
+
+
+
+                                                                                                           >500mm
+                                                                                    CPU      CPU timer
+                                                                                                  Re-
+
+
+
+
+                                                              16-socket Pond
+16-socket Pond (180ns, 212%)
+                                                                                    CPU
+                                                                                    CPU
+                                                                                             CPU timer
+                                                                                                  Re-
+
+
+                                                                                             CPU timer
+                                                                                                  Re-
+                                                                                                                                                                       Pool Size [Sockets]
+                                                                                               Re-
+                                                                                    CPU   CPU timer
+                                    EMC                                        PM     EMC   EMC                           Figure 8: Pool access latency comparison (§4.1). Pond reduces
+Core/LLC   CXL       Re-       CXL  ACL MC &                                        CPU      CPU timer
+                                                                                                  Re-
+
+
+
+ /Fabric   Port     timer      Port NOC DRAM                                        CPU      CPU timer
+                                                                                                  Re-
+                                                                                                                          latencies by 1/3 compared to switch-only designs.
+                                                                                    CPU      CPU    Re-
+                                                                                                   timer
+
+
+  40ns     25ns   5+20+5ns     25ns 15ns 45ns                                       CPU      CPU timer
+                                                                                                  Re-
+
+
+
+
+32/64-socket Pond (>270ns, 318%)
+                                    Switch                           EMC
+Core/LLC   CXL       Re-       CXL ARB CXL         Re-          CXL ACL MC &
+                                                                                                                          4.2                     System Software Layer
+ /Fabric   Port     timer      Port NOC Port      timer         Port NOC DRAM                                             Pond’s system software involves multiple components.
+  40ns     25ns   5+20+5ns     25ns 20ns 25ns   5+20+5ns       25ns                   15ns 45ns
+                                                                                                                          Pool memory ownership. Pool management involves assign-
+Figure 7: Pool size and latency tradeoffs (§4.1). Small Pond                                                              ing Pond’s memory slices to hosts and reclaiming them for the
+pools of 8-16 sockets add only 75-90ns relative to NUMA-                                                                  pool (Figure 9). It involves 1) implementing the control paths for
+local DRAM. Latency increases for larger pools that require                                                               pool-level memory assignment and 2) preventing pool memory
+retimers and a switch.                                                                                                    fragmentation.
+                                                                                                                             Hosts discover local and pool capacity through CXL device dis-
+controllers including memory error correction, management, and                                                            covery and map them to their address space. Once mapped, the
+isolation. A key design parameter of Pond’s EMC is the pool size,                                                         pool address range is marked hot-pluggable and “not enabled.” Slice
+which defines the number of CPU sockets able to use pool mem-                                                             assignment is controlled at runtime via a Pool Manager (PM) that
+ory. We first observe that the EMC’s IO, (De)Serializer, and MC                                                           is colocated on the same blade as the EMCs (Figure 7). In Pond’s
+requirements resemble AMD Genoa’s 397𝑚𝑚 2 IO-die (IOD) [10, 11].                                                          current design, the PM is connected to EMCs and CPU sockets via
+Figure 6 shows that EMC requirements for a 16-socket Pond parallel                                                        a low-power management bus (e.g., [20]). To allocate pool memory,
+the IOD’s requirements, with a small 8-socket Pond paralleling half                                                       the Pool Manager triggers two types of interrupts at the EMC and
+an IOD. Thus, up to 16-sockets can directly connect to an EMC.                                                            host driver. Add_capacity(host, slice) interrupts the host driver
+Pool sizes of 32-64 would combine CXL switches with Pond’s multi-                                                         which reads the address range to be hot-plugged. The driver then
+headed EMC. The optimal design point balances the potential pool                                                          communicates with the OS memory manager to bring the memory
+savings for larger pool sizes (§6) with the added cost of larger EMCs                                                     online. The EMC adds the host id to its permission table at the
+and switches.                                                                                                             slice offset. Release_capacity(host, slice) works similarly by
+                                                                                                                          offlining the slice on the host and resetting the slice’s permission
+EMC Latency. While latency is affected by propagation delays, it                                                          table entry on the EMC. An alternative to this design would be
+is dominated by CXL port latency, and any use of CXL retimers and                                                         inband-communication using the Dynamic Capacity Device (DCD)
+CXL switches. Port latencies are discussed in §2 and [68]. Retimers                                                       feature in CXL 3.0 [28, §9.13]. This change would maintain the same
+are devices used to maintain CXL/PCIe signal integrity over longer                                                        functionality for Pond.
+distances and add about 10ns of latency in each direction [17, 18].                                                          Pond must avoid fragmenting its online pool memory as the
+In datacenter conditions, signal integrity simulations [39] indicate                                                      contiguous 1GB address range must be free before it can be offlined
+that CXL could require retimers above 500mm. Switches add at                                                              for reassignment to another host. Pool memory is allocated to VMs
+least 70ns of latency due to ports/arbitration/NOC with estimates                                                         in 1GB-aligned increments (§4.3). While this prevents fragmenta-
+above 100ns [60].                                                                                                         tion due to VM starts and completions, our experience has shown
+   Figure 7 breaks down Pond’s latency for different pool sizes.                                                          that host agents and drivers can allocate pool memory and cause
+Figure 8 compares Pond’s latency to a design that relies only on                                                          fragmentation. Pond thus uses a special-purpose memory partition
+switches instead of a multi-headed EMC. We find that Pond reduces                                                         that is only available to the hypervisor. Host agents and drivers
+latencies by 1/3 with 8-and 16-socket pools adding only 70-90ns                                                           allocate memory in host-local memory partition, which effectively
+relative to NUMA-local DRAM. In practice, we expect Pond to be                                                            contains fragmentation.
+deployed primarily with small 8/16-socket pools, given the latency                                                           With these optimizations, offlining 1GB slices empirically takes
+and cost overheads, and diminishing returns of larger pools (§3).                                                         10-100 milliseconds/GB. Onlining memory is near instantaneous
+Modern CPUs can connect to multiple EMCs which allows scaling                                                             with microseconds/GB. These observations are reflected in Pond’s
+to meet bandwidth and capacity goals for different clusters.                                                              asynchronous release strategy (§4.3).
+                                                                                                                          Failure management. Hosts interleave across socket-local mem-
+                                                                                                                          ory at cacheline-granularity. While a host may be connected to mul-
+                                                                                                                          tiple EMCs, it does not interleave memory across EMCs. This mini-
+
+
+
+
+                                                                                                                    579
+Pond: CXL-Based Memory Pooling Systems for Cloud Platforms                                                                             ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+Hosts map local and        Time          t=0           t=1           t=2    t=3            t=4
+EMC memory at boot
+                          Host 1     x        Used
+                                              by VM1
+    Local                 (H1)       y        Used          VM2
+    DRAM                                      by VM2        leaves
+
+
+
+x   EMC         x         Host 2     x
+
+y
+    memory
+                y         (H2)       y                                                          Used
+                                                                                                by VM3
+    starts in                                                                                                   Figure 10: zNUMA (§4.2). zNUMA seen from a Linux VM.
+    ofﬂine
+    state
+
+
+
+
+                                                       H1
+
+
+
+
+                                                                     H1
+
+
+                                                                           H1
+
+
+
+
+                                                                                           H1
+                                         H1
+                                     x
+                          EMC 1                                                                                                     ML                Server Blades
+
+                                                       H1
+
+
+
+
+                                                                                           H2
+                                         H1
+
+
+
+                                     y
+                                                                                                                                  System                               B1      QoS
+                                                                                                                                                      VM1     VM2             Monitor
+                                                                                                                          Workload
+         Add capacity
+                           Pool                                                                                           prediction   A2
+                                                        Release                 Add                                                                    Hypervisor             B2
+         events lead     Manager                                                                                                                                        B3
+                                                        capacity                capacity                        VM request          VM        A5
+         the host OS       (PM)                         (H1,y)                  (H2,y)
+                                                                                                                                 scheduler                                    Mitigation
+                                                                                                                    A1
+         to online the      VM                                             New VM                                                                     Memory Pools            Manager
+                                                                                                                                      A3
+         associated                                                        (1GB on
+                         scheduler                                         pool)
+         1GB slice
+                                                                                                                                  Pool                   EMC
+                                                                                                                                 Manager      A4
+Figure 9: Pool management example (§4.2). Pond assigns
+pool memory to at most one host at a time. This example                                                        Figure 11: Pond control plane workflow (§4.3). A) The VM
+shows Pond’s asynchronous memory release strategy which                                                        scheduler uses ML-based predictions that identify latency-
+engages when a VM departs (𝑡=1 and 𝑡=2). During VM sched-                                                      sensitive VMs and their likely amount of untouched memory
+uling, memory is added to the corresponding host before the                                                    to decide on VM placement (see Figure 13). B) The monitoring
+VM starts (𝑡=3 and 𝑡=4).                                                                                       pipeline reconfigures VMs if quality-of-service (QoS) not met.
+
+
+mizes the EMCs’ blast radius and facilitate memory hot-plugging.                                               (PMU) to gather hardware counters related to memory performance.
+EMC failures affect only VMs with memory on that EMC, while                                                    Specifically, we use the top-down-method for analysis (TMA) [25,
+VMs with memory on other EMCs continue normally. CPU/host                                                      79]. TMA characterizes how the core pipeline slots are used. For
+failures are isolated and associated pool memory is reallocated                                                example, we use the “memory-bound” metric, which is defined as
+to other hosts. Pool Manager failures prevent reallocating pool                                                pipeline stalls due to memory loads and stores. Figure 12 lists these
+memory but do not affect the datapath.                                                                         metrics. While TMA was developed for Intel, its relevant parts are
+                                                                                                               available on AMD and ARM as well. We modify Azure’s production
+Exposing pool memory to VMs. VMs that use both NUMA-                                                           hypervisor to associate these metrics with individual VMs (§5) and
+local and pool memory see pool memory as a zNUMA node. The                                                     record VM counter samples in a distributed database. All our core-
+hypervisor creates a zNUMA node by adding a memory block                                                       PMU-metrics use simple counters and induce negligible overhead
+(node_memblk) without an entry in the node_cpuid in the SLIT/                                                  (unlike event-based sampling [29, 64]).
+SRAT tables [74]. We later show the guest-OS preferentially allocates                                             Second, we use hypervisor telemetry to track a VM’s untouched
+memory from the local NUMA node before going to zNUMA (§6).                                                    pages. We use an existing counter that tracks guest-committed mem-
+Thus, if zNUMA is sized to the amount of untouched memory, it is                                               ory, which overestimates used memory. This counter is available
+never going to be used. Figure 10 shows a Linux VM which includes                                              for 98% of Azure VMs. We also scan access bits in the hypervisor
+the correct latency in the NUMA distance matrix (numa_slit). This                                              page table (§5). Since we only seek untouched pages, frequently
+facilitates guest-OS NUMA-aware memory management [78, 80]                                                     access bits reset is not required. This minimizes overhead.
+for the rare case that the zNUMA is used (§4.4).
+Reconfiguration of memory allocation. To remain compati-                                                       4.3    Distributed Control Plane Layer
+ble with (G2), local and pool memory mapping generally remain                                                  Figure 11 shows the two tasks performed by Pond’s control plane:
+static during a VM’s lifetime. There are two exceptions that are                                               (A) predictions to allocate memory during VM scheduling and (B)
+implemented today. When live-migrating a VM or when remapping                                                  QoS monitoring and resolution.
+a page with a memory fault, the hypervisor temporarily disables
+                                                                                                               Predictions and VM scheduling (A). Pond uses ML-based pre-
+virtualization acceleration and the VM falls back to a slower I/O
+                                                                                                               diction models (§4.4) to decide how much pool memory to allocate
+path [66]. Both events are quick and transient and typically only
+                                                                                                               for a VM. After a VM request arrives (A1), the scheduler queries
+happen once during a VM’s lifetime. We implement a third variant
+                                                                                                               the distributed ML serving system (A2) for a prediction on how
+which allows Pond a one-time correction to a suboptimal memory
+                                                                                                               much local memory to allocate for the VM. The scheduler then
+allocation. Specifically, if the host has local memory available, Pond
+                                                                                                               informs the Pool Manager about the target host and associated pool
+disables the accelerator, copies all of the VM’s memory to local
+                                                                                                               memory needs (A3). The Pool Manager triggers a memory onlining
+memory and enables the accelerator again. This takes about 50ms
+                                                                                                               workflow using the configuration bus to the EMCs and host (A4).
+for every GB of pool memory that Pond allocated to the VM.
+                                                                                                               Memory onlining is fast enough to not block a VM’s start time
+Telemetry for opaque VMs. Pond requires two types of telemetry                                                 (§4.2). The scheduler informs the hypervisor to start the VM on a
+for VMs. First, we use the core-performance-measurement-unit                                                   zNUMA node matching the onlined memory amount.
+
+
+
+
+                                                                                                         580
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                              Li, Berger, Hsu, Ernst, Zardoshti, Novakovic, Shah, Rajadnya, Lee, Agarwal, Hill, Fontoura, and Bianchini
+
+
+              CPU                                  Ofﬂine          A/B tests                                                                 Decision        Prediction model          Action
+                                  Core
+                                                                                                                           CPU
+                                                   test            on internal                                                   Core                    Workload history?                       VM Metadata
+                                                                                                                                                                                                VM type, OS, Region,
+                                  PMU              runs            workloads                                                     PMU               Yes
+
+
+
+
+                                                                                                      (A) VM scheduling
+                                                                                                                                                                                                Percentiles of memory
+                                                                                                                                                                                  No            usage in previous VM
+                                                                                                                                         Latency insensitive?                                   by same Customer,
+                                                Relative slowdown if on pool memory                                                                                No                           Workload name.
+                   TMA pipeline slot for:
+                   backend-bound,                                   Labels
+                   memory-bound,                                                                                                   Yes                                   Untouched memory?
+         Metrics
+
+
+
+
+                   store-bound,                                                                                                                                  Yes
+                   DRAM-latency-bound
+                                                            Model training                                                                                                                          No
+                                              Features
+                   Other counters: LLC MPI,
+                   memory bandwidth,                                                                                       Entirely pool DRAM        Pool DRAM=untouched            Entirely local DRAM
+                   memory parallelism                    Latency insensitive?
+                                                                                                                           CPU                                                                   Hypervisor
+
+
+
+
+                                                                                                      (B) QoS monitoring
+                                                                                                                                 Core                                                            access bits
+Figure 12: Pond latency insensitive model (§4.2). This model                                                                     PMU
+uses metrics from the core’s performance-measurement-unit                                                                                                       Yes Overpredicted untouched?
+(PMU). It is trained with labels gathered from offline runs                                                                              Latency insensitive?
+and internal workloads.                                                                                                             No                                 Yes                          No
+
+                                                                                                                                 Reconﬁguration mitigation                      Continue monitoring
+
+   Memory offlining is slow and cannot happen on the critical path                                    Figure 13: Pond prediction models (§4.4). Pond’s prediction
+of VM starts (§4.2). Pond resolves this by always keeping a buffer                                    models (dark grey) rely on telemetry (blue boxes) that is
+of unallocated pool memory. This buffer is replenished when VMs                                       available for all VM types, including third-party opaque VMs.
+terminate and hosts asynchronously release associated slices.
+QoS monitoring (B). Pond continuously inspects the performance
+of all running VMs via its QoS monitor. The monitor queries hy-                                       QoS monitoring (B). For zNUMA VMs, Pond monitors if it over-
+pervisor and hardware performance counters (B1) and uses an ML                                        predicted the amount of untouched memory during scheduling. For
+model of latency sensitivity (§4.4) to decide whether the VM’s per-                                   pool-backed VMs and zNUMA VMs with less untouched memory
+formance impact exceeds the PDM. In this case, the monitor asks                                       than predicted, we use the sensitivity model to determine whether
+its mitigation manager (B2) to trigger a memory reconfiguration                                       the VM workload is suffering excessive performance loss. If not,
+(§4.2) through the hypervisor (B3). After this reconfiguration, the                                   the QoS monitor initiates a live VM migration to a configuration
+VM uses only local memory.                                                                            allocated entirely on local DRAM.
+                                                                                                      Model details. Pond’s two ML prediction models consume teleme-
+4.4     Prediction Models                                                                             try that is available for opaque VMs from Pond’s system software
+Pond’s VM scheduling (A) and QoS monitoring (B) algorithms rely                                       layer (§4.2). Figure 12 shows features, labels, and the training proce-
+on two prediction models (in Figure 13).                                                              dure for the latency insensitivity model. The model uses supervised
+                                                                                                      learning (§5) with core-PMU metrics as features and the slowdown
+Predictions for VM scheduling (A). For scheduling, we first check
+                                                                                                      of pool memory relative to NUMA-local memory as labels. Pond
+if we can correlate a workload history with the VM requested. This
+                                                                                                      gets samples of slowdowns from offline test runs and A/B tests of
+works by checking if there have been previous VMs with the same
+                                                                                                      internal workloads which make their performance numbers avail-
+metadata as the request VM, e.g., the customer-id, VM type, and
+                                                                                                      able. These feature-label-pairs are used to retrain the model daily.
+location. This is based on the observation that VMs from the same
+                                                                                                      As the core-PMU is lightweight (§5), Pond continuously measures
+customer tend to exhibit similar behavior [41].
+                                                                                                      core-PMU metrics at VM runtime. This enable the QoS monitor to
+   If we have prior workload history, we make a prediction on
+                                                                                                      react quickly and enables retaining a history of VMs that have been
+whether this VM is likely to be memory latency insensitive, i.e.,
+                                                                                                      latency sensitive.
+its performance would be within the PDM while using only pool
+                                                                                                         Figure 14 shows the inputs and training procedure for the unto-
+memory. (Model details appear below.) Latency-insensitive VMs
+                                                                                                      uched-memory model. The model uses supervised learning (details
+are allocated entirely on pool DRAM.
+                                                                                                      in §5) with VM metadata as features and the minimum untouched
+   If the VM has no workload history or is predicted to be latency-
+                                                                                                      memory over each VM’s lifetime as labels. Its most important fea-
+sensitive, we predict untouched memory (UM) over its lifetime. In-
+                                                                                                      ture is a range of percentiles (e.g., 80𝑡ℎ –99𝑡ℎ ) of the recorded un-
+terestingly, UM predictions with only generic VM metadata such as
+                                                                                                      touched memory by a customer’s VMs in the last week.
+customer history, VM type, guest OS, and location are accurate (§6).
+VMs without untouched memory (UM = 0) are allocated entirely                                          Parameterization of prediction models. Pond’s latency insen-
+with local DRAM. VMs with a UM > 0 are allocated with a rounded-                                      sitivity model is parameterized to stay below a target rate of false
+down GB-aligned percentage of pool memory and a corresponding                                         positives (FP), i.e., workloads it incorrectly specifies as latency in-
+zNUMA node; the remaining memory is allocated on local DRAM.                                          sensitive but which are actually sensitive to memory latency. This
+   If we underpredict UM, the VM will not touch the slower pool                                       parameter enforces a tradeoff as the percentage of workloads that
+memory as the guest OS prioritizes allocating local DRAM. If we                                       are labeled as latency insensitive (LI) is a function of FP. For ex-
+overpredict UM, we rely on the QoS monitor for mitigation. Impor-                                     ample, a rate of 0.1% FP may force the model to 5% of LI.
+tantly, Pond always keeps a VM’s memory mapped in hypervisor                                             Similarly, Pond’s untouched memory model is parameterized to
+page tables at all times. This means that even if our predictions                                     stay below a target rate of overpredictions (OP), i.e., workloads that
+happen to be incorrect, performance does not fall off a cliff.                                        touch more memory than predicted and thus would use memory
+
+
+
+
+                                                                                                581
+Pond: CXL-Based Memory Pooling Systems for Cloud Platforms                                                                  ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+                                Guest-committed        Access bits never
+                                                                             Address A M
+                                memory counter         set since VM start
+
+                                            Untouched memory percentage
+               VM: memory, cores, OS;
+               Location: region,                             Labels
+    Metadata
+
+
+
+
+                availability zone;
+               Customer history from                                        Hypervisor
+               previous VMs:                         Model training         page tables
+                0/25/50/75/100
+                                        Features
+                percentile untouched;
+               Workload name                       Untouched memory?
+
+Figure 14: Training of the untouched memory model (§4.4).
+This model uses VM metadata as features and labels of un-
+touched memory gathered from hypervisor telemetry.
+
+                                                                                                                      Workloads            Traffic to zNUMA
+pages on the zNUMA node. This parameter enforces a tradeoff as
+                                                                                                                      Video                             0.25%
+the percentage of untouched memory (UM) is a function of OP. For                                                      Database                          0.06%
+example, a rate of 0.1% OP may force the model to 3% of UM.                                                           KV store                          0.11%
+   With two models and their respective parameters, Pond needs                                                        Analytics                         0.38%
+to decide how to balance FP and OP between the two models. This
+balance is done by solving an optimization problem based on the                                        Figure 15: Effectiveness of zNUMA (§6.2). Latency sensitive
+given performance degradation margin (PDM) and the target per-                                         workloads get a local vNUMA node large enough to cover
+centage of VMs that meet this margin (TP). Specifically, Pond seeks                                    the workload’s footprint. zNUMA nodes holds the VM’s re-
+to maximize the average amount of memory that is allocated on                                          maining memory on Pond CXL pool. Access bit scans, e.g., for
+the CXL pool, which is defined by LI and UM, while keeping the                                         Video (right), show that this configuration indeed minimizes
+percentage of false positives (FP) and untouched overpredictions                                       traffic to the zNUMA node.
+(OP) below the TP.
+                           maximize         (LIPDM ) + (UM)                                            by current Intel processors. The untouched memory model uses a
+                           subject to (FPPDM ) + (OP) ≤ (100 − TP)                         (1)         gradient boosted regression model (GBM) from LightGBM [48] and
+                                                                                                       makes a quantile regression prediction with a configurable target
+Note that TP essentially defines how often the QoS monitor has to                                      percentile. After exporting to ONNX [61], the prototype adds the
+engage and initiate memory reconfigurations.                                                           prediction (the size of zNUMA) on the VM request path using a
+   Besides PDM and TP, Pond has no other parameters as it automat-                                     custom inference serving system similar to [41, 42]. Azure’s VM
+ically solves the optimization problem from Eq.(1). The models rely                                    scheduler [47] incorporates zNUMA requests and pool memory as
+on their respective framework’s default hyperparameters (§5).                                          an additional dimension into its bin packing. This approach also
+                                                                                                       applies to other cluster schedulers [37].
+5         IMPLEMENTATION
+We implement and evaluate Pond on production servers that emu-                                         6     EVALUATION
+late pool latency.                                                                                     Our evaluation addresses the performance of zNUMA VMs (§6.2,
+System software. This implementation comprises three parts. First,                                     §6.3), the accuracy of Pond’s prediction models (§6.4), and Pond’s
+we emulate a single-socket system with a CXL pool on a two-socket                                      end-to-end DRAM savings (§6.5).
+server by disabling all cores in one socket, while keeping its memory
+accessible from the other socket. This memory mimics the pool.                                         6.1    Experimental Setup
+   Second, we change Azure’s hypervisor to instantiate arbitrary                                       We evaluate the performance of our prototype using 158 cloud
+zNUMA topologies. We extend the API between the control plane                                          workloads. Specifically, our workloads span in-memory databases
+and the host to pass the desired zNUMA topology to the hypervisor.                                     and KV-stores (Redis [22], VoltDB [27], and TPC-H on MySQL [26]),
+   Third, we implement support in Azure’s hypervisor for the                                           data and graph processing (Spark [19] and GAPBS [33]), HPC
+telemetry required for training Pond’s models. We extend each                                          (SPLASH2x [81]), CPU and shared-memory benchmarks (SPEC
+virtual core’s metadata with a copy of its core-PMU state and trans-                                   CPU [24] and PARSEC [35]), and a range of Azure’s internal work-
+fer this state when it gets scheduled on different physical cores.                                     loads (Proprietary). Figure 4 overviews these workloads. We quan-
+Pond samples core-PMU counters once per second, which takes                                            tify DRAM savings with simulations.
+1ms. We enable access bit scanning in hypervisor page tables. We
+                                                                                                       Prototype setup. We run experiments on production servers at
+scan and reset access bits every 30 minutes, which takes 10s.
+                                                                                                       Azure and similarly-configured lab servers. The production servers
+Distributed control plane. We train our prediction models by                                           use either two Intel Skylake 8157M sockets with each 384GB of
+aggregating daily telemetry into a central database. The latency                                       DDR4, or two AMD EPYC 7452 sockets with each 512GB of DDR4.
+insensitivity model uses a simple random forest (RandomForest)                                         On Intel, we measure 78ns NUMA-local latency and 80GB/s band-
+from Scikit-learn [62] to classify whether a workload exceeds the                                      width and 142ns remote latency and 30GB/s bandwidth (3/4 of a
+PDM. The model uses a set of 200 hardware counters as supported                                        CXL ×8 link). On AMD, we measure 115ns NUMA-local latency and
+
+
+
+
+                                                                                                 582
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                                 Li, Berger, Hsu, Ernst, Zardoshti, Novakovic, Shah, Rajadnya, Lee, Agarwal, Hill, Fontoura, and Bianchini
+
+
+               60
+                                                   Overprediction of untouched memory
+
+
+
+
+                                                                                                           Slowdown > PDM [%]
+                                 Correct
+
+
+
+
+                                             {
+                                                                                                              False Positives:
+Slowdown [%]
+
+
+
+
+                                Untouched                                                                                        20
+               40               Prediction                                                                                                Memory-Bound
+
+                    All local                                                                                                                                 DRAM-Bound
+                                                                                                                                 10
+               20   memory
+                                                                                                                                                                              RandomForest
+
+                                                                                                                                  0
+                0                                                                                                                     0    10        20         30         40         50     60
+                       0           0%        10%   20%     40%       60%       75%      100%                                                 Workloads Insensitive to CXL Latency [%]
+                                                   Pool Memory [%]
+Figure 16: Slowdown under different pool allocations (§6.3).                                             Figure 17: Latency insensitivity model (§6.4). As we increase
+Performance for local memory and a correctly-sized zNUMA                                                 how many workloads are marked as insensitive (LI), the
+is comparable. Small slowdowns arise from run-to-run varia-                                              rate of false positives (FP) increases. Pond’s RandomForest
+tion. Slowdown becomes noticeable as soon as the workload                                                slightly outperforms a heuristic based only on the DRAM-
+spills into the zNUMA and steadily increases until the whole                                             bound TMA performance counter.
+workload is allocated on pool memory (100% spilled).
+                                                                                                         the video workload and a table that shows the traffic to the zNUMA
+                                                                                                         node for the four workloads.
+255ns remote latency. Our BIOS disables hyper-threading, turbo-
+                                                                                                          Finding #1: We find that zNUMA nodes are effective at containing
+boost, and C-states.
+                                                                                                          the memory access to the local vNUMA node. A small fraction of
+   We use performance results of VMs entirely backed by NUMA-
+                                                                                                          accesses goes to the zNUMA node. We suspect that this is in part
+local DRAM as our baseline. We present zNUMA performance as
+                                                                                                          due to the guest OS memory manager’s metadata that is explicitly
+normalized slowdowns, i.e., the ratio to the baseline. Performance
+                                                                                                          allocated on each vNUMA node. We find that the video workload
+metrics are workload specific, e.g., job runtime, throughput and tail
+                                                                                                          sends fewer than 0.25% of memory accesses to the zNUMA node.
+latency, etc.
+                                                                                                          Similarly, the other three workloads send 0.06-0.38% of memory
+   Each experiment involves running the application with one of 7
+                                                                                                          access to the zNUMA node. Accesses within the local vNUMA
+zNUMA sizes (as percentages of the workload’s memory footprint
+                                                                                                          node are spread out.
+in Figure 16). With at least three repetitions of each run and 158
+workloads, our evaluation spans more than 3,500 experiments and                                           Implications. With a negligible fraction of memory accesses on
+10,000 machine hours. Most experiments used lab servers; we spot                                          zNUMA, we expect negligible performance impact given a correct
+check outliers on production servers.                                                                     prediction of untouched memory.
+Simulations. Our simulations are based on traces of production
+VM requests and their placement on servers. The traces are from                                          6.3                     zNUMA VMs in the Lab
+randomly selected 100 clusters across 34 datacenters globally over                                       We scale up our evaluation to 158 workloads in a lab setting. Since
+75 days.                                                                                                 we fully control the workloads, we can explicitly measure their per-
+   The simulator implements different memory allocation policies                                         formance. We rerun each workload on all-local memory, a correctly
+and tracks each server and each pool’s memory capacity at second                                         sized zNUMA (0% spilled), differently-sized zNUMA nodes sized
+accuracy. Generally, the simulator schedules VMs on the same                                             between 10-100% of the workload’s footprint. Figure 16 shows a
+nodes as in the trace and changes their memory allocation to match                                       violin plot of associated slowdowns. This setup covers normal be-
+the policy. For rare cases where a VM does not fit on a server, e.g.,                                    havior (all-local and 0% spill) and misprediction for latency sensitive
+due to insufficient pool memory, the simulator moves the VMs to                                          workloads. Thus, this is effectively a sensitivity study.
+another server.
+                                                                                                          Finding #2: With a correct prediction of untouched memory, the
+Model evaluation. We evaluate our model with production re-
+                                                                                                          distribution of workload slowdowns is similar to all-local memory.
+source logs. About 80% of VMs have sufficient history to make a sen-
+sitivity prediction. Our deployment does not report each workload’s                                       Implications. This performance result is expected since the
+perceived performance (opaque VMs). We thus evaluate latency                                              zNUMA node is rarely accessed (§6.2). Our evaluation can thus
+sensitivity model based on our 158 workloads.                                                             assume no performance impact under correct predictions of un-
+                                                                                                          touched memory (§6.5).
+6.2                 zNUMA VMs on Production Nodes
+We perform a small-scale experiment on Azure production nodes
+to validate zNUMA VMs. The experiment evaluates four internal                                             Finding #3: For overpredictions of untouched memory (and cor-
+workloads: an audio/video conferencing application, a database                                            respondingly undersized local vNUMA node), the workload spills
+service, a key-value store, and a business analytics service. To see                                      into zNUMA. Many workloads see an immediate impact on slow-
+the effectiveness of zNUMA, we assume a correct prediction of                                             down. Slowdowns further increase if more workload memory spills
+untouched memory, i.e., the local footprint fits into the VM’s local                                      into zNUMA. Some workloads are slowed down by up to 30-35%
+vNUMA node. Figure 15 shows access bit scans over 48 hours from                                           with 20-75% of workload memory spilled and up to 50% if entirely
+
+
+
+
+                                                                                                   583
+Pond: CXL-Based Memory Pooling Systems for Cloud Platforms                                                                                         ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+allocated on pool memory. We use access bit scans to verify that                                                                 5
+                                                                                                                                         Pond with CXL latency emulated
+
+
+
+
+                                                                                                            Slowdown > PDM [%]
+these workloads indeed actively access their entire working set.
+                                                                                                                                 4          At 222% (255ns)
+Implications. Allocating a fixed percentage of pool DRAM to VMs                                                                             At 182% (142ns)
+                                                                                                                                 3
+would lead to significant performance slowdowns. There are only
+two strategies to reduce this impact: 1) identify which workloads                                                                2
+will see slowdowns and 2) allocate untouched memory on the pool.
+Pond employs both strategies.                                                                                                    1
+
+                                                                                                                                 0
+                                                                                                                                     0                 20            40                    60
+6.4    Performance of Prediction Models                                                                                                              Average Pool DRAM [%]
+We evaluate Pond’s prediction models (§4.4) and its combined pre-
+                                                                            Figure 18: Combined model (§6.4). Pond’s overall tradeoff
+diction model based on Eq.(1).
+                                                                            between average allocation of pool memory and mispredic-
+                                                                            tions after solving Eq.(1).
+6.4.1 Predicting Latency Sensitivity. Pond seeks to predict whether
+a VM is latency insensitive, i.e., whether running the workload
+on pool memory would stay within the performance degradation                                           25
+
+
+
+
+                                                                             Overpredictions [% VMs]
+margin (PDM). We tested the model for PDM between 1-10% and
+on both 182% and 222% latency increases, but report details only                                       20
+for 5% and 182%. Other PDM values lead to qualitatively similar                                        15                                         Fixed Amount / VM
+results. The 222% model is 16% less effective given the same false
+positive rate target. We compare thresholds on memory and DRAM                                         10
+boundedness [25, 79] to our RandomForest (§5).                                                          5
+   Figure 17 shows the model’s false positive rate as a function of                                                                                                    GBM Model 1GB-aligned
+
+the percentage of workloads labeled as latency insensitive, similar                                     0
+                                                                                                            0                                10           20           30            40           50
+to a precision-recall curve [36]. Error bars show 99% confidence                                                                             Average Untouched Memory [% GB-Hours]
+from a 100-fold validation based on randomly splitting into equal-
+sized training and testing datasets.                                        Figure 19: Untouched memory model (§6.4). As we increase
+                                                                            untouched memory (UM), our GBM has a significantly lower
+Finding #4: While DRAM boundedness is correlated with slow-                 rate of overpredictions (OP) that a strawman model.
+down, we find examples where high slowdown occurs even for a
+small percentage of DRAM boundedness. For example, multiple
+workloads exceed 20% slowdown with just two percent of DRAM                 touched, GBM overpredicts only 2.5% of VMs while the static policy
+boundedness.                                                                overpredicts 12%.
+Implication. This shows the general hardness of predicting                  Implication. Our prediction model identifies 25% of untouched
+whether workloads exceed the PDM. Heuristic as well as predictors           memory while only overpredicting 4% of VMs.
+will make statistical errors.
+                                                                            Finding #7: The production version of our model performs sim-
+Finding #5: We find that “DRAM bound” significantly outper-
+                                                                            ilarly to the simulated model. Distributional shifts lead to some
+forms “Memory bound” (Figure 17). Our RandomForest performs
+                                                                            variability over time.
+slightly better than “DRAM bound”.
+                                                                            Implication. We find that accurately predicting untouched mem-
+Implication. Our RandomForest can place 30% of workloads on
+                                                                            ory is practical and a realistic assumption.
+the pool with only 2% of false positives.
+
+
+6.4.2 Predicting Untouched Memory. Pond predicts the amount of              6.4.3 Combined Prediction Models. We characterize Pond’s com-
+untouched memory over a VM’s future lifetime (§4.4). We evalu-              bined models (Eq.(1)) using “scheduling mispredictions”, i.e., the
+ate this model using metadata and resource usage logs from 100              fraction of VMs that will exceed the PDM. This incorporates the
+clusters over 75 days. The model is trained nightly and evaluated           overpredictions of untouched memory, how much the model over-
+on the subsequent day. Figure 19 compares our GBM model to the              predicted, and the probability of this overprediction leading to a
+heuristic that assumes a fixed fraction of memory as untouched              workload exceeding the PDM. Further, Pond uses its QoS monitor
+across all VMs. The figure shows the overprediction rate as a func-         to mitigate up to 1% of mispredictions. Figure 18 shows schedul-
+tion of the average amount of untouched memory. Figure 20 shows             ing mispredictions as a function of the average amount of cluster
+a production version of the untouched memory model during the               DRAM that is allocated on its pools for 182% and 222% memory
+first 110 days of 2022.                                                     latency increases, respectively.
+
+Finding #6: We find that the GBM model is 5× more accurate                  Finding #8: Pond’s combined model outperforms its individual
+than the static policy, e.g., when labeling 20% of memory as un-            models by finding their optimal combination.
+
+
+
+
+                                                                      584
+  ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                   Li, Berger, Hsu, Ernst, Zardoshti, Novakovic, Shah, Rajadnya, Lee, Agarwal, Hill, Fontoura, and Bianchini
+
+
+                                                                                                                              100
+                                    10
+
+
+
+
+                                                                                                  Required Overall DRAM [%]
+Overpredictions
+
+
+
+
+                                                                                                                                                 Fixed 15% percentage of VM memory
+                      [% of VMs]
+
+
+
+
+                                                                                                                                                      with CXL latency at 182%
+
+                                    5                                                                                          95
+
+                                                                                                                                                          Pond with CXL latency at 222%
+
+                                     0                                                                                         90
+                                    50
+  Average Untouched
+
+
+
+
+                                    40                                                                                                                    Pond with CXL latency at 182%
+                       Memory [%]
+
+
+
+
+                                    30                                                                                         85
+                                                                                                                                    2   8   16       32                          64
+                                    20                                                                                                       Pool Scope [CPU Sockets]
+                                    10
+                                    0
+                                                                                             Figure 21: Memory savings under performance constraints
+                                         0    25       50          75       100              (§6.5). Simulated end-to-end evaluation of memory savings
+                                                     Day in 2022                             achieved by Pond under PDM =5% and scheduling mispredic-
+  Figure 20: Untouched memory ML model performance in                                        tions TP =98%.
+  production (§6.4). Our production model targets 4% overpre-
+  dictions (OP). It average untouched memory percentage is                                   tomers, any individual customer’s behavior will have a small impact.
+  similar to the simulated model (Figure 19).                                                Providers can also provide small discounts when resources are not
+                                                                                             fully utilized.
+      Implication. With a 2% scheduling misprediction target, Pond                           Alternatives to static memory preallocation. Pond is designed
+      can schedule 44% and 35% of DRAM on pools with 182% and 222%                           for compatibility static memory as potential workarounds are not
+      memory latency increases, respectively.                                                yet practical. The PCIe Address Translation Service (ATS/PRI) [1]
+                                                                                             enables compatibility with page faults. Unfortunately, ATS/PRI-
+  6.5                                End-to-End Reduction in Stranding                       devices are not yet broadly available [54]. Virtual IOMMUs [31, 34,
+  We characterize Pond’s end-to-end performance while constraining                           73] allow fine-grained pinning but require guest OS changes and
+  its rate of scheduling mispredictions. Figure 21 shows the reduction                       introduce overhead.
+  in aggregate cluster memory as a function of pool size for Pond
+  under 182% and 222% memory latency increase, respectively, and                             8                 RELATED WORK
+  a strawman static allocation policy. We evaluate multiple scenar-                          Hardware-level disaggregation: Hardware-based disaggregation
+  ios; the figure shows PDM =5% and TP =98%. In this scenario, the                           designs [46, 63] are not easily deployable as they do not rely on com-
+  strawman statically allocates each VM with 15% of pool DRAM.                               modity hardware. For instance, ThymesisFlow [63] and Clio [46]
+  About 10% of VMs would touch the pool DRAM (Figure 19). Of                                 propose FPGA-based rack-scale memory disaggregation designs on
+  those touching pool DRAM, we’d expect that about 14 would see                              top of OpenCAPI [21] and RDMA. Their hardware layer shares goals
+  a slowdown exceeding a PDM =5% (Figure 16). So, the strawman                               with Pond. Their software goals differ fundamentally, e.g., Thymes-
+  would have about 2.5% of scheduling mispredictions.                                        isFlow advocates application changes for performance, while Pond
+      Finding #9: At a pool size of 16 sockets, Pond reduces overall                         focuses on platform-level ML-driven pool memory management
+      DRAM requirements by 9% and 7% under 182% and 222% latency                             that is transparent to users.
+      increases, respectively. Static reduces DRAM by 3%. When varying                       Hypervisor/OS level disaggregation: Hypervisor/OS level ap-
+      PDM between 1 and 10% and TP between 90 and 99.9% we find the                          proaches [45, 50, 67] rely on page faults and access monitoring
+      relative savings of the three systems to be qualitatively similar.                     to maintain the working set in local DRAM. Such OS-based ap-
+      Implication. Pond can safely reduce cost. A QoS monitor that mit-                      proaches bring significant overhead, jitter, and are incompatible
+      igates more than 1% of mispredictions, can achieve more aggressive                     with virtualization acceleration (e.g., DDA).
+      performance targets (PDM).                                                             Runtime/application level disaggregation: Runtime-based dis-
+                                                                                             aggregation designs [38, 65, 75] propose customized APIs for remote
+      Finding #10: Throughout the simulations, Pond’s pool memory                            memory access. While effective, this approach requires developers
+      offlining speeds remain below 1GB/s and 10GB/s for 99.99% and                          to explicitly use these mechanisms at the application level.
+      99.999% of VM starts, respectively.
+                                                                                             Memory tiering: Prior works have considered the broader impact
+      Implication. Pond is practical and achieve design goals.                               of extended memory hierarchies and how to handle them [49, 50].
+                                                                                             For example, Google achieves 6µs latency via proactive hot/cold
+  7                             DISCUSSION                                                   page detection and compression [9, 50]. Nimble [78] optimizes
+                                                                                             Linux’s page tracking mechanism to tier pages for increased migra-
+  Robustness of ML. Similar to other oversubscribed resources                                tion bandwidth. Pond takes a different ML-based approach looking
+  (CPU [76] and disks [13]), customers may overuse resources to                              at memory pooling design at the platform-level and is orthogonal
+  get local memory. When multiplexing resource for millions of cus-                          to these works.
+
+
+
+
+                                                                                       585
+Pond: CXL-Based Memory Pooling Systems for Cloud Platforms                                                                    ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+ML for systems: ML is increasingly applied to tackle systems                                      [13] 2021. AWS: Optimize Disk Performance for Instance Store Volumes. https:
+problems, such as cloud efficiency [41, 76], memory/storage op-                                        //docs.aws.amazon.com/AWSEC2/latest/UserGuide/disk-performance.html.
+                                                                                                  [14] 2021. Azure Accelerated Networking: Supported VM Instances. https://docs.mic
+timizations [57, 83], microservices [82], caching/prefetching poli-                                    rosoft.com/en-us/azure/virtual-network/accelerated-networking-overview.
+cies [70, 71]. We uniquely apply ML methods for untouched memory                                  [15] 2021. Compute Express Link 2.0 White Paper. https://b373eaf2-67af-4a29-b28c-
+                                                                                                       3aae9e644f30.filesusr.com/ugd/0c1418_14c5283e7f3e40f9b2955c7d0f60bebe.pdf.
+prediction to support pooled memory provisioning to VMs without                                   [16] 2021. CXL Consortium Member Spotlight: Arm. https://www.computeexpressli
+jeopardizing QoS.                                                                                      nk.org/post/cxl-consortium-member-spotlight-arm.
+                                                                                                  [17] 2021. CXL Use-cases Driving the Need For Low Latency Performance Retimers.
+Coherent memory and NUMA optimizations: Traditional cache                                              https://www.microchip.com/en-us/about/blog/learning-center/cxl--use-cases-
+coherent NUMA architectures [52] use specialized interconnects to                                      driving-the-need-for-low-latency-performance-reti.
+                                                                                                  [18] 2021. Enabling PCIe 5.0 System Level Testing and Low Latency Mode for CXL.
+implement a shared address space. There are also system-level op-                                      https://www.asteralabs.com/videos/aries-smart-retimer-for-pcie-gen-5-and-
+timizations for NUMA, such as NUMA-aware data placement [53]                                           cxl/.
+and proactive page migration [80]. NUMA scheduling policies [40]                                  [19] 2021. HiBench: The Bigdata Micro Benchmark Suite. https://github.com/Intel-
+                                                                                                       bigdata/HiBench.
+balance compute and memory across NUMA nodes. Pond’s own-                                         [20] 2021. MIPI I3C Bus Sensor Specification. https://www.mipi.org/specifications/i3c-
+ership overcomes the need for coherence across the memory pool.                                        sensor-specification.
+                                                                                                  [21] 2021. OpenCAPI Consortium. https://opencapi.org/.
+zNUMA’s zero-core nature requires rethinking of existing optimiza-                                [22] 2021. Redis. https://redis.io.
+tions which are largely optimized for symmetric NUMA systems.                                     [23] 2021. Sapphire Rapids Uncovered: 56 Cores, 64GB HBM2E, Multi-Chip Design.
+                                                                                                       https://www.tomshardware.com/news/intel-sapphire-rapids-xeon-scalable-
+                                                                                                       specifications-and-features.
+9     CONCLUSION                                                                                  [24] 2021. SPEC CPU 2017. https://www.spec.org/cpu2017.
+DRAM costs are an increasing cost factor for cloud providers. This                                [25] 2021. Top-down Microarchitecture Analysis Method. https://software.intel.com
+                                                                                                       /content/www/us/en/develop/documentation/vtune-cookbook/top/methodolo
+paper is motivated by the observation of stranded and untouched                                        gies/top-down-microarchitecture-analysis-method.html.
+memory across 100 production cloud clusters. We proposed Pond,                                    [26] 2021. TPC-H Benchmark. http://www.tpc.org/tpch.
+the first full-stack memory pool that satisfies the requirements of                               [27] 2021. VoltDB. https://www.voltdb.com.
+                                                                                                  [28] 2022. CXL 3.0 Specification. https://www.computeexpresslink.org/download-
+cloud providers. Pond consists of contributions at the hardware, sys-                                  the-specification.
+tem software, and distributed system layers to manage pooled/CXL                                  [29] Soramichi Akiyama and Takahiro Hirofuchi. 2017. Quantitative Evaluation of
+                                                                                                       Intel PEBS Overhead for Online System-noise Analysis. In Proceedings of the 7th
+memory. Our results showed that Pond can reduce the amount of                                          International Workshop on Runtime and Operating Systems for Supercomputers
+needed DRAM by 7% with a pool size of 16 sockets and assum-                                            (ROSS).
+ing CXL increases latency by 222%. This translates into an overall                                [30] Pradeep Ambati, Íñigo Goiri, Felipe Vieira Frujeri, Alper Gun, Ke Wang, Brian
+                                                                                                       Dolan, Brian Corell, Sekhar Pasupuleti, Thomas Moscibroda, Sameh Elnikety,
+reduction of 3.5% in cloud server cost.                                                                Marcus Fontoura, and Ricardo Bianchini. 2020. Providing SLOs for Resource-
+                                                                                                       Harvesting VMs in Cloud Platforms. In Proceedings of the 14th USENIX Symposium
+ACKNOWLEDGMENTS                                                                                        on Operating Systems Design and Implementation (OSDI).
+                                                                                                  [31] Nadav Amit, Muli Ben-Yehuda, IBM Research, Dan Tsafrir, and Assaf Schuster.
+We thank the anonymous reviewers for their feedback and com-                                           2011. vIOMMU: Efficient IOMMU Emulation. In Proceedings of the 2011 USENIX
+ments which improved the paper tremendously. Huaicheng con-                                            Annual Technical Conference (ATC).
+                                                                                                  [32] Yossi Azar, Ilan Reuven Cohen, Seny Kamara, and Bruce Shepherd. 2013. Tight
+tributed to this work as an intern at Microsoft and during his time                                    Bounds for Online Vector Bin Packing. In Proceedings of the 45th ACM Symposium
+at CMU’s Parallel Data Lab (PDL). We thank the member companies                                        on Theory of Computing (STOC).
+of the PDL Consortium for their support.                                                          [33] Scott Beamer, Krste Asanović, and David Patterson. 2015. The GAP Benchmark
+                                                                                                       Suite. arXiv:1508.03619 (2015).
+                                                                                                  [34] Muli Ben-Yehuda, Michael D. Day, Zvi Dubitzky, Michael Factor, Nadav Har’El,
+REFERENCES                                                                                             Abel Gordon, Anthony Liguori, Orit Wasserman, and Ben-Ami Yassour. 2010.
+ [1] 2009. PCI Express Address Translation Services. https://composter.com.ua/doc                      The Turtles Project: Design and Implementation of Nested Virtualization. In
+     uments/ats_r1.1_26Jan09.pdf.                                                                      Proceedings of the 9th USENIX Symposium on Operating Systems Design and
+ [2] 2015. Reliability, Availability, and Serviceability (RAS) Integration and Validation              Implementation (OSDI).
+     Guide for the Intel Xeon Processor E7 Family. https://www.intel.com/content/                 [35] Christian Bienia, Sanjeev Kumar, Jaswinder Pal Singh, and Kai Li. 2008. The
+     dam/develop/external/us/en/documents/emca2-integration-validation-guide-                          PARSEC Benchmark Suite: Characterization and Architectural Implications. In
+     556978.pdf.                                                                                       IEEE International Conference on Parallel Architectures and Compilation Techniques
+ [3] 2017. AMD EPYC brings new RAS capability. https://www.amd.com/system/fil                          (PACT).
+     es/2017-06/AMD-EPYC-Brings-New-RAS-Capability.pdf.                                           [36] Michael Buckland and Fredric Gey. 1994. The Relationship Between Recall and
+ [4] 2019. Single-Root Input/Output Virtualization. httpp://www.pcisig.com/specific                    Precision. Journal of the American Society for Information Science 45, 1 (1994).
+     ations/iov/single_root.                                                                      [37] Brendan Burns, Brian Grant, David Oppenheimer, Eric Brewer, and John Wilkes.
+ [5] 2020. Compute Express Link Specification. Available at https://www.computee                       2016. Borg, Omega, and Kubernetes. Commun. ACM 59, 5 (2016).
+     xpresslink.org.                                                                              [38] Irina Calciu, M. Talha Imran, Ivan Puddu, Sanidhya Kashyap, Hasan Al Maruf,
+ [6] 2020. CXL 2.0 Specification. https://www.computeexpresslink.org/download-                         Onur Mutlu, and Aasheesh Kolli. 2021. Rethinking Software Runtimes for Dis-
+     the-specification.                                                                                aggregated Memory. In Proceedings of the 26th ACM International Conference on
+ [7] 2020. CXL And Gen-Z Iron Out A Coherent Interconnect Strategy. https:                             Architectural Support for Programming Languages and Operating Systems (ASP-
+     //www.nextplatform.com/2020/04/03/cxl-and-gen-z-iron-out-a-coherent-                              LOS).
+     interconnect-strategy/.                                                                      [39] Elene Chobanyan, Casey Morrison, and Pegah Alavi. 2020. End-to-End System-
+ [8] 2020. Intel Virtualization Technology for Directed I/O. https://software.intel.c                  Level Simulations with Retimers for PCIe Gen5 & CXL. DesignCon, slides
+     om/content/dam/develop/external/us/en/documents/vt-directed-io-spec.pdf.                          available at https://www.asteralabs.com/wp-content/themes/astera-labs/images/
+ [9] 2020. Linux Memory Management Documentation - zswap. https://www.kernel                           retimer-cxl.pdf.
+     .org/doc/html/latest/vm/zswap.html.                                                          [40] Jonathan Corbet. 2012. AutoNUMA: the other approach to NUMA scheduling.
+[10] 2021. AMD EPYC Genoa and SP5 Platform Leaked. https://wccftech.com/amd-                           https://lwn.net/Articles/488709/.
+     epyc-genoa-zen-4-server-cpus-and-sp5-lga-6096-server-platform-details-                       [41] Eli Cortez, Anand Bonde, Alexandre Muzio, Mark Russinovich, Marcus Fontoura,
+     leaked/ accessed 8/23/22.                                                                         and Ricardo Bianchini. 2017. Resource Central: Understanding and Predicting
+[11] 2021. AMD Unveils Workload-Tailored Innovations and Products at The Acceler-                      Workloads for Improved Resource Management in Large Cloud Platforms. In
+     ated Data Center Premiere. https://www.amd.com/en/press-releases/2021-11-08-                      Proceedings of the 26th ACM Symposium on Operating Systems Principles (SOSP).
+     amd-unveils-workload-tailored-innovations-and-products-the-accelerated.                      [42] Daniel Crankshaw, Xin Wang, Guilio Zhou, Michael J. Franklin, Joseph E. Gon-
+[12] 2021. AWS: Enhanced Networking Support. https://docs.aws.amazon.com/AW
+     SEC2/latest/UserGuide/enhanced-networking.html.
+
+
+
+
+                                                                                            586
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                    Li, Berger, Hsu, Ernst, Zardoshti, Novakovic, Shah, Rajadnya, Lee, Agarwal, Hill, Fontoura, and Bianchini
+
+
+     zalez, and Ion Stoica. 2017. Clipper: A Low-Latency Online Prediction Serving                  Blondel, P. Prettenhofer, R. Weiss, V. Dubourg, J. Vanderplas, A. Passos, D. Cour-
+     System. In Proceedings of the 14th USENIX Symposium on Networked Systems                       napeau, M. Brucher, M. Perrot, and E. Duchesnay. 2011. Scikit-learn: Machine
+     Design and Implementation (NSDI).                                                              Learning in Python. Journal of Machine Learning Research (JMLR) 12, 85 (2011).
+[43] Donghyun Gouk, Sangwon Lee, Miryeong Kwon, , and Myoungsoo Jung. 2022.                    [63] Christian Pinto, Dimitris Syrivelis, Michele Gazzetti, Panos Koutsovasilis, Andrea
+     Direct Access, High-Performance Memory Disaggregation with DirectCXL. In                       Reale, Kostas Katrinis, and Peter Hofstee. 2020. ThymesisFlow: A Software-
+     Proceedings of the 2022 USENIX Annual Technical Conference (ATC).                              Defined, HW/SW Co-Designed Interconnect Stack for Rack-Scale Memory Disag-
+[44] Robert Grandl, Ganesh Ananthanarayanan, Srikanth Kandula, Sriram Rao, and                      gregation. In 53rd Annual IEEE/ACM International Symposium on Microarchitecture
+     Aditya Akella. 2014. Multi-Resource Packing for Cluster Schedulers. In Proceed-                (MICRO-53).
+     ings of the ACM Special Interest Group on Data Communication (SIGCOMM).                   [64] Amanda Raybuck, Tim Stamler, Wei Zhang, Mattan Erez, and Simon Peter. 2021.
+[45] Juncheng Gu, Youngmoon Lee, Yiwen Zhang, Mosharaf Chowdhury, and Kang G.                       HeMem: Scalable Tiered Memory Management for Big Data Applications and
+     Shin. 2017. Efficient Memory Disaggregation with Infiniswap. In Proceedings of                 Real NVM. In Proceedings of the 28th ACM Symposium on Operating Systems
+     the 14th USENIX Symposium on Networked Systems Design and Implementation                       Principles (SOSP).
+     (NSDI).                                                                                   [65] Zhenyuan Ruan, Malte Schwarzkopf, Marcos K. Aguilera, and Adam Belay. 2020.
+[46] Zhiyuan Guo, Yizhou Shan, Xuhao Luo, Yutong Huang, and Yiying Zhang. 2022.                     AIFM: High-Performance, Application-Integrated Far Memory. In Proceedings of
+     Clio: A Hardware-Software Co-Designed Disaggregated Memory System. In                          the 14th USENIX Symposium on Operating Systems Design and Implementation
+     Proceedings of the 27th ACM International Conference on Architectural Support for              (OSDI).
+     Programming Languages and Operating Systems (ASPLOS).                                     [66] Adam Ruprecht, Danny Jones, Dmitry Shiraev, Greg Harmon, Maya Spivak,
+[47] Ori Hadary, Luke Marshall, Ishai Menache, Abhisek Pan, Esaias E Greeff, David                  Michael Krebs, Miche Baker-Harvey, and Tyler Sanderson. 2018. VM Live Migra-
+     Dion, Star Dorminey, Shailesh Joshi, Yang Chen, Mark Russinovich, and Thomas                   tion at Scale. ACM SIGPLAN Notices 53, 3 (2018).
+     Moscibroda. 2020. Protean: VM Allocation Service at Scale. In Proceedings of              [67] Yizhou Shan, Yutong Huang, Yilun Chen, and Yiying Zhang. 2018. LegoOS: A Dis-
+     the 14th USENIX Symposium on Operating Systems Design and Implementation                       seminated, Distributed OS for Hardware Resource Disaggregation. In Proceedings
+     (OSDI).                                                                                        of the 13th USENIX Symposium on Operating Systems Design and Implementation
+[48] Guolin Ke, Qi Meng, Thomas Finley, Taifeng Wang, Wei Chen, Weidong Ma,                         (OSDI).
+     Qiwei Ye, and Tie-Yan Liu. 2017. Lightgbm: A Highly Efficient Gradient Boosting           [68] Debendra Das Sharma. 2022. Compute Express Link: An Open Industry-standard
+     Decision Tree. Advances in Neural Information Processing Systems (NIPS) (2017).                Interconnect Enabling Heterogenous Data-centric Computing. In Proceedings of
+[49] Jonghyeon Kim, Wonkyo Choe, and Jeongseob Ahn. 2021. Exploring the Design                      the 29th IEEE Hot Interconnects symposium (HotI29).
+     Space of Page Management for Multi-Tiered Memory Systems. In Proceedings of               [69] Debendra Das Sharma. 2022. CXL 3.0: New Features for Increased Scale and
+     the 2021 USENIX Annual Technical Conference (ATC).                                             Optimized Resource Utilization. In Flash Memory Summit.
+[50] Andres Lagar-Cavilla, Junwhan Ahn, Suleiman Souhlal, Neha Agarwal, Radoslaw               [70] Zhan Shi, Xiangru Huang, Akanksha Jain, and Calvin Lin. 2019. Applying
+     Burny, Shakeel Butt, Jichuan Chang, Ashwin Chaugule, Nan Deng, Junaid Shahid,                  Deep Learning to the Cache Replacement Problem. In 52nd Annual IEEE/ACM
+     Greg Thelen, Kamil Adam Yurtsever, Yu Zhao, and Parthasarathy Ranganathan.                     International Symposium on Microarchitecture (MICRO-52).
+     2019. Software-Defined Far Memory in Warehouse-Scale Computers. In Pro-                   [71] Zhan Shi, Akanksha Jain, Kevin Swersky, Milad Hashemi, Parthasarathy Ran-
+     ceedings of the 24th ACM International Conference on Architectural Support for                 ganathan, and Calvin Lin. 2021. A Hierarchical Neural Model of Data Prefetching.
+     Programming Languages and Operating Systems (ASPLOS).                                          In Proceedings of the 26th ACM International Conference on Architectural Support
+[51] Christopher Lameter. 2019. Flavors of Memory supported by Linux, Their Use and                 for Programming Languages and Operating Systems (ASPLOS).
+     Benefit. https://events19.linuxfoundation.org/wp-content/uploads/2017/11/The-             [72] Shigeru Shiratake. 2020. Scaling and Performance Challenges of Future DRAM.
+     Flavors-of-Memory-Supported-by-Linux-their-Use-and-Benefit-Christoph-                          In IEEE International Memory Workshop (IMW).
+     Lameter-Jump-Trading-LLC.pdf.                                                             [73] Kun Tian, Yu Zhang, Luwei Kang, Yan Zhao, and Yaozu Dong. 2020. coIOMMU:
+[52] James Laudon and Daniel Lenoski. 1997. The SGI Origin: A ccNUMA Highly                         A Virtual IOMMU with Cooperative DMA Buffer Tracking for Efficient Memory
+     Scalable Server. In Proceedings of the 24th Annual International Symposium on                  Management in Direct I/O. In Proceedings of the 2020 USENIX Annual Technical
+     Computer Architecture (ISCA).                                                                  Conference (ATC).
+[53] Baptiste Lepers, Vivien Quéma, and Alexandra Fedorova. 2015. Thread and                   [74] UEFI. 2021. Advanced Configuration and Power Interface Specification.
+     Memory Placement on NUMA Systems: Asymmetry Matters. In Proceedings of                    [75] Chenxi Wang, Haoran Ma, Shi Liu, Yuanqi Li, Zhenyuan Ruan, Khanh Nguyen,
+     the 2015 USENIX Annual Technical Conference (ATC).                                             Michael D. Bond, Ravi Netravali, Miryung Kim, and Guoqing Harry Xu. 2020.
+[54] Ilya Lesokhin, Haggai Eran, Shachar Raindel, Guy Shapiro, Sagi Grimberg, Liran                 Semeru: A Memory-Disaggregated Managed Runtime. In Proceedings of the 14th
+     Liss, Muli Ben-Yehuda, Nadav Amit, and Dan Tsafrir. 2017. Page Fault Support                   USENIX Symposium on Operating Systems Design and Implementation (OSDI).
+     for Network Controllers. In Proceedings of the 22nd ACM International Conference          [76] Yawen Wang, Kapil Arya, Marios Kogias, Manohar Vanga, Aditya Bhandari,
+     on Architectural Support for Programming Languages and Operating Systems                       Neeraja J. Yadwadkar, Siddhartha Sen, Sameh Elnikety, Christos Kozyrakis, and
+     (ASPLOS).                                                                                      Ricardo Bianchini. 2021. SmartHarvest: Harvesting Idle CPUs Safely and Effi-
+[55] Huaicheng Li, Mingzhe Hao, Stanko Novakovic, Vaibhav Gogte, Sriram Govindan,                   ciently in the Cloud. In Proceedings of the 2021 EuroSys Conference (EuroSys).
+     Dan R. K. Ports, Irene Zhang, Ricardo Bianchini, Haryadi S. Gunawi, and Anirudh           [77] Johannes Weiner, Niket Agarwal, Dan Schatzberg, Leon Yang, Hao Wang, Blaise
+     Badam. 2020. LeapIO: Efficient and Portable Virtual NVMe Storage on ARM SoCs.                  Sanouillet, Bikash Sharma, Tejun Heo, Mayank Jain, Chunqiang Tang, and Dim-
+     In Proceedings of the 25th ACM International Conference on Architectural Support               itrios Skarlatos. 2022. TMO: Transparent Memory Offloading in Datacenters. In
+     for Programming Languages and Operating Systems (ASPLOS).                                      Proceedings of the 27th ACM International Conference on Architectural Support for
+[56] Kevin T. Lim, Jichuan Chang, Trevor N. Mudge, Parthasarathy Ranganathan,                       Programming Languages and Operating Systems (ASPLOS).
+     Steven K. Reinhardt, and Thomas F. Wenisch. 2009. Disaggregated Memory                    [78] Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee. 2019. Nimble
+     for Expansion and Sharing in Blade Servers. In Proceedings of the 36th Annual                  Page Management for Tiered Memory Systems. In Proceedings of the 24th ACM
+     International Symposium on Computer Architecture (ISCA).                                       International Conference on Architectural Support for Programming Languages and
+[57] Martin Maas, David G. Andersen, Michael Isard, Mohammad Mahdi Javanmard,                       Operating Systems (ASPLOS).
+     Kathryn S. McKinley, and Colin Raffel. 2020. Learning-based Memory Allocation             [79] Ahmad Yasin. 2014. A Top-Down Method for Performance Analysis and Counters
+     for C++ Server Workloads. In Proceedings of the 25th ACM International Conference              Architecture. In IEEE International Symposium on Performance Analysis of Systems
+     on Architectural Support for Programming Languages and Operating Systems                       and Software (ISPASS).
+     (ASPLOS).                                                                                 [80] Huang Ying. 2019. AutoNUMA: Optimize Memory Placement for Memory Tiering
+[58] Hasan Al Maruf and Mosharaf Chowdhury. 2020. Effectively Prefetching Remote                    System. https://lwn.net/Articles/835402/.
+     Memory with Leap. In Proceedings of the 2020 USENIX Annual Technical Conference           [81] Xusheng Zhan, Yungang Bao, Christian Bienia, and Kai Li. 2017. PARSEC3.0:
+     (ATC).                                                                                         A Multicore Benchmark Suite with Network Stacks and SPLASH-2X. ACM
+[59] Hasan Al Maruf, Hao Wang, Abhishek Dhanotia, Johannes Weiner, Niket Agarwal,                   SIGARCH Computer Architecture News (CAN) 44, 5 (2017).
+     Pallab Bhattacharya, Chris Petersen, Mosharaf Chowdhury, Shobhit Kanaujia,                [82] Yanqi Zhang, Weizhe Hua, Zhuangzhuang Zhou, G. Edward Suh, and Christina
+     and Prakash Chauhan. 2022. TPP: Transparent Page Placement for CXL-Enabled                     Delimitrou. 2021. Sinan: ML-Based and QoS-Aware Resource Management for
+     Tiered Memory. arXiv:2206.02878 (2022).                                                        Cloud Microservices. In Proceedings of the 26th ACM International Conference
+[60] Timothy Prickett Morgan. 2021. PCI-Express 5.0: The Unintended but formidable                  on Architectural Support for Programming Languages and Operating Systems
+     datacenter interconnect. DesignCon, slides available at https://www.nextpl                     (ASPLOS).
+     atform.com/2021/02/03/pci- express- 5- 0- the- unintended- but- formidable-               [83] Giulio Zhou and Martin Maas. 2021. Learning on Distributed Traces for Data
+     datacenter-interconnect/.                                                                      Center Storage Systems. In Proceedings of the 4th Conference on Machine Learning
+[61] ONNX. 2021. Open Neural Network Exchange: the Open Standard for Machine                        and Systems (MLSys).
+     Learning Interoperability. https://onnx.ai/.
+[62] F. Pedregosa, G. Varoquaux, A. Gramfort, V. Michel, B. Thirion, O. Grisel, M.             Received 2022-07-07; accepted 2022-09-22
+
+
+
+
+                                                                                         587
+

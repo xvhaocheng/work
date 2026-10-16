@@ -1,0 +1,177 @@
+--- stage73/shared_pretl_read.sv
++++ stage74/shared_pretl_read.sv
+@@ -4,7 +4,7 @@
+ // Mode 0: closed long read; 1: open long read; 2: strong q-read control.
+ module shared_pretl_read #(
+     parameter int unsigned ParentDepth = 4,
+-    parameter bit ClosureAtBurstEnd = 0, ParallelPrefixRepair = 0, ShareRepairSuffix = 1, AdaptiveRepair = 0, RepairChoiceRule = 0, DeferredRepair = 0, PeerIndependentCutover = 0, Q = 2,
++    parameter bit ClosureAtBurstEnd = 0, ParallelPrefixRepair = 0, ShareRepairSuffix = 1, AdaptiveRepair = 0, RepairChoiceRule = 0, DeferredRepair = 0, PeerIndependentCutover = 0, EarlyPrefix = 0, Q = 2,
+     parameter int unsigned RepairWaitBudget = 64,
+     parameter type ar_t = logic, parameter type r_t = logic
+ ) (
+@@ -76,6 +76,7 @@
+     // Only new functional state: V old physical child may survive while
+     // existing main child metadata is reused for A prefix/suffix.
+     logic old_v_busy_q, incoming_old_v;
++    logic early_moved_q;
+     logic independent_v_offer_q;
+     logic repair_shared_q, repair_decided_q, repair_shared_active;
+     logic [15:0] repair_mem_wait_q, repair_consumer_hold_q, repair_samples_q;
+@@ -117,7 +118,7 @@
+     // Already offered q W remains irrevocable in the independent q writer.
+     assign a_hold_o = pause_i || (detach_pending_q && !detached_q) ||
+                       ((detached_q || mode_i==3) && done_q[0] == 0 && cutover_phase_q != 3 &&
+-                       !(ParallelPrefixRepair && cutover_phase_q == 2));
++                       !(ParallelPrefixRepair && (cutover_phase_q == 2 || (EarlyPrefix && cutover_phase_q == 1 && early_moved_q))));
+     assign v_hold_o = start_cutover || cutover_phase_q == 1 ||
+                       (!ParallelPrefixRepair && cutover_phase_q == 2) ||
+                       (cutover_phase_q == 3 && returned_q[1] < v_cut_q);
+@@ -152,14 +153,14 @@
+             m_ar_o.len = 8'(255-returned_q[0]);
+         end
+         repair_end = repair_shared_active ? old_end_q : 9'd256;
+-        incoming_old_v = ParallelPrefixRepair && cutover_phase_q == 2 &&
++        incoming_old_v = ParallelPrefixRepair && (cutover_phase_q == 2 || (EarlyPrefix && cutover_phase_q == 1 && early_moved_q)) &&
+                          old_v_busy_q && m_r_i.id == parent_q[0][0].id;
+         // An accepted old V beat is always the next undelivered V index:
+         // one global skid forbids accepting another until its delivery.
+         beat_index = incoming_old_v ? returned_q[0] : child_offset_q + child_got_q;
+         required = child_members_q;
+         if (detached_q && child_members_q == 2'b11) required[1] = 0;
+-        if (cutover_phase_q == 2) required = ParallelPrefixRepair ?
++        if (cutover_phase_q == 2 || (EarlyPrefix && cutover_phase_q == 1 && early_moved_q)) required = ParallelPrefixRepair ?
+             (incoming_old_v ? 2'b01 : 2'b10) : 2'b00;
+         if (cutover_phase_q == 3 && beat_index >= v_cut_q) required = 2'b11;
+         eligible_r = (incoming_old_v ? old_v_busy_q : busy_q) && !skid_q && required != 0;
+@@ -175,15 +176,15 @@
+                 // would trap that old W behind peer's two-beat W head.
+                 if (returned_q[f] < raw_written_i[f] ||
+                     returned_q[f]-raw_written_i[f] >= 2 ||
+-                    (cutover_phase_q != 3 && !(ParallelPrefixRepair && cutover_phase_q == 2) &&
++                    (cutover_phase_q != 3 && !(ParallelPrefixRepair && (cutover_phase_q == 2 || (EarlyPrefix && cutover_phase_q == 1 && early_moved_q))) &&
+                      (beat_index == 255 || beat_index+1 == certified_end_q[f])) ||
+                     (f == 1 && (pause_i || detach_pending_q ||
+                      (detached_q && cutover_phase_q != 3 &&
+-                      !(ParallelPrefixRepair && cutover_phase_q == 2)))))
++                      !(ParallelPrefixRepair && (cutover_phase_q == 2 || (EarlyPrefix && cutover_phase_q == 1 && early_moved_q)))))))
+                     eligible_r = 0;
+             end
+         end
+-        if (cutover_phase_q == 1 && beat_index >= v_cut_q) eligible_r = 0;
++        if (cutover_phase_q == 1 && (!EarlyPrefix || !early_moved_q || incoming_old_v) && beat_index >= v_cut_q) eligible_r = 0;
+         if (start_cutover) eligible_r = 0;
+         // Sink real old responses including a held R, independently of DMA
+         // FIFO availability. Never issue the repair AR until true RLAST.
+@@ -201,7 +202,7 @@
+             child_q <= '0; child_offset_q <= 0; child_beats_q <= 0; child_got_q <= 0;
+             child_members_q <= 0; detached_q <= 0; detach_pending_q <= 0;
+             cutover_phase_q <= 0; v_cut_q <= 0; old_end_q <= 0;
+-            old_v_busy_q <= 0; independent_v_offer_q <= 0; parallel_overlap_ars_q <= 0;
++            old_v_busy_q <= 0; early_moved_q <= 0; independent_v_offer_q <= 0; parallel_overlap_ars_q <= 0;
+             repair_shared_q <= DeferredRepair ? 1 : ShareRepairSuffix; repair_decided_q <= 0; repair_wait_q <= 0;
+             repair_mem_wait_q <= 0; repair_consumer_hold_q <= 0; repair_samples_q <= 0;
+             repair_decision_cursor_q <= 0; repair_decision_endpoint_q <= 0;
+@@ -318,10 +319,18 @@
+                 v_cut_q <= closure_target;
+                 old_end_q <= child_offset_q+child_beats_q;
+             end
++            // All irrevocable V W payload is already resident; actual W may
++            // drain while independently authorized A AR is prepared.
++            if (EarlyPrefix && cutover_phase_q == 1 && !early_moved_q && !skid_q &&
++                returned_q[0] == v_cut_q && returned_q[0] >= promised_write_end_i[0]) begin
++                old_v_busy_q <= busy_q;
++                busy_q <= 0;
++                early_moved_q <= 1;
++            end
+             if (cutover_phase_q == 1 && !skid_q && returned_q[0] == v_cut_q &&
+                 raw_written_i[0] == v_cut_q && returned_q[0] >= promised_write_end_i[0]) begin
+                 cutover_phase_q <= 2;
+-                if (ParallelPrefixRepair) begin
++                if (ParallelPrefixRepair && !early_moved_q) begin
+                     old_v_busy_q <= busy_q;
+                     busy_q <= 0;
+                 end
+@@ -346,7 +355,7 @@
+                 independent_v_offer_q <= 1;
+             end
+             if (!offered_q && !busy_q && !skid_q) begin
+-                if (cutover_phase_q == 2 && ParallelPrefixRepair) begin
++                if (ParallelPrefixRepair && (cutover_phase_q == 2 || (EarlyPrefix && cutover_phase_q == 1 && early_moved_q))) begin
+                     // A's independently authenticated prefix ends at E. A
+                     // held suffix R cannot block the unfinished old V tail.
+                     if (returned_q[1] < repair_end && cache_valid_i[1][0] && certified_end_q[1] == 256 &&
+@@ -472,6 +481,8 @@
+         end
+     end
+     initial begin
++        if (EarlyPrefix && (!PeerIndependentCutover || !DeferredRepair || !ParallelPrefixRepair))
++            $fatal(1,"SR74 early prefix requires peer independent deferred parallel");
+         if (PeerIndependentCutover && (!DeferredRepair || !ParallelPrefixRepair))
+             $fatal(1,"SR73 peer independent requires deferred parallel repair");
+         if ((AdaptiveRepair || DeferredRepair) && !ParallelPrefixRepair)
+@@ -480,6 +491,7 @@
+     end
+     always_ff @(posedge clk_i) if (rst_ni && (AdaptiveRepair || DeferredRepair) && mode_i != 3)
+         $fatal(1,"SR72 bound prototype requires mode3/FA0");
++    final $display("EARLY74-OBS enabled=%0d moved=%0d",EarlyPrefix,early_moved_q);
+     final $display("DEFERRED72-OBS enabled=%0d budget=%0d waited=%0d decided=%0d share=%0d",DeferredRepair,RepairWaitBudget,repair_wait_q,repair_decided_q,repair_shared_active);
+     final $display("SR50 mode=%0d parents=%0d children=%0d merged=%0d logical_lasts=%0d returned_v=%0d returned_a=%0d detached=%0d cut_bytes=%0d offered=%0d busy=%0d skid=%0d",mode_i,parent_count_o,child_count_o,merged_count_o,parent_last_count_o,returned_q[0],returned_q[1],detached_q,detach_cut_bytes_o,offered_q,busy_q,skid_q);
+ final $display("PARALLEL68-OBS enabled=%0d overlap_ars=%0d two_routes_seen=%0d old_v_busy=%0d",ParallelPrefixRepair,parallel_overlap_ars_q,parallel_two_routes_seen_q,old_v_busy_q);
+--- stage73/multi_actual_dma_top.sv
++++ stage74/multi_actual_dma_top.sv
+@@ -48,7 +48,7 @@
+     parameter int unsigned DmaBufferDepth      = 512,
+     parameter int unsigned WriteOutstanding = 1,
+     parameter bit ShareRepairSuffix = 1,
+-    parameter bit AdaptiveRepair = 0, RepairChoiceRule = 0, DeferredRepair = 0, PeerIndependentCutover = 0,
++    parameter bit AdaptiveRepair = 0, RepairChoiceRule = 0, DeferredRepair = 0, PeerIndependentCutover = 0, EarlyPrefix = 0,
+     parameter int unsigned RepairWaitBudget = 64,
+     parameter bit ParallelPrefixRepair = 0,
+     parameter bit ClosureAtBurstEnd          = 0,
+@@ -716,7 +716,7 @@
+                         64'(write_child_quantum[f]) > 64'((4096-int'(i_pre.dst_q[1][11:0]))/8)-start_beat)
+                         write_child_quantum[f] = 9'(64'((4096-int'(i_pre.dst_q[1][11:0]))/8)-start_beat);
+                 end
+-                if (ParallelPrefixRepair && i_pre.cutover_phase_q == 2) begin
++                if (ParallelPrefixRepair && (i_pre.cutover_phase_q == 2 || (EarlyPrefix && i_pre.cutover_phase_q == 1 && i_pre.early_moved_q))) begin
+                     // Own V and A prefixes end at E, possibly an odd tail.
+                     if (i_pre.repair_shared_active ||
+                         (DeferredRepair && f == 1 && i_pre.returned_q[1] < i_pre.old_end_q) || (f == 0 && i_pre.returned_q[0] < i_pre.old_end_q)) begin
+@@ -747,7 +747,7 @@
+             q_write_splitter #(.Q(2), .MaxOutstanding(WriteOutstanding), .req_t(axi_tr2_req_t), .rsp_t(axi_tr2_resp_t),
+                 .aw_t(axi_tr2_aw_chan_t)) i_q (
+                 .clk_i, .rst_ni, .hold_i(!current_write_recipe_valid[f] ||
+-                    (ParallelPrefixRepair && i_pre.cutover_phase_q == 2 &&
++                    (ParallelPrefixRepair && (i_pre.cutover_phase_q == 2 || (EarlyPrefix && i_pre.cutover_phase_q == 1 && i_pre.early_moved_q)) &&
+                      64'(q_next_end[f])*8 > source_returned[f]) ||
+                     ((f==1 ? source_a_hold : (source_v_hold &&
+                      !(i_pre.cutover_phase_q == 1 && q_next_end[f] <= i_pre.v_cut_q))) && 64'(q_next_end[f])*8 > source_returned[f])),
+@@ -1006,7 +1006,7 @@
+     assign dbg_repair_H = i_pre.repair_samples_q;
+     assign dbg_repair_cursor = i_pre.repair_decision_cursor_q;
+     assign dbg_repair_endpoint = i_pre.repair_decision_endpoint_q;
+-    shared_pretl_read #(.ParentDepth(4), .ClosureAtBurstEnd(ClosureAtBurstEnd), .ParallelPrefixRepair(ParallelPrefixRepair), .ShareRepairSuffix(ShareRepairSuffix), .AdaptiveRepair(AdaptiveRepair), .RepairChoiceRule(RepairChoiceRule), .DeferredRepair(DeferredRepair), .PeerIndependentCutover(PeerIndependentCutover), .RepairWaitBudget(RepairWaitBudget), .ar_t(axi_tr4_ar_chan_t), .r_t(axi_tr4_r_chan_t)) i_pre (
++    shared_pretl_read #(.ParentDepth(4), .ClosureAtBurstEnd(ClosureAtBurstEnd), .ParallelPrefixRepair(ParallelPrefixRepair), .ShareRepairSuffix(ShareRepairSuffix), .AdaptiveRepair(AdaptiveRepair), .RepairChoiceRule(RepairChoiceRule), .DeferredRepair(DeferredRepair), .PeerIndependentCutover(PeerIndependentCutover), .EarlyPrefix(EarlyPrefix), .RepairWaitBudget(RepairWaitBudget), .ar_t(axi_tr4_ar_chan_t), .r_t(axi_tr4_r_chan_t)) i_pre (
+         .clk_i, .rst_ni, .pause_i(pause_a_i), .cutover_i(shared_source_cutover_i), .mode_i(physical_bypass_i), .read_quantum_i(shared_read_quantum_i), .keep_q_i(shared_write_keep_q_i),
+         .a_write_quiet_i(q_quiet[1]), .raw_written_i(q_raw_written), .write_recipe_end_i(write_recipe_end),
+         .promised_write_end_i(q_promised_end),
+--- stage73/multi_system_top.sv
++++ stage74/multi_system_top.sv
+@@ -80,7 +80,7 @@
+     parameter int unsigned DmaBufferDepth      = 512,
+     parameter int unsigned WriteOutstanding = 1,
+     parameter bit ShareRepairSuffix = 1,
+-    parameter bit AdaptiveRepair = 0, RepairChoiceRule = 0, DeferredRepair = 0, PeerIndependentCutover = 0,
++    parameter bit AdaptiveRepair = 0, RepairChoiceRule = 0, DeferredRepair = 0, PeerIndependentCutover = 0, EarlyPrefix = 0,
+     parameter int unsigned RepairWaitBudget = 64,
+     parameter bit ParallelPrefixRepair = 0,
+     parameter bit ClosureAtBurstEnd          = 0,
+@@ -1166,7 +1166,7 @@
+         .PolicyEnable        (PolicyEnable),
+         .DmaBufferDepth      (DmaBufferDepth),
+         .ShareRepairSuffix (ShareRepairSuffix),
+-        .AdaptiveRepair(AdaptiveRepair), .RepairChoiceRule(RepairChoiceRule), .DeferredRepair(DeferredRepair), .PeerIndependentCutover(PeerIndependentCutover), .RepairWaitBudget(RepairWaitBudget),
++        .AdaptiveRepair(AdaptiveRepair), .RepairChoiceRule(RepairChoiceRule), .DeferredRepair(DeferredRepair), .PeerIndependentCutover(PeerIndependentCutover), .EarlyPrefix(EarlyPrefix), .RepairWaitBudget(RepairWaitBudget),
+         .ParallelPrefixRepair (ParallelPrefixRepair),
+         .WriteOutstanding   (WriteOutstanding),
+         .ClosureAtBurstEnd   (ClosureAtBurstEnd),

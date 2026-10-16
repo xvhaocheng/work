@@ -1,0 +1,1913 @@
+                                Designing Virtual Memory System of MCM GPUs
+
+
+                     Pratheek B*                        Neha Jawalkar*                        Arkaprava Basu
+              Indian Institute of Science          Indian Institute of Science           Indian Institute of Science
+                   Bangalore, India                     Bangalore, India                      Bangalore, India
+                 pratheekb@iisc.ac.in                 jawalkarp@iisc.ac.in                 arkapravab@iisc.ac.in
+
+
+
+   Abstract— Multi-Chip Module (MCM) designs have emerged         all embrace the MCM design to meet ever-growing compute
+as a key technique to scale up a GPU’s compute capabilities       needs in the era of slowing transistor scaling [22], [43], [56].
+in the face of slowing transistor technology. However, the dis-   Further, broader industry support toward a common chiplet
+aggregated nature of MCM GPUs with many chiplets connected
+via in-package interconnects leads to non-uniformity.             interconnect (UCIe) will likely make MCM-based processors
+   We explore the implications of MCM’s non-uniformity on the     commonplace in the near future [6], [25], [57].
+GPU’s virtual memory. We quantitatively demonstrate that an          MCM designs, however, present new design challenges due
+MCM-aware virtual memory system should aim to 1 leverage          to the non-uniformity in accessing resources across chiplets.
+aggregate TLB capacity across chiplets while limiting accesses    To an application, an MCM GPU may appear as a logically
+to L2 TLB on remote chiplets, 2 reduce accesses to page table
+entries resident on a remote chiplet’s memory during page         unified monolithic GPU. However, its physical resources are
+walks. We propose MCM-aware GPU virtual memory (MGvm)             distributed across the chiplets. For example, each chiplet
+that leverages static analysis techniques, previously used for    has its own memory hierarchy, including a slice of High-
+thread and data placement, to map virtual addresses to chiplets   Bandwidth Memory or GDDR (HBM). Threads executing on
+and to place the page tables. At runtime, MGvm balances its       a chiplet may need to access data residing on another chiplet’s
+objective of limiting the number of remote L2 TLB lookups
+with that of reducing the number of remote page table accesses    HBM. The remote memory access is slower than accessing
+to achieve good speedups (52%, on average) across diverse         data residing on the memory of its own chiplet. The remote
+application behaviors.                                            accesses need to cross the inter-chiplet interconnect twice.
+  Keywords-Graphics Processing Units, Multi-Chip Module,          While inter-chiplet bandwidth is often adequate, traveling to
+Chiplet, Virtual Memory, Address Translation, Page Table          another chiplet can add ∼ 32 ns, one-way [7].
+Walkers, Translation Look-aside Buffers                              Several recent works have researched ways to limit the
+                                                                  overheads of remote data access in MCM GPUs [7], [31],
+                         I. I NTRODUCTION                         [32], [51]. These works explored the scheduling of GPU
+   The slowing of transistor scaling makes it hard to build       threads and placement of data for co-locating threads, and the
+larger monolithic single-chip processors [29], [37]. At the       data those threads access, onto the same chiplet. For example,
+same time, the need to increase compute capabilities of           a recent work by Khairy et al. showed that static analysis
+processors has never been higher. The industry is increasingly    of GPU kernel yields a handful of patterns that capture the
+adopting multi-chip-module (MCM) designs to cope with             relation between the groups of threads (called Cooperative
+these twin challenges [2], [5], [6], [22], [25], [56], [58].      Thread Array or CTA) and the data they access [31].
+   MCM designs embrace a disintegrated design where a pro-        The authors then propose Locality-Aware Scheduling and
+cessor package contains multiple smaller chiplets, with each      Placement (LASP) that leverages these patterns to schedule
+chiplet housing only a fraction of the resources compared to      CTAs and place data pages on the same chiplet [31].
+a traditional monolithic SoC. Fabricating individual chiplets        However, no prior work has explored the impact of MCM’s
+is easier and cheaper since it needs only a fraction of the       non-uniformity on the GPU’s virtual memory. We find that
+transistors that a larger monolithic design would otherwise       even when the data accesses are local, address translations
+contain. These chiplets are then connected through a fast,        may need to access resources on a remote chiplet, limiting
+high-bandwidth in-package interconnect to scale up to the         the benefits of local data access.
+computational needs of modern software. MCM designs are              We start by exploring the obvious design choices for the
+thus also called chiplet-based processor designs.                 virtual memory in an MCM GPU. In one design, the L2
+   AMD’s Epyc and Ryzen CPU families were the first com-          TLB and the page table walkers (PTWs) could be private to
+mercial products to adopt an MCM design [2]. MCM designs          a chiplet. The L2 TLB and the PTWs serve requests only
+are now making their way to commercial GPUs (Graphics             from their own chiplet. Alternatively, in a shared design,
+Processing Units). For example, NVIDIA’s upcoming Grace,          the L2 TLBs and PTWs of all chiplets are logically shared.
+AMD’s Aldebaran MI200, and Intel’s Ponte Vecchio GPUs,            On an L1 TLB miss, the virtual address of the missing
+* Both authors contributed equally.
+                                                                  translation is hashed to one of the chiplet’s L2 TLB (also
+called ‘home’ L2 TLB ‘slice’) that should serve the L1 miss.       accesses. If data access is local, then MGvm aims to ensure
+On a miss in the L2 TLB slice, chiplet’s local PTWs service        the corresponding address translation request is local too.
+the request by walking the in-memory page table.                      In a conventional design, the virtual address (VA) of an
+   We find that MCM’s inherent non-uniformity affects the          L1 TLB miss is hashed to determine the chiplet’s L2 TLB
+virtual memory in two ways. First, a hit in the L2 TLB slice       slice (and thus, PTWs) should service the request. We call
+of another chiplet (i.e., remote L2 TLB hit) is slower than        the hash function the home slice selection function (HSL).
+a hit in the chiplet’s local L2 TLB slice. This affects only       For private TLB, the HSL maps all VAs to the local L2
+the shared TLB design since all hits are local in a private        TLB slice, while in shared TLB, typically, an XOR or MOD
+TLB. However, a shared TLB can leverage the aggregate L2           of the VA determines its ‘home’ L2 TLB slice. In contrast,
+capacity across chiplets, unlike a private TLB.                    MGvm employs a dynamic HSL (dHSL) where the function
+   Interestingly, MCM designs can significantly affect the         is determined for each kernel. During a kernel’s launch, the
+page walk subsystem. When a PTW walks the in-memory                static analysis in LASP that determines its CTA scheduling
+page tables on an L2 TLB miss, it may have to access page          and data placement to reduce remote memory access also
+table entries (PTEs) residing on the memory of another chiplet     determines the dHSL in MGvm. Thus, if a data access is
+(i.e., remote memory access). A page walk may require up           local, the corresponding L2 TLB access is also local. Since
+to four memory accesses for typical four-level radix-tree          dHSL maps a given VA to only one L2 TLB slice, it does not
+page tables. Each of those can be a remote memory access,          waste aggregate L2 TLB capacity due to duplication either.
+incurring the additional latency of crossing the inter-chiplet        Next, we observe that remote accesses to PTEs are avoided
+interconnect twice. Thus, page table walks can significantly       if a page containing PTEs is placed on the same chiplet whose
+slow down due to remote accesses to PTEs.                          L2 TLB slice (and thus, PTWs) are responsible for servicing
+   We quantitatively analyze how these factors affect the          the VA range mapped by PTEs residing on that page. The
+design choices in an MCM GPU’s virtual memory. We find             GPU driver, therefore, uses the dHSL to decide where to
+that no single design point works well for all applications.       place a page with leaf-level PTEs. We focus on placing
+Some applications perform better with private TLB thanks           leaf-level PTEs as upper-level PTEs are often well-cached
+to faster local L2 TLB hits. Others prefer shared TLB due          in page walk caches. A challenge, however, is that a page
+to lower L2 TLB miss rates, thanks to larger aggregate TLB         (4KB) typically holds 512 8-byte long PTEs, mapping 2MB
+capacity. We quantitatively find that several applications could   of contiguous VA region. Thus, to avoid remote accesses to
+speed up if remote L2 TLB hits were instead local hits.            leaf-level PTE, the dHSL must map (multiples of) a 2MB
+   We also notice that if an application does not speed up with    VA region to a chiplet.
+shared TLB design over private TLB, it does not necessarily           We also observe that in a few applications, a relatively
+mean that the application has no use of the aggregate TLB          small VA range (< 2MB) is concurrently accessed from
+capacity. In regular GPU applications, it is common for            several chiplets. The coarse grain mapping of VAs by dHSL
+CTAs to compute on mutually exclusive portions of the              can lead to flooding of one of the L2 TLB slices with requests
+dataset. If the CTAs and the data they access are mapped           while others remain lightly loaded. We extend the GPU
+onto the same chiplet, then the aggregate L2 TLB capacity          hardware to detect such imbalance at runtime and switch to
+of the chiplets is well-utilized even with private TLB since       finer-grain (4KB) mapping of VA amongst the chiplets to
+there is no duplication of entries across the L2 TLB slices.       distribute L2 TLB traffic better.
+Therefore, CTA scheduling and data placement are important            In an evaluation with 15 workloads on a GPU with four
+considerations for L2 TLB utilization.                             chiplets, MGvm improves performance over private and
+   We find that the slower walks due to remote accesses to         shared TLB designs by 52% and 30%, on average, respec-
+PTEs cause significant performance degradation under both          tively. In summary, we make the following contributions.
+private and shared TLB for several applications. Slower walks      • We, for the first time, quantitatively analyze and explore
+make servicing each L2 TLB miss significantly costlier and         design choices for the virtual memory in MCM GPUs.
+keep the walkers occupied for longer. This, in turn, increases     • We propose MCM-aware GPU virtual memory that
+the queuing at the PTWs and TLBs.                                  achieves a balance between using aggregate L2 TLB capacity,
+   Driven by the analysis, we propose MCM-aware GPU                local L2 TLB accesses, and local PTE accesses on page walk.
+virtual memory (MGvm) with the following goals. 1
+Leverage the aggregate L2 TLB capacity across the chiplets,                  II. BACKGROUND AND R ELATED WORK
+ 2 Render remote L2 TLB hits to local hits, and 3 Reduce              Processor vendors have been building ever-larger GPUs to
+remote memory accesses to PTEs during page table walks.            cater to the growing computing needs of today’s data-driven
+   MGvm proposes three enhancements for the purpose.               world. However, with a GPU’s die area already reaching
+First, it extends LASP [31]’s static analysis used for CTA         800mm2 [41] and the decreasing yield due to shrinking
+scheduling and data page placement for better aggregate            transistor sizes, it is economically unviable to continue to
+use of L2 TLB capacity while limiting remote L2 TLB                build larger dies [63].
+                                                                                                               followed by a set of parallel page table walkers (PTWs), also
+               RMA RTU
+
+
+
+
+                                        RMA RTU
+                                                                                  Compute Unit
+
+
+
+
+                                                            RTU
+     Chiplet
+       1
+                                                  Chiplet
+                                                    3
+                                                                     L1 TLB
+                                                                               Scheduler
+                                                                                                               shared among the CUs. Typical 4-level radix-tree page tables
+                                                                                                               resident on HBM(s), hold the virtual-to-physical address
+                         Interconnect
+                                                                           L1 cache      SIMD
+                                                                                          SIMD
+                                                                                           SIMD
+                                                                                                               translation [42]. On a load/store, the associated L1 TLB of
+
+
+
+
+                                                                                             L2 Cache
+                                                                  L2 TLB        Page                           the CU is looked up. On a miss, the L2 TLB is looked up.
+               RMA RTU
+
+
+
+
+                                        RMA RTU
+
+
+
+
+                                                                                                        DRAM
+     Chiplet                                      Chiplet                      Walkers
+
+
+
+
+                                                            RMA
+       2                                            4                                                             On an L2 TLB miss, a PTW walks the page tables to obtain
+                                                                                                               the desired translation. A page walk cache (PWC) helps speed
+               Figure 1: Architecture of an MCM GPU                                                            up page table walks by caching the higher levels (levels 1-3)
+                                                                                                               of the page tables [11]. It performs a longest-prefix match
+   Processor vendors are thus increasingly adopting MCM                                                        on the virtual page number (VPN) to be translated. Based
+designs for both CPUs and GPUs [2], [22], [44], [56]. An                                                       on the length of a prefix match, 1-4 memory accesses are
+MCM-based processor comprises multiple smaller dies or                                                         required for a walk. In our design, page table entries are also
+chiplets glued together with fast in-package interconnects.                                                    cached in the L2 cache along with data.
+Each chiplet houses only a fraction of the resources of a                                                         While L1 TLBs are private to each CU, the L2 TLBs,
+large monolithic die. Thus, each chiplet has a much smaller                                                    PTWs, and PWCs of chiplets can either be logically shared
+die size, with a higher likelihood of getting a working chiplet.                                               or remain private to their chiplet. In the next section, we
+The aggregate computing capability of all chiplets is typically                                                will quantitatively discuss the implications of these designs.
+similar to or more than a large monolithic chip. Chiplets                                                         In our design, address translation requests that need to
+are connected with each other with high bandwidth, low                                                         travel to another chiplet are routed through per-chiplet
+latency (e.g., 768 GB/sec, 32ns [8]) in-package interconnects.                                                 Remote Translation Units (RTUs). Data accesses to other
+The chiplets work together as a single logical unit and may                                                    chiplets are similarly routed through Remote Memory Access
+present themselves as a single GPU to the programmer.                                                          (RMA) Units (Figure 1). RTUs and RMAs are connected
+   However, MCM designs introduce non-uniformity. Access-                                                      to each other via a high-speed in-package interconnect that
+ing resources on a remote chiplet is slower than accessing                                                     provides 32ns latency from any chiplet to any other [7].
+resources on a local chiplet. Thus, the key challenge is to                                                       The GPU driver decides the allocation of CTAs to chiplets.
+leverage this non-uniformity. We, for the first time, explore                                                  It is also responsible for placing the pages containing data
+the impact of non-uniformity on a GPU’s virtual memory.                                                        or PTEs across chiplets’ memory.
+GPU architecture: Figure 1 shows a typical 4-chiplet MCM                                                       CTA scheduling and data placement in MCM GPUs:
+GPU, with the components of a single chiplet shown in detail.                                                  Remote memory accesses, from a CTA executing on one
+Each chiplet in an MCM GPU houses the typical compute                                                          chiplet, to memory on another chiplet, incurs additional
+and memory of a monolithic GPU, but in smaller portions.                                                       latency compared to local memory accesses (to the same
+A chiplet contains several Compute Units (CUs), a.k.a, SMs                                                     chiplet). Prior works have explored ways to reduce the
+in NVIDIA’s terminology. Each CU is composed of several                                                        number of slower remote memory accesses by coordinating
+SIMD units. SIMD units in a CU share an L1 cache and an                                                        CTA scheduling amongst chiplets with the placement of data
+L1 TLB. The SIMD units of a CU typically execute a group                                                       pages across chiplets [7], [31].
+of 32-64 threads in lockstep. A hardware coalescer combines                                                       Arunkumnar et al. pioneered the work on optimizing
+memory accesses that fall on the same cache line before                                                        data locality for CTAs in MCMs GPUs [7]. They distribute
+looking up the L1 cache. A programmer is required to divide                                                    contiguous groups of CTA to chiplets with the assumption
+the grid of threads executing their kernel (GPU program)                                                       that neighboring CTAs are likely to access similar regions
+into Cooperative Thread Arrays (CTAs), a.k.a, workgroups                                                       of data. They propose a first-touch policy for data placement
+or threadblocks. A CTA can contain up to 1024 threads, and                                                     whereby a page is placed on the chiplet from where it is first
+a given CTA executes entirely on a single CU. A GPU kernel                                                     accessed. Unfortunately, the first touch policy relies on GPU
+(program) is launched for execution with many such CTAs.                                                       page faults, which are at least an order of magnitude slower
+   Each chiplet has a highly banked L2 cache shared by all                                                     than CPU page faults at 20-50 microseconds [62], [68].
+the CUs in the chiplet. Each chiplet also hosts a stack of                                                        Researchers also enabled software to explicitly express data
+HBM or GDDR [3]. It is typical for MCM GPUs to logically                                                       locality to be exploited by the hardware [59], [65]. While a
+share the L2 cache and HBM across chiplets to aggregate                                                        promising approach, it is not always possible for programmers
+the on-board cache and memory capacity [7], [31]. Thus,                                                        to capture data locality in their program correctly and modify
+threads executing on a CU have access to the L2 cache and                                                      their program to communicate the same.
+memory on all chiplets. However, accesses to L2 caches or                                                         Recent works propose to use compile-time static analysis of
+HBMs on a remote chiplet are slower than accesses to the                                                       kernels to infer data access patterns and their relation to CTAs
+local L2 cache or HBM.                                                                                         for coordinating CTA scheduling and data placement [31],
+   Each CU has a private L1 TLB. A larger L2 TLB is                                                            [32]. Inferring data access patterns through static analysis is
+shared across all the CUs of the chiplet. The L2 TLB is                                                        plausible for GPU kernels as all memory is allocated before
+        CU                                          CU          CU         HBM                HBM          CU          CU       HBM                      HBM      CU
+                  HBM                     HBM
+
+
+
+
+                                                                                                                                                 RTU
+      L1 TLB                                      L1 TLB      L1 TLB                                     L1 TLB      L1 TLB                                     L1 TLB
+                                                                                                                                                         L2 $
+          1       L2 $                    L2 $                             L2 $                L2 $                      2      L2 $
+
+
+
+
+                              RTU
+
+                                    RTU
+
+
+
+
+                                                                                  RTU
+
+                                                                                        RTU
+
+
+
+
+                                                                                                                                           RTU
+      L2 TLB                                      L2 TLB     L2 TLB                                      L2 TLB      L2 TLB                                     L2 TLB +
+
+
+
+
+                                                                                                                                                 RMA
+       slice                                       slice      slice    1                                  slice       slice                                     walkers
+          2      3a                                                                                          2           3       4
+
+
+
+                              RMA
+
+                                    RMA
+
+
+
+
+                                                                                  RMA
+
+                                                                                        RMA
+
+
+
+
+                                                                                                                                           RMA
+     Walkers +           3b                      Walkers +   Walkers                               3a   Walkers +   Walkers +          1
+                                                                                              3b                                                       Driver
+      PWC                                         PWC        + PWC                                       PWC         PWC
+
+                 (a) Private L2 TLB                                    (b) Shared L2 TLB                                     (c) Our proposal: MGvm
+      Figure 2: TLB lookup and page table walk under various configurations. Dotted lines show less common paths
+
+ a kernel starts execution, and threads are often arranged in                             chiplet has an L2 TLB, which may be configured primarily
+ CTAs to facilitate parallel access to data.                                              in two ways. The L2 TLB on a chiplet may cache only the
+    Khairy et al. [31] use static index-analysis of GPU kernels                           address translations requested by CUs on the same chiplet
+ to minimize remote memory accesses. In their work, LASP                                  (private TLB). Alternatively, the L2 TLBs can be part of a
+(Locality Aware Scheduling and Placement), GPU kernels are                                logically shared TLB across the entire GPU (shared TLB).
+ classified according to their data access patterns. LASP then                            We refer to the L2 TLB on a chiplet as an L2 TLB slice.
+ schedules CTAs to chiplets and tries to place the data pages                             Figures 2a and 2b pictorially illustrate the private TLB and
+ those CTAs will access on the same chiplet, to maximize                                  shared TLB designs.
+ local memory accesses.                                                                      In a private TLB design (Figure 2a), all L2 TLB accesses
+    LASP classifies kernels into four classes using static                                occur locally at the L2 TLB slice of the CU where the request
+ analysis. In kernels such as Jacobi-1D, CTAs access over-                                originated 1 . On an L2 TLB miss, page table walkers (PTWs)
+whelmingly mutually exclusive data regions. LASP partitions                               on the same chiplet service the walk request 2 . In the shared
+ the data across different chiplets’ memory, and the CTAs that                            TLB design (Figure 2b), on an L1 TLB miss, an address
+ exclusively access them are scheduled on the same chiplets.                              translation request is routed to one of the L2 TLB slices
+Thus, data accesses remain local. Such kernels are classified                             (‘home’) based on the hash of the missing virtual address 1 .
+‘no locality’ (NL) since there is no locality (sharing) across                            We call this hash function the Home Slice Selection function
+ CTAs. The kernels where a set of neighboring CTAs access                                 (HSL). Under shared TLB, translations in the L2 TLB are
+ contiguous sets of rows (columns) of a matrix are classified                             cached only in the home slice. On an L2 TLB miss, the
+‘RCL’ (row-column locality). Here, LASP stripes CTAs and                                  PTWs of the home slice perform the page walk 2 . We
+ data across rows (columns) amongst the chiplets to limit                                 refer to the L2 TLB requests that travel to another chiplet
+ remote memory accesses. For example, in SYRK, CTAs                                       as remote requests. Remote requests are slower than local
+ along the y-axis of the kernel grid access consecutive rows                              requests, as they incur additional interconnect latency. While
+ of the input matrix. Thus, CTAs are divided along the y-axis                             the private TLB does not incur remote requests, it may not
+ of the grid, and the data is distributed row-wise.                                       necessarily leverage the aggregate capacity of the L2 TLB
+    The kernels in ITL (intra-thread locality) category demon-                            slices of all chiplets.
+ strate access locality within each thread, but there is a little                            The non-uniformity of MCM design uniquely affects page
+ discernible pattern across CTAs. Finally, kernels whose access                           table walks. A PTW can perform up to four memory accesses
+ patterns do not fit any of the patterns are termed ‘unclassified’.                       (assuming a four-level page table) based on hits/misses in the
+The set of CTAs and data pages are divided equally, and                                   page walk caches. The GPU driver populates the PTEs and
+ contiguous blocks of CTAs and data pages are distributed                                 can place the pages containing PTEs in any chiplet’s memory.
+ evenly across chiplets.                                                                  A page walk may access PTEs residing on a remote chiplet’s
+    Our baseline design uses LASP’s CTA scheduling and data                               memory, incurring extra latency. Page walks can incur remote
+ placement. We independently found LASP to be effective                                   memory access in both private TLB and shared TLB ( 3b in
+ in reducing remote data accesses – it reduced remote data                                Figures Figures 2a and 2b). Walks that access local memory
+ accesses from 67% to 18%, on average, over round-robin                                   are faster ( 3a ). The fraction of remote memory accesses to
+ CTA scheduling and data placement. Khairy et al. further                                 PTEs is a key factor in determining the latency experienced
+ proposed controlled caching of data from remote chiplets in                              on page walks in an MCM design. Further, slower walks
+ the L2 cache. However, it complicates cache coherence. We                                can stall the L2 TLB by occupying MSHR entries at the L2
+ do not incorporate it in our baseline as it does not directly                            TLB for longer. On an MSHR stall, no new TLB misses
+ impact the virtual memory.                                                               can be served, ultimately putting back pressure on the entire
+                                                                                          address translation system.
+    III. MCM’ S IMPACT ON GPU V IRTUAL M EMORY                                               We quantitatively analyze these effects on an MCM GPU’s
+  We study the impact of MCM’s non-uniformity on the                                      virtual memory. We first detail the baseline design. We follow
+GPU’s virtual memory subsystem. First, the non-uniformity                                 Khairy et al.’s LASP for CTA scheduling and data placement
+can affect the L2 TLB lookups in an MCM GPU. Each                                         [31]. However, their proposal is silent on how the pages
+                                                                                                         Private TLB            Shared TLB       5.1                     2.7          2.0    2.2
+containing PTEs are placed. A naive policy would be to
+
+
+
+
+                                                                   Throughput (normalized
+                                                                                                 1.5
+spread the pages with PTEs uniformly across chiplets in a
+
+
+
+
+                                                                       to Private TLB)
+                                                                                                 1.0
+round-robin fashion. However, this leads to many remote                                          0.5
+memory accesses on page walks. Instead, in our baseline, the
+                                                                                                 0.0
+PTE placement follows the data placement policy. Memory
+
+
+
+
+                                                                                                                                                MIS
+
+
+
+
+                                                                                                                                                                                     SYRK
+                                                                                                        C2D
+
+
+
+
+                                                                                                                          J1D
+                                                                                                                                J2D
+
+
+
+
+                                                                                                                                                                               S2D
+                                                                                                                                                       PR
+                                                                                                                                                            SC
+                                                                                                                   GUPS
+                                                                                                              FW
+
+
+
+
+                                                                                                                                      KM
+                                                                                                                                           MT
+
+
+
+
+                                                                                                                                                                        SPMV
+
+
+
+
+                                                                                                                                                                                            SYR2K
+
+
+                                                                                                                                                                                                    Gmean
+                                                                                                                                                                 RED
+can be allocated amongst chiplets by the driver at the
+granularity of a page (default, 4KB) or its multiples. A
+                                                                       Figure 3: Throughput normalized to Private TLB design.
+single 4KB page contains 512 8-byte PTEs [42]. Thus, a
+                                                                                                 4.0
+single page with leaf-level PTEs contains translations for                                                                                 Local Hit    Remote Hit         PW Local          PW Remote
+
+
+
+
+                                                                   (normalized to Private TLB)
+                                                                                                 3.5
+2MB of contiguous virtual address region. We place a page                                        3.0
+
+
+
+
+                                                                       L1 TLB Miss Cycles
+                                                                                                 2.5
+containing leaf-level PTEs on the chiplet where any data                                         2.0
+page from the corresponding 2MB VA region is first placed.                                       1.5
+                                                                                                 1.0
+   The above-mentioned policy for PTE placement is also the
+                                                                                                 0.5
+same strategy used by Linux in placing pages with PTEs in                                        0.0
+
+
+
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+
+                                                                                                        Private
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+
+                                                                                                        Shared
+multi-socket NUMA machines [1]. Pages containing upper-
+level PTEs follow the same principle, although each higher
+                                                                                                         C2D FW GUPS J1D J2D               KM   MT MIS      PR     SC     RED SPMV S2D SYRK SYR2
+level covers 512 times more contiguous VA region. We
+empirically found that this policy reduced the fraction of                                             Figure 4: Breakdown of L1 TLB miss latency
+remote memory accesses on page walks by 64%, on average,
+over the naive approach of uniformly distributing PTEs.            there is little duplication of entries across L2 TLB slices of
+Private versus shared TLB design: We start our quantitative        individual chiplets.
+analysis by exploring whether the private TLB or shared TLB        Effects of non-uniformity on virtual memory: We now
+design is preferable. For the analysis, we choose applications     take a deeper look at the effect of the non-uniformity of
+that can utilize at least four chiplets. Section VI-A details      MCM on a GPU’s virtual memory. The address translation
+the methodology, including the applications evaluated. The         requests that hit the L1 TLB are not affected by MCM’s
+applications cover diverse behavior, including those that stress   non-uniformity since L1 TLBs are private to each CU. In
+the virtual memory and those that do not.                          shared TLB, an L1 TLB miss may require a remote L2 TLB
+   Figure 3 shows the throughput of applications under the         lookup if the HSL maps the virtual address onto a remote
+private TLB and shared TLB designs (normalized to private          chiplet. In the case of private TLB, though, only the local
+TLB for each application). We notice that neither private          L2 TLB slice is accessed. However, a page walk may need
+TLB nor shared TLB always performs better than the other.          to access PTEs resident on a remote chiplet’s memory. Thus,
+   The advantage of shared TLB is its use of aggregate             page table walks in both the designs can suffer from the
+L2 TLB capacity. Several applications, e.g., MIS, SPMV,            non-uniformity of the MCM design.
+and SYRK, benefit from larger TLB capacity. Table III                 To quantify the contributions of these factors on both the
+confirms the same. It reports the number of L2 TLB misses          private TLB and shared TLB designs, we break down the
+per thousand SIMD instructions (MPKI). We observe that             total L1 TLB miss latency cycles into four parts. 1 L2 TLB
+kernels of applications such as SPMV (sparse matrix-vector         local hit cycles (Local hit). These cycles account for L1
+multiplication) suffer very high MPKI. The larger aggregate        TLB misses that hit in the L2 TLB of the same chiplet. 2
+capacity of shared TLB significantly lowers the MPKI.              L2 TLB remote hit cycles (Remote hit). These account
+   In contrast, applications like page rank (PR) have signifi-     for L2 TLB hits on a remote chiplet. These cycles are absent
+cant MPKI but shared TLB does not reduce L2 TLB misses             in private TLB. 3 Local page walk cycles (PW local).
+significantly. The irregular memory access pattern of the          These are L2 TLB miss cycles spent by a walker to access
+graph application, coupled with its larger memory footprint        PTEs resident on the same chiplet as the walker. 4 Remote
+that overflows even the aggregate L2 TLB capacity, is to           page walk cycles (PW remote). These are the L2 TLB
+blame. While PR is unable to leverage aggregate capacity,          miss cycles a walker spends accessing PTEs that reside on
+it suffers from increased remote TLB accesses in the shared        a different chiplet from the walker. Figure 4 shows stacked
+TLB design. Applications such as Stencil2D (S2D) also              (vertical) bars of the above breakdown of the L1 TLB miss
+fail to benefit from the aggregate capacity. The CTAs in           latency for each application under the private TLB and shared
+the kernel access data that can be well-partitioned. LASP’s        TLB designs. Consequently, each application has two stacked
+data placement and CTA scheduling policy leverage this to          bars. The height of each stack is normalized to the L2 TLB
+ensure that CTAs access data placed on their local chiplet.        miss cycles under private TLB for a given application.
+Consequently, an L2 TLB entry is typically looked up only             Several applications, e.g., C2D, J2D, and SC, spend
+by the CTAs executing on the same chiplet. Thus, private           a significant amount of cycles in ‘L2 TLB remote hit’
+TLB does not lose capacity relative to a shared TLB as             under shared TLB. The address translation overhead of
+                                Local   Remote                                                          in shared TLB, is important. 3 However, applications such
+                        1.0
+Fraction of PW Access
+
+
+
+
+                        0.8                                                                             as J2D slow down due to remote L2 TLB lookups in shared
+                        0.6                                                                             TLB design. 4 Importantly, remote memory accesses on
+                        0.4
+                                                                                                        page walks significantly affect both private TLB and shared
+                        0.2
+                        0.0
+                                                                                                        TLB designs; more so in the latter.
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+
+                              Private
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+
+                              Shared
+                                                                                                                   IV. G OALS AND K EY DESIGN IDEAS
+                              C2D FW GUPS J1D    J2D   KM   MT MIS   PR   SC   RED SPMV S2D SYRK SYR2
+                                                                                                           Driven by the quantitative analysis, we set out to design a
+Figure 5: Split of page walk accesses into remote and local                                             virtual memory system for MCM GPUs with the following
+                                                                                                        three goals. 1 Leverage the aggregate capacity of the L2
+these applications would reduce if these remote hits could                                              TLB slices across chiplets when needed, 2 Limit accesses to
+be converted to local hits. This also explains why these                                                remote L2 TLB slices, and 3 Limit remote memory accesses
+applications perform better with private TLB, particularly                                              due to page table walks.
+since the aggregate L2 capacity with shared TLB does not                                                   Toward these, we enhance GPU’s virtual memory in three
+reduce MPKIs (Table III). Next, we observe that applications                                            ways. First, we dynamically change the HSL at the time of
+such as J1D, J2D, PR, and S2D suffer under shared TLB                                                   each kernel launch, guided by LASP’s placement of data
+due to remote memory accesses during page walks.                                                        pages. We call this optimization dynamic HSL (dHSL). Recall
+   For a deeper analysis, we report the fraction of memory                                              that the HSL decides the home L2 TLB slice responsible
+accesses due to page walks that are local versus those that                                             for serving a given virtual address. For example, suppose
+are remote in Figure 5. We observe that under shared TLB,                                               LASP finds that the CTAs of a kernel mostly access non-
+often a more significant fraction of memory accesses due to                                             overlapping address regions (data), i.e., classified as NL. In
+page walks end up on a remote chiplet compared to private                                               that case, LASP schedules the CTAs and the data pages it
+TLB. This is expected in hindsight. LASP is often able to                                               would access on the same chiplet. We leverage the same
+schedule CTAs and place the data pages those CTAs access                                                insight gathered by LASP to ensure that the HSL maps the
+on the same chiplet. LASP, coupled with our baseline’s PTE                                              corresponding virtual address regions onto the same chiplet.
+placement policy, ensures that PTEs corresponding to the                                                Consequently, kernels enjoy local L2 TLB accesses (hits) as
+data are also likely to be placed on the same chiplet.                                                  in a private TLB. In contrast, if the LASP decides to stripe
+   For example, suppose that CTAs executing on chiplet 1                                                data across chiplets, for example, when it encounters a kernel
+mostly access data on the same chiplet. The corresponding                                               with ITL or is unclassified (Section II), the HSL would also
+PTEs are also likely to be placed on chiplet 1. Under private                                           accordingly map the virtual address ranges across chiplets.
+TLB, the L2 TLB slice on the same chiplet (chiplet 1)                                                      This approach of LASP-guided HSL addresses the first
+services address translation requests from the CTAs, and                                                two goals leveraging the aggregate capacity of the TLB slices
+thus, the PTWs on chiplet 1 will perform page walks on L2                                               and limiting remote TLB accesses. Notice that private TLB
+TLB misses. Since most PTEs corresponding to the virtual                                                sacrifices capacity vis-a-vis shared TLB as it allows duplicate
+addresses of that data would also reside on the chiplet 1,                                              entries across L2 TLB slices of chiplets. However, dHSL
+page walks will mostly look up the local memory. In contrast,                                           maps a given virtual address onto a single L2 TLB slice only.
+under shared TLB, the virtual addresses can map onto the                                                When LASP decides to spread the data across chiplets, dHSL
+L2 TLB slice of any of the chiplets (say, chiplet 2) as per                                             will also leverage the aggregate capacity of all chiplets’ L2
+the HSL. If there is a miss on the remote L2 TLB slice,                                                 TLB slices. At the same time, by ensuring L2 TLB slices
+that chiplet’s walkers would have to access PTEs resident                                               are responsible for servicing translation requests from CTAs
+on chiplet 1, inducing remote accesses.                                                                 on the same chiplet wherever possible, LASP-guided HSL
+   We also observe that a few applications incur many remote                                            minimizes remote L2 TLB accesses.
+PTE accesses (a.k.a., remote page walk) even under private                                                 Next, we focus on limiting remote memory accesses during
+TLB. For example, in MT, the input matrix is accessed                                                   page walks (a.k.a. remote page walks). Recall that the HSL
+row-wise, while the output matrix is accessed column-wise.                                              maps a virtual address to a home chiplet. The PTWs on the
+Accesses to the output matrix are largely remote. Since                                                 home chiplet are responsible for translating virtual address
+the baseline places page tables along with the data, the                                                regions mapped onto it by the HSL. The pages containing
+corresponding page table accesses also tend to be remote.                                               the PTEs corresponding to those address regions are placed
+Similarly, for SPMV, all the elements of a vector are accessed                                          on the home chiplet’s memory to limit remote page walks.
+by all the CTAs. Thus, some amount of remote data accesses                                              We focus on placing PTEs from the leaf level of the page
+and thus, corresponding remote page walks are unavoidable.                                              table since PWCs often filter out the accesses to the upper
+Summary: 1 Neither private TLB nor shared TLB suits                                                     levels of the page table.
+all applications. 2 For several applications, e.g., SPMV,                                                  It is evident from the above discussion that the HSL and the
+harnessing the aggregate L2 TLB capacity across chiplets, as                                            PTE placement strategy must work together to limit remote
+page walks. However, notice that HSL can map VA ranges          configure the HSL in the hardware that determines which
+at the minimum granularity of a page, here, 4KB. Further, a     chiplet’s L2 TLB (and, thus, page walkers) are responsible
+single 4KB page with PTEs contains 512 PTEs. Thus, a page       for translating a given virtual address. The static analysis is
+containing leaf-level PTEs covers the address translation for   performed once per kernel, exactly as in LASP [31]. While
+a 2MB of the contiguous virtual address range. Therefore,       LASP uses it for data page placement, MGvm uses it for
+to ensure synergy between HSL and PTE placement, we             deciding the HSL. 2 At a kernel launch, the pages with
+enhance the dHSL to map virtual addresses at a coarser          page tables are placed as per the HSL chosen in the previous
+granularity of 2MB across L2 TLB slices of chiplets (named      step. The CTAs are scheduled on the chiplet where their data
+dHSL-coarse). At a kernel launch, the GPU driver consults       resides, as in LASP. 3 During the execution of a kernel, the
+dHSL-coarse to find the home chiplet for a given 2MB VA         enhanced GPU hardware monitors possible imbalance in the
+range. It then places the 4KB page containing the leaf-level    L2 traffic. On encountering severe imbalance, the hardware
+PTEs for that 2MB region on that home chiplet’s memory.         employs dHSL-balance whereby the HSL falls back to fine-
+   The enhancements mentioned above work well for most          grain interleaving of virtual addresses across L2 TLB slices.
+applications but not for all. There are kernels where nearly    Figure 2c depicts the operation of dHSL and dHSL-coarse,
+every CTAs from all chiplets concurrently access a relatively   and figure 6 shows the switching logic for dHSL-balance.
+small VA range (< 2MB). Since dHSL-coarse maps at                  Now, we describe the actions that happen upon a kernel
+least 2MB of VA range onto one L2 TLB slice, address            launch and during the kernel’s execution.
+translation requests for those small but frequently accessed    Upon a kernel launch: MGvm’s first task is to decide
+data structures, queue up at a single TLB slice. This queuing   the HSL function guided by LASP’s data placement. An
+overwhelms the L2 TLB slice’s resources, including the ports    application may have multiple kernels, and MGvm can set
+and MSHRs on one chiplet, while the other L2 TLB slices         a different HSL function for each kernel. LASP performs
+remain unloaded. Unfortunately, such behavior of a kernel       static analysis of a GPU kernel’s code at compile time to
+is not necessarily discernible at the time of compilation.      infer its memory access pattern. Based on the analysis, LASP
+Thus, we extend the GPU hardware to monitor the system          classifies the kernel into different categories (Section II). It
+for imbalance in the L2 TLB traffic amongst the chiplets at     interleaves data structures across the chiplets based on the
+runtime and switch to finer grain (4KB) mapping to ensure       expected access pattern and schedules the CTAs on the same
+that one TLB slice does not become a choke point.               chiplet where its data is placed.
+   Note that giving up coarser granularity mapping (dHSL-          MGvm leverages LASP’s analysis to determine the most
+coarse) sacrifices the benefits of local memory accesses        suitable HSL for a kernel to limit remote L2 TLB accesses
+on page walks. However, if the L2 TLB hit rate is high,         and remote page table accesses. A page containing PTEs
+then ensuring balance in L2 TLB utilization across chiplets     maps (at least) 2MB of contiguous virtual address (VA)
+could be more important than reducing remote page walks.        region 1 . Thus, MGvm sets the HSL to map a VA region in
+Therefore, this enhancement, acronym-ed dHSL-balance,           multiples of 2MB onto a single chiplet while following the
+switches to finer grain mapping of virtual addresses across     interleaving pattern selected by LASP. The need for HSL to
+the L2 TLB slices if it encounters an imbalance in traffic      interleave across a coarser granularity (2MB vs. 4KB) stems
+among the L2 TLBs and finds the L2 TLB hit rate is high.        from its goal to reduce remote memory accesses on page
+Summary: We achieve the three goals by: 1 LASP-directed         walks. If LASP had selected an interleaving granularity for
+per-kernel configuration of the HSL to leverage the aggregate   the data pages that is not a multiple of 2MB, then MGvm
+L2 capacity when needed, while benefiting from local L2         rounds it up to the closest multiple of 2MB for HSL (a.k.a,
+TLB lookup where possible (dHSL). 2 Placing pages               dHSL-coarse). If LASP’s data interleaving granularity is a
+containing PTE on chiplets in coordination with the dHSL        multiple of 2 MB, then MGvm guarantees that if a data
+and the coarser grain (default at 2MB) mapping of virtual       access is local, the corresponding address translation request
+addresses to L2 TLB slices to limit remote memory accesses      would be local too. However, if MGvm rounds up LASP’s
+on page walks (dHSL-coarse). 3 Switching to finer-grain         data interleaving granularity to a multiple of 2MB, then some
+(default, 4KB) HSL at runtime to avoid congestion in one        of the accesses to L2 TLB can be remote while the data
+of the L2 TLB slices (dHSL-balance). We name the overall        accesses are local.
+solution MCM-aware GPU virtual memory (MGvm).                      Pseudo-code in Listing 1 shows the high-level algorithm
+                                                                used by MGvm to determine the HSL and place page
+           V. D ESIGN AND I MPLEMENTATION
+                                                                tables (discussed later). Upon a kernel launch, the driver
+   We elaborate on how MGvm realizes the ideas discussed in     first queries the available LASP information about different
+the previous section. There are three major components in the   memory allocations (line 1). Then it picks up the largest
+design and implementation. 1 At a kernel launch, the HSL is
+decided based on the static analysis for data page placement    1We assume 4KB default page size. Later in this section, we discuss how
+as in LASP. This information is conveyed to the GPU to           MGvm handles larger page sizes.
+memory allocation of the kernel and queries LASP for the             1 listOfAllocs = QueryLASP (LIST_OF_ALLOCS)
+data placement policy used for the particular allocation (lines      2 largestAlloc = max(listOfAllocs)
+                                                                     3 LASPBlkSize = QueryLASP(BLOCKSIZE, largestAlloc)
+2-3). Notice that MGvm focuses on ensuring local L2 TLB              4 if LASPBlkSize % 2M == 0
+accesses for the largest data structure only, as it is likely to     5   dHSLcoarse = LASPBlkSize
+                                                                     6 else
+have the most significant effect on the performance of the
+                                                                     7   dHSLcoarse = closestMultiple(LASPBlkSize, 2M)
+kernel [31]. LASP decides the interleaving for each memory           8
+allocation independently. However, MGvm cannot similarly             9 # Allocate virtual and physical memory
+decide the HSL for each allocation independently without            10 alignTo = closestPow2(largestAlloc)
+                                                                    11 StartingVPN = newAlignedVAddr(alignTo)
+significantly complicating the HSL in the hardware. When an         12 sort(listOfAllocs)
+L1 TLB miss occurs, the HSL should quickly find which L2            13 for alloc in listOfAllocs
+
+TLB slice (thus, chiplet) the VA of that translation request        14   vAddr = allocateVAddr(alloc)
+                                                                    15   allocatePhyMemLASP(vAddr, alloc)
+maps to. To avoid hardware complexity and yet be effective          16
+in practice, MGvm employs a common HSL for the entire               17 # Each page table page covers 2MB VA
+VA space of a kernel.                                               18 foreach 2MB region
+                                                                    19   VPN = startAddr(region)
+   Notice that while LASP can distribute each memory                20   block = VPN / dHSLcoarse
+allocation at a different granularity across chiplets, it focuses   21   homeNode = block % numChiplets
+primarily on avoiding remote data accesses for the largest          22   allocatePTEPageOnChiplet(VPN, homeNode)
+                                                                    23
+data structure. This is because data page placement alone           24   GPU.SetdHSL(dSHLcoarse)
+is insufficient to ensure local accesses. LASP schedules
+                                                                                 Listing 1: Pre-kernel launch steps
+the CTAs on chiplets to minimize remote data access to
+the largest data structure. We follow the same rationale to
+optimize for the largest data structure.                            2, larger than the largest memory allocation in the program.
+   In listing 1, we define LASPBlockSize as the block size          This is easy since the virtual address space is abundant.
+used by LASP for interleaving data across chiplets, for the          2 MGvm rearranges the VA assignments for each memory
+largest memory allocation. If LASPBlockSize is a multiple of        allocation request such that the largest allocation request is
+2MB, then MGvm also uses the same as the HSL. Otherwise,            assigned VA first (lines 9-12). These ensure that the selected
+MGvm chooses the closest multiple of 2MB as the HSL (lines          HSL will produce local L2 TLB lookups for the largest
+4-7). The output of this algorithm is the selected interleaving     allocation, even with multiple allocations of varying sizes,
+granularity (dHSL-coarse) used by the hardware to set its           as long as LASP analysis is accurate.
+HSL before the given kernel starts executing (line 22).                Next, the driver allocates the virtual addresses and physical
+   The alignment of the virtual address ranges allocated            memory to the different allocations (lines 13-15). Finally, the
+to different data structures can impact the effectiveness of        driver places the pages with PTEs such that remote memory
+MGvm in reducing remote TLB lookups, and remote page                accesses to the leaf-level PTEs are avoided during page walks
+walks. Suppose there are two data structures of sizes 4MB           (step 1 in Figure 2c). Lines 17-22 show the pseudo-code
+and 8MB for a given kernel. Say LASP chooses to use block           for the same. The allocation for the PTEs is made simple
+sizes of 1MB and 2MB, respectively, for the two allocations.        by the fact that dHSL-coarse always allocates contiguous
+Since the latter allocation is the larger, MGvm decides to          VA regions of multiples of 2MB on the same chiplet. For
+use 2MB granularity in HSL. Now say the allocation starts           every allocated 2MB VA region, the driver finds the chiplet
+at VA 0 (zero). The first memory allocation (4MB) starts            whose L2 TLB slice would be responsible for its address
+at VA 0, and the second memory allocation (8MB) gets the            translation as per the chosen HSL function (lines 19-21). It
+VA from 4MB to 12MB. In this case, the HSL would map                then allocates the corresponding PTEs such that the page
+the first 2MB chunk of the 8MB data structure onto the              containing the leaf-level PTEs resides on the chosen chiplet.
+third chiplet’s L2 TLB. However, the corresponding data             The upper-level PTEs may reside on any chiplet as their
+pages will be placed on the first chiplet by LASP. Assuming         placement is not critical to the performance.
+LASP’s static analysis correctly finds CTAs that will access        Operation during kernel execution: The command proces-
+that VA region and schedules them on the first chiplet, it will     sor (CP) in a GPU schedules CTAs to different chiplets as
+ensure local data accesses. However, the L2 TLB lookups             per LASP to reduce remote data accesses. MGvm does not
+for the given VA region will travel from the first chiplet          make any modifications to this. The chosen HSL and PTE
+(where the execution occurs) to the third chiplet. Thus, if         page placement limits remote L2 TLB accesses and remote
+the allocated VA ranges are improperly aligned, HSL may             page walks, utilizing LASP’s CTA scheduling.
+be ineffective in reducing remote L2 TLB accesses.                     Before the kernel starts executing, the CP broadcasts the
+   MGvm’s driver takes care of the alignment needs as               HSL’s granularity to all the L1 TLBs and the RTUs. The L1
+follows. 1 The starting virtual address for the memory              TLBs and the RTUs use the same to find any given VA’s
+allocations in the program is aligned to the nearest power-of-      home TLB slice (chiplet). Under MGvm, L1 TLB misses are
+                                                              Chiplet
+      RMA   L2 cache                       L1     L1                                                  1   global bool prevImbalance;
+                                          TLB    cache                      L1 TLB
+                                         Compute Unit                                                 2
+                 DRAM                     Compute Unit                    Compute Unit
+                                                                                                      3 let numIncoming[4] be num. incoming reqs at each
+            Walkers +                                                 Local L1 TLB                           chiplet
+                                RTU          L2 TLB slice                miss
+             PWC
+                                                                                                      4 let hitRate = totalNumHits / totalNumAccesses
+                             Monitoring       Monitoring
+           VM                                                               VM subsystem              5 let imbalance = False
+                               logic            logic
+        subsystem                                                               L2 TLB                6
+
+                                     1                4
+                                                                         L2 TLB miss     3            7   total = sum(numIncoming)
+             3 Send            Incoming           Hits                                                8
+             Incoming          Outgoing          Misses                   Page Walkers + PWC
+                                                                                                      9 for nI in numIncoming
+      TO CP Stats to CP        Serviced          Epoch
+                                                              2                                      10     if (nI/total) > 0.8
+                                                   Send                                                         imbalance = True
+                        Incoming >                                                                   11
+                                                 Hit/Miss                                    L2$ +
+                        2 * Outgoing
+                                                stats to CP                                  DRAM    12
+                                                              RTU               RMA                     if imbalance == True and hitRate > 0.9
+                               2                  5                                                  13
+                                                                          Remote L1 TLB              14     if prevImbalance == True
+                          Alert CP                                1
+                                                                              miss
+                                                                                                     15         send SwitchMsg(TLBs, RTUs)
+      (a) Per-chiplet monitoring logic                        (b) Routing logic                      16     else prevImbalance = true
+                                                                                                     17 else prevImbalance = false
+
+                             Figure 6: Switching logic                                                            Listing 2: Decision flow at the CP
+
+typically directed to the local L2 TLB slice in the common                                           Figure 6a). Upon receiving the message, the CP requests all
+case, thanks to dHSL (step 2 in Figure 2c). Further, dHSL-                                           the RTUs to share their counter values of incoming requests.
+coarse ensures that leaf-level PTE accesses remain local ( 4                                         Further, the CP requests all L2 TLB slices to send the number
+in Figure 2c).                                                                                       of hits and misses over the last epoch ( 4 in Figure 6a).
+Mitigating L2 TLB imbalance: The primary task of MGvm                                                The RTUs and the L2 TLB slices reply with the requested
+during the execution of a kernel is to monitor for potential                                         information ( 3 , 5 in Figure 6a). Once the CP receives the
+imbalance in the L2 TLB traffic that can hurt performance.                                           data from all the RTUs and TLBs, it combines the information
+As noted in Section IV, coarse granularity mapping in dHSL-                                          to infer the existence of imbalance (if any) across chiplets.
+coarse is to blame in such cases. Kernels that typically enjoy                                       Listing 2 shows the algorithm used by the CP to decide on
+higher L2 hit rates are often most affected by imbalance. If                                         switching. If the imbalance amongst the chiplets is higher
+the L2 MPKI is high, then the address translation overhead                                           than a threshold (default, > 0.8), and the L2 TLB hit rate
+is dominated by the long latency page walks, and thus,                                               is high (default, > 0.9), for two consecutive epochs, the CP
+imbalance at L2 TLBs matters less.                                                                   decides to switch to fine-grain dHSL-balance.
+   MGvm extends the GPU hardware to monitor the signs of                                                When the CP decides to switch to dHSL-balance, it
+imbalance in the presence of high L2 TLB hit rates. Upon                                             broadcasts an HSL switch message to all the L1 TLBs, RTUs
+detecting such a scenario, MGvm abandons dHSL-coarse                                                 and L2 TLBs. Once the RTUs and L1 TLBs receive it, they
+and switches to fine-grain (here, 4KB) interleaving (dHSL-                                           asynchronously switch to the fine-grain HSL.
+balance) to distribute the L2 traffic evenly across all chiplets.                                    Mechanism to switch to dHSL-balance: Switching to a dif-
+MGvm defines imbalance at a chiplet as follows.                                                      ferent HSL is not instantaneous. Translation requests already
+                                    IncomingRequests                                                 in the network must be rerouted appropriately according to
+     imbalance :=                                      > threshold                                   the latest HSL. Figure 6b illustrates the additional paths that a
+                                   TotalRemoteRequests
+                                                                                                     translation request can traverse in MGvm (in red) in addition
+   We assume the number of chiplets in the GPU to be 4 in                                            to the baseline (in green). Due to asynchronous switching,
+the following discussion without loss of generality. Figure 6a                                       an RTU may receive requests from other chiplets that should
+shows the per-chiplet monitoring logic. MGvm monitors the                                            not have been routed to it as per the updated HSL. The RTU
+number of incoming and outgoing translation requests with a                                          assumes that its currently effective HSL (e.g., dHSL-coarse)
+pair of counters at each RTU ( 1 in Figure 6a). Recall that all                                      is the HSL currently used by all components and reroutes
+translation requests that travel to another chiplet pass through                                     the request according to its current HSL ( 1 in Figure 6b).
+the RTU (Section II). Another counter maintains the total                                            Since all chiplets eventually receive the switching message
+number of requests (incoming and outgoing) serviced. At the                                          from the CP, rerouting happens only a bounded number of
+end of an epoch (default, 5000 requests), each RTU saves                                             times (typically, once). Further, delays within a chiplet may
+the values of the counters and resets them to 0. Then, based                                         lead to a request being (incorrectly, as per the latest HSL)
+on the saved values of these counters, each RTU determines                                           routed to the RTU instead of the local L2 TLB. The RTU
+if there is any possibility of imbalance across the system.                                          assumes its HSL to be the latest and routes the request back
+                                                                                                     to the local L2 TLB slice ( 2 in Figure 6b).
+       Possible := IncomingReqs > 2 ∗ OutgoingReqs
+                                                                                                        The L2 TLB slice on each chiplet also maintains the latest
+If the RTU detects a possible imbalance for two consecutive                                          HSL. The L2 TLB looks up all the requests it receives. If
+epochs, the RTU sends a trigger message to the CP ( 2 in                                             the lookup is a hit, no additional action is needed. On a miss,
+the L2 TLB slice sends the request to the local page walk                            Table I: Simulation Parameters
+system only if its copy of the HSL determines that it should        Chiplets
+                                                                                       4 chiplets, 32 CUs per chiplet
+serve that request. Otherwise, it redirects it to the RTU ( 3 ),                       16 memory controllers per chiplet
+                                                                    CU                 4 exec. units per CU, 64 threads per wavefront
+which, in turn, sends it to the request’s home L2 TLB slice.
+                                                                                       64KB vector cache, 5 cycle lookup
+   As Figure 6b shows, the asynchronicity of components             Cache (per CU)     32KB Inst. cache shared b/w 4 CUs
+(even within the same chiplet) can cause translation requests                          16KB Scalar cache shared b/w 4 CUs
+                                                                    TLB (per CU)       32 entry fully assoc., 1 cycle lookup
+to reroute. Suppose the RTU and the L2 TLB slice on a                                  512 entry TLB per chiplet, 8 way, 10 cycle lookup
+chiplet temporarily disagree on the HSL. Then a translation         L2 TLB
+                                                                                       64 entry MSHR per chiplet
+request may be rerouted between the RTU and L2 TLB slice.           L2 Cache           4MB per chiplet, 16 banks, 16 way, 12 cycle lookup
+                                                                    DRAM               1 TBps, 100 ns latency
+A similar situation may arise when RTUs on different chiplets                          16 page walkers per chiplet (default)
+disagree about the HSL in use. However, this is a transitory        Page walking
+                                                                                       32 entry fully assoc. page cache, 10 cycle lookup
+phase without the possibility of deadlock since the RTUs,           Interconnect       768 GBps, bi-directional, ∼32 ns latency
+and L2 TLB slices of each chiplet will eventually receive the
+switching message from the CP. We empirically found that           pages. However, MGvm’s design is not tied to the page size.
+switching messages constitute a minuscule fraction (< 0.1%)        The page table’s radix tree structure remains the same when
+of the network traffic due to address translation.                 using large pages (say 64 KB pages) for data. The page
+Switching back to dHSL-coarse: MGvm can switch back                tables pages continue to use base 4KB pages [42]. Thus,
+from fine-grain dHSL-balance to the original driver-selected       the basic algorithms remain the same. The most significant
+dHSL-coarse if the imbalance disappears. Every L2 TLB              changes are: 1 The dHSL-coarse would now have to be the
+entry is tagged with the chiplet ID that the corresponding         multiples of 32MB instead of 2MB, since each page with
+VPN would have hashed under dHSL-coarse during the                 PTEs would now cover 32MB of contiguous virtual address
+TLB fill operation. Additionally, we keep four counters, one       space. 2 The thresholds for switching the HSL may change
+representing each chiplet on the GPU. Whenever an L2 TLB           due to higher expected TLB hit rates. In Section VI, we
+entry is accessed, the counter corresponding to the chiplet        evaluate MGvm with 64KB pages.
+ID stored in that L2 TLB entry is incremented. At the end
+of every epoch, these counters are checked to see if the                                    VI. E VALUATION
+imbalance has disappeared (i.e., no chiplet has an imbalance       A. Methodology
+greater than a threshold, default 0.5). If two consecutive            We use the MGPUSim [59] simulator to model the
+epochs show that the imbalance has disappeared, we switch          MCM GPU. MGPUSim is designed to model multiple
+back to dHSL-coarse. We do not observe the need to switch          interconnected GPUs. We simulate a GPU with characteristics
+back in our evaluated applications.                                similar to AMD’s GCN architecture. Our simulated GPU has
+   Notice that since TLBs are read-only caches, there can be       4 chiplets connected to each other via a fast, high-bandwidth
+no correctness issue even when different slices use different      interconnect. Each chiplet has 768 GBps of bi-directional
+HSL during switching. Switching also does not require a            bandwidth to every other. The latency to cross from one
+TLB shootdown since the page tables remain unaltered. We           chiplet to another is 32ns (default). We follow the numbers
+empirically found that it has little performance impact as it is   published by NVIDIA for these parameters [7]. Table I details
+a transitory phase. We evaluated a hypothetical configuration      the simulation parameters. We follow the strategy detailed
+that magically avoids all costs of switching. We found             in LASP [31] for data placement and CTA scheduling.
+a minuscule performance difference (< 1%) between this                We use a mix of workloads from various suites, e.g.,
+magical configuration and MGvm.                                    Polybench [48], AMD App SKD [4], Heteromark [60], SHOC
+Hardware overheads: MGvm requires one additional                   [23], Pannotia [20]. Table II shows the workloads, their
+register (to store the HSL parameter) per each CU, RTU,            classification according to LASP, and their memory footprints.
+and L2 TLB to compute the HSL. Each RTU requires five              To present a holistic evaluation, we include workloads that
+32-bit counters, one for maintaining the epoch, two for            stress the virtual memory and those that do not.
+maintaining the number of incoming and outgoing requests,
+and two more for maintaining the number of incoming and            B. Results and analysis
+outgoing requests in the previous epoch. Each L2 TLB entry            Figure 7 shows the normalized throughput (higher is better)
+is augmented with log(numChiplets) bits. Each L2 TLB also          for four different configurations – private TLB, shared TLB,
+maintains numChiplets counters. In an MCM GPU with four            MGvm-no-balance, and MGvm. MGvm-no-balance is our
+chiplets, MGvm needs an additional 32 bits per CU (4096            proposed solution, but without balancing, i.e., dHSL-balance
+across the entire GPU), 1152 bits across the RTUs and L2           is disabled and only dHSL and dHSL-coarse enabled. The
+TLB counters, and 4096 bits for the L2 TLB entries. In             throughput is measured as the total number of instructions
+aggregate, the total state overhead is 9344 bits.                  executed divided by the total time. The height of each bar is
+MGvm with larger page sizes: Hitherto, we assumed 4KB              normalized to the private TLB configuration.
+                                                         Table II: Workloads                                                                                         Table III: L2 TLB MPKI with different configurations
+                                                                                                        Size           Locality                                                    Workload       Private TLB          Shared TLB          MGvm
+    Abbr.                           Benchmark
+                                                                                                        (MB)           Type                                                        C2D            1.07                 1.07                1.07
+    C2D                             2-D convolution [48]                                                512            NL                                                          FW             2.28                 2.28                2.28
+    FW                              fast Warshall transform [4]                                         32             RCL                                                         GUPS           698.32               480.82              513.27
+    GUPS                            multi-threaded, random access                                       16             unclassified
+                                                                                                                                                                                   J1D            3.21                 3.21                3.21
+    J1D                             1-D Jacobi solver [48]                                              512            NL
+    J2D                             2-D Jacobi solver [48]                                              128            NL                                                          J2D            2.16                 2.15                2.15
+    KM                              kmeans clustering with 20 clusters [60]                             128            ITL                                                         KM             11.04                10.25               21.70
+    MIS                             max. independent set [20]                                           16             NL+ITL                                                      MT             69.31                62.00               68.5
+    MT                              matrix transpose [4]                                                32             NL                                                          MIS            260.52               2.11                8.50
+    PR                              Page Rank algorithm [60]                                            256            ITL                                                         PR             91.33                90.38               90.83
+    SC                              simple convolution on a matrix [4]                                  512            NL                                                          SC             0.40                 0.40                0.40
+    RED                             reduction kernel [23]                                               256            NL                                                          RED            6.01                 5.93                5.93
+    SPMV                            sparse matrix vector multiplication [23]                            360            ITL                                                         SPMV           1531.47              422.73              451.94
+    S2D                             stencil operation on 2-D matrix [23]                                32             NL                                                          S2D            12.32                10.24               12.18
+    SYRK                            rank of a symmetric matrix [48]                                     32             RCL
+                                                                                                                                                                                   SYRK           201.46               53.03               53.17
+    SYR2                            rank-2k of a symmetric matrix [48]                                  16             RCL
+                                                                                                                                                                                   SYR2           178.35               54.72               54.95
+
+                              2.0         2.3                             5.1         4.1         2.7           4.2                 2.2
+                                                                                                                                                                                     Local   Remote
+(normalized to Private TLB)
+
+
+
+
+                                                                                                                                                   Fraction of L2 TLB Hits
+                                                         2.3                           4.8                      4.2                   2.2                                    1.0
+                              1.5
+                                                                                                                                                                             0.8
+       Throughput
+
+
+
+
+                              1.0                                                                                                                                            0.6
+                                                                                                                                                                             0.4
+                              0.5
+                                                                                                                                                                             0.2
+                              0.0                                                                                                                                            0.0
+                                                                                                                             SYR2
+                                          FW
+
+
+
+
+                                                                     KM
+
+
+                                                                                MIS
+
+
+
+
+                                                                                                                      SYRK
+                                    C2D
+
+
+
+
+                                                       J1D
+                                                               J2D
+
+
+
+
+                                                                                                  RED
+
+
+                                                                                                               S2D
+                                                                                      PR
+                                                GUPS
+
+
+
+
+                                                                          MT
+
+
+
+
+                                                                                             SC
+
+
+                                                                                                        SPMV
+
+
+
+
+                                                                                                                                          Gmean
+
+
+
+
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                                                                                                                                                                   Shared
+                                                                                                                                                                                   MGvm
+                                     Private TLB             Shared TLB         MGvm-nobalance                 MGvm                                                                C2D   FW GUPS J1D   J2D   KM   MT   MIS   PR   SC   RED SPMV S2D SYRK SYR2
+
+Figure 7: Throughput of private TLB, shared TLB, MGvm-
+                                                                                                                                                  Figure 8: Reduction in remote TLB hits with MGvm
+no-balance and MGvm, normalized to private TLB
+                                                                                                                                                  compared to shared TLB
+
+   We first observe that MGvm outperforms private TLB                                                                                             that MGvm reduces the page walk latency of KM by a large
+by 52% and shared TLB by 30%, on average (geometric                                                                                               fraction (Figure 10). This leads to frequent L2 TLB fill as
+mean). Even if we compare MGvm to the better-performing                                                                                           each completed page walk brings a new entry into the TLB.
+configuration among private TLB and shared TLB for indi-                                                                                          This, in turn, leads to frequent eviction of useful TLB entries,
+vidual applications, MGvm outperforms the better alternative                                                                                      i.e., thrashing of the L2 TLB. We further confirm that the
+by 12%, on average. In short, MGvm not only matches the                                                                                           MPKI of KM increases with a hypothetical configuration
+better among private and shared TLB for each application                                                                                          where all remote page walks are made local (and hence
+but also performs better than any of them. While comparing                                                                                        faster). The phenomenon of thrashing due to faster page
+MGvm-no-balance and MGvm, we observe the need to detect                                                                                           walks has been observed before [49].
+and correct imbalance in three of the applications – MIS,                                                                                            Figure 8 shows the breakup of local versus remote L2
+SYRK, and SYR2.                                                                                                                                   hits for shared TLB and MGvm. Note that all L2 hits are
+   Next, we dive into the sources of these improvements.                                                                                          local for private TLB and thus are not shown. The figure
+Note that MGvm aims to achieve a balance between three                                                                                            shows that applications that benefit from a high local L2
+objectives: 1 lower L2 TLB miss rate by leveraging                                                                                                TLB hit rate in private TLB also experience good local L2
+aggregate L2 TLB capacity, 2 increase local L2 TLB hit                                                                                            hit rate under MGvm relative to shared TLB. This is evident
+fraction to limit remote TLB lookups, and 3 limit remote                                                                                          in applications such as C2D, J1D, J2D, S2D, SC, and MT.
+memory accesses due to page walks to make walks faster.                                                                                           In short, MGvm can leverage the benefits of private TLB
+We will analyze MGvm against each of these objectives.                                                                                            where it suits the application.
+   Table III shows the L2 TLB misses per kilo SIMD                                                                                                   Finally, we evaluate if MGvm is able to reduce remote
+instructions (MPKI). As expected, the best aggregate capacity,                                                                                    memory accesses during page walks. Figure 9 shows the
+and thus, the lowest MPKI, is achieved under shared TLB.                                                                                          breakdown of local versus remote accesses to PTEs for private
+We observe that, in most cases, MGvm achieves MPKI close                                                                                          TLB, shared TLB, and MGvm. Across all applications, except
+to that of the shared TLB design. For example, applications                                                                                       SYRK and SYR2, MGvm provides the lowest fraction of
+such as MIS, SPMV, SYRK, and SYR2, which suffer many                                                                                              remote accesses to PTEs, establishing its success in achieving
+L2 misses in private TLB, leverage the aggregate L2 capacity                                                                                      the third goal. For SYRK and SYR2, the remote access
+under MGvm. Surprisingly, the MPKI of KM is higher with                                                                                           fraction with MGvm is similar to shared TLB. This is because
+MGvm than private TLB. On further investigation, we find                                                                                          these applications switch to using finer grain (4KB) to avoid
+                                      Local      Remote                                              P: Private     S: Shared.        M: MGvm                                                            Private TLB             Shared TLB              MGvm
+
+
+
+
+                                                                                                                                                              (normalized to Private TLB)
+                          1.0                                                                                                                                                               2.0
+Fraction of PW Accesses
+
+
+
+
+                          0.8                                                                                                                                                               1.5
+
+
+
+
+                                                                                                                                                                    Throughput
+                          0.6                                                                                                                                                               1.0
+
+                          0.4                                                                                                                                                               0.5
+                          0.2                                                                                                                                                               0.0
+                                                                                                                                                                                                     J2D        SYR2K            PR          S2D         SYRK         MT                         Gmean
+                          0.0
+                                 PSM PSM PSM PSM PSM PSM PSM PSM PSM PSM PSM PSM PSM PSM PSM
+                                  C2D         FW GUPS J1D             J2D    KM    MT     MIS       PR    SC      RED SPMV S2D SYRK SYR2                                                          Figure 11: Throughput with large pages
+                     Figure 9: Ratio of local vs. remote page table accesses
+                                                                                                                                                                                                                 3.4                  2.9          4.0        2.6            3.0
+                                                                                                                                                                                            2.5
+
+
+
+
+                                                                                                                                                        (normalized to Private TLB)
+                                              Private          Shared       MGvm        3.5   3.0                                                                                           2.0
+                                2.0
+(normalized to Private TLB)
+
+
+
+
+                                                                                                                                                                                                                                                   6.0        3.6            6.0
+                                                                                                                                                                                            1.5
+
+
+
+
+                                                                                                                                                                Throughput
+                                1.5
+                                                                                                                                                                                            1.0
+       PW latency
+
+
+
+
+                                1.0
+                                                                                                                                                                                            0.5
+                                0.5                                                                                                                                                         0.0
+
+
+
+
+                                                                                                                                                                                                                                             MIS
+
+
+
+
+                                                                                                                                                                                                                                                                                          SYR2
+                                                                                                                                                                                                         FW
+
+
+
+
+                                                                                                                                                                                                                                                                                   SYRK
+                                                                                                                                                                                                   C2D
+
+
+
+
+                                                                                                                                                                                                                     J1D
+                                                                                                                                                                                                                           J2D
+
+
+
+
+                                                                                                                                                                                                                                                                RED
+
+
+                                                                                                                                                                                                                                                                             S2D
+                                                                                                                                                                                                                                                   PR
+                                                                                                                                                                                                              GUPS
+
+
+
+
+                                                                                                                                                                                                                                 KM
+                                                                                                                                                                                                                                        MT
+
+
+
+
+                                                                                                                                                                                                                                                         SC
+
+
+                                                                                                                                                                                                                                                                      SPMV
+
+
+
+
+                                                                                                                                                                                                                                                                                                    Gmean
+                                0.0
+                                                                                        MIS
+
+
+
+
+                                                                                                                                      SYR2
+                                                FW
+
+
+
+
+                                                                                                                               SYRK
+                                        C2D
+
+
+
+
+                                                                J1D
+                                                                      J2D
+
+
+
+
+                                                                                                          RED
+
+
+                                                                                                                         S2D
+                                                                                              PR
+                                                        GUPS
+
+
+
+
+                                                                            KM
+                                                                                  MT
+
+
+
+
+                                                                                                    SC
+
+
+                                                                                                                  SPMV
+
+
+
+
+                                                                                                                                                Gmean
+                                                                                                                                                                                                  Double TLB         Double Walkers            Half Latency            Double Latency
+
+                                                                                                                                                        Figure 12: Throughput of MGvm normalized to private TLB
+        Figure 10: Page walk latency with various configurations
+
+imbalance in L2 TLB traffic early in their executions. Giving                                                                                           sizes, more page table walkers, lower and higher interconnect
+up coarser grain (2MB) mapping to L2 TLB slices sacrifices                                                                                              latencies. Specifically, we studied the impact of doubling the
+the ability to keep accesses to leaf-level PTEs local. However,                                                                                         size of each L2 TLB slice to 1024 entries (a total of 4096
+MGvm finds this necessary to limit imbalance for maintaining                                                                                            entries). We studied the impact of doubling the number of
+good overall performance.                                                                                                                               page table walkers to 32 per chiplet (a total of 128). We also
+   In Figure 10, we further show how reducing remote PTE                                                                                                studied the impact of halving (16 ns) and doubling (64 ns)
+accesses speeds up page walks across configurations. This                                                                                               the inter-chiplet interconnect latencies.
+confirms the benefits of limiting remote accesses to PTEs.                                                                                                 Figure 12 shows the throughput of applications with
+   In summary, MGvm matches or betters the best of both                                                                                                 MGvm under these varying configurations, with the height
+worlds – private TLB and shared TLB, even when the baseline                                                                                             of each bar, normalized to the throughput under private TLB
+contains state-of-the-art optimizations for CTA scheduling                                                                                              (higher is better). Figure 13 shows the same with the heights
+and data placement, as well as smart page table placement                                                                                               of the bars normalized to shared TLB. As expected, with
+that follows data placement.                                                                                                                            more virtual memory resources (TLBs, page walkers), the
+                                                                                                                                                        relative improvement with MGvm moderates but remains
+C. Sensitivity studies and generality                                                                                                                   significant. For example, even after doubling the TLB size,
+Large pages: We study the impact of MGvm with 64KB and                                                                                                  MGvm outperforms private and shared TLB by 12% and
+2MB large page sizes that NVIDIA GPUs support [42]. We                                                                                                  20%, respectively, on average (geomean). After doubling the
+increased the memory footprints of workloads to generate                                                                                                number of walkers, the improvements are 38%, and 21%.
+enough TLB misses to stress the virtual memory subsystem.                                                                                                  As expected, when the interconnect latency is halved,
+Unfortunately, these large-footprint simulations run for many                                                                                           the effect of non-uniformity in the MCM design reduces.
+days. Figure 11 shows a subset of applications running private                                                                                          Thus, improvements with MGvm moderate at 43% and 17%,
+TLB, shared TLB, and MGvm with 64KB pages. These                                                                                                        on average, over the private and shared TLB designs. The
+applications finished simulation within a reasonable time.                                                                                              opposite trend is observed when the interconnect latency
+Even with larger 64KB pages, MGvm remains effective,                                                                                                    doubles. We see 68% and 54% improvements over private
+outperforming the better alternative for each application by                                                                                            TLB and shared TLB with higher interconnect latency.
+26%, on average. The speedup is as high as 82% for matrix-                                                                                              The generality of MGvm: Thus far, we assumed LASP [31]
+transpose (MT). We also experimented with 2MB pages                                                                                                     for the CTA scheduling and data page placement policy in
+(not shown). As expected, the headroom for improvement                                                                                                  the baseline design. While MGvm leverages LASP’s static
+reduces with a larger page size. However, MGvm remains                                                                                                  analysis, it can provide benefits even if the static analysis is
+useful by consistently providing more than 15% performance                                                                                              unavailable.
+improvement over private TLB or shared TLB for applications                                                                                                We simulate an alternative baseline design where CTAs
+with high address translation overheads.                                                                                                                and the data pages are distributed in a round-robin fashion
+Sensitivity to TLB sizes, number of walkers, and inter-                                                                                                 across the CUs and the memory banks in the absence of
+connect latency: We studied the impact of larger L2 TLB                                                                                                 LASP. We call this the naive baseline. The optimization in
+                                                                           2.9          3.3            2.6                                                                                                                               3.1         3.1         2.2          2.3
+                                                                                                                                                                                            2.0
+
+
+
+
+                                                                                                                                                                Throughput (normalized to
+                                2.5
+ (normalized to Shared TLB)
+
+
+
+
+                                                                                                                                                                   Private PW-All-Local)
+                                2.0                                                                                                                                                         1.5
+                                                                                        3.6            5.4
+                                1.5                                                                                                                                                         1.0
+         Throughput
+
+
+
+
+                                1.0
+                                                                                                                                                                                            0.5
+                                0.5
+                                                                                                                                                                                            0.0
+                                0.0
+
+
+
+
+                                                                                                                                                                                                                                                                                     SYRK
+                                                                                                                                                                                                   C2D
+
+
+
+
+                                                                                                                                                                                                                      J1D
+                                                                                                                                                                                                                            J2D
+
+
+
+
+                                                                                                                                                                                                                                                                              S2D
+                                                                                                                                                                                                                                                     PR
+                                                                                                                                                                                                               GUPS
+
+
+
+
+                                                                                                                                                                                                                                                                                            SYR2
+                                                                                                                                                                                                         FW
+
+
+
+
+                                                                                                                                                                                                                                  KM
+                                                                                                                                                                                                                                        MT
+                                                                                                                                                                                                                                               MIS
+
+
+
+
+                                                                                                                                                                                                                                                                       SPMV
+
+
+
+
+                                                                                                                                                                                                                                                                                                   Gmean
+                                                                                                                                                                                                                                                                RED
+                                                                                                                                                                                                                                                           SC
+                                               FW
+
+
+
+
+                                                                           KM
+
+
+                                                                                        MIS
+
+
+
+
+                                                                                                                                  SYRK
+                                                                                                                                         SYR2K
+                                        C2D
+
+
+
+
+                                                            J1D
+                                                                  J2D
+
+
+
+
+                                                                                                             RED
+
+
+                                                                                                                            S2D
+                                                                                                PR
+                                                     GUPS
+
+
+
+
+                                                                                 MT
+
+
+
+
+                                                                                                      SC
+
+
+                                                                                                                    SPMV
+
+
+
+
+                                                                                                                                                        Gmean
+                                    Double TLB              Double Walkers                    Half Latency                 Double Latency                                                         Private PW-All-Local            Shared PW-All-Local           MGvm
+
+
+Figure 13: Throughput of MGvm normalized to shared TLB                                                                                                          Figure 15: Comparison with Page Table Replication (PTR).
+                                                                                                                                                                Throughput normalized to private TLB with PTR.
+                                                                     3.9         4.3          4.2             4.5    2.8     3.2 3.2      3.2
+                              2.5                                                                                                                   10.5
+(normalized to Private TLB)
+
+
+
+
+                              2.0                                                                    2.9                                         10.4                                                    Local Caching        MGvm             2.9                     2.3                   2.5
+                                                                                                              2.9                                                                           2.0
+
+
+
+
+                                                                                                                                                                Throughput (normalized
+       Throughput
+
+
+
+
+                              1.5
+
+
+
+
+                                                                                                                                                                   to Local Caching)
+                                                                                                                                                                                            1.5
+                              1.0
+                                                                                                                                                                                            1.0
+                              0.5
+                                                                                                                                                                                            0.5
+                              0.0
+                                                                                       MIS
+
+
+
+
+                                                                                                                                         SYR2
+                                             FW
+
+
+
+
+                                                                      KM
+
+
+
+
+                                                                                                                                                        GMean
+                                                                                                                                  SYRK
+                                      C2D
+
+
+
+
+                                                         J1D
+                                                               J2D
+
+
+
+
+                                                                                                             RED
+
+
+                                                                                                                            S2D
+                                                                                               PR
+                                                                                                     SC
+                                                  GUPS
+
+
+
+
+                                                                                MT
+
+
+
+
+                                                                                                                    SPMV
+
+
+
+
+                                                                                                                                                                                            0.0
+
+
+
+
+                                                                                                                                                                                                                                   KM
+
+
+
+
+                                                                                                                                                                                                                                                                                                   Gmean
+                                                                                                                                                                                                          FW
+
+
+                                                                                                                                                                                                                      J1D
+                                                                                                                                                                                                                            J2D
+
+
+
+
+                                                                                                                                                                                                                                               MIS
+
+
+
+
+                                                                                                                                                                                                                                                                RED
+
+
+                                                                                                                                                                                                                                                                               S2D
+                                                                                                                                                                                                                                        MT
+
+
+
+
+                                                                                                                                                                                                                                                                       SPMV
+                                                                                                                                                                                                                                                           SC
+
+
+
+
+                                                                                                                                                                                                                                                                                            SYR2
+                                                                                                                                                                                                                                                      PR
+                                                                                                                                                                                                   C2D
+
+
+
+
+                                                                                                                                                                                                                                                                                     SYRK
+                                                                                                                                                                                                               GUPS
+                                            Private TLB           Shared TLB             MGvm-RR
+
+
+Figure 14: Application of our techniques to naive baseline                                                                                                      Figure 16: Impact of local caching of remote L2 TLB entries
+with round-robin scheduling
+                                                                                                                                                                Page table replication can improve performance by 23% and
+MGvm that leveraged LASP’s analysis to dynamically select
+                                                                                                                                                                20%, over private and shared designs. Importantly, MGvm
+HSL to avoid remote TLB lookups is inapplicable. However,
+                                                                                                                                                                outperforms private and shared TLB designs with page table
+the other optimization to place PTEs for reducing remote page
+                                                                                                                                                                replication by 24% and 8%.
+walks remains relevant. We name this constrained version of
+MGvm, MGvm-RR (round-robin).                                                                                                                                       Figure 15 shows three bars for each application – represent-
+   Figure 14 shows the performance of MGvm-RR over                                                                                                              ing throughput with page table replication with private TLB
+private TLB and shared TLB with the naive baseline. First,                                                                                                      and shared TLB (Private PW-All-Local and Shared PW-All-
+we observe that without LASP, private TLB is not a good                                                                                                         Local in the figure), and with MGvm. Recall that MGvm also
+design choice since it suffers from high L2 TLB miss but                                                                                                        limits remote L2 TLB lookups and leverages aggregate L2
+fails to fully harness local TLB lookup due to its inability to                                                                                                 TLB capacity of the chiplets, besides limiting remote accesses
+exploit locality. MGvm-RR outshines private TLB by 113%,                                                                                                        to PTEs during page walks. MGvm outperforms private TLB
+on average. The shared TLB performs relatively better as it                                                                                                     with page table replication due to better L2 TLB hit rate. It
+leverages the aggregate capacity of L2 TLB slices. However,                                                                                                     outperforms shared TLB with page table replication thanks to
+it also suffers from a high percentage of remote memory                                                                                                         fewer remote L2 TLB lookups. Importantly, MGvm achieves
+accesses to PTEs. MGvm-RR improves throughout over the                                                                                                          this without the complexity of keeping all the replicas of
+shared TLB by 26%, on average, as it limits remote page                                                                                                         the page table consistent. Today’s MCM processors already
+walks by smartly placing the PTEs.                                                                                                                              have 4 chiplets [2], and this number will only increase [57].
+   In general, we find that when the data access locality is                                                                                                    Keeping many replicas of a page table coherent, especially
+improved through smart data placement and CTA scheduling,                                                                                                       with unified virtual memory, would be challenging.
+the average data access latency reduces. This brings forth                                                                                                      Caching remote TLB entries: Another design alternative is
+the address translation as a more significant performance                                                                                                       to cache remote L2 TLB entries in the local L2 TLB slice of
+bottleneck. However, even in the absence of smart data                                                                                                          the requesting chiplet. Caching remote TLB entries locally
+placement and CTA scheduling, and even without dynamic                                                                                                          can reduce remote L2 TLB lookups. We studied whether
+HSL optimization, MGvm can provide significant speedups.                                                                                                        caching remote TLB entries in the requesting chiplet’s L2
+                                                                                                                                                                TLB slice can improve performance.
+                                                               VII. D ISCUSSIONS                                                                                   Figure 16 reports our findings and compares page table
+Why not replicate page tables? A key goal of MGvm is to                                                                                                         replication with MGvm. We observe that caching remote
+avoid remote memory accesses while walking the page table.                                                                                                      TLB entries hurts performance compared to MGvm by 24%,
+An alternate way to achieve the same is by replicating the                                                                                                      on average. We find that the duplication of entries across
+entire page table onto each chiplet’s memory. We simulated                                                                                                      L2 TLB slices due to caching of remote entries is to blame.
+replication of the page table by making all accesses to the                                                                                                     Duplication decreases the effective aggregate capacity of the
+page table local (i.e., zero remote accesses to PTE). We                                                                                                        L2 TLB, thus, increasing the L2 TLB MPKI by 60% over
+evaluated this for both private TLB and shared TLB designs.                                                                                                     MGvm. In particular, applications that benefited from larger
+TLB capacity (MT, MIS, SPMV, SYRK, and SYR2) show                 al. proposed batching page faults for reducing unified memory
+significant performance loss with caching of remote TLB           overheads [33]. ActivePointers is a software mechanism for
+entries. In contrast, MGvm, by design, ensures that there is      mapping files onto GPU address space [52]. None studied
+no duplication of entries, since an L2 TLB entry is mapped        the virtual memory in MCM GPUs, though.
+only onto one L2 TLB slice.                                          CARVE caches remote data for multi-GPU systems in the
+Applicability to unified virtual memory (UVM): MGvm’s             local DRAM for lowering memory access latency [67]. Milic
+two key optimizations – dynamically selecting HSL to              et al. modify caching and interconnect policies according to
+ensure local TLB lookups for local data accesses and              application phase behaviour [40]. Griffin balances memory
+page table placement to ensure local accesses to PTEs,            distribution by migrating pages across GPUs [13]. These
+are equally applicable under UVM, albeit with a slightly          works explore multi-GPUs, not MCMs.
+different implementation. The static analysis that determines        Mitosis replicates page tables across all sockets in a multi-
+the data placement, CTA scheduling (as in LASP [31]),             socket CPU system [1], while vMitosis extends it to work
+and the dHSL in MGvm, remain unchanged under UVM.                 under virtualization and enables PTE migration [45]. In
+At a kernel launch, the driver sets up dHSL as before.            contrast, we avoid the complexity of replicating page tables
+Unlike typical pinned memory allocation in GPU (e.g., using       but still achieve mostly local page walks. MIXTLB explored
+cudaMalloc), the data pages may be allocated during a             mechanisms to support multiple page sizes on a single
+kernel’s execution on encountering page faults. Thus, UVM’s       TLB [21]. CoLT exploited virtual address space contiguity
+page fault handler should be extended for MGvm to allocate        to map multiple address translations to a single TLB
+the pages containing PTEs following MGvm’s principle,             entry [46]. SpecTLB uses address translation speculation to
+i.e., on the chiplets whose L2 TLB slice is responsible for       hide page walk latency [12]. Reactive NUCA and Cooperative
+translating the VA region mapped by those PTEs. In summary,       Caching [19], [26] carefully place and spill cache lines in
+MGvm’s principles are equally applicable under UVM, but           NUCA caches to improve cache hit rates and performance.
+its implementation should extend to the page fault handler.       Bhattacharjee et al. suggested exploiting commonality in TLB
+                                                                  miss patterns across CPU cores to pre-fetch TLB entries [18],
+                   VIII. R ELATED WORK
+                                                                  while Mazumdar et al. proposed predicting dead entries in
+   The background section describes the most closely related      TLBs to reduce TLB misses [39]. Previous works have also
+prior works. We discuss several more here.                        explored using segments to avoid page table lookups or
+   HMG [51] tackles the problem of coherence across a             use very large page sizes [15], [16], [17], [24], [30], [50].
+multi-(MCM)GPU system. Vijaraghavan et al. [64] discuss           However, none of these works explore the effect of MCM’s
+an AMD APU which uses MCM for scaling. Loh et al. [37]            non-uniformity on the virtual memory system.
+discuss the benefits and drawbacks of various approaches
+to building chiplet-based processors. Simba is a prototype                             IX. C ONCLUSION
+MCM deep learning accelerator [53]. These prior works did
+                                                                     We quantitatively analyzed the impact of MCM designs
+not study the impact of the MCM design on virtual memory.
+                                                                  on a GPU’s virtual memory system. We demonstrated that
+   Researchers have proposed various techniques to reduce
+                                                                  remote TLB lookups and remote memory accesses to PTEs
+address translation overheads in GPUs, such as the coa-
+                                                                  during page walks can limit performance on MCM GPUs.
+lescing of TLB requests [38], warp scheduling [47], direct
+                                                                  We proposed MGvm to reduce such remote L2 TLB lookups
+mapping [27], and virtual caches [66]. Vesely et al. studied
+                                                                  and remote memory accesses to PTEs. We then extended it
+the effect of memory access divergence on a GPU’s virtual
+                                                                  with dynamic switching for applications to switch back to
+memory [62]. Mosaic explored the overheads of demand
+                                                                  fine-grained interleaving if needed. Our solution speeds up
+paging and issues with huge pages [9]. Ducati used last-
+                                                                  15 applications by 52%, on average, over the private TLB
+level caches to store address translations [28]. Shin et al.
+                                                                  baseline and by 30% over the shared TLB baseline.
+studied the re-ordering [54] and coalescing [55] of page walks.
+Tang et al. leverage the compressibility of TLB entries to
+                                                                                      ACKNOWLEDGMENT
+improve hit rates [61]. Valkyrie proposed probing and pre-
+fetching into L1 TLBs [14]. Kotra et al.leverage under-utilized      The authors thank anonymous reviewers for their valuable
+resources in CUs to cache address translations [34] . Li et. al   feedback and help in improving the article. The authors also
+study the TLB hierarchy of a multi-GPU system and suggest         thank the artifact evaluators from MICRO 2022. The authors
+methods for effectively utilizing multiple levels of TLBs         thank members of Computer Systems Labs at IISc for their
+under multi-tenancy [35]. MASK used L2 TLB tokens and             valuable comments and discussions. This work is partially
+selective bypassing of the L2 TLB to avoid thrashing under        supported by research grants from VMware and Google. Neha
+multi-tenancy [10]. DWS studied the impact of multi-tenancy       is supported by Prime Minister’s Research Fellowship, while
+on page walkers [10]. ETC studied pre-fetching and eviction       Arkaprava is partially supported by a Young Investigator
+policies under unified memory over-subscription [36]. Kim et      Fellowship by Pratiksha Trust, Bangalore.
+                        A PPENDIX                                  3) Software dependencies: We have containerized our
+                                                                setup and provided a Docker image for ease of evaluation.
+A. Abstract
+                                                                Therefore, we only have a software dependency on Docker.
+   Our artifact provides a Docker image with simulator code,    To install Docker on an Ubuntu machine, use the following
+required compilation tools (Go language), and scripts to        command.
+compile, run and parse the metrics. We have included the         sudo apt install docker.io
+code and scripts for reproducing figures 7,8,9, and 10 from
+the paper, corresponding to throughput, the ratio of remote
+to local TLB access, the ratio of remote to local page walk     D. Installation
+accesses, and page walk latencies, respectively.                   Please download the Docker file and code archive (tag-gz).
+                                                                Ensure the Dockerfile and code archive (tar-gz) are in the
+B. Artifact check-list (meta-information)                       same directory. Build the Docker image from the Docker file
+  • Compilation: golang                                         with the following command. Note: please run the command
+  • Run-time environment: Tested on Linux                       from the same directory as the Dockerfile and code archive.
+  • Hardware: Tested on x86
+  • Metrics: Throughput, Page walk latency, Ratio of local to   docker build -f mgvm.Dockerfile . -t mgvm
+    remote accesses.
+  • How much disk space required (approximately)?: 20 GB           The above command also copies the code archive inside
+  • How much time is needed to prepare workflow (approxi-       Docker and extracts it to mgvm directory.
+    mately)?: One (1) hour
+                                                                   Run the Docker container in interactive mode using the
+  • How much time is needed to complete experiments
+    (approximately)?: Forty Eight (48) hours                    following command. This command opens up a bash shell
+  • Publicly available?: yes                                    in the Docker image.
+                                                                docker run -it mgvm
+C. Description
+   We evaluated different virtual memory configurations for       Change directory to the mgvm directory. Then again to
+MCM GPUs using a modified version of MGPUSim. We                scripts sub-directory.
+have 15 benchmarks in our evaluation. We have containerized     cd mgvm
+our entire setup to allow easy evaluation.                      cd scripts
+Configurations
+   • Private TLB.                                                 The scripts directory contains several scripts for
+   • Shared TLB.                                                compiling and running the workloads.
+   • MGvm (our proposal).                                         Run the following scripts in order to setup the workloads.
+   • MGvm-nobalance (variant of our proposal).                  ./0_clean.sh
+Evaluation                                                      ./1_compile_benchmarks.py
+   Our primary results are in figures 7, 8, 9, and 10.          ./2_copy_benchmarks.sh
+   • Figure 7 shows the throughput of different configura-
+                                                                ./3_gen_runners.py
+      tions, normalized to private.
+                                                                   The above commands create four new sub-directories
+   • Figure 8 shows the ratio of remote vs local TLB hits.
+                                                                inside scripts folder, namely private, shared, mgvm,
+   • Figure 9 shows the ratio of remote vs local page walk
+                                                                mgvm-nobalance. These correspond to the various config-
+      accesses.
+                                                                urations under evaluation. Each of these sub-directories will
+   • Figure 10 shows the average page walk latency, normal-
+                                                                contain a samples folder, which contains the benchmark
+      ized to private.
+                                                                binaries, and scripts for running each benchmark. For e.g., a
+   1) How to access: Please download the Dockerfile and         file called convolution2d.sh is responsible for running
+the code archive (tar-gz) from the following URL.               the benchmark convolution2D with the right parameters.
+   https://doi.org/10.5281/zenodo.6937470.                         We have provided more scripts to run these workloads in
+   2) Hardware dependencies:                                    batches. Please see the next section.
+   • A single run (configuration) requires around 300-400
+      GB of RAM. Running all the configurations in parallel     E. Experiment workflow
+      requires 1.2 TB to 1.5 TB.                                  To run the experiments, we provide the following scripts :
+   • Each run requires 15 cores (for 15 workloads).               • 4 run benchmarks private.sh
+   We ran our simulations on x86-64 machines (both Intel          • 4 run benchmarks shared.sh
+and AMD). We expect our simulations to behave identically         • 4 run benchmarks mgvm-nobalance.sh
+if compiled and run on other architectures.                       • 4 run benchmarks mgvm.sh
+  For different configurations, please run the appropriate              [4] AMD, “Tools and sdks,” https://developer.amd.com/amd-
+scripts. The outputs would be stored in the corresponding                   accelerated-parallel-processing-app-sdk/, 2021.
+sub-directories in the scripts directory. If the machine
+has sufficient RAM and cores, one may run more than one                 [5] Apple, “Apple unveils m1 ultra, the world’s most powerful
+                                                                            chip for a personal computer,” https://www.apple.com/in/
+configuration at a time. Each configuration requires around                 newsroom/2022/03/apple-unveils-m1-ultra-the-worlds-most-
+300-400 GB RAM at peak, and 15 cores to run.                                powerful-chip-for-a-personal-computer/, 2022.
+  For e.g., to run the private configuration, please run,
+./4_run_benchmarks_private.sh                                           [6] ARM, “Why chiplets and why now?” https:
+                                                                            //community.arm.com/arm-community-blogs/b/infrastructure-
+   The scripts launch the jobs as background processes. Most                solutions-blog/posts/why-chiplets-why-now, 2022.
+jobs finish within 12 hours. A few (SPMV in particular) may
+                                                                        [7] A. Arunkumar, E. Bolotin, B. Cho, U. Milic, E. Ebrahimi,
+take up to 24 hours. We track the progress of our jobs using
+                                                                            O. Villa, A. Jaleel, C.-J. Wu, and D. Nellans, “Mcm-gpu:
+ps or top.                                                                  Multi-chip-module gpus for continued performance scalability,”
+   After all the configurations have finished running, please               in Proceedings of the 44th Annual International Symposium
+use the parsing scripts to generate a csv with the results. The             on Computer Architecture, ser. ISCA ’17. New York,
+output will be stored in the file results.csv. Please use                   NY, USA: ACM, 2017, pp. 320–332. [Online]. Available:
+                                                                            http://doi.acm.org/10.1145/3079856.3080231
+the same order of arguments to the parsing script.
+./5_collect_stats.py private shared \                                   [8] A. Arunkumar, E. Bolotin, B. Cho, U. Milic, E. Ebrahimi,
+        mgvm-nobalance mgvm                                                 O. Villa, A. Jaleel, C.-J. Wu, and D. Nellans, “Mcm-gpu:
+                                                                            Multi-chip-module gpus for continued performance scalability,”
+  Finally, running the normalization script over                            ACM SIGARCH Computer Architecture News, vol. 45, no. 2,
+results.csv as follows, will produce the normalized                         pp. 320–332, 2017.
+numbers as in the paper. The output will be stored in
+normalized.csv.                                                         [9] R. Ausavarungnirun, J. Landgraf, V. Miller, S. Ghose,
+                                                                            J. Gandhi, C. J. Rossbach, and O. Mutlu, “Mosaic:
+ ./6_normalize_results.py results.csv \                                     A gpu memory manager with application-transparent
+          normalized.csv                                                    support for multiple page sizes,” in Proceedings of
+                                                                            the 50th Annual IEEE/ACM International Symposium on
+                                                                            Microarchitecture, ser. MICRO-50 ’17. New York, NY,
+F. Evaluation and expected results                                          USA: ACM, 2017, pp. 136–150. [Online]. Available:
+  The contents of normalized.csv match the corre-                           http://doi.acm.org/10.1145/3123939.3123975
+sponding figures in the paper.
+                                                                       [10] R. Ausavarungnirun, V. Miller, J. Landgraf, S. Ghose,
+G. Notes                                                                    J. Gandhi, A. Jog, C. J. Rossbach, and O. Mutlu,
+                                                                            “Mask: Redesigning the gpu memory hierarchy to support
+   Please ensure that the scripts have executable permisssion               multi-application concurrency,” SIGPLAN Not., vol. 53,
+set. If not, please use chmod to set the executable bit.                    no. 2, p. 503–518, Mar. 2018. [Online]. Available:
+chmod u+x root <scriptname.ext>                                             https://doi.org/10.1145/3296957.3173169
+
+  Please use TMUX when running Docker using interactive                [11] T. W. Barr, A. L. Cox, and S. Rixner, “Translation caching:
+mode. If the Docker container dies while in interactive mode,               Skip, don’t walk (the page table),” in Proceedings of the 37th
+                                                                            Annual International Symposium on Computer Architecture,
+then the entire runs launched from the Docker image will                    ser. ISCA ’10. New York, NY, USA: Association for
+be lost. Alternatively, please start the Docker container in                Computing Machinery, 2010, p. 48–59. [Online]. Available:
+detached mode.                                                              https://doi.org/10.1145/1815961.1815970
+
+                         R EFERENCES                                   [12] T. W. Barr, A. L. Cox, and S. Rixner, “SpecTLB:
+ [1] R. Achermann, A. Panwar, A. Bhattacharjee, T. Roscoe, and              A mechanism for speculative address translation,” in
+     J. Gandhi, “Mitosis: Transparently self-replicating page-tables        Proceedings of the 38th Annual International Symposium
+     for large-memory machines,” in Proceedings of the Twenty-              on Computer Architecture, ser. ISCA ’11. New York,
+     Fifth International Conference on Architectural Support for            NY, USA: ACM, 2011, pp. 307–318. [Online]. Available:
+     Programming Languages and Operating Systems, 2020, pp.                 http://doi.acm.org/10.1145/2000064.2000101
+     283–300.
+                                                                       [13] T. Baruah, Y. Sun, A. T. Dinçer, S. A. Mojumder, J. L. Abellán,
+ [2] AMD, “Amd epyc products,” https://www.amd.com/en/                      Y. Ukidave, A. Joshi, N. Rubin, J. Kim, and D. Kaeli, “Griffin:
+     products/epyc, 2021.                                                   Hardware-software support for efficient page migration in
+                                                                            multi-gpu systems,” in 2020 IEEE International Symposium
+ [3] AMD, “Amd high bandwidth memory,” https://www.amd.com/                 on High Performance Computer Architecture (HPCA). IEEE,
+     en/technologies/hbm, 2021.                                             2020, pp. 596–609.
+[14] T. Baruah, Y. Sun, S. A. Mojumder, J. L. Abellán, Y. Ukidave,   [24] J. Gandhi, A. Basu, M. D. Hill, and M. M. Swift,
+     A. Joshi, N. Rubin, J. Kim, and D. Kaeli, “Valkyrie:                  “Efficient memory virtualization: Reducing dimensionality
+     Leveraging inter-tlb locality to enhance gpu performance,”            of nested page walks,” in Proceedings of the 47th Annual
+     in Proceedings of the ACM International Conference                    IEEE/ACM International Symposium on Microarchitecture,
+     on Parallel Architectures and Compilation Techniques,                 ser. MICRO-47. Washington, DC, USA: IEEE Computer
+     ser. PACT ’20. New York, NY, USA: Association for                     Society, 2014, pp. 178–189. [Online]. Available: http:
+     Computing Machinery, 2020, p. 455–466. [Online]. Available:           //dx.doi.org/10.1109/MICRO.2014.37
+     https://doi.org/10.1145/3410463.3414639
+                                                                      [25] Google, “A chiplet innovation ecosystem for a new era
+[15] A. Basu, J. Gandhi, J. Chang, M. D. Hill, and M. M.                   of custom silicon,” https://cloud.google.com/blog/topics/
+     Swift, “Efficient virtual memory for big memory servers,”             systems/open-chiplet-ecosystem-powering-next-era-of-
+     in Proceedings of the 40th Annual International Symposium             custom-silicon, 2022.
+     on Computer Architecture, ser. ISCA ’13. New York,
+     NY, USA: ACM, 2013, pp. 237–248. [Online]. Available:
+                                                                      [26] N. Hardavellas, M. Ferdman, B. Falsafi, and A. Ailamaki,
+     http://doi.acm.org/10.1145/2485922.2485943
+                                                                           “Reactive nuca: near-optimal block placement and replication
+                                                                           in distributed caches,” in Proceedings of the 36th annual
+[16] Basu, Arkaprava, “Revisiting virtual memory,” 2013, http:             international symposium on Computer architecture, 2009, pp.
+     //research.cs.wisc.edu/multifacet/theses/arka basu phd.pdf.           184–195.
+
+[17] Basu, Arkaprava and Hill, Mark D. amd Swift, Michael M.,         [27] S. Haria, M. D. Hill, and M. M. Swift, “Devirtualizing memory
+     “Virtual memory management system with reduced latency,”              in heterogeneous systems,” in Proceedings of the Twenty-
+     2015, https://patents.google.com/patent/US9158704B2/en.               Third International Conference on Architectural Support for
+                                                                           Programming Languages and Operating Systems, ser. ASPLOS
+[18] A. Bhattacharjee and M. Martonosi, “Inter-core cooperative            ’18. New York, NY, USA: ACM, 2018, pp. 637–650. [Online].
+     TLB for chip multiprocessors,” in Proceedings of the Fifteenth        Available: http://doi.acm.org/10.1145/3173162.3173194
+     Edition of ASPLOS on Architectural Support for Programming
+     Languages and Operating Systems, ser. ASPLOS XV. New             [28] A. Jaleel, E. Ebrahimi, and S. Duncan, “Ducati: High-
+     York, NY, USA: ACM, 2010, pp. 359–370. [Online].                      performance address translation by extending tlb reach
+     Available: http://doi.acm.org/10.1145/1736020.1736060                 of gpu-accelerated systems,” ACM Trans. Archit. Code
+                                                                           Optim., vol. 16, no. 1, Mar. 2019. [Online]. Available:
+[19] J. Chang and G. S. Sohi, “Cooperative caching for                     https://doi.org/10.1145/3309710
+     chip multiprocessors,” in Proceedings of the 33rd Annual
+     International Symposium on Computer Architecture, ser.
+     ISCA ’06. USA: IEEE Computer Society, 2006, p. 264–276.          [29] S. N. Jonathan Koomey, “Moore’s law might be slowing down,
+     [Online]. Available: https://doi.org/10.1109/ISCA.2006.17             but not energy efficiency,” https://spectrum.ieee.org/moores-
+                                                                           law-might-be-slowing-down-but-not-energy-efficiency, 2015.
+[20] S. Che, B. Beckmann, S. K. Reinhardt, and K. Skadron,
+     “Pannotia: Understanding irregular GPGPU graph applications,”    [30] V. Karakostas, J. Gandhi, F. Ayar, A. Cristal, M. D. Hill,
+     in 2013 IEEE International Symposium on Workload Charac-              K. S. McKinley, M. Nemirovsky, M. M. Swift, and O. Ünsal,
+     terization, IISWC 2013, 09 2013, pp. 185–195.                         “Redundant memory mappings for fast access to large
+                                                                           memories,” in Proceedings of the 42Nd Annual International
+                                                                           Symposium on Computer Architecture, ser. ISCA ’15. New
+[21] G. Cox and A. Bhattacharjee, “Efficient address translation           York, NY, USA: ACM, 2015, pp. 66–78. [Online]. Available:
+     for architectures with multiple page sizes,” in Proceedings of        http://doi.acm.org/10.1145/2749469.2749471
+     the Twenty-Second International Conference on Architectural
+     Support for Programming Languages and Operating
+     Systems, ser. ASPLOS ’17. New York, NY, USA:                     [31] M. Khairy, V. Nikiforov, D. Nellans, and T. G. Rogers,
+     ACM, 2017, pp. 435–448. [Online]. Available: http:                    “Locality-centric data and threadblock management for mas-
+     //doi.acm.org/10.1145/3037697.3037704                                 sive gpus,” in 2020 53rd Annual IEEE/ACM International
+                                                                           Symposium on Microarchitecture (MICRO). IEEE, 2020, pp.
+                                                                           1022–1036.
+[22] I. Cutress, “Intel: Sapphire rapids with 64gb of
+     hbm2e, ponte vecchio with 408 mb l2 cache,” https:
+     //www.anandtech.com/show/17067/intel-sapphire-rapids-            [32] H. Kim, R. Hadidi, L. Nai, H. Kim, N. Jayasena, Y. Eck-
+     with-64-gb-of-hbm2e-ponte-vecchio-with-408-mb-l2-cache,               ert, O. Kayiran, and G. Loh, “Coda: Enabling co-location
+     2021.                                                                 of computation and data for multiple gpu systems,” ACM
+                                                                           Transactions on Architecture and Code Optimization (TACO),
+[23] A. Danalis, G. Marin, C. McCurdy, J. S. Meredith, P. C.               vol. 15, no. 3, pp. 1–23, 2018.
+     Roth, K. Spafford, V. Tipparaju, and J. S. Vetter, “The
+     scalable heterogeneous computing (shoc) benchmark suite,”        [33] H. Kim, J. Sim, P. Gera, R. Hadidi, and H. Kim,
+     in Proceedings of the 3rd Workshop on General-Purpose                 Batch-Aware Unified Memory Management in GPUs for
+     Computation on Graphics Processing Units, ser. GPGPU-3.               Irregular Workloads. New York, NY, USA: Association
+     New York, NY, USA: ACM, 2010, pp. 63–74. [Online].                    for Computing Machinery, 2020, p. 1357–1370. [Online].
+     Available: http://doi.acm.org/10.1145/1735688.1735702                 Available: https://doi.org/10.1145/3373376.3378529
+[34] J. B. Kotra, M. LeBeane, M. T. Kandemir, and G. H.                  [46] B. Pham, V. Vaidyanathan, A. Jaleel, and A. Bhattacharjee,
+     Loh, “Increasing gpu translation reach by leveraging under-              “CoLT: Coalesced large-reach TLBs,” in 2012 45th Annual
+     utilized on-chip resources,” in MICRO-54: 54th Annual                    IEEE/ACM International Symposium on Microarchitecture,
+     IEEE/ACM International Symposium on Microarchitecture,                   Dec 2012, pp. 258–269.
+     ser. MICRO ’21. New York, NY, USA: Association
+     for Computing Machinery, 2021, p. 1169–1181. [Online].              [47] B. Pichai, L. Hsu, and A. Bhattacharjee, “Architectural
+     Available: https://doi.org/10.1145/3466752.3480105                       support for address translation on GPUs: Designing memory
+                                                                              management units for CPU/GPUs with unified address
+[35] B. Li, J. Yin, Y. Zhang, and X. Tang, “Improving                         spaces,” in Proceedings of the 19th International Conference
+     address translation in multi-gpus via sharing and spilling               on Architectural Support for Programming Languages
+     aware tlb design,” in MICRO-54: 54th Annual IEEE/ACM                     and Operating Systems, ser. ASPLOS ’14. New York,
+     International Symposium on Microarchitecture, ser. MICRO                 NY, USA: ACM, 2014, pp. 743–758. [Online]. Available:
+     ’21. New York, NY, USA: Association for Computing                        http://doi.acm.org/10.1145/2541940.2541942
+     Machinery, 2021, p. 1154–1168. [Online]. Available:
+     https://doi.org/10.1145/3466752.3480083                             [48] L.-N. Pouchet and T. Yuki, “Polybench,” 2010, http://web.cse.
+                                                                              ohio-state.edu/∼pouchet.2/software/polybench/.
+[36] C. Li, R. Ausavarungnirun, C. J. Rossbach, Y. Zhang,                [49] B. Pratheek, N. Jawalkar, and A. Basu, “Improving gpu multi-
+     O. Mutlu, Y. Guo, and J. Yang, “A framework for memory                   tenancy with page walk stealing,” in 2021 IEEE International
+     oversubscription management in graphics processing units,”               Symposium on High-Performance Computer Architecture
+     in Proceedings of the Twenty-Fourth International Conference             (HPCA), 2021, pp. 626–639.
+     on Architectural Support for Programming Languages and
+     Operating Systems, ser. ASPLOS ’19. New York, NY,                   [50] V. S. S. Ram, A. Panwar, and A. Basu, “Trident: Harnessing
+     USA: Association for Computing Machinery, 2019, p. 49–63.                architectural resources for all page sizes in x86 processors,” in
+     [Online]. Available: https://doi.org/10.1145/3297858.3304044             MICRO-54: 54th Annual IEEE/ACM International Symposium
+                                                                              on Microarchitecture, ser. MICRO ’21. New York, NY, USA:
+[37] G. H. Loh, S. Naffziger, and K. Lepak, “Understanding                    Association for Computing Machinery, 2021, p. 1106–1120.
+     chiplets today to anticipate future integration opportunities and        [Online]. Available: https://doi.org/10.1145/3466752.3480062
+     limits,” in 2021 Design, Automation Test in Europe Conference
+     Exhibition (DATE), 2021, pp. 142–145.                               [51] X. Ren, D. Lustig, E. Bolotin, A. Jaleel, O. Villa, and
+                                                                              D. Nellans, “Hmg: Extending cache coherence protocols
+[38] J. Lowe-Power, M. Hill, and D. Wood, “Supporting x86-64                  across modern hierarchical multi-gpu systems,” in 2020 IEEE
+     address translation for 100s of GPU lanes,” in Proceedings               International Symposium on High Performance Computer
+     of International Symposium on High-Performance Computer                  Architecture (HPCA). IEEE, 2020, pp. 582–595.
+     Architecture, ser. HPCA ’14, 02 2014, pp. 568–578.
+                                                                         [52] S. Shahar, S. Bergman, and M. Silberstein, “Activepointers:
+[39] C. Mazumdar, P. Mitra, and A. Basu, “Dead page and                       A case for software address translation on gpus,” in 2016
+     dead block predictors: Cleaning tlbs and caches together,”               ACM/IEEE 43rd Annual International Symposium on Com-
+     in 2021 IEEE International Symposium on High-Performance                 puter Architecture (ISCA), 2016, pp. 596–608.
+     Computer Architecture (HPCA), 2021, pp. 507–519.
+                                                                         [53] Y. S. Shao, J. Clemons, R. Venkatesan, B. Zimmer, M. Fojtik,
+                                                                              N. Jiang, B. Keller, A. Klinefelter, N. Pinckney, P. Raina, S. G.
+[40] U. Milic, O. Villa, E. Bolotin, A. Arunkumar, E. Ebrahimi,
+                                                                              Tell, Y. Zhang, W. J. Dally, J. Emer, C. T. Gray, B. Khailany,
+     A. Jaleel, A. Ramirez, and D. Nellans, “Beyond the socket:
+                                                                              and S. W. Keckler, “Simba: Scaling deep-learning inference
+     Numa-aware gpus,” in Proceedings of the 50th Annual
+                                                                              with multi-chip-module-based architecture,” in Proceedings
+     IEEE/ACM International Symposium on Microarchitecture,
+                                                                              of the 52nd Annual IEEE/ACM International Symposium
+     2017, pp. 123–135.
+                                                                              on Microarchitecture, ser. MICRO ’52. New York, NY,
+[41] Nvidia, “Nvidia ampere architecture in-depth.” [Online].                 USA: Association for Computing Machinery, 2019, p. 14–27.
+     Available: https://developer.nvidia.com/blog/nvidia-ampere-              [Online]. Available: https://doi.org/10.1145/3352460.3358302
+     architecture-in-depth/                                              [54] S. Shin, G. Cox, M. Oskin, G. H. Loh, Y. Solihin, A. Bhat-
+                                                                              tacharjee, and A. Basu, “Scheduling page table walks for
+[42] Nvidia, “Nvidia pascal mmu,” 2019, https://nvidia.github.io/             irregular gpu applications,” in 2018 ACM/IEEE 45th Annual
+     open-gpu-doc/pascal/gp100-mmu-format.pdf.                                International Symposium on Computer Architecture (ISCA),
+                                                                              June 2018, pp. 180–192.
+[43] Nvidia, “Nvidia grace cpu,” https://www.nvidia.com/en-in/
+     data-center/grace-cpu/, 2022.                                       [55] S. Shin, M. LeBeane, Y. Solihin, and A. Basu, “Neighborhood-
+                                                                              aware address translation for irregular gpu applications,” in
+[44] NVIDIA, “Nvidia hopper architecture,” 2022, https://nvdam.               Proceedings of the 51st Annual IEEE/ACM International
+     widen.net/s/9bz6dw7dqr/gtc22-whitepaper-hopper.                          Symposium on Microarchitecture, ser. MICRO-51. Piscataway,
+                                                                              NJ, USA: IEEE Press, 2018, pp. 352–363. [Online]. Available:
+[45] A. Panwar, R. Achermann, A. Basu, A. Bhattacharjee,                      https://doi.org/10.1109/MICRO.2018.00036
+     K. Gopinath, and J. Gandhi, “Fast local page-tables for
+     virtualized numa servers with vmitosis,” in Proceedings of the      [56] R. Smith, “Amd announces mi200 accelerator family,”
+     26th ACM International Conference on Architectural Support               https://www.anandtech.com/show/17054/amd-announces-
+     for Programming Languages and Operating Systems, 2021,                   instinct-mi200-accelerator-family-cdna2-exacale-servers,
+     pp. 194–210.                                                             2021.
+[57] R. Smith, “Universal chiplet interconnect express (ucie)              virtual memory for heterogeneous systems,” in 2016 IEEE
+     announced: Setting standards for the chiplet ecosystem,”              International Symposium on Performance Analysis of Systems
+     https://www.anandtech.com/show/17288/universal-chiplet-               and Software (ISPASS), April 2016, pp. 161–171.
+     interconnect-express-ucie-announced-setting-standards-for-
+     the-chiplet-ecosystem, 2022.
+                                                                      [63] T. Vijayaraghavan, Y. Eckert, G. H. Loh, M. J. Schulte, M. Ig-
+[58] I. Spectrum, “Behind intel’s hpc chip that will pierce                natowski, B. M. Beckmann, W. C. Brantley, J. L. Greathouse,
+     the exascale barrier,” https://spectrum.ieee.org/intel-s-             W. Huang, A. Karunanithi, O. Kayiran, M. Meswani, I. Paul,
+     exascale-supercomputer-chip-is-a-master-class-in-3d-                  M. Poremba, S. Raasch, S. K. Reinhardt, G. Sadowski, and
+     integration#toggle-gdpr, 2022.                                        V. Sridharan, “Design and analysis of an apu for exascale
+                                                                           computing,” in 2017 IEEE International Symposium on High
+[59] Y. Sun, X. Gong, A. K. Ziabari, L. Yu, X. Li, S. Mukherjee,           Performance Computer Architecture (HPCA), Feb 2017, pp.
+     C. McCardwell, A. Villegas, and D. Kaeli, “Hetero-mark, a             85–96.
+     benchmark suite for cpu-gpu collaborative computing,” in 2016
+     IEEE International Symposium on Workload Characterization
+     (IISWC). IEEE, 2016, pp. 1–10.                                   [64] T. Vijayaraghavan, Y. Eckert, G. H. Loh, M. J. Schulte,
+                                                                           M. Ignatowski, B. M. Beckmann, W. C. Brantley, J. L.
+[60] Y. Sun, X. Gong, A. K. Ziabari, L. Yu, X. Li, S. Mukherjee,           Greathouse, W. Huang, A. Karunanithi et al., “Design and
+     C. Mccardwell, A. Villegas, and D. Kaeli, “Hetero-mark, a             analysis of an apu for exascale computing,” in 2017 IEEE
+     benchmark suite for cpu-gpu collaborative computing,” in 2016         International Symposium on High Performance Computer
+     IEEE International Symposium on Workload Characterization             Architecture (HPCA). IEEE, 2017, pp. 85–96.
+     (IISWC), 2016, pp. 1–10.
+
+[61] X. Tang, Z. Zhang, W. Xu, M. T. Kandemir, R. Melhem,             [65] N. Vijaykumar, E. Ebrahimi, K. Hsieh, P. B. Gibbons,
+     and J. Yang, “Enhancing address translations in throughput            and O. Mutlu, “The locality descriptor: A holistic cross-
+     processors via compression,” in Proceedings of the                    layer abstraction to express data locality in gpus,” in 2018
+     ACM International Conference on Parallel Architectures and            ACM/IEEE 45th Annual International Symposium on Computer
+     Compilation Techniques, ser. PACT ’20. New York, NY, USA:             Architecture (ISCA), 2018, pp. 829–842.
+     Association for Computing Machinery, 2020, p. 191–204.           [67] V. Young, A. Jaleel, E. Bolotin, E. Ebrahimi, D. Nellans,
+     [Online]. Available: https://doi.org/10.1145/3410463.3414633          and O. Villa, “Combining hw/sw mechanisms to improve
+                                                                           numa performance of multi-gpu systems,” in 2018 51st Annual
+[62] J. Vesely, A. Basu, M. Oskin, G. H. Loh, and A. Bhattachar-           IEEE/ACM International Symposium on Microarchitecture
+     jee, “Observations and opportunities in architecting shared           (MICRO). IEEE, 2018, pp. 339–351.
+[66] H. Yoon, J. Lowe-Power, and G. S. Sohi, “Filtering translation
+     bandwidth with virtual caching,” in Proceedings of the Twenty-
+     Third International Conference on Architectural Support for      [68] T. Zheng, D. Nellans, A. Zulfiqar, M. Stephenson, and S. W.
+     Programming Languages and Operating Systems, ser. ASPLOS              Keckler, “Towards high performance paged memory for gpus,”
+     ’18. New York, NY, USA: ACM, 2018, pp. 113–127. [Online].             in 2016 IEEE International Symposium on High Performance
+     Available: http://doi.acm.org/10.1145/3173162.3173195                 Computer Architecture (HPCA), 2016, pp. 345–357.
+

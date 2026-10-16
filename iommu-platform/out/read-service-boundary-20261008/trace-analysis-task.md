@@ -1,0 +1,8 @@
+普通脚本实现/证据整理任务。请返回一个精简完整Python3标准库脚本（建议<=200行，别搭framework）、解析接口/限制，不能声称执行。Codex会执行和核诊断。CLI --root DIR --output FILE，读取DIR的serial-p.log,serial-pn.log和对应-events.csv；不得修改项目，写JSON到FILE。可使用下述现有指标口径和示例，不需要读CPP或大仓库。
+CSV columns cycle,event,tag,address,value，cycle相对win_open。窗口pre-edge事件(open,close]，ddr_ar是实际DDR_AR握手(6bitID:>>4&3=port;2DMAdata,3DS,0CPU)，ddr_r_last是完整read握手，value为accept->last latency。fast_response tag是bank0/1；newcaptured标签低4bit originalid，bit4bank，bit5FAST。source IDs0/4分别V/A，所有data burst len255；Vsourceaddr0x80000000/0x80000800两段循环。arfire tag=originalsourceid 是代理下游实际AR握手；ddr_ar port2且low4bit=0/4是物理数据读。不存在跨同源乱序；每个请求原ID内FIFO，FAST标签源FIFO已验收。
+任务：
+1)提取READ-SERVICE-WINDOW-JSON,ACTUAL-DMA-WINDOW-JSON和FAST标签终端，4服务类sum==W且transfer==window.ddr_r/backpressure==window.ddr_r_stall，否则raise。算PN-P四类别差值正好Wdiff，注明是服务账本不是独立因果。
+2)按source FIFO匹配全部newcaptured、arfire、data ddr_ar，交叉count/addr/len、nonnegative cycles；FAST响应仅bank0窗口62，按同源FAST capture序配对fast_response，要求全部对应/时间非负，否则输出具体missing不要硬改。给FAST->newcaptured/arfire/ddr_ar min/median/max，first burst vs second burst分组；同时所有V数据read capture->arfire->DDR延迟对比P/PN。不得把相对wallcycle差直接当copy耗时，不匹配CPU/PTW为DMAdata。
+3)用每cycle ddr_ar(+1)和ddr_r_last(-1)重建FIFO pending/read队列空闲区间，事件在posedge后改变队列，因此某cycle的pre-edge empty基于此前cycle事件。最开始pending未知，只尝试pending0并把边界假设写输出；若pending为负或重建empty!=实测empty，输出unverified诊断，不伪造初始值/不据此报告因果。最后服务计数本身仍有效。不按长区间逐cycle膨胀几十万数组；可event grouped扫描或有限W<=100k也可以。保留最长8个emptyinterval，记录区间中/附近可观察FAST/newcaptured/arfire/aw_wait_change/ptw_start/end/dma_done，不能直接写这就是IOMMU/DMA瓶颈。窗口opening cycle0不计，closing cycleW计。
+4)readlatency模型默认serial仅观察，无干预源码。返回中文导航摘要+代码，不造未观察机制原因/创新。代码在source数据不匹配时清晰报错或diagnostic，不能 silently drop事件；所有原字段完整记录。输入文件只为字段验证，不需输出全部CSV。
+

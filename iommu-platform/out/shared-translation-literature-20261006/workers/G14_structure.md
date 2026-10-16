@@ -1,0 +1,671 @@
+# G14_structure 证据阅读报告（仅基于给定全文；不联网）
+
+## 0. 导航摘要（≤1页）
+
+本组 8 篇新证据 + 1 篇对照旧文 `revelator2026v2`。本组主线不是单一“IOMMU/SVA 方案”，而是 **CPU 侧地址翻译与 OS 内存管理接口** 的演化：
+
+1. **2011 SpecTLB**：利用 reservation-based 分配器的“对齐/连续”规律，对 TLB miss 做 VA→PA 插值预测，并并行验证页表。核心是 **推测**。
+2. **2016 Ingens**：把 contiguity 当作一等资源，用利用率/访问频率驱动 huge page 提升、降级、公平分配、主动压缩。核心是 **OS 生命周期与尾延迟**。
+3. **2019 Translation Ranger**：不再只靠分配时连续，而是在运行中主动合并同一 VMA 的碎片页，生成任意大小 contiguity。核心是 **后分配碎片整理**。
+4. **2020 CA paging + SpOT**：CA paging 在缺页分配路径生成大连续映射；SpOT 用 PC 索引预测表推测 gVA→hPA，后台验证嵌套页表。核心是 **分配路径 + 推测验证**。
+5. **2021 Midgard**：引入 VMA 粒度的中间地址空间，V2M 用 VLB/VMA Table 快速翻译，M2P 只在 LLC miss 时做重翻译。核心是 **拆分翻译层级**。
+6. **2023 Memento**：把 malloc/free 语义暴露给硬件，用 HOT 和硬件页分配器处理 serverless 短生命周期对象/页。核心是 **临时内存生命周期**。
+7. **2024 DPT**：把物理内存当作无界哈希页表，用 Hash(VPN tag, PID) 直接定位 PTE 页，SOA/CVA/CPD 解决地址碰撞。核心是 **页表结构去串行化**。
+8. **2025 EMT**：在 Linux 上抽象 translation object/database/service，用 MMU driver 支持 radix/ECPT/FPT 等结构。核心是 **OS 可扩展接口**。
+9. **对照 2026 Revelator**：用 OS tiered hash-based allocation 建立可预测 VA→PA，硬件在 L2 TLB miss 后推测数据/PTE 位置。它与本组多篇有 actual citation 关系：SpecTLB、SpOT/CA paging、Translation Ranger、Ingens、DPT、EMT、Midgard 均被其参考文献引用；**Memento 在给定 Revelator 全文里未找到引用条目**，只能做 mechanism_comparison，不能假称实际引用。
+
+**本组最确定的瓶颈**：碎片化破坏连续映射；页表串行访问/多级 walk 成本高；OS 分配/迁移/失效维护成本高；新翻译结构难以接入 commodity OS；尾延迟在 huge page/压缩路径中明显。
+
+**本组不能断言的**：不能从这些全文推出“IOMMU/SVA 已解决/无人做”。EMT 明确说不面向 IOMMU DMA；Memento 不是设备翻译；Midgard 不是 IOMMU/SVA；Translation Ranger、CA paging、SpecTLB、Ingens、DPT 都是 CPU/虚拟化侧。**远端 PTW、设备队列、设备页表缓存一致性、SVA 权限/身份复用粒度、跨设备失效，本组全文基本未覆盖。**
+
+---
+
+## A. 按时间的机制演化
+
+### 2011 SpecTLB：把“可预测的 reservation”变成推测翻译
+- 前作：FreeBSD reservation-based superpage，Talluri & Hill partial-subblock TLB，Navarro et al. 透明 superpage。SpecTLB 观察到：reservation 中 4KB 页的 VA offset 与 PA offset 对齐，因此 TLB miss 可先插值预测 PA，再并行 walk 验证。
+- 关键改变：从“增加 TLB 容量/大页覆盖”转为“提前给出可验证的 PA，隐藏 TLB miss 延迟”。
+- 仍依赖条件：OS 必须有 reservation-based allocator；显式 marking 需要 OS/PTE 改动，论文实际用 heuristic；预测必须验证；I/O/不可缓存区域需防止推测副作用。
+- 真实评估：microarchitecture-independent simulation，AMD SimNow 采 trace，自定义 MMU 模拟器；不是硬件原型。
+
+### 2016 Ingens：从“有 huge page”到“公平、低尾延迟、低 bloat 地管理 contiguity”
+- 前作：Linux THP、FreeBSD reservation promotion、KVM page sharing。
+- 关键改变：显式把 contiguity 当资源，用 util bitvector 记录利用率、access bitvector/EMA 记录访问频率；Promote-kth 异步提升，Proactive batched compaction 主动压缩，公平分配 huge page。
+- 仍依赖条件：OS/hypervisor 共享内存管理代码（Linux/KVM）；4KB/2MB；匿名内存；单 NUMA 区域；access bit 清位会触发 TLB invalidation。
+- 真实评估：Linux 4.3 原型 + KVM，真实硬件；报告 tail latency、bloat、fairness、sharing tradeoff。
+
+### 2019 Translation Ranger：从“分配时连续”到“后分配碎片整理”
+- 前作：huge page、direct segments、RMM、devirtualizing memory、Hybrid TLB、CoLT。
+- 关键改变：不要求预分配/identity mapping/固定大页；给每个 VMA 选 anchor point，运行时后台合并同一 VMA 的碎片物理帧；处理 inter-VMA 干扰、非可迁移页、COW、synonym、VMA 增长/收缩。
+- 仍依赖条件：连续区域属于同一 VMA 且权限一致；权限变更会打断 VMA/连续区域；页面迁移和 TLB shootdown 有成本；NUMA 未深入。
+- 真实评估：Linux v4.16 真机实现，Broadwell 2-socket，120GB 级 footprint；主要测 contiguity coverage 和 runtime overhead。
+
+### 2020 CA paging + SpOT：分配路径生成连续性，硬件推测翻译
+- 前作：Translation Ranger 后分配迁移；RMM 预分配；Hybrid TLB 对齐限制；SpecTLB/Glue 只处理 huge page 内 4KB。
+- 关键改变：CA paging 用 offset + contiguity map + next-fit，在缺页分配路径生成大于页的连续映射，不预分配；SpOT 用 PC 索引预测表缓存 [2D offset, permissions]，在 L2 TLB miss 后预测 hPA，后台嵌套 walk 验证。
+- 仍依赖条件：CA paging 是 best-effort；SpOT 依赖上一次同 PC 访问的 offset/权限；OS 需给 PTE 打 reserved bit；安全 mitigation 开销未完整实测。
+- 真实评估：Linux v4.19 + KVM，BadgerTrap 在真机模拟 TLB miss/硬件方案，SpOT 为模拟/仿真式评估。
+
+### 2021 Midgard：把地址空间一分为二
+- 前作：virtual cache、single address space OS、in-cache address translation、range TLB、VBI。
+- 关键改变：VMA 直接进硬件，建立系统级 Midgard 中间地址空间；V2M 以 VMA 粒度用 VLB/VMA Table 翻译，M2P 以页粒度只在 LLC miss 后走 Midgard Page Table/MLB。
+- 仍依赖条件：OS 要映射 VMA→MMA、去重共享 VMA、维护 MMA 增长/冲突/迁移；硬件要 VLB、MLB、额外 cache tag 位、store rollback 支持；当前是 software-modeled proof-of-concept。
+- 真实评估：QFlex/QEMU trace-driven，AMAT 分析，22nm CMOS 分析 VLB；不是流片。
+
+### 2023 Memento：serverless 临时内存生命周期硬件化
+- 前作：Mallacc 只加速 C++ userspace malloc；传统 mmap/page fault/munmap 路径昂贵；cold-start 优化不解决分配/释放临界路径。
+- 关键改变：ISA 扩展 obj-alloc/obj-free；HOT 在核附近缓存 arena 元数据；硬件页分配器管理 Memento 页池和 Memento Page Table；主存 bypass 让新对象先在 cache 中实例化。
+- 仍依赖条件：OS 预留 Memento 地址区间、控制寄存器；只支持 ≤512B 小对象、heap、RW/NX；大对象/文件后端交给软件；多核需 flush HOT；不是设备翻译。
+- 真实评估：QEMU + SST + DRAMSim3 full-system simulation；CACTI 估 HOT/AAC 面积功耗；不是真机硬件原型。
+
+### 2024 DPT：用哈希页表替代串行 radix walk
+- 前作：radix page table、conventional HPT、ECPT、ME-HPT、Mosaic。
+- 关键改变：把整个物理内存当巨大 HPT，PTE 页位置由 Hash(VPN tag, PID) 决定；SOA/CVA/CPD 解决“地址碰撞”；DMT/DMC 缓存 stride/step 元数据。
+- 仍依赖条件：MMU 改动、DMT 寄存器、frame bitmap、reverse map；PTE 页不可迁移；高利用率下 CPD 可能迁移数据页并触发 TLB shootdown；CVA 受 MAX CVA SIZE/CNT 限制；demand paging 下 CVA 适用性有限。
+- 真实评估：Sniper cycle-level 模拟 + Linux 5.11 真机原型验证分配机制；性能主结果来自模拟。
+
+### 2025 EMT：承认 commodity OS 不可扩展，做 OS 框架
+- 前作：ECPT、FPT、DPT、Mosaic、Utopia、Virtuoso、FBMM。
+- 关键改变：EMT 抽象 translation object、translation database、translation service；架构无关代码不再硬编码 radix tree；MMU driver 实现基本函数与可定制函数。
+- 仍依赖条件：硬件未上市，用 QEMU 模拟 MMU；ECPT 有 kECPT self-reference paradox、锁/稀疏地址空间问题；EMT 自身不解决物理页操作；**明确不支持 IOMMU translation for DMA**；只支持 native，虚拟化在 roadmap。
+- 真实评估：EMT-Linux v5.15，LTP 1,208 tests，真机接口开销 <0.5%；ECPT/FPT 用 QEMU 模拟 + DynamoRIO 硬件模拟。
+
+### 对照 2026 Revelator：哈希分配建立可预测性，避免 contiguity 脆弱性
+- 与 SpOT/CA paging 对比：SpOT 依赖任意大连续段；Revelator 用 per-page hash placement，成功率只依赖内存利用率，不依赖碎片/分配干扰。
+- 与 SpecTLB 对比：SpecTLB 依赖 reserved large page；Revelator 用 tiered hash candidates。
+- 与 DPT/EMT 对比：Revelator 与 hash-based page table 正交；EMT 可作为集成载体。
+- 与本组关系：**actual citation** 确认 Revelator 引用了 SpecTLB、SpOT/CA paging、Translation Ranger、Ingens、DPT、EMT、Midgard。Memento 未在给定 Revelator 参考文献中找到，不能假称实际引用。
+
+---
+
+## B. 证据卡
+
+### 1. translation_ranger2019
+
+**题录核对**：文件 `translation_ranger2019.txt` L1–L19：标题 “Translation Ranger: Operating System Support for Contiguity-Aware TLBs”；作者 Zi Yan, Daniel Lustig, David Nellans, Abhishek Bhattacharjee；ISCA ’19；DOI 10.1145/3307650.3322223。
+
+**精确机制**：OS 后台服务主动合并同一 VMA 内碎片物理帧，生成任意大小连续映射；给每个 VMA 选 anchor point；跟踪 coalesced/uncoalesced 区域避免 inter-VMA 干扰；VMA 增长/收缩时迭代重定位；用页交换而非中间页复制；跳过内核/不可迁移页，busy 页后续再试；处理 synonym/COW。
+
+**复用粒度及身份/权限匹配前提**：连续区域以 VMA 为语义单位；论文明确假设连续区域属于单个 VMA 且所有虚拟页权限一致（L901–L903）。若权限变化，VMA 被拆成多个 VMA，连续区域也被打断，contiguity-aware TLB 需要更多 entry（L903–L914）。身份匹配依赖进程地址空间/VMA，不是设备 PASID/IOMMU 身份。
+
+**资源共享 vs 映射共享/SVA**：论文讨论 CPU/GPU/accelerator 共享虚拟地址空间的动机（L25–L30, L104–L113），但实现与评估是 Linux CPU 侧 contiguity 生成，没有设备 IOMMU/SVA 页表共享、PASID、设备 TLB 失效机制。
+
+**评价配置**：Linux v4.16，2-socket Intel E5-2650v4 Broadwell，128GB DDR4，SPEC ACCEL/GAP/Graph500/GUPS；人为碎片化+memhog 预处理；比较 Linux Default、Large Max Order、Enhanced khugepaged、Translation Ranger 5s/50s；测 TotalNumContigRegions、MemCoverage32/128、runtime。报告 120GB footprint 约 >90% 由 128 区域覆盖，<2% overhead（L31–L37, L693–L708, L750–L783）。
+
+**限制/未覆盖**：初始只研究单 memory node，NUMA 跨 socket 留作未来（L890–L900）；需要 contiguity-aware TLB 硬件才能兑现收益；未穷举多种 TLB 设计；页面迁移/TLB shootdown 是实际税；权限一致假设强。
+
+**对可能创新点最强反证**：如果创新点是“只要 OS 把页合并，硬件 TLB 就自然解决”，本文反例是：连续区域一旦遇到权限变化、VMA 拆分、非可迁移页、跨 NUMA，就会被打破；且 OS 合并本身有迁移/失效成本。
+
+**后续必追引文**：RMM [23]；Devirtualizing Memory [18]；Hybrid TLB Coalescing [37]；CoLT [39]；Nimble Page Management [54]；Direct Segments [4]。
+
+**可导航原文证据**：
+- `translation_ranger2019.txt` L25–L37：主动合并分散物理帧，真机实现，120GB/128 区域、<2% overhead。
+- L135–L142：Translation Ranger 主动合并同 VMA 碎片页，服务 contiguity-aware TLB。
+- L284–L328：anchor point 与 inter-VMA interference。
+- L901–L914：连续区域要求单一 VMA 且权限一致；权限变化打断连续区域。
+- L890–L900：NUMA 只做单节点初始研究，跨 socket 未来工作。
+- L693–L708：128 区域覆盖 >90% 120GB footprint，对比传统 TLB coverage。
+
+---
+
+### 2. spectlb2011
+
+**题录核对**：`spectlb2011.txt` L1–L7：标题 “SpecTLB: A Mechanism for Speculative Address Translation”；作者 Thomas W. Barr, Alan L. Cox, Scott Rixner；L59–L60：ISCA’11，June 4–8, 2011, San Jose；正文无 DOI，填 null。
+
+**精确机制**：SpecTLB 跟踪“部分填充的大页 reservation”，TLB miss 时若 VA 落在已跟踪 reservation 的 2MB 虚拟页，则用 reservation 的物理页号 + 大页内 offset 插值出候选 PA，让处理器先推测执行；真正 x86 page walk 并行进行，结果匹配则提交，不匹配回滚。有两种变体：显式 PTE reservation bit marking；heuristic，检测 `VA[20:12] == PA[20:12]`。
+
+**复用粒度及身份/权限匹配前提**：以 2MB reservation 和 4KB base page 为粒度；需要 OS  reservation allocator；显式 marking 需要修改 x86 PTE 和 OS；heuristic 不修改 OS，但 false positive 1:512、false negative 0；预测必须与底层 page table 验证，stale entry 不会导致错误操作，只浪费；context switch 时清 SpecTLB，虽非严格必要。
+
+**资源共享 vs 映射共享/SVA**：SpecTLB 针对 native 与 nested paging 虚拟化，不针对设备共享地址空间/SVA。嵌套场景是 gVA→gPA→hPA 的二维 walk 推测，不是 IOMMU 设备翻译。
+
+**评价配置**：microarchitecture-independent simulation；AMD SimNow 采 trace，自定义 MMU 模拟器；模拟 AMD Family 10h Opteron 风格：64-entry L1 TLB、512-entry L2 small、128-entry L2 large、16-entry NTLB、24-entry Page Walk Cache；Dinero IV 模拟 1MB L2。报告平均 overlap 57% page walk、40% MMU DRAM accesses、misprediction <1%。嵌套部分为分析/模拟，不是实机。
+
+**限制/未覆盖**：无硬件原型；显式 marking 尚未进入任何 OS，论文实际采用 heuristic（L419–L423）；I/O/不可缓存 speculative side effects 需要额外 tagging 机制（L323–L331）；依赖 reservation-based allocator；嵌套场景大量为“argue”而非完整实测。
+
+**对可能创新点最强反证**：如果创新点是“推测翻译可以完全无 OS 配合”，本文反例：显式 marking 需要 OS/PTE 改动；heuristic 有 false positive/security 风险；必须验证，且 I/O 副作用需要额外机制。
+
+**后续必追引文**：Navarro et al. 2002 [19]；Talluri & Hill 1994 [24]；Romer et al. 1995 [21]；Kandiraju & Sivasubramaniam 2002 [12]；Bhargava et al. 2008 [5]；Romanescu et al. 2010 [20]。
+
+**可导航原文证据**：
+- L14–L32：SpecTLB 插值预测，平均 overlap 57%，misprediction <1%。
+- L249–L273：SpecTLB 跟踪部分填充 reservation，而不是大页本身。
+- L322–L340：预测必须与底层 page table 验证；stale entry 可 lazy invalidate。
+- L350–L362：heuristic 检测 `VA[20:12] == PA[20:12]`，false positive 1:512、false negative 0。
+- L419–L423：显式 reservation marking 尚未被 OS 支持，实际实现用 heuristic。
+- L128–L147：microarchitecture-independent simulation 评估配置与结果。
+
+---
+
+### 3. capaging2020
+
+**题录核对**：`capaging2020.txt` L1–L11：标题 “Enhancing and Exploiting Contiguity for Fast Memory Virtualization”；作者 Chloe Alverti, Stratos Psomadakis, Vasileios Karakostas, Jayneel Gandhi, Konstantinos Nikas, Georgios Goumas, Nectarios Koziris；L1：ISCA 2020；L65–L66：DOI 10.1109/ISCA45697.2020.00050。
+
+**精确机制**：软件侧 CA paging 在缺页分配路径用 `Offset = VA−PA`、per-VMA offset、system-wide contiguity map、next-fit 策略，把同 VMA 页尽量分配到连续物理块；失败时 sub-VMA placement，4KB 页回退默认分配并停止跟踪。硬件侧 SpOT 在 L2 TLB miss 后用 PC 索引预测表缓存 `[2D offset, permissions]`，预测 `spec hPA = gVA − offset`，后台 nested walk 验证；预测表 set-associative、LRU、2-bit confidence；OS 用 PTE reserved bit 标记大连续映射，阈值 32 页。
+
+**复用粒度及身份/权限匹配前提**：CA paging 粒度是 VMA/页；Offset 是 per-VMA 的 VA−PA 位移。SpOT 以 PC 关联指令与连续映射，缓存 2D offset 和权限；权限继承上一次同 PC 访问；虚拟化中分别对 guest/host 独立做 CA paging，SpOT 跟踪完整 2D offset。身份是进程 PC + gVA/hPA offset，不是设备 PASID/SVA。
+
+**资源共享 vs 映射共享/SVA**：面向 native + KVM nested paging；不是设备 SVA。它讨论 vRMM/vHC 在虚拟化下的复杂度，但仍是 CPU 页表，不是 IOMMU。
+
+**评价配置**：Linux v4.19 + QEMU/KVM v2.1.2，BadgerTrap 在 guest 中强制 TLB miss 并模拟硬件；真机 2-socket Broadwell，256GB；比较 THP、Ingens、Eager paging、Ranger、CA paging、Ideal；工作负载 SVM、PageRank、hashjoin、XSBench、BT；报告 nested paging overhead 从 ~16.5% 降到 ~0.9%；CA paging 覆盖、fragmentation、page fault tail latency、bloat；SpOT 用模拟性能模型，安全 mitigation 只做估算。
+
+**限制/未覆盖**：CA paging 是 best-effort；内存压力下预留是未来工作（L380–L384）；vRMM 复杂、vHC 对齐限制；SpOT 的安全 mitigation 需 full-system cycle-accurate simulation，论文未做（L887–L896）；SpOT 没有真实硬件原型；BT 跨 NUMA 时 CA paging 表现下降。
+
+**对可能创新点最强反证**：如果创新点是“预分配大连续页即可”，本文反例：eager paging 对外部碎片敏感，覆盖率随重复运行下降；CA paging 才在分配路径持续生成 contiguity；如果创新点是“推测翻译不需要验证/无安全代价”，SpOT 明确需要后台验证、置信计数、安全 mitigation。
+
+**后续必追引文**：RMM [11]；CoLT [12]；Hybrid TLB Coalescing [16]；Translation Ranger [18]；SpecTLB [19]；Devirtualizing Memory [30]；InvisiSpec/SafeSpec [21][22]。
+
+**可导航原文证据**：
+- L14–L33：CA paging + SpOT 把 nested overhead 从 ~16.5% 降到 ~0.9%。
+- L157–L227：CA paging 的 Offset、contiguity map、next-fit、sub-VMA placement。
+- L311–L535：SpOT PC 索引预测表、TLB miss 路径、confidence、OS PTE reserved bit、阈值 32 页。
+- L380–L384：严重内存压力下的 reservation 留作未来工作。
+- L887–L896：安全 mitigation 开销需要 full-system cycle-accurate simulation，未完整完成。
+- L121–L130：nested paging 最多 24 次内存访问。
+
+---
+
+### 4. ingens2016
+
+**题录核对**：`ingens2016.txt` L1–L24：标题 “Coordinated and Efficient Huge Page Management with Ingens”；作者 Youngjin Kwon, Hangchen Yu, Simon Peter, Christopher J. Rossbach, Emmett Witchel；L11–L15：OSDI ’16，Nov 2–4, 2016, Savannah；正文无 DOI。
+
+**精确机制**：Ingens 把 contiguity 当资源。util bitvector 记录每个 2MB 区域内 512 个 base page 的使用；access bitvector/EMA 记录访问频率。Promote-kth 后台提升 huge page；Scan-kth 周期扫描访问位；Utilization-based promotion/demotion 控制 bloat；Proactive batched compaction 控制 FMFI；比例公平 promotion 按 share priority 和 idle penalty 分配 huge page；page sharing 时若 huge page 频繁访问则拒绝共享，否则允许降级共享。
+
+**复用粒度及身份/权限匹配前提**：进程/VM 级别的 share priority；2MB aligned region 内 512 base pages；访问/利用率 metadata；KVM guest/host 共享同一套 Linux 内存管理代码。身份是进程/VM，不是设备。
+
+**资源共享 vs 映射共享/SVA**：研究 OS/hypervisor 的 huge page 资源共享与 KSM 式页共享；不是设备 SVA/IOMMU 映射共享。KVM 场景是 guest physical→host physical 的 host huge page。
+
+**评价配置**：Linux 4.3 + KVM，Ubuntu 14.04，Haswell 2× E5-2640 v3，64GB；云负载 Cloudstone/Olio、Redis、MongoDB、Canneal、SVM、Tunkrank、Nutch、MovieRecmd 等；报告 Cloudstone 最高 18% 提升、90th tail latency 降低 41%、Redis bloat 69%→0.8%、公平性改善、page sharing tradeoff；真实原型。
+
+**限制/未覆盖**：只支持匿名内存 huge page；page cache huge page 留作未来（L656–L663）；硬件细粒度 access/dirty 支持会更好；NUMA 只测单区域，跨 NUMA 未测（L673–L677）；需要 OS/hypervisor 共享内存管理代码；不涉及设备 IOMMU/SVA。
+
+**对可能创新点最强反证**：如果创新点是“huge page 总是好”，本文反例：贪婪提升导致尾延迟、bloat、碎片和不公平；需要利用率/访问频率/公平策略；如果创新点是“KSM 共享免费”，本文反例：KVM 激进共享导致最高 20.2% slowdown，huge page sharing 只省 1.5–2.1%。
+
+**后续必追引文**：Navarro et al. 2002 [68]；Gorman & Healy 2008 [56]；Gorman & Whitcroft 2005 [58]；Waldspurger 2002 [81]；AMD-V Nested Paging [40]；GLUE [73]；RMM [61]。
+
+**可导航原文证据**：
+- L44–L56：Ingens 原理与收益：公平、性能最高 18%、tail latency 最高 41%、bloat 69%→<1%。
+- L513–L542：util bitvector、access bitvector、EMA、频繁访问判定。
+- L556–L584：Promote-kth 异步提升、主动压缩、100MB 限制、避免迁移热页。
+- L656–L677：限制：只支持匿名内存；page cache 未来；NUMA 单区域。
+- L248–L258：假设 OS/hypervisor 共享内存管理代码。
+- L1000–L1026：memory sharing 与性能 tradeoff。
+
+---
+
+### 5. dpt2024
+
+**题录核对**：`dpt2024.txt` L1–L11：标题 “Distributed Page Table: Harnessing Physical Memory as An Unbounded Hashed Page Table”；作者 Osang Kwon, Yongho Lee, Junhyeok Park, Sungbin Jang, Byungchul Tak, Seokin Hong；L1：MICRO 2024；L81–L82：DOI 10.1109/MICRO61859.2024.00013。
+
+**精确机制**：DPT 把整个物理内存当巨大 hashed page table。用 `Hash(VPN tag, PID)` 得到 PTE 页的 PFN，9-bit PTE offset 定位页内 PTE。地址碰撞用 SOA（stride 1/512/256K + step 搜索空闲 frame）、CVA（寻找无碰撞虚拟地址区域）、CPD（迁移被碰撞的数据页）解决；FAP 在碎片化 2MB 区域内分配 PTE 页；PTP 预分配 heap 虚拟区 PTE 页。DMT 存 stride/step，DMC 在 MMU 中缓存。
+
+**复用粒度及身份/权限匹配前提**：VPN tag + PID 决定 PTE 页位置；2MB 虚拟区对应一个 PTE page；进程私有 DMT，context switch 换寄存器；PTE 页不可迁移；CPD 依赖 reverse map 找到 victim PTE；CVA 依赖 OS 在虚拟地址空间选择无碰撞区域。身份是进程 PID/gPID/hPID，不是设备 PASID。
+
+**资源共享 vs 映射共享/SVA**：DPT 支持 guest/host 虚拟化：guest DPT 用 gPID，host DPT 用 hPID，gPA→hPA 再翻译；不是 IOMMU/SVA。它谈“two memory accesses”虚拟化翻译，但未覆盖设备共享页表。
+
+**评价配置**：Sniper cycle-level 4-core 模拟，extended page walker/PWC/memory allocator/large page；对比 RPT、ME-HPT、Mosaic、DPT+MOSAIC；真机 Linux 5.11.6 原型验证 PTE 分配、碰撞频率、碎片率、fault/migration 开销；工作负载 GraphBIG、GenomicsBench、HPCC、XSBench、DLRM；报告平均提升 12.6%/11.6%/8.7%，translation latency 降低 55.4%/51.8%/34.2%。
+
+**限制/未覆盖**：高内存利用率下 CPD 更频繁，98% 利用率性能下降约 3.3%，并触发 TLB shootdown；PTE 页/non-migratable 页不能迁移；CVA 限制 MAX CVA SIZE/CNT，demand paging 下适用性有限；需要 MMU 改动、DMT/DMC、frame bitmap；主性能模拟，真机只验证分配机制；不涉及设备 IOMMU/SVA。
+
+**对可能创新点最强反证**：如果创新点是“哈希页表天然无碰撞/无需迁移”，本文反例：地址碰撞会出现；CPD 必须迁移数据页；PTE 页不可迁移；高利用率下性能下降；哈希索引还降低 PTE 空间局部性。
+
+**后续必追引文**：ECPT [55]；ME-HPT [56]；Mosaic [21]；Hash, Don’t Cache [65]；Utopia [32]；Victima [33]；Contiguitas [66]；Perforated Page [47]；Every Walk’s a Hit [48]。
+
+**可导航原文证据**：
+- L26–L41：DPT 把物理内存当无界 HPT，减少碰撞，避免 resize；平均提升 12.6/11.6/8.7%。
+- L379–L414：Hash(VPN tag, PID) 定位 PTE page；frame bitmap；9-bit PTE offset。
+- L415–L485：SOA/CVA；CVA 的 MAX CVA SIZE/CNT 限制与 demand paging 限制。
+- L486–L555：CPD 迁移数据页；reverse map；PTE 页不可迁移。
+- L906–L920：98% 利用率下性能下降约 3.3%，CPD 触发 TLB shootdown。
+- L648–L672：虚拟化下 DPT 只要两次内存访问。
+
+---
+
+### 6. emt2025
+
+**题录核对**：`emt2025.txt` L1–L15：标题 “EMT: An OS Framework for New Memory Translation Architectures”；作者 Siyuan Chai, Jiyuan Zhang, Jongyul Kim, Alan Wang, Fan Chung, Jovan Stojkovic, Weiwei Jia, Dimitrios Skarlatos, Josep Torrellas, Tianyin Xu；L12–L14：OSDI ’25，July 7–9, 2025, Boston；正文无 DOI。
+
+**精确机制**：EMT 在 Linux 上抽象三类原语：translation object（VA→PA + metadata）、translation database（地址空间翻译对象集合）、translation service（MMU 状态/地址空间切换）。基本函数由 MMU driver 实现；可定制函数有架构无关默认实现，MMU driver 可覆盖以保留优化。EMT-Linux v5.15 重写架构无关代码，x86-64 driver 维护 radix tree，FPT driver 复用 x86-64 driver，ECPT driver 用三路 cuckoo hashing、CWT/CWC、kECPT/uECPT。
+
+**复用粒度及身份/权限匹配前提**：translation object 可表示 PTE、段或变长区域；translation database 每个地址空间唯一返回一个 translation object；MMU driver 负责 encode metadata/permission，支持 MPK、cache mode 等。身份是进程地址空间/MMU driver，不是设备 PASID。
+
+**资源共享 vs 映射共享/SVA**：EMT 明确只关注 CPU VA→PA，**不面向 IOMMU translation for DMA**；但说 Linux IOMMU 代码也硬编码 radix tree，EMT 方法“可以潜在适用”。这是全文可支持范围，不可推成已支持设备 SVA。
+
+**评价配置**：EMT-Linux v5.15；LTP 1,208 tests 通过；真机 Intel Xeon Gold 6346 测接口开销，平均 <0.5%，macro <0.1%，真实应用 <0.1%/0.1%/0.2%；ECPT/FPT 用 QEMU 模拟 MMU + DynamoRIO 硬件模拟；ECPT 平均 page walk 加速 23.1%、IPC +7.0%、total cycles -2.3%，运行阶段 -6.6%；FPT flatten L3+L2 仅 1.1% total cycles 改善。
+
+**限制/未覆盖**：EMT 不改变物理页操作；只聚焦 CPU translation；**不针对 IOMMU DMA**；只支持 native，虚拟化 roadmap；ECPT kECPT self-reference paradox、锁/稀疏地址空间访问、atomic kECPT switching 需硬件支持；ECPT 增加 kernel instructions 1.74x/2.59x；FPT 对 huge page 支持有限。
+
+**对可能创新点最强反证**：如果创新点是“新翻译架构可以直接替换 radix tree 而没有 OS 代价”，本文反例：Linux 硬编码假设遍布 mm，新增 5-level paging 改 715 行/23 文件；ECPT 在 OS 侧引入大量额外 kernel instructions、kECPT 悖论、锁问题；OS overhead 可抵消硬件 PTW 收益。
+
+**后续必追引文**：ECPT [98]；FPT [87]；Midgard [56]；DPT [68]；Mosaic [53]；Direct Memory Translation [111]；Utopia [63]；FBMM [103]；Virtuoso [64]。
+
+**可导航原文证据**：
+- L40–L52：EMT 架构中立接口，支持 ECPT/FPT，并揭示 OS 视角。
+- L483–L507：限制：不涉及物理页操作；聚焦 CPU translation；**不面向 IOMMU DMA**；native only，虚拟化 roadmap。
+- L609–L665：ECPT kECPT self-reference paradox。
+- L875–L896：ECPT 1.74x/2.59x more page fault instructions；OS overhead 重要。
+- L922–L944：ECPT total cycles 平均 -2.3%，FPT flatten L3+L2 仅 -1.1%。
+- L738–L812：emulator toolchain、LTP 测试、EMT 接口开销。
+
+---
+
+### 7. midgard2021
+
+**题录核对**：`midgard2021.txt` L1–L8：标题 “Rebooting Virtual Memory with Midgard”；作者 Siddharth Gupta, Atri Bhattacharyya, Yunho Oh, Abhishek Bhattacharjee, Babak Falsafi, Mathias Payer。该文件正文题头**没有 venue/DOI**；在 `emt2025.txt` L1149–L1152 的参考文献中列为 ISCA-48 2021。因此 JSON 中 venue 写 ISCA 2021 并注明证据来自 EMT 引用，DOI null。
+
+**精确机制**：在 virtual 与 physical 之间插入系统级 Midgard 地址空间。VMA 直接映射为 MMA；V2M 用 per-core VLB（L1 页式 TLB + L2 VMA-based range TLB）和 VMA Table（B-tree）翻译；M2P 只在 LLC miss 时走 Midgard Page Table（radix 512 度，连续布局支持 short-circuit），可选 MLB 缓存 M2P entry。OS 需维护 VMA→MMA、MMA→PFN，去重共享 VMA，处理 MMA 增长/冲突/迁移。
+
+**复用粒度及身份/权限匹配前提**：V2M 以 VMA 粒度，M2P 以页粒度；VMA Table entry 含 base/bound/offset/permission；VLB 做 range compare；Midgard 地址空间必须无 synonym/homonym，共享 VMA 需 OS 去重；MMA 增长可能冲突并触发 remap/cache flush/split。身份是进程 VMA + 系统级 Midgard namespace，不是设备 PASID。
+
+**资源共享 vs 映射共享/SVA**：Midgard 目标是让 coherent cache hierarchy 使用统一中间 namespace，避免 virtual cache synonym/homonym；它提到 GPU/FPGA/NIC/ASIC 等加速器共享 VM 抽象（L52–L57），但机制和评估是 CPU 多核 cache/QEMU，不是 IOMMU/SVA 页表共享。
+
+**评价配置**：QFlex/QEMU full-system trace-driven；16× ARM Cortex-A76，2GHz，64KB L1，1MB/tile LLC，256GB；Midgard VLB L1 48-entry、L2 16-VMA；AMAT 分析 16MB–16GB cache hierarchy；GAP/Graph500；22nm CMOS 分析 VLB；报告 16MB LLC 下仅比 4KB TLB 高 5% translation overhead，256MB LLC 下与 2MB TLB break even，cache 更大时接近零。是 software-modeled proof-of-concept。
+
+**限制/未覆盖**：论文明确这是 proof-of-concept software-modeled prototype，未来才做 OS support、多架构验证、电路级研究（L875–L880）；需要硬件扩展（VLB、MLB、额外 tag 位、store rollback）；OS 需要重大修改；没有真实流片；没有 IOMMU/SVA 设备评估。
+
+**对可能创新点最强反证**：如果创新点是“引入中间地址空间不需要改 OS/硬件”，本文反例：需要 OS 去重共享 VMA、维护 MMA 增长/冲突/迁移，需要 VLB/MLB/cache tag 扩展和 store rollback；如果创新点是“TLB 越大越好”，本文反例：传统 TLB 在大 cache 下 overhead 反而升高，Midgard 靠 cache 过滤 M2P 才下降。
+
+**后续必追引文**：VBI [18]；Devirtualizing Memory [19]；RMM [28]；Translation Ranger [67]；Prefetched Address Translation [38]；ECPT [55]；virtual cache [10][11][16]；in-cache address translation [65]。
+
+**可导航原文证据**：
+- L12–L45：Midgard 中间地址空间；16MB LLC 下仅 5% overhead，256MB LLC 与 2MB TLB break even。
+- L177–L241：VMA→MMA 映射、VMA Table、MMA sizing/dedup。
+- L374–L407：V2M 与 M2P 两步翻译流程。
+- L427–L537：VLB；L1 页式，L2 VMA-based range TLB；22nm 分析。
+- L539–L572：MLB 可选，用于小 LLC。
+- L831–L880：proof-of-concept software-modeled；未来 OS、验证、电路级工作。
+- `emt2025.txt` L1149–L1152：Midgard venue evidence。
+
+---
+
+### 8. memento2023
+
+**题录核对**：`memento2023.txt` L1–L16：标题 “Memento: Architectural Support for Ephemeral Memory Management in Serverless Environments”；作者 Ziqi Wang, Kaiyang Zhao, Pei Li, Andrew Jacob, Michael Kozuch, Todd C. Mowry, Dimitrios Skarlatos；L39–L44：MICRO ’23，Oct 28–Nov 01, 2023, Toronto；L44/L57：DOI 10.1145/3613424.3623795。
+
+**精确机制**：两个机制：硬件 object allocator 用 arena + HOT 缓存 arena header/bitmap/list pointer，在核附近完成 obj-alloc/obj-free；硬件 page allocator 在 memory controller 管理 free page pool、Memento Page Table、MRS/MRE 区域寄存器、MPTR，负责 arena VA 和 PA 分配。主存 bypass 用 Bypass Counter 跟踪已访问 cache line，新分配对象直接在 cache hierarchy 实例化，避免 DRAM 读。
+
+**复用粒度及身份/权限匹配前提**：对象粒度 ≤512B，8B size class，64 类；arena 256 objects；HOT 以 size class 直接索引；硬件页分配器以页粒度维护 Memento Page Table；MRS/MRE 定义进程 Memento 区域，MPTR 是 Memento 页表根；arena 页权限固定 RW/NX；只支持 heap，不支持 file-backed。身份是进程/线程 arena，不是设备。
+
+**资源共享 vs 映射共享/SVA**：Memento 是 serverless 用户态/内核内存分配加速，不是地址翻译架构，更不是 IOMMU/SVA 设备共享。它暴露的是 malloc/free 语义，不是 PASID/设备页表共享。
+
+**评价配置**：QEMU + SST + DRAMSim3 full-system simulation；4-issue OOO 3GHz，L1/L2/LLC，64GB DDR4，Linux 5.18；HOT 3.4KB direct-mapped 2-cycle，AAC 32-entry；14 个 serverless/数据处理基准，Python/C++/Golang；报告 function speedup 8–28%（平均 16%），DRAM traffic -30%，pricing -29%；CACTI 估面积/功耗。
+
+**限制/未覆盖**：不是硬件原型；只优化 ≤512B 小对象和 heap；大对象/文件后端交给软件；多核需 context switch flush HOT；只支持 heap RW/NX；serverless 特定；不涉及设备共享地址翻译。
+
+**对可能创新点最强反证**：如果创新点是“把 malloc/free 放硬件就能解决地址翻译/IOMMU”，本文反例：Memento 只处理对象/页分配生命周期，不处理 VA→PA 翻译结构、设备 TLB、SVA；HOT free hit 率平均 83%，Python 更低；冷启动 speedup 7–22%；碎片约 3.68%；多进程需 flush，有开销。
+
+**后续必追引文**：Mallacc [26]；FunctionBench [28]；SeBS [11]；cold-start 工作 [14][18][39][48][52][56]；Google 内存管理 profiling [20][25]；硬件 allocator [7][8][9][34][35]。
+
+**可导航原文证据**：
+- L17–L45：Memento 机制与收益：8–28% speedup、DRAM -30%、pricing -29%。
+- L94–L118：serverless 内存行为三大 insight：小对象、双峰生命周期、用户态+内核成本。
+- L512–L588：HOT 与硬件 object allocator 的初始化/分配/释放步骤。
+- L629–L656：硬件 page allocator、Memento Page Table、MPTR、按需 back 页。
+- L667–L717：主存 bypass 机制。
+- L624–L631：只支持 heap、RW/NX，不支持 file-backed。
+- L679–L683：大于 512B 由软件处理。
+- L798–L832：QEMU+SST+DRAMSim3 full-system simulation。
+
+---
+
+## C. 本组对照矩阵：优化哪一段 / 信息何处产生 / 何时必须完成 / 谁承担维护成本
+
+| 论文 | 优化的翻译/内存段 | 关键信息何处产生 | 何时必须完成 | 维护成本承担者 | 关键前提 |
+|---|---|---|---|---|---|
+| SpecTLB 2011 | TLB miss 延迟 | OS reservation + PTE alignment | 推测预测在 walk 前；验证并行完成 | OS reservation；硬件 SpecTLB | reservation-based allocator；预测必须验证 |
+| Ingens 2016 | huge page 生命周期/尾延迟/bloat/公平 | OS util/access bitvector；Promote-kth/Scan-kth | 提升/降级/压缩在后台，不在 page fault 临界路径 | OS/hypervisor | Linux/KVM 共享内存代码；匿名内存；单 NUMA |
+| Translation Ranger 2019 | contiguity 生成与维持 | VMA anchor/coalesced region | 后台 daemon 周期性完成；迁移需 TLB shootdown | OS daemon | 同一 VMA 权限一致；迁移成本可接受 |
+| CA paging 2020 | 分配路径 contiguity | VMA offset + contiguity map + PTE reserved bit | 缺页分配时即时生成 | OS 分配器 | best-effort；严重压力无 reservation |
+| SpOT 2020 | TLB miss 推测翻译 | PC-indexed prediction table + 2D offset | L2 TLB miss 后立即预测；后台 nested walk 验证 | 硬件预测表 + OS PTE 标记 | 同 PC offset/权限稳定；需验证/安全 mitigation |
+| Midgard 2021 | 两级翻译拆分 | VMA→MMA Table；MMA→PFN Midgard Page Table | V2M 每次访问；M2P 仅 LLC miss | OS 维护 VMA/MMA/页表；硬件 VLB/MLB | VMA 数量少；OS 大改；proof-of-concept |
+| Memento 2023 | 对象/页分配释放临界路径 | arena header/HOT；Memento Page Table | obj-alloc/free 在核附近数 cycle；页分配在 memory controller | 硬件 HOT/页分配器 + OS 预留区域 | 小对象、heap、单线程为主；非设备翻译 |
+| DPT 2024 | 页表 walk 串行性 | Hash(VPN tag, PID) + DMT/DMC | TLB miss/page walk 时必须算出 PTE 页 | MMU + OS 页分配/迁移 | 解决地址碰撞；PTE 页不可迁移；高利用率有代价 |
+| EMT 2025 | OS 可扩展翻译接口 | translation object/database/service + MMU driver | 所有 OS translation 操作 | OS kernel + MMU driver 开发者 | 新架构需 MMU driver；不面向 IOMMU DMA |
+| Revelator 2026（对照） | VA→PA/PTE 推测 + hash 分配 | OS tiered hash allocation + counters；speculation engine | L2 TLB miss 后候选推测；PTW 并行验证 | OS allocator + 硬件 speculation engine | per-page hash placement；大页/NUMA 兼容 |
+
+**按关注维度再看**：
+- **TLB coverage**：SpecTLB 用小预测结构换覆盖；Translation Ranger/CA paging 生成 contiguity 提高覆盖；DPT/EMT 改变页表结构；Midgard 用 VLB/MLB；Ingens 用 huge page 覆盖。
+- **序列化**：DPT 直接攻击 radix walk 串行性；EMT 支持 ECPT 并行 lookup、FPT 折叠层级；SpecTLB/SpOT/Revelator 用推测与 walk 并行；Translation Ranger/CA paging 减少需要缓存的 entry 数。
+- **内存碎片**：Translation Ranger 后分配合并；CA paging 分配时防止碎片；Ingens 主动压缩但也会产生碎片；DPT FAP 防碎片；Revelator 明确说 hash placement 不依赖 contiguity，只依赖内存利用率。
+- **实现复杂性**：SpecTLB 需 reservation mark 或 heuristic；Translation Ranger 需 daemon/migration/shootdown；CA paging 需 contiguity map/next-fit/多线程锁；Ingens 需 kernel thread/bitvector/EMA/公平策略；Midgard 需 OS 去重/MMA 增长/硬件 VLB/MLB/store rollback；DPT 需 MMU/DMT/DMC/CPD；EMT 需重写 mm 并写 MMU driver；Memento 需 ISA 和硬件 allocator。
+
+---
+
+## D. 被证据支持的剩余瓶颈与不能断言的点
+
+### D.1 被证据支持的瓶颈
+1. **碎片化会破坏连续映射**：Translation Ranger 图 3/4 显示内存很快碎片化，1GB 连续区域从 >80% 覆盖降到约 20%（L191–L262）；CA paging 明确 eager paging 对外部碎片敏感（L96–L98, L677–L687, L717–L721）；Revelator 进一步量化 SpOT 在碎片/分配干扰下 coverage/accuracy 下降（revelator L239–L287, L413–L484）。
+2. **页表串行 walk 是根本成本**：DPT 指出 radix tree 串行访问是瓶颈（dpt L68–L76, L215–L224）；EMT 指出 x86 多级 walk 与 nested walk 最多 24/35 次访问（emt L27–L36, L60–L87, L189–L197）。
+3. **OS 迁移/失效/维护成本高**：Translation Ranger 有 page migration/TLB shootdown；CA paging 说 Ranger migrations 延迟 contiguity 并 penalize 访问、触发 shootdown（capaging L150–L154, L178–L184）；Ingens compaction 会产生 TLB invalidation（ingens L573–L575）；DPT CPD 迁移数据页会 TLB shootdown（dpt L906–L920）。
+4. **huge page 不是万能**：Ingens 显示 greedy huge page 导致 bloat、尾延迟、不公平（ingens L287–L338, L339–L357, L406–L480）；CA paging 显示 2MB huge page 下 nested overhead 仍约 16.5%（capaging L132–L140）。
+5. **新翻译架构的 OS 接入成本被低估**：EMT 明确 Linux 不可扩展，ECPT 在 OS 侧增加 kernel instructions、kECPT 悖论、锁问题（emt L257–L311, L609–L737, L875–L896）。
+6. **尾延迟来源**：Ingens 明确报告 huge page page fault latency、90th/99.9th tail latency（ingens L287–L338, L897–L922）；CA paging 测 99th page fault latency（capaging Table V L726–L741）。
+
+### D.2 不能断言的点（全文可支持范围）
+- **不能断言 IOMMU/SVA 已被本组解决**：EMT 明确说 EMT 聚焦 CPU virtual-to-physical translation，**不 target IOMMU translation for DMA**（emt L483–L489）。Memento 不是设备翻译；Midgard 不是 IOMMU/SVA；Translation Ranger、CA paging、SpecTLB、Ingens、DPT 都是 CPU/虚拟化侧。
+- **不能断言设备身份/PASID 权限匹配已覆盖**：本组权限匹配都是进程/VMA/PTE/PC/offset 级别；没有设备 PASID、ATC、device TLB invalidation、SVA fault/queue 的机制。
+- **不能断言远端 PTW 已覆盖**：Translation Ranger 只做单 NUMA node 初始研究（L890–L900）；Ingens 单 NUMA 区域（L673–L677）；DPT/EMT/CA paging 没有远端 NUMA PTW 队列分析。Revelator 对照文有 NUMA spillover 分析，但这不是本组新卡内容。
+- **不能断言设备队列/MSHR/bandwidth 竞争已覆盖**：SpOT 有 confidence filter 减少预测；Memento 有 memory controller first-come-first-serve；但本组没有设备 IOMMU queue、ATC MSHR、跨设备 bandwidth 的实测。
+- **不能断言容量/尾延迟全领域空白**：本组覆盖了部分 CPU 侧容量、碎片、尾延迟；但未覆盖的设备侧容量/尾延迟不能推成“无人做”。
+- **不能断言 hash 页表是最终解**：DPT 仍要解决地址碰撞、CPD 迁移、高利用率性能下降；EMT 显示 ECPT 在 OS 侧有额外 kernel overhead；Revelator 只说 hash 分配对碎片不敏感。
+- **不能把概念相邻当实际引用**：SpecTLB→contiguity→DPT→EMT 在机制上相邻，但 actual citation 关系只按参考文献确认。Revelator 引用了它们，不等同于它们彼此都实际引用。
+
+### D.3 常见创新说法被本组反证/削弱
+- “只要 TLB 够大就能解决”：被 CA paging 的 2MB huge page 仍有 ~16.5% nested overhead（L132–L140）和 Revelator 的 64K L2 TLB 仍有残余 PTW 成本削弱（revelator L1020–L1031）。
+- “预分配大页/提升 MAX_ORDER 就够”：Translation Ranger 显示后分配碎片整理有价值；CA paging 显示 eager paging 对碎片敏感；Ingens 显示贪婪提升有 bloat/公平/尾延迟问题。
+- “contiguity 元数据是免费的”：Translation Ranger/CA paging/Ingens/DPT/EMT 都显示维护成本（迁移、shootdown、后台扫描、锁、kernel instructions）。
+- “新页表结构可以直接替换 radix 而没有 OS 代价”：EMT 明确反驳，ECPT 在 OS 侧增加 1.74x/2.59x page fault instructions，并出现 self-reference paradox、锁与稀疏地址问题。
+- “把 malloc/free 放硬件就等于解决地址翻译”：Memento 只覆盖对象/页分配生命周期，不覆盖 VA→PA 设备翻译/SVA。
+
+---
+
+## E. JSON 证据卡
+
+```json
+{
+  "papers": [
+    {
+      "id": "translation_ranger2019",
+      "title": "Translation Ranger: Operating System Support for Contiguity-Aware TLBs",
+      "authors": ["Zi Yan", "Daniel Lustig", "David Nellans", "Abhishek Bhattacharjee"],
+      "year": 2019,
+      "venue": "ISCA '19: The 46th Annual International Symposium on Computer Architecture",
+      "doi": "10.1145/3307650.3322223",
+      "publication_status": "published",
+      "relevance": "core",
+      "evaluation_type": ["measurement", "analysis"],
+      "mechanism": "OS 后台主动合并同一 VMA 内碎片物理帧，生成并维持任意大小连续映射，减少 contiguity-aware TLB 所需条目。",
+      "assumptions": [
+        "连续区域属于单个 VMA 且各虚拟页权限一致",
+        "页面可迁移；不可迁移页可跳过",
+        "目标系统有支持 contiguity 的 TLB 硬件",
+        "VMA 是稳定语义单位，跨 OS 可用 VMA-like 结构移植"
+      ],
+      "limitations": [
+        "初始只研究单 memory node，NUMA 为未来工作",
+        "权限变化会拆分 VMA 并打断连续区域",
+        "页面迁移和 TLB shootdown 有运行时税",
+        "未穷举多种 contiguity-aware TLB 设计",
+        "未覆盖 IOMMU/SVA/设备页表共享"
+      ],
+      "evidence": [
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/translation_ranger2019.txt", "location": "L1-L19", "claim": "题录：ISCA'19，DOI 10.1145/3307650.3322223。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/translation_ranger2019.txt", "location": "L25-L37", "claim": "主动合并分散物理帧，真机 Linux 实现，120GB footprint 用≤128区域覆盖>90%，<2% overhead。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/translation_ranger2019.txt", "location": "L135-L142", "claim": "Translation Ranger 主动合并同 VMA 碎片页，服务 contiguity-aware TLB。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/translation_ranger2019.txt", "location": "L284-L328", "claim": "anchor point 与 inter-VMA interference 处理。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/translation_ranger2019.txt", "location": "L901-L914", "claim": "连续区域要求单一 VMA 且权限一致；权限变化打断连续区域。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/translation_ranger2019.txt", "location": "L890-L900", "claim": "NUMA 只做单节点初始研究，跨 socket 未来工作。"}
+      ],
+      "relations": [
+        {"target": "revelator2026v2", "type": "actual_citation", "source": "revelator2026v2.txt L1727-L1729", "note": "Revelator 参考文献 [167] 引用 Translation Ranger。"},
+        {"target": "capaging2020", "type": "actual_citation", "source": "capaging2020.txt L1286-L1288", "note": "CA paging 参考文献 [18] 引用 Translation Ranger。"}
+      ]
+    },
+    {
+      "id": "spectlb2011",
+      "title": "SpecTLB: A Mechanism for Speculative Address Translation",
+      "authors": ["Thomas W. Barr", "Alan L. Cox", "Scott Rixner"],
+      "year": 2011,
+      "venue": "ISCA '11: 38th Annual International Symposium on Computer Architecture",
+      "doi": null,
+      "publication_status": "published",
+      "relevance": "core",
+      "evaluation_type": ["simulation", "analysis"],
+      "mechanism": "利用 reservation-based 内存分配器的对齐规律，对 TLB miss 的 4KB 页做 VA-PA 插值预测，并并行验证页表。",
+      "assumptions": [
+        "OS 使用 reservation-based physical memory allocator",
+        "预测必须与底层 page table 验证",
+        "显式 marking 需要 OS/PTE 改动；heuristic 不修改 OS",
+        "I/O/不可缓存区域需要防止推测副作用"
+      ],
+      "limitations": [
+        "无硬件原型，仅 simulation",
+        "显式 reservation marking 尚未进入任何 OS",
+        "heuristic 有 false positive，需验证",
+        "未覆盖设备 IOMMU/SVA"
+      ],
+      "evidence": [
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/spectlb2011.txt", "location": "L1-L7, L59-L60", "claim": "题录：ISCA'11，正文无 DOI。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/spectlb2011.txt", "location": "L14-L32", "claim": "SpecTLB 插值预测并并行验证；平均 overlap 57% page walk，misprediction <1%。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/spectlb2011.txt", "location": "L249-L273", "claim": "SpecTLB 跟踪部分填充的大页 reservation。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/spectlb2011.txt", "location": "L322-L340", "claim": "预测必须与底层 page table 验证；stale entry 可 lazy invalidate。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/spectlb2011.txt", "location": "L350-L362", "claim": "heuristic 检测 VA[20:12]==PA[20:12]，false positive 1:512、false negative 0。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/spectlb2011.txt", "location": "L419-L423", "claim": "显式 reservation marking 尚未被 OS 支持，实际实现用 heuristic。"}
+      ],
+      "relations": [
+        {"target": "revelator2026v2", "type": "actual_citation", "source": "revelator2026v2.txt L1565-L1567", "note": "Revelator 参考文献 [88] 引用 SpecTLB。"},
+        {"target": "capaging2020", "type": "actual_citation", "source": "capaging2020.txt L1290-L1292", "note": "CA paging 参考文献 [19] 引用 SpecTLB。"},
+        {"target": "emt2025", "type": "actual_citation", "source": "emt2025.txt L1100-L1103", "note": "EMT 参考文献 [33] 引用 SpecTLB。"}
+      ]
+    },
+    {
+      "id": "capaging2020",
+      "title": "Enhancing and Exploiting Contiguity for Fast Memory Virtualization",
+      "authors": ["Chloe Alverti", "Stratos Psomadakis", "Vasileios Karakostas", "Jayneel Gandhi", "Konstantinos Nikas", "Georgios Goumas", "Nectarios Koziris"],
+      "year": 2020,
+      "venue": "2020 ACM/IEEE 47th Annual International Symposium on Computer Architecture (ISCA)",
+      "doi": "10.1109/ISCA45697.2020.00050",
+      "publication_status": "published",
+      "relevance": "core",
+      "evaluation_type": ["measurement", "simulation", "analysis"],
+      "mechanism": "CA paging 在缺页分配路径用 offset/contiguity map 生成大于页的连续映射；SpOT 用 PC 索引预测表推测 gVA→hPA，后台验证嵌套页表。",
+      "assumptions": [
+        "CA paging 是 best-effort，允许 sub-VMA placement",
+        "SpOT 依赖同 PC 上一次 offset 和权限",
+        "OS 用 PTE reserved bit 标记大连续映射",
+        "预测必须验证；安全 mitigation 可复用 Spectre/Meltdown 机制"
+      ],
+      "limitations": [
+        "严重内存压力下 reservation 留作未来工作",
+        "vRMM 复杂、vHC 有对齐限制",
+        "SpOT 安全 mitigation 开销未做 full-system cycle-accurate simulation",
+        "SpOT 无真实硬件原型",
+        "不是 IOMMU/SVA 设备翻译"
+      ],
+      "evidence": [
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/capaging2020.txt", "location": "L1-L11, L65-L66", "claim": "题录：ISCA 2020，DOI 10.1109/ISCA45697.2020.00050。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/capaging2020.txt", "location": "L14-L33", "claim": "CA paging + SpOT 把 nested overhead 从 ~16.5% 降到 ~0.9%。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/capaging2020.txt", "location": "L157-L227", "claim": "CA paging 的 Offset、contiguity map、next-fit、sub-VMA placement。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/capaging2020.txt", "location": "L311-L535", "claim": "SpOT PC 索引预测表、TLB miss 路径、confidence、OS PTE reserved bit、阈值 32 页。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/capaging2020.txt", "location": "L380-L384", "claim": "严重内存压力下的 reservation 留作未来工作。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/capaging2020.txt", "location": "L887-L896", "claim": "安全 mitigation 开销需要 full-system cycle-accurate simulation，未完整完成。"}
+      ],
+      "relations": [
+        {"target": "revelator2026v2", "type": "actual_citation", "source": "revelator2026v2.txt L1397-L1400", "note": "Revelator 参考文献 [21] 引用 SpOT/CA paging。"},
+        {"target": "emt2025", "type": "actual_citation", "source": "emt2025.txt L1311-L1314", "note": "EMT 参考文献 [28] 引用 Enhancing and Exploiting Contiguity。"},
+        {"target": "translation_ranger2019", "type": "actual_citation", "source": "capaging2020.txt L1286-L1288", "note": "CA paging 引用 Translation Ranger 作为对比基线。"}
+      ]
+    },
+    {
+      "id": "ingens2016",
+      "title": "Coordinated and Efficient Huge Page Management with Ingens",
+      "authors": ["Youngjin Kwon", "Hangchen Yu", "Simon Peter", "Christopher J. Rossbach", "Emmett Witchel"],
+      "year": 2016,
+      "venue": "12th USENIX Symposium on Operating Systems Design and Implementation (OSDI '16)",
+      "doi": null,
+      "publication_status": "published",
+      "relevance": "core",
+      "evaluation_type": ["measurement", "analysis"],
+      "mechanism": "以 contiguity 为一等资源，用 util bitvector、access bitvector、后台 Promote-kth/Scan-kth 做利用率和访问频率驱动的提升/降级/公平分配/主动压缩。",
+      "assumptions": [
+        "OS/hypervisor 共享内存管理代码（Linux/KVM）",
+        "huge page 提升/降级可异步进行",
+        "access bit tracking 可接受 TLB invalidation 开销",
+        "主要针对匿名内存，4KB/2MB"
+      ],
+      "limitations": [
+        "只支持匿名内存 huge page；page cache 未来工作",
+        "NUMA 只测单区域",
+        "需要 OS/hypervisor 共享代码",
+        "不涉及 IOMMU/SVA"
+      ],
+      "evidence": [
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/ingens2016.txt", "location": "L1-L24", "claim": "题录：OSDI '16。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/ingens2016.txt", "location": "L44-L56", "claim": "收益：公平、性能最高 18%、tail latency 最高 41%、bloat 69%→<1%。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/ingens2016.txt", "location": "L513-L542", "claim": "util bitvector、access bitvector、EMA、频繁访问判定。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/ingens2016.txt", "location": "L556-L584", "claim": "Promote-kth 异步提升、主动压缩、100MB 限制、避免迁移热页。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/ingens2016.txt", "location": "L656-L677", "claim": "限制：匿名内存 only；page cache 未来；NUMA 单区域。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/ingens2016.txt", "location": "L248-L258", "claim": "假设 OS/hypervisor 共享内存管理代码。"}
+      ],
+      "relations": [
+        {"target": "revelator2026v2", "type": "actual_citation", "source": "revelator2026v2.txt L1682-L1683", "note": "Revelator 参考文献 [155] 引用 Ingens。"},
+        {"target": "emt2025", "type": "actual_citation", "source": "emt2025.txt L1229-L1233", "note": "EMT 参考文献 [69] 引用 Ingens。"}
+      ]
+    },
+    {
+      "id": "dpt2024",
+      "title": "Distributed Page Table: Harnessing Physical Memory as An Unbounded Hashed Page Table",
+      "authors": ["Osang Kwon", "Yongho Lee", "Junhyeok Park", "Sungbin Jang", "Byungchul Tak", "Seokin Hong"],
+      "year": 2024,
+      "venue": "2024 57th IEEE/ACM International Symposium on Microarchitecture (MICRO)",
+      "doi": "10.1109/MICRO61859.2024.00013",
+      "publication_status": "published",
+      "relevance": "core",
+      "evaluation_type": ["simulation", "measurement", "analysis"],
+      "mechanism": "把物理内存当作无界哈希页表，用 Hash(VPN tag, PID) 直接定位 PTE 页，SOA/CVA/CPD 解决地址碰撞，DMT/DMC 缓存参数。",
+      "assumptions": [
+        "PTE 页用哈希直接定位，地址碰撞可解决",
+        "PTE 页不可迁移；数据页可迁移但需 reverse map",
+        "CVA 依赖 OS 选择无碰撞虚拟地址区域",
+        "DMT/DMC/MMU 改动可接受"
+      ],
+      "limitations": [
+        "高利用率下 CPD 更频繁，98% 利用率性能下降约 3.3% 并 TLB shootdown",
+        "PTE 页/non-migratable 页不能迁移",
+        "CVA 有 MAX CVA SIZE/CNT 限制，demand paging 适用性有限",
+        "主性能来自模拟，真机只验证分配机制",
+        "不涉及 IOMMU/SVA"
+      ],
+      "evidence": [
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/dpt2024.txt", "location": "L1-L11, L81-L82", "claim": "题录：MICRO 2024，DOI 10.1109/MICRO61859.2024.00013。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/dpt2024.txt", "location": "L26-L41", "claim": "DPT 把物理内存当无界 HPT，减少碰撞，避免 resize；平均提升 12.6/11.6/8.7%。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/dpt2024.txt", "location": "L379-L414", "claim": "Hash(VPN tag, PID) 定位 PTE page；frame bitmap；9-bit PTE offset。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/dpt2024.txt", "location": "L415-L485", "claim": "SOA/CVA；CVA 的 MAX CVA SIZE/CNT 限制与 demand paging 限制。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/dpt2024.txt", "location": "L486-L555", "claim": "CPD 迁移数据页；reverse map；PTE 页不可迁移。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/dpt2024.txt", "location": "L906-L920", "claim": "98% 利用率下性能下降约 3.3%，CPD 触发 TLB shootdown。"}
+      ],
+      "relations": [
+        {"target": "revelator2026v2", "type": "actual_citation", "source": "revelator2026v2.txt L1651-L1653", "note": "Revelator 参考文献 [146] 引用 Distributed Page Table。"},
+        {"target": "emt2025", "type": "actual_citation", "source": "emt2025.txt L1220-L1227", "note": "EMT 参考文献 [68] 引用 Distributed Page Table。"}
+      ]
+    },
+    {
+      "id": "emt2025",
+      "title": "EMT: An OS Framework for New Memory Translation Architectures",
+      "authors": ["Siyuan Chai", "Jiyuan Zhang", "Jongyul Kim", "Alan Wang", "Fan Chung", "Jovan Stojkovic", "Weiwei Jia", "Dimitrios Skarlatos", "Josep Torrellas", "Tianyin Xu"],
+      "year": 2025,
+      "venue": "19th USENIX Symposium on Operating Systems Design and Implementation (OSDI '25)",
+      "doi": null,
+      "publication_status": "published",
+      "relevance": "core",
+      "evaluation_type": ["measurement", "simulation", "analysis"],
+      "mechanism": "在 Linux 上抽象 translation object/database/service，用 MMU driver 实现 radix/ECPT/FPT 等翻译结构，保持架构无关代码可扩展。",
+      "assumptions": [
+        "新翻译架构可由 MMU driver 实现基本函数",
+        "可定制函数保留硬件特定优化",
+        "ECPT/FPT 可在 QEMU 模拟 MMU 上评估",
+        "EMT 接口开销可忽略"
+      ],
+      "limitations": [
+        "EMT 不改变物理页操作",
+        "只聚焦 CPU VA→PA translation",
+        "明确不面向 IOMMU DMA translation",
+        "只支持 native，虚拟化在 roadmap",
+        "ECPT 有 kECPT self-reference paradox、锁/稀疏地址空间问题"
+      ],
+      "evidence": [
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/emt2025.txt", "location": "L1-L15", "claim": "题录：OSDI '25。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/emt2025.txt", "location": "L40-L52", "claim": "EMT 架构中立接口，支持 ECPT/FPT，并揭示 OS 视角。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/emt2025.txt", "location": "L483-L507", "claim": "限制：不涉及物理页操作；聚焦 CPU translation；不面向 IOMMU DMA；native only。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/emt2025.txt", "location": "L609-L665", "claim": "ECPT kECPT self-reference paradox。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/emt2025.txt", "location": "L875-L896", "claim": "ECPT 1.74x/2.59x more page fault instructions；OS overhead 重要。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/emt2025.txt", "location": "L922-L944", "claim": "ECPT total cycles 平均 -2.3%，FPT flatten L3+L2 仅 -1.1%。"}
+      ],
+      "relations": [
+        {"target": "revelator2026v2", "type": "actual_citation", "source": "revelator2026v2.txt L1672-L1674", "note": "Revelator 参考文献 [153] 引用 EMT。"},
+        {"target": "midgard2021", "type": "actual_citation", "source": "emt2025.txt L1149-L1152", "note": "EMT 参考文献 [56] 引用 Midgard，并给出 venue 线索。"},
+        {"target": "dpt2024", "type": "actual_citation", "source": "emt2025.txt L1220-L1227", "note": "EMT 参考文献 [68] 引用 Distributed Page Table。"}
+      ]
+    },
+    {
+      "id": "midgard2021",
+      "title": "Rebooting Virtual Memory with Midgard",
+      "authors": ["Siddharth Gupta", "Atri Bhattacharyya", "Yunho Oh", "Abhishek Bhattacharjee", "Babak Falsafi", "Mathias Payer"],
+      "year": 2021,
+      "venue": "ISCA 2021 (evidence: emt2025.txt L1149-L1152; midgard2021.txt header lacks venue/DOI)",
+      "doi": null,
+      "publication_status": "published",
+      "relevance": "core",
+      "evaluation_type": ["simulation", "analysis"],
+      "mechanism": "引入 VMA 粒度的中间 Midgard 地址空间，V2M 由 VLB/VMA Table 翻译，M2P 只在 LLC miss 时走 Midgard Page Table/MLB。",
+      "assumptions": [
+        "少量活跃 VMA 可覆盖工作集",
+        "OS 可去重共享 VMA 并维护 VMA→MMA 和 MMA→PFN",
+        "硬件可加 VLB/MLB、额外 cache tag 位、store rollback",
+        "Midgard namespace 可作 coherent cache hierarchy 的地址空间"
+      ],
+      "limitations": [
+        "proof-of-concept software-modeled prototype，不是完整系统",
+        "未来需 OS support、多架构验证、电路级研究",
+        "OS 需重大修改；MMA 增长/冲突可能 remap/cache flush",
+        "不涉及 IOMMU/SVA 设备翻译"
+      ],
+      "evidence": [
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/midgard2021.txt", "location": "L1-L8", "claim": "题录作者；该文件正文无 venue/DOI。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/emt2025.txt", "location": "L1149-L1152", "claim": "EMT 参考文献将 Midgard 列为 ISCA-48 2021。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/midgard2021.txt", "location": "L12-L45", "claim": "Midgard 中间地址空间；16MB LLC 下仅 5% overhead，256MB LLC 与 2MB TLB break even。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/midgard2021.txt", "location": "L177-L241", "claim": "VMA→MMA 映射、VMA Table、MMA sizing/dedup。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/midgard2021.txt", "location": "L374-L407", "claim": "V2M 与 M2P 两步翻译流程。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/midgard2021.txt", "location": "L831-L880", "claim": "proof-of-concept software-modeled；未来 OS、验证、电路级工作。"}
+      ],
+      "relations": [
+        {"target": "revelator2026v2", "type": "actual_citation", "source": "revelator2026v2.txt L1407-L1409", "note": "Revelator 参考文献 [23] 引用 Midgard。"},
+        {"target": "emt2025", "type": "actual_citation", "source": "emt2025.txt L1149-L1152", "note": "EMT 引用 Midgard，并提供 venue/year 证据。"}
+      ]
+    },
+    {
+      "id": "memento2023",
+      "title": "Memento: Architectural Support for Ephemeral Memory Management in Serverless Environments",
+      "authors": ["Ziqi Wang", "Kaiyang Zhao", "Pei Li", "Andrew Jacob", "Michael Kozuch", "Todd C. Mowry", "Dimitrios Skarlatos"],
+      "year": 2023,
+      "venue": "MICRO '23: 56th Annual IEEE/ACM International Symposium on Microarchitecture",
+      "doi": "10.1145/3613424.3623795",
+      "publication_status": "published",
+      "relevance": "nearby",
+      "evaluation_type": ["simulation", "analysis"],
+      "mechanism": "用 HOT 缓存 arena 元数据在核心附近完成 obj-alloc/obj-free，用硬件页分配器管理小页池和 Memento Page Table，并做主存 bypass。",
+      "assumptions": [
+        "serverless 函数分配多为 ≤512B 小对象",
+        "对象生命周期双峰：短命或函数退出批量释放",
+        "OS 预留 Memento 虚拟地址区域并暴露控制寄存器",
+        "ISA 扩展 obj-alloc/obj-free 可被语言运行时使用"
+      ],
+      "limitations": [
+        "full-system simulation，不是硬件原型",
+        "只支持 heap 小对象，RW/NX，不支持 file-backed",
+        "大对象由软件处理",
+        "多核需 flush HOT，有开销",
+        "不是地址翻译架构，不是 IOMMU/SVA"
+      ],
+      "evidence": [
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/memento2023.txt", "location": "L1-L16, L39-L44, L57", "claim": "题录：MICRO '23，DOI 10.1145/3613424.3623795。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/memento2023.txt", "location": "L17-L45", "claim": "Memento 机制与收益：8–28% speedup、DRAM -30%、pricing -29%。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/memento2023.txt", "location": "L94-L118", "claim": "serverless 内存行为三大 insight：小对象、双峰生命周期、用户态+内核成本。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/memento2023.txt", "location": "L512-L588", "claim": "HOT 与硬件 object allocator 的初始化/分配/释放步骤。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/memento2023.txt", "location": "L629-L656", "claim": "硬件 page allocator、Memento Page Table、MPTR、按需 back 页。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/memento2023.txt", "location": "L667-L717", "claim": "主存 bypass 机制。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/memento2023.txt", "location": "L624-L631", "claim": "只支持 heap、RW/NX，不支持 file-backed。"},
+        {"file": "iommu-platform/out/shared-translation-literature-20261006/papers/memento2023.txt", "location": "L798-L832", "claim": "QEMU+SST+DRAMSim3 full-system simulation。"}
+      ],
+      "relations": [
+        {"target": "revelator2026v2", "type": "mechanism_comparison", "source": "本报告对比；在 revelator2026v2.txt 给定全文参考文献中未找到 Memento 条目", "note": "Memento 优化对象/页分配生命周期，Revelator 优化 VA→PA/PTE 推测翻译；二者都涉及 OS 分配语义暴露，但 Memento 未直接为设备共享地址翻译设计，不能假称 Revelator 实际引用。"}
+      ]
+    }
+  ]
+}
+```
+
+**不确定性与后续核对**：
+- `spectlb2011`、`ingens2016`、`emt2025` 正文题头未给出 DOI，JSON 填 null。
+- `midgard2021` 正文题头无 venue/DOI；venue 依据 `emt2025.txt` 参考文献填写，并已在 JSON 中注明证据来源。若后续拿到正式出版页，应复核。
+- `memento2023` 与 Revelator 的关系仅为机制对比；给定 Revelator 全文未找到实际引用条目，不能写成 actual_citation。
+- 本组全文可支持范围主要是 CPU/虚拟化地址翻译与 OS 内存管理；设备 IOMMU/SVA、远端设备 PTW、设备队列/尾延迟仍需另找全文，不能由本组推断。

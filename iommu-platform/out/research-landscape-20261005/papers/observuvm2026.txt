@@ -1,0 +1,1265 @@
+Observability-aided GPU Memory Oversubscription
+                             Pratheek B †                  Khushit Shah§                  Arkaprava Basu
+                                                     Indian Institute of Science
+                                                         Bangalore, India
+                                            {pratheekb, khushits, arkapravab}@iisc.ac.in
+
+
+   Abstract—Unified Virtual Memory (UVM) enables the over-             in the critical path and on choosing what pages to migrate
+subscription of GPUs’ limited High Bandwidth Memory (HBM)              from DRAM to the capacity-constrained HBM. For example,
+capacity. Unfortunately, applications can significantly slow down      batching of GPU page faults was proposed to amortize the
+when HBM is oversubscribed. We set out to make oversubscrip-
+tion practical without needing custom hardware modifications.          cost of faults [31], while prefetching pages to HBM hides
+   The UVM driver, executing on the CPU, is responsible for            migration latency from the critical path [18].
+eviction and prefetching but lacks observability into GPUs’               While UVM’s page migration overhead and policies have
+accesses to HBM-resident memory. This fundamentally limits the         been the focus of several recent works [5], [18], [22], [31],
+driver’s ability to make informed decisions. Toward this, we           policies for deciding what to evict from HBM under over-
+repurpose existing hardware access counters originally designed
+to track PCIe accesses to CPU’s DRAM to aid page migration.            subscription (henceforth, eviction policies) have received little
+Instead, we leverage the counters to provide (sampled) observ-         attention. We posit that the fact that GPU hardware provides
+ability into GPU’s accesses to HBM-resident pages. We then             no direct means to monitor GPU accesses to HBM-resident
+create ObservUVM, a novel software framework that enables              pages, fundamentally limits exploration of eviction policies.
+easy exploration of observability-aided custom eviction and            The UVM driver – running on the CPU – only witnesses a
+prefetching policies in the userspace, facilitating future research.
+We demonstrate that better-informed eviction and prefetching           stream of page faults upon GPU’s access to DRAM-resident
+policies, enabled by the newfound observability, can significantly     pages and their migration to HBM. However, once the pages
+speed up GPU applications under memory oversubscription.               are migrated onto HBM, the driver is blind to accesses to
+   Index Terms—GPGPU, UVM, observability, eviction-policy              HBM-resident pages.
+                                                                          Unsurprisingly, the driver implements a simple Least Re-
+                        I. I NTRODUCTION                               cently Migrated (LRM) eviction policy [44], given the limited
+   GPUs are the platform of choice for accelerating parallel           information available. The driver maintains a list of HBM-
+applications. However, they are often constrained by their             resident memory regions, with the most recently migrated
+limited onboard memory (HBM) capacity [42]. We refer to                regions at the tail, and the least recently migrated at the head.
+the GPU’s onboard memory as High Bandwidth Memory                      Under memory pressure, it evicts the region that was migrated
+(HBM), and CPU’s attached memory as DRAM, without loss                 earliest, i.e., at the head of the list. Unfortunately, this policy
+of generality. While the need to process ever-growing amounts          often evicts regions that the GPU is actively computing on.
+of data on GPUs remains unabated, the HBM on most GPUs                 Least recently migrated does not imply a region is inactive.
+remains limited to tens of GBs, which pales in comparison to           Any evicted but active memory regions must be migrated back
+the TBs of DRAM on modern servers.                                     to HBM, adding significant but avoidable overhead.
+                                                                          The fundamental reason behind UVM’s propensity to make
+   To allow GPU programs to operate seamlessly on data
+                                                                       poor eviction decisions is its lack of observability – the ability
+that exceeds the HBM capacity, NVIDIA introduced the Uni-
+                                                                       to infer which HBM-resident pages are actively accessed by
+fied Virtual Memory (UVM) technology [23]. UVM relieves
+                                                                       the GPU. Even if the driver had observability into only the
+programmers from explicitly orchestrating data movement
+                                                                       memory regions at imminent risk of eviction, it could have
+between DRAM and HBM while also oversubscribing the
+                                                                       avoided evicting those actively accessed by the GPU.
+limited HBM capacity. It allows TBs of DRAM capacity to
+                                                                          The absence of observability hamstrings UVM’s prefetching
+act as the backing store to the GPU’s HBM. A GPU page fault
+                                                                       policies, too. The driver today has no mechanism for knowing
+(henceforth, page fault) is raised when the GPU accesses data
+                                                                       whether its prefetches are actually useful, i.e., it lacks feedback
+that is not available on HBM. The UVM driver, executing on
+                                                                       on the usefulness of past prefetches. This limitation forces
+the CPU, services the page fault by migrating the requested
+                                                                       the driver to adopt a conservative policy to avoid useless
+page(s) from DRAM to HBM.
+                                                                       prefetches that could contend with demand requests.
+   Unfortunately, UVM can significantly slow down GPU
+                                                                          A key goal of this work is to empower UVM with sam-
+programs under memory oversubscription due to the overheads
+                                                                       pled observability: the ability to infer whether HBM-resident
+of page fault servicing, migration, and eviction [4], [5], [11],
+                                                                       memory regions (sampled) are accessed by the GPU, without
+[20]. Prior research has focused on limiting page fault latency
+                                                                       needing hardware modifications. With the newfound capability
+    † Now at NVIDIA.                                                   of sampled observability (henceforth, observability), UVM can
+    § Now at Nutanix.                                                  make better-informed eviction and prefetching decisions.
+   Our key insight is that existing hardware access counters         regions be evicted [24](Section VI-A). Similarly, we observe
+can be repurposed to provide observability. NVIDIA GPUs              that no single prefetching strategy suits all applications.
+have access counters to track accesses from the GPU to                  Importantly, the newfound observability can enable these
+DRAM over the PCIe interconnect [45]. These counters are             diverse choices of eviction and prefetching policies. However,
+designed to differentiate frequently accessed DRAM-resident          fully harnessing observability requires the flexibility to adapt
+pages (hot) from infrequently accessed ones (cold) to help           eviction and prefetching policies to diverse application needs.
+migrate hot pages to the HBM. They cannot monitor accesses           Unfortunately, the current UVM framework is not conducive to
+to HBM-resident pages, though. We find that access counters          exploration and adaptation. It bakes the eviction and prefetch-
+are of limited usefulness for page migration (their original         ing policies into the driver – every new policy would require
+purpose) for several fundamental reasons (Section III-D). For        driver modifications.
+example, the limited number of hardware counters (∼ 256)                To this end, we create ObservUVM, a new framework built
+is ineffective at tracking the hotness of TBs of DRAM. It is         atop UVM that enables easy exploration of observability-aided
+thus unsurprising that the UVM driver does not enable access         eviction and prefetching policies. ObservUVM cleanly sepa-
+counters for page migration by default [47].                         rates mechanisms from policies. It implements mechanisms for
+   We, instead, propose to repurpose these counters to provide       observability, eviction, and prefetching by modifying the UVM
+observability into the GPU’s accesses to the HBM. To observe         driver. The policies, however, are delegated to userspace. The
+GPU accesses to a HBM-resident memory region (here, 2MB),            enhanced driver exposes APIs to userspace, enabling safe and
+we migrate a sample of pages in the region (say, one 64KB            rapid exploration of policies without requiring modifications to
+page) to the DRAM and map them on GPU page tables. We                the driver for each policy. The source code of the framework,
+then track the GPU’s accesses to these sampled pages over            along with example custom eviction and prefetching policies,
+the PCIe using access counters. Thanks to the high spatial           is available at https://github.com/csl-iisc/ObservUVM.
+locality of accesses in typical GPU applications [36], sampling         We demonstrate the efficacy of ObservUVM by imple-
+even a single 64KB page within a 2MB region provides                 menting 1 three observability-enabled eviction policies, 2 a
+sufficient observability to the eviction and prefetching policies    meta-policy, Tournament, that chooses the appropriate eviction
+(Sections IV-A and VII-C). Nevertheless, we dynamically              policy at runtime, and 3 two observability-guided prefetching
+increase (decrease) the number of sampled pages per region           policies. We evaluate these policies with a diverse set of
+based on an application’s spatial locality (Section V-D).            fourteen applications under varying levels of memory oversub-
+   Using access counters for observability rather than for page      scription, and show an average speed up of 34% (geometric
+migration sidesteps their key limitations. The few hundred           mean) over UVM.
+hardware counters are insufficient to track TBs of DRAM                 In summary, we make the following key contributions:
+to distinguish hot and cold regions effectively, but suffice         • We show that UVM’s memory eviction and prefetching
+to track a limited number of sampled pages from a few                policies under memory oversubscription can significantly ben-
+key HBM-resident regions. For instance, the driver’s LRM             efit from sampled observability of GPU accesses to HBM-
+eviction policy can be enhanced to approximate the Least             resident memory.
+Recently Used (LRU) policy by observing a few regions (say,          • We enable observability by repurposing existing access
+100, parametrized) near the head of the eviction list. These         counters, which otherwise have limited usefulness for its origi-
+are at imminent risk of eviction and thus are key regions            nal use case of page migration. This helps enable observability
+in this context. If sampled pages from such regions witness          without requiring new hardware.
+access counter notifications, these actively accessed regions        • We create a framework, ObservUVM, for the easy explo-
+are moved to the tail of the list, protecting them from eviction.    ration of UVM eviction and prefetching strategies, facilitating
+This avoids evicting actively accessed HBM-resident regions.         future research.
+   Beside eviction, prefetching policies can also leverage ob-       • We demonstrate how observability helps create new classes
+servability by monitoring recently prefetched memory regions         of eviction and prefetching policies for UVM that significantly
+(i.e., key regions in this context). Access to the observed region   speed up applications under memory oversubscription.
+would indicate the usefulness of past prefetches, while a lack
+of access can serve as negative feedback. This observability-                        II. BACKGROUND ON UVM
+enabled feedback can help guide the prefetching strategy.               NVIDIA introduced Unified Virtual Memory (UVM) to
+   While the observability-enabled (approximate) LRU policy          simplify GPU programming and enable oversubscription of
+significantly improves eviction decisions, it is, unsurprisingly,    GPU memory [23]. GPUs have limited on-board memory
+not ideal for every application. For example, applications with      (High-Bandwidth Memory, or HBM) [26] typically in tens
+significant skew in the access frequencies across memory             of GBs with a couple of hundreds of GBs only in the top-
+regions, such as those with matrix rank operations and decom-        end server GPUs. Compare this with CPU memories (DRAM)
+position (SRK [49]), LU [49]), may prefer the Least Frequently       that routinely scale up to TBs. Traditionally, the programmer
+Used (LFU) policy. LFU prioritizes eviction of infrequently          allocates memory buffers on the HBM, copies data from
+accessed regions. Applications with cyclic memory access pat-        DRAM to HBM over the PCIe interconnect, requests the
+terns, on the other hand, prefer having more recently migrated       GPU to perform computation, and then copies the output
+    UVM driver 3                                          UVM driver                                             UVM driver 1
+
+
+
+
+                                                                                         counters
+                      2 Fault info
+
+
+
+
+                                                                                          Access
+                                                                              4
+                     Map/Replay                                                     3                                              Unmap
+     CPU                                         GPU      CPU                                             GPU     CPU
+                          PCIe                                                    PCIe                                                                GPU
+                                                                                                                                       PCIe
+                                                                             5 Migration
+    4                 5 Migration        1   6                                                      2            4                            3   2
+                                     7                                                                                             Eviction
+        Page table                           Page table     Page table         Eviction 1           Page table       Page table                   Page table
+
+
+
+                        DRAM                                                DRAM                        HBM                         DRAM
+                                             HBM                                                                                                      HBM
+
+
+             (a) Page fault based migration                     (b) Access counter based migration                                (c) Eviction
+
+                        Fig. 1: Page fault based migration, eviction and access counter based migration in UVM
+
+back to the DRAM. UVM simplifies GPU programming by                                 migrations on the first touch. To improve page migration,
+freeing the programmer from manual memory copying. The                              NVIDIA introduced optional Access Counter Based Migration
+UVM driver, running on the CPU, transparently performs page                         (ACBM) with the Volta generation of GPUs [42], [45].
+migrations between the DRAM and HBM, like demand paging                                Figure 1b shows the working of ACBM. With ACBM
+in CPUs. Importantly, UVM enables HBM oversubscription.                             enabled, regions evicted from the HBM to the DRAM 1 are
+Oversubscription allows GPU programs to work with datasets                          mapped onto the GPU’s page tables 2 , and are accessed by
+larger than the HBM capacity.                                                       the GPU over PCIe. Access counters monitor accesses over
+   There are two key parts to UVM: 1 deciding what pages to                         PCIe 3 and raise notifications 4 when a region accumulates
+migrate onto the HBM, and 2 what to evict from HBM under                            a threshold (parameterized) number of accesses. Upon a
+memory pressure. The former encompasses page migration                              notification, the driver triggers the migration of the region from
+and prefetching strategies, and has been studied well [2], [3],                     DRAM to HBM ( 5 ). The tracking granularity and threshold
+[9], [18], [22], [31]. The latter is in the purview of the eviction                 are configured at driver load time, with threshold from 1 to
+policy, and little attention has been paid to this aspect. We now                   65535 and granularity from 64KB, 2MB, 16M, or 1GB.
+describe the workings of UVM in detail, focusing on page                               ACBM provides two benefits. 1 Only heavily accessed
+migration, page eviction, and prefetching strategies.                               regions are migrated to the HBM to enjoy high bandwidth,
+                                                                                    minimizing needless migrations and preventing thrashing. 2
+A. Page Migration in UVM                                                            DRAM-resident pages remain accessible to the GPU (mapped
+   UVM employs a page fault mechanism to migrate 64KB                               onto GPU page tables), unlike in page fault-based migration
+pages between the DRAM and HBM (Figure 1a). When the                                where the faulting instruction stalls until the fault is serviced.
+GPU accesses a page that is not resident on the HBM, it                                We emphasize that access counters track accesses from
+raises a page fault 1 . The faulting address is placed in a                         GPU to DRAM over the PCIe, and not the accesses to HBM-
+buffer shared between the GPU and the CPU 2 . The UVM                               resident pages. We believe this is the result of fundamental
+driver reads this page fault information from the shared buffer                     hardware limitations – tracking and updating access counters
+and services the corresponding page faults 3 . It locates the                       for HBM accesses at TB/s bandwidth is challenging and
+faulting page on the CPU DRAM, unmaps the page from the                             possibly unrealistic. In comparison, PCIe bandwidth is only
+CPU’s page tables 4 , migrates the page to the faulting GPU’s                       a few tens of GB/s and thus easy to track. Note that ACBM
+HBM 5 over PCIe, establishes the appropriate page table                             is disabled by default in the UVM driver (Section III-D).
+mappings on the GPU’s page tables 6 , and finally instructs
+the GPU to replay the faulting instructions 7 .
+                                                                                    C. Prefetching in UVM
+   Servicing a single page fault takes between 10 and 50 mi-
+croseconds [65]. Since page faults lie on the critical execution                       The UVM driver performs prefetching within 2MB bound-
+path of the GPU, page migration through page faults is costly.                      aries (intra-2MB) from DRAM to HBM using a Tree-Based
+It has been well recognized that enhancing page migration                           Prefetching (TBP) strategy to reduce critical path page mi-
+is important for improving UVM performance [4], [5], [11].                          gration latency [18], [46]. TBP uses complete binary trees,
+Thus, prior works have proposed improving UVM page migra-                           each representing a 2MB memory region, to track HBM
+tion with page fault handling optimizations [31], prefetching                       residency within the region. The leaves of this tree represent
+[22], [46], and access counter-based page migration [19], [45].                     64KB regions, the root represents the 2MB region, and the
+                                                                                    internal nodes represent power-of-two sized regions between
+B. Access Counter Based Page Migration (ACBM)                                       them. Each node tracks the fraction of HBM-resident memory
+  The latency of page fault servicing and page migrations in                        under the sub-tree of the node. On a page fault, if a node’s
+UVM lies on the critical path of execution. Further, the page                       GPU-resident memory exceeds a threshold (default 51%), all
+fault based mechanism cannot differentiate between heavily                          pages in its sub-tree are prefetched. The threshold determines
+accessed and lightly accessed pages, leading to blind page                          the aggressiveness of prefetching. A lower threshold leads
+to sub-tree migrations with fewer faults, and hence is more                                                           Legend
+                                                                    Matrix A                                Current   Expired     Future
+aggressive. Similarly, a higher threshold is less aggressive.
+   However, note that TBP is not adaptive. It uses a fixed                                    I Insertion    Promotion      Eviction   E
+                                                                    Matrix B                                  P
+threshold and does not consider the utility of prefetched                                 T                                                H
+pages to adapt its aggressiveness. Thus, it may prefetch pages      Matrix C
+                                                                                      W   L
+unnecessarily, wasting PCIe bandwidth, or miss opportunities              Workload                    Least Recently Migrated
+to prefetch pages early.                                                Fig. 2: Working of the UVM’s default LRM policy
+D. Eviction in UVM
+   While page migration and prefetching have received consid-      in the figure) operates on three matrices, A, B, and C. The
+erable attention, eviction is, unfortunately, an overlooked yet    shaded squares in the figure represent the state of 2MB regions
+important aspect of UVM. To make room for pages demanded           within these matrices: fully shaded regions (Current) are
+by the GPU, the UVM driver may evict HBM resident pages            being accessed currently; hatched regions (Expired) have
+to the DRAM. Figure 1c shows the page eviction mechanism.          been accessed earlier and not accessed again; and tiled regions
+The UVM driver, running on the CPU, chooses the eviction           (Future) will be accessed in the future. Matrices A and C
+victim 1 . The chosen victim is unmapped from the GPU’s            are accessed in parts, with different portions accessed during
+page tables 2 , migrated to the DRAM 3 , and mapped onto           different stages of execution. Matrix B is accessed in its
+the CPU’s page tables 4 . The choice of eviction victim is         entirety across the entire execution. Consequently, the pages
+important, as poor eviction decisions can lead to frequent page    of B should never be evicted from the HBM. Unfortunately,
+faults, ultimately degrading performance.                          the driver has no way of knowing if a region is being accessed
+   The UVM driver uses a Least Recently Migrated (LRM)             after it has been migrated to the HBM. As a result, the regions
+policy (Figure 2) for choosing 2MB regions to evict from the       of B move towards the head of the list L and get evicted early
+HBM. The driver maintains a list L of HBM-resident 2MB             under memory pressure (Section II-D). It must subsequently
+memory regions. When a 2MB region that is not resident on          be migrated back upon access, incurring significant overheads.
+the HBM is faulted upon, the UVM driver inserts the region            If the driver could peek into GPU accesses to HBM, it could
+to the tail T of the list ( I ). Eventually, the region moves      make better-informed eviction decisions. It could transform
+towards the head H of the list, as newer regions are added         the default LRM eviction policy to approximate the Least
+to the tail. When another 64KB page within the 2MB region          Recently Used (LRU) policy. In the above example, the driver
+is faulted upon, the 2MB region is promoted to the tail of the     could move memory regions of the matrix B to the tail of
+list ( P ). Under memory pressure, the 2MB region at the head      the list to avoid evicting them. As we will show later, using
+ H of the list (i.e., the least recently migrated) is chosen for   the LRU policy instead of LRM reduces evictions in matrix
+eviction and removed from the list ( E ).                          multiplication by as much as 71%. Unfortunately, it is not
+Limitations: The UVM driver makes eviction decisions with-         possible today due to the lack of observability.
+out any information about the GPU’s accesses to the HBM.
+Unlike CPUs, NVIDIA GPUs do not provide access bits [43],          B. Single Policy Does Not Fit All
+[44] or low-overhead monitoring tools (e.g., AMD’s IBS [1])           Unsurprisingly, different applications, with distinct access
+to track memory accesses to the HBM. Thus, the UVM driver          patterns, prefer different eviction policies. For example, in
+chooses eviction victims solely based on the page fault stream,    applications with a cyclic access pattern with very large reuse
+limiting its ability to make good decisions (Section III-A).       distances between consecutive accesses to the same memory
+                                                                   region, evicting the least-recently used regions effectively
+    III. C URRENT S HORTCOMINGS AND K EY I NSIGHTS                 leads to no reuse of the migrated pages. Such applications,
+   In this section, we discuss the limitations of existing evic-   instead, benefit from evicting recently used regions. Similarly,
+tion, prefetching, and access counter-based migration policies,    some applications exhibit access patterns that favor evicting
+and present four observations that motivate our approach to        the least frequently used (LFU) regions. In our evaluation
+improving GPU memory oversubscription.                             with fourteen diverse applications, five prefer LRU, six prefer
+                                                                   LFU, and three prefer a policy tailored for cyclic patterns. We
+A. Limitations of UVM’s LRM Eviction Policy                        describe the policies in detail in Section VI-A and evaluate
+   UVM’s Least Recently Migrated (LRM) eviction policy             them in Section VII-A. Ultimately, no single policy suits every
+often makes poor eviction decisions. The LRM policy can evict      application. Choosing the right policy is important to minimize
+HBM-resident regions that are actively being accessed, even        evictions and subsequent migrations.
+when there are other regions that are inactive. This is because       Thankfully, UVM policies are implemented in the software
+the UVM driver, running on the CPU, has no knowledge of            (driver), enabling customization of eviction policies without
+GPU accesses to HBM, i.e., the driver has no observability         hardware modification. However, policies are deeply embed-
+into the accesses to HBM.                                          ded in the UVM driver, making it impractical to easily explore
+   We demonstrate this limitation using a simple matrix multi-     diverse policy choices. Changing policies would require modi-
+plication application shown in Figure 2. This application ( W      fying, recompiling, and reloading the driver. Bugs in the policy
+or in implementation could crash the system and expose it to                           300
+
+
+
+
+                                                                     # notifications
+security vulnerabilities. In Section IV-C, we discuss how we
+                                                                                       200
+separate policy from mechanism to overcome these limitations.                                                                 256
+                                                                                       100
+C. Lack of Feedback Constrains Prefetching
+                                                                                         0
+   Prefetching can improve performance by reducing page                                      0        100               200         300
+migrations on the critical path of access. However, useless                                                 # regions (p)
+prefetches can cause destructive interference on the PCIe and
+                                                                   Fig. 3: Microbenchmark: Limited number of access counters
+further limit the effective capacity of the HBM. As with
+eviction, the driver is responsible for prefetching into HBM.
+However, it lacks knowledge of whether a prefetched region         x times from the GPU. Correspondingly, we set the threshold
+is actually accessed in the HBM.                                   for the access counters to x. We expect one notification per
+   In the absence of feedback on prefetch’s usefulness, the        region (p) as long as ‘p’ is equal to or less than the number of
+driver acts blindly and often conservatively. The UVM driver       hardware counters. Figure 3 reports the number of notifications
+employs a Tree-Based Prefetcher (TBP) that desists from            (y-axis) with varying p (number of regions). We observe that
+migrating entire 2MB regions. Instead, it waits for a stream       the number of notifications increases linearly with p until 256.
+of faults to 64KB constituent pages to gain confidence before      It saturates thereafter, confirming the presence of 256 hardware
+migrating the residual pages within a region (Section II-C).       counters. We observe the same on a range of NVIDIA GPUs.
+While justified for applications with low spatial locality to         Tracking accesses to TBs of DRAM (millions of pages)
+avoid useless prefetches, TBP leaves significant performance       with only 256 access counters is futile. It is also unrealistic to
+on the table for those with high spatial locality – typical        ever have millions of access counters on a GPU.
+for many GPU applications. It would have been beneficial to           Furthermore, access counters have a large configuration
+prefetch the entire 2MB region upfront, wherever an applica-       space. There are four possible tracking granularities and 65535
+tion ultimately accesses all or most of the constituent 64KB       possible thresholds, yielding ∼ 250,000 possible combinations
+pages. However, feedback on past prefetches is essential to        (Section II). The right configuration varies across applica-
+prefetch aggressively without risking many useless ones.           tions. Lower thresholds may cause excessive migrations and
+   To quantify the opportunity cost of TBP’s conservative          thrashing, while higher thresholds risk delayed migration. For
+strategy, we measure the number of HBM-resident 64KB               instance, cuBLAS’s matrix multiplication works best with low
+pages in every 2MB region (i.e., occupancy) at the time of the     thresholds (e.g., 1), while rank computation prefers higher
+region’s eviction. A high occupancy indicates that most pages      thresholds. Similarly, the tracking granularity trades off track-
+were accessed and consequently, migrated onto the HBM. We          ing precision for coverage. Thus, ACBM needs extensive per-
+find that, on average, a 2MB region is over 90% occupied at        application tuning to be useful in practice.
+eviction. This implies a significant opportunity to aggressively      In short, access counters have limited usefulness in perform-
+prefetch entire 2MB regions upfront.                               ing their primary function – i.e., identifying and migrating hot
+   Further, the UVM driver only prefetches within a 2MB re-        pages. We observed that ACBM can be detrimental to per-
+gion but never across regions. Many applications could benefit     formance (Section VII-B). Consequently, ACBM is disabled
+from prefetching beyond a single 2MB region. For instance, in      by default in the UVM driver. It instead relies on traditional
+the example described in Section III-A, matrices A and C are       page-fault-based migration (Section II).
+accessed in parts, but in a predictable and linear fashion. Such
+access patterns are amenable to prefetch policies that transcend                       Summary of Key Insights
+2MB boundaries. However, blindly prefetching across 2MB
+                                                                      1 Lack of observability into GPUs’ accesses to HBM
+regions can significantly hurt performance (Section VI-D).
+                                                                     hinders UVM’s ability to make informed eviction choices.
+Feedback on the usefulness of past prefetches is crucial for
+                                                                      2 Absence of feedback on the utility of prefetching
+dynamically tuning prefetch aggressiveness.
+                                                                     limits the aggressiveness of prefetching policies. 3 A
+D. Limited Usefulness of Access Counters for Migration               flexible framework is needed to customize UVM policies
+   Finally, we find that ACBM, while good in theory, does not        for diverse application needs. 4 Fundamental limitations
+work as well in practice. It is constrained by 1 the limited         prevent access counters from aiding page migration.
+number of hardware counters and 2 the difficulty of selecting
+appropriate configuration parameters (granularity, threshold).     IV. O BSERV UVM: A F RAMEWORK FOR I NFORMED UVM
+   We found that there are only a limited number (256)                We design a framework, named ObservUVM, to overcome
+of hardware access counters for tracking GPU accesses to           key limitations of existing eviction and prefetching mecha-
+DRAM-resident pages. We reverse-engineer the number of             nisms. It has three key objectives:
+counters using a microbenchmark. It allocates p × 2MB on           1) Provide observability of accesses to HBM-resident mem-
+the DRAM and pins it to avoid migration, maps the allocated            ory without needing hardware modifications.
+memory to the GPU page table, and accesses each 2MB region         2) Enable feedback on the utility of prefetching into HBM.
+             Eviction                                                                1
+
+
+
+
+                                                                     2MB regions
+                                                                      Fraction of
+                                        counters
+              policy
+
+
+
+
+                                         Access
+                                                                                    0.5
+       CPU     1 Region           4
+                                                                                     0
+              Page            PCIe                        GPU
+                                                                                          0   2     4 6 8 10 12 14 16 18 20 22 24 26 28 30 32
+             select                                                                               Number of 64KB pages accessed per 2MB region at eviction
+                 2                 6    Migration
+
+                               Observable                                            Fig. 5: Locality in 2MB regions upon eviction
+                                               3
+
+
+                            DRAM                                       We empirically find that monitoring a single page (64KB)
+                                                    HBM
+                                                                    within a memory region (2MB) is sufficient for making
+         Fig. 4: Mechanism to enable observability                  informed eviction decisions. A 2MB region consists of thirty-
+                                                                    two 64KB pages. If most of the constituent pages of a
+                                                                    region are accessed before the region is evicted from HBM,
+3)   Ease customization of UVM’s eviction and prefetching           sampling any one of the pages provides accurate observability
+     policies by separating them from mechanisms in driver.         for the region. Figure 5 empirically measures this across
+   Here, we detail the framework’s design principles. Section       all applications. The x-axis shows the number of constituent
+V details the implementation of ObservUVM, while Section            pages within a region that are accessed before the region’s
+VI demonstrates how the framework can be used to enable             eviction. The height (y-axis) of a bar at a point ‘p’ on the x-
+different eviction and prefetching policies in userspace.           axis captures the fraction of 2MB regions (y-axis) whose ‘p’
+                                                                    constituent pages are accessed. From the figure, we notice that
+A. Sampled Observability for Eviction Policies
+                                                                    all constituent pages of more than 90% of regions are accessed
+   ObservUVM enables eviction policies to observe (sampled)         before eviction. This affirms that sampling a single page within
+accesses to a chosen set of key HBM-resident memory regions         a region provides sufficient observability. Section VII-C shows
+(e.g., up to 100 2MB regions). It emulates the functionality of     the sensitivity to sampling a different number of pages from a
+‘access bits’ for chosen regions without requiring new hard-        region. Further, we extend ObservUVM to dynamically adjust
+ware by re-purposing existing access counters. Figure 4 shows       the number of pages it samples per region based on the spatial
+ObservUVM’s philosophy behind making a region observable.           locality of applications (Section V-D).
+An eviction policy chooses an HBM-resident region (here,               Note that accessing sampled pages over the PCIe increases
+2MB) to be made observable 1 . ObservUVM chooses a                  access latency. However, upon access, the sampled page is
+constituent page (here, 64KB) within the observable region as       migrated back to the HBM to enjoy high-bandwidth access,
+a sample 2 . It migrates the sampled page to DRAM and pins          limiting the number of PCIe accesses.
+it 3 . Upon a GPU access (over PCIe) to the sampled page
+on the DRAM 4 , the hardware generates an access counter            B. Feedback for Prefetching Policies
+notification to ObservUVM’s driver 5 . The driver informs the
+policy about the access to the sampled page. The sampled page          Observability is also useful for providing feedback on the
+is then migrated back to the HBM as it has finished serving         usefulness of past prefetches. For example, a TBP prefetching
+its purpose of monitoring access to its encompassing region         policy can make (a subset of) regions under active prefetching
+ 6 . The region ceases to be observable.                            observable. It can then sample a prefetched page within a
+   Re-purposing access counters for observability sidesteps its     region and pin it on the DRAM to monitor accesses to it using
+key limitations (Section III-D). The traditional use case of page   counters. Upon receiving an access counter notification for a
+migration necessitates tracking possibly terabytes of DRAM.         prefetched page, the driver notifies the policy of the useful
+In contrast, ObservUVM only monitors (observes) sampled             prefetch (positive feedback). If a region is evicted without its
+pages from the chosen HBM-resident regions that are key to          sampled page witnessing access, it provides negative feedback
+a policy’s decision-making. An eviction policy needs only to        to the policy. A prefetching policy can utilize the feedback to
+observe regions at immediate risk of eviction (key regions). We     increase the aggressiveness of prefetching or throttle it.
+empirically find that observing up to 100 regions is sufficient,
+                                                                    C. Separation of Policy from Mechanism
+well within the tracking capabilities of current GPUs. Another
+limitation of access counters is finding the right threshold to        Today, the eviction and prefetching policies are baked into
+differentiate hot pages from cold ones. Since ObservUVM             the driver. It impedes safe and rapid exploration of policies.
+uses access counters to emulate access bits, the threshold must     In contrast, ObservUVM enables policies to be implemented
+naturally be one.                                                   in userspace. It extends the UVM driver to relay events
+   The effectiveness of sampling for observability relies on        (e.g., page faults and evictions) to userspace (Section V-A).
+spatial locality in an application. If the GPU accesses an ob-      It provides observability and enforces the policy decisions.
+served region but not its sampled page, ObservUVM will fail         Meanwhile, the userspace (Section V-C) is responsible for
+to report accesses to the region. Fortunately, GPU programs         making policy decisions, e.g., selecting an eviction candidate,
+naturally exhibit significant spatial locality [36].                based on information relayed by the modified driver.
+                      U                                                                                        TABLE I: Comm. layer interface/Userspace callbacks
+                                Userspace engine      FDP    RGP
+                                                                     .   LRU        LFU    MRU    Tour.
+                                                                                                                                   Interface/callback          Arguments
+  GPU residency           Observability     Prefetch policy              Eviction policies
+                 U5                  U4                     U3                                   U2                                onPageFault                 Address
+
+
+
+
+                                                                                                             Downstream Upstream
+                                                                           U1
+                                                                                                                                   onAccessCounter             Address
+                                Userspace event loop             .                                                                 onEviction                  Address
+                                                                                                                                   onPrefetch                  Address, Bitmap
+        Events             Communication layer.               . .
+                                                            Decisions                     Requests
+                                                                                                                                   setEvictionRegion           Address
+                      C                                                                                                            setPrefetchThreshold        Integer
+                                                                                                                                   setPrefetchRegion           Address
+   T2                      T1                  T3                                                                                  setObservabilityCandidate   Address
+     Upstream              Observability
+                               TP                                                                                                  setFeedbackCandidate        Address
+                                                     Downstream tracepoints
+    tracepoints             tracepoints
+   D2                      D1                  D4                              D3
+         Events            Observability            Prefetch                        Eviction
+                                Modified driver                  .                                          Upon memory pressure, the driver needs to evict a 2MB
+                      D
+                                                                                                          region D3 . The modified driver retrieves the eviction victim,
+ Fig. 6: Components of ObservUVM and their interactions                                                   as chosen by the userspace and conveyed over the communi-
+                                                                                                          cation layer. It evicts the region from the HBM to DRAM.
+                                                                                                            The driver can receive requests T3 from the userspace to
+         V. I MPLEMENTING O BSERV UVM FRAMEWORK                                                           change the prefetching strategy too. ObservUVM controls the
+   We implement ObservUVM by extending NVIDIA’s open-                                                     prefetching aggressiveness by changing the prefetch threshold
+source UVM driver v525 [47], creating an extensible userspace                                             (Section VI-C). A lower threshold value implies aggressive
+engine, and a communication layer between the driver and                                                  prefetching, and vice versa. The driver also receives addresses
+userspace. The userspace engine is written in C++11 while                                                 of regions to prefetch from the userspace (Section VI-D).
+the communication layer uses eBPF [15] via libbpf [38].                                                   B. Communication Layer
+Overview: Figure 6 depicts the three major components of
+                                                                                                             The communication layer relays messages between the
+ObservUVM. The modified UVM driver D provides observ-
+                                                                                                          modified driver and the userspace engine. It provides two sets
+ability, relays events (e.g., page faults) to the userspace, and
+                                                                                                          of interfaces: upstream interfaces that the driver uses to relay
+enforces policy decisions (Section V-A). The userspace engine
+                                                                                                          events to userspace, and downstream interfaces for messages
+ U consumes the events from the modified driver, exports an
+                                                                                                          from userspace to the driver. These interfaces are listed in
+interface for custom policies to make decisions, and relays
+                                                                                                          Table I and are self-explanatory.
+policy decisions to the driver (Section V-C). The userspace
+also chooses pages for observability and feedback. Finally,                                                  We implement the communication layer using Linux’s eBPF
+the communication layer C (Section V-B) enables fast com-                                                 framework [15]. eBPF allows running custom programs safely
+munication between the modified driver and the userspace.                                                 in the kernel context at specified points (e.g., tracepoints [12]).
+                                                                                                          It also provides shared data structures, e.g., maps, for easy
+A. Modifications to the UVM Driver                                                                        communication between userspace and eBPF programs in the
+                                                                                                          kernel [16]. Finally, the kfunc feature allows eBPF programs
+   We extend the UVM driver to perform three key functions,                                               to manipulate kernel/driver variables [14].
+in addition to its existing responsibilities: 1 enable observ-
+ability, 2 relay important events to user space, and 3 enforce                                            C. Userspace Engine
+decisions from userspace.                                                                                   The userspace engine ( U in Figure 6) is responsible for
+Enabling observability: The extended driver receives the                                                  polling events upstreamed by the driver, passing them to the
+address of a 64KB page from the 2MB region selected for                                                   appropriate policies, maintaining metadata, and communicat-
+observability by the userspace via the communication layer                                                ing policy decisions to the driver.
+ T1 (Figure 6). It migrates the selected (sampled) page from                                                The heart of the engine is an event loop U1 , that retrieves
+the HBM onto the DRAM and maps the page onto the GPU’s                                                    and processes events from the driver. Based on the specific
+page tables. Such pages can now be accessed over PCIe and                                                 event, the engine invokes appropriate callbacks of registered
+raise access counter notifications.                                                                       eviction U2 and/or prefetching U3 policies. Corresponding
+Relaying events to userspace: We extend the driver to                                                     to every API exposed by the driver in Table I, the engine
+relay important events D2 to the userspace.We added tra-                                                  provides a callback for policies to implement. Each user-
+cepoints T2 [12] to the driver on page fault, access counter-                                             implemented policy, written in C++, must register its im-
+notification, prefetch, and eviction events. These tracepoints                                            plementation for the callbacks exposed by the engine. For
+are used by the communication layer (Section V-B) to relay                                                example, upon a page fault event upstreamed by the driver,
+events to the userspace.                                                                                  the engine invokes onPageFault callbacks of the registered
+Receiving and enforcing userspace decisions: The modified                                                 eviction and prefetching policies.
+driver receives decisions (e.g., eviction victims) from the                                                 The engine also maintains policy-agnostic metadata, such as
+userspace through the communication layer T3 (detailed in                                                 currently GPU-resident regions U5 , and currently observed
+Section V-B) and enforces these decisions.                                                                regions U4 . The policies can query the engine for this
+metadata if needed for their decision-making. Finally, policy         1   void onPageFault(u64 addr):
+implementations (Section VI) invoke downstream callbacks to           2       lru_list.move_to_tail(addr);
+relay their decisions to the driver. The engine forwards them         3
+                                                                      4   void onAccessCounter(u64 addr):
+to the driver using APIs exposed by the driver.                       5       lru_list.move_to_tail(addr);
+   The enhanced driver, the communication layer, and the              6
+userspace engine complete the ObservUVM framework. In                 7   void onEviction(u64 addr):
+Section VI, we demonstrate how ObservUVM can be used                  8       lru_list.remove(addr);
+to create a diverse set of eviction and prefetching policies.         9
+                                                                     10   u64 setEvictionCandidate():
+D. Adapting Number of Pages to Sample                                11       return lru_list.head;
+                                                                     12
+   By default, ObservUVM randomly samples one 64KB page              13   u64 setObservabilityCandidate():
+(parameterized) within a HBM-resident 2MB region to provide          14       node = lru_list.head;
+(sampled) observability for the region. While our analysis           15       while (node.isObservable()):
+                                                                     16           node = node->next;
+in Section IV-A and the sensitivity studies (Section VII-C)
+                                                                     17       return node;
+show that one sampled page per region is sufficient to make
+informed eviction and prefetching decisions, ObservUVM can           Listing 1: Implementation of LRU policy using ObservUVM
+dynamically increase (decrease) the number of sampled pages
+per region to adapt to different degrees of spatial locality.
+   We observe that if an actively accessed region gets evicted       to the tail of the list (Insertion). Upon further page faults, 2MB
+from the HBM despite sampling a 64KB page, then the region           regions are moved to the tail (Promotion).
+will quickly experience a page fault. ObservUVM’s driver                The LRU policy picks a small number (e.g., 100) of key
+monitors 2MB regions (default, 100) that were recently evicted       2MB regions near the head of the LRU list (at risk of eviction)
+from the HBM. A page fault on these monitored regions                to be made observable ( ). Regions that receive access counter
+indicates a likely failure of sampling to ascertain the usefulness   notifications AC are deemed actively accessed by the GPU
+of the region.                                                       and thus, moved (Promotion) to the tail. This avoids evicting
+   ObservUVM periodically calculates the fraction of recently        actively accessed regions. The 2MB region at the top of the
+evicted regions that are accessed again. If this fraction crosses    list is evicted due to memory pressure (Eviction).
+a threshold (default, 0.5), ObservUVM doubles the number                Listing 1 shows simplified pseudo-code for the LRU pol-
+of sampled pages per region to improve observability resolu-         icy, implementing ObservUVM’s callbacks (Table I). The
+tion. Similarly, if a large fraction (here, 0.8) of the recently     list lru_list tracks HBM-resident 2MB regions. On a
+evicted region were not accessed quickly again, ObservUVM            page fault (lines 1,2) or an access counter notification
+halves the number of sampled pages within a region. Thus,            (lines 4,5), the region is moved to the tail of the list
+ObservUVM adapts the number of samples per region based              (lines 2,5). On eviction, the region is removed from the
+on the application characteristics.                                  list (lines 7,8). At every page fault/access counter event,
+                                                                     the user-space engine calls setEvictionRegion and
+      VI. E XPLORING POLICIES WITH O BSERV UVM                       setObservabilityCandidate to obtain the policy’s
+   We create several policies using the ObservUVM framework          choice of regions for eviction and observability. LRU chooses
+to demonstrate its versatility and usefulness. We create three       the region at the head of the list (lines 10,11) for eviction. It
+different eviction policies leveraging the newfound observabil-      chooses the unobserved region closest to the head of the list
+ity. We then create a meta-policy (Tournament) to dynamically        (lines 13-17) for observability after querying the metadata.
+choose between the eviction policies. Finally, we design two         Least Frequently Used (LFU): We create an (approximate)
+feedback-driven prefetching policies.                                LFU policy that avoids evicting frequently accessed 2MB
+                                                                     regions from the HBM. When the constituent pages of the
+A. Eviction Policies Enabled by Observability                        regions are in the DRAM, any access to them triggers a page
+   We implement three eviction policies that leverage observ-        fault. The driver uses the fault stream to track the frequency
+ability. These policies are built on a common principle: utilize     of accesses to a region. However, once the region migrates
+observability to identify memory regions that are at immediate       to HBM, the policy leverages observability to estimate the
+risk of eviction from HBM (key regions) but are actively             relative access frequency of HBM-resident region as the driver
+accessed by the GPU. We now detail these policies.                   is otherwise blind to GPU accesses to HBM.
+Least Recently Used (LRU): Our (approximate) LRU policy                 Figure 7b pictorially depicts the working of an example
+(Figure 7a) avoids evicting recently accessed HBM-resident           LFU policy using ObservUVM framework. It maintains a
+regions. It maintains a list of HBM-resident 2MB regions.            histogram of 2MB regions binned by their (estimated) access
+The head H of the list represents the least recently accessed        frequencies. Regions within a bin are maintained in a list, with
+region, and the tail T represents the most recently accessed.        the most recently accessed region at the tail T . On the first
+When a DRAM-resident 64KB page is faulted upon and                   fault to a constituent page in a 2MB region, the region is added
+migrated to the HBM, the encompassing 2MB region is added            to the tail of the lowest frequency bin (Insertion). On further
+                                                       H
+
+
+
+
+                                                                             Least Recently Used
+   Insertion                   Eviction   Eviction                                                 Insertion     Eviction
+                                                           Promotion     H
+        PF                                                 AC   PF                                  PF                                LRU       LFU      MRU
+                                                                H    H                                                Protected
+    T                               H                                                                             S
+                                                                                                   T                              H
+             Promotion
+             AC    PF
+                                             PF                                                        Unprotected
+                                          Insertion    T        T    T   T
+                                                                                                                                            Tournament
+                                                                                                         Most Recently Used
+             Least Recently Used                       Lower Frequency
+               (a) LRU policy                         (b) LFU policy                                        (c) CP policy             (d) Tournament policy
+                                    Fig. 7: Different eviction policies implemented over ObservUVM
+page faults PF , the frequency of the region is incremented                          Algorithm 1 Tournament: Selecting the eviction policy
+by moving the region to the next bin (Promotion).                                     1: N := {set of all policies}
+   The LFU policy makes HBM-resident regions in the low-                              2: A := {set of active policies}, initially A := N
+est frequency bin, i.e., those at risk of immediate eviction,                         3: CauseM ap{Region, P olicy}
+observable ( ), for monitoring accesses to them. Upon an                              4: BlmP ts[N ] = 0
+access counter notification, the frequency of the encompassing                        5: while P ageF ault||EvictionRequest do
+regions is incremented and (possibly) moved to the next bin.                          6:   if EvictionRequest then
+When moving a region across bins, it is added to the tail of                          7:      evP olicy = chooseP olicyRR(A)
+the destination bin to avoid victimizing the recently accessed                        8:      evRegion = evP olicy()
+region. The LFU policy evicts the region at the head of the                           9:      CauseM ap[evRegion] = evP olicy
+lowest-frequency bin ( H ).                                                          10:   if P ageF ault(Region) then
+Cyclic Protection(CP): LRU and LFU policies are not suit-                            11:      blameP olicy := CauseM ap[Region]
+able for applications with cyclic access patterns, which re-                         12:      BlmP ts[blameP olicy] + +
+peatedly cycle through a large number of regions (large reuse                        13:      if ΣBlmP ts > T then
+distance) that do not fit on the HBM (e.g., BlackScholes) [50].                      14:         W = (1/(|A|) ∗ 1.2)
+Evicting more recently migrated regions (MRU) is better. [24].                       15:         for x ∈ A do
+   We design an example Cyclic Protection policy (CP) (Fig-                          16:           if BlmP ts[x]/ΣBlmP ts > W then
+ure 7c) tailored for such use cases using observability. It                          17:              Retire x; A = A \ x
+maintains a list of 2MB regions resident in HBM. The list
+is divided into two parts: a protected area (hatched shading)
+towards the head H , and an unprotected area at the tail T .                         the appropriate eviction policy for a given application at run-
+The regions in the protected area are not evicted; the policy                        time (Figure 7d). Tournament runs different eviction policies
+tries to retain them on the HBM across cycles. Regions are                           concurrently, monitors their effectiveness, and retires poorly
+evicted from the tail of the unprotected area S . Upon a page                        performing policies.
+fault PF , the region is migrated to HBM and added to the
+tail of the list, i.e., to the unprotected region (Insertion).
+   We notice that just-migrated 2MB regions do not immedi-                              Algorithm 1 depicts simplified code for the Tournament
+ately lose their usefulness but witness accesses over a short                        policy. It starts by running all constituent policies (N) simul-
+period. However, the length of this period is application-                           taneously (lines 1, 2). It selects the eviction region from one
+dependent. Thus, the practical challenge here is to find the                         of the active policies (A) using a round-robin fashion (lines 7,
+‘right’ split between the protected and unprotected areas. The                       8). Tournament notes the policy associated with each eviction,
+split, however, is application-dependent. The unprotected area                       termed the cause of the eviction, and stores the association
+must be large enough that a region is not evicted before                             in the CauseMap dictionary (line 9).
+its usefulness expires. However, a larger unprotected area
+reduces the protected area, increasing subsequent page faults
+and migration. We leverage observability to determine the                               Some of the evicted regions get accessed again later, causing
+appropriate split at runtime. CP chooses the regions near the                        page faults (line 10). Tournament places the blame for the
+head of the unprotected area S to be made observable ( ).                            bad eviction decision on the policy that caused the eviction
+If such regions are accessed, then the unprotected area is too                       and accumulates blame for each policy in the BlmPts
+small. The policy increases it accordingly. If observable pages                      array (lines 11, 12). When the total number of blames
+are evicted before being accessed, the policy decreases its size,                    assigned crosses a threshold (T), Tournament retires policies
+giving more space to the protected region.                                           that accumulate blames faster than its contemporaries. In
+                                                                                     our implementation, we retire policies with more than 20%
+B. Runtime Policy Selection with Tournament                                          (parameterized) higher blame than the average (lines 14-17). In
+  Since one policy does not fit all, we further design the                           summary, Tournament selects the appropriate eviction policy
+Tournament meta-policy (henceforth, Tournament) to choose                            for each application based on its performance.
+Algorithm 2 FDP: choosing the appropriate threshold                               Prefetch next 2MB region P                    Legend
+                                                                                                                   Prefetched   Trigger     Candidate
+ 1: P ref etchT hreshold := 51                                                                                 C
+                                                                              T
+ 2: CountAC, CountEV, CountSum := 0
+ 3: while F eedback do
+ 4:   if F eedback == AC then                                                         Fig. 8: Region-Grain Prefetching
+ 5:      CountAC + +
+ 6:   else                                                                                   TABLE II: Workloads
+                                                                      Abbr.       Description                                             Size(GB)
+ 7:      CountEV + +
+                                                                      MM          Tiled matrix multiplication [50]                             10.1
+ 8:   CountSum + +                                                    GMM         Matrix multiplication (CUBLAS) [49]                          12.0
+ 9:   if CountSum > T then                                            SRK         Symmetric rank-k operation (CUBLAS) [49]                      9.6
+10:      if CountAC/CountSum > 0.8 then                               SR2         Symmetric rank-2k operation (CUBLAS) [49]                     8.3
+                                                                      HEL         Hellinger algorithm [27]                                      7.9
+11:         P ref etchT hreshold = 1                                  2DC         2DC convolution [58]                                         18.0
+12:      else                                                         GMV         Matrix vector product (CUBLAS) [49]                          23.6
+13:         P ref etchT hreshold = 51                                 LU          Lower-upper decomposition (CUSOLVER) [49]                    12.0
+                                                                      BLK         Black Scholes iterative algorithm [49]                       10.0
+                                                                      SPM         Sparse matrix-matrix mult. (CUSPARSE) [49]                    8.0
+C. Feedback Driven Prefetching Policy                                 AN          Alexnet batched inference [30]                               10.3
+                                                                      SN          Squeezenet batched inference [30]                            19.8
+   Next, we design Feedback-Driven Prefetching (FDP), which           BTR         B+ tree query [7]                                             5.0
+controls the aggressiveness of prefetching within 2 MB mem-           BFS         Breadth-first search [10]                                     2.1
+ory regions based on feedback garnered through ObservUVM.           RGP aggressively prefetches entire 2MB blocks of the virtual
+Under Tree-Based Prefetching (TBP) (Section II-C), a page           address space, rather than 64KB pages onto the HBM.
+fault triggers the prefetch of all pages in the subtree rooted at      RGP then leverages feedback to appropriately time
+any ancestor node, if the fraction of HBM resident memory           prefetches. Figure 8 depicts RGP’s philosophy. Green boxes
+at the node is above the 51% threshold. We propose a                show already prefetched regions. The orange ones show
+simple Aggressive Prefetching (AP) strategy to complement           prefetch candidates. RGP makes a randomly sampled 64KB
+TBP in applications with high spatial locality. Under AP, an        page in each prefetched region observable, referred to as the
+entire 2MB region is migrated upon the first page fault to          trigger T . When a trigger page is accessed, RGP prefetches
+one of its constituent pages. We achieve this by setting a           P the next yet-to-be-prefetched region onto HBM C . This
+low prefetch threshold. AP reduces page migrations in high-         way, 2MB regions are migrated before demand accesses, but
+spatial-locality applications, thereby improving performance.       not too early to evict other useful regions. It reduces migration
+However, in low-locality applications, aggressive prefetching       in the critical path to improve performance.
+can cause unnecessary migrations and hurt performance.
+   The FDP policy (Algorithm 2) dynamically chooses be-                                         VII. E VALUATION
+tween TBP and AP. It sets TBP (i.e., threshold 51%) as the de-
+fault prefetching policy (line 1). FDP samples a few prefetched        We evaluate ObservUVM with various policies on a system
+regions and makes them observable to garner feedback. FDP           with an NVIDIA 3090 GPU (24 GB GDDR), connected to
+counts the number of access counter notifications and evictions     AMD Ryzen 7950X CPU over PCIe 4.0 interconnect. We
+for these sampled regions (lines 4-8). If more than 80% of the      evaluate fourteen applications with diverse access patterns
+observed regions are accessed, it switches to AP by setting         and memory footprints. Table II describes the applications
+the threshold to 1 (lines 9-13). Otherwise, it continues with       and their memory footprints. We subject each application to
+TBP’s conservative policy (line 13). Thus, the feedback is used     varying levels of GPU memory oversubscription. An oversub-
+to enable aggressive prefetching only when beneficial.              scription of x% implies that the application’s memory footprint
+                                                                    is x% larger than the available HBM capacity. To emulate
+D. Region-Grain Prefetching Policy                                  different oversubscription levels, we reserve a portion of the
+   We leverage feedback to design a Region-Grain Prefetching        HBM using cudaMalloc API [48] rendering it unavailable
+policy that implements a next-region (here, 2MB) prefetcher,        to applications. Varying the size of this reserved memory
+similar to next-line cache prefetchers [57]. Here, feedback         capacity helps create different degrees of oversubscription for
+helps to ensure prefetch timeliness, which is as important as       an application.
+accuracy [8], especially when prefetching aggressively.
+                                                                    A. Performance of Tournament and Prefetching
+   RGP identifies streaming access patterns across contigu-
+ously allocated memory regions (e.g., cudaMallocManaged()).            We evaluate the performance of eviction and prefetching
+Specifically, it tracks the stream of page fault addresses          policies built on ObservUVM. Figure 9 shows the execution
+within each allocated virtual address region. If it finds fault-    time (lower is better) on the y-axis, for different applications
+ing addresses within an allocated virtual address region that       under 1 default UVM (UVM), 2 Tournament without FDP
+are to neighboring pages, it classifies the allocated region        or RGP (TM), 3 Tournament with FDP (TM+), and 4
+as witnessing a streaming access pattern. For such regions,         Tournament with FDP and RGP (TM++), all under 50%
+                      (norm. to UVM, lower is better)
+                                                                       UVM    TM   TM+    TM++                                                                                                                UVM   LRU    LFU     CP     TM      9.6                     1.5
+                                                                                                                                                                                                   1.2
+
+
+
+
+                                                                                                                                                       Number of evictions
+                                                              1
+
+
+
+
+                                                                                                                                                                             (normalized to UVM)
+                                                                                                                                                                                                    1
+   Execution time
+
+                                                                                                                                                34%
+                                                         0.8                                                                                                                                       0.8
+                                                                                                                                                                                                   0.6
+                                                         0.6
+                                                                                                                                                                                                   0.4
+                                                                                                                                                                                                   0.2
+                                                         0.4
+                                                                                                                                                                                                    0
+                                                         0.2                                                                                                                                             MM    GMM SRK    SR2    HEL    2DC GMV     LU   BLK   SPM   AN    SN   BTR   BFS
+                                                                  MM GMM SRK SR2 HEL 2DC GMV LU BLK SPM AN                  SN BTR BFS         GM                                           Fig. 11: Number of evictions with different policies
+                                                   Fig. 9: Execution time with TM, TM+, and TM++
+                                                                                                                                                      ensures that regions with higher reuse are not easily evicted.
+                                                                                                                                                      BTR and BFS are irregular applications – they make data-
+                                                                   UVM       LRU   LFU    CP     TM
+                                                        1.2                                              1.8                                          dependent memory accesses. Consequently, the addresses of
+                 (normalized to UVM)
+Execution time
+
+
+
+
+                                                         1                                                                                            memory accesses are unpredictable, i.e., irregular. However,
+                                                        0.8                                                                                           these applications also end up accessing most of the 64KB
+                                                        0.6                                                                                           pages within a 2MB region. Thus, ObservUVM is effective
+                                                        0.4
+                                                                                                                                                      in providing observability through sampling. BTR (B+ tree)
+                                                        0.2
+                                                                  MM    GMM SRK    SR2   HEL   2DC GMV     LU   BLK   SPM    AN   SN     BTR   BFS    prefers the LFU policy which prioritizes keeping frequently
+                     Fig. 10: Execution time with different eviction policies                                                                         used regions on the GPU, which are more likely to be re-
+                                                                                                                                                      accessed. BFS, which has sparse accesses across all regions,
+memory oversubscription. We exclude time to allocate, and                                                                                             prefers the CP policy.
+initialize memory. The execution time is normalized to UVM.                                                                                              Figure 12 shows the normalized number of page faults (y-
+   TM++ improves performance over UVM by 34%, and up                                                                                                  axis) with UVM, TM, TM+, and TM++. On average, TM
+to 64% (SPM). Tournament picks the appropriate eviction                                                                                               reduces the number of faults by 40% thanks to better-informed
+policy for each application, improving execution time by an                                                                                           eviction choices that avoids repeated faults to same pages.
+average of 20% over UVM. FDP speeds up further by 9%, and                                                                                             Prefetching: TM+ uses FDP to improve performance over
+RGP by another 5%, by enabling aggressive prefetching where                                                                                           TM by choosing the appropriate threshold for prefetching
+beneficial. We now analyze the sources of improvement.                                                                                                within 2MB regions. All applications except GMM opt for AP
+Eviction policies: First, we analyze Tournament’s constituent                                                                                         (threshold 1), due to high spatial locality. TM+ reduces GPU
+eviction policies. Figure 10 compares the execution times (y-                                                                                         page faults by 36% on average (and up to 84%) and improves
+axis) of Tournament’s constituent policies, with prefetching                                                                                          execution time by 8% on average (up to 15%) over TM without
+disabled (referred to as LRU, LFU, and CP) and Tournament                                                                                             FDP. GMM, with poor spatial locality, chooses TBP, and has a
+(TM). As expected, no single policy performs best for all ap-                                                                                         similar number of page faults with TM and TM+. SN and AN
+plications; five prefer LRU, three prefer CP, and the remaining                                                                                       are ML inference applications. Prefetching of memory regions
+six prefer LFU. Applications LU and SPM do not finish within                                                                                          containing weights to the GPU HBM reduces page faults in
+a reasonable amount of time under CP. The graph shows the                                                                                             their critical path of execution. Overall, TM+ reduces page
+Tournament performs close to the best-performing policy for                                                                                           faults over UVM by around 78% on average. TM++ (TM with
+each application by choosing the ‘right’ policy. It adds ∼ 2%                                                                                         FDP and RGP) further improves performance by an additional
+overhead in its effort to choose the policy but this overhead is                                                                                      6%, thanks to a 9% reduction in page faults over TM+. By
+easily amortized thanks to better eviction decisions.                                                                                                 prefetching entire 2MB regions before witnessing any page
+                                                                                                                                                      fault, RGP further improves performance.
+   Figure 11 shows the normalized number of evictions (lower
+is better) along the y-axis with different policies. The applica-                                                                                     Overheads of ObservUVM: ObservUVM introduces two
+tions MM, GMM, and HEL preferred the LRU policy, reducing                                                                                             types of overheads. 1 Overheads of migrating sampled pages
+evictions by 62% and improving execution time by about                                                                                                between DRAM and HBM for observability and upon re-
+14% on average (up to 20%). These applications have data                                                                                              ceiving access counter notifications. 2 Overheads due to
+structures that are accessed throughout the entire execution,                                                                                         communication between the driver and the userspace, and due
+as well as those that are accessed in parts. LRU ensures that                                                                                         to the driver’s enforcement of policy decisions. We quantified
+pages of the former are not evicted, reducing evictions and                                                                                           these overheads at around 2.4% and 1.8%, on average, respec-
+page faults. AN and SN choose the LRU policy, but do not                                                                                              tively. The reported numbers already include these overheads.
+show performance improvements, as LRU has similar behavior                                                                                            Importantly, the benefit from better-informed eviction and
+to UVM’s default LRM policy in these cases. Applications                                                                                              prefetching decisions outweigh ObservUVM’s overheads.
+2DC and BLK have cyclic access patterns and thus benefit
+                                                                                                                                                      B. Comparison with Alternatives
+from the CP policy, improving the number of evictions by
+46% and execution time by around 34%. Applications such                                                                                                  Figure 13 compares the execution time (y-axis) of TM++
+as SRK, SR2, GMV, LU, and SPM incline towards the LFU                                                                                                 versus access counter-based migration (ACBM), i.e., the tradi-
+policy, with an average of 16% (up to 58%) performance                                                                                                tional use case of access counters, in its default configuration,
+improvement and 46% reduction in evictions. The LFU policy                                                                                            and with a prior work, EarlyAdaptor [22].
+Num. page faults                                                                                        UVM    TM     TM+        TM++                                                                                                        UVM   TM++
+                   (norm. to UVM)                          1                                                                                                         1
+
+
+
+
+                                                                                                                                        (normalized to UVM)
+                                                                                                                                                                    0.8
+
+
+
+
+                                                                                                                                           Execution time
+                                                      0.5                                                                                                           0.6
+                                                                                                                                                                    0.4
+                                                           0
+                                                                MM GMM SRK SR2 HEL 2DC GMV    LU   BLK SPM    AN     SN    BTR    BFS                               0.2
+                                                                                                                                                                     0
+
+
+
+
+                                                                                                                                                                            AN
+
+
+
+
+                                                                                                                                                                                                                  AN
+
+
+
+
+                                                                                                                                                                                                                                                     30%
+                                                                                                                                                                                                                                                     70%
+                                                                                                                                                                             LU
+
+
+
+
+                                                                                                                                                                                                                   LU
+                                                                                                                                                                            MM
+                                                                                                                                                                          GMM
+
+
+
+
+                                                                                                                                                                           BLK
+                                                                                                                                                                          GMV
+
+
+                                                                                                                                                                          SPM
+
+                                                                                                                                                                            SN
+
+                                                                                                                                                                           BFS
+
+                                                                                                                                                                                                                  MM
+                                                                                                                                                                                                                GMM
+
+
+
+
+                                                                                                                                                                                                                 BLK
+                                                                                                                                                                                                                GMV
+
+
+                                                                                                                                                                                                                SPM
+
+                                                                                                                                                                                                                  SN
+
+                                                                                                                                                                                                                 BFS
+                                                                                                                                                                           HEL
+                                                                                                                                                                           2DC
+
+
+
+
+                                                                                                                                                                           BTR
+
+
+
+
+                                                                                                                                                                                                                 HEL
+                                                                                                                                                                                                                 2DC
+
+
+
+
+                                                                                                                                                                                                                 BTR
+                                                                                                                                                                           SRK
+                                                                                                                                                                           SR2
+
+
+
+
+                                                                                                                                                                                                                 SRK
+                                                                                                                                                                                                                 SR2
+   Fig. 12: Number of page faults with TM, TM+, and TM++
+                                                                      1.3                                                                                                         30% oversubscription                      70% oversubscription        GM
+                        (norm. to UVM, lower is better)
+
+
+
+
+                                                                                           UVM     AC   EA    TM++        1.27
+  Execution time
+
+
+
+
+                                                           1
+                                                                                                                                          Fig. 14: ObservUVM with selected oversubscription levels
+                                                          0.5
+                                                                                                                                                                      4
+
+
+
+
+                                                                                                                                            Geomean of runtimes
+                                                                                                                                            norm. to zero oversub
+                                                           0                                                                                                          3                                               UVM
+                                                                MM GMM SRK SR2 HEL 2DC GMV LU BLK SPM AN SN BTR BFS               GM
+                                                                                                                                                                      2                                                          TM++
+ Fig. 13: Comparison of TM++ with UVM, ACBM, and EA
+                                                                                                                                                                      1
+                                                                                                                                                                                              UVM.Zero
+Comparison with access counter-based page migration                                                                                                                   0
+                                                                                                                                                                          UVM TM++ UVM TM++ UVM TM++ UVM TM++ UVM TM++ UVM TM++ UVM TM++
+(ACBM): TM++ significantly outperforms ACBM, across the
+                                                                                                                                                                             10          20              30      40            50          60      70
+board, thanks to its superior eviction and prefetching decisions.
+                                                                                                                                                                                                     Oversubscription ratios
+The limited number of access counters hinders ACBM’s effec-
+tiveness. For some applications (MM, GMM), ACBM performs                                                                                 Fig. 15: ObservUVM with different oversubscription levels
+worse than even page fault-based UVM (default). Overall,
+                                                                                                                                        y-axis value of 1 (red trend line, UVM.Zero) shows UVM’s
+TM++ shows around 20% improvement over ACBM.
+                                                                                                                                        performance with no (zero) oversubscription, capturing head-
+Comparison with EarlyAdaptor (EA): EarlyAdaptor is a
+                                                                                                                                        room for further improvement.
+runtime approach that chooses the appropriate prefetching
+threshold using page faults as signals [22]. Note that it does not                                                                      Sensitivity to the number of samples: Figure 16 shows
+focus on eviction policies, unlike ObservUVM. We empirically                                                                            the performance of LRU eviction policy with decreasing
+find that EA is generally effective at selecting the appropri-                                                                          number of observable 2MB regions (along x-axis). Decreasing
+ate prefetching threshold, except for GMM. With GMM, EA’s                                                                               the number of observable 2MB regions has little effect on
+heuristics prefetch more aggressively than necessary, resulting                                                                         most applications, as we only need to track a few critical
+in performance degradation. Nevertheless, TM++ outperforms                                                                              regions. However, GMM and SPM suffer significantly. In these
+EA by nearly 20%, on average (and up to 36%). Further, our                                                                              applications, with fewer access counters, observable regions
+technique does not degrade any application and provides a                                                                               get evicted before they get a chance to be accessed.
+platform to create custom eviction and prefetching policies.                                                                               Increasing the number of 64KB samples per 2MB region
+                                                                                                                                        also has little impact on most applications. Figure 17 shows the
+C. Sensitivity Studies                                                                                                                  execution time with 75 observable 2MB regions, tracking 1, 2,
+Sensitivity to oversubscription level: Figure 14 shows the                                                                              or 3 64KB pages per 2MB region. As expected, applications
+execution time (y-axis) of UVM and TM++, with two sections                                                                              show high locality as discussed in III-A, and do not see
+along the x-axis for 30% and 70% oversubscription, respec-                                                                              benefits from sampling more pages per region.
+tively. We observe significant improvements in execution time
+with TM++, with an average of 26% and 38% improvements                                                                                                                                        VIII. D ISCUSSION
+for 30% and 70% oversubscription, respectively. Typically, the
+improvements of TM++ over UVM increase with increasing                                                                                  A. Extendability to Multi-GPU Systems
+oversubscription. In some cases (e.g., GMV, LU), a change in
+oversubscription level results in a sharp change in memory                                                                                 ObservUVM is a first step towards enabling observability-
+pressure and access patterns. There, the improvements of                                                                                driven eviction and prefetching policies under memory over-
+TM++ are relatively muted with 70% oversubscription.                                                                                    subscription. While its current focus is on single-GPU systems,
+   Furthermore, Figure 15 shows the trends in the normalized                                                                            the core challenge of the UVM driver being blind to the GPU’s
+runtime under TM++ and UVM with increasing memory                                                                                       accesses to the HBM remains for multi-GPU systems. Further,
+oversubscription levels. Each bar shows the geometric mean of                                                                           ObservUVM’s core idea of re-purposing access counters for
+normalized runtimes of all applications, normalized to UVM                                                                              observability is also applicable in multi-GPU systems.
+with no oversubscription, with increasing memory oversub-                                                                                  Extending ObservUVM to multi-GPU systems brings new
+scription from 10 percent to 70 percent (lower is better). The                                                                          challenges, though. The access counters track peer-to-peer
+blue bar represents TM++ and the gray bar represents the                                                                                accesses in addition to PCIe accesses to DRAM. ObservUVM
+execution time of UVM. TM++ outperforms UVM by a wide                                                                                   must differentiate between accesses over PCIe to DRAM
+margin under all levels of oversubscription. The improvements                                                                           and to peer GPUs’ HBM. Newer generation GPUs allow
+increase with increasing oversubscription, as demonstrated by                                                                           monitoring specific parts of the virtual address space, making
+the widening gap between the black and blue trend lines. The                                                                            the necessary enhancements achievable.
+Execution time
+(norm. to 200)    1
+                                             200         150        100       75     50                                [64] performed automatic tensor migration between HBM,
+                                                                                                                       DRAM, and disk. DynaMap [9] migrated hot pages in graph
+                  0
+                                                                                                                       workloads using instrumentation. Go et al. [22] improved
+                          MM    GMM   SRK   SR2    HEL    2DC       GMV   LU       BLK    SPM   AN   SN   BTR    BFS   prefetching with page fault history. None of these techniques
+                  Fig. 16: Sensitivity to number of observable regions                                                 enable observability into GPU’s accesses to improve eviction
+                                                                                                                       or prefetching policies on UVM.
+                                                                1         2          3
+                                                                                                                          A recent work, Forest [39], proposed new hardware for
+ Execution time
+
+
+
+
+                      1
+  (norm. to 1)
+
+
+
+
+                                                                                                                       observing accesses to HBM to improve UVM policies. Un-
+                  0.5
+                                                                                                                       like ObservUVM, Forest requires significant new hardware
+                      0                                                                                                and source code analysis – both of which impede practical
+                           MM    GMM SRK    SR2    HEL     2DC      GMV   LU       BLK    SPM   AN   SN   BTR   BFS
+                                                                                                                       adoption. Moreover, Forest was evaluated on small memory
+                 Fig. 17: Sensitivity to number of samples per region                                                  footprints (average 60MB), likely masking the need to track
+                                                                                                                       a significantly larger number of regions. Importantly, Forest
+B. Applicability to CPU-GPU Systems
+                                                                                                                       does not enable the flexibility of customizing eviction policies,
+   Even in tightly integrated CPU-GPU systems with high-                                                               whereas ObservUVM allows users to build custom eviction
+speed cache-coherent interconnects, such as the GH200 [55],                                                            and prefetching policies in the userspace.
+the UVM driver running on the CPU manages the GPU-                                                                        Many works have proposed hardware modifications to im-
+attached HBM. The CPU and GPU have different types of                                                                  prove UVM. ETC [36] improved UVM with pre-eviction,
+physical memory attached – slower LPDDR on the CPU                                                                     throttling, and compression. HPE [63] and CHPE [62] propose
+and fast HBM on the GPU. While the fast, cache-coherent                                                                hardware counters to help with prefetching and page eviction.
+interconnect reduces overheads, the difference in bandwidth                                                            Zheng et al. [65] describe hardware and software techniques
+between the CPU DRAM and GPU HBM is still high.                                                                        to improve UVM’s performance. Ganguly et al. [19] proposed
+Managing the HBM capacity well is essential to maximize                                                                improved access counters for better page migration. Ganguly
+utilization and eviction policy still remains an important aspect                                                      et al. [17] [18] improved migration/prefetching with new
+of UVM. Thus, the core idea of observability remains relevant                                                          hardware. GRIT [60] IDYLL [34], and Trans-FW [35] propose
+in such systems. To the best of our knowledge, access counters                                                         hardware techniques to improve multi-GPU UVM. Unlike
+in GH200 GPUs function similarly, tracking accesses to pages                                                           these, ObservUVM requires no hardware changes. While
+resident in the DRAM. Thus, it is possible for ObservUVM                                                               UVM has been studied extensively in the past, ObservUVM
+to enable observability as it does on the evaluated system.                                                            opens new possibilities with observability and flexibility for
+C. ObservUVM with Different Page Sizes                                                                                 custom eviction and prefetching policies on real systems.
+                                                                                                                          Access bits have existed on CPUs since 1960s [21]. Several
+  ObservUVM builds upon UVM for seamlessly speeding up                                                                 works propose policies to exploit them better [13], [40],
+UVM applications today while avoiding bespoke hardware                                                                 [41], [61]. Memtis [33], TMTS [13], and HeMem [53] used
+modifications. Consequently, ObservUVM relies on the region                                                            hardware sampling (e.g., AMD IBS [1]) for tiered memory
+and page sizes (2MB and 64KB respectively) that UVM                                                                    management while Memstrata [66] and M5 [59] exploit CXL’s
+exposes. That said, the idea of sampled observability by re-                                                           access tracking features. These works exploit purpose-built
+purposing the access counter is not tied to any region or                                                              tracking hardware, a luxury unavailable to ObservUVM.
+page sizes. Being a software-only technique, ObservUVM can
+easily adopt other page or region sizes exposed by UVM.
+                                                                                                                                              X. C ONCLUSION
+                                             IX. R ELATED W ORK
+                                                                                                                          ObservUVM empowers UVM with observability into the
+   A large body of works have studied the overheads of                                                                 GPU’s accesses to the HBM without hardware modifications,
+migration in UVM and tried to mitigate them. Gayathri et al.                                                           thereby enabling better-informed eviction and prefetching poli-
+[20], Chien et al. [11], and Tyler and Ge [4], [5], analyzed the                                                       cies. Its clean separation of policy and mechanism simplifies
+costs and benefits of demand paging and prefetching in UVM.                                                            the development of custom policies and enables rapid ex-
+Agarwal et al. [3], [2] used profiling for page placement in                                                           ploration of what-if scenarios. We demonstrate policies that
+UVM. Mosaic [6] used many page sizes to improve memory                                                                 improve performance of UVM-based applications by 34%. We
+transfer overheads. Li et al. [37] and SUV [52] leverage                                                               believe that ObservUVM has the potential to accelerate future
+high-level access information from static analysis for memory                                                          research on UVM policies.
+management. Kim et al. [32] optimized page fault batch
+size and enabled eager eviction to reduce UVM overheads.                                                                                 XI. ACKNOWLEDGMENT
+Helm [28] introduces novel locality metrics to guide data
+placement under UVM. Ariadne [56] utilize dynamic page-                                                                   We thank anonymous reviewers for the constructive feed-
+sharing information to perform data placement under UVM.                                                               back. Pratheek was partially supported by the Intel India
+SwapAdvisor [25], Capuchin [51], Sentinel [54] and DeepUM                                                              Ph.D. Fellowship. This work is partially supported by generous
+[29], optimize DNN training under UVM with profiling. G10                                                              research grants from AMD, Microsoft, and Google.
+                            A PPENDIX                                 3) Software dependencies:
+                                                                      • Linux 6.2
+A. Abstract
+                                                                      • libbpf
+   This artifact contains the source code for ObservUVM               • make
+framework, various eviction/prefetching policies, and the             • gcc
+workloads used to evaluate them.                                      • clang
+   ObservUVM is a framework for creating eviction/prefetch-           4) Data sets: All required data sets are included.
+ing policies for UVM that utilizes the power of sampled ob-           5) Models: None.
+servability by repurposing existing access counters. It consists
+                                                                    D. Installation
+of a modified UVM driver and a userspace component. The
+userspace component exposes APIs to implement different               [Optional] Install the CUDA 11.8 from NVIDIA’s download
+eviction/prefetching policies. We have implemented Least Re-        page or from your distribution’s repository.
+cently Used, Least Frequently Used, and Cyclic Protection           E. Experiment Workflow
+eviction policies, the Tournament meta policy, an intra-2MB
+                                                                       1) Prerequisites: Root access is necessary to run the
+prefetching policy called Feedback Driven Prefetching, and
+                                                                    userspace, primarily for running eBPF programs. The scripts
+an aggressive Region Grain Prefetching policy. We evaluate
+                                                                    assume the user can run sudo. Set up password-less sudo
+these policies over a wide range of workloads, under various
+                                                                    for ease of running experiments. For e.g., if your username is
+memory oversubscription levels.
+                                                                    username, then run the following.
+   The artifact includes the source code for the userspace
+                                                                      1   sudo visudo -f /etc/sudoers.d/username
+component, the modified UVM driver and the aforementioned             2   username ALL=(ALL) NOPASSWD: ALL
+eviction and prefetching policies. We have pre-compiled bina-
+ries for different workload configurations for ease of running.       2) Compile the drivers: Compile the baseline driver and
+The default scripts use these binaries. We also include the         ObservUVM driver with the following commands. It should
+source code to generate the binaries.                               generate several kernel objects, including nvidia.ko,
+   We maintain the most updated code and additional scripts         base-driver.ko, super-driver.ko. We will compile
+at https://github.com/csl-iisc/ObservUVM. Please use GitHub         the drivers only once, but use these drivers in the next steps.
+to discuss or raise any issues.                                       1 cd driver;
+                                                                      2 bash compile_drivers.sh
+                                                                      3 cd ..
+B. Artifact Check-list (meta-information)
+      • Algorithm: Eviction policies (page replacement policies)       Modify the following files driver_change_base.sh,
+      • Program: UVM driver, GPU workloads                          driver_change_ac.sh,             driver_change_ea.sh,
+      • Run-time environment: Linux 6.2, libbpf
+                                                                    driver_change_super.sh, to point the DPATH variable
+      • Hardware: NVIDIA 3090, AMD Ryzen 9 7950X
+      • Metrics: Execution time, GPU page faults, evictions
+                                                                    to the driver folder using your editor. Assuming the artifact
+      • Experiments: Comparison of different eviction/prefetching   is extracted at isca26ae in your home folder, then the
+        policies                                                    DPATH will be as follows:
+      • How much disk space required (approximately)?: 20 GB
+                                                                      1   DPATH=/home/username/isca26ae/driver
+      • How much time is needed to prepare workflow (approxi-
+        mately)?: 2 hours                                             3) Compile the userspace: Next, compile the userspace
+      • How much time is needed to complete experiments (approx-
+        imately)?: 24 hours                                         component using the following commands.
+      • Publicly available?: Yes.                                     1 cd userspace;
+      • Workflow automation framework used?: No                       2 bash compile_userspace.sh
+      • Archived                   (provide                DOI)?:     3 bash gen_configs.sh
+                                                                      4 cd ..
+        https://doi.org/10.5281/zenodo.19428841
+                                                                      4) Setup workloads: Generate the input for bfs.
+C. Description
+                                                                      1 cd workloads/bfs
+   1) How to access: Please download the artifact from the            2 cd inputGen
+                                                                      3 make
+Zenodo link here https://zenodo.org/records/19428841. Please          4 bash gen_dataset.sh
+extract the file aeisca26.tar.gz to an appropriate loca-              5 cp graph16M.txt ..
+
+tion.                                                                 6 cp graph16M.txt ../..
+
+
+  1       tar xvf aeisca26.tar.gz                                     5) Run workload under key configurations: Run the fol-
+                                                                    lowing script to run all the workloads under configurations
+  2) Hardware dependencies:                                         necessary for reproducing the key figures (9, 10, 11, 12, and
+  • NVIDIA 3090 GPU (24GB)                                          13).
+  • AMD Ryzen 9 7950X                                                 1   bash run_key.sh
+  • 64GB DRAM recommended (32 GB minimum)
+   6) Generating figures: Run the script for the appropriate                  [4] T. Allen and R. Ge, “Demystifying gpu uvm cost with deep runtime and
+figure. These scripts will generate .csv files that may be                        workload analysis,” in 2021 IEEE International Parallel and Distributed
+                                                                                  Processing Symposium (IPDPS), 2021, pp. 141–150.
+used to generate the final plots.                                             [5] T. Allen and R. Ge, “In-depth analyses of unified virtual memory
+  1 bash fig9.sh                                                                  system for gpu accelerated computing,” in Proceedings of the
+  2 bash fig10.sh                                                                 International Conference for High Performance Computing, Networking,
+  3 bash fig11.sh                                                                 Storage and Analysis, ser. SC ’21. New York, NY, USA:
+  4 bash fig12.sh                                                                 Association for Computing Machinery, 2021. [Online]. Available:
+  5 bash fig13.sh                                                                 https://doi.org/10.1145/3458817.3480855
+                                                                              [6] R. Ausavarungnirun, J. Landgraf, V. Miller, S. Ghose, J. Gandhi,
+  Copy the output .csv to the provided Excel file                                 C. J. Rossbach, and O. Mutlu, “Mosaic: A gpu memory manager
+                                                                                  with application-transparent support for multiple page sizes,” in
+(Graphs.xlsx) to the appropriate sheet (Figure number)                            Proceedings of the 50th Annual IEEE/ACM International Symposium
+which is pre-populated with the formulas to generate the                          on Microarchitecture, ser. MICRO-50 ’17. New York, NY, USA:
+graphs.                                                                           Association for Computing Machinery, 2017, p. 136–150. [Online].
+                                                                                  Available: https://doi.org/10.1145/3123939.3123975
+F. Evaluation and Expected Results                                            [7] M. A. Awad, S. Ashkiani, R. Johnson, M. Farach-Colton, and J. D.
+                                                                                  Owens, “Engineering a high-performance gpu b-tree,” in Proceedings
+   The key figures in the paper are as follows:                                   of the 24th Symposium on Principles and Practice of Parallel
+   Figure 9 compares the performance of baseline UVM with                         Programming, ser. PPoPP ’19. New York, NY, USA: Association
+                                                                                  for Computing Machinery, 2019, p. 145–157. [Online]. Available:
+ObservUVM with various policies. It shows the execution time                      https://doi.org/10.1145/3293883.3295706
+(lower is better) normalized against baseline UVM.                            [8] G. Ayers, H. Litz, C. Kozyrakis, and P. Ranganathan, “Classifying
+   Figure 10 compares different eviction policies (with                           memory access patterns for prefetching,” in Proceedings of the
+prefetching disabled). It shows different policies being pre-                     Twenty-Fifth International Conference on Architectural Support for
+                                                                                  Programming Languages and Operating Systems, ser. ASPLOS ’20.
+ferred by different workloads, and that the Tournament meta                       New York, NY, USA: Association for Computing Machinery, 2020, p.
+policy performs as well as the best performing alternative                        513–526. [Online]. Available: https://doi.org/10.1145/3373376.3378498
+among the different policies.                                                 [9] C.-H. Chang, A. Kumar, and A. Sivasubramaniam, “To move or not
+                                                                                  to move? page migration for irregular applications in over-subscribed
+   Figure 11 shows the number of evictions corresponding to                       gpu memory systems with dynamap,” in Proceedings of the 14th ACM
+different policies (without prefetching).                                         International Conference on Systems and Storage, ser. SYSTOR ’21.
+   Figure 12 shows the number of page faults corresponding                        New York, NY, USA: Association for Computing Machinery, 2021.
+                                                                                  [Online]. Available: https://doi.org/10.1145/3456727.3463766
+to different prefetching policies.                                           [10] S. Che, M. Boyer, J. Meng, D. Tarjan, J. W. Sheaffer, S.-H. Lee, and
+   Figure 13 compares ObservUVM with alternatives.                                K. Skadron, “Rodinia: A benchmark suite for heterogeneous computing,”
+                                                                                  in 2009 IEEE International Symposium on Workload Characterization
+G. More Results                                                                   (IISWC), 2009, pp. 44–54.
+  Figure 14 can be reproduced easily by running                              [11] S. Chien, I. Peng, and S. Markidis, “Performance evaluation of advanced
+                                                                                  features in cuda unified memory,” in 2019 IEEE/ACM Workshop on
+  1   bash fig14.sh                                                               Memory Centric High Performance Computing (MCHPC), 2019, pp.
+                                                                                  50–57.
+  Other graphs can be reproduced by suitably modifying the                   [12] L. community, “Using linux kernel tracepoints,” 2024. [Online].
+                                                                                  Available: https://docs.kernel.org/trace/tracepoints.html
+configuration flags.
+                                                                             [13] P. Duraisamy, W. Xu, S. Hare, R. Rajwar, D. Culler, Z. Xu, J. Fan,
+H. Experiment Customization                                                       C. Kennelly, B. McCloskey, D. Mijailovic, B. Morris, C. Mukherjee,
+                                                                                  J. Ren, G. Thelen, P. Turner, C. Villavieja, P. Ranganathan, and
+   To create new eviction (or prefetching) policies, please add                   A. Vahdat, “Towards an adaptable systems architecture for memory
+a new directory and create appropriate .cpp and .h files.                         tiering at warehouse-scale,” in Proceedings of the 28th ACM
+                                                                                  International Conference on Architectural Support for Programming
+Eviction policies inherit from the EvictionPolicy base                            Languages and Operating Systems, Volume 3, ser. ASPLOS 2023.
+class, and must implement all the key functionality (i.e., all                    New York, NY, USA: Association for Computing Machinery, 2023, p.
+the virtual functions in the base class). Intra-2MB prefetching                   727–741. [Online]. Available: https://doi.org/10.1145/3582016.3582031
+                                                                             [14] eBPF community, “Bpf kernel functions (kfuncs),” 2024. [Online].
+policies inherit from the ShallowPrefetch base class and                          Available: https://docs.kernel.org/bpf/kfuncs.html
+inter-2MB prefetching policies from DeepPrefetch.                            [15] eBPF community, “ebpf,” 2024. [Online]. Available: https://docs.kernel.
+                                                                                  org/bpf/index.html
+                            R EFERENCES                                      [16] eBPF community, “ebpf maps,” 2024. [Online]. Available: https:
+[1] Advanced Micro Devices, Inc., BIOS and Kernel Developer’s Guide               //docs.kernel.org/bpf/maps.html
+    (BKDG) for AMD Family 15h Models 00h–0Fh Processors, 2022,               [17] D. Ganguly, R. Melhem, and J. Yang, “An adaptive framework for
+    revision 3.14. [Online]. Available: https://www.amd.com/content/dam/          oversubscription management in cpu-gpu unified memory,” in 2021
+    amd/en/documents/developer/uprof-v4.0-gaGA-user-guide.pdf                     Design, Automation and Test in Europe Conference and Exhibition
+[2] N. Agarwal, D. Nellans, M. O’Connor, S. W. Keckler, and T. F. Wenisch,        (DATE), 2021, pp. 1212–1217.
+    “Unlocking bandwidth for gpus in cc-numa systems,” in 2015 IEEE 21st     [18] D. Ganguly, Z. Zhang, J. Yang, and R. Melhem, “Interplay between
+    International Symposium on High Performance Computer Architecture             hardware prefetcher and page eviction policy in cpu-gpu unified virtual
+    (HPCA), 2015, pp. 354–365.                                                    memory,” in 2019 ACM/IEEE 46th Annual International Symposium on
+[3] N. Agarwal, D. Nellans, M. Stephenson, M. O’Connor, and S. W.                 Computer Architecture (ISCA), 2019, pp. 224–235.
+    Keckler, “Page placement strategies for gpus within heterogeneous        [19] D. Ganguly, Z. Zhang, J. Yang, and R. Melhem, “Adaptive page
+    memory systems,” in Proceedings of the Twentieth International                migration for irregular data-intensive applications under gpu memory
+    Conference on Architectural Support for Programming Languages                 oversubscription,” in 2020 IEEE International Parallel and Distributed
+    and Operating Systems, ser. ASPLOS ’15. New York, NY, USA:                    Processing Symposium (IPDPS), 2020, pp. 451–461.
+    Association for Computing Machinery, 2015, p. 607–618. [Online].         [20] R. Gayatri, K. Gott, and J. Deslippe, “Comparing managed memory
+    Available: https://doi.org/10.1145/2694344.2694381                            and ats with and without prefetching on nvidia volta gpus,” in 2019
+     IEEE/ACM Performance Modeling, Benchmarking and Simulation of               [36] C. Li, R. Ausavarungnirun, C. J. Rossbach, Y. Zhang, O. Mutlu,
+     High Performance Computer Systems (PMBS), 2019, pp. 41–46.                       Y. Guo, and J. Yang, “A framework for memory oversubscription
+[21] C. T. Gibson, “Time-sharing in the ibm system/360: model 67,”                    management in graphics processing units,” in Proceedings of the
+     in Proceedings of the April 26-28, 1966, Spring Joint Computer                   Twenty-Fourth International Conference on Architectural Support for
+     Conference, ser. AFIPS ’66 (Spring). New York, NY, USA:                          Programming Languages and Operating Systems, ser. ASPLOS ’19.
+     Association for Computing Machinery, 1966, p. 61–78. [Online].                   New York, NY, USA: Association for Computing Machinery, 2019, p.
+     Available: https://doi.org/10.1145/1464182.1464190                               49–63. [Online]. Available: https://doi.org/10.1145/3297858.3304044
+[22] S. Go, H. Lee, J. Kim, J. Lee, M. K. Yoon, and W. W. Ro, “Early-            [37] L. Li and B. Chapman, “Compiler assisted hybrid implicit and explicit
+     adaptor: An adaptive framework for proactive uvm memory manage-                  gpu memory management under unified address space,” in Proceedings
+     ment,” in 2023 IEEE International Symposium on Performance Analysis              of the International Conference for High Performance Computing,
+     of Systems and Software (ISPASS), 2023, pp. 248–258.                             Networking, Storage and Analysis, ser. SC ’19. New York, NY,
+[23] M. Harris, “Unified memory for cuda beginners,” https://developer.               USA: Association for Computing Machinery, 2019. [Online]. Available:
+     nvidia.com/blog/unified-memory-cuda-beginners/, 2017.                            https://doi.org/10.1145/3295500.3356141
+[24] J. L. Hennessy and D. A. Patterson, Computer Architecture: A Quanti-        [38] libbpf community, “libbpf,” 2024. [Online]. Available: https://docs.
+     tative Approach, 6th ed. Morgan Kaufmann, 2017.                                  kernel.org/bpf/libbpf/libbpf overview.html
+[25] C.-C. Huang, G. Jin, and J. Li, “Swapadvisor: Pushing deep                  [39] M. Lin, Y. Feng, G. Cox, and H. Jeon, “Forest: Access-aware gpu
+     learning beyond the gpu memory limit via smart swapping,”                        uvm management,” in Proceedings of the 52nd Annual International
+     in Proceedings of the Twenty-Fifth International Conference on                   Symposium on Computer Architecture, ser. ISCA ’25. New York,
+     Architectural Support for Programming Languages and Operating                    NY, USA: Association for Computing Machinery, 2025, p. 137–152.
+     Systems, ser. ASPLOS ’20. New York, NY, USA: Association                         [Online]. Available: https://doi.org/10.1145/3695053.3731047
+     for Computing Machinery, 2020, p. 1341–1355. [Online]. Available:           [40] A. Maruf, A. Ghosh, J. Bhimani, D. Campello, A. Rudoff, and R. Ran-
+     https://doi.org/10.1145/3373376.3378530                                          gaswami, “Multi-clock: Dynamic tiering for hybrid memory systems,”
+[26] JEDEC, “High bandwidth memory (hbm) dram,” 2021. [Online].                       in 2022 IEEE International Symposium on High-Performance Computer
+     Available: https://www.jedec.org/standards-documents/docs/jesd235a               Architecture (HPCA), 2022, pp. 925–937.
+[27] Z. Jin and J. S. Vetter, “A benchmark suite for improving performance       [41] H. A. Maruf, H. Wang, A. Dhanotia, J. Weiner, N. Agarwal,
+     portability of the sycl programming model,” in 2023 IEEE International           P. Bhattacharya, C. Petersen, M. Chowdhury, S. Kanaujia, and
+     Symposium on Performance Analysis of Systems and Software (ISPASS),              P. Chauhan, “Tpp: Transparent page placement for cxl-enabled tiered-
+     2023, pp. 325–327.                                                               memory,” in Proceedings of the 28th ACM International Conference
+[28] N. Jones, T. Allen, and R. Ge, “Helm: Characterizing unified memory              on Architectural Support for Programming Languages and Operating
+     accesses to improve gpu performance under memory oversubscription,”              Systems, Volume 3, ser. ASPLOS 2023. New York, NY, USA:
+     in Proceedings of the International Conference for High Performance              Association for Computing Machinery, 2023, p. 742–755. [Online].
+     Computing, Networking, Storage and Analysis, ser. SC ’25. New York,              Available: https://doi.org/10.1145/3582016.3582063
+     NY, USA: Association for Computing Machinery, 2025, p. 490–504.             [42] NVIDIA, “Nvidia tesla v100 gpu architecture,” https://images.nvidia.
+     [Online]. Available: https://doi.org/10.1145/3712285.3759812                     com/content/volta-architecture/pdf/volta-architecture-whitepaper.pdf,
+[29] J. Jung, J. Kim, and J. Lee, “Deepum: Tensor migration and prefetching           2018.
+     in unified memory,” in Proceedings of the 28th ACM International            [43] Nvidia, “Nvidia pascal mmu,” 2019, https://nvidia.github.io/
+     Conference on Architectural Support for Programming Languages                    open-gpu-doc/pascal/gp100-mmu-format.pdf.
+     and Operating Systems, Volume 2, ser. ASPLOS 2023. New York,                [44] NVIDIA, “open-gpu-kernel-modules,” https://github.com/NVIDIA/
+     NY, USA: Association for Computing Machinery, 2023, p. 207–221.                  open-gpu-kernel-modules/tree/main, 2023.
+     [Online]. Available: https://doi.org/10.1145/3575693.3575736                [45] NVIDIA, “open-gpu-kernel-modules,” https://github.com/NVIDIA/
+[30] A. Karki, C. P. Keshava, S. M. Shivakumar, J. Skow, G. M. Hegde,                 open-gpu-kernel-modules/blob/main/kernel-open/nvidia-uvm/uvm
+     and H. Jeon, “Detailed characterization of deep neural networks on               gpu access counters.c, 2023.
+     gpus and fpgas,” in Proceedings of the 12th Workshop on General             [46] NVIDIA, “open-gpu-kernel-modules,” https://github.com/NVIDIA/
+     Purpose Processing Using GPUs, ser. GPGPU ’19. New York, NY,                     open-gpu-kernel-modules/blob/main/kernel-open/nvidia-uvm/uvm
+     USA: Association for Computing Machinery, 2019, p. 12–21. [Online].              perf prefetch.c, 2023.
+     Available: https://doi.org/10.1145/3300053.3319418                          [47] NVIDIA, “open-gpu-kernel-modules, v525,” https://github.com/
+[31] H. Kim, J. Sim, P. Gera, R. Hadidi, and H. Kim, Batch-Aware Unified              NVIDIA/open-gpu-kernel-modules/tree/525, 2023.
+     Memory Management in GPUs for Irregular Workloads. New York,                [48] NVIDIA, “Cuda toolkit documentation,” 2025. [Online]. Avail-
+     NY, USA: Association for Computing Machinery, 2020, p. 1357–1370.                able: https://docs.nvidia.com/cuda/cuda-runtime-api/group CUDART
+     [Online]. Available: https://doi.org/10.1145/3373376.3378529                       MEMORY.html
+[32] H. Kim, J. Sim, P. Gera, R. Hadidi, and H. Kim, “Batch-aware                [49] NVIDIA, “Nvidia cuda library samples,” 2025. [Online]. Available:
+     unified memory management in gpus for irregular workloads,”                      https://github.com/NVIDIA/CUDALibrarySamples
+     in Proceedings of the Twenty-Fifth International Conference on              [50] NVIDIA, “Nvidia cuda library samples,” 2025. [Online]. Available:
+     Architectural Support for Programming Languages and Operating                    https://github.com/NVIDIA/cuda-samples
+     Systems, ser. ASPLOS ’20. New York, NY, USA: Association                    [51] X. Peng, X. Shi, H. Dai, H. Jin, W. Ma, Q. Xiong, F. Yang, and
+     for Computing Machinery, 2020, p. 1357–1370. [Online]. Available:                X. Qian, “Capuchin: Tensor-based gpu memory management for deep
+     https://doi.org/10.1145/3373376.3378529                                          learning,” in Proceedings of the Twenty-Fifth International Conference
+[33] T. Lee, S. K. Monga, C. Min, and Y. I. Eom, “Memtis: Efficient                   on Architectural Support for Programming Languages and Operating
+     memory tiering with dynamic page classification and page size                    Systems, ser. ASPLOS ’20. New York, NY, USA: Association
+     determination,” in Proceedings of the 29th Symposium on Operating                for Computing Machinery, 2020, p. 891–905. [Online]. Available:
+     Systems Principles, ser. SOSP ’23. New York, NY, USA: Association                https://doi.org/10.1145/3373376.3378505
+     for Computing Machinery, 2023, p. 17–34. [Online]. Available:               [52] B. Pratheek, G. Cox, J. Vesely, and A. Basu, “Suv: Static analysis
+     https://doi.org/10.1145/3600006.3613167                                          guided unified virtual memory,” in 2024 57th IEEE/ACM International
+[34] B. Li, Y. Guo, Y. Wang, A. Jaleel, J. Yang, and X. Tang,                         Symposium on Microarchitecture (MICRO), 2024, pp. 293–308.
+     “Idyll: Enhancing page translation in multi-gpus via light weight           [53] A. Raybuck, T. Stamler, W. Zhang, M. Erez, and S. Peter, “Hemem:
+     pte invalidations,” in Proceedings of the 56th Annual IEEE/ACM                   Scalable tiered memory management for big data applications and
+     International Symposium on Microarchitecture, ser. MICRO ’23.                    real nvm,” in Proceedings of the ACM SIGOPS 28th Symposium on
+     New York, NY, USA: Association for Computing Machinery, 2023,                    Operating Systems Principles, ser. SOSP ’21. New York, NY, USA:
+     p. 1163–1177. [Online]. Available: https://doi.org/10.1145/3613424.              Association for Computing Machinery, 2021, p. 392–407. [Online].
+     3614269                                                                          Available: https://doi.org/10.1145/3477132.3483550
+[35] B. Li, J. Yin, A. Holey, Y. Zhang, J. Yang, and X. Tang, “Trans-fw: Short   [54] J. Ren, J. Luo, K. Wu, M. Zhang, H. Jeon, and D. Li, “Sentinel:
+     circuiting page table walk in multi-gpu systems via remote forwarding,”          Efficient tensor migration and allocation on heterogeneous memory
+     in 2023 IEEE International Symposium on High-Performance Computer                systems for deep learning,” in 2021 IEEE International Symposium on
+     Architecture (HPCA), 2023, pp. 456–470.                                          High-Performance Computer Architecture (HPCA), 2021, pp. 598–611.
+[55] G. Schieffer, J. Wahlgren, J. Ren, J. Faj, and I. Peng, “Harnessing     [62] Q. Yu, B. Childers, L. Huang, C. Qian, H. Guo, and Z. Wang,
+     integrated cpu-gpu system memory for hpc: a first look into grace            “Coordinated page prefetch and eviction for memory oversubscription
+     hopper,” in Proceedings of the 53rd International Conference on              management in gpus,” in 2020 IEEE International Parallel and Dis-
+     Parallel Processing, ser. ICPP ’24. New York, NY, USA: Association           tributed Processing Symposium (IPDPS), 2020, pp. 472–482.
+     for Computing Machinery, 2024, p. 199–209. [Online]. Available:         [63] Q. Yu, B. Childers, L. Huang, C. Qian, and Z. Wang, “Hierarchical page
+     https://doi.org/10.1145/3673038.3673110                                      eviction policy for unified memory in gpus,” in 2019 IEEE International
+[56] H. Shin, S. Bang, H. Park, and D. Kim, “Ariadne: Adaptive uvm                Symposium on Performance Analysis of Systems and Software (ISPASS),
+     management for efficient gpu memory oversubscription,” in 2026 IEEE          2019, pp. 149–150.
+     International Symposium on High Performance Computer Architecture       [64] H. Zhang, Y. Zhou, Y. Xue, Y. Liu, and J. Huang, “G10: Enabling
+     (HPCA), 2026, pp. 1–15.                                                      an efficient unified gpu memory and storage architecture with smart
+[57] A. Smith, “Sequential program prefetching in memory hierarchies,”            tensor migrations,” in Proceedings of the 56th Annual IEEE/ACM
+     Computer, vol. 11, no. 12, pp. 7–21, 1978.                                   International Symposium on Microarchitecture, ser. MICRO ’23. New
+[58] O. STARLAB, “Uvm benchmark,” 2025. [Online]. Available: https:               York, NY, USA: Association for Computing Machinery, 2023, p.
+     //github.com/OSU-STARLAB/UVM benchmark                                       395–410. [Online]. Available: https://doi.org/10.1145/3613424.3614309
+[59] Y. Sun, J. Kim, Z. Yu, J. Zhang, S. Chai, M. J. Kim, H. Nam, J. Park,   [65] T. Zheng, D. Nellans, A. Zulfiqar, M. Stephenson, and S. W. Keckler,
+     E. Na, Y. Yuan, R. Wang, J. H. Ahn, T. Xu, and N. S. Kim, “M5:               “Towards high performance paged memory for gpus,” in 2016 IEEE
+     Mastering page migration and memory management for cxl-based                 International Symposium on High Performance Computer Architecture
+     tiered memory systems,” in Proceedings of the 30th ACM International         (HPCA), 2016, pp. 345–357.
+     Conference on Architectural Support for Programming Languages and       [66] Y. Zhong, D. S. Berger, C. Waldspurger, R. Wee, I. Agarwal, R. Agarwal,
+     Operating Systems, Volume 2, ser. ASPLOS ’25. New York, NY, USA:             F. Hady, K. Kumar, M. D. Hill, M. Chowdhury, and A. Cidon, “Manag-
+     Association for Computing Machinery, 2025, p. 604–621. [Online].             ing memory tiers with cxl in virtualized environments,” in Proceedings
+     Available: https://doi.org/10.1145/3676641.3711999                           of the 18th USENIX Conference on Operating Systems Design and
+[60] Y. Wang, B. Li, A. Jaleel, J. Yang, and X. Tang, “Grit: Enhancing            Implementation, ser. OSDI’24. USA: USENIX Association, 2024.
+     multi-gpu performance with fine-grained dynamic page placement,” in
+     2024 IEEE International Symposium on High-Performance Computer
+     Architecture (HPCA), 2024, pp. 1080–1094.
+[61] Z. Yan, D. Lustig, D. Nellans, and A. Bhattacharjee, “Nimble page
+     management for tiered memory systems,” in Proceedings of the
+     Twenty-Fourth International Conference on Architectural Support for
+     Programming Languages and Operating Systems, ser. ASPLOS ’19.
+     New York, NY, USA: Association for Computing Machinery, 2019, p.
+     331–345. [Online]. Available: https://doi.org/10.1145/3297858.3304024
+

@@ -1,0 +1,1058 @@
+# G16_semantics / 共享地址翻译证据阅读报告
+
+## 0. 导航摘要（≤1 页）
+
+- **范围**：本报告只基于提供的 6 份全文；没有联网、没有执行、没有浏览。所有题录、年份、venue、DOI 只按原文可证内容填写；找不到就写 `null` 或 `uncertain`。未覆盖不等于全领域无人做。
+- **本组新 id**：`m2ndp2024`、`coatcheck2016`、`prefetched2019`、`cva6rt2026`。按要求另加两篇必须出卡经典：`iotlb_bottleneck2010`、`iommu_cost2007`。
+- **一句话演化**：2007 年把 IOMMU 主要成本归到软件 `map/unmap`、锁与 hypercall；2010 年用 pseudo pass-through 隔离软件成本后，指出硬件 IOTLB 解析本身可成主瓶颈；2016 年 COATCheck 把问题从“翻译/隔离成本”推到“地址翻译参与的内存次序正确性”；2019 年 Prefetched Address Translation 用 OS 排序页表 + 范围寄存器把 CPU 页表遍历变短，并坚持完整遍历校验预取；2024 年 M2NDP 把 CXL.mem 用于 NDP 命令与通用近数据处理，设备侧仍依赖 ATS/ATC 并引入 DRAM-TLB，但没有评估共享 IOMMU 多设备干扰；2026 年 CVA6-RT 是短文/预印本，只做核内 TLB 分区/锁定与实时中断，不可当 IOMMU 端到端保证。
+- **真正卡点（由本组证据支持）**：动态映射/迁移/失效、远端 PTW、共享队列与容量、尾延迟、多设备共享 IOMMU 干扰，**在这 6 篇里没有形成端到端闭环**。尤其 2010 只用单 I/OAT 通道做 DMA 微基准和 trace 驱动 IOTLB 模拟，不能外推为多设备干扰结论；2024 明说 ATS 可到 µs 级并靠 DRAM-TLB 补 TLB reach，但没有测共享 IOTLB/共享 ATC 冲突。
+- **定位**：`m2ndp2024` = nearby；`coatcheck2016` = foundation；`prefetched2019` = foundation；`cva6rt2026` = nearby（短/方法不清）；`iotlb_bottleneck2010` = foundation；`iommu_cost2007` = foundation。
+
+---
+
+## A. 按时间解释本组问题与机制演化
+
+### 2007：IOMMU 的成本先在软件路径上暴露
+`iommu_cost2007` 比较 Calgary 与 DART IOMMU，在裸机和 Xen 下跑 netperf、FFSB。原文结论是：吞吐大体不变，但启用 IOMMU 后 CPU 利用率可高约 60%（hypervisor）或约 30%（裸机）；profile 直接指向 TCE 表 `map/unmap`、锁竞争、hypercall/地址空间切换。它的机制对象是 TCE 表 + IOTLB + Linux DMA-API / Xen 路径，优化方向是 deferred cache flush、Xen multicalls、DMA-API 预分配/批量/永不释放、grant table 集成。核心不是“硬件 IOTLB 冲突有多严重”，而是“软件映射路径频繁且昂贵”。
+
+### 2010：隔离软件成本后，硬件 IOTLB 解析成为瓶颈
+`iotlb_bottleneck2010` 接上 2007：先用 IOMMU pseudo pass-through 固定恒等映射，消掉大部分 `map/unmap`；再用 I/OAT 高速 DMA 微基准扫源页数 1–256，保持 copy 总次数不变。结果是，单 I/OAT 通道下执行时间惩罚可到 47%（1KB block、256 源页）；32 源页后出现明显 IOTLB 容量/冲突效应。它用 KVM 里的 vIOMMU 捕获真实设备 DMA 访问模式，再用 trace 驱动 IOTLB 模拟评估：ALH、EH、MPRE、SD-ALH、coherent frame offset、super-page、更大/更高关联 IOTLB。结论是：当前 miss-rate 可先靠软件/已定义硬件特性降约 30%，再加简单硬件改动能再降约 20%，总体超过 60%。关键限制是：单设备微基准为主，两 E1000 NIC 只用于展示共享 coherent page 热点，未做多设备共享 IOMMU 干扰的系统评估。
+
+### 2016：从性能成本转向“翻译感知的次序正确性”
+`coatcheck2016` 不讨论攻击，也不评估 IOMMU 吞吐。它指出传统 memory consistency model 不够：TLB、页表遍历、synonym、dirty/access bit、`invlpg`、IPI TLB shootdown、微码 ghost instructions 都会影响内存次序。COATCheck 用 μspec DSL + μhb graph + 约束求解器，把硬件流水线、OS synopsis、TLB occupancy、page walk 微码都建模；还提出 `transistency`，表示显式考虑虚实翻译的次序规则集。它证明即使 SC/SC-for-VAMC 也可能因 synonym 的 dirty bit 检查而错。对“多个设备共享地址翻译”的启示是：正确性义务不只是权限检查，还包含共享 TLB/页表/失效路径的次序；但全文不是 IOMMU 端到端验证。
+
+### 2019：CPU 页表遍历可被“直接索引 + 预取”缩短，但必须完整遍历校验
+`prefetched2019` 的 ASAP 观察到：应用只占用少量大 VMA，若 OS 让 PL1/PL2 页表节点在物理内存中按对应虚拟页顺序连续，则可用 `base+offset` 直接算出目标 PT 节点物理地址。TLB miss 时同时启动普通 page walk 和 PL1/PL2 预取；预取被 L1-D/MSHR 缓冲，最终只消费由完整 walk 验证过的条目。它评估 native、SMT colocation、virtualization、2MB host page 等场景：SMT colocation 下 native 平均降低 25%、虚拟化平均 45%（max 55%）。它仍依赖 OS 修改、范围寄存器、prefetchable VMA 的物理连续性，并明确处理 page fault、VMA 扩展和“holes”。它不是设备侧 IOMMU/SVA 机制。
+
+### 2024：CXL NDP 把设备翻译/命令开销重新带回台面
+`m2ndp2024` 的主线是 CXL memory expander 上的通用 NDP：`M2 func` 把 NDP 管理命令封装进对预定地址的 CXL.mem 读写，避免 CXL.io/PCIe ring buffer 的 µs 级启动/轮询；`M2 µthread` 用轻量线程、FGMT、RVV 和 memory-mapped µthread pool 降低执行成本。与共享翻译直接相关的是：CXL 设备访问自身内存可用 ATS 请求 host 翻译，但原文说这会有 µs 级协议/页表遍历开销，设备可用 ATC 缓存翻译，host 可 invalidate ATC；进一步，M2NDP 用 on-chip TLB + DRAM-TLB（ASID/tag/PPN/权限）提升 reach，并承认 TLB shootdown 需要发给所有 CXL-M2NDP。这里的问题是：它把 ATS/ATC 当背景与依赖，不是贡献；也没有评估多个 CXL 设备共享 host IOMMU/ATC 时的干扰、队列或尾延迟。
+
+### 2026：核内实时 TLB 分区，不是 IOMMU 端到端保证
+`cva6rt2026` 是短文/预印本，提出 CVA6-RT：可配置 TLB 分区、静态锁定 TLB 条目、L1 cache/scratchpad 混合模式、增强 CLIC + 硬件上下文压栈。它报告平均中断延迟 12 cycles，比 baseline CVA6 的约 140 cycles 低 10×，Table 1 给出 12–13 cycles 的变异性。原文没有说这是 FPGA 原型、流片实测还是 RTL 仿真；也没有 IOMMU、设备、SVA、多设备共享翻译评估。因此只能当“核内 TLB 干扰与实时中断”的 nearby 证据，不能当共享 IOMMU 端到端保证。
+
+---
+
+## B. 逐篇证据卡
+
+### B1. `m2ndp2024`
+
+- **文件**：`iommu-platform/out/shared-translation-literature-20261006/papers/m2ndp2024.txt`
+- **准确题目**：Low-overhead General-purpose Near-Data Processing in CXL Memory Expanders（L1–L2）
+- **作者**：Hyungkyu Ham, Jeongmin Hong, Geonwoo Park, Yunseon Shin, Okkyun Woo, Wonhyuk Yang, Jinhoon Bae, Eunhyeok Park, Hyojin Sung, Euicheol Lim, Gwangsun Kim（L3–L5）
+- **年份**：2024（L11，arXiv:2404.19381v3 [cs.AR] 23 Sep 2024）
+- **venue**：arXiv:2404.19381v3 [cs.AR]，未见正式会议/期刊名（L11）
+- **DOI**：null（原文未给 DOI）
+- **publication_status**：preprint
+- **relevance**：nearby
+- **evaluation_type**：`["simulation", "measurement"]`（主设计为基于 Ramulator 的 cycle-level 模拟；CPU-NDP OLAP 在真实双路 AMD EPYC 上测量，L918–L923、L920–L923）
+
+**最强前作 / 关键改变 / 仍依赖条件**
+- 最强前作：CXL NDP 的专用加速器（CXL-ANNS、CMS、RecNMP、CXL-PNM）以及 GPU-style NDP/NSU（L1781–L1798、L1444–L1448、L1418 附近）。
+- 关键改变：把 NDP 管理命令做成 CXL.mem 可寻址 M2 func；把 µthread 与内存位置绑定，降低地址计算与 threadblock 资源浪费；用 DRAM-TLB 提升 NDP 侧 TLB reach。
+- 仍依赖：未修改的 CXL.mem 标准与 host processor；packet filter；HDM-DB/back-invalidation；OS/driver 初始化；用户态编程 API；手工数据放置；尚无 C++/RVV 编译器，kernel 用 assembly（L981–L982）。
+
+**精确机制**
+- M2 func 在 CXL memory 输入端口放 packet filter，检查请求地址是否落在每 host process 预分配的 M2 func 区域；命中后按地址偏移触发注册/启动/轮询/TLB shootdown 等管理功能（L136–L151、L420–L437）。
+- M2 func 用 write request 的 data 部分传参，用后续 read 取返回值，并要求 fence；M2 func region 被设为 uncacheable，从而绕过 host cache（L409–L424、L527–L534）。
+- M2 µthread 是 memory-mapped：µthread 与其要处理的内存位置直接关联，`x1/x2` 给映射地址/偏移；比 CUDA 更细粒度（32 B vs 典型 128 B/warp），用 scalar 指令减少 SIMT 冗余地址计算（L160–L168、L574–L603）。
+- 虚拟内存：NDP unit 用 on-chip TLB、DRAM-TLB、ATS；DRAM-TLB entry 含 ASID、tag、物理页号、权限，按 VPN+ASID 哈希定位，同 CXL memory 内 NDP units 可共享（L785–L809、L862–L871）。
+
+**复用粒度及身份/权限匹配前提**
+- 粒度：M2 func region 按 host process 分配；packet filter entry 为 64-bit base + 64-bit bound + 16-bit ASID，约 18 B/process（L420–L425）；µthread pool region 是虚拟内存区域，µthread 可映射到数据/行指针或 dummy 位置（L801–L806）。
+- 身份/权限：进程隔离靠 host 分配 M2 func region 与 packet filter 的 ASID；NDP kernel 使用 RV64IMAFDV 子集，禁止操作系统类指令如 ECALL（L789–L794）。原文没有 PASID/SVA 级别的多设备身份匹配细节。
+
+**资源共享 vs 映射共享/SVA**
+- 它共享的是 CXL controller、NDP units、cache/TLB、DRAM-TLB 和 CXL memory 带宽；不是多个设备共享同一个 IOMMU 翻译域/SVA。
+- 设备自身翻译依赖 ATS/ATC：ATS 请求 host 翻译可 µs 级，ATC 缓存翻译，host 可 invalidate ATC（L256–L262）。这属于设备翻译缓存，但未评估多设备共享 ATC/IOMMU 的争用。
+
+**评价配置**
+- cycle-level simulator based on Ramulator；CPU/GPU baseline 模型；CXL latency 150/300/600 ns；32 NDP units @2 GHz；最多 48 concurrent kernels；workload 含 OLAP、KVStore、graph、DLRM、OPT（L920–L973、L813–L899）。
+- 与 CPU-NDP 的真实测量对比：AMD EPYC 75F3 双路、32 核、409.6 GB/s，以匹配 CXL memory 带宽（L918–L923）。
+
+**限制 / 未覆盖**
+- 无硬件原型、无硅后数据；性能主要来自模拟与建模。
+- ATS 延迟被作为已知成本引用，未提出消除方案；DRAM-TLB 是 reach 补充，不是共享 IOMMU 干扰机制。
+- 多 CXL-M2NDP 扩展要求用户/软件做数据放置，自动扩展留作 future work（L888–L898）。
+- TLB shootdown 需发给所有 CXL-M2NDP；作者假设 in-memory data 很少换页，故认为 rare（L868–L871）。
+- 未覆盖多设备共享 IOMMU/IOTLB 干扰、队列容量、尾延迟、动态迁移、远端 PTW 的端到端评估。
+- 未评估安全隔离/攻击面；CXL switch 集成场景只模拟 scalability（L903–L916、L1732–L1744）。
+
+**对可能创新点的最强反证**
+- 反证“CXL/NDP 只需解决 kernel launch，设备翻译不是瓶颈”：M2NDP 明确把 ATS 的 µs 级延迟和 ATC invalidation 写进背景，并用 DRAM-TLB 处理 TLB reach（L256–L262、L785–L809）。
+- 但它不反证“多设备共享 IOMMU 干扰已经解决”：全文没有该评估，不能由此宣称全领域空白或已覆盖。
+
+**后续必追引文（原文编号）**
+- [13] ATS revision 1.1（L1848–L1850）
+- [19] CXL Specification 3.1（L1868–L1871）
+- [72] Ducati: GPU address translation TLB reach（L1936–L1938）
+- [115] Very large part-of-memory TLB（L2046–L2048）
+- [120] D. D. Sharma, CXL architecture/latency（L2066–L2067）
+- [129] Sun et al., Demystifying CXL memory（L2101–L2104）
+- [130] Tamimi et al., CCIX host-FPGA（L2105–L2109）
+
+**可导航原文证据**
+1. `m2ndp2024.txt` L84–L95：摘要给出 “up to 128x (14.5x overall)” 与节能数字，并声明模拟器公开。
+2. L136–L151：M2 func 把 NDP 管理命令封装进 CXL.mem 请求到预定地址；packet filter 在输入端口匹配地址。
+3. L256–L262：CXL 设备用 ATS 请求翻译；可 µs 级；ATC 缓存；host 可 invalidate ATC。
+4. L785–L809：NDP unit 用 on-chip TLB，但可能不够；ATS 也高延迟；故用 DRAM-TLB；entry 含 ASID、tag、PPN、权限。
+5. L868–L871：TLB shootdown 要发给所有 CXL-M2NDP；作者假设 in-memory/no swapping 使其 rare。
+6. L1289–L1310：性能结论：OLAP 最高 128×；GPU workload 最高 9.71×；M2 func 对细粒度 NDP 尤其有效。
+
+---
+
+### B2. `coatcheck2016`
+
+- **文件**：`iommu-platform/out/shared-translation-literature-20261006/papers/coatcheck2016.txt`
+- **准确题目**：COATCheck: Verifying Memory Ordering at the Hardware-OS Interface（L1–L2）
+- **作者**：Daniel Lustig, Geet Sethi, Margaret Martonosi, Abhishek Bhattacharjee（L4–L5）
+- **年份**：2016（L54，ASPLOS ’16）
+- **venue**：ASPLOS ’16, April 2–6, 2016, Atlanta, Georgia, USA（L54）
+- **DOI**：10.1145/2872362.2872399（L57）
+- **publication_status**：published
+- **relevance**：foundation
+- **evaluation_type**：`["analysis", "measurement"]`（主贡献是静态验证/分析工具；8.2 在真实 Xeon 服务器上测 tool runtime，L780、L914–L938）
+
+**最强前作 / 关键改变 / 仍依赖条件**
+- 最强前作：PipeCheck、CCICheck、Romanescu et al. 的 VAMC/PAMC 区分（L146–L168、L940–L958）。
+- 关键改变：从“一致性”扩到“transistency”，把 OS syscall、IPI、TLB shootdown、页表遍历微码、TLB occupancy、synonym、dirty/access bit 纳入 μhb 图；μspec 可模块化替换硬件/OS 模型。
+- 仍依赖：Sandy Bridge-like 硬件模型基于公开文档/专利/合理猜测，不是精确商业实现；Linux synopsis 只含与分页和同步相关的内存访问；Coq 形式证明尚未完成（L393–L397、L483–L503）。
+
+**精确机制**
+- Enhanced Litmus Tests（ELT）同时描述虚拟地址、物理地址、PTE 状态；插入 OS synopsis、ghost instructions 表示页表遍历/状态位更新等微码（L211–L234、L301–L365）。
+- μspec 是一阶逻辑 + μhb 图 DSL，组件各自声明 ordering axioms，系统模型做逻辑 AND；solver 用类似 DPLL 的回溯找可行 μhb 图（L368–L441、L399–L441）。
+- 案例：store buffer forwarding 需要检测 synonym；若只用虚拟地址会错（L503–L570）。页表遍历 ghost loads 不经过 Fetch/Dispatch 等阶段，也不使用 SameVirtualTag；状态位更新则经过 Dispatch/Issue/Commit，因为会影响架构状态（L590–L653）。
+- TLB occupancy 用 TLB entry creation/invalidation 节点约束，保证指令读到存在且匹配的 translation/status（L624–L692）。
+
+**复用粒度及身份/权限匹配前提**
+- 粒度：按物理地址、虚拟地址、PTE、TLB entry、页表遍历、status bit update、IPI handler 等事件建模（L211–L234、L374–L388、L685–L692）。
+- 身份/权限前提：它建模的是 OS 管理的进程页表、OS TLB coherence（x86 `invlpg`+IPI）、PTE 权限/accessed/dirty 位；**没有** PASID、设备域、IOMMU context entry 的身份匹配讨论。权限检查体现在 SamePhysicalAddress、PTE status/permission 约束中（L646–L653、L767–L781）。
+
+**资源共享 vs 映射共享/SVA**
+- 共享资源：CPU core 内 TLB、cache、store buffer、page walker、页表层级，以及 OS 的 TLB shootdown 路径。
+- 映射共享：它处理 synonym（多个虚拟地址映射到同一物理地址）和页表状态一致性，但不处理多设备共享 IOMMU 映射或 SVA 的 ATC/IOMMU 交互。
+- 它提醒：共享翻译结构的正确性不只是“谁有权限”，还包括共享 TLB/页表的次序与失效责任。
+
+**评价配置**
+- 案例：SandyBridge-like processor + Linux-like OS；118 个 litmus tests；覆盖 Intel/AMD manual tests、翻译/IPI/TLB/synonym 测试；从 ELT 到 solver 的 runtime 全都在 100 s 内完成，很多更快（L756–L781、L914–L938）。
+- 服务器：3.2 GHz Intel Xeon E5-2667 v3（L780）。
+
+**限制 / 未覆盖**
+- 静态验证工具，不是运行时 IOMMU/SVA 系统；不验证商业 RTL，不覆盖 Verilog/HDL 自动抽取（L393–L397）。
+- 未完成 Coq 形式证明（L400–L405）。
+- 不建模完整 OS 决策/数据结构，只包含分页结构和同步相关内存访问（L248–L259）。
+- 不覆盖 IOMMU IOTLB、设备 ATC、PASID、多设备共享翻译域、tail latency。
+- 不是攻击/安全论文；它的“正确性义务”是内存次序与页表状态，不是 DMA 隔离攻击。
+
+**对可能创新点的最强反证**
+- 反证“内存一致性模型足以覆盖地址翻译正确性”：COATCheck 明确给出 synonym dirty bit 案例，即使 SC/SC-for-VAMC 也可能出错；这类次序要求甚至在 VAMC 范围之外（L722–L751、L762–L781）。
+- 但它不反证“IOMMU 共享翻译性能已解决”：完全不同问题维度。
+
+**后续必追引文（原文编号）**
+- [26][27] PipeCheck（L995–L1000）
+- [29] CCICheck（L1007–L1010）
+- [38][39] Romanescu et al. VAMC/PAMC（L1039–L1046）
+- [37] UNITD coherence（L1035–L1038）
+- [46] DiDi TLB shootdown（L1065–L1070）
+- [12][41] TLB prefetching / recency-based TLB preloading（L1004–L1007、L1051–L1053）
+- [33] CoLT coalesced large-reach TLB（L1024、L1025–L1028）
+
+**可导航原文证据**
+1. `coatcheck2016.txt` L22–L38：摘要提出 COATCheck、DSL、约束求解、transistency。
+2. L100–L120：μspec 让每个组件独立声明 ordering contribution，solver 自动分析。
+3. L130–L158：VAMC/PAMC 区分及其不足；COATCheck 进一步发现即使 VAMC/PAMC 都 SC 仍可出错。
+4. L211–L234：ELT 三要素：虚实地址同时跟踪、OS 活动、ghost instructions。
+5. L519–L545：Store buffer forwarding 必须检测 synonym；否则图 7 场景会错。
+6. L722–L751、L762–L781：synonym dirty bit/OS 责任案例；说明 transistency 超出 VAMC，且可在无重排时出错。
+
+---
+
+### B3. `prefetched2019`
+
+- **文件**：`iommu-platform/out/shared-translation-literature-20261006/papers/prefetched2019.txt`
+- **准确题目**：Prefetched Address Translation（L3、L49）
+- **作者**：Artemiy Margaritov, Dmitrii Ustiugov, Edouard Bugnion, Boris Grot（L50–L52）
+- **年份**：2019（L6–L9、L55–L59）
+- **venue**：MICRO-52, October 12–16, 2019, Columbus, OH, USA（L6–L9、L127–L133）
+- **DOI**：10.1145/3352460.3358294（L10、L14）
+- **publication_status**：published
+- **relevance**：foundation
+- **evaluation_type**：`["measurement", "simulation", "analysis"]`（真实 perf counter 测 TLB miss overhead；DynamoRIO 型内存层级模拟器测 page walk latency；分析/投影 L712–L721、L897–L960）
+
+**最强前作 / 关键改变 / 仍依赖条件**
+- 最强前作：CoLT/Clustered TLB、SpecTLB、hash page table、segment-based VM、large pages、page walk cache 等（L300–L392、L987–L1044）。
+- 关键改变：OS 把 PL1/PL2 页表节点按虚拟页顺序放到连续物理内存，使 TLB miss 时可用 `base+offset` 直接预取深层 PT 节点；预取与普通 page walk 并行，但完整遍历继续执行以确保只消费正确项。
+- 仍依赖：应用少数大 VMA；OS 在 VMA 创建/扩展时保留连续物理内存；架构范围寄存器；PL1/PL2 是主要目标；虚拟化下 guest/host 两侧都要连续与排序；VMAs 可能扩展、可能有 holes（L142–L215、L538–L560、L661–L710）。
+
+**精确机制**
+- TLB miss 时，除了启动 page walker，还检查虚拟地址是否命中 prefetchable VMA 范围寄存器；命中则用 PL1/PL2 base + 偏移算出目标 PT 节点物理地址，向 L1-D 发预取（L585–L612）。
+- 预取走正常内存层级，进入 L1-D，利用 MSHR；best-effort，不修改 cache hierarchy 或 page walker（L603–L612）。
+- 完整 walk 仍照常走；ASAP 不消费未验证预取，降低投机翻译安全风险（L211–L224、L1041–L1044）。
+- 虚拟化：2D walk 中对 guest/host 的 PL1/PL2 分别预取；guest OS 需通过 vmcall 让 hypervisor 维护连续区域（L632–L639、L667–L691）。
+
+**复用粒度及身份/权限匹配前提**
+- 粒度：VMA 级别范围寄存器 + PL1/PL2 PT 节点/页表页；虚拟地址偏移按固定 shift 映射到各层（L567–L601）。
+- 身份/权限：按硬件线程架构状态保存 VMA descriptors；OS 在上下文切换/中断时管理；每个 VMA 有 start/end/base。原文没有 PASID、设备身份或权限标签；它针对 CPU 进程地址空间，不是设备 SVA。
+
+**资源共享 vs 映射共享/SVA**
+- 共享资源：TLB、PWC、cache hierarchy、SMT 核上 co-runner、虚拟化嵌套页表遍历资源。
+- 映射共享：它优化的是同一进程/VM 的 PT 布局和预取；不是多设备共享 IOMMU 映射，也不是设备 ATC/SVA。
+- 但它对“共享翻译结构被 co-runner/SMT 压到后端缓存”有直接测量：SMT colocation 下 baseline page walk latency 增加 2.1–3.2×，ASAP 才更有空间（L844–L864）。
+
+**评价配置**
+- 真实系统：Dual socket Intel Xeon E5-2630v4 (BDW), 2.40 GHz, 20 cores/socket, SMT；用 Linux perf 测 page walker active cycles，用 in-house kernel module 抓页表 dump（L645–L721）。
+- 模拟：基于 DynamoRIO 的 Intel Broadwell-like 内存层级模拟；L1/L2 TLB、3-level split PWC、32KB L1、256KB L2、20MB L3、191 cycles 主存；额外用 synthetic co-runner 施压（L645–L721、L784–L802）。
+- 主要结果：native isolation 平均降 14%；native SMT colocation 平均降 25%（max 42%）；virtualized isolation 平均降 39%（max 43%）；virtualized + colocation 平均降 45%（max 55%）（L107–L115、L779–L784、L844–L883）。
+
+**限制 / 未覆盖**
+- 不改变现有 radix 页表结构，但仍需 OS 分配连续物理 PT 区域和范围寄存器；不是零软件修改。
+- 预取不能消除至少一次内存层级访问；大页与 5-level PT 只是兼容扩展（L216–L224、L615–L631）。
+- 依赖 VMA 稳定与 PT 节点可排序；VMA 扩展、holes、被 pinned 页面会使部分 walk 不被加速（L661–L710）。
+- 不覆盖设备 IOMMU、SVA、PASID、多设备共享 IOTLB/ATC、远端 PTW。
+- 评估主要是 page walk latency 与保守性能投影，不是 IOMMU 端到端系统。
+
+**对可能创新点的最强反证**
+- 反证“翻译优化只需做 TLB 合并/大页/缓存扩容”：原文 §2.5 明确说 coalescing 受 TLB 容量与物理连续性限制，PWC 扩大也不足以显著降低 walk latency；ASAP 针对的是长延迟 walk（L300–L392、L830–L843、L962–L1003）。
+- 反证“预取翻译可以投机消费”：ASAP 坚持完整 walk 校验预取，并把 SpecTLB/Spectre/Meltdown 风险作为反例（L211–L224、L1037–L1044）。
+
+**后续必追引文（原文编号）**
+- [1] Gandhi et al., Agile paging（L1051–L1053）
+- [4] CoLT（L1057–L1059）
+- [5] Increasing TLB reach by clustering（L1060–L1063）
+- [18] Hash, don’t cache the page table（L1104–L1106）
+- [43] Kandiraju & Sivasubramaniam, TLB prefetching（L1100–L1102）
+- [47] SpecTLB（L1111–L1113）
+- [16] Ryoo et al., very large part-of-memory TLB（L1098–L1100）
+
+**可导航原文证据**
+1. `prefetched2019.txt` L55–L113：摘要：ASAP、直接索引、OS 排序页表、预取与完整 walk 并行，25%/45% 结果。
+2. L140–L215：直索思想、VMA、范围寄存器、prefetch 地址计算。
+3. L211–L224：预取不绕过完整 walk，只消费正确项。
+4. L450–L467：PL1/PL2 是主要目标；100GB 数据集下 PL1 footprint 约 200MB，PL4/3 很小。
+5. L538–L560：buddy allocator 使 PT 页面散乱；ASAP 只要求 PT 小部分连续。
+6. L844–L883：SMT colocation 与 virtualized 下的数值。
+7. L661–L710：page fault 与 VMA 扩展/hole 的处理边界。
+
+---
+
+### B4. `cva6rt2026`
+
+- **文件**：`iommu-platform/out/shared-translation-literature-20261006/papers/cva6rt2026.txt`
+- **准确题目**：CVA6-RT: an Open-Source Time-Predictable RV64 Processor for Mixed-Criticality Systems（L1–L2）
+- **作者**：Enrico Zelioli, Christopher Reinwardt, Nils Wistoff, Robert Balas, Alessandro Ottaviano, Luca Benini, Angelo Garofalo（L3–L5）
+- **年份**：2026（L15，arXiv:2606.26177v1 [cs.AR] 24 Jun 2026）
+- **venue**：arXiv:2606.26177v1；页脚写 RISC-V Summit Europe, Bologna, 8-12th June 2026（L64、L128）
+- **DOI**：null（原文未给 DOI）
+- **publication_status**：uncertain（有 arXiv 与 summit 页脚，但未给正式 DOI/proceedings 信息）
+- **relevance**：nearby
+- **evaluation_type**：`["analysis"]`（原文只报告平均中断延迟/组成；未说明仿真、FPGA 或流片实测，不能当 measurement/hardware_prototype）
+
+**最强前作 / 关键改变 / 仍依赖条件**
+- 最强前作：CVA6 开源 RV64 Linux-ready core；SW-only cache/TLB coloring 等实时隔离方法（L41–L58、L52–L58）。
+- 关键改变：在 CVA6 核内加 TLB 分区/锁定、L1 cache/scratchpad 混合、CLIC+硬件上下文压栈，目标 bounded interrupt/translation latency。
+- 仍依赖：特权软件选择 active partition bitmap；任务被分配不相交 partition；静态锁定条目；cache ways 被映射为 SPM；CLIC 扩展；硬件上下文压栈需要预定内存位置（L75–L109、L110–L126）。
+
+**精确机制**
+- TLB 分区：扩展 pseudo-LRU 树，限制哪些子集可替换；特权软件用 bitmap 选择 partition；任务分配 disjoint partition 后，TLB replacement 互不驱逐；静态锁定若干 TLB entry，使其不可被驱逐（L91–L108）。
+- L1 混合 cache/SPM：每个 cache way 可动态配置为 cache 或 software-managed scratchpad；SPM ways 从替换逻辑移除并清 tag/valid；地址解码把指定物理区域映射到 SPM（L75–L87）。
+- 中断：增强 CLIC 提供优先级/抢占/vector/nesting/tail-chaining；硬件辅助寄存器压栈；中断检测从 decode 移向 commit 以降同步延迟；支持虚拟化（L110–L126、L39–L48）。
+
+**复用粒度及身份/权限匹配前提**
+- 粒度：TLB entries/sets、L1 cache ways、任务 partition、寄存器上下文栈。
+- 身份/权限：任务级 partition，由特权软件控制 bitmap；原文没有 ASID/PASID、设备身份、VMID 或共享翻译权限匹配细节。因此它解决的是同核任务间资源干扰，不是多设备共享地址空间的身份隔离。
+
+**资源共享 vs 映射共享/SVA**
+- 共享资源：同一 core 的 TLB、L1 cache、interrupt/CLIC、pipeline/flush 资源。
+- 映射共享：没有；不涉及 IOMMU、device ATC、SVA、共享页表；它是资源分区而非映射共享。
+- 对“共享翻译”的启示最多是：同核共享 TLB 可被分区/锁定以降干扰；但 IOMMU 侧是否可类比，原文不提供证据。
+
+**评价配置**
+- 以中断延迟为 case study：CVA6-RT 平均 12 cycles，baseline CVA6 约 140 cycles，10× reduction（L87–L90、L23–L24、L66–L74）。
+- Table 1：interrupt propagation 3/3，injection 2–3 vs 6–30，pipeline flush 7/7，context save 0 vs 104–130，total 12–13 vs 120–170（L66–L74）。
+- 原文没有给出 FPGA board、频率、工艺、RTL synthesis 或仿真器细节；不能推断为流片/FPGA 实测。
+
+**限制 / 未覆盖**
+- 短 paper/预印本；核心贡献是微架构扩展与单点中断延迟。
+- 无 IOMMU、设备 DMA、SVA、多设备共享翻译评估。
+- 无动态映射/迁移/失效的尾延迟评估；TLB lock 是静态条目，可能带来容量/置换灵活性代价。
+- 无安全评估；不能把 TLB 分区等同于 DMA 隔离或 IOMMU 端到端保证。
+- 评估只给中断延迟组成，未报告对其他 workload/吞吐的影响。
+
+**对可能创新点的最强反证**
+- 反证“TLB 分区/锁定就是实时地址翻译的完整保证”：原文只证明核内 TLB 分区和中断延迟；没有 IOMMU、远端 PTW、共享设备路径。
+- 反证“硬件实时特性可以脱离评估方法被当成已测结果”：原文未交代评估载体，只能当设计报告/短文，不能当硬件原型证据。
+
+**后续必追引文（原文编号）**
+- [4] Zaruba & Benini, CVA6（L121–L125）
+- [1] Gracioli et al., cache management for real-time（L113–L115）
+- [3] ARM Cortex-M interrupt latency guide（L119–L120）
+- [2] STMicroelectronics Stellar（L116–L117）
+
+**可导航原文证据**
+1. `cva6rt2026.txt` L13–L24：摘要给出 TLB partitioning/locking、scratchpad、CLIC+context stacking、12-cycle 中断延迟。
+2. L60–L62：软件可配置、硬件 TLB 资源分区用于 predictable address translation。
+3. L91–L109：TLB 分区/锁定机制、特权软件 bitmap、disjoint partition 隔离驱逐干扰。
+4. L75–L87：L1 cache/SPM 混合与 constant access latency。
+5. L110–L126：CLIC 增强、硬件上下文压栈、中断检测搬迁。
+6. L66–L74：Table 1 中断延迟组成与 variability。
+7. L87–L90：以 interrupt latency 为 case study，未提 IOMMU/设备。
+
+---
+
+### B5. `iotlb_bottleneck2010`
+
+- **文件**：`iommu-platform/out/shared-translation-literature-20261006/papers/iotlb_bottleneck2010.txt`
+- **准确题目**：IOMMU: Strategies for Mitigating the IOTLB Bottleneck（L7）
+- **作者**：Nadav Amit, Muli Ben-Yehuda, Ben-Ami Yassour（L10–L11）
+- **年份**：2010（L1–L2、L23）
+- **venue**：WIOSCA 2010 - Sixth Annual Workshop on the Interaction between Operating Systems and Computer Architecture（L1–L2）
+- **DOI**：null（原文给 inria-00493752 version 1，非 DOI）
+- **publication_status**：published
+- **relevance**：foundation
+- **evaluation_type**：`["measurement", "simulation", "analysis"]`（真实 Xeon X5570 + X58 + I/OAT DMA 微基准；KVM vIOMMU 抓 trace；trace-driven IOTLB 模拟评估策略）
+
+**最强前作 / 关键改变 / 仍依赖条件**
+- 最强前作：`iommu_cost2007` 和 Ben-Yehuda et al. OLS’06 认为主要开销来自软件实现；本文明确问“软件成本去掉后，硬件地址解析是否成为新瓶颈”（L962–L977、L209–L234）。
+- 关键改变：用 IOMMU pseudo pass-through 固定恒等映射，消掉 map/unmap 与 IOTLB flush；自建 I/OAT DMA 微基准控制源页数与 block size；用 vIOMMU 在 KVM 中捕获真实设备 DMA trace。
+- 仍依赖：IOTLB baseline 是合理默认（32 entries、2-way、LRU、4-entry prefetch buffer），因为 Intel/AMD 未公开实现细节；trace-driven 模拟；真实微基准只在单 I/OAT channel 上做。
+
+**精确机制**
+- 观察：streaming DMA map 通常单次使用后 unmap；缓存这些条目收益小，还可能逐出长期 coherent mappings（L511–L523）。
+- 策略：
+  - EH/Eviction Hints：将 transient mappings 标记为可提前逐出（L574–L585）。
+  - Non-overlapping coherent frames / virtual I/O page coloring：把不同设备的 coherent mapping 偏移到不同 frame，避免 IOTLB set 热点（L587–L601）。
+  - 大 TLB / 高关联：可能降 eviction，但成本和复杂度上升（L603–L646）。
+  - Super-pages：可明显减少所需 IOTLB entries，但保护粒度粗、共享/单次使用模型不匹配（L647–L674）。
+  - Prefetching：区分 stride 与 history；作者认为 history-based 对单次 DMA 不适用（L775–L795）。
+  - Adjacent Mappings Prefetch / ALH / SD-ALH / MPRE：按空间局部性预取相邻映射、单方向提示、显式预取每组首个 streaming mapping（L796–L843）。
+- 模拟评估：Naïve、OPT-EV、ALH、ALH+EH、offset、SD-ALH、MPRE、8-entry prefetch、4-way、64-entry 等组合（L889–L912、L919–L923）。
+
+**复用粒度及身份/权限匹配前提**
+- 粒度：IOTLB entry/set、DMA frame、scatter-gather list、coherent/streaming映射、虚拟 I/O 地址。
+- 身份/权限前提：每个设备有独立 virtual I/O memory space/domain；Linux 从同一虚拟 I/O 地址池分配，可能让多个设备 coherent mappings 落在同一 IOTLB set（L498–L507、L587–L601）。原文没有 PASID/SVA/IOMMU context entry 的细粒度身份模型；权限粒度由 IOMMU 页表 page-size 决定。
+
+**资源共享 vs 映射共享/SVA**
+- 共享资源：共享 IOTLB、TCE/IOMMU 页表、set index 冲突、I/OAT/DMA 引擎。
+- 映射共享：它讨论多个设备有各自 domain，但 virtual I/O 地址区域可能重叠/热点；super-page 的 shared usage-model 可让多个 DMA descriptor 指向同一物理内存，但这是共享映射缓存，不是现代 SVA/PASID 共享地址空间。
+- 关键区分：本文的 “共享” 主要是共享 IOTLB 容量/set 与共享映射库；不是多设备共享同一个页表/地址空间。
+
+**评价配置**
+- 真实微基准：Intel Xeon X5570 2.93 GHz + Intel X58；I/OAT 单通道；copy block 4KB/2KB/1KB；源页 1–256；round-robin 消除 set hotspot；assert processor idle after DMA setup；IOMMU on/off 对比（L240–L277）。
+- vIOMMU：KVM + QEMU emulated E1000/SCSI/IDE；Linux 2.6.31 guest；trace 每个 map/unmap/DMA access；再用 TLB emulator 模拟不同 IOTLB 配置（L320–L454）。
+- 主要结果：32 源页后 IOTLB 超容量，256 源页时 4KB page penalty 15%、1KB block 47%（L240–L256）；策略可降 miss-rate 约 50%–60%（L917–L923、L995–L1005）。
+
+**限制 / 未覆盖**
+- **单设备微基准为主**：DMA 微基准用单 I/OAT channel；两 E1000 NIC 只用来看 map/unmap/共享 coherent page 现象，不是多设备共享 IOMMU 干扰的端到端评估（L275–L276、L887–L894、L498–L507）。
+- 真实硬件上只测执行时间惩罚，不直接读 IOTLB miss counter；策略效果主要来自 trace-driven 模拟。
+- baseline IOTLB 参数是作者设定，因为没有公开 Intel/AMD IOTLB 设计。
+- 不覆盖 PASID/SVA、设备 ATC、远端 PTW、队列/tail latency、动态迁移/失效的端到端延迟。
+- 部分策略（ALH/EH）是 Intel 已定义特性，论文评估它们与自提策略的组合，不代表商用 IOMMU 都已实现。
+
+**对可能创新点的最强反证**
+- 反证“IOMMU 开销只是软件 map/unmap；优化软件就够”：pseudo pass-through 消掉软件映射后，单 I/OAT 通道仍可观测最高 47% penalty，且作者认为这是 IOTLB miss/thrashing（L240–L256、L207–L234）。
+- 反证“只要换更大 IOTLB/更高关联就能解决”：模拟显示增加 entry/way 改善相对小；ALH、MPRE、offset 更有效（L887–L923）。
+- 但**不能**由此推“多设备共享 IOMMU 干扰已被完整覆盖”：原始实验不是多设备共享干扰的系统评估。
+
+**后续必追引文（原文编号）**
+- [4] Ben-Yehuda et al., The Price of Safety（L961–L964）
+- [3] Ben-Yehuda et al., Utilizing IOMMUs in Linux and Xen（L951–L960）
+- [7] Intel VT-d architecture spec（L970–L973）
+- [1] AMD IOMMU architectural spec（L944–L946）
+- [19] Willmann et al., protection strategies for direct access（L1015–L1021）
+- [20] Yassour et al., DMA mapping in direct device assignment（L1021–L1025）
+- [10] Kandiraju & Sivasubramaniam, TLB prefetching（L983–L985）
+- [8] Jouppi, prefetch buffer（L975–L977）
+
+**可导航原文证据**
+1. `iotlb_bottleneck2010.txt` L21–L42：摘要：IOTLB miss 增 DMA latency；提出软硬件增强，可降 miss-rate >60%。
+2. L70–L82：single-use mapping 是常见策略；map/unmap 成本被认为是主要瓶颈。
+3. L207–L234：作者问 IOTLB 硬件地址解析是否引入显著开销，称本文是首次尝试；pseudo pass-through + I/OAT 微基准。
+4. L240–L256：源页数 1–256；32 页后惩罚上升；256 页时 4KB page 15%、1KB block 47%，疑似 IOTLB thrashing。
+5. L498–L507：多设备各有 domain，虚拟 I/O 区域可能重叠；两 E1000 展示同一虚拟 I/O 页被多设备访问。
+6. L587–L601：coherent frame 非重叠/page coloring 解决多设备 IOTLB set 热点；不需硬件修改。
+7. L887–L923：主要降 miss-rate 的是 ALH 与 MPRE；offset 对多 NIC 有效；单纯 OPT-EV/更大 TLB 效果有限。
+8. L962–L989：Related Work 明确把 2007 的软件成本结论与本文硬件 IOTLB 问题区分。
+
+---
+
+### B6. `iommu_cost2007`
+
+- **文件**：`iommu-platform/out/shared-translation-literature-20261006/papers/iommu_cost2007.txt`
+- **准确题目**：The Price of Safety: Evaluating IOMMU Performance（L1）
+- **作者**：Muli Ben-Yehuda, Jimi Xenidis, Michal Ostrowski, Karl Rister, Alexis Bruemmer, Leendert Van Doorn（L2–L7）
+- **年份**：2007（L518–L528）
+- **venue**：2007 Linux Symposium, Volume One, June 27–30, 2007, Ottawa, Ontario, Canada（L518–L528）
+- **DOI**：null（原文无 DOI）
+- **publication_status**：published
+- **relevance**：foundation
+- **evaluation_type**：`["measurement", "analysis"]`（真实 IBM x460 等系统；裸机与 Xen dom0/domU；netperf/FFSB；profile 分析）
+
+**最强前作 / 关键改变 / 仍依赖条件**
+- 最强前作：Ben-Yehuda et al. OLS’06 “Utilizing IOMMUs for Virtualization in Linux and Xen”；软件 bounce buffering/DMA descriptor validation 及 Calgary/DART 设计（L463–L478、L191–L210）。
+- 关键改变：系统量化 Calgary 与 DART 在裸机/ Xen 下的吞吐与 CPU 成本，并把主要成本定位到 TCE `map/unmap`、锁、hypercall/地址空间切换。
+- 仍依赖：特定 Calgary/DART 硬件与 Linux/Xen 版本；TCE 表 + IOTLB 架构；benchmark 局限；未隔离 IOTLB 硬件 miss 成本。
+
+**精确机制**
+- TCE 表：每个 TCE 映射 4KB host page 及权限；DMA address 直接索引 TCE 表；Calgary 与 DART 的 TCE 格式不同（L80–L177）。
+- IOTLB：IOMMU 需要 translation cache 避免过多内存查找；性能受 cache size/associativity、replacement、invalidation 频率与代价影响（L80–L110）。
+- 关键分析：DMA 地址不一定有 CPU 访问那样的时空局部性；NIC 收包可写向任意应用 buffer（L98–L110）。
+- Calgary 无单 entry invalidate，只能停顿 DMA 后全 flush；实现用 next-fit allocator + roll-around 延迟 flush，用一点点安全换可用性（L292–L365）。
+- 优化：Xen multicalls；DMA-API overhaul：预分配、批量、永不释放、grant table 集成；profile 显示绝大多数 map/unmap 是单 entry，故 multicall 收益有限（L372–L451）。
+
+**复用粒度及身份/权限匹配前提**
+- 粒度：4KB page 的 TCE entry、TCE 表、DMA address space、domain、bus/device。
+- 身份/权限前提：TCE table 可为共享该表的设备建立单一 IO 地址空间；hypervisor/OS 拥有、复用和保护 IOMMU；bare-metal 下 Linux DMA-API，hypervisor 下 hypervisor-aware IOMMU layer。没有 PASID/SVA；权限由 TCE R/W 位等控制（L80–L210）。
+
+**资源共享 vs 映射共享/SVA**
+- 共享资源：共享 IOMMU、TCE 表、IOTLB、DMA address space、锁。
+- 映射共享：同一 TCE 表可服务多个共享它的设备；这不是现代多设备 SVA/PASID 共享地址翻译。
+- 关键区分：本文的共享是“共享 IOMMU 硬件与映射表”，不是“多个设备共享同一虚拟地址空间”。
+
+**评价配置**
+- 真实系统：IBM x460，Hurricane 2.1 chipset，4× dual-core Paxville，16GB RAM（限制 4GB），SLES10 x86_64 + Xen；netperf TCP_STREAM；FFSB disk IO（L228–L233、L179–L190）。
+- 模式：bare metal、Xen dom0 direct hardware access、Xen domU virtual-IO；IOMMU on/off；同时测 throughput、CPU utilization（L221–L233、L237–L291）。
+- 结果：吞吐基本相同；CPU 利用率最多高 60%（hypervisor），裸机通常约 30%；小包吞吐可明显下降；domU 小包最多 15% 吞吐差、较大消息 40% CPU 高（L252–L291、L426–L432）。
+
+**限制 / 未覆盖**
+- 主要瓶颈在软件 map/unmap 与 hypercall/锁；**没有量化 IOTLB 硬件 miss 成本**，并明确未来再研究 VT-d/AMD IOMMU（L405–L417）。
+- 不是多设备共享 IOMMU 干扰研究；不是 IOTLB 冲突微架构实验。
+- 较老平台、特定 Calgary/DART；结果不能直接外推到现代 CXL/ATS/SVA IOMMU。
+- 不覆盖 PASID、共享虚拟地址、设备 ATC、尾延迟、队列容量。
+
+**对可能创新点的最强反证**
+- 反证“IOMMU 的成本主要是硬件地址翻译”：本文测得主要成本在软件 `map/unmap`、锁、hypercall/地址空间切换；吞吐大体不变而 CPU 利用率显著上升。
+- 但它**不反证**硬件 IOTLB 瓶颈：恰恰因为它没有隔离硬件成本，才给 2010 的 pseudo pass-through 实验留下空间。
+
+**后续必追引文（原文编号）**
+- [3] Utilizing IOMMUs for Virtualization in Linux and Xen（L474–L478）
+- [1] Intel VT-d spec（L463–L467）
+- [2] AMD IOMMU spec（L469–L472）
+- [7] netperf（L487–L488）
+- [6] FFSB（L484–L485）
+- [13] Hennessy & Patterson, Computer Architecture（L461–L464）
+- [11] Xen driver domains（L507–L511）
+
+**可导航原文证据**
+1. `iommu_cost2007.txt` L14–L52：摘要：IOMMU 提供隔离但有性能代价；本文量化 Calgary/DART 裸机与 hypervisor。
+2. L80–L110：IOTLB 必要性、cache size/associativity/replacement/invalidation；DMA 地址不一定有 CPU 式局部性。
+3. L237–L258：裸机吞吐无明显差异，但 CPU 利用率可高 60%，通常约 30%；DART 类似。
+4. L255–L273：profile 显示 TCE map/unmap 是最大 hog，可能是 IOMMU 数据结构锁竞争；hypervisor 还要模式切换。
+5. L292–L365：Calgary 只能全 cache flush；deferred flush 用 next-fit roll-around 降低开销，但留 reuse-after-unmap 窗口。
+6. L372–L390：Xen multicalls；但 >99% map/unmap 是单 entry，收益有限。
+7. L394–L451：DMA-API 预分配/批量/永不释放/grant table 等优化；部分场景牺牲保护。
+8. L426–L432：结论：常见情况吞吐相同，但 CPU 最多高 60% hypervisor / 30% 裸机；主成本来自过频 map/unmap。
+
+---
+
+## C. 被证据支持的剩余瓶颈与不能断言的点
+
+### C1. 动态映射、迁移、失效
+- **证据支持**：
+  - `iommu_cost2007`：map/unmap 频率是 CPU 成本主因；Calgary 缺乏单 entry invalidate，只能 roll-around 全 flush（L292–L365）。
+  - `iotlb_bottleneck2010`：streaming mappings 单次使用，map 后很快 unmap；IOTLB flush/invalidation 策略影响 miss 与 hot-spot（L511–L523、L574–L585）。
+  - `m2ndp2024`：ATS 可 µs 级，ATC invalidation 由 host 发起；TLB shootdown 要发给所有 CXL-M2NDP（L256–L262、L868–L871）。
+  - `prefetched2019`：VMA 扩展、page fault、PT “holes” 会让预取不完整；完整 walk 仍是正确性保障（L661–L710）。
+- **不能断言**：这 6 篇都没有给出多设备共享 IOMMU 下“动态迁移 + 远端失效 + 队列容量 + 尾延迟”的端到端测量。未评估不等于全领域无人做。
+
+### C2. 远端 PTW
+- **证据支持**：
+  - `m2ndp2024` 明说设备用 ATS 请求 host 翻译可能 µs 级；NDP unit 的 on-chip TLB 可能不足，ATS 也高延迟，因此用 DRAM-TLB（L256–L262、L785–L809）。
+  - `prefetched2019`：虚拟化下 2D nested walk 可多达 24 次内存访问；ASAP 只对 guest/host PL1/PL2 预取（L289–L298、L632–L639）。
+  - `iommu_cost2007` / `iotlb_bottleneck2010`：IOTLB miss 触发 page-walk，DMAR 层级在主存，多 consecutive access，增加 DMA latency（L84–L110、L207–L234）。
+- **不能断言**：没有论文测“远端 IOMMU PTW 服务队列/带宽/尾延迟”，M2NDP 只把 ATS 当背景。
+
+### C3. 队列与容量
+- **证据支持**：
+  - `iommu_cost2007`：map/unmap 锁竞争、TCE 表、hypercall 路径是容量/队列成本来源（L255–L273）。
+  - `iotlb_bottleneck2010`：IOTLB 32-entry 默认、I/OAT 256 源页后 thrash；更大 IOTLB/更高关联收益有限（L240–L256、L603–L646、L887–L923）。
+  - `m2ndp2024`：NDP kernel launch 资源不足会 buffer，buffer 满返回错误；M2 func 避免 ring buffer 共享队列复杂性（L521–L524、L155–L158）。
+- **不能断言**：没有多设备共享 IOMMU 请求队列/完成队列的实测；也没有现代 CXL ATS 队列容量实验。
+
+### C4. 尾延迟
+- **证据支持**：
+  - `m2ndp2024`：CXL latency 影响 KVS P95；M2 func 对 KVStore 的 P95 有改善，但评估是自己的模拟/模型与设定（L68–L79、L35–L47、L1301–L1307）。
+  - `iommu_cost2007`：小消息吞吐可下降、CPU 利用率上升；未给尾延迟分位数。
+  - `prefetched2019`：page walk latency 平均/最大值，不是 IOMMU 尾延迟。
+- **不能断言**：没有论文给出共享 IOMMU 多设备竞争下的 P95/P99 失效/PTW 尾延迟。
+
+### C5. 多设备共享 IOMMU 干扰
+- **证据支持**：
+  - `iotlb_bottleneck2010`：两 E1000 NIC 显示 coherent mappings 可能落在同一 IOTLB set；提出 page coloring 缓解热点；但这是现象与策略模拟，**不是多设备共享干扰的系统基准**（L498–L507、L587–L601、L887–L894）。
+  - `iommu_cost2007`：共享 IOMMU 硬件由 OS/hypervisor 复用和保护，但没测多设备并行干扰（L172–L210）。
+  - `m2ndp2024`：多 CXL-M2NDP 扩展只按数据放置/模型并行模拟，未测共享 IOMMU（L888–L898、L1724–L1740）。
+- **不能断言**：不能由 2010 单设备微基准外推多设备干扰已解决或未解决；也不能说全领域空白。
+
+### C6. 资源隔离 vs 地址空间/映射共享/SVA
+- `cva6rt2026` 展示的是核内 TLB/cache 资源分区，不是 IOMMU/SVA 映射共享（L60–L62、L91–L109）。
+- `m2ndp2024` 有 per-process M2 func region + ASID，但设备侧翻译仍靠 ATS/ATC/DRAM-TLB，未见共享 SVA 评估（L420–L437、L785–L809）。
+- `iommu_cost2007` 的 TCE 表可被多个设备共享，但那是 IO 地址空间/TCE 表级共享，不是设备 SVA（L80–L177）。
+- `iotlb_bottleneck2010` 的 per-device domain 与 virtual I/O page 重叠是 IOMMU 域级共享问题，不是 PASID/SVA（L498–L507）。
+- `coatcheck2016` 的 synonym/页表共享是 CPU OS 地址翻译共享，不是设备 SVA（L762–L781）。
+
+---
+
+## D. 本组对照矩阵：优化哪一段 / 信息何处产生 / 何时必须完成 / 谁维护
+
+| 论文 | 优化/验证对象 | 信息产生位置 | 必须完成的时点 | 维护成本承担者 | 共享资源 vs 映射共享/SVA | 原文证据 |
+|---|---|---|---|---|---|---|
+| `iommu_cost2007` | IOMMU 软硬件总成本；TCE map/unmap、flush、hypercall | DMA-API / hypervisor / TCE 表 / IOTLB | map/unmap 与 flush 在 DMA 前生效；deferred flush 在 allocator roll-around | OS、驱动、hypervisor；设备共享 IOMMU 硬件 | 共享 TCE 表/IOTLB/DMA 地址空间；非 SVA | L14–L52, L80–L110, L255–L273, L292–L365, L394–L451 |
+| `iotlb_bottleneck2010` | IOTLB miss-rate 与 address resolution | IOTLB set/entry、DMAR 页表、设备 virtual I/O 访问模式 | 每次 DMA 翻译；miss 时 page-walk 完成才能完成 DMA | IOMMU 硬件 + OS/驱动映射策略；vIOMMU 只用于抓 trace | 共享 IOTLB/页表；多设备各有 domain；非 SVA | L21–L42, L207–L234, L240–L256, L498–L507, L587–L601, L887–L923 |
+| `coatcheck2016` | 翻译感知的内存次序正确性验证 | μhb 图：流水线、TLB、页表遍历、OS synopsis、IPI | 每个 litmus test 的 ordering 必须由 μspec 约束保证；静态验证时 | 硬件设计者（μspec 硬件模型）+ OS 知识者（OS synopsis）；工具开源 | CPU 共享 TLB/页表/store buffer；synonym；非设备 SVA | L22–L38, L100–L120, L130–L158, L211–L234, L590–L653, L762–L781 |
+| `prefetched2019` | CPU page walk latency | OS 控制 PT 物理连续性；TLB miss 触发范围寄存器+base+offset 预取 | TLB miss 时发预取；完整 walk 校验；page fault/VMA 扩展时保持正确 | OS 分配连续 PT 区域；hypervisor/guest OS；硬件范围寄存器 | 共享 TLB/PWC/cache；SMT co-runner；非 IOMMU/SVA | L142–L215, L211–L224, L538–L560, L603–L612, L632–L639, L661–L710 |
+| `m2ndp2024` | CXL NDP offload 命令开销 + 通用 NDP 执行 + 设备侧翻译 reach | M2 func region / packet filter；CXL.mem 读写；ATS/ATC；DRAM-TLB | 每次 M2 func 调用；kernel launch/status；TLB miss 翻译；shootdown 时 | 用户态 API + host driver；CXL controller/NDP controller；host 负责 ATC invalidation | 共享 CXL controller/NDP units/TLB/DRAM-TLB/带宽；per-process mapping；非多设备 SVA | L84–L95, L136–L151, L256–L262, L785–L809, L868–L871, L1289–L1310 |
+| `cva6rt2026` | 核内 TLB 分区/锁定、L1 SPM、CLIC+context save | 特权软件 bitmap；TLB replacement；cache way 配置；中断/CLIC | TLB replacement 时；中断进入/退出；静态锁定后不可驱逐 | 特权软件/OS 配置 partition；硬件维护 TLB/cache/interrupt 状态 | 共享核内 TLB/cache/pipeline；非映射共享、非 IOMMU | L13–L24, L60–L62, L75–L87, L91–L109, L110–L126 |
+
+---
+
+## E. 被本组反证的常见创新说法（严格限定）
+
+1. **“IOMMU 开销只是软件 map/unmap，优化软件就够。”**
+   - 2007 支持软件路径主导；2010 在 pseudo pass-through 消掉 map/unmap 后仍看到单 I/OAT 通道最高 47% penalty，反证“软件优化足够”的普遍化说法（`iommu_cost2007` L255–L273；`iotlb_bottleneck2010` L240–L256）。
+   - 但 2010 不是多设备实验，不能反证“多设备共享 IOMMU 干扰”已被解决。
+
+2. **“TLB/IOTLB 只要做大或提高关联就能解决。”**
+   - 2010 模拟显示增大 entry/way 收益相对小，ALH、MPRE、offset 更有效（L887–L923）。
+   - 2019 也说 coalescing/PWC 扩容受容量/连续性限制，长 walk 仍吃亏（L300–L392、L830–L843、L962–L1003）。
+
+3. **“翻译预取可以投机消费，只要性能高。”**
+   - 2019 ASAP 明确完整 walk 校验预取，并举 SpecTLB/Spectre/Meltdown 风险；不消费未验证条目（L211–L224、L1037–L1044）。
+
+4. **“地址翻译只是权限/隔离问题，与内存次序正确性无关。”**
+   - 2016 COATCheck 给出 synonym dirty bit 案例，即使 SC/SC-for-VAMC 也可能错，属 transistency 范围（L722–L751、L762–L781）。
+
+5. **“CVA6-RT 的 TLB 分区等于 IOMMU/设备共享翻译的实时保证。”**
+   - 原文只覆盖核内 TLB/cache/中断，不涉及 IOMMU、设备 DMA、SVA（L60–L62、L91–L109、L87–L90）。
+
+6. **“M2NDP 解决了 CXL 设备侧共享翻译。”**
+   - 它把 ATS 高延迟、ATC invalidation、DRAM-TLB 作为背景与依赖，未评估多设备共享 IOMMU/ATC 干扰（L256–L262、L785–L809、L868–L871）。
+
+> 再次强调：以上“反证”只在所给全文可支持范围内成立；未出现的实验不等于全领域无人做，也不等于对应机制未实现。
+
+---
+
+```json
+{
+  "papers": [
+    {
+      "id": "m2ndp2024",
+      "title": "Low-overhead General-purpose Near-Data Processing in CXL Memory Expanders",
+      "authors": [
+        "Hyungkyu Ham",
+        "Jeongmin Hong",
+        "Geonwoo Park",
+        "Yunseon Shin",
+        "Okkyun Woo",
+        "Wonhyuk Yang",
+        "Jinhoon Bae",
+        "Eunhyeok Park",
+        "Hyojin Sung",
+        "Euicheol Lim",
+        "Gwangsun Kim"
+      ],
+      "year": 2024,
+      "venue": "arXiv:2404.19381v3 [cs.AR] (preprint; no formal venue in provided text)",
+      "doi": null,
+      "publication_status": "preprint",
+      "relevance": "nearby",
+      "evaluation_type": [
+        "simulation",
+        "measurement"
+      ],
+      "mechanism": "用 CXL.mem 可寻址 M2 func 承载 NDP 管理命令，并用 memory-mapped mu-thread 执行通用 NDP；设备侧翻译依赖 ATS/ATC，并用 DRAM-TLB 扩展 TLB reach。",
+      "assumptions": [
+        "使用未修改的 CXL.mem 与未修改 host processor；M2 func 需 CXL controller/packet filter 支持",
+        "NDP 目标为 memory-bound、低算术强度、大数据集工作负载",
+        "使用 HDM-DB 与 back-invalidation 支持 device coherence",
+        "M2 func region 按 host process 分配且 uncacheable；packet filter 用 base/bound/ASID 区分进程",
+        "设备侧可发 ATS 请求，ATC 缓存翻译，host 负责 invalidation",
+        "多 CXL-M2NDP 扩展需要软件做数据放置；自动扩展未实现",
+        "kernel 用 assembly 编写，因为 M2NDP 编译器尚未提供"
+      ],
+      "limitations": [
+        "主结果来自 cycle-level 模拟器，不是硬件原型；仅 CPU-NDP OLAP 基线在真实双路 EPYC 上测量",
+        "没有评估多设备共享 host IOMMU/IOTLB/ATC 的干扰、队列容量或尾延迟",
+        "ATS 被明说可能 µs 级；DRAM-TLB 只补 reach，不解决共享 IOMMU 争用",
+        "TLB shootdown 需发给所有 CXL-M2NDP；作者假设 in-memory/no-swapping 使其 rare",
+        "多设备 scalability 只按模型并行/数据放置模拟，未做共享 IOMMU 端到端实验",
+        "未评估安全隔离或多租户共享 ATC/IOMMU 的攻击面"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/m2ndp2024.txt",
+          "location": "L84-L95",
+          "claim": "摘要声明 M2NDP 对多类负载最高 128x、总体 14.5x，节能最高 87.9%，并公开模拟器。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/m2ndp2024.txt",
+          "location": "L136-L151",
+          "claim": "M2 func 在 CXL.mem 请求中封装 NDP 管理命令，packet filter 按地址匹配预分配 range。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/m2ndp2024.txt",
+          "location": "L256-L262",
+          "claim": "CXL 设备访问自身内存可用 ATS 请求 host 翻译，但会因协议/页表遍历有 µs 级延迟；ATC 缓存翻译，host 可 invalidate ATC。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/m2ndp2024.txt",
+          "location": "L785-L809",
+          "claim": "NDP unit 使用 on-chip TLB，但大数据 kernel 可能 TLB 不足，ATS 也高延迟；因此采用 DRAM-TLB，entry 含 ASID、tag、PPN、权限。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/m2ndp2024.txt",
+          "location": "L868-L871",
+          "claim": "TLB shootdown 必须发给所有 CXL-M2NDP；作者假设 in-memory data 不换页，因此 rare。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/m2ndp2024.txt",
+          "location": "L1289-L1310",
+          "claim": "性能评估给出 OLAP 最高 128x、GPU workload 最高 9.71x，并指出 M2 func 对细粒度 NDP 尤其有效。"
+        }
+      ],
+      "relations": [
+        {
+          "type": "mechanism_comparison",
+          "target": "iommu_cost2007",
+          "source_section": "L256-L262, L785-L809",
+          "note": "2007 关注软件 map/unmap 成本；M2NDP 关注 CXL 设备侧 ATS/ATC 延迟与 DRAM-TLB reach，二者不是同一瓶颈。"
+        },
+        {
+          "type": "mechanism_comparison",
+          "target": "iotlb_bottleneck2010",
+          "source_section": "L785-L809",
+          "note": "M2NDP 未评估共享 IOTLB 冲突；2010 的 IOTLB 冲突/容量实验不能直接映射到 CXL 多设备共享 IOMMU。"
+        }
+      ]
+    },
+    {
+      "id": "coatcheck2016",
+      "title": "COATCheck: Verifying Memory Ordering at the Hardware-OS Interface",
+      "authors": [
+        "Daniel Lustig",
+        "Geet Sethi",
+        "Margaret Martonosi",
+        "Abhishek Bhattacharjee"
+      ],
+      "year": 2016,
+      "venue": "ASPLOS '16, April 2-6, 2016, Atlanta, Georgia, USA",
+      "doi": "10.1145/2872362.2872399",
+      "publication_status": "published",
+      "relevance": "foundation",
+      "evaluation_type": [
+        "analysis",
+        "measurement"
+      ],
+      "mechanism": "用 mu-spec DSL、mu-hb 图和约束求解器，将 OS syscall、IPI TLB shootdown、页表遍历微码、TLB occupancy、synonym 与 PTE status bits 纳入地址翻译感知的内存次序验证。",
+      "assumptions": [
+        "目标硬件模型为 Sandy Bridge-like，基于公开文档、专利与合理猜测，不是精确商业实现",
+        "Linux synopsis 只建模与分页结构和同步相关的内存访问，不建模完整 OS 决策/数据结构",
+        "x86-style 页表遍历由硬件执行，TLB coherence 由 OS 通过 invlpg+IPI 管理",
+        "mu-spec 模型由硬件设计者提供，OS synopsis 由 OS 知识者提供；Coq 形式证明尚未完成",
+        "litmus tests 与 ELT 需覆盖虚拟地址、物理地址、PTE 状态与 ghost instructions"
+      ],
+      "limitations": [
+        "是静态验证工具，不是运行时 IOMMU/SVA 系统，也不是攻击/安全论文",
+        "未验证商业 RTL，未自动从 Verilog/HDL 抽取 mu-spec",
+        "未完成 Coq 形式正确性证明",
+        "不覆盖 IOMMU IOTLB、设备 ATC、PASID、多设备共享翻译域",
+        "不给出共享 IOMMU 的 performance/tail latency 数据",
+        "OS synopsis 不建模完整 OS 行为，只包含与分页和同步相关的内存访问"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/coatcheck2016.txt",
+          "location": "L22-L38",
+          "claim": "摘要提出 COATCheck、mu-spec DSL、约束求解与 transistency 概念。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/coatcheck2016.txt",
+          "location": "L100-L120",
+          "claim": "mu-spec 让每个组件独立声明 ordering axioms；solver 自动分析复杂内存次序场景。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/coatcheck2016.txt",
+          "location": "L130-L158",
+          "claim": "VAMC/PAMC 区分不足；COATCheck 发现即使 VAMC 与 PAMC 都 SC 仍可能有翻译相关 ordering bugs。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/coatcheck2016.txt",
+          "location": "L211-L234",
+          "claim": "ELT 同时描述虚拟/物理地址、OS 活动（syscall/IPI）与 ghost instructions（页表遍历等微码）。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/coatcheck2016.txt",
+          "location": "L519-L545",
+          "claim": "Store buffer forwarding 必须检测 synonym；只用虚拟地址会无法检测同物理地址依赖。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/coatcheck2016.txt",
+          "location": "L762-L781",
+          "claim": "OS 对 synonym dirty bit 负责；若只检查另一个 synonym 的 PTE，可能错误认为物理页 clean，COATCheck 可发现该时序。"
+        }
+      ],
+      "relations": [
+        {
+          "type": "mechanism_comparison",
+          "target": "m2ndp2024",
+          "source_section": "L22-L38, L762-L781",
+          "note": "COATCheck 管 CPU/OS 翻译次序正确性；M2NDP 管 CXL NDP 性能与设备翻译 reach，二者覆盖不同正确性/性能维度。"
+        },
+        {
+          "type": "mechanism_comparison",
+          "target": "prefetched2019",
+          "source_section": "L914-L938",
+          "note": "COATCheck 提醒 TLB prefetch/coalescing/shootdown 必须保持 ordering；2019 的 ASAP 用完整 walk 校验预取，方向一致但对象是 CPU page walk。"
+        }
+      ]
+    },
+    {
+      "id": "prefetched2019",
+      "title": "Prefetched Address Translation",
+      "authors": [
+        "Artemiy Margaritov",
+        "Dmitrii Ustiugov",
+        "Edouard Bugnion",
+        "Boris Grot"
+      ],
+      "year": 2019,
+      "venue": "The 52nd Annual IEEE/ACM International Symposium on Microarchitecture (MICRO-52), October 12-16, 2019, Columbus, OH, USA",
+      "doi": "10.1145/3352460.3358294",
+      "publication_status": "published",
+      "relevance": "foundation",
+      "evaluation_type": [
+        "measurement",
+        "simulation",
+        "analysis"
+      ],
+      "mechanism": "ASAP 让 OS 将 PL1/PL2 页表节点按虚拟页顺序放在连续物理内存；TLB miss 时通过 VMA 范围寄存器和 base+offset 直接预取目标 PT 节点，同时普通 page walk 仍完整执行并校验预取条目。",
+      "assumptions": [
+        "应用使用少数大 VMA，且这些 VMA 覆盖大部分内存占用",
+        "OS 能在 VMA 创建/扩展时保留连续物理内存并维持 PT 节点排序",
+        "硬件有架构可见的 VMA 范围寄存器，保存 start/end 与 PL1/PL2 base",
+        "预取是 best-effort，利用 L1-D/MSHR；完整 page walk 继续执行并验证预取",
+        "虚拟化下 guest/host 两侧的 PL1/PL2 都需连续且排序，guest 需用 vmcall 通知 hypervisor",
+        "page fault 与 VMA 扩展/hole 不破坏正确性，只是部分 walk 不被加速"
+      ],
+      "limitations": [
+        "不是零修改：仍需 OS 分配连续 PT 区域和架构范围寄存器",
+        "不能完全消除 page walk 延迟，至少一次内存层级访问仍暴露",
+        "主要针对 PL1/PL2；PL3/PL4 依靠 PWC/cache",
+        "VMA 扩展、holes、pinned pages 会使部分预取失效",
+        "不覆盖 IOMMU、设备 SVA、PASID、多设备共享 ATC/IOTLB",
+        "性能投影是保守估计，不是 IOMMU 端到端系统测量"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/prefetched2019.txt",
+          "location": "L55-L113",
+          "claim": "摘要提出 ASAP；报告 SMT colocation 下 native 平均降 25%，virtualized 平均降 45%（max 55%）。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/prefetched2019.txt",
+          "location": "L140-L215",
+          "claim": "直接索引思想：PT 节点物理连续且按虚拟地址排序时可用 base+offset；需 OS 预留连续区域和范围寄存器。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/prefetched2019.txt",
+          "location": "L211-L224",
+          "claim": "无论预取与否，PT radix tree 都照常完整遍历；只有正确预取条目会被消费。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/prefetched2019.txt",
+          "location": "L450-L467",
+          "claim": "聚焦 PL1/PL2；100GB 数据集下 PL4 8B、PL3 800B、PL2 400KB、PL1 约 200MB。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/prefetched2019.txt",
+          "location": "L538-L560",
+          "claim": "buddy allocator 让 PT 页面散乱；ASAP 只要求 PT 小部分连续，约 0.2% 数据集大小。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/prefetched2019.txt",
+          "location": "L844-L883",
+          "claim": "SMT colocation 与 virtualized 下的 page walk latency 数据；colocation 使 baseline 增 2.1-3.2x，ASAP 更有空间。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/prefetched2019.txt",
+          "location": "L661-L710",
+          "claim": "page fault 时 ASAP 仍发预取以加速 fault detection；VMA 扩展/hole 时部分 PT 页面可不连续，walk 仍正确但不受加速。"
+        }
+      ],
+      "relations": [
+        {
+          "type": "mechanism_comparison",
+          "target": "coatcheck2016",
+          "source_section": "L211-L224",
+          "note": "ASAP 用完整 walk 校验预取，呼应 COATCheck 对 TLB/page walk 次序正确性的要求；但 ASAP 目标是 CPU page walk 性能，COATCheck 是验证方法。"
+        },
+        {
+          "type": "mechanism_comparison",
+          "target": "iotlb_bottleneck2010",
+          "source_section": "L538-L560",
+          "note": "两者都利用 OS 布局/预取改善 TLB/IOTLB miss；但 2019 针对 CPU MMU/PT，2010 针对 IOMMU IOTLB/DMA，不可直接等同。"
+        }
+      ]
+    },
+    {
+      "id": "cva6rt2026",
+      "title": "CVA6-RT: an Open-Source Time-Predictable RV64 Processor for Mixed-Criticality Systems",
+      "authors": [
+        "Enrico Zelioli",
+        "Christopher Reinwardt",
+        "Nils Wistoff",
+        "Robert Balas",
+        "Alessandro Ottaviano",
+        "Luca Benini",
+        "Angelo Garofalo"
+      ],
+      "year": 2026,
+      "venue": "arXiv:2606.26177v1 [cs.AR]; footer: RISC-V Summit Europe, Bologna, 8-12th June 2026",
+      "doi": null,
+      "publication_status": "uncertain",
+      "relevance": "nearby",
+      "evaluation_type": [
+        "analysis"
+      ],
+      "mechanism": "在 CVA6 核内加入可配置 TLB 分区与静态锁定、L1 cache/scratchpad 混合模式、增强 CLIC 和硬件上下文压栈，以降中断和地址翻译的延迟变异。",
+      "assumptions": [
+        "任务被分配给不相交的 TLB partition，以避免替换驱逐干扰",
+        "特权软件通过 bitmap 选择 active partition，并配置静态锁定 TLB 条目",
+        "L1 cache ways 可动态配置为 cache 或 software-managed SPM；SPM 区域映射到 SoC 地址空间",
+        "使用增强 CLIC 与硬件辅助寄存器压栈；硬件可把寄存器 spill 到预定内存位置",
+        "面向 mixed-criticality/soft real-time 场景"
+      ],
+      "limitations": [
+        "短文/预印本，评估只报告中断延迟；未说明是仿真、FPGA 还是流片实测",
+        "没有 IOMMU、设备 DMA、SVA、共享页表或多设备共享翻译评估",
+        "TLB 锁定为静态条目；未评估容量/置换灵活性代价",
+        "没有动态映射、迁移、失效或尾延迟实验",
+        "不能当 IOMMU 端到端实时保证，也不能当设备隔离证据"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/cva6rt2026.txt",
+          "location": "L13-L24",
+          "claim": "摘要列出 TLB 分区/锁定、L1 scratchpad、CLIC+硬件上下文压栈；报告 12-cycle 中断延迟，比 baseline CVA6 低 10x。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/cva6rt2026.txt",
+          "location": "L60-L62",
+          "claim": "目标包括 software-configurable、hardware-based TLB 资源分区，以获取 predictable address translation latency。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/cva6rt2026.txt",
+          "location": "L91-L109",
+          "claim": "TLB 分区机制：pseudo-LRU 树加约束；特权软件 bitmap 选择 partition；disjoint partition 隔离 TLB replacement；静态锁定条目不可驱逐。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/cva6rt2026.txt",
+          "location": "L75-L87",
+          "claim": "L1 cache/SPM 混合：每个 way 可配置为 cache 或 scratchpad；SPM 从替换逻辑移除，提供 constant access latency。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/cva6rt2026.txt",
+          "location": "L110-L126",
+          "claim": "增强 CLIC、硬件上下文压栈、中断检测移向 commit，以降低中断延迟和变异；支持虚拟化。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/cva6rt2026.txt",
+          "location": "L66-L74",
+          "claim": "Table 1 给出中断延迟组成：context save 从 104-130 降到 0，total 从 120-170 降到 12-13。"
+        }
+      ],
+      "relations": [
+        {
+          "type": "mechanism_comparison",
+          "target": "iotlb_bottleneck2010",
+          "source_section": "L91-L109",
+          "note": "CVA6-RT 是核内 TLB 资源分区/锁定，目标是实时可预测性；2010 是 IOMMU IOTLB 冲突/预取，目标是 DMA 吞吐；二者资源层级不同。"
+        },
+        {
+          "type": "mechanism_comparison",
+          "target": "m2ndp2024",
+          "source_section": "L13-L24",
+          "note": "CVA6-RT 未涉及 CXL/设备侧共享翻译；不能把核内 TLB 分区等同于共享 IOMMU 或设备 ATC 保证。"
+        }
+      ]
+    },
+    {
+      "id": "iotlb_bottleneck2010",
+      "title": "IOMMU: Strategies for Mitigating the IOTLB Bottleneck",
+      "authors": [
+        "Nadav Amit",
+        "Muli Ben-Yehuda",
+        "Ben-Ami Yassour"
+      ],
+      "year": 2010,
+      "venue": "WIOSCA 2010 - Sixth Annual Workshop on the Interaction between Operating Systems and Computer Architecture",
+      "doi": null,
+      "publication_status": "published",
+      "relevance": "foundation",
+      "evaluation_type": [
+        "measurement",
+        "simulation",
+        "analysis"
+      ],
+      "mechanism": "用 pseudo pass-through 消除软件 map/unmap 与 IOTLB flush，再用 I/OAT DMA 微基准和 vIOMMU 抓取设备访问模式，分析 IOTLB 冲突并评估 ALH、EH、page coloring、super-page、prefetch 等降 miss-rate 策略。",
+      "assumptions": [
+        "IOTLB 无公开实现细节，baseline 取合理默认：32 entries、2-way、LRU、4-entry prefetch buffer",
+        "pseudo pass-through 使用固定恒等映射，消掉大部分 map/unmap 与 flush",
+        "DMA 微基准用单 I/OAT channel，变化源页数与 block size 以控制 IOTLB 冲突",
+        "vIOMMU 在 KVM 中模拟 VT-d 接口，guest Linux 2.6.31，strict mode 立即 invalidate",
+        "策略效果主要用 trace-driven IOTLB 模拟评估",
+        "coherent mappings 可能因虚拟 I/O 地址分配而集中到某些 IOTLB set"
+      ],
+      "limitations": [
+        "单设备 I/OAT 微基准为主；两 E1000 NIC 只展示共享 coherent mapping 现象，不是系统多设备干扰评估",
+        "真实硬件上不直接读 IOTLB miss counter；策略效果来自 trace-driven 模拟",
+        "baseline IOTLB 参数是作者设定，因 Intel/AMD 未公开",
+        "不覆盖 PASID/SVA、设备 ATC、远端 PTW、队列容量、尾延迟、动态迁移",
+        "部分策略是 Intel 已定义特性（ALH/EH），论文评估组合，不代表硬件都已采用",
+        "不能从单设备实验外推多设备共享 IOMMU 干扰"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iotlb_bottleneck2010.txt",
+          "location": "L21-L42",
+          "claim": "摘要：IOTLB miss 显著增 DMA latency；提出软硬件增强，miss-rate 可降超过 60%。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iotlb_bottleneck2010.txt",
+          "location": "L70-L82",
+          "claim": "single-use mapping 常见；map/unmap 成本被认为主要瓶颈；本文关注硬件地址解析开销。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iotlb_bottleneck2010.txt",
+          "location": "L207-L234",
+          "claim": "用 pseudo pass-through 消软件映射成本；I/OAT 微基准；作者称这是首次尝试回答 IOMMU 硬件地址解析是否显著开销。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iotlb_bottleneck2010.txt",
+          "location": "L240-L256",
+          "claim": "单 I/OAT 通道下，32 源页后 penalty 上升；256 源页时 4KB page 15%、1KB block 47%，推断为 IOTLB thrashing。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iotlb_bottleneck2010.txt",
+          "location": "L498-L507",
+          "claim": "多设备各有独立 virtual I/O domain，虚拟 I/O 区域可能重叠；两 E1000 NIC 展示同虚拟 I/O page 被多设备访问。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iotlb_bottleneck2010.txt",
+          "location": "L587-L601",
+          "claim": "coherent mapping 非重叠/page coloring：按设备偏移 virtual I/O 地址，避免 IOTLB set 热点。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iotlb_bottleneck2010.txt",
+          "location": "L887-L923",
+          "claim": "ALH 与 MPRE 降 miss-rate 最多；offset 对多 NIC 有效；单纯增大 entry/way 或 OPT-EV 效果有限。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iotlb_bottleneck2010.txt",
+          "location": "L962-L989",
+          "claim": "Related Work 明确把 2007 的软件成本结论与本文硬件 IOTLB 瓶颈区分。"
+        }
+      ],
+      "relations": [
+        {
+          "type": "actual_citation",
+          "target": "iommu_cost2007",
+          "source_section": "References [4] and Related Work L962-L977",
+          "note": "正文引用 Ben-Yehuda et al. [4] The Price of Safety，并说明其结论侧重软件实现。"
+        },
+        {
+          "type": "mechanism_comparison",
+          "target": "m2ndp2024",
+          "source_section": "L887-L923",
+          "note": "M2NDP 用 DRAM-TLB 扩展设备侧 reach，但未评估共享 IOTLB 冲突；2010 的 IOTLB 冲突策略不能直接代表 CXL 多设备场景。"
+        }
+      ]
+    },
+    {
+      "id": "iommu_cost2007",
+      "title": "The Price of Safety: Evaluating IOMMU Performance",
+      "authors": [
+        "Muli Ben-Yehuda",
+        "Jimi Xenidis",
+        "Michal Ostrowski",
+        "Karl Rister",
+        "Alexis Bruemmer",
+        "Leendert Van Doorn"
+      ],
+      "year": 2007,
+      "venue": "2007 Linux Symposium, Volume One, June 27-30, 2007, Ottawa, Ontario, Canada",
+      "doi": null,
+      "publication_status": "published",
+      "relevance": "foundation",
+      "evaluation_type": [
+        "measurement",
+        "analysis"
+      ],
+      "mechanism": "在裸机与 Xen 下量化 Calgary/DART IOMMU 的吞吐和 CPU 成本；分析 TCE 表、IOTLB、map/unmap、flush、hypercall/锁的开销，并提出 deferred flush、DMA-API 预分配/批量、grant table 等优化。",
+      "assumptions": [
+        "目标为 Calgary 与 DART 两类 TCE 架构 IOMMU",
+        "bare-metal 使用 Linux DMA-API；hypervisor 使用 Xen dom0/domU 与 hypervisor-aware IOMMU 层",
+        "netperf 测网络 IO，FFSB 测磁盘 IO；IOMMU on/off 对比",
+        "TCE 表/IO 地址空间可被多个共享该表的设备使用",
+        "IOTLB 行为受 cache size/associativity/replacement/invalidation 影响",
+        "DMA 地址不一定有 CPU 式时空局部性"
+      ],
+      "limitations": [
+        "主要成本定位在软件 map/unmap、锁、hypercall/地址空间切换；未量化 IOTLB 硬件 miss 成本",
+        "不是多设备共享 IOMMU 干扰研究；不是现代 IOMMU/SVA/ATS 研究",
+        "老平台 Calgary/DART，不能直接外推到现代 CXL/ATS IOMMU",
+        "无 PASID、设备 ATC、共享虚拟地址、尾延迟、队列容量评估",
+        "部分优化（never free、预分配）牺牲保护或要求 guest 映射稳定"
+      ],
+      "evidence": [
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iommu_cost2007.txt",
+          "location": "L14-L52",
+          "claim": "摘要：IOMMU 提供隔离但有性能代价；本文评估 Calgary/DART 裸机与 hypervisor，并讨论缓解策略。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iommu_cost2007.txt",
+          "location": "L80-L110",
+          "claim": "IOTLB 用于避免过多内存查找；性能受 size/associativity、replacement、invalidation 影响；DMA 地址不一定有 CPU 式时空局部性。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iommu_cost2007.txt",
+          "location": "L237-L273",
+          "claim": "裸机吞吐几乎不变但 CPU 利用率可高 60%；profile 显示 TCE map/unmap 是最大 hog，可能因 IOMMU 数据结构锁竞争。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iommu_cost2007.txt",
+          "location": "L292-L365",
+          "claim": "Calgary 无单 entry invalidate，只能停顿 DMA 后全 flush；deferred flush 使用 next-fit allocator roll-around，留 reuse-after-unmap 风险。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iommu_cost2007.txt",
+          "location": "L372-L390",
+          "claim": "Xen multicalls 可减少 hypercall，但 >99% map/unmap 是单 entry，因此收益有限。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iommu_cost2007.txt",
+          "location": "L394-L451",
+          "claim": "DMA-API 优化：预分配、alloc/free 替代 streaming、批量 map/unmap、never free、grant table 集成；部分牺牲保护。"
+        },
+        {
+          "file": "iommu-platform/out/shared-translation-literature-20261006/papers/iommu_cost2007.txt",
+          "location": "L426-L432",
+          "claim": "结论：常见情况吞吐相同，但 CPU 利用率最高高 60% hypervisor、30% 裸机；主成本来自过频 map/unmap。"
+        }
+      ],
+      "relations": [
+        {
+          "type": "mechanism_comparison",
+          "target": "iotlb_bottleneck2010",
+          "source_section": "L426-L432 vs iotlb_bottleneck2010 L207-L234",
+          "note": "2007 把主成本放在软件 map/unmap；2010 用 pseudo pass-through 隔离软件成本后转向硬件 IOTLB 解析瓶颈。二者是同一系统不同阶段的瓶颈。"
+        },
+        {
+          "type": "mechanism_comparison",
+          "target": "m2ndp2024",
+          "source_section": "L255-L273",
+          "note": "2007 关注 CPU 侧软件映射成本；M2NDP 关注 ATS/ATC 与 CXL NDP 命令开销，问题对象不同。"
+        }
+      ]
+    }
+  ]
+}
+```

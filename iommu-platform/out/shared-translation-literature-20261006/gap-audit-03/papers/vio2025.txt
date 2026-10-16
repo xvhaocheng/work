@@ -1,0 +1,1216 @@
+         To PRI or Not To PRI, That’s the question
+      Yun Wang, Shanghai Jiao Tong University; Liang Chen, Jie Ji, Xianting Tian,
+     and Ben Luo, Alibaba Group; Zhixiang Wei, Zhibai Huang, and Kailiang Xu,
+ Shanghai Jiao Tong University; Kaihuan Peng, Kaijie Guo, Ning Luo, Guangjian Wang,
+             Shengdong Dai, Yibin Shen, and Jiesheng Wu, Alibaba Group;
+                     Zhengwei Qi, Shanghai Jiao Tong University
+             https://www.usenix.org/conference/osdi25/presentation/wang-yun
+
+
+
+
+This paper is included in the Proceedings of the 19th USENIX Symposium
+          on Operating Systems Design and Implementation.
+                          July 7–9, 2025 • Boston, MA, USA
+                                ISBN 978-1-939133-47-2
+
+             Open access to the Proceedings of the 19th USENIX Symposium
+            on Operating Systems Design and Implementation is sponsored by
+                                To PRI or Not To PRI, That’s the question
+
+                        Yun Wang∗♠ Liang Chen*♢ Jie Ji♢ Xianting Tian♢ Ben Luo♢
+                  Zhixiang Wei♠ Zhibai Huang♠ Kailiang Xu♠ Kaihuan Peng♢ Kaijie Guo♢
+                         Ning Luo♢ Guangjian Wang♢ Shengdong Dai♢ Yibin Shen♢
+                                         Jiesheng Wu♢ Zhengwei Qi♠
+                               ♠ Shanghai Jiao Tong University ♢ Alibaba Group
+
+
+
+
+Abstract                                                                          Memory Usage Distribution
+                                                                               (Each Square = 1GB, 1000 in total.)
+SR-IOV and I/O device passthrough enable network and
+storage devices to be shared among multiple tenants with                   Reclaimable by VIO: 120GB
+high density using virtual functions (VFs), achieving near-                Cold Pages: 272GB
+native performance. However, passthrough does not support
+page faults, requiring the hypervisor to statically pin the VM-
+allocated memory. This approach is unacceptable for cloud
+service providers (CSPs) that rely on oversubscription to en-              Legacy VM Memory: 800GB
+hance memory utilization and reduce costs. The Page Request
+Interface (PRI) was designed to support device-side I/O page
+faults (IOPFs) through collaboration among devices, Input-
+Output Memory Management Units (IOMMU), and the OS.                        Other: 200GB
+But PRI has not seen broad adoption in devices like NICs and
+storage.
+   We propose VIO, a novel dynamic I/O device passthrough         Figure 1: VMs Consumption. In a 300-node production envi-
+approach that achieves near-native performance and is             ronment, over 80% of long-running legacy (running at least
+hardware-independent. By leveraging a shadow available            one year) VMs without PRI support hold up to 800GB of
+queue, VIO can dynamically and transparently switch devices       memory, with ∼ 34% cold pages unreclaimed. With VIO en-
+between VIO and passthrough modes based on I/O operations         abled, approximately 120GB/day can be freed which satisfies
+per second (IOPS) pressure, balancing resource utilization        user SLOs, translating to savings equivalent to running about
+and performance. Each DMA request is probed via IOPA-             30 VMs (2C/4GB) per day.
+snooping in the virtio data plane to eliminate IOPFs, while
+device interrupts are directly passed through to the VM guest,
+enabling performance close to passthrough. VIO is exten-
+                                                                  by allowing virtual machines (VMs) direct access to hardware.
+sively tested and deployed by a leading global CSP across
+                                                                  However, this approach has a major limitation: Direct Mem-
+300K VMs, supporting both legacy and new instances while
+                                                                  ory Access (DMA), which enables devices to transfer data
+reclaiming up to the equivalent of 30K VM memory daily
+                                                                  directly to or from memory, can target any Guest Physical
+without compromising user Service Level Objectives (SLOs).
+                                                                  Address (GPA). If the address is swapped out or otherwise
+As the scale grows, the benefits continue to increase.
+                                                                  inaccessible, it results in an I/O page fault (IOPF). Since most
+                                                                  devices cannot handle such faults, DMA failures may disrupt
+1     Introduction                                                operations or even cause system crashes. To mitigate this is-
+                                                                  sue, passthrough requires static pinning of the VM’s virtual
+Cloud workloads vary significantly, ranging from simple web       memory to physical memory, which precludes memory op-
+hosting to resource-intensive applications like large language    timization techniques [31, 44, 46] like overcommitment [15]
+models, all of which require high-performance I/O for op-         in multi-tenant cloud environments, leading to suboptimal
+timal operation. Device passthrough is commonly used in           memory utilization and resource wastage.
+cloud environments to provide near bare-metal performance
+                                                                    In 2009, PCI-SIG addressed this challenge by expanding
+    ∗ Equal contribution.                                         the Address Translation Services (ATS) specification to in-
+
+
+
+USENIX Association                            19th USENIX Symposium on Operating Systems Design and Implementation            75
+                                      Table 1: Comparison of Memory Reclamation Methods
+
+     Method                       IO-Safety     HW Compatibility      Guest modification       Reclaim type       Overhead
+     {v,co}IOMMU [8, 39]             ✓              General             Frontend Driver        Unused + Cold        High
+     IOGuard [12]                    ✓              General             Frontend Driver        Unused + Cold       Medium
+     Ballooning [41]                 ✓              General             Frontend Driver           Unused            High
+     Free Page Reporting [2]         ×              General             Frontend Driver           Unused            High
+     Hyperupcall [9]                 ×              General            eBPF-Tool Chain         Unused + Cold        Low
+     IOPF/VPRI [17]                  ✓             Dedicated                  No               Unused + Cold        Low
+     VIO                             ✓              General                   No               Unused + Cold        Low
+
+
+clude the Page Request Interface (PRI) functionality [33],          modifications to VM software, which is not viable in multi-
+which enables devices to handle IOPFs. PRI relies on co-            tenant cloud environments. The second approach involves im-
+ordination between the Input-Output Memory Management               plementing IOPF handling at the hardware level, decoupling
+Units (IOMMU), devices, and the operating system to man-            it from the IOMMU, as seen in solutions like On-Demand
+age IOPFs. Intel introduced PRI support in their IOMMUs             Paging and VPRI [17,27]. However, these approaches are lim-
+with the 2023 Sapphire Rapids platform, significantly advanc-       ited to high-end or custom hardware, restricting their broad
+ing PRI adoption despite its introduction 14 years earlier.         adoption. Like PRI, these hardware solutions also introduce
+However, delayed adoption has limited its widespread imple-         additional latency to I/O operations, leading to substantial
+mentation, with most mainstream I/O devices—except for              performance degradation in high-performance scenarios.
+high-end GPUs [7, 21, 34]—currently lacking PRI support.                In this paper, we introduce VIO (Virtual I/O), a hardware-
+Additionally, Linux (v6.12) supports PRI only in scenarios          independent, IOPF-free virtualization solution designed to de-
+that require PASID under IOMMU_INTEL_SVA, further restrict-         liver both high performance and low overhead in high-density,
+ing its hardware compatibility [4].                                 multi-tenant environments. We identify that placing page
+   Despite the potential for widespread adoption of ATS/PRI         faults in the critical I/O path of complex network and storage
+hardware and software in the future, oversubscribed cloud           devices is a major contributor to performance degradation.
+environments face two primary challenges. As Figure 1 de-           Our approach builds on the VirtIO standard, which abstracts
+picts, in our production environment with a cluster size of         the underlying hardware differences in VM I/O devices. VIO
+300 nodes, more than 80% of legacy VMs consume ∼ 800GB              utilizes VirtIO’s data plane to implement IOPA snooping,
+of memory, and this situation is expected to continue. Since        which detects potential page faults in advance. By eliminating
+the kernels of these VMs do not support PRI, hardware up-           IOPFs through this proactive snooping, VIO ensures high
+grades alone will not yield benefits. Large-scale migration to      compatibility and improved performance. We implement and
+PRI-compatible devices is both technically and economically         deploy VIO on x86 platforms, including both AMD and Intel.
+impractical. Moreover, these VMs exhibit a cold page rate ex-           As Table 1 highlights, the key differentiator of VIO is that
+ceeding 34%, suggesting an opportunity to reclaim ∼ 270GB           it requires no modifications to the guest software stack—all
+of memory. Additionally, ATS/PRI introduces higher latency          changes reside solely in the host hypervisor. This design
+(∼ 3× to ∼ 80×) compared to CPU page fault handling due             choice is critical for our environment, which includes hun-
+to its reliance on the PCIe bus for fault handling. This necessi-   dreds of thousands of long-running VMs (running at least
+tates the use of an on-device buffer to store in-flight requests.   one year) from which memory needs to be reclaimed. The
+The widespread adoption of SR-IOV (Single Root I/O Vir-             design implications and technical details are discussed further
+tualization) technology, which virtualizes a single Physical        in §3.3. Prior solutions that rely on guest frontend driver or
+Function (PF) of an I/O device into thousands of VFs for dif-       eBPF modifications are unsuitable for such deployments. Fur-
+ferent guests, exacerbates scalability issues related to offline    thermore, existing approaches largely overlook the need to
+PRI and increases hardware costs [30, 40]. Therefore, PRI is        adapt to dynamically varying IOPS, whereas VIO addresses
+not currently suitable for addressing the high-performance,         this gap, offering both practical engineering benefits and novel
+high-density multi-tenant cloud scenarios.                          research value.
+   Previous works attempt to address the challenge of stati-            To optimize memory usage while meeting user SLOs, VIO
+cally pinning VM memory without PRI support, with solu-             employs dynamic device passthrough, ensuring optimal per-
+tions falling into two main categories. The first approach          formance in high I/O operations per second (IOPS) environ-
+is software-based, including methods such as vIOMMU,                ments. Specifically, we introduce a fine-grained, I/O pressure-
+coIOMMU, VProbe and IOGuard [8, 12, 39, 43]. These so-              based elastic passthrough strategy. Different workloads and
+lutions often introduce significant performance bottlenecks,        users have varying IOPS demands, and as IOPS increase,
+making them impractical for real-world use, and some require        memory requirements also tend to rise. In such cases, VIO
+
+
+
+76   19th USENIX Symposium on Operating Systems Design and Implementation                                    USENIX Association
+suspends snooping on I/O page access and directly passes the       bility and simplifies driver management. This hybrid model,
+VirtIO data plane to the hardware, enabling near bare-metal        known as VirtIO hardware offloading, allows VMs to access
+performance and maximizing efficiency. When workload in-           SR-IOV-enabled devices using standard VirtIO drivers, reduc-
+tensity decreases, VIO reclaims unused memory. Our experi-         ing vendor lock-in and facilitating seamless integration with
+ments demonstrate that, compared to traditional passthrough,       existing software stacks. By offloading the VirtIO backend
+elastic device passthrough allows up to 10% daily memory           to hardware, this approach enhances both performance and
+reduction in production while still meeting SLO requirements.      scalability, offering a robust solution for modern virtualized
+                                                                   environments.
+                                                                      The evolution of I/O virtualization reflects the growing de-
+                                                                   mand for solutions that balance high performance with broad
+2     Background                                                   compatibility [29]. As virtualization technologies continue to
+                                                                   advance, the need for efficient and scalable solutions becomes
+2.1    Trends on IO Virtualization                                 increasingly critical. VirtIO, now widely adopted as the de
+I/O virtualization has evolved over the years to meet the in-      facto standard in virtualization environments, epitomizes this
+creasing demands for high performance and scalability in vir-      trend. As virtualization continues to evolve, the emphasis on
+tualized environments. Initially, full virtualization provided a   achieving both performance and universality will intensify,
+simple and straightforward approach to I/O virtualization. In      with VirtIO playing a central role.
+this model, devices are fully emulated through software, en-
+abling VMs to interact with virtualized devices transparently,     2.2    Pitfalls of IO Devices with IOPF
+without requiring modifications to the guest OS. While this
+method offers high transparency, it incurs significant perfor-     In traditional memory management, when the CPU encoun-
+mance overhead due to frequent VM exits and data copying           ters a page fault, i.e., when it attempts to access a virtual page
+between the guest OS and the hypervisor.                           not currently mapped to physical memory, an exception is
+   To mitigate the performance drawbacks of full virtualiza-       triggered. The operating system’s memory management unit
+tion, para-virtualization [19, 24] (PV) emerged as a more          (MMU) handles the fault by performing the necessary address
+efficient approach. PV reduces overhead by modifying the           translation, which often involves loading the page from disk
+guest OS, allowing it to interact directly with the hypervisor     into physical memory. Once the page is mapped, the CPU can
+through specialized drivers, rather than emulating hardware.       resume its operation seamlessly.
+A prominent example of PV is VirtIO, as Figure 2a illustrates,        Similarly, when an I/O device performs DMA to access a
+which employs a split-driver model where the guest front-end       virtual memory page that has not been mapped yet, it triggers
+driver communicates with the host’s back-end driver. This          an IOPF. However, unlike the CPU, devices generally cannot
+design reduces the overhead of memory-mapped I/O (MMIO)            handle such faults on their own. The device lacks the ability
+operations by avoiding unnecessary VM exits, thus improving        to resolve the fault [11, 28] or perform the necessary address
+system performance. However, as the hypervisor still manages       translation. If the system fails to resolve the IOPF, it can lead
+memory and I/O operations, PV can encounter performance is-        to severe system instability and may even result in a system
+sues, particularly in environments with multiple concurrently      panic.
+running VMs.                                                          To address this issue, PCI-SIG introduced the PRI in the
+   With the introduction of technologies like VT-d, direct de-     PCIe 4.0 specification. PRI provides a standardized interface
+vice assignment became feasible. This approach, particularly       that allows devices to request the physical address translation
+through SR-IOV, has gained traction due to the high-density        of virtual memory pages from the host system. With PRI,
+requirements of cloud computing. As is shown in Figure 2b,         when a device encounters an IOPF, it can directly request
+SR-IOV enables physical devices to expose multiple VFs,            memory translation from the operating system or hypervisor.
+which can be directly assigned to VMs, bypassing the hy-           This mechanism enables the system to resolve IOPF without
+pervisor to achieve near-native I/O performance. Each VF           CPU intervention, allowing the device to continue its memory
+is isolated and has its own PCI registers and interrupt han-       access without causing a system crash.
+dling, making SR-IOV highly effective for high-performance            Figure 3 illustrates how PRI handles IOPFs. Initially, the
+applications. However, SR-IOV requires vendor-specific VF          device’s PRI function sends a page request message to the
+drivers in the guest OS, and its lack of full compatibility        IOMMU over PCIe (⃝).     1 This message is received by the PRI
+across hardware vendors introduces fragmentation and device        Server (PRS) within the IOMMU, which writes it to the PRS
+migration challenges in large-scale cloud environments.            event queue, triggering a host interrupt (⃝).  2 This interrupt
+   To overcome these limitations, a hybrid approach com-           asynchronously notifies the IOMMU driver, leading to sig-
+bining SR-IOV and VirtIO has been proposed. As is shown            nificant delays. In steps ⃝  3 and ⃝, 4 the memory subsystem
+in Figure 2c, SR-IOV provides hardware-level isolation for         handles the process similar to a CPU page fault: the system
+improved I/O performance, while VirtIO ensures compati-            requests a physical page, populates it, and updates the page
+
+
+
+USENIX Association                            19th USENIX Symposium on Operating Systems Design and Implementation               77
+     Data              IRQ
+
+                               QEMU                                                                         VM #N                                                                        VM #N
+                                                                                                           VM #1                                                                        VM #1
+       Guest Kernel                 1
+                                            VirtIO Device                                                VM #0                                                                       VM #0
+        VirtIO Deice           vring
+                                             Emulation
+            Driver                  7                                                               Vendor-specific
+                                                                                                                                                                                  VirtIO Driver
+                                                                                                       VF Driver
+       2                        3             4         6
+
+
+                       9                8
+                                                                                                                                                                                      vring
+                                                                                                                  Passthrough                                                                     Passthrough
+                                                                                   Host Kernel                   Bypass Kernel                                       Host Kernel     oﬄoad
+                                                                                                                                                                                                 Bypass Kernel
+               KVM                          Device Driver
+                           Host Kernel                                                        VF          VF                            VF           NIC             VirtIO-VF     VirtIO-VF      VirtIO-VF DPU
+                                                  5
+
+                                    …                       NICs                                          PF                                                                          PF
+
+                           (a) VirtIO                                                                    (b) SR-IOV                                                              (c) VirtIO Offload
+
+Figure 2: The evolution of I/O virtualization. (a) VirtIO illustrates the para-virtualization approach with a split-driver model to
+improve performance by reducing VM exits. (b) SR-IOV demonstrates hardware-level direct device assignment for near-native
+performance by exposing VFs to VMs. (c) VirtIO hardware offload combines the benefits of SR-IOV and VirtIO, leveraging
+hardware offloading to achieve both high performance and broad compatibility.
+
+           Interrupt       PCIe Transaction
+                                                       Root Complex                                SSD                                  100
+                                                                                                                    VM Percentage (%)                                                Only 3.57% VMs Have
+                                                                                       PCIe Bus
+                                                                       Root Port
+
+
+
+
+                           4
+                                                         IOMMU                     6
+                                                                                                   …
+                             PRQ              5
+  DRAM           MMU   CPUs Handling                   Page Response                                                                                                                 Higher IOPS
+                                                                                                   NIC
+                           3                ~5-500μs
+                                                         PRQ Event                                                                                                                   Requirement!
+                                                                                                   PRI
+                                              2
+                                                                         1         ~1μs                                                  50
+
+Figure 3: IOPF Handling Process. PRQ handling in step ⃝2
+introduces the most significant delay, followed by memory                                                                                                           3.57%
+population and response delivery.                                                                                                            0
+                                                                                                                                                 0         10     20     30      40    50 50 100 200             500
+                                                                                                                                                                IO Operation Per Second (×1k)
+
+tables. Finally, the IOMMU driver sends a response to the
+                                                                                                                   Figure 4: IOPS distribution in a CSP production environment,
+device PRI interface (⃝,5 ⃝).
+                            6
+                                                                                                                   showing a long-tail pattern where 73.14% of workloads have
+   Mellanox [20] and VPRI focus on optimizing the latency                                                          IOPS below 1,000, while less than 3.57% exceed 30,000
+of the IOPF process, claiming that the entire IOPF handling                                                        IOPS.
+cycle introduces a latency of a few hundred milliseconds.
+However, based on previous studies and our experiments, we
+find that because IOPF occurs in the critical path of DMA,                                                         consistency across device and CPU memory page tables. This
+any delays in this path can cause the device to drop the current                                                   scale of memory management creates a significant burden in
+packet. The device then relies on higher-layer protocols (such                                                     terms of both energy consumption and computational over-
+as TCP/RDMA) to handle packet loss through retransmission.                                                         head, which, when combined with the performance penalties
+This retransmission process can lead to packet damming or                                                          from DevTLB misses and the need for extensive TLB ca-
+flooding, causing delays that are several hundred milliseconds                                                     pacities, exacerbates the challenges associated with scaling
+long, ∼ 100 times the latency of the IOPF itself.                                                                  ATS/PRI in production environments.
+   Moreover, another significant pitfall in the deployment of                                                         In summary, PRI-based solutions place IOPF handling in
+ATS/PRI arises from the need for synchronization between                                                           the critical I/O path, which interrupts the original flow of I/O
+on-device memory and the CPU’s page table information.                                                             operations, thus leading to significant performance degrada-
+Modern systems, especially those with large memory con-                                                            tion. Therefore, due to its inherent characteristics, PRI is not
+figurations, such as 2TB memory machines, face substantial                                                         suitable for use in I/O-intensive environments.
+challenges when attempting to manage this synchronization.
+For example, using a 4KB page size, synchronizing such a
+                                                                                                                   2.3                       IOPS Distribution in Cloud Environment
+large memory footprint can lead to an enormous overhead
+in terms of memory storage. Specifically, the system must                                                          As is illustrated in Figure 4, the IOPS distribution in a CSP
+handle the synchronization of up to 500MB memory, which                                                            production environment demonstrates a distinct long-tail pat-
+results in a considerable memory requirement just to maintain                                                      tern. The vast majority of virtual machines, accounting for
+
+
+
+78     19th USENIX Symposium on Operating Systems Design and Implementation                                                                                                                   USENIX Association
+     Host                                                       Guest                          3     Design & Implementation
+                                                      Kick
+                        IOPS-Aware                   (Notify)    2           VMs
+             High                                                           VMs
+                                                                        VirtIO FE              3.1     Overview
+                        Passthrough
+                               Low                               VM
+                    Trigger    3
+                                                                          1        Interrupt   Based on our analysis and observations, we propose a novel
+                          IOPA Snoop                                             Passthrough   IOPF system called VIO, as is illustrated in Figure 5. VIO
+                                                                      Buf.
+      Lockpage
+
+
+
+
+                                                                                               is a software-based, elastic device passthrough solution that
+                    6                                                   Avail.
+                                       4                                                       adheres to the VirtIO 1.0 standard. The design of VIO en-
+                                                                        vring
+                                   Page Fault
+                                    Handling
+                                                                                               ables IOPF support without relying on any specific CPU or
+                         PT                     PT                                             hardware vendors, achieving this entirely through software. In
+                        Shadow
+                         vring
+                                                                                               contrast to the less widely adopted ATS/PRI solution, VIO is
+           DPU             5
+                                                    Notify after
+                                                                                               hardware-independent and transparent to the guest operating
+                                                all pages mapped
+                                                                         VirtIO-VFs
+                                                                       VirtIO-VFs              system. The key features of VIO are as follows:
+                        Fallback to passthrough                       VirtIO-VFs
+                                                                                                   1. IOPA-Snoop: VIO snoops every VirtIO command to
+Figure 5: Overview. The figure illustrates the VIO process,                                           ensure that DMA-buffered pages are handled correctly.
+where IOPF handling is offloaded to the hypervisor, transpar-                                         This mechanism guarantees that page faults will not
+ent to both the software and hardware. This approach elim-                                            occur during device DMA operations, eliminating the
+inates IOPF overhead from the critical I/O path, improving                                            need for PCIe PRI-based page requests.
+performance while maintaining full compatibility.
+                                                                                                   2. IOPS-Aware Elastic Passthrough: As device I/O pres-
+                                                                                                      sure increases, VIO switches to a passthrough mode. It
+                                                                                                      uses a shadow available ring to enable elastic switching
+                                                                                                      between device passthrough and VIO passthrough. By
+                                                                                                      toggling the IOPT in the IOMMU to the shadow avail-
+                                                                                                      able ring, VIO achieves transparent passthrough mode
+73.14%, have IOPS demands that do not exceed 1,000. This
+                                                                                                      switching for the VM. This mechanism also supports
+indicates that most workloads in the cloud operate at relatively
+                                                                                                      seamless upgrades to VIO for existing VMs, enabling
+low IOPS levels. Meanwhile, only a small fraction of virtual
+                                                                                                      hot upgrades without disruption.
+machines—less than 3.57%—require more than 30,000 IOPS,
+highlighting the rarity yet importance of high-IOPS work-                                          3. Adaptive Lockpage: VIO implements device-agnostic
+loads in production environments.                                                                     I/O page access logging through IOPA-snoop, which col-
+                                                                                                      lects information about IO page access pattern. Based on
+   This distribution reflects the resource heterogeneity in                                           this information, VIO introduces an adaptive lockpage
+cloud environments, where low-IOPS workloads dominate                                                 mechanism that optimizes the usage of I/O hot pages,
+while high-IOPS workloads represent a smaller but criti-                                              improving memory efficiency and reducing IOPFs.
+cal segment. The latter are often accompanied by memory-
+intensive operations. In such scenarios, memory oversubscrip-                                     Figure 5 illustrates the VIO process as follows: Step ⃝:  1
+tion, a common practice to optimize resource utilization, can                                  The VirtIO frontend in the VM prepares the buffer and places
+lead to significant interference with high-IOPS workloads,                                     it in the available ring. Step ⃝:
+                                                                                                                              2 The VirtIO frontend then
+disrupting performance and potentially violating SLOs.                                         uses a kick to notify the backend that the buffer is ready
+                                                                                               for device use. Step ⃝:  3 Depending on the current IOPS
+                                                                                               pressure, the process is divided into two paths: (a) When
+   To address these challenges, a potential solution involves                                  the VM is under heavy load, the process directly follows the
+an elastic passthrough strategy capable of dynamically switch-                                 passthrough fast path. (b) When the device is in VIO mode,
+ing between resource sharing and passthrough modes based                                       the kick triggers an IOPA-Snoop. It is important to note that in
+on real-time workload demands. Under typical conditions,                                       both modes, hardware interrupts are directly passed through
+low-IOPS workloads efficiently share resources to maximize                                     to the virtual machine. Step ⃝: 4 The IOPA-Snoop thread
+utilization. When workloads intensify and IOPS demands                                         handles any page faults in the buffer prepared in step ⃝  1 by
+increase, the strategy shifts to direct passthrough, minimizing                                querying the Extended Page Table (EPT). Step ⃝:  5 The IOPA-
+overhead and delivering near-native performance. By dynam-                                     Snoop thread then kicks the actual hardware, initiating the
+ically adjusting working mode based on IOPS intensity, such                                    I/O operation.
+an approach has the potential to balance high efficiency and                                      During hardware I/O operation, IOPA-Snoop ensures that
+reliable performance across diverse and complex workloads                                      the device can continue the operation without being inter-
+in cloud environments.                                                                         rupted by an IOPF. Compared to the PRI-based solution, this
+
+
+
+USENIX Association                                                        19th USENIX Symposium on Operating Systems Design and Implementation             79
+         D0                                                                                         Device                                        Snooping
+           D1                                                                        VM                                      VM
+                                           1                 VirtIO FE                            Passthrough                                      Mode
+      Desc D2                                                                       vring                                   vring
+                                                              Driver
+      Ring                                 2
+
+                                                                                    EPT                                        EPT
+                                                               3
+                       S. Idx                                                                                              1      unmap
+                                6                         Available Ring                                          3
+
+          7
+               5                    Shadow Idx (S. Idx)            Idx            Available         Shadow                Available   2copy        Shadow
+       Avail       2        Idx
+                                                                                    Ring             Ring                   Ring      ~10μs         Ring
+       Ring                                               Ring[QueueSize]
+                                7                                  …                          1   atomic     IOPS-Aware                   3   atomic
+                        Read                                   4                  IOMMU           remap                   IOMMU               remap
+
+                                    Page                       IOPA                 vring                                   vring
+      VirtIO BE
+                                    Swap
+                                           5
+                                                              Snoop                Device                                  Device
+       Device
+                                           Disk
+
+                                                                            Figure 7: Elastic passthrough. It illustrates the IOPS-aware
+Figure 6: Overview of IOPA Snoop. This module offloads                      mechanism, switching between snooping and passthrough
+IOPF handling to the hypervisor, without device involvement.                modes using shadow page tables to manage memory map-
+It ensures that DMA operations can continue without IOPF                    pings.
+by guaranteeing that all pages are mapped before the device
+accesses them.
+                                                                            observes the available index and uses the buffer allocated in
+                                                                            step ⃝1 by referring to the descriptor table based on that index.
+approach removes the IOPF overhead from the critical path                   If the page in the buffer has been unmapped by the hypervi-
+of the I/O operation.                                                       sor, it triggers an IOPF, which would normally require the
+   The changes in the VIO process described above occur                     ATS/PRI hardware process to resolve. If the back-end device
+within the host’s hypervisor, making them transparent to both               waits for the page fault to be handled before continuing, it
+the upper-level guest and the underlying hardware. Unlike                   would need to store additional information in a special buffer
+PRI, the current page fault handling in VIO is no longer ini-               to manage multiple in-flight page faults. This is impractical
+tiated by asynchronous interrupts. This design ensures that                 for I/O devices due to resource limitations. As a result, most
+performance improvements in IOPF handling are achieved                      hardware implementations drop the related packets, relying
+without requiring modifications to guest operations or addi-                on higher-layer protocols like TCP/RDMA to handle retrans-
+tional hardware functionality. By offloading IOPF handling                  mission, which leads to performance degradation.
+to the hypervisor and optimizing the I/O path, VIO enhances                    In our approach, we introduce a shadow index mechanism,
+system performance while maintaining full compatibility be-                 where the device and driver operate on different indices. After
+tween the guest and the hardware.                                           step ⃝,3 the device sees a shadow index, which has not yet
+                                                                            been updated and still points to the old address in the available
+3.2    IOPA-Snoop Mechanism                                                 ring. The following steps outline the process: Step ⃝:   4 The
+                                                                            IOPA-Snoop module detects the index update and snoops
+VirtIO is a general I/O virtualization framework that allows                the buffer allocated in step ⃝.1 Step ⃝:  5 The IOPA-Snoop
+the hypervisor to emulate a variety of virtualized devices,                 module reads the unmapped data from the swap to ensure that
+making them accessible within a virtual machine through API                 the pages in the buffer are correctly mapped. Step ⃝:    6 The
+calls. It is widely used in cloud environments to enhance vir-              shadow available index is then updated to the available index.
+tualization I/O performance and ensure compatibility across                 Step ⃝:7 The back-end device observes the updated shadow
+different systems. Virtqueue serves as the transport layer ab-              available index and proceeds with the DMA operation.
+straction between the VirtIO front-end and back-end. To pre-                   In this process, IOPF handling is entirely managed on the
+vent devices from encountering page faults during DMA, VIO                  hypervisor side, with no direct involvement from the device.
+introduces the IOPA-Snoop module to manage the virtqueue.                   Even when multiple page faults occur simultaneously, the
+   Figure 10 illustrates the process by which the VirtIO front-             handling process remains consistent with traditional CPU
+end adds requests and notifies the back-end for consumption.                page fault handling, effectively removing IOPF handling from
+Step ⃝:1 The front-end driver allocates a buffer and adds it to             the critical path of the DMA operation.
+the descriptor table. Step ⃝:
+                            2 The front-end driver then adds a
+new entry with the head index of the descriptor chain, which
+                                                                            3.3      Elastic Passthrough
+describes the request in the available ring entries. Step ⃝:3
+The front-end driver increments the index by the number of                  In cloud environments, many VMs run for extended periods
+new entries.                                                                and may not be able to easily take advantage of new hardware
+   In the standard VirtIO path, the back-end device eventually              features such as PRI. To ensure that both existing hardware
+
+
+
+80    19th USENIX Symposium on Operating Systems Design and Implementation                                                        USENIX Association
+and software can benefit from improvements, we introduce              ing this transition, the hypervisor remaps the shadow available
+elastic passthrough. Elastic passthrough enables VMs to seam-         ring back to the original native available ring, allowing the
+lessly switch between device passthrough and snooping mode            VM to operate in passthrough mode and bypass the snooping
+without requiring any changes to the VM or the underlying             overhead, thereby maintaining high I/O performance. This
+hardware.                                                             threshold-based switching mechanism dynamically adapts
+   To protect sensitive data from malicious VMs, the hypervi-         to workload demands, ensuring that the system operates effi-
+sor utilizes EPT to control each VM’s memory access. The              ciently across varying I/O loads.
+VM’s MMU translates Guest Virtual Addresses (GVA) into                   The transition from snooping mode back to passthrough
+GPA, while the hypervisor maps these GPAs to Host Phys-               mode is optimized to minimize performance disruption. Be-
+ical Addresses (HPA). Additionally, the IOMMU translates              fore initiating the switch, the hypervisor proactively swaps in
+I/O Virtual Addresses (IOVA) to HPA, ensuring that mali-              swapped-out pages. Because snooping continuously swaps
+cious devices cannot gain unauthorized access to memory via           in pages, relatively few pages need to be swapped in when
+DMA.                                                                  transitioning back to passthrough mode. This swap-in oper-
+   VIO utilizes separate page tables for the device and driver        ation occurs in parallel with ongoing snooping, effectively
+when accessing the available ring. VIO employs separate               hiding the latency of page retrieval. When the actual mode
+available rings: a native available ring for the device and           switch takes place (remapping the shadow available ring to
+a shadow available ring managed by the hypervisor. This               the native available ring), all necessary pages are already resi-
+design allows the hypervisor to use the shadow available ring         dent in memory. This design choice eliminates IOPFs from
+for snooping mode, without necessitating any modifications            the critical path of the transition, resulting in a smooth switch
+within the VM’s guest OS or applications.                             with no noticeable performance degradation.
+Transitioning from Passthrough to Snooping: As is shown                  To ensure that VIO can benefit existing long-running
+in the right side of Figure 7, when switching from passthrough        legacy VMs, we utilize a combination of Elastic Passthrough
+mode to snooping mode, the hypervisor follows these steps:            and VMM live upgrade. VMM live upgrade is a technique
+Step ⃝:1 Unmaps the available ring in the EPT, blocking new           that has been widely adopted in both industry and academia
+requests if any are in-flight. Step ⃝: 2 Copies the contents of       to update the underlying hypervisor (KVM/QEMU) without
+the available ring to the shadow available ring, which takes          requiring any reboot or reconfiguration of the VMs them-
+about 10 microseconds. Step ⃝:   3 Atomically remaps the avail-       selves [37]. VIO’s design is implemented entirely within the
+able ring to the shadow available ring in the IOMMU’s IOPT,           hypervisor, meaning that no modifications or upgrades are
+and then remaps the EPT back to the available ring. This              necessary within the guest VMs to take advantage of its bene-
+sequence completes the transition to VIO mode without any             fits.
+noticeable changes to the VM or device.                                  We choose Orthus [50] to live upgrade VMM as it is widely
+   When operating in snooping mode, each I/O request from             deployed in our production. This VMM live upgrade process
+the VM triggers an IOPA-Snoop operation. Each snooping                leverages a dual KVM approach, where a new, upgraded ver-
+operation introduces a small overhead (approximately 4µs              sion of KVM can be loaded while the original KVM instance
+according to our measurements, as detailed in the §4.1). At           continues to run the VMs. Then, the VMs are “grafted” from
+low IOPS, the cumulative overhead of snooping is negligi-             the old KVM to the new KVM, and device ownership is
+ble, and the benefits of preventing IOPFs outweigh this cost.         handed over to the new VMM. This process enables a seam-
+However, as the IOPS increases, the cumulative overhead of            less upgrade of the QEMU process using a fork-exec model,
+these snooping operations grows proportionally, potentially           where the original QEMU process forks, and the child process
+becoming a significant performance bottleneck. Furthermore,           loads the new QEMU image. The upgraded QEMU includes
+we observe that VMs with high IOPS workloads tend to re-              VIO’s Elastic Passthrough capabilities. Once the legacy VM
+quire most, if not all, of their allocated memory to maintain         is running under the upgraded hypervisor, its transition be-
+performance. In such scenarios, the benefits of memory recla-         tween passthrough mode and VIO’s snooping mode operates
+mation through snooping diminish, making it more efficient            identically to a VM that was initially started in a VIO-enabled
+to switch these heavy-load VMs back to passthrough mode.              environment.
+Transitioning from Snooping to Passthrough: To mitigate                  Figure 8 illustrates the Iperf performance of a legacy VM
+the snooping overhead under heavy I/O load and to avoid               during this upgrade process in our production environment.
+unnecessary snooping for VMs that benefit little from mem-            As the graph shows, there is some performance fluctuation
+ory reclamation, VIO incorporates an IOPS-Aware Elastic               during the 200ms window while QEMU is upgraded and the
+Passthrough feature. An IOPS monitor tracks the I/O activity          VM is switched to VIO mode. It’s important to note that this
+of the VM. When the IOPS exceeds a predefined threshold               fluctuation occurs under peak Iperf bandwidth conditions.
+(e.g., 100k IOPS in our production environment), the system              During a production rollout, we schedule these upgrades
+automatically triggers a switch back to passthrough mode.             during periods of low workload for the legacy VMs to mini-
+The left side of Figure 7 illustrates this transition process. Dur-   mize any potential impact. Crucially, the VMs do not need to
+
+
+
+USENIX Association                               19th USENIX Symposium on Operating Systems Design and Implementation              81
+                                         iPerf Performance                                     Algorithm 1 Adaptive Lockpage Mechanism in VIO
+                                                            QEMU Update
+                     14                                     QEMU Update + VIO Mode Switching    1: Initialize Lockpage Bitmap with 2MB granularity
+                                                                                                2: Initialize Active List and Inactive List for each Protection
+                     12                                                                              Domain
+ Speed (Gbits/sec)
+
+
+
+
+                                                                                                3: procedure IOPA_S NOOP (access_log)
+                     10
+                                                                                                4:     for all page ∈ access_log do
+                     8                                                                          5:           M OVE T OACTIVE L IST(page)
+                                                                                                6:           if I S I N I NACTIVE L IST(page) then
+                     6
+                                                                                                7:                 U NPIN PAGE(page)
+                          0      20      40                 60            80             100
+                                                                                                8:           end if
+                                              Time (0.1s)                                       9:     end for
+                                                                                               10: end procedure
+                      Figure 8: iPerf performance during VMM upgrade                           11: procedure M OVE T OACTIVE L IST (page)
+                                                                                               12:     Remove page from Inactive List if present
+                                                                                               13:     Add page to the head of Active List
+be restarted or reconfigured, and the entire process is trans-
+                                                                                               14:     if I S ACTIVE L IST F ULL then
+parent to the guest operating system and applications. This
+                                                                                               15:           E VICT F ROM ACTIVE L IST
+is a significant advantage, as it avoids the complexity and
+                                                                                               16:     end if
+potential disruption of coordinating upgrades across a large
+                                                                                               17: end procedure
+number of diverse VMs.
+                                                                                               18: procedure E VICT F ROM ACTIVE L IST
+   Overall, Elastic Passthrough allows VMs in a virtual-                                       19:     evicted_page ← Remove page from tail of Active
+ized environment to seamlessly switch between full de-                                             List
+vice passthrough and VIO modes. This flexibility ensures                                       20:     A DD T O I NACTIVE L IST(evicted_page)
+that memory usage is optimized and performance goals are                                       21:     P IN PAGE(evicted_page)
+achieved without requiring any changes to the VM or hard-                                      22: end procedure
+ware.
+
+
+3.4                       Lockpage                                                             swapped out. This approach ensures that VIO does not need
+                                                                                               to verify the presence of these pages in memory before DMA
+The IOPA-snoop mechanism (see §4.1) ensures the safety of                                      operations, thereby enhancing performance. Currently, VIO
+I/O pages involved in DMA operations. However, the repeated                                    employs static lockpage exclusively for the VirtIO RX queue
+reclamation and snooping of specific pages can introduce ad-                                   due to its pre-allocated and contiguous memory layout.
+ditional performance overhead. To mitigate the frequency of                                       Adaptive Lockpage: The adaptive lockpage mechanism
+page faults caused by snooping, VIO employs a lockpage                                         in VIO is inspired by the Dual LRU and Multi-generational
+mechanism to pin particular I/O hotspot pages, thereby sig-                                    LRU algorithms utilized in the Linux kernel. The primary
+nificantly reducing the occurrence of IOPF page faults.                                        objective is to avoid pinning pages in the youngest genera-
+   I/O operations exhibit strong temporal locality, as the same                                tion (active list) since these pages are already identified as
+memory pages may be accessed repeatedly within short in-                                       hot by the EPT through the IOPA-snoop mechanism. Pin-
+tervals. In contrast to the more random and less predictable                                   ning these pages would unnecessarily lock those that do not
+access patterns typical of CPU operations, I/O operations gen-                                 require it. Instead, the focus is on pinning pages from the sec-
+erally follow consistent and repetitive access patterns. This                                  ond young/inactive list, which represent long-term recently
+predictability facilitates more effective optimization strate-                                 used pages. By pinning these pages, the kernel’s page reclaim
+gies, such as pinning frequently accessed pages to prevent                                     module is prevented from evicting them, thereby reducing re-
+their eviction.                                                                                peated page faults and enhancing overall system performance.
+   VIO employs two primary lockpage strategies to leverage                                        The adaptive lockpage algorithm (Algorithm 1) manages
+I/O page locality. A lockpage bitmap manages these locked                                      memory pages using Active and Inactive lists. When
+pages, with memory managed in 2MB chunks. Additionally,                                        IOPA-snoop detects a page access, it transfers the page to
+VIO maintains an internal table, enabling it to bypass the                                     the Active List and unpins it if it was previously in the
+checking of Page Table Entries (PTEs) for pages listed in the                                  Inactive List. If the Active List becomes full, the least
+lockpage bitmap, prior to the IOPA-snoop process.                                              recently used page is evicted to the Inactive List and subse-
+   Static Lockpage: This strategy locks frequently used I/O                                    quently pinned to retain it in memory. This selective pinning
+pages based on their spatial continuity. For example, the Vir-                                 strategy ensures that frequently accessed I/O pages remain
+tIO RX queue, which is preallocated with contiguous memory                                     available, reducing the number of IOPFs and enhancing the
+regions, is entirely locked to prevent its pages from being                                    ultimate system performance.
+
+
+
+82                    19th USENIX Symposium on Operating Systems Design and Implementation                                              USENIX Association
+                                                                                 Table 2: Environment Configuration
+                                                  79
+                    80    High lock rate
+Lockpage Rate (%)
+
+
+
+                          due to Windows VMs.                          Type    Hardware Configuration
+                    60
+                                                                               Intel Xeon CPU Platinum 8269CY
+                                                                       Host    52C/104T@2.50GHz in 2 sockets
+                    40
+                                                                               12 * 16GB DRAM, 1TB SSD
+                    20                   10                                    Connection: PCIe GEN3, 8 lanes
+                                 1                                     DPU     Device emulation: up to 2300 VFs
+                     0                                                         Max bandwidth: 200 Gb/s
+                             p50        p90       p99
+                                     Percentile                                4 vCPUs, 8GB RAM
+                                                                               CentOS Linux release 7.9.2009
+                                                                       VM
+                                                                               NIC device: dual queue virtio-net x1
+Figure 9: Lockpage rate in a production environment, showing
+                                                                               10Gb/s max throughput, 190,000 PPS
+P50 at 1%, P90 at 10%, and P99 spiking to 79% due to poor
+I/O locality in Windows VirtIO driver.
+                                                                     grates on-device PRI functionality, enabling IOPF processing
+                                                                     on the DPU. We have implemented VPRI ourselves, and since
+Lockpage Rate: We collected lockpage data from about                 VIO does not rely on specific hardware conditions, we are
+300K virtual machines in our production environment. As              able to support both VPRI and VIO on the same platform.
+shown in Figure 9, the analysis of lockpage rates reveals            Configurations are shown in Table 2.
+significant differences in memory usage across VMs in pro-              Benchmarks: To demonstrate the impact of VIO, we se-
+duction. The median lockpage rate is 1%, indicating strong           lect various I/O-intensive applications, which are highly repre-
+I/O locality for most VMs. At the 90th percentile, the lock-         sentative of common cloud computing scenarios. The selected
+page rate increases to 10%, reflecting the memory demands of         applications and their setups are listed as follows.
+more intensive workloads. However, at the 99th percentile, the
+                                                                        • iperf3: Tests network throughput using iperf3 with a
+lockpage rate jumps sharply to 79%, highlighting a subset of
+                                                                          single thread and a packet size of 1024 bytes. Simulates
+VMs with significantly higher memory locking requirements.
+                                                                          TCP-based data transfer to evaluate system bandwidth
+   This sharp increase is largely due to approximately one-               over a specified duration.1
+quarter of the VMs running the Windows VirtIO driver. These
+VMs exhibit poor I/O locality because the driver disrupts               • nginx: Measures web server performance under stress
+typical memory access patterns, causing a much larger portion             using two threads and 200 concurrent connections. Sim-
+of memory pages to be locked. This observation suggests that              ulates heavy HTTP traffic to assess nginx’s handling of
+optimizing the Windows VirtIO driver could improve I/O                    simultaneous requests.2 For Nginx benchmarks, we used
+locality and significantly reduce memory locking overhead.                2KB static web pages.
+Although adaptive lockpage strategies can effectively reduce
+the lockpage rate, we adopt a static lockpage configuration in          • Redis: Benchmarked with redis-benchmark, using 16
+production for ease of maintenance.                                       threads performing GET operations on 256-byte data.
+                                                                          Evaluates Redis’s ability to handle concurrent database
+                                                                          queries efficiently.3 For Redis benchmarks, we used 16
+4                   Evaluation                                            connections (-c 16).
+                                                                        • Memcached: Tested with memaslap, using 8 threads op-
+We evaluate VIO across several dimensions through ex-
+                                                                          erating on 64-byte keys (-c 8). Assesses Memcached’s
+periments. First, we examine its performance using micro-
+                                                                          performance under concurrent GET and SET work-
+benchmarks, focusing on the end-to-end latency for handling
+                                                                          loads.4
+IOPF. Next, we illustrate its performance with real-world
+benchmarks, comparing it to relevant hardware-based solu-
+tions. Finally, we analyze data from a production environment
+to verify that VIO meets the SLO requirements for users in
+                                                                     4.1    IOPA-Snooping Overhead
+public cloud settings.                                               To evaluate the efficiency of VIO in production environments,
+   Experimental Setup: We deployed VIO in one of the                 we monitored its deployment on a sample of 10,000 VMs.
+largest global CSP production environments. Due to the lack            1 iperf3, https://iperf.fr/
+of commercially available network cards that support PRI,              2 nginx, https://nginx.org/
+we chose VPRI from SOSP’24 as the baseline [17]. VPRI is               3 Redis, https://redis.io/
+
+a state-of-the-art hardware implementation of PRI that inte-           4 Memcached, https://memcached.org/
+
+
+
+
+USENIX Association                                19th USENIX Symposium on Operating Systems Design and Implementation           83
+                  10                                                       VIO, we used snooping mode for comparison. These laten-
+                            Page Fault
+                            Miss Page Check                                cies are chosen to reflect the wide range of delays observed
+                  8         Lockpage Bitmap Check                          in cloud SSDs: while high-performance cloud SSDs offer
+                                                              700µs        read/write latencies around 4ms, others can be significantly
+IO Latency (µs)
+
+
+
+
+                  6                                                        higher. By adjusting both the IOPF frequency and latency, we
+                                                     4.5µs                 simulate conditions that capture the complexity and variability
+                             4µs
+                  4                    3.5µs                               of real-world cloud storage environments.
+                                      Only                                    As is shown in the Figure 11, VPRI experiences significant
+                  2                                                        throughput degradation as delay increases due to its reliance
+                                      90ns                                 on retransmissions to recover from packet loss caused by
+                  0
+                                                    1µs                    IOPFs. For instance, in Redis, VPRI throughput drops by
+                            AVG        LP Hit       LP Miss   Page Fault   60% under 10ms delay, while Nginx and Memcached exhibit
+                            700                                            similar degradation trends of 45% and 57%, respectively. This
+ Figure 10: IOPA-Snooping Latency. The figure shows the                    cascading effect of retransmissions highlights the sensitivity
+ latency distribution of the IOPA-snoop process, detailing the             of VPRI to IOPF frequency, particularly in workloads with
+ impact of lockpage hits (3.5µs) and misses (4.5µs) on over-               high transaction rates or network demands.
+ head, with page faults averaging 700µs.                                      In contrast, VIO demonstrates excellent stability under
+                                                                           the same conditions. By isolating page fault handling from
+                                                                           the critical I/O data path, VIO avoids packet loss and re-
+ We sampled the IOPA-snoop process, which handles I/O page                 transmissions, resulting in minimal performance degradation.
+ accesses in VIO. The results provide valuable insights into               Across all applications, VIO’s throughput reductions remain
+ the latency distribution and the effectiveness of the lockpage            below 10%, even at higher delays. For example, in Redis, VIO
+ mechanism in reducing overhead.                                           achieves a modest 6% drop under a 10ms delay, while Nginx
+    As is shown in Figure 10, the IOPA-snoop process incurs                and Memcached see reductions of 9% and 6%, respectively.
+ a average latency of 4µs, with a clear distinction based on               This consistent performance advantage underscores VIO’s
+ lockpage hits and misses. When a lockpage hit occurs, the                 ability to maintain stable throughput across a range of work-
+ latency is reduced to approximately 3.5µs, as the system only             loads and delay conditions. Redis shows poorer performance
+ needs to query VIO internal bitmap, which takes 90ns. For                 in low IOPF situations because the frequency of snooping
+ lockpage misses, the latency increases to 4.5µs, as the system            operations becomes a significant bottleneck due to snooping
+ must first check whether the page is present in memory, taking            latency. When IOPS is high, total snooping overhead increases
+ around 1µs. If the page is not present, a page fault is triggered,        proportionally with the growth in I/O operations. This data
+ which has an average handling time of 700µs.                              supports the design goal of Elastic Passthrough of employ-
+    These findings highlight the efficiency of VIO’s lockpage              ing snooping in most low-IOPS scenarios and switching to
+ mechanism, which minimizes the need for costly page fault                 passthrough in high-IOPS scenarios.
+ handling by ensuring that frequently accessed I/O pages are                  Overall, the results emphasize the effectiveness of VIO in
+ pinned in memory. Even in cases where a page fault occurs,                mitigating the impact of IOPFs. While VPRI struggles with
+ VIO ensures robust performance with a well-contained av-                  retransmission overheads that degrade performance as delays
+ erage fault-handling latency. This efficient handling of I/O              increase, VIO ensures predictable and reliable throughput by
+ page accesses demonstrates VIO’s capability to maintain low               handling page faults in a non-intrusive manner. This makes
+ overhead and stable performance, making it suitable for large-            VIO a robust solution for diverse cloud applications requiring
+ scale cloud environments with diverse workloads.                          stable and efficient I/O operations under varying workloads
+                                                                           and network conditions.
+ 4.2                   Applications
+                                                                           4.3    I/O SLOs
+ The performance comparison between VPRI and VIO across
+ four I/O-intensive applications, reveals differences in their             In production environments, intermittent I/O jitter caused by
+ ability to handle IOPF. The performance comparison between                infrastructure issues such as network congestion often results
+ VPRI and VIO was evaluated under varying I/O pressure by                  in long-tail performance degradation and packet loss. This
+ injecting IOPFs at different rates (1/2/5/10 per second) and              significantly impacts I/O SLO metrics, prompting CSPs to
+ introducing diverse fault latencies. All tests were conducted             invest substantial resources in maintaining I/O jitter within
+ under memory oversubscription conditions with Snooping                    tolerable levels. However, the limitations of the current IOPF
+ mode enabled. Please note that under such high IOPS condi-                architecture exacerbate I/O jitter. Frequent IOPFs, particularly
+ tions, VIO would typically run in passthrough mode. However,              during rapid successive bursts, introduce retransmissions and
+ in this case, to demonstrate the worst-case performance of                delays, directly leading to I/O SLO violations.
+
+
+
+ 84               19th USENIX Symposium on Operating Systems Design and Implementation                               USENIX Association
+                                                 1 IOPF/s                             2 IOPF/s                                   5 IOPF/s                     10 IOPF/s
+                100
+Throughput
+
+
+
+
+                      50
+
+
+
+                       0
+                                                                                   (a) iperf TCP (1 thread, size=1024B)
+                100
+                                                                                                                                                                               VPRI
+Request/sec
+
+
+
+
+                                                                                                                                                                               VIO
+                      50
+
+
+
+
+                       0
+                                                                                  (b) Nginx (2 threads, 200 connections)
+                100
+RPS of GET
+
+
+
+
+                      50
+
+
+
+
+                       0
+                                                                                  (c) Redis (16 threads, GET size=256B)
+                100
+Net Rate
+
+
+
+
+                      50
+
+
+
+
+                       0
+                                   1
+
+
+                                         5
+
+
+                                                  10
+
+
+                                                            20
+
+
+                                                                 50
+
+
+
+                                                                        1
+
+
+                                                                              5
+
+
+                                                                                       10
+
+
+                                                                                                 20
+
+
+                                                                                                         50
+
+
+
+                                                                                                                   1
+
+
+                                                                                                                             5
+
+
+                                                                                                                                  10
+
+
+                                                                                                                                            20
+
+
+                                                                                                                                                 50
+
+
+
+                                                                                                                                                      1
+
+
+                                                                                                                                                          5
+
+
+                                                                                                                                                                10
+
+
+                                                                                                                                                                          20
+
+
+                                                                                                                                                                               50
+                                                                                                        Fault Latency (ms)
+                                                                              (d) Memcached (8 threads, keysize=64B)
+
+                                       Figure 11: VPRI[SOSP’24] vs VIO Performance comparison normalized to respective passthrough mode.
+
+
+                                                                                                 VPRI            10 Gbps with minimal fluctuation. This robustness effectively
+                      20
+                                                                                                 VIO             mitigates I/O jitter, ensuring predictable I/O performance even
+Bitrate (Gbits/sec)
+
+
+
+
+                      15                                                                                         under bursty or high-load conditions. Consequently, VIO en-
+                                                                                                                 ables CSPs to achieve better compliance with I/O SLOs while
+                      10                                                                                         reducing the operational burden of jitter management, making
+                                                                                                                 it a reliable solution for production-scale environments.
+                           5
+
+                           0                                                                                      4.4        VIO in Production
+                               0             2               4         6          8               10
+                                                             Time (seconds)
+                                                                                                                 We have deployed VIO in one of the largest global CSPs for
+                                                                                                                 over a year. During this time, we collected extensive produc-
+Figure 12: iperf3 performance when IOPF occurs in a fixed
+                                                                                                                 tion data from its deployment. Throughout the upgrade and
+rate of 1s and fault latency of 5ms.
+                                                                                                                 operational phases, there have been no user-reported issues
+                                                                                                                 related to I/O SLOs. Below, we present actual production data
+   To evaluate the impact of IOPF on I/O jitter, we used iperf                                                   gathered from the deployment of VIO.
+to measure network bandwidth, sampling throughput data ev-                                                       IOPF in High Oversubscription: Figure 13 illustrates the
+ery 0.1 seconds. Figure 12 reveals that VPRI suffers from                                                        distribution of page accesses and the single IOPF observed
+significant bursts of packet loss due to its reliance on retrans-                                                during the trace. Under a 30% memory oversubscription rate,
+missions when an IOPF occurs. This behavior leads to highly                                                      we analyzed a page access trace over a one-hour period using
+unstable throughput, frequently dropping nearly to zero dur-                                                     YCSB Workload on Redis.5 During this time, the system
+ing retransmission periods. These bursts not only degrade                                                        recorded 1,464,225 unique page accesses but encountered
+the average throughput but also amplify I/O jitter, making it                                                    only a single IOPF. This result highlights the effectiveness of
+difficult for VPRI to meet SLO requirements.                                                                     the lockpage mechanism in maintaining low IOPF rates even
+                                                                                                                 under high memory pressure.
+   In contrast, VIO demonstrates remarkable stability under
+                                                                                                                    The lockpage mechanism ensures that frequently accessed
+the same testing conditions. By decoupling IOPF handling
+                                                                                                                 I/O pages are pinned in memory, reducing the need for costly
+from the critical data path, VIO avoids packet loss and retrans-
+missions, resulting in consistent throughput that remains near                                                         5YCSB, https://github.com/brianfrankcooper/YCSB
+
+
+
+
+USENIX Association                                                            19th USENIX Symposium on Operating Systems Design and Implementation                                  85
+                         00
+                                                                                                                                               100.0
+                        0
+
+                                                                                                100
+                     00
+                  20
+
+
+
+
+                                                                          Transaction/s (10k)
+                0x
+
+
+
+
+                                                                                                                                  90.0
+                                                                                                                    87.0
+   GFN
+
+
+
+
+                                                                                                 80
+
+                                              IOPF Occurs
+                                                                                                        60.5
+                                                                                                 60
+                                          Time (second)
+                         00
+                     00
+                    60
+
+
+
+
+                                                                                                      coIOMMU   VIO Snooping VIO Snooping VIO Passthrough
+                    0x
+
+
+
+
+                                                                                                                w/o lockpage  w/ lockpage
+Figure 13: Page Access Trace (1:5000 Downsample). The
+figure shows a one-hour YCSB Workload on Redis under 30%                   Figure 15: Ablation study of VIO under netperf TCP_RR.
+memory oversubscription, with only one IOPF observed.                      Lockpage improves snooping performance by 3.4%, while
+                                                                           passthrough mode outperforms snooping by 11.1%.
+
+                     104
+                                   7474
+Page Fault Amount
+
+
+
+
+                                                                           high IOPS, VIO operating in snooping mode exhibits a 10%
+                                                                           performance degradation compared to VIO in passthrough
+                     103                      Less Than 1% of
+                                                                           mode. This performance difference highlights the overhead
+                                              CPU-side Page Faults
+                                                                           of snooping under heavy I/O load and underscores the neces-
+                     102                                                   sity for Elastic Passthrough to switch to passthrough mode in
+                                                                           such scenarios. For comparison, we implemented colOMMU
+                                                          37               and observed that its performance at high IOPS reached only
+                                                                           60.5% of the native passthrough performance. This result
+                                CPU-side PF         IO-side PF
+                                                                           indicates that colOMMU is less suitable for production envi-
+                                                                           ronments with demanding I/O workloads.
+Figure 14: Daily Page Fault Comparison. The figure shows
+IOPFs reduced to less than 1% of CPU Page Faults, highlight-
+ing the effectiveness of the lockpage mechanism in ensuring                5                      Related Work
+I/O SLO requirement.
+                                                                           Static Memory Pinning Avoidance: To solve the problem
+                                                                           of static memory pinning caused by IOPFs, PCI-SIG pro-
+page faults. In this case, the mechanism effectively identified            posed the ATS/PRI specification [3]. However, ATS/PRI has
+and locked critical pages, allowing the workload to run with               not been widely adopted by I/O devices. Both industry and
+minimal interruptions.                                                     academia have explored various ways to address this issue.
+Daily Page Faults Rate: As shown in Figure 14, the lock-                   Previous research [17, 18, 27, 35] introduced IOPF handling
+page mechanism in the production environment effectively                   into RDMA and DPU devices using methods similar to PRI
+reduced IOPFs to less than 1% of CPU Page Faults. By pin-                  from a hardware perspective. However, these PRI-like meth-
+ning frequently accessed I/O pages in memory, it minimized                 ods suffer from significant performance degradation as the
+the occurrence of costly page faults, ensuring stable and effi-            number of IOPFs increases because they handle page faults in
+cient I/O operations for VMs.                                              the critical path [16, 18, 49]. There have also been approaches
+   This reduction in IOPFs is critical for meeting I/O SLOs.               for handling IOPF in GPUs [22, 38], but these methods are
+It prevents performance degradation caused by resource con-                specific for GPUs, not suitable for general network and stor-
+tention, ensuring low latency and consistent performance for               age devices.
+critical workloads, even in high-density, multi-tenant environ-               Many software-based solutions have also been proposed to
+ments.                                                                     solve the IOPF problem. coIOMMU [39] and vIOMMU [8]
+Ablation Study: To evaluate the individual contributions                   use para-virtualization to support IOPFs, where the guest ker-
+of VIO’s components, we conducted an ablation study using                  nel and the hypervisor work together to implement dynamic
+the netperf TCP_RR benchmark. 6 As shown in Figure 15,                     memory pinning. IOGuard [12] dedicates one CPU core to
+in snooping mode we observed a 3.4% performance differ-                    handle IOPFs in software. These software solutions either
+ence between VIO without lockpage and VIO with lockpage                    require modifications to the VM, leading to poor performance,
+(870, 000 to 900, 000 transactions per second). This improve-              or consume valuable CPU resources, which is unacceptable
+ment is attributed to the lockpage hit mechanism reducing                  in cloud environments.
+snooping overhead by approximately 1us per operation. At                      On the other hand, VIO provides a high-performance and
+                                                                           cost-effective way to handle IOPFs without requiring changes
+              6 netperf, https://hewlettpackard.github.io/netperf/         to the guest or additional hardware features.
+
+
+
+86                   19th USENIX Symposium on Operating Systems Design and Implementation                                           USENIX Association
+   Memory Page Tracking: Various studies have aimed at            6.2    Generalizability
+detecting hot pages to reduce access latency by pinning or
+placing them in faster memory. Some approaches track mem-         While VIO is initially implemented and evaluated within
+ory access by utilizing page faults [23, 25, 45], while oth-      the VirtIO framework, its underlying principles of IOPA-
+ers focus on periodically checking reference bits in PTEs to      Snooping and Elastic Passthrough are applicable to other I/O
+monitor page hotness [26, 32, 36, 42, 48]. Modern processors      architectures. Within the virtIO ecosystem, VIO effectively
+provide advanced hardware features for performance moni-          supports both network devices (virtio-net) and storage de-
+toring, such as Intel’s PEBS and AMD’s IBS, which enable          vices (virtio-blk), demonstrating its versatility. Furthermore,
+precise tracking of memory access events [10]. More recent        we have successfully extended VIO’s concepts to the NVMe
+works [13, 26, 47] have adopted these hardware-based tech-        protocol. In NVMe, I/O submission involves writing the tail
+niques for enhanced memory access monitoring. However, a          index to a doorbell register. We adapted IOPA-Snooping by in-
+key challenge is balancing the trade-off between the accuracy     tercepting this doorbell register write, enabling us to monitor
+of sampling and the overhead it incurs, especially as memory      I/O requests and proactively handle potential IOPFs. Addi-
+usage scales. To overcome this, a novel approach [14] com-        tionally, we implemented Elastic Passthrough for NVMe by
+bines TLB and PTE sampling, based on the observation that         monitoring IOPS and dynamically switching between snoop-
+frequently accessed pages tend to experience a high rate of       ing and direct I/O, similar to the VirtIO implementation. These
+TLB misses. VIO takes advantage of its VirtIO data plane to       implementations across VirtIO-net, VirtIO-blk, and NVMe
+track I/O page access in a way that is transparent to both the    demonstrate that VIO’s core ideas can be generalized beyond
+device and the guest OS.                                          the VirtIO model, offering a more broadly applicable solution
+                                                                  for managing I/O in virtualized environments.
+
+
+                                                                  6.3    Future Work
+6     Discussion                                                  The VirtIO 1.1 standard draft, introduced in 2018, offers the
+                                                                  Packed virtqueue as a more efficient alternative to the Split
+                                                                  virtqueue [1]. Future iterations of VIO are planned to support
+6.1    Compatibility                                              VirtIO 1.1, further improving I/O efficiency and scalability.
+
+In this paper, we present a Linux-based implementation of
+VIO, which ensures high compatibility for several key reasons.    7     Conclusion
+First, VIO is built upon the VirtIO interface, a standardized
+virtual I/O interface that is supported across various CPU        This paper presents VIO, a production-level I/O virtualiza-
+architectures and does not depend on specific hardware I/O        tion framework offering hardware independence, high perfor-
+devices or kernel versions. This makes the implementation         mance, and resource efficiency. VIO introduces: 1) an elastic
+highly portable and flexible. Second, VIO does not require        passthrough mechanism adapting to IOPS demands for near-
+any modifications to the guest OS, as it operates transparently   native performance; 2) an adaptive lockpage mechanism re-
+through the VirtIO interface. This ensures that VIO maintains     ducing IOPFs by pinning frequently accessed pages; and 3) a
+full compatibility with a wide range of guest OSes, includ-       proactive snooping approach separating IOPF handling from
+ing Linux, BSD, and even Windows, without enforcing any           the critical I/O path. Unlike PRI, which struggles with latency
+changes or additional dependencies. In theory, VIO can work       and limited hardware adoption, VIO provides a practical and
+with other hypervisors like Xen, Firecracker which supports       efficient solution for large-scale cloud environments.
+VirtIO for efficient I/O virtualization. Moreover, VIO’s design      VIO, deployed across 300K VMs, achieves up to the equiv-
+leverages basic virtualization features of the system, ensuring   alent of 30K VM memory daily savings while maintaining
+broad hardware compatibility. CPU platforms, including Pow-       I/O SLOs with less than 1% IOPFs compared to CPU page
+erPC, ARM, and RISC-V, can theoretically support VIO, as          faults, demonstrating its efficiency and scalability in produc-
+they widely adopt VirtIO in their virtualization ecosystems.      tion environments.
+
+   VIO requires guest VMs to use VirtIO and assumes the
+presence of a DPU that supports VirtIO offload. Major DPU         8     Acknowledgements
+vendors such as Intel and Mellanox support this function-
+ality [5, 6], and our in-house DPU also implements it. In         We thank our shepherd and the anonymous reviewers for the
+principle, any kernel version with VirtIO support can work        insightful comments that improved the quality of this paper.
+with VIO. In our deployment, we have successfully migrated        This work was supported in part by the National NSF of China
+legacy VMs—including a 10-year-old CentOS 5 instance with         (NO. 62141218, 62232012), and Shanghai Key Laboratory of
+kernel version 2.6.18—to VIO without modification.                Scalable Computing and Systems.
+
+
+
+USENIX Association                            19th USENIX Symposium on Operating Systems Design and Implementation           87
+References                                                                          PADHYE , J., P OPURI , G., R AINDEL , S., S APRE , T., S HAW, M., S ILVA ,
+                                                                                    G., S IVAKUMAR , M., S RIVASTAVA , N., V ERMA , A., Z UHAIR , Q.,
+ [1] Virtual I/O Device (VIRTIO) Version 1.1.         https://docs.                 BANSAL , D., B URGER , D., VAID , K., M ALTZ , D. A., AND G REEN -
+     oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.                           BERG , A. G. Azure accelerated networking: Smartnics in the public
+     1-csprd01.html, Dec. 2018. [Online; accessed 14. May 2025].                    cloud. In 15th USENIX Symposium on Networked Systems Design and
+ [2] mm / virtio: Provide support for free page reporting. https://lwn.             Implementation, NSDI 2018, Renton, WA, USA, April 9-11, 2018 (2018),
+     net/Articles/808807, Jan. 2020. [Online; accessed 9. May 2025].                S. Banerjee and S. Seshan, Eds., USENIX Association, pp. 51–66.
+
+ [3] Address Translation Services Revision 1.1 | PCI-SIG, Dec. 2024. [On-     [15] F UKUOKA , T., S ATO , S., AND TAURA , K. Pitfalls of infiniband with
+     line; accessed 6. Dec. 2024].                                                 on-demand paging. In 2021 IEEE International Symposium on Perfor-
+                                                                                   mance Analysis of Systems and Software (ISPASS) (2021), pp. 265–275.
+ [4] Linux Plumbers Conference 2024. https://lpc.events/event/18/
+     contributions/1684, May 2025. [Online; accessed 14. May 2025].           [16] F UKUOKA , T., S ATO , S., AND TAURA , K. Pitfalls of infiniband with
+                                                                                   on-demand paging. In IEEE International Symposium on Performance
+ [5] Powering Infrastructure to Help Shape the Data Center                         Analysis of Systems and Software, ISPASS 2021, Stony Brook, NY, USA,
+     of the Future.         https://www.intel.com/content/dam/                     March 28-30, 2021 (2021), IEEE, pp. 265–275.
+     www/central-libraries/us/en/documents/2022-09/
+     ipu-baidu-dpu-white-paper.pdf, May 2025.      [Online; ac-               [17] G UO , K., L I , D., L UO , B., S HEN , Y., P ENG , K., L UO , N., DAI , S.,
+     cessed 15. May 2025].                                                         L IANG , C., S ONG , J., YANG , H., Z HANG , X., AND M I , Z. VPRI:
+                                                                                   efficient I/O page fault handling via software-hardware co-design for
+ [6] VirtIO-net Emulated Devices - NVIDIA Docs. https://docs.                      iaas clouds. In Proceedings of the ACM SIGOPS 30th Symposium on
+     nvidia.com/networking/display/bluefielddpubspv422/                            Operating Systems Principles, SOSP 2024, Austin, TX, USA, November
+     virtio-net+emulated+devices, May 2025. [Online; accessed 15.                  4-6, 2024 (2024), E. Witchel, C. J. Rossbach, A. C. Arpaci-Dusseau,
+     May 2025].                                                                    and K. Keeton, Eds., ACM, pp. 541–557.
+ [7] A LLEN , T., AND G E , R. In-depth analyses of unified virtual memory    [18] G UO , Z., S HAN , Y., L UO , X., H UANG , Y., AND Z HANG , Y. Clio:
+     system for gpu accelerated computing. In Proceedings of the Inter-            a hardware-software co-designed disaggregated memory system. In
+     national Conference for High Performance Computing, Networking,               ASPLOS ’22: 27th ACM International Conference on Architectural Sup-
+     Storage and Analysis (New York, NY, USA, 2021), SC ’21, Association           port for Programming Languages and Operating Systems, Lausanne,
+     for Computing Machinery.                                                      Switzerland, 28 February 2022 - 4 March 2022 (2022), B. Falsafi,
+ [8] A MIT, N., B EN -Y EHUDA , M., T SAFRIR , D., AND S CHUSTER , A.              M. Ferdman, S. Lu, and T. F. Wenisch, Eds., ACM, pp. 417–433.
+     viommu: Efficient IOMMU emulation. In Proceedings of the 2011            [19] H AR ’E L , N., G ORDON , A., L ANDAU , A., B EN -Y EHUDA , M.,
+     USENIX Annual Technical Conference, USENIX ATC 2011, Portland,                T RAEGER , A., AND L ADELSKY, R. Efficient and scalable paravirtual
+     OR, USA, June 15-17, 2011 (2011), J. Nieh and C. A. Waldspurger,              I/O system. In 2013 USENIX Annual Technical Conference (USENIX
+     Eds., USENIX Association.                                                     ATC 13) (San Jose, CA, June 2013), USENIX Association, pp. 231–
+ [9] A MIT, N., AND W EI , M. The design and implementation of hyperup-            242.
+     calls. In Proceedings of the 2018 USENIX Annual Technical Confer-        [20] H UDZIA , B. On allowing shorter timeout on mellanox cards and other
+     ence, USENIX ATC 2018, Boston, MA, USA, July 11-13, 2018 (2018),              tips and tricks. https://www.reflectionsofthevoid.com/2014/
+     H. S. Gunawi and B. C. Reed, Eds., USENIX Association, pp. 97–112.            02/on-allowing-shorter-timeout-on-mellanox.html, 2014.
+[10] B EN -Y EHUDA , M., DAY, M. D., D UBITZKY, Z., FACTOR , M.,                   Accessed: 2024-12-10.
+     H AR ’E L , N., G ORDON , A., L IGUORI , A., WASSERMAN , O., AND         [21] JALEEL , A., E BRAHIMI , E., AND D UNCAN , S. Ducati: High-
+     YASSOUR , B. The turtles project: Design and implementation of nested         performance address translation by extending tlb reach of gpu-
+     virtualization. In 9th USENIX Symposium on Operating Systems De-              accelerated systems. ACM Trans. Archit. Code Optim. 16, 1 (Mar.
+     sign and Implementation, OSDI 2010, October 4-6, 2010, Vancouver,             2019).
+     BC, Canada, Proceedings (2010), R. H. Arpaci-Dusseau and B. Chen,
+                                                                              [22] K IM , H., S IM , J., G ERA , P., H ADIDI , R., AND K IM , H. Batch-aware
+     Eds., USENIX Association, pp. 423–436.
+                                                                                   unified memory management in gpus for irregular workloads. In AS-
+[11] C HEN , Y., B ILAS , A., DAMIANAKIS , S. N., D UBNICKI , C., AND L I ,        PLOS ’20: Architectural Support for Programming Languages and
+     K. Utlb: a mechanism for address translation on network interfaces.           Operating Systems, Lausanne, Switzerland, March 16-20, 2020 (2020),
+     SIGOPS Oper. Syst. Rev. 32, 5 (Oct. 1998), 193–204.                           J. R. Larus, L. Ceze, and K. Strauss, Eds., ACM, pp. 1357–1370.
+[12] D ONG , Y., AND M I , Z. Ioguard: Software-based I/O page fault han-     [23] K IM , J., C HOE , W., AND A HN , J. Exploring the design space of
+     dling with one CPU core. In Proceedings of the 15th Asia-Pacific              page management for multi-tiered memory systems. In Proceedings of
+     Symposium on Internetware, Internetware 2024, Macau, SAR, China,              the 2021 USENIX Annual Technical Conference, USENIX ATC 2021,
+     July 24-26, 2024 (2024), H. Mei, J. Lv, A. Helal, X. Ma, S. Cheung,           July 14-16, 2021 (2021), I. Calciu and G. Kuenning, Eds., USENIX
+     J. Zhang, and T. Zhang, Eds., ACM.                                            Association, pp. 715–728.
+[13] D URAISAMY, P., X U , W., H ARE , S., R AJWAR , R., C ULLER , D. E.,     [24] K UPERMAN , Y., M OSCOVICI , E., N IDER , J., L ADELSKY, R., G OR -
+     X U , Z., FAN , J., K ENNELLY, C., M C C LOSKEY, B., M IJAILOVIC , D.,        DON , A., AND T SAFRIR , D. Paravirtual remote i/o. In Proceedings of
+     M ORRIS , B., M UKHERJEE , C., R EN , J., T HELEN , G., T URNER , P.,         the Twenty-First International Conference on Architectural Support for
+     V ILLAVIEJA , C., R ANGANATHAN , P., AND VAHDAT, A. Towards an                Programming Languages and Operating Systems (New York, NY, USA,
+     adaptable systems architecture for memory tiering at warehouse-scale.         2016), ASPLOS ’16, Association for Computing Machinery, p. 49–65.
+     In Proceedings of the 28th ACM International Conference on Archi-
+                                                                              [25] L AGAR -C AVILLA , H. A., A HN , J., S OUHLAL , S., AGARWAL , N.,
+     tectural Support for Programming Languages and Operating Systems,
+                                                                                   B URNY, R., B UTT, S., C HANG , J., C HAUGULE , A., D ENG , N.,
+     Volume 3, ASPLOS 2023, Vancouver, BC, Canada, March 25-29, 2023
+                                                                                   S HAHID , J., T HELEN , G., Y URTSEVER , K. A., Z HAO , Y., AND R AN -
+     (2023), T. M. Aamodt, N. D. E. Jerger, and M. M. Swift, Eds., ACM,
+                                                                                   GANATHAN , P. Software-defined far memory in warehouse-scale com-
+     pp. 727–741.
+                                                                                   puters. In Proceedings of the Twenty-Fourth International Conference
+[14] F IRESTONE , D., P UTNAM , A., M UNDKUR , S., C HIOU , D., DABAGH ,           on Architectural Support for Programming Languages and Operat-
+     A., A NDREWARTHA , M., A NGEPAT, H., B HANU , V., C AULFIELD ,                ing Systems, ASPLOS 2019, Providence, RI, USA, April 13-17, 2019
+     A. M., C HUNG , E. S., C HANDRAPPA , H. K., C HATURMOHTA , S.,                (2019), I. Bahar, M. Herlihy, E. Witchel, and A. R. Lebeck, Eds., ACM,
+     H UMPHREY, M., L AVIER , J., L AM , N., L IU , F., OVTCHAROV, K.,             pp. 317–330.
+
+
+
+
+88    19th USENIX Symposium on Operating Systems Design and Implementation                                                         USENIX Association
+[26] L EE , T., M ONGA , S. K., M IN , C., AND E OM , Y. I. MEMTIS: effi-             [40] VOGEL , P., M ARONGIU , A., AND B ENINI , L. Exploring shared vir-
+     cient memory tiering with dynamic page classification and page size                   tual memory for fpga accelerators with a configurable iommu. IEEE
+     determination. In Proceedings of the 29th Symposium on Operating                      Transactions on Computers 68, 4 (2019), 510–525.
+     Systems Principles, SOSP 2023, Koblenz, Germany, October 23-26,                  [41] WALDSPURGER , C. A. Memory resource management in vmware
+     2023 (2023), J. Flinn, M. I. Seltzer, P. Druschel, A. Kaufmann, and                   ESX server. In 5th Symposium on Operating System Design and Imple-
+     J. Mace, Eds., ACM, pp. 17–34.                                                        mentation (OSDI 2002), Boston, Massachusetts, USA, December 9-11,
+[27] L ESOKHIN , I., E RAN , H., R AINDEL , S., S HAPIRO , G., G RIMBERG ,                 2002 (2002), D. E. Culler and P. Druschel, Eds., USENIX Association.
+     S., L ISS , L., B EN -Y EHUDA , M., A MIT, N., AND T SAFRIR , D. Page
+     fault support for network controllers. In Proceedings of the Twenty-             [42] WANG , Y., C HEN , L., D ENG , T., L UO , B., S HEN , Y., W EI , Z., X U ,
+     Second International Conference on Architectural Support for Pro-                     Y., H UANG , M., AND Q I , Z. Effectively virtual page prefetching via
+     gramming Languages and Operating Systems, ASPLOS 2017, Xi’an,                         spatial-temporal patterns for memory-intensive cloud applications. In
+     China, April 8-12, 2017 (2017), Y. Chen, O. Temam, and J. Carter, Eds.,               ACM SIGPLAN Symposium on Principles and Practice of Parallel
+     ACM, pp. 449–466.                                                                     Programming (PPoPP 2025) (2025). To appear.
+[28] L ESOKHIN , I., E RAN , H., R AINDEL , S., S HAPIRO , G., G RIMBERG ,            [43] WANG , Y., L UO , B., AND S HEN , Y. Efficient memory overcommit-
+     S., L ISS , L., B EN -Y EHUDA , M., A MIT, N., AND T SAFRIR , D. Page                 ment for I/O passthrough enabled vms via fine-grained page meta-data
+     fault support for network controllers. SIGARCH Comput. Archit. News                   management. In Proceedings of the 2023 USENIX Annual Techni-
+     45, 1 (Apr. 2017), 449–466.                                                           cal Conference, USENIX ATC 2023, Boston, MA, USA, July 10-12,
+                                                                                           2023 (2023), J. Lawall and D. Williams, Eds., USENIX Association,
+[29] L IU , J., H UANG , W., A BALI , B., AND PANDA , D. K. High perfor-
+                                                                                           pp. 769–783.
+     mance VMM-Bypass I/O in virtual machines. In 2006 USENIX Annual
+     Technical Conference (USENIX ATC 06) (Boston, MA, May 2006),                     [44] W EINER , J., AGARWAL , N., S CHATZBERG , D., YANG , L., WANG ,
+     USENIX Association.                                                                   H., S ANOUILLET, B., S HARMA , B., H EO , T., JAIN , M., TANG , C.,
+                                                                                           AND S KARLATOS , D. Tmo: transparent memory offloading in data-
+[30] L IU , Y., M A , J., Z HANG , Z., L I , L., Q I , Z., AND G UAN , H. Megatron:
+     Software-managed device tlb for shared-memory fpga virtualization.                    centers. In Proceedings of the 27th ACM International Conference
+     In 2021 58th ACM/IEEE Design Automation Conference (DAC) (2021),                      on Architectural Support for Programming Languages and Operating
+     pp. 1213–1218.                                                                        Systems (New York, NY, USA, 2022), ASPLOS ’22, Association for
+                                                                                           Computing Machinery, p. 609–621.
+[31] PARK , J., J EONG , D., AND K IM , J. Uvmmu: Hardware-offloaded page
+     migration for heterogeneous computing. In 2023 Design, Automation                [45] W EINER , J., AGARWAL , N., S CHATZBERG , D., YANG , L., WANG ,
+     & Test in Europe Conference & Exhibition (DATE) (2023), pp. 1–6.                      H., S ANOUILLET, B., S HARMA , B., H EO , T., JAIN , M., TANG , C.,
+                                                                                           AND S KARLATOS , D. TMO: transparent memory offloading in dat-
+[32] PARK , S., B HOWMIK , M., AND U TA , A. DAOS: data access-aware
+                                                                                           acenters. In ASPLOS ’22: 27th ACM International Conference on
+     operating system. In HPDC ’22: The 31st International Symposium
+                                                                                           Architectural Support for Programming Languages and Operating Sys-
+     on High-Performance Parallel and Distributed Computing, Minneapo-
+                                                                                           tems, Lausanne, Switzerland, 28 February 2022 - 4 March 2022 (2022),
+     lis, MN, USA, 27 June 2022 - 1 July 2022 (2022), J. B. Weissman,
+                                                                                           B. Falsafi, M. Ferdman, S. Lu, and T. F. Wenisch, Eds., ACM, pp. 609–
+     A. Chandra, A. Gavrilovska, and D. Tiwari, Eds., ACM, pp. 4–15.
+                                                                                           621.
+[33] PCI-SIG. Address translation services revision 1.1, 2009. Accessed:
+     2024-12-10.                                                                      [46] W ÜNSCHE , J., K ARIM , S., K UHN , M., B RONESKE , D., AND S AAKE ,
+                                                                                           G. Intelligent data migration policies in a write-optimized copy-on-
+[34] P ICHAI , B., H SU , L., AND B HATTACHARJEE , A. Architectural sup-
+                                                                                           write tiered storage stack. In Proceedings of the 3rd Workshop on
+     port for address translation on gpus: designing memory management
+                                                                                           Challenges and Opportunities of Efficient and Performant Storage
+     units for cpu/gpus with unified address spaces. SIGPLAN Not. 49, 4
+                                                                                           Systems (New York, NY, USA, 2023), CHEOPS ’23, Association for
+     (Feb. 2014), 743–758.
+                                                                                           Computing Machinery, p. 17–26.
+[35] P SISTAKIS , A., C HRYSOS , N., C HAIX , F., A SIMINAKIS , M., G IAN -
+     NIOUDIS , M., X IROUCHAKIS , P., PAPAEFSTATHIOU , V., AND K AT-
+                                                                                      [47] X IANG , L., L IN , Z., D ENG , W., L U , H., R AO , J., Y UAN , Y., AND
+     EVENIS , M. PART: pinning avoidance in RDMA technologies. In 14th
+                                                                                           WANG , R. Nomad: Non-exclusive memory tiering via transactional
+     IEEE/ACM International Symposium on Networks-on-Chip, NOCS                            page migration. In 18th USENIX Symposium on Operating Systems
+     2020, Hamburg, Germany, September 24-25, 2020 (2020), IEEE, pp. 1–                    Design and Implementation, OSDI 2024, Santa Clara, CA, USA, July
+     8.                                                                                    10-12, 2024 (2024), A. Gavrilovska and D. B. Terry, Eds., USENIX
+                                                                                           Association, pp. 19–35.
+[36] R EN , J., X U , D., RYU , J., S HIN , K., K IM , D., AND L I , D. MTM:
+     rethinking memory profiling and migration for multi-tiered large mem-            [48] YAN , Z., L USTIG , D., N ELLANS , D. W., AND B HATTACHARJEE , A.
+     ory. In Proceedings of the Nineteenth European Conference on Com-                     Nimble page management for tiered memory systems. In Proceed-
+     puter Systems, EuroSys 2024, Athens, Greece, April 22-25, 2024 (2024),                ings of the Twenty-Fourth International Conference on Architectural
+     ACM, pp. 803–817.                                                                     Support for Programming Languages and Operating Systems, ASP-
+                                                                                           LOS 2019, Providence, RI, USA, April 13-17, 2019 (2019), I. Bahar,
+[37] S TEVE S ISTARE , M. K. QEMU Live Update. https://blogs.
+                                                                                           M. Herlihy, E. Witchel, and A. R. Lebeck, Eds., ACM, pp. 331–345.
+     oracle.com/linux/post/qemu-live-update, May 2025. [Online;
+     accessed 14. May 2025].                                                          [49] YANG , J., I ZRAELEVITZ , J., AND S WANSON , S. Filemr: Rethinking
+[38] TANASIC , I., G ELADO , I., J ORDÀ , M., AYGUADÉ , E., AND                            RDMA networking for scalable persistent memory. In 17th USENIX
+     NAVARRO , N. Efficient exception handling support for gpus. In                        Symposium on Networked Systems Design and Implementation, NSDI
+     Proceedings of the 50th Annual IEEE/ACM International Symposium                       2020, Santa Clara, CA, USA, February 25-27, 2020 (2020), R. Bhagwan
+     on Microarchitecture, MICRO 2017, Cambridge, MA, USA, October                         and G. Porter, Eds., USENIX Association, pp. 111–125.
+     14-18, 2017 (2017), H. C. Hunter, J. Moreno, J. S. Emer, and                     [50] Z HANG , X., Z HENG , X., WANG , Z., L I , Q., F U , J., Z HANG , Y., AND
+     D. Sánchez, Eds., ACM, pp. 109–122.                                                   S HEN , Y. Fast and scalable VMM live upgrade in large cloud infrastruc-
+[39] T IAN , K., Z HANG , Y., K ANG , L., Z HAO , Y., AND D ONG , Y.                       ture. In Proceedings of the Twenty-Fourth International Conference
+     coiommu: A virtual IOMMU with cooperative DMA buffer tracking                         on Architectural Support for Programming Languages and Operat-
+     for efficient memory management in direct I/O. In Proceedings of                      ing Systems, ASPLOS 2019, Providence, RI, USA, April 13-17, 2019
+     the 2020 USENIX Annual Technical Conference, USENIX ATC 2020,                         (2019), I. Bahar, M. Herlihy, E. Witchel, and A. R. Lebeck, Eds., ACM,
+     July 15-17, 2020 (2020), A. Gavrilovska and E. Zadok, Eds., USENIX                    pp. 93–105.
+     Association, pp. 479–492.
+
+
+
+
+USENIX Association                                          19th USENIX Symposium on Operating Systems Design and Implementation                                 89
+

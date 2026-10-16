@@ -1,0 +1,726 @@
+--- a/scripts/research_plan.py
++++ b/scripts/research_plan.py
+@@ -99,6 +99,20 @@
+     ("cost", "solo"),
+     ("cost", "a8g0"),
+     ("cost", "a16g0"),
+ )
+ 
++# ``cost-followup`` is a fixed, independent follow-up collection segment.  It
++# is NOT the completion of the frozen 84-case run: it re-uses the two frozen
++# short-stage cost cases and the main-stage cost conditions Solo/A8g0/A8g2000
++# (three blocks each) exactly as they already appear in the frozen plan, so
++# every selected case keeps its original id, ordinal and per-block order and
++# only the other cost conditions are dropped.  Selection is a pure filter over
++# the frozen case list: build_plan() and the frozen TSV bytes do not change.
++FOLLOWUP_MODE = "cost-followup"
++FOLLOWUP_SHORT_IDS = ("short-cost-solo", "short-cost-a8g0")
++FOLLOWUP_MAIN_CONDITIONS = ("solo", "a8g0", "a8g2000")
++FOLLOWUP_CASE_COUNT = (
++    len(FOLLOWUP_SHORT_IDS) + COST_BLOCKS * len(FOLLOWUP_MAIN_CONDITIONS)
++)
++
+ TSV_COLUMNS = (
+     "id",
+     "ordinal",
+@@ -286,7 +300,35 @@
+         "cases": cases,
+     }
+     plan["tsv_sha256"] = hashlib.sha256(to_tsv(plan).encode("utf-8")).hexdigest()
+     return plan
+ 
+ 
++def select_cases(cases, mode):
++    """Return the cases one runner mode selects, in frozen execution order.
++
++    ``short`` keeps the historical short-stage prefix and ``all`` the whole
++    frozen list.  ``cost-followup`` is a pure filter over the frozen list - the
++    two frozen short-stage cost cases plus every main-stage cost case whose
++    condition is in ``FOLLOWUP_MAIN_CONDITIONS`` - so the original ids,
++    ordinals and per-block order are preserved and only the other conditions
++    are dropped.  The caller checks the resulting count.
++    """
++    if mode == "short":
++        return list(cases[: len(SHORT_STAGE)])
++    if mode == "all":
++        return list(cases)
++    if mode == FOLLOWUP_MODE:
++        selected = []
++        for case in cases:
++            if (case["stage"] == "short" and case["mode"] == "cost"
++                    and case["id"] in FOLLOWUP_SHORT_IDS):
++                selected.append(case)
++            elif (case["stage"] == "main" and case["mode"] == "cost"
++                    and case["condition"] in FOLLOWUP_MAIN_CONDITIONS):
++                selected.append(case)
++        return selected
++    raise ValueError("unknown runner mode: %r" % (mode,))
++
++
+ def to_tsv(plan):
+--- a/scripts/research_results.py
++++ b/scripts/research_results.py
+@@ -5,7 +5,7 @@
+ Usage::
+ 
+-    scripts/research_results.py {short,all} INPUT_DIR --output NEW_DIR
++    scripts/research_results.py {short,all,cost-followup} INPUT_DIR --output NEW_DIR
+ 
+ The analyzer reads a finished board-research run directory (read-only) and
+ writes two new artifacts into NEW_DIR, which must not exist yet:
+@@ -21,6 +21,13 @@
+     (``scripts/research_plan.py``) and its TSV is compared byte for byte with
+     the runner's frozen copies (plan.copy.tsv / plan.selected.tsv).  A plan
+     that does not match the generator is reported unverified, never accepted.
++  * ``cost-followup`` is an independent, fixed follow-up collection segment:
++    the two frozen short-stage cost cases plus the main-stage cost cases whose
++    condition is Solo/A8g0/A8g2000, in their original ids, ordinals and
++    per-block order.  The analyzer expects exactly that selection, never the
++    first eleven rows of the plan.  It does not complete the frozen 84-case
++    run, and new Solo data is never merged with the earlier non-Solo data as
++    one slowdown comparison.
+   * Only the raw words are evidence.  The CLI's ``success``/``validated``
+     booleans are recorded and never trusted; every statement is re-derived from
+     the raw capture using the register map read out of the read mux of
+@@ -61,6 +68,6 @@
+ REPORT_VERSION = 1
+ 
+-MODE_CASES = {"short": 6, "all": 84}
++MODE_CASES = {"short": 6, "all": 84, "cost-followup": 11}
+ 
+ RAW_WORDS = 4096
+ PLATFORM_HZ = 50_000_000
+@@ -536,6 +543,41 @@
+         problems.append("plan.selected.tsv has %d rows, mode needs %d" % (len(cases), count))
+     return cases[:count]
+ 
+ 
++def expected_selection(generator, cases, mode, problems):
++    """Return the cases one runner mode executes, according to the generator.
++
++    ``scripts/research_plan.py`` exposes ``select_cases(cases, mode)``, so the
++    analyzer verifies exactly the rows the runner selected instead of assuming
++    a prefix of the frozen list.  Older generators keep the historical prefix
++    rule, which is exact for short/all and is reported unverifiable for any
++    filtered mode.
++    """
++    selector = getattr(generator, "select_cases", None)
++    if selector is not None:
++        try:
++            return list(selector(cases, mode))
++        except Exception as exc:
++            problems.append("the plan generator's select_cases(%s) failed: %s" % (mode, exc))
++            return None
++    if mode == "all":
++        return list(cases)
++    if mode == "short":
++        return list(cases[:MODE_CASES["short"]])
++    problems.append(
++        "the plan generator cannot select mode %s (no select_cases): the first %d rows are "
++        "assumed and the selection is not independently verified"
++        % (mode, MODE_CASES[mode])
++    )
++    return list(cases[:MODE_CASES[mode]])
++
++
++def render_selected_tsv(cases):
++    """Render a selection exactly as the runner's plan.selected.tsv bytes."""
++    return "".join(
++        "\t".join(str(case[column]) for column in FROZEN_COLUMNS) + "\n" for case in cases
++    )
++
++
+ def verify_plan(base, mode, generator):
+     expected_count = MODE_CASES[mode]
+     info = {
+@@ -576,9 +618,16 @@
+     info["cases_total"] = len(cases)
+     if len(cases) < expected_count:
+         problems.append(
+             "the generator has %d cases but mode %s needs %d" % (len(cases), mode, expected_count)
+         )
+         return info
+-    info["expected_cases"] = cases[:expected_count]
+-    rows = full_tsv.splitlines()
++    expected = expected_selection(generator, cases, mode, problems)
++    if expected is None:
++        return info
++    info["expected_cases"] = expected
++    if len(expected) != expected_count:
++        problems.append(
++            "the plan generator selects %d cases for mode %s, but the mode needs %d"
++            % (len(expected), mode, expected_count)
++        )
+ 
+     if info["copy"]["present"]:
+@@ -598,8 +647,9 @@
+     if info["selected"]["present"]:
+-        expected_selected = "\n".join(rows[1 : 1 + expected_count]) + "\n"
++        expected_selected = render_selected_tsv(expected)
+         if read_text(selected_path) != expected_selected:
+             problems.append(
+-                "plan.selected.tsv does not match the first %d generator rows" % expected_count
++                "plan.selected.tsv does not match the %d cases the generator selects for mode %s"
++                % (expected_count, mode)
+             )
+     else:
+         problems.append("plan.selected.tsv is missing")
+@@ -2002,7 +2052,11 @@
+     add("二、冻结计划（以生成器为准）")
+     plan = report["plan"]
+     add("  plan.copy.tsv 存在：%s；与生成器逐字节一致：%s"
+         % ("是" if plan["copy"]["present"] else "否", "是" if plan["verified"] else "否"))
+-    add("  plan.selected.tsv 与生成器前 %d 行一致：%s"
+-        % (plan["expected_count"], "是" if plan["verified"] else "否"))
++    add("  plan.selected.tsv 与生成器为该模式选出的 %d 个用例一致：%s"
++        % (plan["expected_count"], "是" if plan["verified"] else "否"))
++    if report["mode"] == "cost-followup":
++        add("  说明：cost-followup 是独立的一次软件采集段（2 个已冻结 short cost 用例 + "
++            "主阶段 cost 的 Solo/A8g0/A8g2000 各 3 个，保留原始 id/ordinal/每 block 顺序）。"
++            "它不是完成旧的 84 用例计划；新 Solo 数据不得与旧 non-Solo 数据当作同一版 slowdown 合并。")
+     if plan.get("generator"):
+         add("  生成器：%s（可用：%s）"% (plan["generator"].get("path"), plan["generator"].get("available")))
+     for problem in plan["problems"]:
+@@ -2027,4 +2081,4 @@
+         for problem in report["runner"]["problems"]:
+             add("    %s" % problem)
+-    add("  注：合法停止或 short 模式不要求 84 个用例；缺失与失败逐条列出，不重跑、不丢弃。")
++    add("  注：合法停止、short 模式或 cost-followup 段都不要求 84 个用例；缺失与失败逐条列出，不重跑、不丢弃。")
+     for record in report["cases"]:
+         add("  [%s] %s（%s/%s/%s）"
+             % (record["status"], record["id"], record["stage"], record["mode"], record["condition"]))
+@@ -2192,3 +2246,20 @@
+         status = "ok"
+ 
++    conclusion_notes = [
++        "per-case classifications, per-condition counts and run-local marks only",
++        "no case, condition or repetition is upgraded to a global or hardware claim",
++        "one case never establishes an E2 positive result for the whole matrix",
++        "three repetitions per condition are engineering repetition: no p-value, no "
++        "novelty claim, no full-method decision",
++        "explicit unknowns are reported where the evidence cannot establish a causal chain",
++        "failed, missing and surprising no-aggressor cases are kept and flagged, never "
++        "dropped and never retried",
++    ]
++    if mode == "cost-followup":
++        conclusion_notes.append(
++            "cost-followup is an independent software collection segment: it does not "
++            "complete the frozen 84-case plan, and the new Solo data is never merged "
++            "with the earlier non-Solo data as one slowdown comparison"
++        )
++
+     report = {
+         "schema": REPORT_SCHEMA,
+         "version": REPORT_VERSION,
+@@ -2253,14 +2324,5 @@
+             "e2_global": e2["global_claim"],
+             "cost_claim": "diagnostic_only",
+-            "notes": [
+-                "per-case classifications, per-condition counts and run-local marks only",
+-                "no case, condition or repetition is upgraded to a global or hardware claim",
+-                "one case never establishes an E2 positive result for the whole matrix",
+-                "three repetitions per condition are engineering repetition: no p-value, no "
+-                "novelty claim, no full-method decision",
+-                "explicit unknowns are reported where the evidence cannot establish a causal chain",
+-                "failed, missing and surprising no-aggressor cases are kept and flagged, never "
+-                "dropped and never retried",
+-            ],
++            "notes": conclusion_notes,
+         },
+     }
+--- a/tests/board-research.sh
++++ b/tests/board-research.sh
+@@ -7,7 +7,17 @@
+ # Usage: board-research.sh MODE [OUTPUT_DIR]
+ #   MODE is required and has no implicit default:
+-#     short   run the 6 frozen short-stage cases (ordinals 1..6)
+-#     all     run all 84 frozen cases (6 short + 60 main E2 + 18 main cost)
++#     short          run the 6 frozen short-stage cases (ordinals 1..6)
++#     all            run all 84 frozen cases (6 short + 60 main E2 + 18 main cost)
++#     cost-followup  run the fixed 11-case cost follow-up segment selected from
++#                    the same frozen 84-row plan: the two frozen short-stage
++#                    cost cases (short-cost-solo, short-cost-a8g0) plus the
++#                    main-stage cost cases whose condition is Solo/A8g0/
++#                    A8g2000 (three blocks each), each with its original id,
++#                    ordinal and per-block order.  This is an independent
++#                    software collection segment: it does not complete the
++#                    frozen 84-case run, and its new Solo data must not be
++#                    merged with the earlier non-Solo data as one slowdown
++#                    comparison.
+ #
+ # Rules:
+ #   * The case list comes from one frozen plan file (RESEARCH_PLAN, default
+@@ -73,4 +83,5 @@
+ PLAN_ROWS=84
+ SHORT_ROWS=6
+ ALL_ROWS=84
++FOLLOWUP_ROWS=11
+ STDERR_TAIL_BYTES=2048
+ 
+ usage() {
+@@ -79,8 +90,11 @@
+     cat <<'EOF'
+ Usage: board-research.sh MODE [OUTPUT_DIR]
+   MODE is required; there is no implicit default.
+-    short   run the 6 frozen short-stage cases (ordinals 1..6)
+-    all     run all 84 frozen cases (6 short + 60 main E2 + 18 main cost)
++    short          run the 6 frozen short-stage cases (ordinals 1..6)
++    all            run all 84 frozen cases (6 short + 60 main E2 + 18 main cost)
++    cost-followup  run the fixed 11-case cost follow-up segment selected from
++                   the same frozen 84-row plan (2 frozen short cost cases +
++                   Solo/A8g0/A8g2000 x 3 main cost cases).
+   OUTPUT_DIR must not already exist; this script creates it.
+   Default OUTPUT_DIR: /tmp/research-$$.
+   Plan file: RESEARCH_PLAN or /etc/platform-research-plan.tsv.
+@@ -325,8 +339,21 @@
+ [ $# -ge 1 ] && [ $# -le 2 ] || { usage >&2; exit 2; }
+ MODE=$1
+ case "$MODE" in
+-    short) SEL_N=$SHORT_ROWS ;;
+-    all)   SEL_N=$ALL_ROWS ;;
+-    *) usage >&2; exit 2 ;;
++    short)
++        SEL_N=$SHORT_ROWS
++        MODE_NOTE="frozen short stage, ordinals 1..6 of the frozen 84-case plan"
++        ;;
++    all)
++        SEL_N=$ALL_ROWS
++        MODE_NOTE="all 84 frozen cases (6 short + 60 main E2 + 18 main cost)"
++        ;;
++    cost-followup)
++        SEL_N=$FOLLOWUP_ROWS
++        MODE_NOTE="independent cost-followup segment: 2 frozen short cost + Solo/A8g0/A8g2000 x3 main cost; not a completion of the frozen 84-case plan"
++        ;;
++    *)
++        usage >&2
++        exit 2
++        ;;
+ esac
+ if [ $# -eq 2 ]; then
+@@ -448,9 +475,25 @@
+ } > "$OUT/plan.source.txt" || fatal "plan.source write failed"
+ 
+-if ! sed -n "1,${SEL_N}p" "$OUT/plan.data.tsv" > "$OUT/plan.selected.tsv"; then
+-    fatal "plan selection failed"
+-fi
++# Select the rows this mode executes: short/all keep the historical prefix and
++# the whole plan, cost-followup is a fixed filter over the same validated
++# 84-row plan (no operator edit on the board), so the selected ids, ordinals
++# and per-block order are exactly the frozen ones and other conditions drop out.
++case "$MODE" in
++    cost-followup)
++        if ! awk -F "$TAB" '
++            ($3 == "short" && $4 == "cost" && ($1 == "short-cost-solo" || $1 == "short-cost-a8g0")) ||
++            ($3 == "main" && $4 == "cost" && ($5 == "solo" || $5 == "a8g0" || $5 == "a8g2000"))
++        ' "$OUT/plan.data.tsv" > "$OUT/plan.selected.tsv"; then
++            fatal "plan selection failed"
++        fi
++        ;;
++    *)
++        if ! sed -n "1,${SEL_N}p" "$OUT/plan.data.tsv" > "$OUT/plan.selected.tsv"; then
++            fatal "plan selection failed"
++        fi
++        ;;
++esac
+ selected_rows=$(awk 'END { print NR + 0 }' "$OUT/plan.selected.tsv")
+ if [ "$selected_rows" != "$SEL_N" ]; then
+     fatal "selected row count got=$selected_rows want=$SEL_N"
+@@ -463,7 +506,8 @@
+ {
+     echo "runner=board-research.sh"
+     echo "mode=$MODE"
++    echo "mode_note=$MODE_NOTE"
+     echo "output=$OUT"
+     echo "plan_source=$PLAN_SOURCE"
+     echo "plan_path=$PLAN"
+     echo "plan_copy=plan.copy.tsv"
+--- a/tests/test_research_plan.py
++++ b/tests/test_research_plan.py
+@@ -605,5 +605,222 @@
+         self.assertIn("plan_source=sibling", source)
+ 
+ 
++FOLLOWUP_IDS = (
++    "short-cost-solo",
++    "short-cost-a8g0",
++    "cost-b01-solo",
++    "cost-b01-a8g0",
++    "cost-b01-a8g2000",
++    "cost-b02-a8g0",
++    "cost-b02-a8g2000",
++    "cost-b02-solo",
++    "cost-b03-a8g0",
++    "cost-b03-a8g2000",
++    "cost-b03-solo",
++)
++FOLLOWUP_ORDINALS = (4, 5, 67, 69, 72, 74, 77, 78, 79, 82, 83)
++
++
++class CostFollowupPlanTest(unittest.TestCase):
++    """The fixed cost-followup selection of the frozen 84-case plan.
++
++    Host-side only.  Appended as an independent class so the frozen short/all
++    expectations above and build_plan() itself stay untouched.
++    """
++
++    def test_frozen_plan_still_has_eighty_four_unchanged_cases(self):
++        plan = research_plan.build_plan()
++        self.assertEqual(len(plan["cases"]), 84)
++        self.assertEqual([c["ordinal"] for c in plan["cases"]], list(range(1, 85)))
++        text = research_plan.to_tsv(plan)
++        self.assertEqual(text, FROZEN_TSV.read_text(encoding="utf-8"))
++        self.assertEqual(
++            plan["tsv_sha256"], hashlib.sha256(text.encode("utf-8")).hexdigest()
++        )
++        self.assertEqual(plan["counts"]["total"], 84)
++        self.assertEqual(
++            research_plan.select_cases(plan["cases"], "short"), plan["cases"][:6]
++        )
++        self.assertEqual(len(research_plan.select_cases(plan["cases"], "all")), 84)
++
++    def test_followup_selection_keeps_ids_ordinals_and_plan_order(self):
++        plan = research_plan.build_plan()
++        selected = research_plan.select_cases(plan["cases"], "cost-followup")
++        self.assertEqual([c["id"] for c in selected], list(FOLLOWUP_IDS))
++        self.assertEqual([c["ordinal"] for c in selected], list(FOLLOWUP_ORDINALS))
++        self.assertEqual(len(selected), 11)
++        self.assertEqual(research_plan.FOLLOWUP_CASE_COUNT, 11)
++        self.assertNotEqual(
++            [c["id"] for c in selected], [c["id"] for c in plan["cases"][:11]]
++        )
++        originals = {c["id"]: c for c in plan["cases"]}
++        for case in selected:
++            self.assertIs(case, originals[case["id"]])
++            self.assertEqual(case["mode"], "cost")
++        main = [c for c in selected if c["stage"] == "main"]
++        self.assertEqual(len(main), 9)
++        for condition in ("solo", "a8g0", "a8g2000"):
++            self.assertEqual(sum(1 for c in main if c["condition"] == condition), 3)
++        for block in (1, 2, 3):
++            order = [c["condition"] for c in main if c["block"] == block]
++            self.assertEqual(
++                order,
++                [
++                    condition
++                    for condition in research_plan.rotate(
++                        research_plan.COST_CONDITIONS, block
++                    )
++                    if condition in ("solo", "a8g0", "a8g2000")
++                ],
++            )
++
++
++class CostFollowupRunnerTest(unittest.TestCase):
++    """Drive tests/board-research.sh cost-followup with host stubs.
++
++    No root, no hardware and no board claim: the stub CLI/dmesg/uname tools and
++    a temporary taint file are the only inputs.
++    """
++
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self._tmp.name)
++        self.cli = self._write_stub("idma_research_stub", CLI_STUB)
++        self.dmesg = self._write_stub("dmesg_stub", DMESG_STUB)
++        self.uname = self._write_stub("uname_stub", UNAME_STUB)
++        self.taint = self.root / "tainted"
++        self.taint.write_text("0\n", encoding="utf-8")
++        self.log = self.root / "argv.log"
++        self.count = self.root / "count"
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def _write_stub(self, name, text):
++        path = self.root / name
++        path.write_text(text, encoding="utf-8")
++        path.chmod(0o755)
++        return path
++
++    def env(self, **overrides):
++        env = dict(os.environ)
++        env.update(
++            {
++                "RESEARCH_CLI": str(self.cli),
++                "RESEARCH_PLAN": str(FROZEN_TSV),
++                "RESEARCH_TAINT": str(self.taint),
++                "RESEARCH_DMESG": str(self.dmesg),
++                "RESEARCH_UNAME": str(self.uname),
++                "STUB_LOG": str(self.log),
++                "STUB_COUNT": str(self.count),
++                "STUB_TAINT_PATH": str(self.taint),
++            }
++        )
++        env.update(overrides)
++        return env
++
++    def run_runner(self, mode, out_dir, **overrides):
++        return subprocess.run(
++            [SH, str(RUNNER), mode, str(out_dir)],
++            capture_output=True,
++            text=True,
++            env=self.env(**overrides),
++            timeout=600,
++        )
++
++    def stub_argv(self):
++        if not self.log.exists():
++            return []
++        return [
++            line
++            for line in self.log.read_text(encoding="utf-8").splitlines()
++            if line
++        ]
++
++    def followup_cases(self):
++        return research_plan.select_cases(
++            research_plan.build_plan()["cases"], "cost-followup"
++        )
++
++    def test_runs_exactly_the_eleven_cases_in_frozen_order(self):
++        out = self.root / "out-followup"
++        proc = self.run_runner("cost-followup", out)
++        self.assertEqual(proc.returncode, 0, proc.stderr)
++        self.assertIn("complete mode=cost-followup cases=11 total=11", proc.stdout)
++        self.assertFalse((out / "STOPPED.txt").exists())
++        cases = self.followup_cases()
++        self.assertEqual([c["id"] for c in cases], list(FOLLOWUP_IDS))
++        self.assertEqual([c["ordinal"] for c in cases], list(FOLLOWUP_ORDINALS))
++        self.assertEqual(self.stub_argv(), [" ".join(c["argv"]) for c in cases])
++        for case in cases:
++            self.assertTrue((out / (case["id"] + ".json")).is_file())
++            self.assertTrue((out / (case["id"] + ".exit")).is_file())
++            self.assertTrue((out / (case["id"] + ".dmesg.before")).is_file())
++            self.assertTrue((out / (case["id"] + ".dmesg.after")).is_file())
++        self.assertFalse((out / "e2-b01-w0.json").exists())
++        for argv in self.stub_argv():
++            self.assertTrue(argv.startswith("--cost "), argv)
++
++    def test_selected_tsv_is_exactly_the_frozen_eleven_rows(self):
++        out = self.root / "out-selected"
++        proc = self.run_runner("cost-followup", out)
++        self.assertEqual(proc.returncode, 0, proc.stderr)
++        frozen = FROZEN_TSV.read_text(encoding="utf-8").splitlines()
++        expected = "".join(frozen[ordinal] + "\n" for ordinal in FOLLOWUP_ORDINALS)
++        selected = (out / "plan.selected.tsv").read_text(encoding="utf-8")
++        self.assertEqual(selected, expected)
++        self.assertEqual(
++            [line.split("\t")[0] for line in selected.splitlines()],
++            list(FOLLOWUP_IDS),
++        )
++        first_eleven = "".join(line + "\n" for line in frozen[1:12])
++        self.assertNotEqual(selected, first_eleven)
++        self.assertEqual(
++            (out / "plan.copy.tsv").read_text(encoding="utf-8"),
++            FROZEN_TSV.read_text(encoding="utf-8"),
++        )
++        self.assertEqual(
++            len((out / "cases.tsv").read_text(encoding="utf-8").splitlines()), 12
++        )
++
++    def test_short_cost_solo_failure_stops_before_the_next_case(self):
++        out = self.root / "out-followup-stop"
++        proc = self.run_runner("cost-followup", out, STUB_FAIL_AT="1")
++        self.assertEqual(proc.returncode, 7)
++        self.assertEqual(len(self.stub_argv()), 1)
++        self.assertTrue((out / (FOLLOWUP_IDS[0] + ".json")).is_file())
++        self.assertFalse((out / (FOLLOWUP_IDS[1] + ".json")).exists())
++        stopped = (out / "STOPPED.txt").read_text(encoding="utf-8")
++        self.assertIn("exit=7", stopped)
++        self.assertIn("cases_done=0", stopped)
++        self.assertIn("cases_total=11", stopped)
++        self.assertIn("resume_supported=0", stopped)
++
++    def test_short_and_all_modes_keep_their_original_counts(self):
++        short_out = self.root / "out-short-still"
++        first = self.run_runner("short", short_out)
++        self.assertEqual(first.returncode, 0, first.stderr)
++        self.assertEqual(len(self.stub_argv()), 6)
++        all_out = self.root / "out-all-still"
++        second = self.run_runner("all", all_out)
++        self.assertEqual(second.returncode, 0, second.stderr)
++        got = self.stub_argv()
++        self.assertEqual(len(got), 6 + 84)
++        cases = research_plan.build_plan()["cases"]
++        self.assertEqual(got[:6], [" ".join(c["argv"]) for c in cases[:6]])
++        self.assertEqual(got[6:], [" ".join(c["argv"]) for c in cases])
++
++    def test_existing_output_directory_is_refused_untouched(self):
++        out = self.root / "out-exists"
++        out.mkdir()
++        marker = out / "marker.txt"
++        marker.write_text("keep me\n", encoding="utf-8")
++        proc = self.run_runner("cost-followup", out)
++        self.assertEqual(proc.returncode, 2)
++        self.assertEqual(marker.read_text(encoding="utf-8"), "keep me\n")
++        self.assertEqual(self.stub_argv(), [])
++        self.assertFalse((out / "STOPPED.txt").exists())
++
++
+ if __name__ == "__main__":
+     unittest.main()
+--- a/tests/test_research_results.py
++++ b/tests/test_research_results.py
+@@ -1016,6 +1016,158 @@
+             self.assertEqual(report["exit_status"], 0, report["runner"])
+             self.assertEqual(len(report["summary"]["ok"]), 6)
+ 
+ 
++FOLLOWUP_IDS = (
++    "short-cost-solo",
++    "short-cost-a8g0",
++    "cost-b01-solo",
++    "cost-b01-a8g0",
++    "cost-b01-a8g2000",
++    "cost-b02-a8g0",
++    "cost-b02-a8g2000",
++    "cost-b02-solo",
++    "cost-b03-a8g0",
++    "cost-b03-a8g2000",
++    "cost-b03-solo",
++)
++FOLLOWUP_ORDINALS = (4, 5, 67, 69, 72, 74, 77, 78, 79, 82, 83)
++
++
++def followup_selected_rows(plan_tsv, ordinals):
++    rows = plan_tsv.splitlines()
++    return "".join(rows[ordinal] + "\n" for ordinal in ordinals)
++
++
++class CostFollowupAnalyzerTest(unittest.TestCase):
++    """The analyzer must expect the fixed 11-case cost-followup selection.
++
++    Host-only fixtures.  Appended as an independent class: another patch owns
++    analyze_e2/analyze_cost, and the short/all expectations above are kept.
++    """
++
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.base = Path(self.tmp.name)
++        self.root = self.base / "run"
++        self.out = self.base / "out"
++        self.generator = rr.load_plan_generator()
++        self.assertIsNotNone(self.generator, "scripts/research_plan.py is not loadable")
++        self.assertTrue(
++            hasattr(self.generator, "select_cases"),
++            "scripts/research_plan.py must provide select_cases(cases, mode)",
++        )
++        self.plan = self.generator.build_plan()
++        self.full_tsv = self.generator.to_tsv(self.plan)
++        self.selected = self.generator.select_cases(self.plan["cases"], "cost-followup")
++        self.selected_tsv = followup_selected_rows(self.full_tsv, FOLLOWUP_ORDINALS)
++        self.docs = build_docs(self.selected)
++
++    def run_analyze(self, selected_tsv=None, **kwargs):
++        write_run_dir(
++            self.root,
++            self.selected,
++            self.docs,
++            plan_tsv=self.full_tsv,
++            selected_tsv=self.selected_tsv if selected_tsv is None else selected_tsv,
++            **kwargs,
++        )
++        return rr.analyze("cost-followup", str(self.root), str(self.out))
++
++    def test_mode_table_and_selection_are_the_fixed_eleven(self):
++        self.assertEqual(rr.MODE_CASES, {"short": 6, "all": 84, "cost-followup": 11})
++        self.assertEqual([c["id"] for c in self.selected], list(FOLLOWUP_IDS))
++        self.assertEqual([c["ordinal"] for c in self.selected], list(FOLLOWUP_ORDINALS))
++        self.assertNotEqual(
++            [c["id"] for c in self.selected], [c["id"] for c in self.plan["cases"][:11]]
++        )
++
++    def test_complete_segment_is_ok_and_expects_exactly_those_rows(self):
++        report = self.run_analyze()
++        self.assertEqual(report["plan"]["problems"], [])
++        self.assertTrue(report["plan"]["verified"])
++        self.assertEqual(report["summary"]["expected_cases"], 11)
++        self.assertEqual(len(report["summary"]["ok"]), 11)
++        self.assertEqual([case["id"] for case in report["cases"]], list(FOLLOWUP_IDS))
++        self.assertEqual(
++            [case["id"] for case in report["plan"]["expected_cases"]],
++            list(FOLLOWUP_IDS),
++        )
++        self.assertEqual(report["exit_status"], 0)
++        self.assertEqual(report["status"], "ok")
++        text = (self.out / "report.zh.txt").read_text(encoding="utf-8")
++        self.assertIn("cost-followup", text)
++
++    def test_first_eleven_plan_rows_are_rejected_as_the_selection(self):
++        rows = self.full_tsv.splitlines()
++        wrong = "".join(row + "\n" for row in rows[1:12])
++        report = self.run_analyze(selected_tsv=wrong)
++        self.assertFalse(report["plan"]["verified"])
++        self.assertTrue(
++            any("plan.selected.tsv" in item for item in report["plan"]["problems"])
++        )
++        self.assertNotEqual(report["exit_status"], 0)
++
++    def test_swapped_selected_rows_are_rejected(self):
++        rows = self.selected_tsv.splitlines()
++        rows[0], rows[1] = rows[1], rows[0]
++        report = self.run_analyze(selected_tsv="".join(row + "\n" for row in rows))
++        self.assertFalse(report["plan"]["verified"])
++        self.assertNotEqual(report["exit_status"], 0)
++
++    def test_missing_followup_case_is_incomplete_and_not_retried(self):
++        report = self.run_analyze(
++            omit_ids=("cost-b03-solo",), drop_cases_rows=("cost-b03-solo",)
++        )
++        self.assertEqual(report["status"], "incomplete")
++        self.assertEqual(report["exit_status"], 1)
++        self.assertEqual(report["summary"]["expected_cases"], 11)
++        self.assertIn("cost-b03-solo", report["summary"]["missing"])
++
++    def test_real_runner_cost_followup_matches_the_analyzer(self):
++        replies = {
++            " ".join(case["argv"]): self.docs[case["id"]] for case in self.selected
++        }
++        (self.base / "replies.json").write_text(json.dumps(replies), encoding="utf-8")
++        cli = self.base / "fake-cli"
++        cli.write_text(
++            "#!/usr/bin/env python3\n"
++            "import json, sys\n"
++            "from pathlib import Path\n"
++            "d = json.loads(Path(__file__).with_name('replies.json').read_text())\n"
++            "print(json.dumps(d[' '.join(sys.argv[1:])]))\n",
++            encoding="utf-8",
++        )
++        cli.chmod(0o755)
++        taint = self.base / "taint"
++        taint.write_text("0\n", encoding="utf-8")
++        env = dict(
++            os.environ,
++            RESEARCH_PLAN=str(REPO_ROOT / "tests" / "research-plan.tsv"),
++            RESEARCH_CLI=str(cli),
++            RESEARCH_TAINT=str(taint),
++            RESEARCH_DMESG="true",
++            RESEARCH_UNAME="uname",
++        )
++        run_dir = self.base / "runner-run"
++        subprocess.run(
++            ["sh", str(REPO_ROOT / "tests" / "board-research.sh"),
++             "cost-followup", str(run_dir)],
++            env=env,
++            check=True,
++            capture_output=True,
++            text=True,
++        )
++        self.assertEqual(
++            (run_dir / "plan.selected.tsv").read_text(encoding="utf-8"),
++            self.selected_tsv,
++        )
++        self.assertEqual(
++            (run_dir / "plan.copy.tsv").read_text(encoding="utf-8"), self.full_tsv
++        )
++        report = rr.analyze("cost-followup", run_dir, self.base / "report")
++        self.assertEqual(report["plan"]["problems"], [])
++        self.assertEqual(report["exit_status"], 0, report["runner"])
++        self.assertEqual(len(report["summary"]["ok"]), 11)
++        self.assertEqual([case["id"] for case in report["cases"]], list(FOLLOWUP_IDS))
++
++
+ if __name__ == "__main__":
+     unittest.main()
+

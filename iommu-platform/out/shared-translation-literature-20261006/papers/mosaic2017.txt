@@ -1,0 +1,1478 @@
+                  Mosaic: A GPU Memory Manager
+    with Application-Transparent Support for Multiple Page Sizes
+               Rachata Ausavarungnirun†                                  Joshua Landgraf‡     Vance Miller‡ Saugata Ghose†
+                         Jayneel Gandhiℵ                                 Christopher J. Rossbach‡ℵ   Onur Mutlu§†
+               † Carnegie Mellon University                       ‡ University of Texas at Austin                ℵ VMware Research             § ETH Zürich
+
+
+
+ABSTRACT                                                                                          the TLB to use large pages, reducing address translation overhead.
+Contemporary discrete GPUs support rich memory management                                         During data transfer, this mechanism enables the GPU to transfer
+features such as virtual memory and demand paging. These features                                 only the base pages that are needed by the application over the
+simplify GPU programming by providing a virtual address space                                     system I/O bus, keeping demand paging overhead low. Our evalua-
+abstraction similar to CPUs and eliminating manual memory man-                                    tions show that Mosaic reduces address translation overheads while
+agement, but they introduce high performance overheads during                                     efficiently achieving the benefits of demand paging, compared to
+(1) address translation and (2) page faults. A GPU relies on high                                 a contemporary GPU that uses only a 4KB page size. Relative to a
+degrees of thread-level parallelism (TLP) to hide memory latency.                                 state-of-the-art GPU memory manager, Mosaic improves the per-
+Address translation can undermine TLP, as a single miss in the                                    formance of homogeneous and heterogeneous multi-application
+translation lookaside buffer (TLB) invokes an expensive serialized                                workloads by 55.5% and 29.7% on average, respectively, coming
+page table walk that often stalls multiple threads. Demand paging                                 within 6.8% and 15.4% of the performance of an ideal TLB where
+can also undermine TLP, as multiple threads often stall while they                                all TLB requests are hits.
+wait for an expensive data transfer over the system I/O (e.g., PCIe)
+bus when the GPU demands a page.                                                                  CCS CONCEPTS
+   In modern GPUs, we face a trade-off on how the page size used                                  • Computer systems organization → Parallel architectures;
+for memory management affects address translation and demand
+paging. The address translation overhead is lower when we employ                                  KEYWORDS
+a larger page size (e.g., 2MB large pages, compared with conven-
+tional 4KB base pages), which increases TLB coverage and thus                                     graphics processing units, GPGPU applications, address translation,
+reduces TLB misses. Conversely, the demand paging overhead is                                     demand paging, large pages, virtual memory management
+lower when we employ a smaller page size, which decreases the                                     ACM Reference format:
+system I/O bus transfer latency. Support for multiple page sizes can                              R. Ausavarungnirun et al. Mosaic: A GPU Memory Manager with Application-
+help relax the page size trade-off so that address translation and de-                            Transparent Support for Multiple Page Sizes. In Proceedings of The 50th An-
+mand paging optimizations work together synergistically. However,                                 nual IEEE/ACM International Symposium on Microarchitecture, Cambridge,
+existing page coalescing (i.e., merging base pages into a large page)                             MA, USA, October 14–18, 2017 (MICRO-50), 15 pages.
+and splintering (i.e., splitting a large page into base pages) policies
+require costly base page migrations that undermine the benefits
+multiple page sizes provide. In this paper, we observe that GPGPU
+applications present an opportunity to support multiple page sizes                                1    INTRODUCTION
+without costly data migration, as the applications perform most of                                Graphics Processing Units (GPUs) are used for an ever-growing
+their memory allocation en masse (i.e., they allocate a large number                              range of application domains due to steady increases in GPU com-
+of base pages at once). We show that this en masse allocation allows                              pute density and continued improvements in programming tools [55,
+us to create intelligent memory allocation policies which ensure                                  60, 80]. The growing adoption of GPUs has in part been due to better
+that base pages that are contiguous in virtual memory are allocated                               high-level language support [20, 80, 97, 110], which has improved
+to contiguous physical memory pages. As a result, coalescing and                                  GPU programmability. Recent support within GPUs for memory vir-
+splintering operations no longer need to migrate base pages.                                      tualization features, such as a unified virtual address space [60, 77],
+   We introduce Mosaic, a GPU memory manager that provides                                        demand paging [82], and preemption [2, 82], can provide funda-
+application-transparent support for multiple page sizes. Mosaic uses                              mental improvements that can ease programming. These features
+base pages to transfer data over the system I/O bus, and allocates                                allow developers to exploit key benefits that have long been taken
+physical memory in a way that (1) preserves base page contiguity                                  for granted in CPUs (e.g., application portability, multi-application
+and (2) ensures that a large page frame contains pages from only                                  execution). Such familiar features can dramatically improve pro-
+a single memory protection domain. We take advantage of this                                      grammer productivity and further boost GPU adoption. However, a
+allocation strategy to design a novel in-place page size selection                                number of challenges have kept GPU memory virtualization from
+mechanism that avoids data migration. This mechanism allows                                       achieving performance similar to that in CPUs [66, 114]. In this
+                                                                                                  work, we focus on two fundamental challenges: (1) the address
+Permission to make digital or hard copies of all or part of this work for personal or             translation challenge, and (2) the demand paging challenge.
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation         Address Translation Challenge. Memory virtualization relies
+on the first page. Copyrights for components of this work owned by others than ACM                on page tables to store virtual-to-physical address translations. Con-
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior specific permission and/or a       ventionally, systems store one translation for every base page (e.g.,
+fee. Request permissions from permissions@acm.org.                                                a 4KB page). To translate a virtual address on demand, a series of
+MICRO-50, October 14–18, 2017, Cambridge, MA, USA                                                 serialized memory accesses are required to traverse (i.e., walk) the
+© 2017 Association for Computing Machinery.
+ACM ISBN 978-1-4503-4952-9. . . $15.00
+                                                                                                  page table [91, 92]. These serialized accesses clash with the single-
+https://doi.org/10.1145/3123939.3123975                                                           instruction multiple-thread (SIMT) execution model [33, 63, 73]
+
+                                                                                              1
+MICRO-50, October 14–18, 2017, Cambridge, MA, USA                                                                              R. Ausavarungnirun et al.
+
+
+used by GPU-based systems, which relies on high degrees of con-                memory can be coalesced (i.e., combined) into a single large page,
+currency through thread-level parallelism (TLP) to hide long mem-              and a large page can be splintered (i.e., split) into multiple base
+ory latencies during GPU execution. Translation lookaside buffers              pages. With multiple page sizes, and the ability to change virtual-
+(TLBs) can reduce the latency of address translation by caching                to-physical mappings dynamically, the GPU system can support
+recently-used address translation information. Unfortunately, as               good TLB reach by using large pages for address translation, while
+application working sets and DRAM capacity have increased in                   providing better demand paging performance by using base pages
+recent years, state-of-the-art GPU TLB designs [91, 92] suffer due to          for data transfer.
+inter-application interference and stagnant TLB sizes. Consequently,              Application-transparent support for multiple page sizes has
+GPUs have poor TLB reach, i.e., the TLB covers only a small fraction           proven challenging for CPUs [59, 74]. A key property of mem-
+of the physical memory working set of an application. Poor TLB                 ory virtualization is to enforce memory protection, where a distinct
+reach is particularly detrimental with the SIMT execution model, as            virtual address space (i.e., a memory protection domain) is allocated
+a single TLB miss can stall hundreds of threads at once, undermining           to an individual application or a virtual machine, and memory is
+TLP within a GPU and significantly reducing performance [66, 114].             shared safely (i.e., only with explicit permissions for accesses across
+    Large pages (e.g., the 2MB or 1GB pages in modern CPUs [41,                different address spaces). In order to ensure that memory protec-
+43]) can significantly reduce the overhead of address translation.             tion guarantees are not violated, coalescing operations can combine
+A major constraint for TLB reach is the small, fixed number of                 contiguous physical base pages into a single physical large page
+translations that a TLB can hold. If we store one translation for              only if all base pages belong to the same virtual address space.
+every large page instead of one translation for every base page, the              Unfortunately, in both CPU and state-of-the-art GPU memory
+TLB can cover a much larger fraction of the virtual address space              managers, existing memory access patterns and allocation mecha-
+using the same number of page translation entries. Large pages                 nisms make it difficult to find regions of physical memory where
+have been supported by CPUs for decades [103, 104], and large page             base pages can be coalesced. We show an example of this in Fig-
+support is emerging for GPUs [91, 92, 118]. However, large pages               ure 1a, which illustrates how a state-of-the-art GPU memory man-
+increase the risk of internal fragmentation, where a portion of the            ager [92] allocates memory for two applications. Within a single
+large page is unallocated (or unused). Internal fragmentation occurs           large page frame (i.e., a contiguous piece of physical memory that is
+because it is often difficult for an application to completely utilize         the size of a large page and whose starting address is page aligned),
+large contiguous regions of memory. This fragmentation leads to                the GPU memory manager allocates base pages from both Applica-
+(1) memory bloat, where a much greater amount of physical memory               tions 1 and 2 ( 1 in the figure). As a result, the memory manager
+is allocated than the amount of memory that the application needs;             cannot coalesce the base pages into a large page ( 2 ) without first
+and (2) longer memory access latencies, due to a lower effective               migrating some of the base pages, which would incur a high latency.
+TLB reach and more page faults [59].
+Demand Paging Challenge. For discrete GPUs (i.e., GPUs that                        Application 1 Base Pages      Application 2 Base Pages   Unallocated Pages
+are not in the same package/die as the CPU), demand paging can                        1
+                                                                                            Large Page Frame 1            2 Large Page Frame 1
+incur significant overhead. With demand paging, an application
+can request data that is not currently resident in GPU memory. This
+triggers a page fault, which requires a long-latency data transfer for
+                                                                                            Large Page Frame 2               Large Page Frame 2
+an entire page over the system I/O bus, which, in today’s systems, is
+also called the PCIe bus [85]. A single page fault can cause multiple
+threads to stall at once, as threads often access data in the same                   Standard Memory Allocation            Cannot Coalesce Pages
+page due to data locality. As a result, the page fault can significantly                                                   Without Migrating Data
+reduce the amount of TLP that the GPU can exploit, and the long
+latency of a page fault harms performance [118].                                          (a) State-of-the-art GPU memory management [92].
+    Unlike address translation, which benefits from larger pages,                         3 Large Page Frame 1          4 Coalesced Large Page 1
+demand paging benefits from smaller pages. Demand paging for
+large pages requires a greater amount of data to be transferred
+over the system I/O bus during a page fault than for conventional                           Large Page Frame 2             Coalesced Large Page 2
+base pages. The larger data transfer size increases the transfer time
+significantly, due to the long latency and limited bandwidth of the
+system I/O bus. This, in turn, significantly increases the amount of                      Contiguity-Conserving                 Lazy Coalescer
+time that GPU threads stall, and can further decrease the amount of                             Allocation
+TLP. To make matters worse, as the size of a page increases, there                              (b) Memory management with Mosaic.
+is a greater probability that an application does not need all of the
+data in the page. As a result, threads may stall for a longer time             Figure 1: Page allocation and coalescing behavior of GPU
+without gaining any further benefit in return.                                 memory managers: (a) state-of-the-art [92], (b) Mosaic.
+Page Size Trade-Off. We find that memory virtualization in state-                 We make a key observation about the memory behavior of con-
+of-the-art GPU systems has a fundamental trade-off due to the page             temporary general-purpose GPU (GPGPU) applications. The vast
+size choice. A larger page size reduces address translation stalls by          majority of memory allocations in GPGPU applications are per-
+increasing TLB reach and reducing the number of high-latency TLB               formed en masse (i.e., a large number of pages are allocated at the
+misses. In contrast, a smaller page size reduces demand paging stalls          same time). The en masse memory allocation presents us with an
+by decreasing the amount of unnecessary data transferred over the              opportunity: with so many pages being allocated at once, we can
+system I/O bus [92, 118]. We can relax the page size trade-off by              rearrange how we allocate the base pages to ensure that (1) all
+using multiple page sizes transparently to the application, and, thus,         of the base pages allocated within a large page frame belong to
+to the programmer. In a system that supports multiple page sizes,              the same virtual address space, and (2) base pages that are con-
+several base pages that are contiguous in both virtual and physical            tiguous in virtual memory are allocated to a contiguous portion
+
+                                                                           2
+Mosaic: A GPU Memory Manager
+with Application-Transparent Support for Multiple Page Sizes                            MICRO-50, October 14–18, 2017, Cambridge, MA, USA
+
+of physical memory and aligned within the large page frame. Our              2     BACKGROUND
+goal in this work is to develop an application-transparent memory            We first provide necessary background on contemporary GPU ar-
+manager that performs such memory allocation, and uses this allo-            chitectures. In Section 2.1, we discuss the GPU execution model. In
+cation property to efficiently support multiple page sizes in order          Section 2.2, we discuss state-of-the-art support for GPU memory
+to improve TLB reach and efficiently support demand paging.                  virtualization.
+   To this end, we present Mosaic, a new GPU memory manager that
+uses our key observation to provide application-transparent support          2.1    GPU Execution Model
+for multiple page sizes in GPUs while avoiding high overhead
+for coalescing and splintering pages. The key idea of Mosaic is              GPU applications use fine-grained multithreading [105, 106, 112,
+to (1) transfer data to GPU memory at the small base page (e.g.,             113]. A GPU application is made up of thousands of threads. These
+4KB) granularity, (2) allocate physical base pages in a way that             threads are clustered into thread blocks (also known as work groups),
+avoids the need to migrate data during coalescing, and (3) use a             where each thread block consists of multiple smaller bundles of
+simple coalescing mechanism to combine base pages into large                 threads that execute concurrently. Each such thread bundle is
+pages (e.g., 2MB) and thus increase TLB reach. Figure 1b shows a             known as a warp, or a wavefront. Each thread within the warp
+high-level overview of how Mosaic allocates and coalesces pages.             executes the same instruction at the same program counter value.
+Mosaic consists of three key design components: (1) Contiguity-              The GPU avoids stalls due to dependencies and long memory laten-
+Conserving Allocation (CoCoA), a memory allocator which provides             cies by taking advantage of thread-level parallelism (TLP), where
+a soft guarantee that all of the base pages within the same large page       the GPU swaps out warps that have dependencies or are waiting
+                                                                             on memory with other warps that are ready to execute.
+range belong to only a single application ( 3 in the figure); (2) In-
+                                                                                A GPU consists of multiple streaming multiprocessors (SMs), also
+Place Coalescer, a page size selection mechanism that merges base
+                                                                             known as shader cores. Each SM executes one warp at a time using
+pages into a large page immediately after allocation ( 4 ), and thus         the single-instruction, multiple-thread (SIMT) execution model [33,
+does not need to monitor base pages to make coalescing decisions             63, 73]. Under SIMT, all of the threads within a warp are executed
+or migrate base pages; and (3) Contiguity-Aware Compaction (CAC),            in lockstep. Due to lockstep execution, a warp stalls when any one
+a memory compaction mechanism that transparently migrates data               thread within the warp has to stall. This means that a warp is unable
+to avoid internal fragmentation within a large page frame, which             to proceed to the next instruction until the slowest thread in the
+frees up large page frames for CoCoA.                                        warp completes the current instruction.
+Key Results. We evaluate Mosaic using 235 workloads. Each work-                 The GPU memory hierarchy typically consists of multiple levels
+load consists of multiple GPGPU applications from a wide range of            of memory. In contemporary GPU architectures, each SM has a
+benchmark suites. Our evaluations show that compared to a con-               private data cache, and has access to one or more shared memory
+temporary GPU that uses only 4KB base pages, a GPU with Mosaic               partitions through an interconnect (typically a crossbar). A memory
+reduces address translation overheads while efficiently achieving            partition combines a single slice of the banked L2 cache with a
+the benefits of demand paging, thanks to its use of multiple page            memory controller that connects the GPU to off-chip main mem-
+sizes. When we compare to a GPU with a state-of-the-art memory               ory (DRAM). More detailed information about the GPU memory
+manager (see Section 3.1), we find that a GPU with Mosaic pro-               hierarchy can be found in [8, 10, 44, 46, 47, 48, 54, 86, 95, 115, 116].
+vides an average speedup of 55.5% and 29.7% for homogeneous
+and heterogeneous multi-application workloads, respectively, and             2.2    Virtualization Support in GPUs
+comes within 6.8% and 15.4% of the performance of a GPU with                 Hardware-supported memory virtualization relies on address trans-
+an ideal TLB, where all TLB requests are hits. Thus, by alleviating          lation to map each virtual memory address to a physical address
+the page size trade-off between address translation and demand               within the GPU memory. Address translation uses page-granularity
+paging overhead, Mosaic improves the efficiency and practicality             virtual-to-physical mappings that are stored within a multi-level
+of multi-application execution on the GPU.                                   page table. To look up a mapping within the page table, the GPU
+   This paper makes the following contributions:                             performs a page table walk, where a page table walker traverses
+     • We analyze fundamental trade-offs on choosing the correct             through each level of the page table in main memory until the
+        page size to optimize both address translation (which benefits       walker locates the page table entry for the requested mapping in
+        from larger pages) and demand paging (which benefits from            the last level of the table. GPUs with virtual memory support have
+        smaller pages). Based on our analyses, we motivate the need          translation lookaside buffers (TLBs), which cache page table entries
+        for application-transparent support of multiple page sizes in        and avoid the need to perform a page table walk for the cached
+        a GPU.                                                               entries, thus reducing the address translation latency.
+     • We present Mosaic, a new GPU memory manager that ef-                     The introduction of address translation hardware into the GPU
+        ficiently supports multiple page sizes. Mosaic uses a novel          memory hierarchy puts TLB misses on the critical path of appli-
+        mechanism to allocate contiguous virtual pages to contigu-           cation execution, as a TLB miss invokes a page table walk that
+        ous physical pages in the GPU memory, and exploits this              can stall multiple threads and degrade performance significantly.
+        property to coalesce contiguously-allocated base pages into a        (We study the impact of TLB misses and page table walks in Sec-
+        large page for address translation with low overhead and no          tion 3.1.) A GPU uses multiple TLB levels to reduce the number
+        data migration, while still using base pages during demand           of TLB misses, typically including private per-SM L1 TLBs and a
+        paging.                                                              shared L2 TLB [91, 92, 118]. Traditional address translation mech-
+     • We show that Mosaic’s application-transparent support for             anisms perform memory mapping using a base page size of 4KB.
+        multiple page sizes effectively improves TLB reach while             Prior work for integrated GPUs (i.e., GPUs that are in the same
+        efficiently achieving the benefits of demand paging. Overall,        package or die as the CPU) has found that using a larger page size
+        Mosaic improves the average performance of homogeneous               can improve address translation performance by improving TLB
+        and heterogeneous multi-application workloads by 55.5%               reach (i.e., the maximum fraction of memory that can be accessed
+        and 29.7%, respectively, over a state-of-the-art GPU memory          using the cached TLB entries) [91, 92, 118]. For a TLB that holds
+        manager.                                                             a fixed number of page table entries, using the large page (e.g., a
+
+                                                                         3
+MICRO-50, October 14–18, 2017, Cambridge, MA, USA                                                                                            R. Ausavarungnirun et al.
+
+          SM                     SM                                                     threads to the same page are coalesced (i.e., combined). On an L1
+    L1 TLB     PTBR          L1 TLB   PTBR
+                                                                                        TLB miss ( 1 in Figure 2), the shared L2 TLB is accessed. If the
+                                                          3            SM-Private       request misses in the shared L2 TLB, the page table walker begins a
+                                                               3
+    11                                                                    Shared        walk ( 2 ). The walker reads the Page Table Base Register (PTBR)1
+             Shared L2 TLB                   Highly Threaded Page Table Walker          from the core that caused the TLB miss ( 3 ), which contains a
+                                       22                                               pointer to the root of the page table. The walker then accesses each
+                                                                                        level of the page table, retrieving the page table data from either
+                                                     Shared L2 Cache
+                                                                                        the shared L2 cache or the GPU main memory ( 4 ).
+                                        4
+                                        4                                                  Figure 3 shows the performance of two GPU-MMU designs:
+                                                       Main Memory
+                                                                                        (1) a design that uses the base 4KB page size, and (2) a design that
+Figure 2: GPU-MMU baseline design with a two-level TLB.                                 uses a 2MB large page size, where both designs have no demand
+                                                                                        paging overhead (i.e., the system I/O bus transfer takes zero cycles to
+page with a size of 2MB or greater) as the granularity for mapping                      transfer a page). We normalize the performance of the two designs
+greatly increases the TLB reach, and thus reduces the TLB miss                          to a GPU with an ideal TLB, where all TLB requests hit in the L1
+rate, compared to using the base page granularity. While memory                         TLB. We make two observations from the figure.
+hierarchy designs for widely-used GPU architectures from NVIDIA,                                4KBpages
+                                                                                                4KB (no demand   paging
+                                                                                                         (no demand      overhead)
+                                                                                                                    paging overhead)   2MBpages
+                                                                                                                                       2MB (no demand   paging
+                                                                                                                                                (no demand      overhead)
+                                                                                                                                                           paging overhead)
+AMD, and Intel are not publicly available, it is widely accepted                                      1.0
+
+
+
+
+                                                                                        Performance
+                                                                                         Normalized
+that contemporary GPUs support TLB-based address translation                                          0.8
+                                                                                                      0.6
+and, in some models, large page sizes [2, 66, 77, 78, 79]. To simplify                                0.4
+translation hardware in a GPU that uses multiple page sizes (i.e.,                                    0.2
+both base pages and large pages), we assume that each TLB level                                       0.0
+contains two separate sets of entries [35, 50, 51, 84, 89, 90], where
+one set of entries stores only base page translations, while the other
+set of entries stores only large page translations.
+                                                                                        Figure 3: Performance of a GPU with no demand paging over-
+   State-of-the-art GPU memory virtualization provides support
+                                                                                        head, using (1) 4KB base pages and (2) 2MB large pages, nor-
+for demand paging [3, 60, 82, 92, 118]. In demand paging, all of the
+                                                                                        malized to the performance of a GPU with an ideal TLB.
+memory used by a GPU application does not need to be transferred
+to the GPU memory at the beginning of application execution.                               First, compared to the ideal TLB, the GPU-MMU with 4KB base
+Instead, during application execution, when a GPU thread issues                         pages experiences an average performance loss of 48.1%. We observe
+a memory request to a page that has not yet been allocated in the                       that with 4KB base pages, a single TLB miss often stalls many of
+GPU memory, the GPU issues a page fault, at which point the data                        the warps, which undermines the latency hiding behavior of the
+for that page is transferred over the off-chip system I/O bus (e.g.,                    SIMT execution model used by GPUs. Second, the figure shows that
+the PCIe bus [85] in contemporary systems) from the CPU memory                          using a 2MB page size with the same number of TLB entries as the
+to the GPU memory. The transfer requires a long latency due to                          4KB design allows applications to come within 2% of the ideal TLB
+its use of an off-chip bus. Once the transfer completes, the GPU                        performance. We find that with 2MB pages, the TLB has a much
+runtime allocates a physical GPU memory address to the page, and                        larger reach, which reduces the TLB miss rate substantially. Thus,
+the thread can complete its memory request.                                             there is strong incentive to use large pages for address translation.
+3        A CASE FOR MULTIPLE PAGE SIZES                                                 3.2             Large Pages Alone Are Not the Answer
+Despite increases in DRAM capacity, TLB capacity (i.e., the number                      A natural solution to consider is to use only large pages for GPU
+of cached page table entries) has not kept pace, and thus TLB reach                     memory management. Using only large pages would reduce address
+has been declining. As a result, address translation overheads have                     translation overhead significantly, with minimal changes to the
+started to significantly increase the execution time of many large-                     hardware or runtime. Unfortunately, this solution is impractical
+memory workloads [15, 34, 66, 91, 92, 114]. In this section, we                         because large pages (1) greatly increase the data transfer size of
+(1) analyze how the address translation overhead changes if we use                      each demand paging request, causing contention on the system I/O
+large pages instead of base pages, and (2) examine the advantages                       bus, and harming performance; and (2) waste memory by causing
+and disadvantages of both page sizes.                                                   memory bloat due to internal fragmentation.
+3.1       Effect of Page Size on TLB Performance                                        Demand Paging at a Large Page Granularity. Following the
+                                                                                        nomenclature from [118], we denote GPU-side page faults that
+To quantify the performance trade-offs between base and large                           induce demand paging transfers across the system I/O bus as far-
+pages, we simulate a number of recently-proposed TLB designs                            faults. Prior work observes that while a 2MB large page size reduces
+that support demand paging [92, 118] (see Section 5 for our method-                     the number of far-faults in GPU applications that exhibit locality,
+ology). We slightly modify Power et al.’s TLB design [92] to create                     the load-to-use latency (i.e., the time between when a thread issues a
+our baseline, which we call GPU-MMU. Power et al. [92] propose                          load request and when the data is returned to the thread) increases
+a GPU memory manager that has a private 128-entry L1 TLB for                            significantly when a far-fault does occur [118]. The impact of far-
+each SM , a highly-threaded page table walker, and a page walk                          faults is particularly harmful for workloads with high locality, as
+cache [92]. From our experiments, we find that using a shared L2                        all warps touching the 2MB large page frame (i.e., a contiguous,
+TLB instead of a page walk cache increases the average performance                      page-aligned 2MB region of physical memory) must stall, which
+across our workloads (described in Section 5) by 14% (not shown).                       limits the GPU’s ability to overlap the system I/O bus transfer by
+As a result, our GPU-MMU baseline design (shown in Figure 2)                            executing other warps. Based on PCIe latency measurements from
+omits the page walk cache in favor of a 512-entry shared L2 TLB.                        a real GTX 1080 system [83], we determine that the load-to-use
+   In our GPU-MMU baseline design, a shared L2 TLB entry is
+extended with address space identifiers. TLB accesses from multiple                     1 CR3 in the x86 ISA [42], TTB in the ARM ISA [7].
+
+
+
+                                                                                    4
+Mosaic: A GPU Memory Manager
+with Application-Transparent Support for Multiple Page Sizes                                                MICRO-50, October 14–18, 2017, Cambridge, MA, USA
+
+
+latency with 2MB large pages (318 µs) is six times the latency with                              page sizes, to exploit the benefits of both small and large page sizes,
+4KB base pages (55 µs).                                                                          while avoiding the disadvantages of each. In order to (1) not burden
+   Figure 4 shows how the GPU performance changes when we                                        programmers and (2) provide performance improvements for legacy
+use different page sizes and include the effect of the demand pag-                               applications, we would like to enable multiple page size support
+ing overhead (see Section 5 for our methodology). We make three                                  transparently to the application. This constraint introduces several
+observations from the figure. First, for 4KB base pages, the demand                              design challenges that must be taken into account.
+paging overhead reduces performance, by an average of 40.0% for                                  Page Size Selection. While conceptually simple, multiple page
+our single-application workloads, and 82.3% for workloads with                                   size support introduces complexity for memory management that
+five concurrently-executing applications. Second, for our single-                                has traditionally been difficult to handle. Despite architectural sup-
+application workloads, we find that with demand paging overhead,                                 port within CPUs [59, 74] for several decades, the adoption of
+2MB pages slow down the execution time by an average of 92.5%                                    multiple page sizes has been quite slow and application-domain
+compared to 4KB pages with demand paging, as the GPU cores                                       specific [15, 34]. The availability of large pages can either be ex-
+now spend most of their time stalling on the system I/O bus trans-                               posed to application programmers, or managed transparently to an
+fers. Third, the overhead of demand paging for larger pages gets                                 application. Application-exposed management forces programmers
+significantly worse as more applications share the GPU. With two                                 to reason about physical memory and use specialized APIs [6, 68]
+applications concurrently executing on the GPU, the average per-                                 for page management, which usually sacrifices code portability and
+formance degradation of demand paging with 2MB pages instead                                     increases programmer burden. In contrast, application-transparent
+of 4KB pages is 98.0%, and with five applications, the average degra-                            support (e.g., management by the OS) requires no changes to exist-
+dation is 99.8%.                                                                                 ing programs to use large pages, but it does require the memory
+              1.0                                                         4KB (no demand         manager to make predictive decisions about whether applications
+Performance
+
+
+
+
+              0.8                                                         paging overhead)
+ Normalized
+
+
+
+
+                                                                                                 would benefit from large pages. OS-level large page management
+              0.6    -92.5%
+                                -98.0%                                    4KB (with demand       remains an active research area [59, 74], and the optimization guid-
+              0.4                          -99.0%     -99.8%              paging overhead)       ance for many modern applications continues to advise strongly
+              0.2                                                -99.8%                          against using large pages [1, 25, 65, 69, 87, 93, 107, 117], due to
+                                                                          2MB (with demand
+              0.0
+                                                                          paging overhead)       high-latency data transfers over the system I/O bus and memory
+                    1 App     2 Apps     3 Apps     4 Apps     5 Apps                            bloat (as described in Section 3.2). In order to provide effective
+               Number of Concurrently-Executing Applications
+                                                                                                 application-transparent support for multiple page sizes in GPUs,
+Figure 4: Performance impact of system I/O bus transfer dur-                                     we must develop a policy for selecting page sizes that avoids high-
+ing demand paging for base pages and large pages, normal-                                        latency data transfer over the system I/O bus, and does not introduce
+ized to base page performance with no demand paging over-                                        significant memory bloat.
+head.                                                                                            Hardware Implementation. Application-transparent support
+                                                                                                 for multiple page sizes requires (1) primitives that implement the
+Memory Bloat. Large pages expose the system to internal frag-                                    transition between different page sizes, and (2) mechanisms that
+mentation and memory bloat, where a much greater amount of                                       create and preserve contiguity in both the virtual and physical
+physical memory is allocated than the amount of memory actually                                  address spaces. We must add support in the GPU to coalesce (i.e.,
+needed by an application. To understand the impact of memory                                     combine) multiple base pages into a single large page, and splinter
+bloat, we evaluate the amount of memory allocated to each appli-                                 (i.e., split) a large page back into multiple base pages. While the
+cation when run in isolation, using 4KB and 2MB page sizes. When                                 GPU memory manager can migrate base pages in order to create
+we use the 4KB base page size, our applications have working sets                                opportunities for coalescing, base page migration incurs a high
+ranging from 10MB to 362MB, with an average of 81.5MB (see Sec-                                  latency overhead [21, 101]. In order to avoid the migration overhead
+tion 5 and [11] for details). We find that the amount of allocated                               without sacrificing coalescing opportunities, the GPU needs to
+memory inflates by 40.2% on average, and up to 367% in the worst                                 initially allocate data in a coalescing-friendly manner.
+case, when we use 2MB pages instead of 4KB pages (not shown).                                        GPUs face additional implementation challenges over CPUs,
+These numbers are likely conservative, as we expect that the frag-                               as they rely on hardware-based memory allocation mechanisms
+mentation would worsen as an application continues to run for                                    and management. In CPU-based application-transparent large page
+longer time scales than we can realistically simulate. Such waste is                             management, coalescing and splintering are performed by the op-
+unacceptable, particularly when there is an increasing demand for                                erating system [59, 74], which can (1) use locks and inter-processor
+GPU memory due to other concurrently-running applications.                                       interrupts (IPIs) to implement atomic updates to page tables, (2) stall
+   We conclude that despite the potential performance gain of 2MB                                any accesses to the virtual addresses whose mappings are changing,
+large pages (when the overhead of demand paging is ignored), the                                 and (3) use background threads to perform coalescing and splinter-
+demand paging overhead actually causes 2MB large pages to per-                                   ing. GPUs currently have no mechanism to atomically move pages
+form much worse than 4KB base pages. As a result, it is impractical                              or change page mappings for coalescing or splintering.
+to use only 2MB large pages in the GPU. Therefore, a design that
+delivers the best of both page sizes is needed.                                                  4   MOSAIC
+                                                                                                 In this section, we describe Mosaic, a GPU memory manager that
+3.3             Challenges for Multiple Page Size Support                                        provides application-transparent support for multiple page sizes
+As Sections 3.1 and 3.2 demonstrate, we cannot efficiently optimize                              and solves the challenges that we discuss in Section 3.3. At runtime,
+GPU performance by employing only a single page size. Recent                                     Mosaic (1) allocates memory in the GPU such that base pages that
+works on TLB design for integrated GPUs [91, 92] and on GPU                                      are contiguous in virtual memory are contiguous within a large
+demand paging support [3, 60, 82, 92, 118] corroborate our own                                   page frame in physical memory (which we call contiguity-conserving
+findings on the performance cost of address translation and the                                  allocation; Section 4.2); (2) coalesces base pages into a large page
+performance opportunity of large pages. Our goal is to design a                                  frame as soon as the data is allocated, only if all of the pages are
+new memory manager for GPUs that efficiently supports multiple                                   i) contiguous in both virtual and physical memory, and ii) belong to
+
+                                                                                             5
+MICRO-50, October 14–18, 2017, Cambridge, MA, USA                                                                                     R. Ausavarungnirun et al.
+
+
+the same application (Section 4.3); and (3) compacts a large page (i.e.,                 splintered large page frames, by migrating data from multiple splin-
+moves the allocated base pages within the large page frame to make                       tered large page frames into a single large page frame ( 9 ). Finally,
+them contiguous) if internal fragmentation within the page is high                       CAC notifies CoCoA of the large page frames that are now free
+after one of its constituent base pages is deallocated (Section 4.4).                    after compaction ( 10 ), which CoCoA can use for future memory
+                                                                                         allocations.
+
+4.1    High-Level Overview of Mosaic                                                     4.2     Contiguity-Conserving Allocation
+Figure 5 shows the major components of Mosaic, and how they in-
+                                                                                       Base pages can be coalesced into a large page frame only if (1) all
+teract with the GPU memory. Mosaic consists of three components:
+                                                                                       base pages within the frame are contiguous in both virtual and
+Contiguity-Conserving Allocation (CoCoA), the In-Place Coalescer,
+                                                                                       physical memory, (2) the data within the large page frame is page
+and Contiguity-Aware Compaction (CAC). These three components
+                                                                                       aligned with the corresponding large page within virtual memory
+work together to coalesce (i.e., combine) and splinter (i.e., split
+                                                                                       (i.e., the first base page within the large page frame is also the first
+apart) base pages to/from large pages during memory management.
+                                                                                       base page of a virtual large page), and (3) all base pages within the
+Memory management operations for Mosaic take place at two times:
+                                                                                       frame come from the same virtual address space (e.g., the same ap-
+(1) when memory is allocated, and (2) when memory is deallocated.
+                                                                                       plication, or the same virtual machine). As Figure 1a (see Section 1)
+Memory Allocation. When a GPGPU application wants to access                            shows, traditional memory managers allocate base pages without
+data that is not currently in the GPU memory, it sends a request to                    conserving contiguity or ensuring that the base pages within a
+the GPU runtime (e.g., OpenCL, CUDA runtimes) to transfer the                          large page frame belong to the same application. For example, if
+data from the CPU memory to the GPU memory ( 1 in Figure 5). A                         the memory manager wants to coalesce base pages of Application 1
+GPGPU application typically allocates a large number of base pages                     into a large page frame (e.g., Large Page Frame 1), it must first
+at the same time. CoCoA allocates space within the GPU memory                          migrate Application 2’s base pages to another large page frame, and
+( 2 ) for the base pages, working to conserve the contiguity of base                   may need to migrate some of Application 1’s base pages within the
+pages, if possible during allocation. Regardless of contiguity, CoCoA                  large page frame to create contiguity. Only after this data migration,
+provides a soft guarantee that a single large page frame contains                      the base pages would be ready to be coalesced into a large page
+base pages from only a single application. Once the base page is                       frame.
+allocated, CoCoA initiates the data transfer across the system I/O                         In Mosaic, we minimize the overhead of coalescing pages by
+bus ( 3 ). When the data transfer is complete ( 4 ), CoCoA notifies                    designing CoCoA to take advantage of the memory allocation be-
+the In-Place Coalescer that allocation is done by sending a list of                    havior of GPGPU applications. Similar to many data-intensive ap-
+the large page frame addresses that were allocated ( 5 ). For each                     plications [37, 75], GPGPU applications typically allocate memory
+of these large page frames, the runtime portion of the In-Place                        en masse (i.e., they allocate a large number of pages at a time). The
+Coalescer then checks to see whether (1) all base pages within the                     en masse allocation takes place when an application kernel is about
+large page frame have been allocated, and (2) the base pages within                    to be launched, and the allocation requests are often for a large
+the large page frame are contiguous in both virtual and physical                       contiguous region of virtual memory. This region is much larger
+memory. If both conditions are true, the hardware portion of the                       than the large page size (e.g., 2MB), and Mosaic allocates multiple
+In-Place Coalescer updates the page table to coalesce the base pages                   page-aligned 2MB portions of contiguous virtual memory from
+into a large page ( 6 ).                                                               the region to large page frames in physical memory, as shown in
+Memory Deallocation. When a GPGPU application wants to                                 Figure 1b (see Section 1). With CoCoA, the large page frames for
+deallocate memory (e.g., when an application kernel finishes), it                      Application 1 and Application 2 are ready to be coalesced as soon
+                                                                                       as their base pages are allocated, without the need for any data
+sends a deallocation request to the GPU runtime ( 7 ). For all deal-
+                                                                                       migration. For all other base pages (e.g., base pages not aligned in
+located base pages that are coalesced into a large page, the runtime
+                                                                                       the virtual address space, allocation requests that are smaller than
+invokes CAC for the corresponding large page. The runtime portion
+                                                                                       a large page), Mosaic simply allocates these pages to any free page,
+of CAC checks to see whether the large page has a high degree
+                                                                                       and does not exploit any contiguity.
+of internal fragmentation (i.e., if the number of unallocated base
+                                                                                           Mosaic provides a soft guarantee that all base pages within a
+pages within the large page exceeds a predetermined threshold).
+                                                                                       large page frame belong to the same application, which reduces the
+For each large page with high internal fragmentation, the hardware
+                                                                                       cost of performing coalescing and compaction, and ensures that
+portion of CAC updates the page table to splinter the large page
+                                                                                       these operations do not violate memory protection. To meet this
+back into its constituent base pages ( 8 ). Next, CAC compacts the                     guarantee during allocation, CoCoA needs to track the application
+
+         1 Application
+            demands data            1
+                                                                                                7 Application
+                                                                 5
+                                                                     Send list of                     deallocates data 1          10 Send list of newly-free
+                                    Contiguity-Conserving            large page frames                                               pages after compaction
+                                          Allocation
+       GPU Runtime                                                              TLBIn-Place
+                                                                                    Misses Handling            Contiguity-Aware
+                               Allocate                 Data transfer             Coalescer                      Compaction
+        Hardware             2             2      3   4
+                               memory                   done notification
+                                                                                           6 Coalesce pages
+                         GPU Main
+                                                   Page Table
+                                                                                                                           9 Compact pages
+                                                                                                                              by migrating data
+                          Memory                       Data
+                                                                                                      8 Splinter pages
+                      System I/O Bus           3 Transfer data
+
+   Figure 5: High-level overview of Mosaic, showing how and when its three components interact with the GPU memory.
+
+
+                                                                                 6
+Mosaic: A GPU Memory Manager
+with Application-Transparent Support for Multiple Page Sizes                                   MICRO-50, October 14–18, 2017, Cambridge, MA, USA
+
+
+that each large page frame with unallocated base pages is assigned               stalls, saving significant waste compared to state-of-the-art memory
+to. The allocator maintains two sets of lists to track this information:         managers. We describe how the In-Place Coalescer (1) decides which
+(1) the free frame list, a list of free large page frames (i.e., frames          pages to coalesce, and (2) updates the page table for pages that are
+where no base pages have been allocated) that are not yet assigned               coalesced.
+to any application; and (2) free base page lists, per-application lists          Deciding When to Coalesce. Unlike existing memory managers,
+of free base pages within large page frames where some (but not                  Mosaic does not need to monitor base page utilization information
+all) base pages are allocated. When CoCoA allocates a page-aligned               to identify opportunities for coalescing. Instead, we design CoCoA
+2MB region of virtual memory, it takes a large page frame from the               to ensure that the base pages that we coalesce are already allocated
+free frame list and maps the virtual memory region to the frame.                 to the same large page frame. Once CoCoA has allocated data within
+When CoCoA allocates base pages in a manner such that it cannot                  a large page frame, it sends the address of the frame to the In-Place
+exploit contiguity, it takes a page from the free base page list for             Coalescer. The In-Place Coalescer then checks to see whether the
+the application performing the memory request, to ensure that the                base pages within the frame are contiguous in both virtual and
+soft guarantee is met. If the free base page list for an application is          physical memory.2 As mentioned in Section 4.2, Mosaic coalesces
+empty, CoCoA removes a large page frame from the free frame list,                base pages into a large page only if all of the base pages within the
+and adds the frame’s base pages to the free base page list.                      large page frame are allocated (i.e., the frame is fully populated).
+    Note that there may be cases where the free frame list runs out              We empirically find that for GPGPU applications, coalescing only
+of large page frames for allocation. We discuss how Mosaic handles               contiguous base pages in fully-populated large page frames achieves
+such situations in Section 4.4.                                                  similar TLB reach to the coalescing performed by existing memory
+                                                                                 managers (not shown), and avoids the need to employ an MMU
+4.3    In-Place Coalescer                                                        or perform page migration, which greatly reduces the overhead of
+In Mosaic, due to CoCoA (Section 4.2), we find that we can simplify              Mosaic.
+how the page size is selected for each large page frame (i.e., decide            Coalescing in Hardware. Once the In-Place Coalescer selects
+which pages should be coalesced), compared to state-of-the-art                   a large page frame for coalescing, it then performs the coalesc-
+memory managers. In state-of-the-art memory managers, such as                    ing operation in hardware. Figure 6b shows the steps required for
+our GPU-MMU baseline based on Power et al. [92], there is no                     coalescing with the In-Place Coalescer under the Mosaic timeline.
+guarantee that base pages within a large page frame belong to the                Unlike coalescing in existing memory managers, the In-Place Coa-
+same application, and memory allocators do not conserve virtual                  lescer does not need to perform any data migration, as CoCoA has
+memory contiguity in physical memory. As a result, state-of-the-art              already conserved contiguity within all large page frames selected
+memory managers must perform four steps to coalesce pages, as                    for coalescing: the coalescing operation needs to only update the
+shown under the Baseline timeline in Figure 6a. First, the manager               page table entries corresponding to the large page frame and the
+must identify opportunities for coalescing across multiple pages (not            base pages ( 4 in the figure).
+shown in the timeline, as this can be performed in the background).                 We modify the L3 and L4 page table entries (PTEs) to simplify
+This is done by a hardware memory management unit (MMU), such                    updates during the coalescing operation, as shown in Figure 7a. We
+as the Falcon coprocessor in recent GPU architectures [81], which                add a large page bit to each L3 PTE (corresponding to a large page),
+tallies page utilization information from the page table entries of              which is initially set to 0 (to indicate a page that is not coalesced),
+each base page. The most-utilized contiguous base pages are chosen               and we add a disabled bit to each L4 PTE (corresponding to a base
+for coalescing (Pages A–G in Figure 6a). Second, the manager must                page), which is initially set to 0 (to indicate that a page table walker
+identify a large page frame where the coalesced base pages will                  should use the base page virtual-to-physical mapping in the L4 PTE).
+reside, and then migrate the base pages to this new large page frame,            The coalescing hardware simply needs to locate the L3 PTE for the
+which uses DRAM channel bandwidth ( 1 in the figure). Third,                     large page frame being coalesced ( 1 in the figure), and set the large
+the manager must update the page table entries (PTEs) to reflect                 page bit to 1 for the PTE ( 2 ). (We discuss how page table lookups
+the coalescing, which again uses DRAM channel bandwidth ( 2 ).                   occur below.) We perform this bit setting operation atomically, with
+Fourth, the manager invokes a TLB flush to invalidate stale virtual-             a single memory operation to minimize the amount of time before
+to-physical mappings (which point to the base page locations prior               the large page mapping can be used. Then, the coalescing hardware
+to migration), during which the SMs stall ( 3 ). Thus, coalescing                sets the disabled bit to 1 for all L4 PTEs ( 3 ).
+using a state-of-the-art memory manager causes significant DRAM                     The virtual-to-physical mapping for the large page can be used
+channel utilization and SM stalls, as Figure 6a shows.                           as soon as the large page bit is set, without (1) waiting for the
+   In contrast, Mosaic can perform coalescing in-place, i.e., base               disabled bits in the L4 PTEs to be set, or (2) requiring a TLB flush
+pages do not need to be migrated in order to be coalesced into a
+large page. Hence, we call the page size selection mechanism of                  2 Coalescing decisions are made purely in the software runtime portion of the In-Place
+Mosaic the In-Place Coalescer. As shown in Figure 6b, the In-Place                Coalescer, and thus system designers can easily use a different coalescing policy, if
+Coalescer causes much less DRAM channel utilization and no SM                     desired.
+
+                      In-Place Coalescer
+                  issues coalescing command          1                                 2
+                 DRAM Channel Page A Page B Page C Page D Page E Page F Page G   Update PTEs         Normal Execution                                Data movement
+(a) Baseline
+                      GPU SM                         Normal Execution                                    TLB Flush
+                                                                                                    3                                                DRAM writes
+                                                                                                                                  time
+                                      4                                                                                                              GPU SM stalls
+                 DRAM Channel    Update PTEs                            Normal Execution
+(b) Mosaic
+                      GPU SM                                     Normal Execution                                                                    Normal execution
+
+
+                                Figure 6: Coalescing timeline for (a) GPU-MMU baseline and for (b) Mosaic.
+
+
+                                                                           7
+MICRO-50, October 14–18, 2017, Cambridge, MA, USA                                                                                       R. Ausavarungnirun et al.
+
+        Level 3                    Level 4                 Large Page     Large Page          the large page. Note that for pages that are not coalesced, the page
+  Page Table Entry           Page Table Entries             Number          Offset
+  (for a large page)          (for base pages)
+                                                                                              walker behavior is not modified.
+                                                   Large
+  1          L                        3 d          Page
+             2                           d                                                    4.4    Contiguity-Aware Compaction
+                                                   Small
+L - large page bit                       d         Page
+                                                                                              After an application kernel finishes, it can deallocate some of the
+d - disabled bit
+                                                                                              base pages that it previously allocated. This deallocation can lead to
+                                         d                    Base Page        Base           internal fragmentation within a large page frame that was coalesced,
+                                                               Number       Page Offset
+                                                                                              as some of the frame’s constituent base pages are no longer valid.
+            (a) Page table entries.                (b)  Virtual-to-physical
+                                                                                              While the page could still benefit from coalescing (as this improves
+                                                   mappings in an L4 PTE.
+                                                                                              TLB reach), the unallocated base pages within the large page frame
+       Figure 7: L3 and L4 page table structure in Mosaic.                                    cannot be allocated to another virtual address as long as the page
+                                                                                              remains coalesced. If significant memory fragmentation exists, this
+to remove the base page mappings from the TLB. This is because                                can cause CoCoA to run out of free large page frames, even though
+no migration was needed to coalesce the base pages into the large                             it has not allocated all of the available base pages in GPU memory.
+page. As a result, the existing virtual-to-physical mappings for the                          To avoid an out-of-memory error in the application, Mosaic uses
+coalesced base pages still point to the correct memory locations.                             CAC to splinter and compact highly-fragmented large page frames,
+While we set the disabled bits in the PTEs to discourage using                                freeing up large page frames for CoCoA to use.
+these mappings, as the mappings consume a portion of the limited
+                                                                                              Deciding When to Splinter and Compact a Coalesced Page.
+number of base page entries in the TLB, we can continue to use the
+                                                                                              Whenever an application deallocates a base page within a coalesced
+mappings safely until they are evicted from the TLB. As shown in
+                                                                                              large page frame, CAC checks to see how many base pages remain
+Figure 6b, since we do not flush the TLB, we do not need to stall
+                                                                                              allocated within the frame. If the number of allocated base pages
+the SMs. Mosaic ensures that if the coalesced page is subsequently
+                                                                                              falls below a predetermined threshold (which is configurable in the
+splintered, the large page virtual-to-physical mapping is removed
+                                                                                              GPU runtime), CAC decides to splinter the large page frame into
+(see Section 4.4).3                                                                           base pages (see below). Once the splintering operation completes,
+   As we can see from Figure 6, the lack of data migration and TLB                            CACperforms compaction by migrating the remaining base pages
+flushes in Mosaic greatly reduces the time required for the coa-                              to another uncoalesced large page frame that belongs to the same
+lescing operation in Mosaic, with respect to coalescing in existing                           application. In order to avoid occupying multiple memory channels
+MMUs.                                                                                         while performing this migration, which can hurt the performance
+TLB Lookups After Coalescing. As mentioned in Section 2.2,                                    of other threads that are executing concurrently, we restrict CAC
+each TLB level contains two separate sets of entries, with one set of                         to migrate base pages between only large page frames that reside
+entries for each page size. In order to improve TLB reach, we need                            within the same memory channel. After the migration is complete,
+to ensure that an SM does not fetch the base page PTEs for coalesced                          the original large page frame no longer contains any allocated base
+base pages (even though these are safe to use) into the TLBs, as                              pages, and CAC sends the address of the large page frame to CoCoA,
+these PTEs contend with PTEs of uncoalesced base pages for the                                which adds the address to its free frame list.
+limited TLB space. When a GPU with Mosaic needs to translate a                                    If the number of allocated base pages within a coalesced page is
+memory address, it first checks if the address belongs to a coalesced                         greater than or equal to the threshold, CAC does not splinter the
+page by looking up the TLB large page entries. If the SM locates a                            page, but notifies CoCoA of the large page frame address. CoCoA
+valid large page entry for the request (i.e., the page is coalesced), it                      then stores the coalesced large page frame’s address in a emergency
+avoids looking up TLB base page entries.                                                      frame list. As a failsafe, if CoCoA runs out of free large pages, and
+   If a TLB miss occurs in both the TLB large page and base page                              CAC does not have any large pages that it can compact, CoCoA
+entries for a coalesced page, the page walker traverses the page table.                       pulls a coalesced page from the emergency frame list, asks CAC to
+At the L3 PTE ( 1 in Figure 7a), the walker reads the large page bit                          splinter the page, and then uses any unallocated base pages within
+( 2 ). As the bit is set, the walker needs to read the virtual-to-physical                    the splintered large page frame to allocate new virtual base pages.
+mapping for the large page. The L3 PTE does not typically contain                             Splintering the Page in Hardware. Similar to the In-Place Coa-
+space for a virtual-to-physical mapping, so the walker instead reads                          lescer, when CAC selects a coalesced page for splintering, it then
+the virtual-to-physical mapping from the first PTE of the L4 page                             performs the splintering operation in hardware. The splintering
+table that the L3 PTE points to. Figure 7b shows why we can use                               operation essentially reverses the coalescing operation. First, the
+the mapping in the L4 PTE for the large page. A virtual-to-physical                           splintering hardware clears the disabled bit in the L4 PTEs of the
+mapping for a large page consists of a page number and an offset.                             constituent base pages. Then, the splintering hardware clears the
+As the base pages within the large page were not migrated, their                              large page bit atomically, which causes the subsequent page table
+mappings point to physical memory locations within the large page                             walks to look up the virtual-to-physical mapping for the base page.
+frame. As a result, if we look at only the bits of the mapping used                           Unlike coalescing, when the hardware splinters a coalesced page, it
+for the large page number, they are identical for both the large page                         must also issue a TLB flush request for the coalesced page. As we
+mapping and the base page mapping. When the large page bit is                                 discuss in Section 4.3, a large page mapping can be present in the
+set, the page walker reads the large page number from the L4 PTE                              TLB only when a page is coalesced. The flush to the TLB removes
+(along with other fields of the PTE, e.g., for access permissions),                           the large page entry for this mapping, to ensure synchronization
+and returns the PTE to the TLB. In doing so, we do not need to                                across all SMs with the current state of the page table.
+allocate any extra storage for the virtual-to-physical mapping of
+                                                                                              Optimizing Compaction with Bulk Copy Mechanisms. The
+3 As there is a chance that base pages within a splintered page can migrated during           migration of each base page during compaction requires several
+ compaction, the large page virtual-to-physical mapping may no longer be valid. To            long-latency memory operations, where the contents of the page
+ avoid correctness issues when this happens, Mosaic flushes the TLB large page entry          are copied to a destination location only 64 bits at a time, due to
+ for the mapping as soon as a coalesced page is splintered.
+
+
+                                                                                          8
+Mosaic: A GPU Memory Manager
+with Application-Transparent Support for Multiple Page Sizes                                         MICRO-50, October 14–18, 2017, Cambridge, MA, USA
+
+
+the narrow width of the memory channel [61, 101, 102]. To opti-                            which ranges from one to five for our homogeneous workloads,
+mize the performance of CAC, we can take advantage of in-DRAM                              and from two to five for our heterogeneous workloads. We form
+bulk copy techniques such as RowClone [101, 102] or LISA [21],                             our homogeneous workloads using multiple copies of the same
+which provide very low-latency (e.g., 80 ns) memory copy within                            application. We build 27 homogeneous workloads for each cate-
+a single DRAM module. These mechanisms use existing internal                               gory using GPGPU applications from the Parboil [109], SHOC [27],
+buses within DRAM to copy an entire base page of memory with a                             LULESH [52, 53], Rodinia [22], and CUDA SDK [76] suites. We
+single bulk memory operation. While such bulk data copy mecha-                             form our heterogeneous workloads by randomly selecting a num-
+nisms are not essential for our proposal, they have the potential to                       ber of applications out of these 27 GPGPU applications. We build
+improve performance when a large amount of compaction takes                                25 heterogeneous workloads per category. Each workload has a
+place. Section 6.4 evaluates the benefits of using in-DRAM bulk                            combined working set size that ranges from 10MB to 2GB. The av-
+copy with CAC.                                                                             erage working set size of a workload is 217MB. In total we evaluate
+                                                                                           235 homogeneous and heterogeneous workloads. We provide a list
+5     METHODOLOGY                                                                          of all our workloads in our extended technical report [11].
+We modify the MAFIA framework [45], which uses GPGPU-Sim                                   Evaluation Metrics. We report workload performance using the
+3.2.2 [12], to evaluate Mosaic on a GPU that concurrently executes                         weighted speedup metric [31, 32], which is a commonly-used metric
+multiple applications. We have released our simulator modifica-                            to evaluate the performance of a multi-application workload [9, 28,
+tions [98, 99]. Table 1 shows the system configuration we simulate                         29, 54, 56, 57, 70, 71, 72]. Weighted speedup is calculated as:
+for our evaluations, including the configurations of the GPU core
+and memory partition (see Section 2.1).                                                                                         X IPC
+                                                                                                                                         shar ed
+                                                                                                          Weighted Speedup =                                 (1)
+                                                                                                                                     IPCalone
+                             GPU Core Configuration
+
+    Shader Core Config      30 cores, 1020 MHz, GTO warp scheduler [96]                    where IPCalone is the IPC of an application in the workload that
+                                                                                           runs on the same number of shader cores using the baseline state-of-
+    Private L1 Cache        16KB, 4-way associative, LRU, L1 misses are
+                            coalesced before accessing L2, 1-cycle latency
+                                                                                           the-art configuration [92], but does not share GPU resources with
+                                                                                           any other applications; and IPCshar ed is the IPC of the application
+    Private L1 TLB          128 base page/16 large page entries per core,                  when it runs concurrently with other applications. We report the
+                            fully associative, LRU, single port, 1-cycle latency
+                                                                                           performance of each application within a workload using IPC.
+                                                                                           Scheduling and Partitioning of Cores. As scheduling is not the
+                       Memory Partition Configuration                                      focus of this work, we assume that SMs are equally partitioned
+     (6 memory partitions in total, with each partition accessible by all 30 cores)
+                                                                                           across the applications within a workload, and use the greedy-then-
+    Shared L2 Cache         2MB total, 16-way associative, LRU, 2 cache banks and          oldest (GTO) warp scheduler [96]. We speculate that if we use other
+                            2 ports per memory partition, 10-cycle latency                 scheduling or partitioning policies, Mosaic would still increase the
+    Shared L2 TLB           512 base page/256 large page entries, non-inclusive,           TLB reach and achieve the benefits of demand paging effectively,
+                            16-way/fully-associative (base page/large page), LRU,          though we leave such studies for future work.
+                            2 ports, 10-cycle latency
+    DRAM                    3GB GDDR5, 1674 MHz, 6 channels, 8 banks per rank,
+                            FR-FCFS scheduler [94, 119], burst length 8
+                                                                                           6     EVALUATION
+                                                                                           In this section, we evaluate how Mosaic improves the performance
+         Table 1: Configuration of the simulated system.                                   of homogeneous and heterogeneous workloads (see Section 5 for
+Simulator Modifications. We modify GPGPU-Sim [12] to model                                 more detail). We compare Mosaic to two mechanisms: (1) GPU-
+the behavior of Unified Virtual Address Space [77]. We add a mem-                          MMU, a baseline GPU with a state-of-the-art memory manager
+ory allocator into cuda-sim, the CUDA simulator within GPGPU-                              based on the work by Power et al. [92], which we explain in detail
+Sim, to handle all virtual-to-physical address translations and to                         in Section 3.1; and (2) Ideal TLB, a GPU with an ideal TLB, where
+provide memory protection. We add an accurate model of address                             every address translation request hits in the L1 TLB (i.e., there are
+translation to GPGPU-Sim, including TLBs, page tables, and a page                          no TLB misses).
+table walker. The page table walker is shared across all SMs, and
+allows up to 64 concurrent walks. Both the L1 and L2 TLBs have                             6.1    Homogeneous Workloads
+separate entries for base pages and large pages [35, 50, 51, 84, 89, 90].                  Figure 8 shows the performance of Mosaicfor the homogeneous
+Each TLB contains miss status holding registers (MSHRs) [58] to                            workloads. We make two observations from the figure. First, we
+track in-flight page table walks. Our simulation infrastructure sup-                       observe that Mosaic is able to recover most of the performance lost
+ports demand paging, by detecting page faults and faithfully mod-                          due to the overhead of address translation (i.e., an ideal TLB) in
+eling the system I/O bus (i.e., PCIe) latency based on measurements                        homogeneous workloads. Compared to the GPU-MMU baseline,
+from NVIDIA GTX 1080 cards [83] (see Section 3.2).4 We use a                               Mosaic improves the performance by 55.5%, averaged across all
+worst-case model for the performance of our compaction mecha-                              135 of our homogeneous workloads. The performance of Mosaic
+nism (CAC, see Section 4.4) conservatively, by stalling the entire                         comes within 6.8% of the Ideal TLB performance, indicating that
+GPU (all SMs) and flushing the pipeline. More details about our                            Mosaic is effective at extending the TLB reach. Second, we observe
+modifications can be found in our extended technical report [11].                          that Mosaic provides good scalability. As we increase the num-
+Workloads. We evaluate the performance of Mosaic using both ho-                            ber of concurrently-executing applications, we observe that the
+mogeneous and heterogeneous workloads. We categorize each work-                            performance of Mosaic remains close to the Ideal TLB performance.
+load based on the number of concurrently-executing applications,                              We conclude that for homogeneous workloads, Mosaic effec-
+4 Our experience with the NVIDIA GTX 1080 suggests that production GPUs perform
+                                                                                           tively approaches the performance of a GPU with the Ideal TLB,
+significant prefetching to reduce latencies when reference patterns are predictable.
+                                                                                           by employing multiple page sizes to simultaneously increase the
+This feature is not modeled in our simulations.                                            reach of both the L1 private TLB and the shared L2 TLB.
+
+
+                                                                                       9
+MICRO-50, October 14–18, 2017, Cambridge, MA, USA                                                                                                                   R. Ausavarungnirun et al.
+
+
+           7                                                                                                  5
+
+
+
+
+                                                                                                Weighted
+                                                                                                Speedup
+           6                                         33.8%       39.0%                                        4       GPU-MMU         Mosaic   Ideal TLB
+Weighted
+Speedup
+
+
+
+
+           5                                                                GPU-MMU                           3
+                                      55.4%                                                                   2
+           4
+           3                                                                Mosaic                            1
+                          61.5%
+           2                                                                Ideal TLB                         0
+               95.0%
+           1
+           0
+                 1 App     2 Apps          3 Apps      4 Apps      5 Apps
+                Number of Concurrently-Executing Applications
+                                                                                                                      TLB-Friendly                                   TLB-Sensitive
+Figure 8: Homogeneous workload performance of the GPU
+memory managers as we vary the number of concurrently-                                          Figure 10: Performance of selected two-application hetero-
+executing applications in each workload.                                                        geneous workloads.
+
+6.2            Heterogeneous Workloads                                                          per-application IPC of Mosaic and Ideal TLB normalized to the ap-
+                                                                                                plication’s performance under GPU-MMU, and sorted in ascending
+Figure 9 shows the performance of Mosaic for heterogeneous work-                                order. We show four graphs in the figure, where each graph corre-
+loads that consist of multiple randomly-selected GPGPU applica-                                 sponds to individual applications from workloads with the same
+tions. From the figure, we observe that on average across all of the                            number of concurrently-executing applications. We make three ob-
+workloads, Mosaic provides a performance improvement of 29.7%                                   servations from these results. First, Mosaic improves performance
+over GPU-MMU, and comes within 15.4% of the Ideal TLB perfor-                                   relative to GPU-MMU for 93.6% of the 350 individual applications.
+mance. We find that the improvement comes from the significant                                  We find that the application IPC relative to the baseline GPU-MMU
+reduction in the TLB miss rate with Mosaic, as we discuss below.                                for each application ranges from 66.3% to 860%, with an average
+           7                                                                                    of 133.0%. Second, for the 6.4% of the applications where Mosaic
+           6                                   43.1%            23.7%                           performs worse than GPU-MMU, we find that for each applica-
+Weighted
+Speedup
+
+
+
+
+           5                                                                GPU-MMU
+           4                 31.5%                                          Mosaic
+                                                                                                tion, the other concurrently-executing applications in the same
+           3   21.4%                                                                            workload experience a significant performance improvement. For
+           2                                                                Ideal TLB
+           1                                                                                    example, the worst-performing application, for which Mosaic hurts
+           0                                                                                    performance by 33.6% compared to GPU-MMU, is from a workload
+                 2 Apps           3 Apps            4 Apps        5 Apps
+                                                                                                with three concurrently-executing applications. We find that the
+                Number of Concurrently-Executing Applications
+                                                                                                other two applications perform 66.3% and 7.8% better under Mosaic,
+Figure 9: Heterogeneous workload performance of the GPU                                         compared to GPU-MMU. Third, we find that, on average across all
+memory managers.                                                                                heterogeneous workloads, 48%, 68.9% and 82.3% of the applications
+                                                                                                perform within 90%, 80% and 70% of Ideal TLB, respectively.
+   The performance gap between Mosaic and Ideal TLB is greater
+for heterogeneous workloads than it is for homogeneous work-                                            8 8                                                   9 9
+                                                                                                       87 7                    GPU-MMU
+                                                                                                                            GPU-MMU                           9 8
+                                                                                                                                                              8 9         GPU-MMU
+                                                                                                                                                                       GPU-MMU
+loads. To understand why, we examine the performance of the each                                          8
+                                                                                                                               Mosaic
+                                                                                                                            Mosaic                              7
+                                                                                                                                                              7 8         Mosaic
+                                                                                                                                                                       Mosaic
+                                                                                                Performance
+
+
+
+
+                                                                                                                                                      Performance
+                                                                                                                            GPU-MMU                                    GPU-MMU
+                                                                                                Performance
+
+
+
+
+                                                                                                                                                      Performance
+                                                                                                       76 6                    GPU-MMU                        8           GPU-MMU
+                                                                                                 Normalized
+
+
+
+
+                                                                                                                                                       Normalized
+                                                                                                          7
+                                                                                                 Normalized
+
+
+
+
+                                                                                                                                                       Normalized
+workload in greater detail. Figure 10 shows the performance im-                                        65 5                    Ideal-TLB
+                                                                                                                            Ideal-TLB
+                                                                                                                            Mosaic                            7 6
+                                                                                                                                                              6 7         Ideal-TLB
+                                                                                                                                                                       Ideal-TLB
+                                                                                                                                                                       Mosaic
+                                                                                             Performance
+
+
+
+
+                                                                                                                                                   Performance
+                                                                                                                               Mosaic                                     Mosaic
+                                                                                             Performance
+
+
+
+
+                                                                                                                                                   Performance
+                                                                                                          6
+                                                                                              Normalized
+
+
+
+
+                                                                                                                                                    Normalized
+                                                                                              Normalized
+
+
+
+
+                                                                                                                                                    Normalized
+                                                                                                                                                                5
+                                                                                                                                                              5 6
+                                                                                                                                                              6
+provement of 15 randomly-selected two-application workloads. We                                           4
+                                                                                                       54 5                 Ideal-TLB
+                                                                                                                               Ideal-TLB                      4 4      Ideal-TLB
+                                                                                                                                                                          Ideal-TLB
+                                                                                                        3 3                                                   5 5
+categorize the workloads as either TLB-friendly or TLB-sensitive.                                      4 4                                                      3
+                                                                                                                                                              3 4
+                                                                                                                                                              4
+                                                                                                        2
+                                                                                                       3 32                                                     2
+                                                                                                                                                              2 3
+The majority of the workloads are TLB-friendly, which means that                                                                                              3
+                                                                                                       21 1
+                                                                                                          2                                                   1 1
+                                                                                                                                                              2 2
+they benefit from utilizing large pages. The TLB hit rate increases                                    10 0
+                                                                                                          1                                                   0 0
+                                                                                                                                                              1 1
+significantly with Mosaic (see Section 6.3) for TLB-friendly work-                                     0 00 0 1010 2020 3030 4040 5050                          0 0
+                                                                                                                                                              0 0        25 25     50 50   75 75
+loads, allowing the workload performance to approach Ideal TLB.                                             0 Sorted
+                                                                                                          0 Sorted    Application
+                                                                                                               10 10Application
+                                                                                                                     20           40Number
+                                                                                                                        20 30 30 Number
+                                                                                                                                     40 50 50                     0 Sorted
+                                                                                                                                                                0 Sorted    Application
+                                                                                                                                                                         Application
+                                                                                                                                                                         25 25     5050  Number
+                                                                                                                                                                                       Number
+                                                                                                                                                                                            7575
+                                                                                                               Sorted  Application Number
+However, for TLB-sensitive workloads, such as HS–CONS and NW–                                                 (a) Sorted Application
+                                                                                                                  2 concurrent       Number
+                                                                                                                                  apps.                        (b) Sorted Application
+                                                                                                                                                                   3 Sorted           Number
+                                                                                                                                                                            Application
+                                                                                                                                                                     concurrent   apps. Number
+                                                                                                         8 8                                                  8 8
+HISTO, there is still a performance gap between Mosaic and the Ideal                                                   GPU-MMU
+                                                                                                                          GPU-MMU                                      GPU-MMU
+                                                                                                                                                                          GPU-MMU
+                                                                                                        87 7
+                                                                                                           8                                                  7 8
+                                                                                                                                                              8 7
+                                                                                                                                                                       Mosaic
+                                                                                                                                                                          Mosaic
+                                                                                                                       Mosaic
+                                                                                                                          Mosaic                                       GPU-MMU
+                                                                                                                                                                          GPU-MMU
+                                                                                                Performance
+
+
+
+
+                                                                                                                                                      Performance
+                                                                                                Performance
+
+
+
+
+                                                                                                                                                      Performance
+
+
+
+
+TLB, even though Mosaic improves the TLB hit rate. We discover                                          76 6
+                                                                                                           7           GPU-MMU
+                                                                                                                          GPU-MMU                             6 7
+                                                                                                                                                              7 6
+                                                                                                 Normalized
+
+
+
+
+                                                                                                                                                       Normalized
+                                                                                                 Normalized
+
+
+
+
+                                                                                                                                                       Normalized
+
+
+
+
+                                                                                                                                                                       Ideal-TLB
+                                                                                                                                                                          Ideal-TLB
+                                                                                                                                                                       Mosaic
+                                                                                                                       Ideal-TLB
+                                                                                                                          Ideal-TLB
+                                                                                                                       Mosaic
+                                                                                                                          Mosaic                                          Mosaic
+                                                                                                        65 5                                                  5 6
+                                                                                                                                                                5
+                                                                                             Performance
+
+
+
+
+                                                                                                                                                   Performance
+                                                                                             Performance
+
+
+
+
+                                                                                                                                                   Performance
+
+
+
+
+two main factors that lead to this performance gap. First, in these                                        6                                                  6
+                                                                                              Normalized
+
+
+
+
+                                                                                                                                                    Normalized
+
+
+
+
+                                                                                                                                                                       Ideal-TLB
+                                                                                              Normalized
+
+
+
+
+                                                                                                                                                    Normalized
+
+
+
+
+                                                                                                                                                                          Ideal-TLB
+                                                                                                        54 4
+                                                                                                           5           Ideal-TLB
+                                                                                                                          Ideal-TLB                           4 5
+                                                                                                                                                              5 4
+workloads, one of the applications is highly sensitive to shared L2
+                                                                                                        43 3
+                                                                                                           4                                                  3 4
+                                                                                                                                                              4 3
+TLB misses (e.g., HS in HS–CONS, HISTO in NW–HISTO), while                                              32 2
+                                                                                                           3                                                  2 3
+                                                                                                                                                              3 2
+the other application (e.g., CONS, NW) is memory intensive. The                                         21 1
+                                                                                                           2                                                  1 2
+                                                                                                                                                              2 1
+                                                                                                         0
+                                                                                                        1 10                                                  0 0
+                                                                                                                                                              1 1
+memory-intensive application introduces a high number of conflict                                          0 0        2525   5050     7575 100
+                                                                                                                                             100                0 0 25 25 50 50 75 75 100
+                                                                                                                                                                                        100125
+                                                                                                                                                                                             125
+                                                                                                        0 0                                                   0 0
+misses on the shared L2 TLB, which harms the performance of the                                               0 Sorted  Application
+                                                                                                                 0 Sorted
+                                                                                                                     25 25  50 50 75 Number
+                                                                                                                           Application Number
+                                                                                                                                      75 100100                     0 Sorted
+                                                                                                                                                                         2525Application
+                                                                                                                                                                      0 Sorted           Number
+                                                                                                                                                                               Application
+                                                                                                                                                                              5050 7575 100Number
+                                                                                                                                                                                           100   125
+                                                                                                                                                                                               125
+TLB-sensitive application significantly, and causes the workload’s                                                  Sorted
+                                                                                                                  Sorted   Application
+                                                                                                                         Application   Number
+                                                                                                                                     Number                            Sorted
+                                                                                                                                                                     Sorted   Application
+                                                                                                                                                                            Application   Number
+                                                                                                                                                                                        Number
+performance under Mosaic to drop significantly below the Ideal                                                (c) 4 concurrent apps.                           (d) 5 concurrent apps.
+TLB performance. Second, the high latency of page walks due to
+compulsory TLB misses and higher access latency to the shared                                   Figure 11: Sorted normalized per-application IPC for ap-
+L2 TLB (which increases because TLB requests have to probe both                                 plications in heterogeneous workloads, categorized by the
+the large page and base page TLBs) have a high impact on the TLB-                               number of applications in a workload.
+sensitive application. Hence, for these workloads, the Ideal TLB still
+has significant advantages over Mosaic.                                                            We conclude that Mosaic is effective at increasing the TLB reach
+Summary of Impact on Individual Applications. To deter-                                         for heterogeneous workloads, and delivers significant performance
+mine how Mosaic affects the individual applications within the                                  improvements over a state-of-the-art GPU memory manager.
+heterogeneous workloads we evaluate, we study the IPC of each                                   Impact of Demand Paging on Performance. All of our results
+application in all of our heterogeneous workloads. In all, this rep-                            so far show the performance of the GPU-MMU baseline and Mosaic
+resents a total of 350 individual applications. Figure 11 shows the                             when demand paging is enabled. Figure 12 shows the normalized
+
+                                                                                        10
+Mosaic: A GPU Memory Manager
+with Application-Transparent Support for Multiple Page Sizes                                                    MICRO-50, October 14–18, 2017, Cambridge, MA, USA
+
+
+               2.0                                                GPU-MMU
+                                                                  GPU-MMU,no Paging         of the large page, which frees up base page TLB entries so that they
+Normalized
+ Weighted
+ Speedup
+
+
+
+
+               1.5                                                no demand paging          can be used to cache mappings for the uncoalesced base pages. We
+                     58.5%              47.5%
+               1.0                                                GPU-MMU
+                                                                  GPU-MMU,with              now evaluate how sensitive the performance of Mosaic is to the
+               0.5                                                with demand paging
+                                                                  Paging                    number of base page and large page entries in each TLB level.
+               0.0                                                Mosaic,with Paging
+                                                                  Mosaic                        Figure 14 shows the performance of both GPU-MMU and Mosaic
+                          Homogeneous        Heterogeneous        with demand paging
+                                                                                            as we vary the number of base page entries in the per-SM L1 TLBs
+Figure 12: Performance of GPU-MMU and Mosaic compared                                       (Figure 14a) and in the shared L2 TLB (Figure 14b). We normalize
+to GPU-MMU without demand paging.                                                           all results to the GPU-MMU performance with the baseline 128-
+                                                                                            base-page-entry L1 TLBs per SM and a 512-base-page-entry shared
+weighted speedup of the GPU-MMU baseline and Mosaic, compared                               L2 TLB. From the figure, we make two observations. First, we find
+to GPU-MMU without demand paging, where all data required by                                that for the L1 TLB, GPU-MMU is sensitive to the number of base
+an application is moved to the GPU memory before the application                            page entries, while Mosaic is not sensitive to the number of base
+starts executing. We make two observations from the figure. First,                          page entries. This is because Mosaic successfully coalesces most
+we find that Mosaic outperforms GPU-MMU without demand pag-                                 of its base pages into large pages, which significantly reduces the
+ing by 58.5% on average for homogeneous workloads and 47.5% on                              pressure on TLB base page capacity. In fact, the number of L1 TLB
+average for heterogeneous workloads. Second, we find that demand                            base page entries has a minimal impact on the performance of
+paging has little impact on the weighted speedup. This is because                           Mosaic until we scale it all the way down to 8 entries. Even then,
+demand paging latency occurs only when a kernel launches, at                                compared to an L1 TLB with 128 base page entries, Mosaic loses
+which point the GPU retrieves data from the CPU memory. The                                 only 7.6% performance on average with 8 entries. In contrast, we
+data transfer overhead is required regardless of whether demand                             find that GPU-MMU is unable to coalesce base pages, and as a
+paging is enabled, and thus the GPU incurs similar overhead with                            result, its performance scales poorly as we reduce the number of
+and without demand paging.                                                                  TLB base page entries. Second, we find that the performance of both
+                                                                                            GPU-MMU and Mosaic is sensitive to the number of L2 TLB base
+6.3            Analysis of TLB Impact                                                       page entries. This is because even though Mosaic does not need
+TLB Hit Rate. Figure 13 compares the overall TLB hit rate of                                many L1 TLB base page entries per SM, the base pages are often
+GPU-MMU to Mosaic for 214 of our 235 workloads, which suffer                                shared across multiple SMs. The L2 TLB allows SMs to share page
+from limited TLB reach (i.e., workloads that have an L2 TLB hit                             table entries (PTEs) with each other, so that once an SM retrieves a
+rate lower than 98%). We make two observations from the figure.                             PTE from memory using a page walk, the other SMs do not need
+First, we observe Mosaic is very effective at increasing the TLB                            to wait on a page walk. The larger the number of L2 TLB base page
+reach of these workloads. We find that for the GPU-MMU baseline,                            entries, the more likely it is that a TLB request can avoid the need
+every fully-mapped large page frame contains pages from multiple                            for a page walk. Since Mosaic does not directly have an effect on
+applications, as the GPU-MMU allocator does not provide the soft                            the number of page walks, it benefits from a mechanism (e.g., a
+guarantee of CoCoA. As a result, GPU-MMU does not have any                                  large L2 TLB) that can reduce the number of page walks and hence
+opportunities to coalesce base pages into a large page without per-                         is sensitive to the size of the L2 TLB.
+forming significant amounts of data migration. In contrast, Mosaic                                                                                        1.4
+                                                                                                          1.4                                                    GPU-MMU      Mosaic
+can coalesce a vast majority of base pages thanks to CoCoA. As                                                  GPU-MMU        Mosaic
+                                                                                                                                            Performance
+                                                                                                                                                          1.3
+                                                                                            Performance
+
+
+
+
+                                                                                                          1.3                                Normalized
+                                                                                             Normalized
+
+
+
+
+a result, Mosaic reduces the TLB miss rate dramatically for these                                         1.2                                             1.2
+workloads, with the average miss rate falling below 1% in both                                            1.1                                             1.1
+                                                                                                          1.0                                             1.0
+the L1 and L2 TLBs. Second, we observe an increasing amount of                                            0.9                                             0.9
+interference in GPU-MMU when more than three applications are                                             0.8                                             0.8
+                                                                                                                8    16   32   64 128 256                       64    128 256 512 1024 4096
+running concurrently. This results in a lower TLB hit rate as the
+                                                                                                                     Per-SM L1 TLB                                    Shared L2 TLB
+number of applications increases from three to four applications,                           (a)                     Base Page Entries       (b)                      Base Page Entries
+and from four to five applications. The L2 TLB hit rate drops from
+81% in workloads with two concurrently-executing applications to                            Figure 14: Sensitivity of GPU-MMU and Mosaic performance
+62% in workloads with five concurrently-executing applications.                             to L1 and L2 TLB base page entries, normalized to GPU-
+Mosaic experiences no such drop due to interference as we increase                          MMU with 128 L1 and 512 L2 TLB base page entries.
+the number of concurrently-executing applications, since it makes
+much greater use of large page coalescing and enables a much larger                            Figure 15 shows the performance of both GPU-MMU and Mosaic
+TLB reach.                                                                                  as we vary the number of large page entries in the per-SM L1 TLBs
+          100%                                                                              (Figure 15a) and in the shared L2 TLB (Figure 15b). We normalize all
+TLB Hit Rate
+
+
+
+
+           80%                                                                              results to the GPU-MMU performance with the baseline 16-large-
+           60%
+                                                                                            page-entry L1 TLBs per SM and a 256-large-page-entry shared L2
+           40%
+           20%
+                                                                                            TLB. We make two observations from the figure. First, for both
+            0%                                                                              the L1 and L2 TLBs, Mosaic is sensitive to the number of large
+                     L1      L2   L1    L2      L1   L2      L1    L2    L1    L2           page entries. This is because Mosaic successfully coalesces most
+          GPU-MMU 1 App     2 Apps      3 Apps       4 Apps      5 Apps
+                                                                                            of its base pages into large pages. We note that the sensitivity is
+          Mosaic      Number of Concurrently-Executing Applications
+                                                                                            not as high as Mosaic’s sensitivity to L2 TLB base page entries
+Figure 13: L1 and L2 TLB hit rate for GPU-MMU and Mosaic.                                   (Figure 14b), because each large page entry covers a much larger
+                                                                                            portion of memory, which allows a smaller number of large page
+TLB Size Sensitivity. A major benefit of Mosaic is its ability to                           entries to still cover a majority of the total application memory.
+improve TLB reach by increasing opportunities to coalesce base                              Second, GPU-MMU is insensitive to the large page entry count.
+pages into a large page. After the base pages are coalesced, the GPU                        This is because GPU-MMU is unable to coalesce any base pages
+uses the large page TLB to cache the virtual-to-physical mapping                            into large pages, due to its coalescing-unfriendly allocation (see
+
+                                                                                       11
+MICRO-50, October 14–18, 2017, Cambridge, MA, USA                                                                                                                 R. Ausavarungnirun et al.
+
+
+
+              1.4                                            1.4                                                        no CAC     CAC                                 no CAC      CAC
+                    GPU-MMU     Mosaic                             GPU-MMU    Mosaic
+Performance
+
+
+
+
+                                               Performance
+              1.3                                            1.3                                                        CAC-BC     Ideal CAC
+                                                                                                                                   CAC-Ideal                           CAC-BC      Ideal CAC
+                                                                                                                                                                                   CAC-Ideal
+ Normalized
+
+
+
+
+                                                Normalized
+                                                                                                                  1.6                                            1.6
+              1.2                                            1.2
+
+
+
+
+                                                                                                    Performance
+
+
+
+
+                                                                                                                                                   Performance
+                                                                                                     Normalized
+
+
+
+
+                                                                                                                                                    Normalized
+              1.1                                            1.1                                                  1.4                                            1.4
+              1.0                                            1.0                                                  1.2                                            1.2
+              0.9                                            0.9
+              0.8                                            0.8                                                  1.0                                            1.0
+                    4      8    16   32   64                       32   64   128   256   512
+                                                                                                                  0.8                                            0.8
+                          Per-SM L1 TLB                               Shared L2 TLB
+(a)                     Large Page Entries     (b)                  Large Page Entries
+                                                                                                    (a)                 Fragmentation Index        (b)             Large Page Frame Occupancy
+Figure 15: Sensitivity of GPU-MMU and Mosaic performance
+to L1 and L2 TLB large page entries, normalized to GPU-                                             Figure 16: Performance of CAC under varying degrees of
+MMU with 16 L1 and 256 L2 TLB large page entries.                                                   (a) fragmentation and (b) large page frame occupancy.
+
+
+Figure 1a). As a result, GPU-MMU makes no use of the large page                                     reduce the overhead of CAC, as there are many opportunities to
+entries in the TLB.                                                                                 free up large page frames that require data migration. Second, we
+                                                                                                    observe that as the occupancy increases beyond 35% (i.e., many
+                                                                                                    base pages are already allocated), the benefits of CAC and CAC-
+6.4             Analysis of the Effect of Fragmentation                                             BC decrease, as (1) fewer large page frames can be freed up by
+When multiple concurrently-executing GPGPU applications share                                       compaction, and (2) more base pages need to be moved in order to
+the GPU, a series of memory allocation and deallocation requests                                    free a large page frame.
+could create significant data fragmentation, and could cause CoCoA                                     Table 2 shows how CAC controls memory bloat for different
+to violate its soft guarantee, as discussed in Section 4.2. While we do                             large page frame occupancies, when we set the fragmentation in-
+not observe this behavior in any of the workloads that we evaluate,                                 dex to 100%. When large page frames are used, memory bloat can
+Mosaic can potentially introduce data fragmentation and memory                                      increase as a result of high fragmentation. We observe that when
+bloat for very long running applications. In this section, we design                                pages are aggressively pre-fragmented, CAC is effective at reducing
+stress-test experiments that induce a large amount of fragmentation                                 the memory bloat resulting from high levels of fragmentation. For
+in large page frames, to study the behavior of CoCoA and CAC.                                       example, when the large page frame occupancy is very high (e.g.,
+   To induce a large amount of fragmentation, we allow the mem-                                     above 75%), CAC compacts the pages effectively, reducing memory
+ory allocator to pre-fragment a fraction of the main memory. We                                     bloat to within 2.2% of the memory that would be allocated if we
+randomly place pre-fragmented data throughout the physical mem-                                     were to use only 4KB pages (i.e., when no large page fragmenta-
+ory. This data (1) does not conform to Mosaic’s soft guarantee, and                                 tion exists). We observe negligible (<1%) memory bloat when the
+(2) cannot be coalesced with any other base pages within the same                                   fragmentation index is less than 100% (not shown), indicating that
+large page frame. To vary the degree of large page fragmentation,                                   CAC is effective at mitigating large page fragmentation.
+we define two metrics: (1) the fragmentation index, which is the
+fraction of large page frames that contain pre-fragmented data;                                      Large Page Frame
+                                                                                                                                     1%        10%           25%       35%      50%     75%
+and (2) large page frame occupancy, which is the fraction of the                                      Occupancy (%)
+pre-fragmented data that occupies each fragmented large page.                                         Memory Bloat                  10.66%     7.56%        7.20%      5.22%    3.37%   2.22%
+   We evaluate the performance of all our workloads on (1) Mo-
+saic with the baseline CAC; and (2) Mosaic with an optimized CAC                                    Table 2: Memory bloat of Mosaic, compared to a GPU-MMU
+that takes advantage of in-DRAM bulk copy mechanisms (see Sec-                                      memory manager that uses only 4KB base pages.
+tion 4.4), which we call CAC-BC. We provide a comparison against
+two configurations: (1) Ideal CAC, a compaction mechanism where                                        We conclude that CoCoA and CAC work together effectively
+data migration incurs zero latency; and (2) No CAC, where CAC is                                    to preserve virtual and physical address contiguity within a large
+not applied.                                                                                        page frame, without incurring high data migration overhead and
+   Figure 16a shows the performance of CAC when we vary the                                         memory bloat.
+fragmentation index. For these experiments, we set the large page
+frame occupancy to 50%. We make three observations from Fig-                                        7         RELATED WORK
+ure 16a. First, we observe that there is minimal performance impact                                 To our knowledge, this is the first work to (1) analyze the funda-
+when the fragmentation index is less than 90%, indicating that it                                   mental trade-offs between TLB reach, demand paging performance,
+is unnecessary to apply CAC unless the main memory is heavily                                       and internal page fragmentation; and (2) propose an application-
+fragmented. Second, as we increase the fragmentation index above                                    transparent GPU memory manager that preemptively coalesces
+90%, CAC provides performance improvements for Mosaic, as CAC                                       pages at allocation time to improve address translation perfor-
+effectively frees up large page frames and prevents CoCoA from                                      mance, while avoiding the demand paging inefficiencies and mem-
+running out of frames. Third, we observe that as the fragmentation                                  ory copy overheads typically associated with large page support.
+index approaches 100%, CAC becomes less effective, due to the fact                                  Reducing performance degradation from address translation over-
+that compaction needs to be performed very frequently, causing a                                    head is an active area of work for CPUs, and the performance
+significant amount of data migration.                                                               loss that we observe as a result of address translation is well cor-
+   Figure 16b shows the performance of CAC as the large page                                        roborated [15, 17, 34, 36, 67]. In this section, we discuss previous
+frame occupancy changes when we set the fragmentation index                                         techniques that aim to reduce the overhead of address translation.
+to 100% (i.e., every large page frame is pre-fragmented). We make
+two observations from the figure. First, we observe that CAC-BC                                     7.1             TLB Designs for CPU Systems
+is effective when occupancy is no greater than 25%. When the                                        TLB miss overhead can be reduced by (1) accelerating page table
+occupancy is low, in-DRAM bulk-copy operations can effectively                                      walks [13, 16] or reducing the walk frequency [35]; or (2) reducing
+
+                                                                                               12
+Mosaic: A GPU Memory Manager
+with Application-Transparent Support for Multiple Page Sizes                             MICRO-50, October 14–18, 2017, Cambridge, MA, USA
+
+
+the number of TLB misses (e.g., through prefetching [18, 49, 100],            Analysis of Address Translation in GPUs. Vesely et al. [114]
+prediction [84], or structural changes to the TLB [88, 89, 111] or            analyze support for virtual memory in heterogeneous systems, find-
+TLB hierarchy [4, 5, 15, 17, 34, 50, 64, 108]).                               ing that the cost of address translation in GPUs is an order of mag-
+Support for Multiple Page Sizes. Multi-page mapping tech-                     nitude higher than that in CPUs. They observe that high-latency
+niques [88, 89, 111] use a single TLB entry for multiple page trans-          address translations limit the GPU’s latency hiding capability and
+lations, improving TLB reach by a small factor; much greater im-              hurt performance, which is in line with the observations we make
+provements to TLB reach are needed to deal with modern memory                 in Section 3. Mei et al. [66] use a set of microbenchmarks to evaluate
+sizes. MIX TLB [26] accommodates entries that translate multiple              the address translation process in commercial GPUs. Their work
+page sizes, eliminating the need for a dedicated set of TLB large             concludes that previous NVIDIA architectures [78, 79] have off-chip
+page entries. MIX TLB is orthogonal to our work, and can be used              L1 and L2 TLBs, which lead to poor performance.
+with Mosaic to further improve TLB reach.                                     Other Ways to Manage Virtual Memory. VAST [62] is a
+    Navarro et al. [74] identify contiguity-awareness and fragmen-            software-managed virtual memory space for GPUs. In that work, the
+tation reduction as primary concerns for large page management,               authors observe that the limited size of physical memory typically
+proposing reservation-based allocation and deferred promotion                 prevents data-parallel programs from utilizing GPUs. To address
+(i.e., coalescing) of base pages to large pages. Similar ideas are            this, VAST automatically partitions GPU programs into chunks that
+widely used in modern OSes [24]. Instead of the reservation-based             fit within the physical memory space to create an illusion of virtual
+scheme, Ingens [59] employs a utilization-based scheme that uses              memory. Unlike Mosaic, VAST is unable to provide memory protec-
+a bit vector to track spatial and temporal utilization of base pages.         tion from concurrently-executing GPGPU applications. Zorua [115]
+Techniques to Increase Memory Contiguity. GLUE [90] groups                    is a holistic mechanism to virtualize multiple hardware resources
+contiguous, aligned base page translations under a single specula-            within the GPU. Zorua does not virtualize the main memory, and is
+tive large page translation in the TLB. GTSM [30] provides hard-              thus orthogonal to our work. CABA [116] introduces assist warps,
+ware support to leverage the contiguity of physical memory region             which act as background helper threads for GPU SMs. These assist
+even when pages have been retired due to bit errors. These mech-              warps can be adapted to perform various memory virtualization
+anisms for preserving or recovering contiguity are orthogonal to              functions, such as page walks and base page utilization analysis.
+the contiguity-conserving allocation we propose for Mosaic, and
+they can help Mosaic by avoiding the need for compaction.                     7.3    Demand Paging for GPUs
+    Gorman et al. [39] propose a placement policy for an OS’s phys-           Demand paging is a challenge for GPUs [114]. Recent works [3, 118],
+ical page allocator that mitigates fragmentation and promotes con-            and the AMD hUMA [60] and NVIDIA PASCAL architectures [82,
+tiguity by grouping pages according to the amount of migration                118] provide various levels of support for demand paging in GPUs.
+required to achieve contiguity. Subsequent work [40] proposes a               These techniques do not tackle the existing trade-off in GPUs be-
+software-exposed interface for applications to explicitly request             tween using large pages to improve address translation and using
+large pages like libhugetlbfs [38]. These ideas are complemen-                base pages to minimize demand paging overhead, which we relax
+tary to our work. Mosaic can potentially benefit from similar policies        with Mosaic. As we discuss in Section 3, support for multiple page
+if they can be simplified enough to be implementable in hardware.             sizes can be adapted to minimize the overhead of demand paging
+Alternative TLB Designs. Research on shared last-level TLB de-                by limiting demand paging to base pages only.
+signs [17, 19, 64] and page walk cache designs [16] has yielded
+mechanisms that accelerate multithreaded CPU applications by                  8     CONCLUSION
+sharing translations between cores. SpecTLB [14] provides a tech-             We introduce Mosaic, a new GPU memory manager that provides
+nique that predicts address translations. While speculation works             application-transparent support for multiple page sizes. The key
+on CPU applications, speculation for highly-parallel GPUs is more             idea of Mosaic is to perform demand paging using smaller page sizes,
+complicated, and can eventually waste off-chip DRAM bandwidth,                and then coalesce small (i.e., base) pages into a larger page immedi-
+which is a highly-contended resource in GPUs. Direct segments [15]            ately after allocation, which allows address translation to use large
+and redundant memory mappings [50] provide virtual memory                     pages and thus increase TLB reach. We have shown that Mosaic
+support for server workloads that reduce the overhead of address              significantly outperforms state-of-the-art GPU address translation
+translation. These proposals map large contiguous chunks of vir-              designs and achieves performance close to an ideal TLB, across
+tual memory to the physical address space in order to reduce the              a wide variety of workloads. We conclude that Mosaic effectively
+address translation overhead. While these techniques improve the              combines the benefits of large pages and demand paging in GPUs,
+TLB reach, they increase the transfer latency depending on the size           thereby breaking the conventional tension that exists between these
+of the virtual chunks they map.                                               two concepts. We hope the ideas presented in this paper can lead to
+                                                                              future works that analyze Mosaic in detail and provide even lower-
+7.2    TLB Designs for GPU Systems                                            overhead support for synergistic address translation and demand
+TLB Designs for Heterogeneous Systems. Previous works pro-                    paging in heterogeneous systems.
+vide several TLB designs for heterogeneous systems with GPUs [91,
+92, 114] and with accelerators [23]. Mosaic improves upon a state-            ACKNOWLEDGMENTS
+of-the-art TLB design [92] by providing application-transparent,              We thank the anonymous reviewers and SAFARI group members for
+high-performance support for multiple page sizes in GPUs. No prior            their feedback. Special thanks to Nastaran Hajinazar, Juan Gómez
+work provides such support.                                                   Luna, and Mohammad Sadr for their feedback. We acknowledge
+TLB-Aware Warp Scheduler. Pichai et al. [91] extend the cache-                the support of our industrial partners, especially Google, Intel,
+conscious warp scheduler [96] to be aware of the TLB in hetero-               Microsoft, NVIDIA, Samsung, and VMware. This research was
+geneous CPU-GPU systems. These techniques are orthogonal to                   partially supported by the NSF (grants 1409723 and 1618563), the
+the problem we focus on, and can be applied in conjunction with               Intel Science and Technology Center for Cloud Computing, and the
+Mosaic to further improve performance.                                        Semiconductor Research Corporation.
+
+                                                                         13
+MICRO-50, October 14–18, 2017, Cambridge, MA, USA                                                                                                    R. Ausavarungnirun et al.
+
+
+REFERENCES                                                                                     [39] M. Gorman and P. Healy, “Supporting Superpage Allocation Without Additional
+ [1] A. Abrevaya, “Linux Transparent Huge Pages, JEMalloc and NuoDB,” 2014.                         Hardware Support,” in ISMM, 2008.
+ [2] Advanced Micro Devices, Inc., “OpenCL: The Future of Accelerated Applica-                 [40] M. Gorman and P. Healy, “Performance Characteristics of Explicit Superpage
+     tion Performance Is Now,” https://www.amd.com/Documents/FirePro_OpenCL_                        Support,” in WIOSCA, 2010.
+     Whitepaper.pdf.                                                                           [41] Intel Corp., “Introduction to Intel® Architecture,” http://www.
+ [3] N. Agarwal, D. Nellans, M. O’Connor, S. W. Keckler, and T. F. Wenisch, “Unlock-                intel.com/content/dam/www/public/us/en/documents/white-papers/
+     ing Bandwidth for GPUs in CC-NUMA Systems,” in HPCA, 2015.                                     ia-introduction-basics-paper.pdf, 2014.
+ [4] J. Ahn, S. Jin, and J. Huh, “Revisiting Hardware-Assisted Page Walks for Virtu-           [42] Intel Corp., “Intel® 64 and IA-32 Architectures Optimization Reference
+     alized Systems,” in ISCA, 2012.                                                                Manual,” https://www.intel.com/content/dam/www/public/us/en/documents/
+ [5] J. Ahn, S. Jin, and J. Huh, “Fast Two-Level Address Translation for Virtualized                manuals/64-ia-32-architectures-optimization-manual.pdf, 2016.
+     Systems,” IEEE TC, 2015.                                                                  [43] Intel Corp., “6th Generation Intel® CoreTM Processor Family Datasheet,
+ [6] Apple Inc., “Huge Page Support in Mac OS X,” http://blog.couchbase.com/                        Vol. 1,” http://www.intel.com/content/dam/www/public/us/en/documents/
+     often-overlooked-linux-os-tweaks, 2014.                                                        datasheets/desktop-6th-gen-core-family-datasheet-vol-1.pdf, 2017.
+ [7] ARM Holdings, “ARM Cortex-A Series,” http://infocenter.arm.com/help/topic/                [44] A. Jog, “Design and Analysis of Scheduling Techniques for Throughput Proces-
+     com.arm.doc.den0024a/DEN0024A_v8_architecture_PG.pdf, 2015.                                    sors,” Ph.D. dissertation, Pennsylvania State Univ., 2015.
+ [8] R. Ausavarungnirun, “Techniques for Shared Resource Management in Systems                 [45] A. Jog, O. Kayıran, T. Kesten, A. Pattnaik, E. Bolotin, N. Chatterjee, S. W. Keckler,
+     with Throughput Processors,” Ph.D. dissertation, Carnegie Mellon Univ., 2017.                  M. T. Kandemir, and C. R. Das, “Anatomy of GPU Memory System for Multi-
+ [9] R. Ausavarungnirun, K. Chang, L. Subramanian, G. Loh, and O. Mutlu, “Staged                    Application Execution,” in MEMSYS, 2015.
+     Memory Scheduling: Achieving High Performance and Scalability in Heteroge-                [46] A. Jog, O. Kayıran, A. K. Mishra, M. T. Kandemir, O. Mutlu, R. Iyer, and C. R.
+     neous Systems,” in ISCA, 2012.                                                                 Das, “Orchestrated Scheduling and Prefetching for GPGPUs,” in ISCA, 2013.
+[10] R. Ausavarungnirun, S. Ghose, O. Kayıran, G. H. Loh, C. R. Das, M. T. Kan-                [47] A. Jog, O. Kayıran, N. C. Nachiappan, A. K. Mishra, M. T. Kandemir, O. Mutlu,
+     demir, and O. Mutlu, “Exploiting Inter-Warp Heterogeneity to Improve GPGPU                     R. Iyer, and C. R. Das, “OWL: Cooperative Thread Array Aware Scheduling
+     Performance,” in PACT, 2015.                                                                   Techniques for Improving GPGPU Performance,” in ASPLOS, 2013.
+[11] R. Ausavarungnirun, J. Landgraf, V. Miller, S. Ghose, J. Gandhi, C. J. Rossbach,          [48] A. Jog, O. Kayiran, A. Pattnaik, M. T. Kandemir, O. Mutlu, R. Iyer, and C. R. Das,
+     and O. Mutlu, “Mosaic: A GPU Memory Manager with Application-Transparent                       “Exploiting Core Criticality for Enhanced GPU Performance,” in SIGMETRICS,
+     Support for Multiple Page Sizes,” Carnegie Mellon Univ., SAFARI Research                       2016.
+     Group, Tech. Rep. TR-2017-003, 2017.                                                      [49] G. B. Kandiraju and A. Sivasubramaniam, “Going the Distance for TLB Prefetch-
+[12] A. Bakhoda, G. Yuan, W. Fung, H. Wong, and T. Aamodt, “Analyzing CUDA                          ing: An Application-Driven Study,” in ISCA, 2002.
+     Workloads Using a Detailed GPU Simulator,” in ISPASS, 2009.                               [50] V. Karakostas, J. Gandhi, F. Ayar, A. Cristal, M. D. Hill, K. S. McKinley, M. Ne-
+[13] T. W. Barr, A. L. Cox, and S. Rixner, “Translation Caching: Skip, Don’t Walk (the              mirovsky, M. M. Swift, and O. Ünsal, “Redundant Memory Mappings for Fast
+     Page Table),” in ISCA, 2010.                                                                   Access to Large Memories,” in ISCA, 2015.
+[14] T. W. Barr, A. L. Cox, and S. Rixner, “SpecTLB: A Mechanism for Speculative               [51] V. Karakostas, J. Gandhi, A. Cristal, M. D. Hill, K. S. McKinley, M. Nemirovsky,
+     Address Translation,” in ISCA, 2011.                                                           M. M. Swift, and O. Unsal, “Energy-Efficient Address Translation,” in HPCA,
+[15] A. Basu, J. Gandhi, J. Chang, M. D. Hill, and M. M. Swift, “Efficient Virtual                  2016.
+     Memory for Big Memory Servers,” in ISCA, 2013.                                            [52] I. Karlin, A. Bhatele, J. Keasler, B. Chamberlain, J. Cohen, Z. DeVito, R. Haque,
+[16] A. Bhattacharjee, “Large-Reach Memory Management Unit Caches,” in MICRO,                       D. Laney, E. Luke, F. Wang, D. Richards, M. Schulz, and C. Still, “Exploring Tradi-
+     2013.                                                                                          tional and Emerging Parallel Programming Models Using a Proxy Application,”
+[17] A. Bhattacharjee, D. Lustig, and M. Martonosi, “Shared Last-level TLBs for Chip                in IPDPS, 2013.
+     Multiprocessors,” in HPCA, 2011.                                                          [53] I. Karlin, J. Keasler, and R. Neely, “LULESH 2.0 Updates and Changes,” Lawrence
+[18] A. Bhattacharjee and M. Martonosi, “Characterizing the TLB Behavior of Emerg-                  Livermore National Lab, Tech. Rep. LLNL-TR-641973, 2013.
+     ing Parallel Workloads on Chip Multiprocessors,” in PACT, 2009.                           [54] O. Kayıran, N. Chidambaram, A. Jog, R. Ausavarungnirun, M. Kandemir, G. Loh,
+[19] A. Bhattacharjee and M. Martonosi, “Inter-Core Cooperative TLB for Chip                        O. Mutlu, and C. Das, “Managing GPU Concurrency in Heterogeneous Archi-
+     Multiprocessors,” in ASPLOS, 2010.                                                             tectures,” in MICRO, 2014.
+[20] B. Catanzaro, M. Garland, and K. Keutzer, “Copperhead: Compiling an Embedded              [55] Khronos OpenCL Working Group, “The OpenCL Specification,” http://www.
+     Data Parallel Language,” in PPoPP, 2011.                                                       khronos.org/registry/cl/specs/opencl-1.0.29.pdf, 2008.
+[21] K. K. Chang, P. J. Nair, D. Lee, S. Ghose, M. K. Qureshi, and O. Mutlu, “Low-Cost         [56] Y. Kim, D. Han, O. Mutlu, and M. Harchol-Balter, “ATLAS: A Scalable and High-
+     Inter-Linked Subarrays (LISA): Enabling Fast Inter-Subarray Data Movement in                   Performance Scheduling Algorithm for Multiple Memory Controllers,” in HPCA,
+     DRAM,” in HPCA, 2016.                                                                          2010.
+[22] S. Che, M. Boyer, J. Meng, D. Tarjan, J. Sheaffer, S.-H. Lee, and K. Skadron,             [57] Y. Kim, M. Papamichael, O. Mutlu, and M. Harchol-Balter, “Thread Cluster
+     “Rodinia: A Benchmark Suite for Heterogeneous Computing,” in IISWC, 2009.                      Memory Scheduling: Exploiting Differences in Memory Access Behavior,” in
+[23] J. Cong, Z. Fang, Y. Hao, and G. Reinman, “Supporting Address Translation for                  MICRO, 2010.
+     Accelerator-Centric Architectures,” in HPCA, 2017.                                        [58] D. Kroft, “Lockup-Free Instruction Fetch/Prefetch Cache Organization,” in ISCA,
+[24] J. Corbet, “Transparent Hugepages,” https://lwn.net/Articles/359158/, 2009.                    1981.
+[25] Couchbase, Inc., “Often Overlooked Linux OS Tweaks,” http://blog.couchbase.               [59] Y. Kwon, H. Yu, S. Peter, C. J. Rossbach, and E. Witchel, “Coordinated and
+     com/often-overlooked-linux-os-tweaks, 2014.                                                    Efficient Huge Page Management with Ingens,” in OSDI, 2016.
+[26] G. Cox and A. Bhattacharjee, “Efficient Address Translation for Architectures             [60] G. Kyriazis, “Heterogeneous System Architecture: A Technical Review,” https:
+     with Multiple Page Sizes,” in ASPLOS, 2017.                                                    //developer.amd.com/wordpress/media/2012/10/hsa10.pdf, Advanced Micro De-
+[27] A. Danalis, G. Marin, C. McCurdy, J. S. Meredith, P. C. Roth, K. Spafford, V. Tip-             vices, Inc., 2012.
+                                                                                               [61] D. Lee, L. Subramanian, R. Ausavarungnirun, J. Choi, and O. Mutlu, “Decoupled
+     paraju, and J. S. Vetter, “The Scalable Heterogeneous Computing (SHOC) Bench-
+                                                                                                    Direct Memory Access: Isolating CPU and IO Traffic by Leveraging a Dual-Data-
+     mark Suite,” in GPGPU, 2010.
+[28] R. Das, O. Mutlu, T. Moscibroda, and C. R. Das, “Application-Aware Prioritization              Port DRAM,” in PACT, 2015.
+                                                                                               [62] J. Lee, M. Samadi, and S. Mahlke, “VAST: The Illusion of a Large Memory Space
+     Mechanisms for On-Chip Networks,” in MICRO, 2009.
+                                                                                                    for GPUs,” in PACT, 2014.
+[29] R. Das, O. Mutlu, T. Moscibroda, and C. R. Das, “Aérgia: Exploiting Packet                [63] E. Lindholm, J. Nickolls, S. Oberman, and J. Montrym, “NVIDIA Tesla: A Unified
+     Latency Slack in On-chip Networks,” in ISCA, 2010.                                             Graphics and Computing Architecture,” IEEE Micro, 2008.
+[30] Y. Du, M. Zhou, B. R. Childers, D. Mossé, and R. Melhem, “Supporting Superpages           [64] D. Lustig, A. Bhattacharjee, and M. Martonosi, “TLB Improvements for Chip
+     in Non-Contiguous Physical Memory,” in HPCA, 2015.                                             Multiprocessors: Inter-Core Cooperative Prefetchers and Shared Last-Level
+[31] S. Eyerman and L. Eeckhout, “System-Level Performance Metrics for Multipro-                    TLBs,” ACM TACO, 2013.
+     gram Workloads,” IEEE Micro, 2008.                                                        [65] Mark       Mumy,        “SAP      IQ    and     Linux     Hugepages/Transparent
+[32] S. Eyerman and L. Eeckhout, “Restating the Case for Weighted-IPC Metrics to                    Hugepages,”              http://scn.sap.com/people/markmumy/blog/2014/05/22/
+     Evaluate Multiprogram Workload Performance,” IEEE CAL, 2014.                                   sap-iq-and-linux-hugepagestransparent-hugepages, SAP SE, 2014.
+[33] W. Fung, I. Sham, G. Yuan, and T. Aamodt, “Dynamic Warp Formation and                     [66] X. Mei and X. Chu, “Dissecting GPU Memory Hierarchy Through Microbench-
+     Scheduling for Efficient GPU Control Flow,” in MICRO, 2007.                                    marking,” IEEE TPDS, 2017.
+[34] J. Gandhi, A. Basu, M. D. Hill, and M. M. Swift, “Efficient Memory Virtualization:        [67] T. Merrifield and H. R. Taheri, “Performance Implications of Extended Page
+     Reducing Dimensionality of Nested Page Walks,” in MICRO, 2014.                                 Tables on Virtualized x86 Processors,” in VEE, 2016.
+[35] J. Gandhi, M. D. Hill, and M. M. Swift, “Agile Paging: Exceeding the Best of              [68] Microsoft Corp., Large-Page Support in Windows, https://msdn.microsoft.com/
+     Nested and Shadow Paging,” in ISCA, 2016.                                                      en-us/library/windows/desktop/aa366720(v=vs.85).aspx.
+[36] F. Gaud, B. Lepers, J. Decouchant, J. Funston, A. Fedorova, and V. Quema, “Large          [69] MongoDB, Inc., “Disable Transparent Huge Pages (THP),” 2017.
+     Pages May Be Harmful on NUMA Systems,” in USENIX ATC, 2014.                               [70] S. P. Muralidhara, L. Subramanian, O. Mutlu, M. Kandemir, and T. Moscibroda,
+[37] D. Gay and A. Aiken, “Memory Management with Explicit Regions,” in PLDI,                       “Reducing Memory Interference in Multicore Systems via Application-Aware
+     1998.                                                                                          Memory Channel Partitioning,” in MICRO, 2011.
+[38] M. Gorman, “Huge Pages Part 2 (Interfaces),” https://lwn.net/Articles/375096/,            [71] O. Mutlu and T. Moscibroda, “Stall-Time Fair Memory Access Scheduling for
+     2010.                                                                                          Chip Multiprocessors,” in MICRO, 2007.
+
+
+                                                                                          14
+Mosaic: A GPU Memory Manager
+with Application-Transparent Support for Multiple Page Sizes                                                MICRO-50, October 14–18, 2017, Cambridge, MA, USA
+
+
+[72] O. Mutlu and T. Moscibroda, “Parallelism-Aware Batch Scheduling: Enhancing                 [96] T. G. Rogers, M. O’Connor, and T. M. Aamodt, “Cache-Conscious Wavefront
+     Both Performance and Fairness of Shared DRAM Systems,” in ISCA, 2008.                           Scheduling,” in MICRO, 2012.
+[73] V. Narasiman, M. Shebanow, C. J. Lee, R. Miftakhutdinov, O. Mutlu, and Y. N. Patt,         [97] C. J. Rossbach, Y. Yu, J. Currey, J.-P. Martin, and D. Fetterly, “Dandelion: A
+     “Improving GPU Performance via Large Warps and Two-Level Warp Scheduling,”                      Compiler and Runtime for Heterogeneous Systems,” in SOSP, 2013.
+     in MICRO, 2011.                                                                            [98] SAFARI Research Group, “Mosaic – GitHub Repository,” https://github.com/
+[74] J. Navarro, S. Iyer, P. Druschel, and A. Cox, “Practical, Transparent Operating                 CMU-SAFARI/Mosaic/.
+     System Support for Superpages,” in OSDI, 2002.                                             [99] SAFARI Research Group, “SAFARI Software Tools – GitHub Repository,” https:
+[75] K. Nguyen, L. Fang, G. Xu, B. Demsky, S. Lu, S. Alamian, and O. Mutlu, “Yak: A                  //github.com/CMU-SAFARI/.
+     High-Performance Big-Data-Friendly Garbage Collector,” in OSDI, 2016.                     [100] A. Saulsbury, F. Dahlgren, and P. Stenström, “Recency-Based TLB Preloading,”
+[76] NVIDIA Corp., “CUDA C/C++ SDK Code Samples,” http://developer.nvidia.com/                       in ISCA, 2000.
+     cuda-cc-sdk-code-samples, 2011.                                                           [101] V. Seshadri, Y. Kim, C. Fallin, D. Lee, R. Ausavarungnirun, G. Pekhimenko, Y. Luo,
+[77] NVIDIA Corp., “NVIDIA’s Next Generation CUDA Compute Architecture:                              O. Mutlu, P. B. Gibbons, M. A. Kozuch, and T. C. Mowry, “RowClone: Fast and
+     Fermi,” http://www.nvidia.com/content/pdf/fermi_white_papers/nvidia_fermi_                      Energy-Efficient In-DRAM Bulk Data Copy and Initialization,” in ISCA, 2013.
+     compute_architecture_whitepaper.pdf, 2011.                                                [102] V. Seshadri and O. Mutlu, “Simple Operations in Memory to Reduce Data Move-
+[78] NVIDIA Corp., “NVIDIA’s Next Generation CUDA Compute Archi-                                     ment,” in Advances in Computers, 2017.
+     tecture: Kepler GK110,” http://www.nvidia.com/content/PDF/kepler/                         [103] T. Shanley, Pentium Pro Processor System Architecture, 1st ed. Boston, MA, USA:
+     NVIDIA-Kepler-GK110-Architecture-Whitepaper.pdf, 2012.                                          Addison-Wesley Longman Publishing Co., Inc., 1996.
+[79] NVIDIA       Corp.,      “NVIDIA         GeForce     GTX      750    Ti,”  http://        [104] R. L. Sites and R. T. Witek, ALPHA Architecture Reference Manual. Boston,
+     international.download.nvidia.com/geforce-com/international/pdfs/                               Oxford, Melbourne: Digital Press, 1998.
+     GeForce-GTX-750-Ti-Whitepaper.pdf, 2014.                                                  [105] B. Smith, “Architecture and Applications of the HEP Multiprocessor Computer
+[80] NVIDIA Corp., “CUDA C Programming Guide,” http://docs.nvidia.com/cuda/                          System,” SPIE, 1981.
+     cuda-c-programming-guide/index.html, 2015.                                                [106] B. J. Smith, “A Pipelined, Shared Resource MIMD Computer,” in ICPP, 1978.
+[81] NVIDIA Corp., “NVIDIA RISC-V Story,” https://riscv.org/wp-content/uploads/                [107] Splunk Inc., “Transparent Huge Memory Pages and Splunk Perfor-
+     2016/07/Tue1100_Nvidia_RISCV_Story_V2.pdf, 2016.                                                mance,” http://docs.splunk.com/Documentation/Splunk/6.1.3/ReleaseNotes/
+[82] NVIDIA Corp., “NVIDIA Tesla P100,” https://images.nvidia.com/content/pdf/                       SplunkandTHP, 2013.
+     tesla/whitepaper/pascal-architecture-whitepaper.pdf, 2016.                                [108] S. Srikantaiah and M. Kandemir, “Synergistic TLBs for High Performance Ad-
+[83] NVIDIA Corp., “NVIDIA GeForce GTX 1080,” https://international.                                 dress Translation in Chip Multiprocessors,” in MICRO, 2010.
+     download.nvidia.com/geforce-com/international/pdfs/GeForce_GTX_                           [109] J. A. Stratton, C. Rodrigues, I. J. Sung, N. Obeid, L. W. Chang, N. Anssari, G. D.
+     1080_Whitepaper_FINAL.pdf, 2017.                                                                Liu, and W. W. Hwu, “Parboil: A Revised Benchmark Suite for Scientific and
+[84] M.-M. Papadopoulou, X. Tong, A. Seznec, and A. Moshovos, “Prediction-Based                      Commercial Throughput Computing,” Univ. of Illinois at Urbana-Champaign,
+     Superpage-Friendly TLB Designs,” in HPCA, 2015.                                                 IMPACT Research Group, Tech. Rep. IMPACT-12-01, 2012.
+[85] PCI-SIG, “PCI Express Base Specification Revision 3.1a,” 2015.                            [110] A. K. Sujeeth, K. J. Brown, H. Lee, T. Rompf, H. Chafi, M. Odersky, and K. Oluko-
+[86] G. Pekhimenko, E. Bolotin, N. Vijaykumar, O. Mutlu, T. C. Mowry, and S. W.                      tun, “Delite: A Compiler Architecture for Performance-Oriented Embedded
+     Keckler, “A Case for Toggle-aware Compression for GPU Systems,” in HPCA,                        Domain-specific Languages,” TECS, 2014.
+     2016.                                                                                     [111] M. Talluri and M. D. Hill, “Surpassing the TLB Performance of Superpages with
+[87] Peter Zaitsev, “Why TokuDB Hates Transparent HugePages,” https://www.                           Less Operating System Support,” in ASPLOS, 1994.
+     percona.com/blog/2014/07/23/why-tokudb-hates-transparent-hugepages/, Per-                 [112] J. E. Thornton, “Parallel Operation in the Control Data 6600,” in AFIPS FJCC,
+     cona LLC, 2014.                                                                                 1964.
+[88] B. Pham, A. Bhattacharjee, Y. Eckert, and G. H. Loh, “Increasing TLB Reach by             [113] J. E. Thornton, Design of a Computer–The Control Data 6600. Scott Foresman
+     Exploiting Clustering in Page Translations,” in HPCA, 2014.                                     & Co, 1970.
+[89] B. Pham, V. Vaidyanathan, A. Jaleel, and A. Bhattacharjee, “CoLT: Coalesced               [114] J. Vesely, A. Basu, M. Oskin, G. H. Loh, and A. Bhattacharjee, “Observations
+     Large-Reach TLBs,” in MICRO, 2012.                                                              and Opportunities in Architecting Shared Virtual Memory for Heterogeneous
+[90] B. Pham, J. Vesely, G. Loh, and A. Bhattacharjee, “Large Pages and Lightweight                  Systems,” in ISPASS, 2016.
+     Memory Management in Virtualized Systems: Can You Have It Both Ways?” in                  [115] N. Vijaykumar, K. Hsieh, G. Pekhimenko, S. Khan, A. Shrestha, S. Ghose, A. Jog,
+     MICRO, 2015.                                                                                    P. B. Gibbons, and O. Mutlu, “Zorua: A Holistic Approach to Resource Virtual-
+[91] B. Pichai, L. Hsu, and A. Bhattacharjee, “Architectural Support for Address                     ization in GPUs,” in MICRO, 2016.
+     Translation on GPUs: Designing Memory Management Units for CPU/GPUs                       [116] N. Vijaykumar, G. Pekhimenko, A. Jog, A. Bhowmick, R. Ausavarungnirun,
+     with Unified Address Spaces,” in ASPLOS, 2014.                                                  C. Das, M. Kandemir, T. C. Mowry, and O. Mutlu, “A Case for Core-Assisted
+[92] J. Power, M. D. Hill, and D. A. Wood, “Supporting x86-64 Address Translation                    Bottleneck Acceleration in GPUs: Enabling Flexible Data Compression with
+     for 100s of GPU Lanes,” in HPCA, 2014.                                                          Assist Warps,” in ISCA, 2015.
+[93] Redis Labs, “Redis Latency Problems Troubleshooting,” http://redis.io/topics/             [117] VoltDB, Inc., “VoltDB Documentation: Configure Memory Management,” https:
+     latency.                                                                                        //docs.voltdb.com/AdminGuide/adminmemmgt.php.
+[94] S. Rixner, W. J. Dally, U. J. Kapasi, P. Mattson, and J. D. Owens, “Memory Access         [118] T. Zheng, D. Nellans, A. Zulfiqar, M. Stephenson, and S. W. Keckler, “Towards
+     Scheduling,” in ISCA, 2000.                                                                     High Performance Paged Memory for GPUs,” in HPCA, 2016.
+[95] T. G. Rogers, “Locality and Scheduling in the Massively Multithreaded Era,”               [119] W. K. Zuravleff and T. Robinson, “Controller for a Synchronous DRAM That
+     Ph.D. dissertation, Univ. of British Columbia, 2015.                                            Maximizes Throughput by Allowing Memory Requests and Commands to Be
+                                                                                                     Issued Out of Order,” US Patent No. 5,630,096, 1997.
+
+
+
+
+                                                                                          15
+

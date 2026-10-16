@@ -1,0 +1,1816 @@
+              Avoiding TLB Shootdowns through Self-invalidating TLB Entries*
+
+
+                  Amro Awad∗ , Arkaprava Basu† , Sergey Blagodurov† , Yan Solihin‡ and Gabriel H. Loh†
+                           ∗ University of Central Florida (UCF), Email: amro.awad@ucf.edu
+             † Advanced Micro Devices, Inc., Email: {arkaprava.basu,sergey.blagodurov,gabriel.loh}@amd.com
+                               ‡ North Carolina State University, Email: solihin@ncsu.edu
+
+
+
+   Abstract—Updates to a process’s page table entry (PTE)           ory [14], memory management debugging [16], MapReduce-
+renders any existing copies of that PTE in any of a system’s        like frameworks [51], and concurrent garbage collectors [13]
+TLBs stale. To prevent a process from making illegal memory         can trigger frequent alterations of PTEs and thus associ-
+accesses using stale TLB entries, the operating system (OS)
+performs a costly TLB shootdown operation. Rather than              ated TLB shootdowns. Importantly, emerging heterogeneous
+explicitly issuing shootdowns, we propose a coordinated TLB         memory systems critically depend upon efficient page migra-
+and page table management mechanism where an expiration             tions across memory backed by disparate technologies. Page
+time is associated with each TLB entry. An expired TLB entry        migrations alter mappings between virtual addresses and the
+is treated as invalid. For each PTE, the OS then tracks the         physical addresses backing them, typically triggering TLB
+latest expiration time of any TLB entry potentially caching that
+PTE. No shootdown is issued if the OS modifies a PTE when           shootdowns [37].
+its corresponding latest expiration time has already passed.           Unfortunately, a TLB shootdown is an expensive opera-
+   In this paper, we explain the hardware and OS support            tion involving the operating system (OS) and hardware that
+required to support Self-invalidating TLB entries (SITE). As        removes all possible stale copies of the modified PTE from
+an emerging use case that needs fast TLB shootdowns, we             all TLBs that could be caching it. This is necessary to ensure
+consider memory systems consisting of different types of
+memory (e.g., faster DRAM and slower non-volatile memory)           any future accesses make use of the correct, most up-to-date
+where aggressive migrations are desirable to keep frequently-       mapping. Depending on the system architecture, number of
+accessed pages in faster memory, but pages cannot migrate           cores, and number of application threads, the latency for a
+too often because each migration requires a PTE update and          TLB shootdown can take up to 13.2 µs [37].
+corresponding TLB shootdown. We demonstrate that such                  In this work, we propose a new hardware-software coop-
+heterogeneous memory systems augmented with SITE can
+allow an average performance improvement of 45.5% over a            erative approach to manage TLBs that greatly reduces the
+similar system with traditional TLB shootdowns by avoiding          number of costly TLB shootdown operations. Traditionally,
+more than 65% of the shootdowns.                                    entries are loaded into a TLB on TLB misses and remain
+  Keywords-Heterogeneous Memory; Self-Invalidation; Virtual         valid until they are evicted by the TLB’s replacement policy
+Memory; TLB; TLB Shootdown; HW/SW Co-design; Non-                   or are explicitly invalidated by a TLB shootdown. Rather
+Volatile Memories;                                                  than let these TLB entries potentially linger on indefinitely
+                                                                    in the processor TLBs until explicitly shot down, we assign
+                      I. I NTRODUCTION                              each TLB entry an expiration time. This acts like a “self-
+                                                                    destruct” mechanism, where the processor automatically
+   The virtual memory system in modern computers enable
+                                                                    treats expired entries as invalid. At the same time, for
+a wide range of features, from virtualization of the ma-
+                                                                    each PTE, the OS keeps track of the latest expiration
+chine’s physical memory and protection, to a wide variety
+                                                                    time assigned to any TLB entry potentially caching that
+of optimizations such as copy-on-write, memory compres-
+                                                                    PTE. If a PTE is modified any time after its corresponding
+sion, garbage collection, late binding/allocation of physical
+                                                                    latest expiration time has passed, then a shootdown is not
+memory, memory relocation, and many aspects of processor
+                                                                    needed. It is guaranteed that no valid copy of the PTE
+virtualization. Processors support high-performance virtual
+                                                                    being modified is cached in any TLB, by design. This paper
+memory translations by caching recently accessed page
+                                                                    details the architectural and OS support required to build an
+table entries (PTEs) in the low-latency translation lookaside
+                                                                    effective virtual memory management system based on this
+buffers (TLBs).
+                                                                    idea of self-invalidating TLB entries (SITE).
+   In the process of supporting the various virtual memory
+                                                                       We demonstrate the potential of this approach with a
+maintenance or optimization operations, however, modifi-
+                                                                    use case based on emerging heterogeneous memory systems
+cations of the page table entries (e.g., changing an address
+                                                                    [e.g., a mix of DRAM and non-volatile memory (NVM)].
+mapping or page permissions) typically require a TLB shoot-
+                                                                    In such systems, there is a tension between frequent page
+down operation. For example, software-transactional mem-
+                                                                    migrations from the slower NVM to the faster DRAM (to
+  *Most of this work was done when Amro Awad was an intern at AMD   increase the fraction of memory requests serviced by the
+Research. He is now an Assistant Professor at UCF.                  high-performance DRAM) and less frequent migrations (to
+decrease the performance impact of TLB shootdowns). SITE                                                                                   when the OS updates the PTE 3 , the OS issues or initiates
+could present a solution that relaxes this tension to provide                                                                              an inter-processor interrupt (IPI) across all participating
+both high DRAM service rates and low shootdown over-                                                                                       cores 4 1 . Each receiving core executes an interrupt handler
+heads, resulting in a substantial improvement in performance                                                                               routine that invalidates the entry for any cached copies of
+over current systems.                                                                                                                      the PTE in the core’s local private TLBs, and then sends
+  In summary, we make the following contributions.                                                                                         an acknowledgment back to the initiating core. In x86-64,
+  • We introduce the idea of Self-invalidating TLB entries                                                                                 invalidating within a local TLB entry is done by either
+     (SITE) to eliminate many TLB shootdowns.                                                                                              executing an invlpg instruction or by writing to the cr3
+  • We detail the hardware and OS modifications needed                                                                                     register. The OS’s TLB shootdown routine running at the
+     for implementing a SITE-based system.                                                                                                 initiator core waits for acknowledgment from each receiving
+  • We perform detailed evaluation of SITE in reducing                                                                                     core before concluding the overall PTE update process 5 .
+     the number of TLB shootdowns for a heterogeneous                                                                                         The overhead of interrupting cores and waiting for all
+     memory system.                                                                                                                        of the acknowledgments is very high, and the overhead
+                                                                                                                                           increases with the number of participating cores. There are
+                    II. BACKGROUND AND M OTIVATION                                                                                         multiple sources for the shootdown overheads, including
+   We describe the TLB shootdown process, how it is                                                                                        multiple user/kernel mode transitions and the usage of legacy
+implemented, and why it does not scale. We discuss sources                                                                                 APIC hardware (on x86-based systems) [37], [51]. Rather
+of TLB shootdowns with a particular focus on heterogeneous                                                                                 than reducing the shootdown latency, this work presents a
+memory systems as they serve as our primary working ex-                                                                                    new mechanism to avoid many shootdown operations. We
+ample in this paper. We motivate our work by demonstrating                                                                                 discuss other related mechanisms that could reduce shoot-
+the tension between page migrations and TLB shootdowns                                                                                     down latency in Section VII, although they are generally
+in such systems.                                                                                                                           orthogonal to our approach.
+
+A. TLB Shootdown
+                                                                                                                                           B. Heterogeneous Memory Systems
+                                                                                                                                              Conventional memory systems are based on DRAM tech-
+                                                                                                                                           nology, which is running up against fundamental physical
+                                        Page Table
+                                                                                                                                           limitations as the DRAM cell sizes continue to shrink [36].
+       Page Table Entry (PTE)   Permissions    Physical address
+                                                                                                                                           At the same time, a variety of emerging non-volatile mem-
+                                       2      Caching PTE
+  1   Caching PTE
+                                                                                                  3     Updating PTE (e.g., new address)
+                                                                                                                                           ory (NVMs) technologies are gaining traction, including
+                                                                                                                                           phase-change memory [30], [28], STT-MRAM [2], mem-
+                      TLB
+                      Entry
+                                    TLB             TLB
+                                                    Entry
+                                                                  TLB          4
+                                                                                     TLB Shootdown                                         ristors [52], and 3DXPoint memory [15]. While the exact
+                                                                             (IPI to all participating cores)
+
+                      Core          Core            Core          Core
+                                                                                                                Operating
+                                                                                                                 System                    characteristics of the different technologies vary, a common
+                                                                                                                                           challenge is that the performance of these NVMs is typically
+                                                                                                                                           worse than DRAM. Thus, using NVM as a wholesale re-
+                                                                                                                                           placement for DRAM is unlikely. Instead, many researchers
+                                                                         5      Waiting for all acknowledgments
+                                                                                                                                           are advocating heterogeneous memory systems consisting
+                                                                                                                                           of some DRAM for performance coupled with NVM for
+                      Figure 1.            The process of TLB Shootdown.                                                                   capacity [7], [38], [42].
+   Modifications to a page table entry (PTE) are typically                                                                                    There are many possible organizations of heterogeneous
+accompanied by a TLB shootdown. If a processor core                                                                                        memory systems. In this paper, we consider a system with
+continues executing with a stale TLB entry, then erroneous                                                                                 a mix of fast DRAM and slower NVM. Other possibilities
+execution may occur due to use of out-of-date address                                                                                      include a combination of high-bandwidth in-package (3D-
+mappings or page permissions. The TLB shootdown pro-                                                                                       stacked) DRAM [1], [4] with either conventional DRAM
+cess ensures that any cached copies of the modified PTE                                                                                    or NVM outside of the package. While several different
+are discarded before continuing execution of the affected                                                                                  approaches have been proposed to manage such heteroge-
+application.                                                                                                                               neous memory systems, in this work we consider a system
+   Prevalent commercial processors like those based on x86-                                                                                where the OS is responsible for migrating pages between
+64 do not support automatic invalidation of stale TLB entries                                                                              the different memories in a manner that is transparent to the
+on a modification to a PTE. The responsibility of invalidating
+stale TLB entries falls on the OS, which does so via the TLB                                                                                 1 In a multi-process scenario, when the OS knows that a process does
+
+shootdown process.                                                                                                                         not have any threads running on particular cores, the IPI does not need to
+                                                                                                                                           be issued to those “non-participating” cores. There are other optimizations
+   As shown in Figure 1, a page table entry (PTE) can be                                                                                   that allow filtering of some IPIs, but in general the IPI will still need to be
+cached in private TLBs of different CPU cores 1 2 . Later,                                                                                 sent to all cores involved in executing threads for the affected process.
+application programmer. More details of the exact mecha-        of 1, almost half of the memory accesses miss in the fast
+nisms are described later, and other alternative approaches     memory. When increasing the migration threshold to 10, we
+to manage heterogeneous memory systems are discussed in         observe a large drop in the TLB shootdown rate, indicating
+Section VII.                                                    that there are a significant number of pages that are accessed
+                                                                fewer than ten times before being evicted out of the fast
+C. Shootdowns vs. Page Migration                                memory.
+   Using the heterogeneous memory system described above           Takeaways: These results illustrate the tradeoff between
+as a working example, we now examine the tension between        maintaining low fast memory miss rate in a heteroge-
+aggressive memory management and the corresponding TLB          neous memory system against the number of costly TLB
+shootdown overheads. We consider a system with a fast,          shootdowns. If the overall cost of TLB shootdowns could
+first level of memory (e.g., DRAM), and a slower-but-larger     be reduced, then the heterogeneous memory management
+second level of memory (e.g., NVM). The details of our          system could afford to be more aggressive in its migration
+experimental system can be found in Section V-A. Our            decisions, leading to more memory accesses being serviced
+baseline heterogeneous memory management policy simply          from the faster memory. In this work, we take the approach
+keeps track of each page currently mapped to the slow           of reducing the frequency of shootdown operations through
+memory. If the page is accessed more than a threshold           self-invalidating TLB entries (described in the next section).
+number of times, then it is migrated to the fast memory.           Furthermore, the results also illustrate that different appli-
+If necessary, a page from the fast memory may also need to      cations react differently in terms of fast-memory miss rates
+be moved back to the slow memory to make room (selected         and the corresponding TLB shootdown rates. This suggests
+with a clock replacement policy [48]).                          that our proposed solution should have some dynamic com-
+   For a low migration threshold, a page in the slow memory     ponent to it to adapt to variations between and even within
+only needs to be referenced a few times before being            workloads.
+migrated to the fast memory. This allows the system to be          Other sources of TLB shootdowns: Beyond heteroge-
+more responsive, aggressively moving pages to (hopefully)       neous memory system, there are several other use cases that
+allow more future references to be serviced from the faster     could benefit from a technique to avoid shootdowns. For ex-
+memory. A large migration threshold however, requires that      ample, software transactional memory dynamically modify
+a page exhibit high levels of reuse before promoting it to      page permissions to detect conflicts among concurrent trans-
+the fast memory. This reduces the likelihood of migrating a     actions [14]. Concurrent garbage collectors modify page
+page with few future uses, but it also increases the number     permissions and re-maps pages to reclaim memory without
+of requests that must be serviced out of the slower memory.     possibility of race conditions [13]. Memory management
+   Figure 2 shows results for two representative applications   bugs could be detected by altering page permissions [16].
+as we vary the migration threshold. Let us first consider       These all could benefit from reduced overall cost of TLB
+the Lulesh application on the left. The left y-axis shows the   shootdowns.
+fast memory’s miss rate (the fraction of memory requests
+not serviced by the fast memory; lower is better). Lulesh            III. S ELF - INVALIDATING TLB E NTRIES (SITE)
+demonstrates reasonably good memory locality; when a page          Traditionally, address translations (contents of PTEs) are
+is accessed, it is likely to be accessed many times again       loaded into the TLB by a hardware page table walker (e.g.,
+in the near future. As a result, when we set the migration      in ARM and x86-based systems) on a TLB miss and remain
+threshold to 1 (i.e., move a page from slow to fast memory      valid until they are evicted by the TLB’s replacement policy
+on the very first access), we achieve a very low miss rate      or explicitly invalidated by a TLB shootdown. Instead, we
+from the fast memory. As the threshold is increased, the        propose self-invalidating TLB Entries or SITE to cache
+miss rate steadily climbs because each memory access on         PTEs in TLBs with an expiration time. SITE enforces an
+our way to reaching the migration threshold results in a miss   invariant that a translation entry in the TLB is valid only
+in the fast memory. However, simply setting a low migration     if its expiration time is in the future. Thus, an entry in the
+threshold can still be disastrous for performance, as every     TLB with an expired “lease” does not need to be explicitly
+migration is accompanied by costly TLB shootdowns. The          invalidated. A shootdown can then be avoided by taking
+right y-axis shows the number of TLB shootdowns incurred,       advantage of this invariant if the latest expiration time of a
+and as the migration threshold is increased, the number of      given PTE is known to be in the past.
+shootdowns drops.                                                  For a concrete exposition of SITE, consider the scenario
+   The right side of Figure 2 shows another application,        shown in Figure 3. The left-hand side of the table shows
+RSBench, that shows the same macro-scale trends, but the        an example sequence of events and their timestamps in a
+slopes and concavities of the curves differ. RSBench has        SITE-based system. The right-hand side depicts these events
+poorer spatial locality than Lulesh, with many pages that are   in a system with two CPU cores. Here, core C0 accesses
+accessed only a few times. Even with a migration threshold      virtual address A 1 . The corresponding TLB in that core
+                                                          Fast	
+  Memory	
+  Miss	
+  Rate	
+                                                                                                                                                                             Fast	
+  Memory	
+  Miss	
+  Rate	
+  
+                                                          #	
+  Shootdowns	
+                       Lulesh	
+                                                                                                                                                             #	
+  Shootdowns	
+                       RSBench	
+  
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                  Shootdowns	
+  per	
+  Million	
+  	
+  Memory	
+  Accesses	
+  
+                                                                                                                                                       Shootdowns	
+  per	
+  Million	
+  	
+  Memory	
+  Accesses	
+  
+                                            1.0	
+                                                                                          16000	
+                                                                                                           1.0	
+                                                                                  1000000	
+  
+                                            0.9	
+                                                                                          14000	
+                                                                                                           0.9	
+                                                                                  900000	
+  
+                                            0.8	
+                                                                                                                                                                                                            0.8	
+                                                                                  800000	
+  
+                                                                                                                                           12000	
+  
+       Fast	
+  Memory	
+  Miss	
+  Rate	
+  
+
+
+
+
+                                                                                                                                                                                                                        Fast	
+  Memory	
+  Miss	
+  Rate	
+  
+                                            0.7	
+                                                                                                                                                                                                            0.7	
+                                                                                  700000	
+  
+                                            0.6	
+                                                                                          10000	
+                                                                                                           0.6	
+                                                                                  600000	
+  
+                                            0.5	
+                                                                                          8000	
+                                                                                                            0.5	
+                                                                                  500000	
+  
+                                            0.4	
+                                                                                          6000	
+                                                                                                            0.4	
+                                                                                  400000	
+  
+                                            0.3	
+                                                                                                                                                                                                            0.3	
+                                                                                  300000	
+  
+                                                                                                                                           4000	
+  
+                                            0.2	
+                                                                                                                                                                                                            0.2	
+                                                                                  200000	
+  
+                                            0.1	
+                                                                                          2000	
+                                                                                                            0.1	
+                                                                                  100000	
+  
+                                            0.0	
+                                                                                          0	
+                                                                                                               0.0	
+                                                                                  0	
+  
+                                                                 1	
+                    10	
+               100	
+        1000	
+                                                                                                                                                1	
+                    10	
+               100	
+        1000	
+  
+                                                                                       Migra8on	
+  Threshold	
+                                                                                                                                                                                      Migra8on	
+  Threshold	
+  
+
+                                                                                                 (a) Lulesh                                                                                                                                                                                                   (b) RSBench
+                                                                         Figure 2.               The impact of the migration threshold on fast memory miss rate and number of migrations.
+
+
+                                                                                                                                                                                                                                                                                                                                                        Core 1
+                                                                                                                                                                                                                    Core 0                                                       4
+
+
+  Event ID Time                                                   Description                                                          1                                                                                                                                                                                                                Cache
+                                                                                                                                                                                                                    Cache                                                                  Translation           Expiration Time
+      1                                               0          C0 accesses address A.                                                                                                                                                                                                                                                                                                                                        TLB
+                                                                 Looks up TLB0.                                                                                                                                                                              TLB
+                                                                                                                                   7
+                                                                  TLB miss.
+      2                                               5                                                                                                                                                                                                                                                                                             5
+                                                                  Page table walk starts.
+                                                                                                                                                                                                                                                                                                                    3
+                                                                  Page table walk completes.
+      3                                               205
+                                                                  Calculating expiration time.                                                                                                                      2
+                                                                                                                                                                                                                                                                                                                                                Operating
+      4                                           210            C0 receives the translation and expiration time.                                                                                                                                                                                                                                System
+
+      5                                          1300             C1 starts shoodown for address A.                                                                                                                                                                                                                           ....
+                                                                                                                                                                                                                                                                               Page Table Root
+      6                                          1400             OS routine returns without shootdown
+                                                                  after consulting expiration time table.
+                                                                                                                                                                                                                                                                                                                                                6
+      7                                          1500             C0 accesses address A.
+                                                                  TLB Miss due to expired lease.                                                                                                                                                                                                                              ....
+                                                                                                                                                                                                                                                                            Expiration Table Root
+
+
+
+
+                                                                                                      Figure 3.      A scenario demonstrating the self-invalidating TLB system.
+
+is searched for a translation for A. Assume that the lookup                                                                                                                                                                                   a PTE modification) 5 . This involves calling a specific
+misses and a page table walk is initiated to find the in-                                                                                                                                                                                     routine in the OS. At T = 1400, this modified OS routine
+memory PTE that holds the desired translation at time T = 5                                                                                                                                                                                   for SITE alters the PTE for address A in the page table and
+ 2 . At time T = 205, the hardware page table walker locates                                                                                                                                                                                  then consults the corresponding entry in ETT 6 . The OS
+the PTE 3 . However, different from a traditional system,                                                                                                                                                                                     routine finds the expiration time for address A in the ETT is
+the walker in a SITE-based system retrieves the translation                                                                                                                                                                                   1205, which is in the past. The OS then immediately returns
+and assigns an expiration time for A. The expiration time                                                                                                                                                                                     without performing the typical TLB shootdown and thus
+is calculated to be 1205 by adding a chosen lease length                                                                                                                                                                                      avoids the corresponding cost. At T = 1500, core C0 again
+(1,000 in this example) and the current time (T = 205).                                                                                                                                                                                       attempts to access data with virtual address A f. However,
+Furthermore, the walker records A’s expiration time in a                                                                                                                                                                                      on a TLB lookup this time, the translation is found to have
+new in-memory data structure called the Expiration Time                                                                                                                                                                                       already expired (expiration time 1205) and cannot be used.
+Table (ETT). At time T = 210, Core C0 ’s TLB receives                                                                                                                                                                                         This ultimately results in a page table walk, similar to what
+A’s translation and installs it in its TLB along with the                                                                                                                                                                                     was explained above 2 .
+expiration time 4 . C0 then initiates its data cache access                                                                                                                                                                                      In summary, we observe that a SITE-based system can
+using the provided physical address. Design details such as                                                                                                                                                                                   avoid performing TLB shootdowns by utilizing the invariant
+lease-length selection are described in the next subsection.                                                                                                                                                                                  that a PTE whose latest-known expiration time (according
+  Later at T = 1300, another core C1 initiates the process                                                                                                                                                                                    to the ETT) ensures that no valid copies of the PTE can
+of invalidating the translation for address A (e.g., due to                                                                                                                                                                                   exist in any TLBs. At the same time, using SITE can also
+                                                        1.0	
+                                                                                                                              1	
+  
+
+                                                                                                                                                                                        0.9	
+  
+                                                        0.9	
+  
+
+
+
+
+                                                                                                                                          Rela%ve	
+  Execu%on	
+  Time	
+  (Cycles)	
+  
+                                                                                                                                                                                        0.8	
+  
+                                                        0.8	
+  
+                                                                                                            Sta8c-­‐Lease-­‐100	
+                                                                                                            Sta:c-­‐Lease-­‐100	
+  
+   (Normalized	
+  to	
+  no	
+  Self-­‐invalida%on)	
+  
+
+
+
+
+                                                                                                                                                                                        0.7	
+  
+     Rela%ve	
+  Number	
+  of	
+  Shootdowns	
+  	
+  
+
+
+
+
+                                                        0.7	
+                                                                                                                                                                                Sta:c-­‐Lease-­‐1K	
+  
+                                                                                                            Sta8c-­‐Lease-­‐1K	
+                                                        0.6	
+  
+                                                        0.6	
+                                                                                                                                                                                Sta:c-­‐Lease-­‐10K	
+  
+                                                                                                            Sta8c-­‐Lease-­‐10K	
+                                                       0.5	
+  
+                                                        0.5	
+                                                                                                                           0.4	
+  
+                                                                                                                                                                                                                                             Sta:c-­‐Lease-­‐100K	
+  
+                                                                                                            Sta8c-­‐Lease-­‐100K	
+  
+                                                                                                                                                                                                                                             Sta:c-­‐Lease-­‐1M	
+  
+                                                        0.4	
+                                                                                                                           0.3	
+  
+                                                                                                            Sta8c-­‐Lease-­‐1M	
+                                                                                                             Sta:c-­‐Lease-­‐10M	
+  
+                                                        0.3	
+                                                                                                                           0.2	
+  
+                                                                                                            Sta8c-­‐Lease-­‐10M	
+                                                                                                            Sta:c-­‐Lease-­‐100M	
+  
+                                                                                                                                                                                        0.1	
+  
+                                                        0.2	
+                                                                                                                                                                                Baseline	
+  
+                                                                                                            Sta8c-­‐Lease-­‐100M	
+  
+                                                                                                                                                                                           0	
+  
+                                                        0.1	
+  
+                                                                                                            Baseline	
+                                                                             Lulesh	
+                    RSBench	
+  
+                                                        0.0	
+                                                                                                                                                   Workload	
+  
+                                                                  LULESH	
+                    RSBENCH	
+  
+                                                                               Workload	
+  
+
+                                                                                                                                       Figure 5. Impact of the lease length on execution time, normalized to the
+                                                                                                                                       baseline (no self-invalidating TLB).
+Figure 4. Number of TLB shootdowns normalized to the baseline (no
+self-invalidation) with varying lease length.
+
+                                                                                                                                       This will ultimately increase address translation cost. On
+                                                                                                                                       the other hand if the lease length is too long, then the
+introduce extra page walks due to expired TLB entries that                                                                             TLB entries will not self-invalidate quickly enough to avoid
+would have remained valid in a conventional system.                                                                                    shootdowns. Figure 4 shows how the fraction of incurred
+                                                                                                                                       TLB shootdowns (lower is better) changes with lease length
+A. Design Considerations for SITE                                                                                                      for two representative benchmarks (the rest are in Sec-
+   While the general idea of self-invalidating TLB entries is                                                                          tion V). As expected, shorter leases reduce the number
+intuitive and simple, there are several key design consider-                                                                           of shootdowns. On the other hand, however, the address
+ations to assemble an effective TLB-management solution.                                                                               translation cost grows with shorter lease lengths as additional
+Below, we discuss key design dimensions and our rationale                                                                              TLB misses are incurred (shown in Figure 11 in Section V).
+for each of our choices.                                                                                                                  These two conflicting trends imply that the overall appli-
+   1) Unit of Lease and Expiration Time: A fundamental                                                                                 cation execution time can be minimized only if the lease
+need for supporting SITE is a way to mark the passage                                                                                  length is neither too short nor too long.
+of time. An obvious option is to use the physical clock                                                                                Dynamic Lease-length Assignment: Figure 5 shows the
+tick as the unit for lease and expiration times, as has                                                                                normalized execution time of two representative workloads
+been previously proposed in the context of hardware cache                                                                              with varying statically selected lease lengths (lower is bet-
+coherence (e.g., globally synchronized timestamps) [45],                                                                               ter). Execution times are normalized to a baseline without
+[43]; commercial vendors also suggest the possibility of                                                                               self-invalidation. We observe that the application LULESH
+realizing such global timestamps at least within a single                                                                              performs best when the lease length is 100K (static-100K,
+chip [19]. While an embodiment of SITE could use such                                                                                  fourth bar from left), and either increasing or decreasing the
+global physical time, we find it is unnecessary. Unlike cache                                                                          lease length increases execution time. The same is true for
+accesses and coherence traffic, TLB shootdowns occur much                                                                              RSBench, but the best-performing lease length is different
+less frequently, and so a fine-grained timestamp based on                                                                              (1k). Furthermore, even within a single application, different
+clock ticks is not needed for SITE. On the other hand, SITE                                                                            memory regions (e.g., stack vs. heap) experience different
+is more valuable in large systems, possibly with multiple                                                                              access patterns and are thus likely to prefer different lease
+chips/sockets, as TLB shootdown costs increase with system                                                                             lengths. These suggest that the desired lease length should
+size [51], [40]. Keeping a physical clock synchronized across                                                                          be dynamically discovered at runtime.
+large systems can be challenging.                                                                                                         To appreciate what lease length (range) may be desirable
+   We instead use the main memory access (DRAM and                                                                                     for a PTE, Figure 6 shows the timeline of an example
+NVM) count as the logical time unit for lease and expiration                                                                           sequence of shootdowns and page table walks for a virtual
+times in our proposed SITE implementation. There are at                                                                                address A. In the figure, the page walks PageWalke0 and
+least two reasons behind this choice. First, the main memory                                                                           PageWalke1 occur due to expired entries in the TLB. These
+access count changes at a much lower rate than clock                                                                                   page walks could have been avoided if the lease length was
+tick as memory is accessed only after a miss in the last-                                                                              long enough to cover the time between the last page walk
+level cache and is therefore easier to keep synchronized                                                                               due a true TLB miss (here, PageWalkm1 ) and the most recent
+(more in Section VI-B). Second, there are only a handful of                                                                            walk (PageWalke1 ). We call this the minimum desirable lease
+memory controllers in a system and therefore the hardware                                                                              length. To avoid the second shootdown (Shootdown1 ), the
+modifications are limited.                                                                                                             lease length should be shorter than the time between the
+   2) Choosing the Lease Length: Choosing an effective                                                                                 latest page walk (PageWalkm2 ) and the shootdown to ensure
+lease length is crucial. If the lease is too short, then TLB                                                                           that the TLB entry has already expired. We call this the
+entries will expire quickly, incurring additional TLB misses.                                                                          maximum desirable lease length. Ideally, one would pick a
+                                                                                                                      63      48   47           39   38           30   29           21   20               12 11                  0
+                                           Legends
+                                                                                                                         Sign       Offset in PGD     Offset in PUD     Offset in PMD         Offset in PTE
+                                                                                                                                                                                                                  Page offset
+           Shootdown                                 Page walk due to                        Page walk due to          Extension        Frame            Frame              Frame                Frame
+                                                   entry missing in TLB                     expired entry in TLB
+
+
+
+                                                                                                     Shootdown1
+  Shootdown0 PageWalkm0          PageWalkm1 PageWalke0          PageWalke1      PageWalkm2
+
+
+
+
+                                                                                                                                                                                              +                                 Information for
+                                                                                                                                                                                                                                     SITE
+
+                                                                                                                                                                            +
+                                                                                                                                                            +
+
+
+        T=0            T=20                  T=300        T=400             T=600           T=700         T=1200
+                                                                                                                                                                                        PMD                                     Physical Page
+                                                                                                                                          +                                                                                     Frame Nubmer
+                                                  Min. Desirable lease length         Max. Desirable lease length
+                                                                                                                                                                        PUD                                          PTE
+                                                                                                                                    CR3                   PGD
+
+                                         Time
+
+               Figure 6.           Desirable lease length for a given PTE.                                          Figure 8. Lookup of Expiration Time Table (ETT) as an extension to
+                                                                                                                    x86-64 page table. Entry for an ETT is outlined in dotted lines. In x86-64,
+                                                                                                                    CR3 keeps the pointer to the root of the page table.
+lease length between the minimum and maximum values.
+Note that the minimum and maximum desirable values may                                                                 3) Storing Expiration Times and Lease: Our SITE-based
+not always overlap, and therefore it may not be possible                                                            system needs to store the latest expiration time of TLB
+to simultaneously minimize both additional page walks and                                                           entries corresponding to a given PTE. Note that because
+shootdowns. Because shootdowns are orders of magnitude                                                              cache latencies are higher than TLB lookup times, the
+slower than page table walks, it is reasonable to avoid                                                             extra latency of book-keeping for the expiration times is
+shootdowns even at the cost of a few additional TLB misses.                                                         completely hidden. Furthermore, for dynamic lease length
+                                                                                                                    assignment, additional information (Figure 7) needs to be
+   On#invalida)ng#a#PTE#for#address#A:#                            LEGEND&                                          kept at a per-page granularity. This information is comprised
+   ###IF#(Expira)onTime(PTEA)#>#CurrentTime)#Then##                Expira)onTime(PTEA)##!##Latest#
+   ###{#####//Shorten)the)lease,)C)is)constant)                    expira)on#)me#for#PTE#of#address#A#
+                                                                   CurrentTime#!#Current#logical#)me#
+                                                                                                                    of the latest expiration time 2 , current lease length, and
+   ###############LeaseA=#(CurrentTime#–#LastPTWTS)/C#              ##
+                                                                   LeaseA####!##Lease#length#for#PTE#of#            timestamps for the latest true page table walks, and that
+   #####}#                                                         address#A###
+   #                                                               numConsecu)veTLBMiss#!#Num.#of#                  for any page walk (LastPTWTSMiss and LastPTWTS in
+   On#a#Page#Table#Walk#for#address#A:#                            consecu)ve#TLB#misses#due#to#expira)on#
+   ######IF#(Page#walk#due#to#expira)on)#Then#                     LastPTWTSMiss##!##Timestamp#of#latest#           Figure 7, respectively). At 32 bits per timestamp, this
+                                                                   page#walk#due#to#missing#TLB#entry#
+   ######{##                                                                                                        amounts to 16 bytes of storage per page, which is less than
+                                                                   LastPTWTS#!#Timestamp#of#latest#page#
+   ############numConsecu)veTLBMiss++;#                            walk#for#either#missing#or#expired#entry&
+   ############IF#(numConsecu)veTLBMiss#>#Th))#Then##                                                               0.31% overhead for 4KB pages (and lower still for large
+   #############{###//Increase)the)lease)length)
+   ########################LeaseA#=#Max#{#(CurrentTime#–#LastPTWTSMiss)*C’),#LeaseA*C’’}#
+                                                                                                                    pages).
+   #######################numConsecu)veTLBMiss#=#0#                                                                    The PTE format in modern page tables barely has any
+   ##############}#
+   ########}##
+                                                                                                                    free bits available [6], and so we propose to store the SITE
+   ######else##
+   ########
+                                                                                                                    information in an auxiliary in-memory data structure called
+   ########{                ##
+   ###################LastPTWTSMiss#=#CurrentTime###//Upda8ng)8ming)informa8on)#                     ##             the Expiration Time Table (ETT). To avoid constructing a
+   #########}#                                                                                                      whole new page-table-like structure, the ETT reuses the non-
+   #####LastPTWTS#=#CurrentTime##                       ##
+                                                                                                                    leaf page-table nodes as shown in Figure 8 (based on the
+       Figure 7.           Algorithms for dynamic lease length assignment.                                          x86-64 page-table structure). The sharing of top-level/non-
+                                                                                                                    leaf nodes reduces the number of memory accesses to look
+   Based on the above observation that the lease length
+                                                                                                                    up the ETT. Each 8-byte PTE entry is paired with 16 bytes of
+should be maintained within the minimum and maximum
+                                                                                                                    SITE information, and so for each page of PTE information
+desirable range, the algorithms described in Figure 7 dynam-
+                                                                                                                    in the original page table, we interleave two additional pages
+ically adjust lease lengths based on a program’s observed
+                                                                                                                    to store the ETT entries3 . With this layout, we can simply
+behaviors. On a PTE invalidation, if the OS finds that
+the copies of the PTE in TLBs may not have expired,                                                                   2 Section VI discusses how overflow can be handled
+
+it lowers the lease length following the insight from the                                                              3 At first glance, the overhead of the ETT may appear unattractive because
+
+Figure 6 (typically, constant C=2). When the hardware page                                                          it amounts to an effective page-table size increase by ∼ 2× (less due to the
+                                                                                                                    sharing of the non-leaf nodes). This can be easily reduced by re-encoding
+table walker observes several consecutive page walks due to                                                         the various ETT timestamps because their upper bits will almost always
+expired entries, it correspondingly increases the lease length.                                                     be identical, and so there are well-known encoding optimizations that can
+We empirically found that a threshold T h=16 is effective to                                                        be applied. However, even with an unoptimized additional 16 bytes per
+                                                                                                                    ETT entry, page tables are very small compared to the corresponding
+ensure that the algorithm favors the reduction of shootdowns                                                        application’s memory footprint to begin with, and so we do not bother
+even at the cost of a few extra page table walks.                                                                   optimizing the ETT size here (less than 0.31% overhead).
+reuse the calculation of the final PTE entry with a modified                  extra needs to be done there (effectively re-using the existing
+offset to retrieve the desired ETT entry. A 16-byte ETT-entry                 PTW operations). While accessing the leaf level of the page
+can be atomically updated by page table walker.                               table, the corresponding ETT entry is concurrently accessed.
+    As shown in Figure 8, a page table walk proceeds as                       Thus, we do not expect page table walk latencies to increase
+unchanged for any non-leaf nodes of the page table. If SITE                   significantly due to this extension, but we have accounted for
+is enabled, however, then on reaching the last non-leaf node                  the possibility of longer page walks for SITE by assuming
+it looks up the corresponding entry in the ETT, in parallel to                a very conservative 33% latency increase in our evaluations.
+looking up the leaf-level of the page table. Note that, a PTE                 Per-core Logical Time: We use the main memory access
+is 8 bytes long and thus, OSes pack 512 PTEs in a 4KB page                    count as the logical clock. Memory controllers can easily
+at the leaf level of a page table. Because each ETT entry is                  keep count of memory accesses. However, on every load
+16 bytes, the OS could allocate two more contiguous pages                     or store, a core cannot query the memory controller for the
+next to the page holding the PTE4 .                                           current count. Therefore in our implementation, we add a
+                                                                              register to each core to hold the current logical time (i.e.,
+   IV. I MPLEMENTATION : P UTTING IT A LL T OGETHER
+                                                                              memory access count here). On each DRAM access, the
+  We now describe the hardware and software modifications                     memory controller broadcasts a special message over the
+necessary to implement one possible embodiment of a SITE-                     cache coherence network (similar to a coherence control
+based system.                                                                 message) to update the per-core registers. In systems with
+                                                                              multiple memory controllers, each controller independently
+A. Hardware Modifications
+                                                                              sends such messages to the cores. This is correct because the
+TLB Structure and Lookup: SITE extends TLB entries to                         per-core logical timestamp (register value) is what is used
+hold their expiration times (32 bits). This adds state overhead               in SITE, not the counts in individual memory controllers
+less than the TLB tag overhead. However, a TLB’s tag array                    (more on scalability in Section VI-B). Also note that these
+does not contribute much to a processor’s area budget and                     update messages are sent to cores (not caches) at a negligible
+thus, this extension barely impacts a processor’s overall die                 rate compared to cache coherence messages that keep the
+area. The TLB lookup process in SITE needs to compare the                     private cache hierarchies coherent in multi-core systems.
+expiration time of a given TLB entry with the current logical                 We empirically measured that this adds approximately only
+time (here, number of DRAM accesses). On a tag match in                       3% overhead on coherence bandwidth, which can be further
+a TLB, a hit is signaled only if its expiration time is greater               reduced, if necessary (Section VI-B).
+than the current logical time. The tag and expiration time
+lookups occur in parallel and do not significantly impact the
+                                                                              B. OS Modifications
+latency of a TLB access.
+   Also note that the overheads of SITE are minor compared                       SITE is an OS-hardware co-designed system. Below, we
+to previously-proposed temporal cache coherence works that                    describe the OS enhancements needed to support SITE.
+use the idea of self-invalidation for caches as they need to                  PTE-invalidation Routine: The OS’s TLB shootdown rou-
+extend each cache block with a timestamp and alter the                        tine is invoked to invalidate a PTE (Section II). This routine
+hardware cache coherence protocol [45], [43].                                 is enhanced to avoid actually performing costly shootdowns,
+Hardware Page Table Walker: The hardware page table                           when possible. Specifically, it looks up the entry in the
+walker (PTW) for SITE has three additional responsibilities.                  ETT corresponding to the PTE to be invalidated. If the
+ 1 The PTW assigns an expiration time to each address                         expiration time in that entry is less than the current logical
+translation it returns to TLBs. The PTW does so by adding                     time (memory access count), then the shootdown is avoided
+the current logical time and the lease value for the PTE                      and the routine returns immediately. If not, the default path
+(found in the ETT) as described in Section III-A. 2                           of TLB shootdown is followed as shown in Figure 1.
+Next, the PTW needs to store the expiration time in the                          This routine also needs to decrease the lease length as
+corresponding entry in the ETT. This becomes the latest                       per the dynamic lease assignment policy in Figure 7 and
+expiration time for that given PTE. At the same time, the                     update the corresponding ETT entry. This does not add any
+PTW updates the statistics needed for the dynamic lease                       observable overhead as PTE invalidation routines are already
+assignment as described in Figure 7, which may cause 3                        several thousands of cycles long.
+the PTW to increase the lease length for later accesses.                      Allocating ETTs and Page Fault Handler: At the time
+   All of the above steps need the PTW to access the ETT.                     of allocating a PTE to map a newly allocated memory
+As depicted in the Figure 8, the page table and the ETT                       page, the corresponding entry in the ETT is also created
+share the top levels or non-leaf nodes, and thus nothing                      and initialized. The page fault handler is easily extended
+  4 Note that PTEs can be overlapped with SITE information in such that
+                                                                              for this purpose. This adds an insignificant overhead as the
+one cache line access is sufficient to obtain the PTE and SITE information.   latency of page faults is already in the order of several micro-
+We leave such optimizations as future work.                                   seconds [42].
+                              Table I                                                                              Table II
+             C ONFIGURATION OF THE SIMULATED SYSTEM .                                                          A PPLICATIONS
+
+                            Processor and Caches                                      BT          Block tri-diagonal solver (NAS benchmark).
+ CPU                           8 in-order cores, single hardware thread per-core      CG          Conjugate gradient kernel (NAS benchmark).
+ L1 TLB                        32-entry fully associative per core (1 cycle hit       FT          Discrete 3D fast Fourier transform (NAS benchmark).
+                               latency)                                               LU          Lower-Upper Gauss-Seidel solver (NAS benchmark).
+ L2 TLB                        256-entry 8-way associative per core (10 cycles        LULESH      Solve a simple Sedov blast problem for hydrodynamic
+                               hit latency)                                                       (ProxyApp)
+ Page Walk Latency             150 cycles page-walk (L2 TLB miss), 50 extra           MINIFE      Finite Element mini-application (ProxyApp)
+                               cycles for SITE                                        RSBENCH     A multi-pole resonance representation lookup cross section
+ L1 Cache                      private, 1 cycles, 32KB, 4-way, 64B block                          algorithm (ProxyApp)
+ L2 Cache                      private, 10 cycles, 256KB, 8-way, 64B block            XSBENCH     A computational kernel of the Monte Carlo neutronics
+ L3 Cache                      shared, 25 cycles, 8MB, 16-way, 64B block                          application OpenMC (ProxyApp).
+ Coherence                     MOESI protocol
+                               Main Memory
+ Fast to Slow Memory Capac-    1:8                                                 caches and their corresponding hit/miss latencies as listed
+ ity Ratio
+ Fast Memory Latency           150 cycles                                          in Table I. Accesses that miss in the last-level cache incur
+ Fast Memory Replacement       Clock replacement policy [48]                       a latency to either fast or slow memory depending upon the
+ Slow Memory Latency           600 cycles
+                         Page Migration Overhead
+                                                                                   current memory mapping. 3 Address translation costs for
+ TLB Shootdown Latency         Issuing core 20,000 cycles, Receiving core 5,000    each load/store instruction are calculated by combining L1
+                               cycles                                              and L2 TLB hit/miss rates with their corresponding latencies
+ Page Copy Latency             5000 cycles
+ Page Migration Size           4KB                                                 and the latency of page table walks (Table I). For the baseline
+                                                                                   without self-invalidating TLB entries, we assumed a page
+                                                                                   table walk latency of 150 cycles. However, in case of SITE,
+                V. E VALUATION AND A NALYSIS
+                                                                                   we conservatively increase this by 33% to 200 cycles to
+   In this section, we evaluate the ability of SITE to reduce                      model any extra latencies associated with ETT accesses. This
+the cost of TLB shootdowns in a heterogeneous memory                               is very conservative because it is possible for the page table
+system. However, SITE is more broadly applicable to other                          walker to access the page table leaf node and ETT entry in
+use cases like copy-on-write and garbage collection that                           parallel. 4 Finally, we calculate the cost of migrating a page
+critically depends upon TLB shootdowns (discussed in Sec-                          from slow memory to fast memory by taking into account
+tion II).                                                                          the latency of copying the page between memories and the
+                                                                                   cost of the TLB shootdown. For TLB shootdown cost, we
+A. Simulation Model                                                                model it accurately assuming a larger latency incurred at the
+   Similar to prior related work [51], [37], [33], to eval-                        initiator (issuer) core of the shootdown and 14 th that latency
+uate SITE, we used trace-based simulation using the PIN                            at the receiving cores. The issuer core needs to wait for all
+toolset [39]. The simulator models detailed three levels of                        other cores to acknowledge the shootdown while receivers
+caches, two levels of TLBs, and keeps the caches coherent                          do not (Section II and Figure 1), hence this asymmetry. The
+using a MOESI coherence protocol. We model heteroge-                               latencies and ratio of asymmetry are similar to those reported
+neous memory comprising of fast (DRAM) and slow (PCM)                              in previous works [40], [51].
+memory. The ratio of capacity between these two types
+of memory is 1:8. We then modeled our threshold-based                              B. Workloads
+page migration policy where a page is migrated to the fast                            We evaluate SITE using eight multi-threaded applications
+memory only after a given number of accesses (threshold)                           as listed in Table II. We choose these workloads from
+to a page residing in slow memory. Unless mentioned                                the NAS parallel benchmark suite [10] and from publicly
+otherwise, we use a page-migration threshold of 10 for the                         released HPC proxy applications from the U.S. Department
+rest of the evaluation. We also model detailed page migration                      of Energy [18], [3], [50], [49]. The applications are chosen
+and TLB shootdown costs. Table I details the configuration                         such that they are memory intensive, a requirement to exer-
+of the system we modeled.                                                          cise systems with heterogeneous memory in any meaningful
+   Using such a PIN-/trace-based simulation allowed us to                          way. We use input set size of C for NAS workloads, and
+simulate workloads with large memory footprints (more than                         the memory footprint of each proxy application is around
+1 GB) and run the applications for long run times. Both                            1.25 GB.
+of these are important to reliably characterize a system
+with heterogeneous memory. We then use the statistics from                         C. Performance Evaluation
+this simulation infrastructure to feed a detailed performance                         In the evaluation, we seek to answer the following ques-
+model. At a high level, it models three types of latency.                          tions: 1 What performance improvement can SITE achieve
+ 1 Non-load/store instructions are assumed to execute in                           by avoiding TLB shootdowns? 2 What are the sources of
+one cycle. 2 Data access costs for load/store instructions                         improvements (degradations)? 3 What is the sensitivity
+are calculated using hit/miss counts at the three levels of                        of the evaluation against varying parameters such as the
+                                                                         1	
+  
+
+
+
+
+                 (Normalized	
+  to	
+  No	
+  Self-­‐invalida%on)	
+  
+                                                                      0.9	
+  
+                                                                      0.8	
+  
+
+                      Rela%ve	
+  Execu%on	
+  Time	
+  	
+  
+                                                                      0.7	
+                                                                                                                                                                                                                                                                           Dynamic	
+  
+                                                                      0.6	
+                                                                                                                                                                                                                                                                           StaEc-­‐Lease-­‐100	
+  
+                                                                      0.5	
+  
+                                                                                                                                                                                                                                                                                                                                                      StaEc-­‐Lease-­‐1K	
+  
+                                                                      0.4	
+  
+                                                                      0.3	
+                                                                                                                                                                                                                                                                           StaEc-­‐Lease-­‐100K	
+  
+
+                                                                      0.2	
+                                                                                                                                                                                                                                                                           StaEc-­‐Lease-­‐10M	
+  
+                                                                      0.1	
+                                                                                                                                                                                                                                                                           No	
+  Self-­‐invalidaEon	
+  
+                                                                         0	
+  
+                                                                                 XSBENCH	
+     LULESH	
+     MINIFE	
+     RSBENCH	
+     CG	
+           BT	
+                                                       FT	
+                                                               LU	
+                                 Mean	
+  
+                                                                                                                                           Workload	
+  
+
+
+
+              Figure 9.                                                          The impact of SITE on performance of a system with heterogeneous memory (page migration threshold = 10).
+
+
+                                                                                                                                                                                                                         1.0	
+  
+migration threshold, shootdown latency, page table walk                                                                                                                                                                                                                                                                                                                                           Dynamic	
+  
+
+
+
+
+                                                                                                                                                                	
+  (Normalized	
+  to	
+  No	
+  Self-­‐Invalida9on)	
+  
+                                                                                                                                                                                                                         0.9	
+  
+                                                                                                                                                                                                                                                                                                                                                                                                  StaEc-­‐Lease-­‐100	
+  
+latency, and slow memory access latency?                                                                                                                                                                                 0.8	
+  
+
+
+
+
+                                                                                                                                                                         Number	
+  of	
+  Shootdowns	
+  
+                                                                                                                                                                                                                         0.7	
+                                                                                                                                                                    StaEc-­‐Lease-­‐1K	
+  
+   Figure 9 shows how execution time of different appli-                                                                                                                                                                 0.6	
+  
+                                                                                                                                                                                                                                                                                                                                                                                                  StaEc-­‐Lease-­‐10K	
+  
+                                                                                                                                                                                                                         0.5	
+  
+cations under page migration (migration threshold = 10)                                                                                                                                                                  0.4	
+                                                                                                                                                                    StaEc-­‐Lease-­‐100K	
+  
+improves with SITE. The y-axis shows the execution time                                                                                                                                                                  0.3	
+                                                                                                                                                                    StaEc-­‐Lease-­‐1M	
+  
+                                                                                                                                                                                                                         0.2	
+  
+normalized to a baseline with no self-invalidating TLB                                                                                                                                                                   0.1	
+                                                                                                                                                                    StaEc-­‐Lease-­‐10M	
+  
+                                                                                                                                                                                                                         0.0	
+                                                                                                                                                                    StaEc-­‐Lease-­‐100M	
+  
+(lower is better). There is a cluster of bars for each appli-                                                                                                                                                                                            XSBENCH	
+   LULESH	
+   MINIFE	
+   RSBENCH	
+                          CG	
+         BT	
+            FT	
+         LU	
+         Mean	
+  
+                                                                                                                                                                                                                                                                                                                              Workload	
+                                                          Baseline	
+  
+cation listed along the x-axis. The right-most bar in each
+cluster represents the baseline (no self-invalidation). The
+left-most bar shows the normalized execution time with                                                                                                         Figure 10. Normalized TLB shootdown count with varying lease assign-
+SITE employing the dynamic lease assignment algorithm                                                                                                          ment policy of SITE.
+(Dynamic lease) described in Figure 7. The bars in the
+middle of each cluster represent SITE with static lease length                                                                                                                                                                                                                    1	
+  
+                                                                                                                                                                                                                          (Normalized	
+  to	
+  No	
+  Self-­‐Invalida%on)	
+  
+
+
+
+
+assignment. For example, Static-Lease-1K represents SITE                                                                                                                                                                                                                       0.9	
+  
+                                                                                                                                                                                                                               Rela%ve	
+  Execu%on	
+  Time	
+  	
+  
+
+
+
+
+                                                                                                                                                                                                                                                                               0.8	
+  
+employing a constant lease length of 1K units of logical
+                                                                                                                                                                                                                                                                               0.7	
+  
+time. We make two observations from Figure 9. 1 SITE                                                                                                                                                                                                                           0.6	
+  
+greatly helps performance, with dynamic lease assignment                                                                                                                                                                                                                       0.5	
+                                                                                             Shootdown	
+  
+(Dynamic) reducing the execution time by 45.5% on average                                                                                                                                                                                                                      0.4	
+                                                                                             TranslaDon	
+  Cost	
+  
+across all workloads. This is expected though, as it is well                                                                                                                                                                                                                   0.3	
+                                                                                             Other	
+  
+                                                                                                                                                                                                                                                                               0.2	
+  
+known that the majority of overhead from page migration is
+                                                                                                                                                                                                                                                                               0.1	
+  
+due to TLB shootdowns [37], [31], [7], and the benefit of                                                                                                                                                                                                                         0	
+  
+migration can be negated by such overheads. Because SITE
+                                                                                                                                                                                                                                                                                                          	
+  
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                    	
+  
+
+                                                                                                                                                                                                                                                                                                                                                                    e	
+  
+                                                                                                                                                                                                                                                                                                                     K	
+  
+                                                                                                                                                                                                                                                                                           ic	
+  
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                   K	
+  
+                                                                                                                                                                                                                                                                                                        00
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                0M
+
+
+                                                                                                                                                                                                                                                                                                                                                                 in
+                                                                                                                                                                                                                                                                                                                 -­‐1
+
+
+                                                                                                                                                                                                                                                                                                                                 00
+                                                                                                                                                                                                                                                                                          m
+
+
+                                                                                                                                                                                                                                                                                                    -­‐1
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                              el
+                                                                                                                                                                                                                                                                                                                 SL
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                            -­‐1
+                                                                                                                                                                                                                                                                                    na
+
+
+
+
+                                                                                                                                                                                                                                                                                                                             -­‐1
+                                                                                                                                                                                                                                                                                                    SL
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                         s
+
+
+
+
+avoids many shootdowns, it helps performance significantly.
+                                                                                                                                                                                                                                                                                                                                       SL
+
+
+                                                                                                                                                                                                                                                                                                                                                      Ba
+                                                                                                                                                                                                                                                                                                                        SL
+                                                                                                                                                                                                                                                                                  Dy
+
+
+
+
+ 2 The dynamic lease algorithm helps across all workloads.
+Except RSBench, the dynamic algorithm outperforms the                                                                                                                                                                                                                      Figure 11.                     XSBench’s execution time breakdown.
+best of all static lease policies evaluated by adjusting lease
+on a per-page basis 5 . Even if a particular static lease length
+performs better for a given workload, it is not known a priori                                                                                                 SITE with both dynamic and static lease assignment policies.
+what this preferred lease length is. Therefore, dynamic lease                                                                                                  For example, on average across all workloads, 65.2% of
+assignment is crucial for an effective SITE-based solution.                                                                                                    the shootdowns are avoided by SITE with dynamic lease
+   Next, we analyze the above-mentioned performance num-                                                                                                       assignment. While SITE can avoid TLB shootdowns, it can
+bers. Figure 10 shows the number of TLB shootdowns nor-                                                                                                        increase address translation costs by incurring additional
+malized to the baseline for each configuration in the figure 9.                                                                                                TLB misses due to expired leases. To understand how these
+The y-axis of Figure 10 shows the number of shootdowns                                                                                                         two opposing trends impact the overall execution time, we
+normalized to that in the baseline (lower is better). The x-                                                                                                   dig into one of the representative workload XSBench in
+axis is same as the previous figure for execution times. We                                                                                                    Figure 11. The y-axis shows the execution time normalized
+see that a large fraction of TLB shootdowns is avoided by                                                                                                      to the baseline. There are stacked bars for different lease
+  5 RSBench prefers a very short lease length, but our dynamic algorithm
+                                                                                                                                                               assignment policies of SITE and for the baseline. Each bar
+was less aggressive and did not reduce the fraction of shootdowns by as                                                                                        is broken into three parts (stacks) showing the fraction of
+much compared to the best static lease values.                                                                                                                 execution time spent on TLB shootdown (Shootdown), the
+                                                                                                                                                                                                                           0.9	
+  
+ (Normalized	
+  to	
+  No	
+  Self-­‐invalida%on)	
+  
+
+
+
+
+                                                                                                                                                                      (Normalized	
+  to	
+  No	
+  Self-­‐invalida%on)	
+  
+                                                         1	
+                                                                             Threshold	
+  =	
+  100	
+                                                           0.8	
+  
+                                                                                                                 0.776	
+                                                                                                   0.7	
+                                                                                                0.658	
+  
+      Rela%ve	
+  Execu%on	
+  Time	
+  	
+  
+
+
+
+
+                                                                                                                                                                           Rela%ve	
+  Execu%on	
+  Time	
+  	
+  
+                                                      0.8	
+                                                                              Threshold	
+  =	
+  10	
+                                                                                                                                                  0.545	
+  
+                                                                                                                       0.545	
+                                                                                             0.6	
+  
+                                                                                                                                         Threshold	
+  =	
+  1	
+                                                             0.5	
+  
+                                                      0.6	
+                                                                                                                                                                                                                                                  0.463	
+                        40K	
+  
+                                                                                                                                                                                                                           0.4	
+  
+                                                      0.4	
+                                                                                                                                                                0.3	
+                                                                                                            20K	
+  
+                                                                                                                             0.235	
+  
+                                                      0.2	
+                                                                                                                                                                0.2	
+  
+                                                                                                                                                                                                                                                                                                                                            10K	
+  
+                                                                                                                                                                                                                           0.1	
+  
+                                                         0	
+                                                                                                                                                               0.0	
+  
+                                                                   H	
+  
+
+
+                                                                      	
+  
+
+                                                                      	
+  
+
+                                                                   H	
+  
+
+
+                                                                                 	
+  
+
+                                                                                          	
+  
+
+
+
+
+                                                                                                          	
+  
+
+
+
+
+                                                                                                                                                                                                                                     	
+  
+
+
+                                                                                                                                                                                                                                             	
+  
+
+                                                                                                                                                                                                                                                        E	
+  
+
+
+                                                                                                                                                                                                                                                                     	
+  
+
+
+                                                                                                                                                                                                                                                                             	
+  
+
+
+                                                                                                                                                                                                                                                                                      	
+  
+
+
+
+
+                                                                                                                                                                                                                                                                                                      	
+  
+                                                                                                                     	
+  
+
+
+
+
+                                                                                                                                                                                                                                                                                                                         	
+  
+                                                                                                 	
+  
+
+
+
+
+                                                                                                                                                                                                                                                                                             	
+  
+                                                                  SH
+
+
+                                                                    E
+
+
+
+
+                                                                               CG
+
+                                                                                        BT
+
+
+
+
+                                                                                                        LU
+
+
+
+
+                                                                                                                                                                                                                                      H
+
+                                                                                                                                                                                                                                            SH
+
+
+
+
+                                                                                                                                                                                                                                                                      H
+
+                                                                                                                                                                                                                                                                            CG
+
+
+                                                                                                                                                                                                                                                                                    BT
+
+
+
+
+                                                                                                                                                                                                                                                                                                    LU
+                                                                                                                    n
+
+
+
+
+                                                                                                                                                                                                                                                                                                                      n
+                                                                                                 FT
+
+
+
+
+                                                                                                                                                                                                                                                                                             FT
+                                                                 IF
+
+
+
+
+                                                                                                                                                                                                                                                      IF
+                                                                                                                 ea
+
+
+
+
+                                                                                                                                                                                                                                                                                                                   ea
+                                                                NC
+
+
+
+
+                                                                NC
+
+
+
+
+                                                                                                                                                                                                                                   NC
+
+
+
+
+                                                                                                                                                                                                                                                                   NC
+                                                               LE
+
+
+
+
+                                                                                                                                                                                                                                            LE
+                                                              IN
+
+
+
+
+                                                                                                                                                                                                                                                    IN
+                                                                                                                 M
+
+
+
+
+                                                                                                                                                                                                                                                                                                                 M
+                                                             BE
+
+
+
+
+                                                             BE
+
+
+
+
+                                                                                                                                                                                                                                BE
+
+
+
+
+                                                                                                                                                                                                                                                                BE
+                                                            LU
+
+
+
+
+                                                                                                                                                                                                                                          LU
+                                                            M
+
+
+
+
+                                                                                                                                                                                                                                                    M
+                                                       XS
+
+
+
+
+                                                          RS
+
+
+
+
+                                                                                                                                                                                                                             XS
+
+
+
+
+                                                                                                                                                                                                                                                           RS
+                                                                                 Workload	
+                                                                                                                                                                                  Workload	
+  
+
+
+
+ Figure 12.                                                      The impact of migration threshold on SITE’s performance.                                            Figure 13. The impact of TLB shootdown latency on SITE’s performance.
+
+
+                                                                                                                                                                                                                           0.7	
+  
+
+
+
+
+                                                                                                                                                                      (Normalized	
+  to	
+  No	
+  Self-­‐invalida%on)	
+  
+                                                                                                                                                                                                                                                                                                                  0.545	
+  
+fraction of time spent on address translation (Translation                                                                                                                                                                 0.6	
+  
+                                                                                                                                                                                                                                                                                                             0.555	
+        0.536	
+  
+
+
+
+
+                                                                                                                                                                           Rela%ve	
+  Execu%on	
+  Time	
+  	
+  
+                                                                                                                                                                                                                           0.5	
+  
+cost), and the rest that includes data access, page copy costs,
+                                                                                                                                                                                                                           0.4	
+  
+and computation cost (Others). From the figure, we observe                                                                                                                                                                 0.3	
+  
+                                                                                                                                                                                                                                                                                                                                            200	
+  
+
+that a large fraction of the execution time in the baseline                                                                                                                                                                0.2	
+                                                                                                            150	
+  
+is attributed to the overhead of TLB shootdowns due to                                                                                                                                                                     0.1	
+  
+                                                                                                                                                                                                                                                                                                                                            100	
+  
+                                                                                                                                                                                                                           0.0	
+  
+page migrations. This is in line with the findings in previous
+
+
+
+
+                                                                                                                                                                                                                                       H	
+  
+
+
+                                                                                                                                                                                                                                        	
+  
+
+                                                                                                                                                                                                                                                        E	
+  
+
+
+                                                                                                                                                                                                                                                                     	
+  
+
+
+                                                                                                                                                                                                                                                                             	
+  
+
+
+                                                                                                                                                                                                                                                                                      	
+  
+
+
+
+
+                                                                                                                                                                                                                                                                                                      	
+  
+
+
+
+
+                                                                                                                                                                                                                                                                                                                         	
+  
+                                                                                                                                                                                                                                                                                             	
+  
+                                                                                                                                                                                                                                      SH
+
+
+
+
+                                                                                                                                                                                                                                                                      H
+
+                                                                                                                                                                                                                                                                            CG
+
+
+                                                                                                                                                                                                                                                                                    BT
+
+
+
+
+                                                                                                                                                                                                                                                                                                    LU
+
+
+
+
+                                                                                                                                                                                                                                                                                                                       n
+                                                                                                                                                                                                                                                                                             FT
+                                                                                                                                                                                                                                                      IF
+
+
+
+
+                                                                                                                                                                                                                                                                                                                    ea
+                                                                                                                                                                                                                                    NC
+
+
+
+
+                                                                                                                                                                                                                                                                   NC
+works [37], [31], [7]. This fraction, however, decreases
+
+
+
+
+                                                                                                                                                                                                                                   LE
+
+
+                                                                                                                                                                                                                                                    IN
+
+
+
+
+                                                                                                                                                                                                                                                                                                                  M
+                                                                                                                                                                                                                                 BE
+
+
+
+
+                                                                                                                                                                                                                                                                BE
+                                                                                                                                                                                                                                LU
+
+
+                                                                                                                                                                                                                                                    M
+                                                                                                                                                                                                                             XS
+
+
+
+
+                                                                                                                                                                                                                                                           RS
+significantly with SITE. Reduction is more significant with                                                                                                                                                                                                                   Workload	
+  
+shorter leases and best with dynamic lease assignment. The
+fraction for address translation is much smaller compared to                                                                                                          Figure 14.                                                          Impact of page table walk latency on SITE’s performance.
+that for TLB shootdowns in the baseline because the cost of
+shootdowns are orders of magnitude larger than the cost of
+a page table walk. However, this fraction grows as the lease
+length decreases, but not enough to negate the advantage                                                                                                             20K cycles to the initiator (issuer) core and 14 th (i.e., 5K
+of the lower shootdown costs until a very small static                                                                                                               cycles) at receiving cores (Table I). In Figure 13, we varied
+lease length of 1K. On the other hand, the dynamic lease                                                                                                             the shootdown latency to 10K cycles and to 40K cycles for
+assignment policy for SITE does a good job of balancing                                                                                                              the initiator core while maintaining the same ratio to the
+the lease length to achieve significant overall performance                                                                                                          latency for the receiving cores. As expected, the efficacy of
+improvement. We omit such breakdown for other workloads                                                                                                              SITE increases or decreases with an increase or decrease in
+due to lack of space and because they show the same overall                                                                                                          the shootdown latency. However, even with a relatively small
+trends.                                                                                                                                                              shootdown latency of 10K, SITE still reduces the average
+                                                                                                                                                                     execution time of applications by 34.2%.
+D. Sensitivity Studies                                                                                                                                               Impact of Page Table Walk Latency: SITE can increase
+   Next, we evaluate the resiliency of our SITE-based solu-                                                                                                          the number of page walks, and thus we vary page walk
+tion against several key design parameters.                                                                                                                          latencies to see how that impacts SITE’s performance. Pre-
+Impact of Migration Threshold: In a system with hetero-                                                                                                              viously, we assumed a page walk latency of 150 cycles and
+geneous memory, lowering the threshold for the number of                                                                                                             200 cycles (33% more) for SITE. We vary the baseline page
+accesses to a page in slow memory before it is migrated to                                                                                                           walk latency to 100 and 200 cycles, while also proportionally
+fast memory (migration threshold) can increase the hit rate in                                                                                                       increasing the page walk latency for SITE. In Figure 14,
+fast memory, but it also increases the number of shootdowns.                                                                                                         we present execution times of SITE (with dynamic lease
+Figure 12 shows how SITE (with dynamic lease assignment)                                                                                                             length), normalized to the baseline (lower is better) with
+fares with migration thresholds of 1 (first touch), 10, and                                                                                                          these variations. As expected, higher page walk latency
+100 (Threshold=1, 10, 100, respectively, in the figure).                                                                                                             decreases efficacy of SITE, but it still remains potent even at
+Lowering the threshold increases the number of shootdowns                                                                                                            a page walk latency of 200 cycles with about 45% reduction
+in the baseline due to aggressive page migration and thus                                                                                                            in execution time on average.
+offers more opportunity for SITE to avoid shootdowns.                                                                                                                Impact of Slow Memory Latency: Previously, we assumed
+Consequently, the efficacy of SITE increases significantly                                                                                                           the slow memory in our heterogeneous memory system is
+with lowering migration threshold as shown in the figure.                                                                                                            4× slower than the fast memory (Table I). Figure 15 shows
+Impact of TLB Shootdown Latency: SITE avoids TLB                                                                                                                     the impact of varying the latency ratio between fast and slow
+shootdowns and thus changes in shootdown latency affect                                                                                                              memory (2× and 8×). We observe that the efficacy of SITE
+its efficacy. Previously, we assumed a shootdown cost of                                                                                                             does not alter with varying the latency ratio of fast and slow
+                                                      0.7	
+                                                                                                                          every 10 or even 100 main memory accesses. Advancing the
+ (Normalized	
+  to	
+  No	
+  Self-­‐invalida%on)	
+  
+
+
+                                                                                                                                                      0.545	
+  
+                                                      0.6	
+  
+                                                                                                                                                 0.553	
+        0.541	
+              clock only in 10 or 100 memory accesses reduces the need
+      Rela%ve	
+  Execu%on	
+  Time	
+  	
+  
+
+
+
+
+                                                      0.5	
+  
+                                                                                                                                                                                     to synchronize the clock by 10 or 100 times. 2 Further,
+                                                      0.4	
+  
+                                                                                                                                                                            8x	
+     we observe that SITE can relax the need for keeping all
+                                                      0.3	
+  
+                                                                                                                                                                            4x	
+  
+                                                                                                                                                                                     local, per-core logical clocks completely synchronized, as
+                                                      0.2	
+  
+                                                                                                                                                                                     long as the maximum drift among them is bounded. SITE
+                                                      0.1	
+                                                                                                                 2x	
+  
+                                                      0.0	
+  
+                                                                                                                                                                                     then avoids a shootdown only if the expiration time of the
+                                                                XSBENCH	
+  LULESH	
+   MINIFE	
+  RSBENCH	
+   CG	
+      BT	
+     FT	
+     LU	
+             Mean	
+                      corresponding PTE is in the past by more than the maximum
+                                                                                                              Workload	
+  
+                                                                                                                                                                                     allowed drift. Drift of n logical ticks can be bounded by
+                                                                                                                                                                                     ensuring that the logical clocks are not advanced if the
+Figure 15.                                                          Impact of the latency ratio of slow to fast memory on SITE.                                                      number of yet-to-be-acknowledged updates to the per-core
+                                                                                                                                                                                     clock is limited to the maximum of n. 3 Finally, SITE does
+memory.
+                                                                                                                                                                                     not break even if logical clocks temporarily stop advancing.
+                                                                                            VI. D ISCUSSION                                                                          The logical clock needs to progress fast enough for the TLB
+  In this section, we discuss a few topics related to the idea                                                                                                                       entries to expire but not necessarily on exactly every main
+of SITE and its proposed implementation.                                                                                                                                             memory access, or on every 10 or 100 memory accesses.
+                                                                                                                                                                                        In summary, we find that SITE can be scaled well to larger
+A. Energy Efficiency of SITE                                                                                                                                                         systems using one or a combination of above-mentioned
+   SITE extends each TLB entry with a 32-bit expiration                                                                                                                              techniques.
+time. On every TLB lookup, SITE also needs to compare
+                                                                                                                                                                                     C. Timestamp Overflow
+this expiration time with the current logical time to confirm
+that the entry has not yet expired. Because the expiration                                                                                                                              Our proposed implementation of SITE uses 32-bit logical
+time can be looked up in parallel with the TLB tag, this does                                                                                                                        timestamps that would overflow at a very slow rate. We
+not significantly impact latency, but it adds to the dynamic                                                                                                                         estimate that even with a sustained high memory bandwidth
+energy consumption. However, industry projections show                                                                                                                               demand of 20 GB/sec, the timestamp counter would over-
+that the TLB contributes about 6% of a chip’s power [46].                                                                                                                            flow in 13 seconds, assuming the timestamp is incremented
+Thus, SITE is unlikely to add much to the overall energy                                                                                                                             on every memory access. In case of the rare overflow, we
+consumption of the chip.                                                                                                                                                             propose to simply flush all TLBs and invalidate all ETTs.
+   More importantly however, SITE is likely to significantly
+                                                                                                                                                                                                        VII. R ELATED W ORK
+reduce static energy. Static energy (leakage) consumption
+is proportional to the execution time, and SITE can reduce                                                                                                                              In this section, we summarize the most related work.
+execution times significantly (e.g., by up to 65%). As the                                                                                                                           Self-Invalidation: The concept of self-invalidation has been
+technology feature size for processors shrinks, the transistors                                                                                                                      explored in other contexts, such as in cache coherence
+tend to leak more current, and therefore the static energy                                                                                                                           protocols [35], [43], [25], [27], [26], [47], [45], in cache
+can become a larger challenge [24]; static energy already                                                                                                                            replacement [23], [32], and in cache power management [5],
+contributes more than 30-40% of some chips’ energy even                                                                                                                              [17], [22]. Min et al. proposed a timestamp-based software-
+at the 22nm technology node [8]. Thus, SITE is likely to                                                                                                                             assisted cache coherence protocol [35]. Lebeck et al. pro-
+help reduce the net energy consumption of a system.                                                                                                                                  posed to proactively invalidate shared cache blocks through
+                                                                                                                                                                                     dynamic self-invalidation (DSI) to eliminate invalidation
+B. Scalability of SITE                                                                                                                                                               messages [27]. Shim et al. improved DSI by delaying writes
+   SITE needs a global logical clock to ascertain when TLB                                                                                                                           until all shared copies are expired [43]. Lai et al. proposed a
+entries have expired, and so SITE’s overall scalability is                                                                                                                           Last-Touch Predictor to improve the accuracy of predicting
+determined by the scalability of this clock. If the clock                                                                                                                            the shared blocks to be proactively invalidated [26]. Somogyi
+progresses too fast, then keeping the clock synchronized                                                                                                                             et al. proposed predicting the last store to cache blocks
+is challenging. Thus, as discussed in Section III-A1, we                                                                                                                             via PC addresses [47]. Employing self-invalidation to re-
+avoided using physical clocks and used the main memory                                                                                                                               duce cache coherence overhead has also been extended for
+access count as the logical clock.                                                                                                                                                   GPUs and accelerators [25], [45]. In the context of cache
+   Here, we make three additional observations that could                                                                                                                            replacement, various studies have looked into identifying
+further enhance the scalability of SITE for larger systems.                                                                                                                          dead blocks as potential replacement victims, using counters
+ 1 We observed that the best-performing lease lengths                                                                                                                                events [23] or cache bursts [32]. Other work proposed using
+across the applications are in 100s or 1000s of main memory                                                                                                                          self-invalidation to reduce leakage power by turning off dead
+accesses (Figure 9) because the shootdowns happen rela-                                                                                                                              cache blocks [5], [17], [22].
+tively infrequently. Therefore, SITE’s performance is un-                                                                                                                               To the best of our knowledge, this is the first work to
+likely to be impacted if the logical clock advances only after                                                                                                                       propose using self-invalidation for TLB entries. Not only is
+the context new, but the challenges are unique because TLBs,     capacity to store the bookkeeping state, thereby reducing the
+page table walkers, and TLB shootdowns are not entirely          effective size of the faster memory resource. Furthermore, by
+managed by the hardware, and the OS plays an important           making the fast memory software-transparent, the total sys-
+role in these. For example, there is no hardware-enforced        tem memory capacity is effectively reduced. An alternative
+TLB coherence in commercial processors and the OS needs          to hardware-only management is a software management
+to get involved. Similarly, the OS allocates entries in the      approach. Software management can be categorized into
+page table, which is then looked up by the hardware page         OS-based and application-explicit management. OS-based
+table walker. This results in a significantly different design   management approaches focus on migration policies and
+space compared to past work on conventional caches.              improving performance via prefetching [37], [7], [33]. In
+Reducing TLB Shootdown Cost: This category of work               application-level management work, the application has the
+is the most related to our work, and includes the fol-           flexibility to choose where to allocate memory objects and
+lowing studies. Romanescu et al. [40] proposed hardware          how to migrate pages across different memory technologies.
+coherence support for TLBs [40]. While feasible, hardware        An example of that is Memkind [12], which is a user-
+coherence for the TLBs may be an overkill because PTEs           level heap manager that provides programmers with different
+are updated much less frequently compared to data caches,        memory services. Similarly, Meswani et al. proposed explicit
+and hardware coherence may add complexity to the core            management of two-level memory through explicit calls
+TLB structures and circuitry. Cache coherence is already         from applications [34].
+tedious to validate due to its complex state machine [9];           Our work investigates a complementary and crucial ques-
+TLB coherence is likely to add to that. Villavieja et al. [51]   tion of reducing the cost of TLB shootdowns. Lowering the
+proposed a shared hardware TLB directory (DiDi) that is          number and cost of TLB shootdowns is a crucial enabling
+inclusive of all TLB entries in the system. DiDi helps filter    technology for the heterogeneous memory management dis-
+extraneous shootdowns to cores without cached copies of the      cussed above.
+PTE. The centralized nature of this hardware-based solution,
+                                                                                    VIII. C ONCLUSION
+and the fact that the proposed shared TLB needs to be
+inclusive to all other TLBs, makes it difficult to scale to         We introduce the concept of self-invalidating TLB entries
+a larger number of cores and to large per-core TLBs that         (SITE) to avoid TLB shootdowns. While previous works
+are becoming more common. It is not clear how it can be          in this domain attempt to make TLB shootdowns faster,
+adapted to handle multi-socket (SMP) systems, either. Oskin      this work avoids shootdowns at the risk of additional TLB
+and Loh [37] proposed hardware-assisted TLB shootdowns           misses. Since shootdowns are typically two order of magni-
+to reduce inter-processor interrupt latency, but the overheads   tudes or more slower than TLB misses, this trade-off often
+are still large, i.e., in the microsecond range. Our proposed    comes out beneficial. We further propose to dynamically
+self-invalidating TLB scheme is distributed, and scalable        adjust lease length of TLB entries to ensure this trade-off
+to implement, without relying on any centralized hardware        remains beneficial for overall application performance even
+structures. Recent versions from ARM processors started to       when shootdowns are not common. However, future work
+support an instruction called TLBi, which submits a request      could unlock more performance by adjusting lease lengths
+to globally invalidate a specific TLB entry; however, it must    more aggressively.
+be followed by expensive global barriers, DSB. The costs of         The scalability of SITE to higher number of cores is
+such global barrier are expected to be extremely expensive       limited by the scalability of the logical clock it employs.
+for large numbers of cores. SITE aims to eliminate the need      Our proposal to use memory access counts as logical clock
+for TLB shootdown, whereas TLBi tries to minimize the cost       works well for moderately sized systems and for our use
+of TLB shootdown. Accordingly, SITE can be combined              case of systems with heterogeneous memory. However, for
+with shootdown overhead optimizations. Furthermore, x86          larger systems with several sockets, an alternative design
+systems are the most dominant for server market, where IPI-      that employs logical clock may work better. Future research
+based shootdown is still required.                               can explore how hierarchical clocks can be used by SITE to
+Heterogeneous Memory Systems Management: There                   scale to large number of sockets.
+are many prior studies exploring the management of page                           IX. ACKNOWLEDGMENT
+placement in heterogeneous memory systems. Some stud-                    R
+ies relied on a hardware-only management approach [20],             AMD , the AMD Arrow logo, and combinations thereof
+[21], [29], [11], [41], [44]. While transparent to system        are trademarks of Advanced Micro Devices, Inc. Other
+software, hardware caching is not without its costs. First,      product names used in this publication are for identification
+the hardware cache typically requires non-trivial resources      purposes only and may be trademarks of their respective
+for bookkeeping (i.e., the tags) that either require the con-    companies.
+                                                                    c
+struction of large on-chip structures (SRAM) that increases            2017 Advanced Micro Devices, Inc. All rights re-
+chip costs, and/or cannibalizes part of the fast memory          served.
+                        R EFERENCES                              [14] JaeWoong Chung, Chi Cao Minh, Austen McDonald, Travis
+                                                                      Skare, Hassan Chafi, Brian D. Carlstrom, Christos Kozyrakis,
+ [1] HMC Consortium, http://www.hybridmemorycube.org/technology.html. and Kunle Olukotun. Tradeoffs in transactional memory virtu-
+                                                                      alization. In Proceedings of the 12th International Conference
+                                                                      on Architectural Support for Programming Languages and
+ [2] Huai, Yiming, et al. Observation of spin-transfer switching
+                                                                      Operating Systems, ASPLOS XII, pages 371–381, New York,
+     in deep submicron-sized and low-resistance magnetic tunnel
+                                                                      NY, USA, 2006. ACM.
+     junctions. Applied Physics Letters 84.16: 3118-3120, 2004.
+                                                                    [15] Rob Crooke and Al Fazio. Intel Non-Volatile Memory Inside.
+ [3] Hydrodynamics Challenge Problem, Lawrence Livermore Na-             The Speed of Possibility Outside. In Intel Developer Forum
+     tional Laboratory. Technical Report LLNL-TR-490254.                 (IDF), 2015.
+
+ [4] Jedec      specifications      for    hbm,        jesd235a,    [16] D. Dhurjati and V. Adve. Efficiently detecting all dangling
+     http://www.jedec.org/standards-documents/docs/jesd235a.             pointer uses in production servers. In International Confer-
+                                                                         ence on Dependable Systems and Networks (DSN’06), pages
+ [5] Jaume Abella, Antonio González, Xavier Vera, and                   269–280, June 2006.
+     Michael FP O’Boyle. Iatac: a smart predictor to turn-off l2
+     cache lines. ACM Transactions on Architecture and Code         [17] Krisztián Flautner, Nam Sung Kim, Steve Martin, David
+     Optimization (TACO), 2(1):55–77, 2005.                              Blaauw, and Trevor Mudge. Drowsy caches: simple tech-
+                                                                         niques for reducing leakage power. In Proceedings of the 29th
+ [6] AMD. AMD64 Architecture Programmer’s Manual, Volume                 Annual International Symposium on Computer Architecture
+     2, Revision 3.23.                                                   (ISCA), 2002, pages 148–157. IEEE, 2002.
+
+ [7] Amro Awad, Sergey Blagodurov, and Yan Solihin. Write-          [18] Michael Heroux, Douglas Doerfler, Paul Crozier, James Wil-
+     aware management of nvm-based memory extensions. In                 lenbring, Carter Edwards, Alan Williams, Mahesh Rajan,
+     Proceedings of the 2016 International Conference on Super-          Eric Keiter, Heidi K Thornquist, and Robert W Numrich.
+     computing, ICS ’16, pages 9:1–9:12, New York, NY, USA,              Improving performance via mini-applications. In Sandia
+     2016. ACM.                                                          Report 2009.
+
+                                                                    [19] Intel. Intel 64 and IA-32 Architectures Software Developer’s
+ [8] Y. Bai, Y. Song, M. N. Bojnordi, A. Shapiro, E. G. Friedman,
+                                                                         Manual 2012.
+     and E. Ipek. Back to the future: Current-mode processor in
+     the era of deeply scaled cmos. IEEE Transactions on Very
+     Large Scale Integration (VLSI) Systems, 24(4):1266–1279,       [20] Hakbeom Jang, Yongjun Lee, Jongwon Kim, Youngsok Kim,
+     April 2016.                                                         Jangwoo Kim, Jinkyu Jeong, and Jae W Lee. Efficient foot-
+                                                                         print caching for tagless dram caches. In Proceedings of IEEE
+                                                                         International Symposium on High Performance Computer
+ [9] Y. Bai, Y. Song, M. N. Bojnordi, A. Shapiro, E. G. Friedman,        Architecture (HPCA), 2016, pages 237–248. IEEE, 2016.
+     and E. Ipek. Back to the future: Current-mode processor in
+     the era of deeply scaled cmos. IEEE Transactions on Very
+                                                                    [21] Djordje Jevdjic, Gabriel H Loh, Cansu Kaynak, and Babak
+     Large Scale Integration (VLSI) Systems, 24(4):1266–1279,
+                                                                         Falsafi. Unison cache: A scalable and effective die-stacked
+     April 2016.
+                                                                         dram cache. In 2014 47th Annual IEEE/ACM International
+                                                                         Symposium on Microarchitecture, pages 25–37. IEEE, 2014.
+[10] David H Bailey, Eric Barszcz, John T Barton, David S
+     Browning, Robert L Carter, Leonardo Dagum, Rod A Fatoohi,      [22] Stefanos Kaxiras, Zhigang Hu, and Margaret Martonosi.
+     Paul O Frederickson, Thomas A Lasinski, Rob S Schreiber,            Cache decay: exploiting generational behavior to reduce
+     et al. The nas parallel benchmarkssummary and preliminary           cache leakage power. ACM SIGARCH Computer Architecture
+     results. In Proceedings of the 1991 ACM/IEEE conference on          News, 29(2):240–251, 2001.
+     Supercomputing, pages 158–165. ACM, 1991.
+                                                                    [23] Mazen Kharbutli and Yan Solihin. Counter-based cache
+[11] Evgeny Bolotin, David Nellans, Oreste Villa, Mike O’Connor,         replacement algorithms. In Proceedings of the 2005 IEEE
+     Alex Ramirez, and Stephen W Keckler. Designing efficient            International Conference on Computer Design (ICCD), 2005,
+     heterogeneous memory architectures. IEEE Micro, 35(4):60–           pages 61–68. IEEE, 2005.
+     68, 2015.
+                                                                    [24] Nam Sung Kim, Todd Austin, David Blaauw, Trevor Mudge,
+[12] Christopher Cantalupo, Vishwanath Venkatesan, and Jeff R            Krisztián Flautner, Jie S. Hu, Mary Jane Irwin, Mahmut
+     Hammond. User extensible heap manager for heterogeneous             Kandemir, and Vijaykrishnan Narayanan. Leakage current:
+     memory platforms and mixed memory policies. 2015.                   Moore’s law meets static power. Computer, 36(12):68–75,
+                                                                         December 2003.
+[13] Perry Cheng and Guy E. Blelloch. A parallel, real-time
+     garbage collector. In Proceedings of the ACM SIGPLAN           [25] Snehasish Kumar, Arrvindh Shriraman, and Naveen Vedula.
+     2001 Conference on Programming Language Design and                  Fusion: design tradeoffs in coherent cache hierarchies for
+     Implementation, PLDI ’01, pages 125–136, New York, NY,              accelerators. In ACM SIGARCH Computer Architecture News,
+     USA, 2001. ACM.                                                     volume 43, pages 733–745. ACM, 2015.
+[26] An-Chow Lai and Babak Falsafi. Selective, accurate, and          [38] Luiz E Ramos, Eugene Gorbatov, and Ricardo Bianchini.
+     timely self-invalidation using last-touch prediction. In Pro-         Page Placement in Hybrid Memory Systems. In Proceedings
+     ceedings of the 27th International Symposium on Computer              of the International Conference on Supercomputing (ICS),
+     Architecture (ISCA), 2000, pages 139–148. IEEE, 2000.                 pages 85–95. ACM, 2011.
+
+[27] Alvin R Lebeck and David A Wood.             Dynamic self-       [39] Vijay Janapa Reddi, Alex Settle, Daniel A Connors, and
+     invalidation: Reducing coherence overhead in shared-memory            Robert S Cohn. Pin: a binary instrumentation tool for
+     multiprocessors. In ACM SIGARCH Computer Architecture                 computer architecture research and education. In Proceedings
+     News, volume 23, pages 48–59. ACM, 1995.                              of the 2004 workshop on Computer architecture education:
+                                                                           held in conjunction with the 31st International Symposium on
+[28] Benjamin Lee, Engin Ipek, Onur Mutlu, and Doug Burger.                Computer Architecture, page 22. ACM, 2004.
+     Architecting phase change memory as a scalable dram alter-
+     native. In International Symposium on Computer Architec-
+                                                                      [40] Bogdan F Romanescu, Alvin R Lebeck, Daniel J Sorin,
+     ture, 2009.
+                                                                           and Anne Bracy. Unified instruction/translation/data (unitd)
+[29] Yongjun Lee, Jongwon Kim, Hakbeom Jang, Hyunggyun                     coherence: One protocol to rule them all. In Proceedings of
+     Yang, Jangwoo Kim, Jinkyu Jeong, and Jae W Lee. A fully               IEEE 16th International Symposium on High Performance
+     associative, tagless dram cache. In ACM SIGARCH Computer              Computer Architecture (HPCA), 2010, pages 1–12. IEEE,
+     Architecture News, volume 43, pages 211–222. ACM, 2015.               2010.
+
+[30] Z. Li, R. Zhou, and T. Li. Exploring high-performance            [41] Jee Ho Ryoo, Karthik Ganesan, Yao-Min Chen, and
+     and energy proportional interface for phase change memory             Lizy Kurian John. i-mirror: A software managed die-stacked
+     systems. In IEEE 19th International Symposium on High                 dram-based memory subsystem. In Proceedings of the 27th
+     Performance Computer Architecture (HPCA), pages 210–221,              International Symposium on Computer Architecture and High
+     Feb 2013.                                                             Performance Computing (SBAC-PAD), 2015, pages 82–89.
+                                                                           IEEE, 2015.
+[31] Felix Xiaozhu Lin and Xu Liu. Memif: Towards programming
+     heterogeneous memory asynchronously. In Proceedings of           [42] Mohit Saxena and Michael M Swift. FlashVM: virtual
+     the Twenty-First International Conference on Architectural            memory management on flash. In Proceedings of the 2010
+     Support for Programming Languages and Operating Systems,              USENIX conference on USENIX Annual Technical Confer-
+     pages 369–383. ACM, 2016.                                             ence, 2010, pages 14–14. USENIX Association, 2010.
+[32] Haiming Liu, Michael Ferdman, Jaehyuk Huh, and Doug
+                                                                      [43] Keun Sup Shim, Myong Hyon Cho, Mieszko Lis, Omer Khan,
+     Burger. Cache bursts: A new approach for eliminating
+                                                                           and Srinivas Devadas. Library cache coherence. 2011.
+     dead blocks and increasing cache efficiency. In Proceedings
+     of the 41st Annual IEEE/ACM International Symposium on
+     Microarchitecture, pages 222–233, 2008.                          [44] Jaewoong Sim, Gabriel H Loh, Vilas Sridharan, and Mike
+                                                                           O’Connor. Resilient die-stacked dram caches. In ACM
+[33] Mitesh R Meswani, Sergey Blagodurov, David Roberts, John              SIGARCH Computer Architecture News, volume 41, pages
+     Slice, Mike Ignatowski, and Gabriel H Loh. Heterogeneous              416–427. ACM, 2013.
+     memory architectures: A hw/sw approach for mixing die-
+     stacked and off-package memories. In 2015 IEEE 21st              [45] Inderpreet Singh, Arrvindh Shriraman, Wilson WL Fung,
+     International Symposium on High Performance Computer                  Mike O’Connor, and Tor M Aamodt. Cache coherence for
+     Architecture (HPCA), pages 126–136. IEEE, 2015.                       gpu architectures. In Proceedings of IEEE 19th International
+                                                                           Symposium on High Performance Computer Architecture
+[34] Mitesh R Meswani, Gabriel H Loh, Sergey Blagodurov,                   (HPCA2013), 2013, pages 578–590. IEEE, 2013.
+     David Roberts, John Slice, and Mike Ignatowski. Toward
+     efficient programmer-managed two-level memory hierarchies        [46] Avinash Sodani. Race to exascale: Opportunities and Chal-
+     in exascale computers. In Hardware-Software Co-Design for             lenges. In Keynote at the Annual IEEE/ACM 44th Annual
+     High Performance Computing (Co-HPC), 2014, pages 9–16.                International Symposium on Microarchitecture.
+     IEEE, 2014.
+                                                                      [47] Stephen Somogyi, Thomas F Wenisch, Nikolaos Hardavellas,
+[35] Sang Lyul Min and J-L Baer. Design and analysis of
+                                                                           Jangwoo Kim, Anastassia Ailamaki, and Babak Falsafi. Mem-
+     a scalable cache coherence scheme based on clocks and
+                                                                           ory coherence activity prediction in commercial workloads.
+     timestamps. IEEE Transactions on Parallel and Distributed
+                                                                           In Proceedings of the 3rd workshop on Memory performance
+     Systems, 3(1):25–44, 1992.
+                                                                           issues: in conjunction with the 31st international symposium
+[36] Prashant J. Nair, Dae-Hyun Kim, and Moinuddin K. Qureshi.             on computer architecture, pages 37–45. ACM, 2004.
+     Archshield: Architectural framework for assisting dram scal-
+     ing by tolerating high error rates. In Proceedings of the 40th   [48] Andrew S Tanenbaum. Modern operating systems. 2009.
+     Annual International Symposium on Computer Architecture,
+     ISCA ’13, pages 72–83, New York, NY, USA, 2013. ACM.             [49] John R Tramm, Andrew R Siegel, Benoit Forget, and Colin
+                                                                           Josey. Performance analysis of a reduced data movement
+[37] Mark Oskin and Gabriel H. Loh. A software-managed                     algorithm for neutron cross section data in monte carlo
+     approach to die-stacked dram. In PACT, pages 188–200.                 simulations. In Solving Software Challenges for Exascale,
+     IEEE, 2015.                                                           pages 39–56. Springer, 2014.
+[50] John R Tramm, Andrew R Siegel, Tanzima Islam, and Martin
+     Schulz. XSBench - The Development and Verification of a
+     Performance Abstraction for Monte Carlo Reactor Analysis.
+     In PHYSOR 2014 - The Role of Reactor Physics toward a
+     Sustainable Future, Kyoto.
+
+[51] Carlos Villavieja, Vasileios Karakostas, Lluis Vilanova, Yoav
+     Etsion, Alex Ramirez, Avi Mendelson, Nacho Navarro,
+     Adrian Cristal, and Osman S. Unsal. Didi: Mitigating the
+     performance impact of tlb shootdowns using a shared tlb
+     directory. In Proceedings of the 2011 International Confer-
+     ence on Parallel Architectures and Compilation Techniques,
+     PACT ’11, pages 340–349, Washington, DC, USA, 2011.
+     IEEE Computer Society.
+
+[52] J Joshua Yang, Dmitri B Strukov, and Duncan R Stewart.
+     Memristive devices for computing. Nature nanotechnology,
+     8(1):13–24, 2013.
+

@@ -1,0 +1,615 @@
+                                               Tiara: A Programmable Line-Rate ISA for Remote Memory
+                                                                       Access
+                                                                                                           Bojie Li
+                                                                                                            Pine AI
+                                         Abstract                                                                     (2) Multi-level translation. Page tables, storage indirection lay-
+                                         RDMA one-sided verbs are the natural primitive for memory dis-                    ers, and block-table lookups resolve addresses through 𝑘 levels
+                                         aggregation, but they require the client to supply the exact remote               of indirection, each requiring a dependent RTT. This pattern is
+                                         address. The 1-RTT performance breaks down when the target ad-                    increasingly critical for disaggregated LLM inference: vLLM’s
+                                         dress depends on data that must first be read from remote mem-                    PagedAttention [21] scatters KV caches into non-contiguous
+                                         ory, a pattern we call the Indirection Wall. Indirection is perva-                blocks, and the client must read a Block Table to discover phys-
+arXiv:2606.13708v1 [cs.AR] 10 Jun 2026
+
+
+
+
+                                         sive: graph traversals follow pointers hop by hop, address trans-                 ical addresses before fetching KV data.
+                                         lation walks multi-level page tables, distributed coordination re-           (3) Conditional multi-host coordination. Distributed locks and
+                                         quires conditional multi-host logic, and disaggregated LLM infer-                 log replication use atomic compare-and-swap (CAS) to acquire
+                                         ence must resolve paged KV caches through block-table lookups.                    state on one node, then conditionally propagate to replicas,
+                                         Each level of indirection costs one sequentially dependent network                forming a sequence of dependent operations spanning multi-
+                                         round-trip, yet offloading to existing RDMA NICs either consumes                  ple hosts.
+                                         remote CPU cycles or has limited throughput. We present Tiara, a             The cost is severe: latency grows as Depth × RTT, link utilization
+                                         compact, statically verifiable instruction set that executes on the          collapses between dependent accesses, and the CPU must orches-
+                                         memory-side NIC. Tiara operators are pre-registered programs, anal-          trate every intermediate step, precisely the “killer microseconds”
+                                         ogous to eBPF programs in the kernel, that resolve indirection lo-           regime [4] where hardware latency dominates software optimiza-
+                                         cally, collapsing multi-RTT dependent chains into a single round-            tion. Yue et al. [48] quantified this for disaggregated PagedAtten-
+                                         trip. On an FPGA-based prototype, Tiara reduces 10-hop graph-                tion: fetching KV data for a single LLaMA3-70B request incurs 160
+                                         traversal latency by 2.85× over one-sided RDMA while sustaining              sequential RTTs, leaving a 200 Gbps link idle 83% of the time.
+                                         3.4× higher throughput, cuts page-table walk latency by 62%, re-                Existing approaches each fall short: chaining RDMA verbs on
+                                         duces uncontended distributed-lock latency by 2.9×, achieves 2.8×            the memory-side NIC [41] resolves indirection in 1 RTT but is
+                                         throughput for disaggregated PagedAttention at 8 KB blocks, and              throughput-limited; two-sided RPC consumes CPU cores disaggre-
+                                         1.88× MoE expert-gather latency at 32 experts.                               gated memory nodes may lack; off-path SmartNIC offloading can
+                                                                                                                      increase latency (§2.2).
+                                         Keywords                                                                        We address this with Tiara, a compact instruction set for the
+                                                                                                                      memory-side NIC. A Tiara operator is a pre-registered program,
+                                         RDMA, remote memory access, SmartNIC, memory disaggrega-                     analogous to an eBPF program in the kernel [14]. Its core mecha-
+                                         tion, programmable networks, instruction set architecture                    nism is simple: a Load returns a value into a register that can imme-
+                                                                                                                      diately serve as the address for the next Load, chaining dependent
+                                         1   Introduction                                                             dereferences with no round-trips. Around this core sit control-flow
+                                                                                                                      instructions (forward-only Jump, bounded Loop, async Wait) and
+                                         Datacenter workloads increasingly demand memory beyond a sin-
+                                                                                                                      integer Compute for address arithmetic. Static verification at regis-
+                                         gle server’s capacity, separating compute and memory into network-
+                                                                                                                      tration guarantees bounded execution and sandboxed access. Tiara
+                                         attached pools [1, 42]. One-sided RDMA verbs are the natural prim-
+                                                                                                                      attempts no general computation, only the minimal address reso-
+                                         itive for this disaggregated setting: the requester specifies a remote
+                                                                                                                      lution that turns an indirect access into a direct one.
+                                         address and the remote NIC completes the access directly, without
+                                                                                                                         We make two contributions:
+                                         notifying the remote CPU, a model a decade of systems has metic-
+                                                                                                                      (1) Tiara, a minimal, statically verifiable NIC-side ISA. The con-
+                                         ulously exploited [10, 19, 20, 30, 46]. But every verb requires the
+                                                                                                                           tribution is not NIC-side programmability itself (RedN, RMC,
+                                         client to supply the exact remote address at issue time. This works
+                                                                                                                           NAAM, and BF-3 DPA all offer that) but the specific subset
+                                         when the address is computable locally (e.g., fixed-size HPC ma-
+                                                                                                                           that simultaneously (i) collapses dependent dereferences in a
+                                         trices), but a growing class of workloads derives the address from
+                                                                                                                           hardware-native sub-𝜇s path that software-dispatched ARM/RISC-
+                                         remote data that must be read first. The client cannot know the next
+                                                                                                                          V cores cannot reach (Fig. 3), and (ii) admits eBPF-style termi-
+                                         address until the current read returns, so each dependent lookup
+                                                                                                                           nation and memory-region verification at registration time, so
+                                         costs a full round-trip that no batching or prefetching can hide.
+                                                                                                                           operators are safe for multi-tenant sharing without runtime
+                                         We call this sequential bottleneck the Indirection Wall, with three
+                                                                                                                           checks.
+                                         recurring patterns:
+                                                                                                                      (2) An FPGA prototype on Alveo U50, evaluated on five work-
+                                         (1) Pointer chasing. Graph traversals and linked data structures
+                                                                                                                           loads. Compared to one-sided RDMA: 2.85× lower graph-traversal
+                                              store each successor’s address in the current node. Every hop
+                                                                                                                           latency at depth 10 and 3.4× higher throughput at depth 3, 62%
+                                              requires one sequential network round-trip. This pattern arises
+                                              in social-network analysis, knowledge-graph queries, and agent-
+                                              driven graph-RAG pipelines.
+                                                                                                                  1
+                                                                                                                                                                                                                  Bojie Li
+
+
+      Table 1: RTT cost of indirection across workloads.                                 (a) One-sided RDMA                                                   (b) CPU-based RPC                       (c) Tiara
+    Workload                     Pattern                   RDMA        Tiara                Client NIC                                                     Client NIC CPU                     Client NIC
+    Graph traversal (depth 𝑑)    Pointer chase              𝑑 RTTs     1 RTT                       Read L1                                                    RPC(vAddr)
+                                                                                                                                                                                               Invoke(vAddr)
+    Page-table walk (3-level)    Multi-level translation   3+1 RTTs    1 RTT                         L2 ptr                                                               dispatch
+    Dist. lock + replication     CAS + cond. writes         5 RTTs     2 RTTs               idle
+                                                                                                   Read L2                                                                    Load L1                 Load L1
+    PagedAttention               Table lookup + gather     160† / 2‡   1 RTT                         L3 ptr                                                                   Load L2                 Load L2 no CPU
+    MoE expert loading           Paged translation          2 RTTs     1 RTT                idle
+                                                                                                   Read L3
+                                                                                                                                               4 RTTs                         Load L3 1 RTT           Load L3 1 RTT
+    Sparse attention (NSA)       Score-then-select          2 RTTs     1 RTT                         pAddr                                                                                            Memcpy
+                                                                                            idle                                                                    Memcpy
+† Unoptimized stop-and-wait, as deployed today [48]. ‡ Optimally batched: 1 RTT to                 Read data                                                                                        Data
+                                                                                                                                                                   Data
+read the block table, then 160 block reads in a 2nd RTT (requires constructing 160                    Data
+work requests on the client).
+                                                                                             1 RTT per level                                                     1 RTT, but burns        NIC resolves locally 1 RTT
+                                                                                             4 sequential RTTs                                                      CPU cores               no CPU involvement
+    lower page-table walk latency, 3.1× lower distributed-lock la-
+                                                                                         Figure 1: Three approaches to data-dependent remote access
+    tency at 16 clients, 2.78× PagedAttention throughput at 8 KB
+                                                                                         (e.g., a 3-level page-table walk). (a) One-sided RDMA incurs
+    blocks, and 1.88× MoE expert-gather latency at 32 experts.
+                                                                                         one RTT per indirection level plus one for the final data
+   Tiara is open source at https://github.com/bojieli/Tiara.
+                                                                                         fetch. (b) CPU-based RPC resolves all levels in 1 RTT but
+                                                                                         consumes CPU cores on the memory node. (c) Tiara resolves
+2 Motivation                                                                             all levels via host DRAM on the NIC and returns data in
+                                                                                         1 RTT, without CPU involvement.
+2.1 The Cost of Indirection
+                                                                                                                                                                                             RDMA
+One-sided RDMA pays one RTT per indirection level; these RTTs                                                                                                                           BlueField−2
+are sequentially dependent: the client cannot issue level-𝑖+1 until
+level-𝑖 completes, and no batching or pipelining can help. Table 1
+
+
+
+
+                                                                                                                                Latency (µs)
+                                                                                                                                                10
+quantifies this cost across the five workloads we evaluate, plus
+sparse attention (NSA), an emerging AI pattern.
+                                                                                                                                                 5
+   Indirection across the AI stack. The Indirection Wall extends be-
+yond classical systems. In MoE serving with disaggregated expert                                                                                 0         Ato    A     H    P     D     L
+                                                                                                                                                               mic tomic T GE T Wa ist.Lo ogRe
+weights, the mapping from expert ID to physical location goes                                                                                                     Rd    Wr   T    lk     ck   pl
+
+through a translation table, structurally identical to PagedAtten-
+                                                                                                   Figure 2: BlueField-2 vs. one-sided RDMA latency.
+tion’s Block Table. DeepSeek’s Native Sparse Attention (NSA) [8]
+scores compressed keys in remote memory to select which full
+blocks to fetch, a “score-then-select” pattern where the decision                                                                                                                                 crossover
+                                                                                                      End-to-end latency (μs)
+
+
+
+
+                                                                                                                                                        Memory-side offload
+                                                                                                                                8                                                                 (= RTT)
+of what to read depends on remote data. As AI systems adopt dis-                                                                                        One-sided RDMA
+aggregated memory [27, 37, 40, 50], data-dependent address reso-
+                                                                                                                                6
+lution becomes a systematic bottleneck.                                                                                                                          Tiara FPGA
+                                                                                                                                                                 PCIe (0.75 µs)
+                                                                                                                                4
+   Indirection vs. scatter-gather. Not all irregular access patterns
+                                                                                                                                                                   BF-3 DPA
+are indirection. In embedding table lookups [15], all reads are in-                                                             2                                  (~0.85 µs)
+
+dependent and parallelizable via RDMA scatter-gather lists. The
+Indirection Wall arises specifically when the address depends on                                                                0
+
+remote data that must be read first.                                                                                                     0.0            0.5        1.0         1.5     2.0      2.5        3.0
+                                                                                                                                                     Host-memory access latency (μs)
+
+    Case Study: Graph Traversal. Social-network graphs stored in                         Figure 3: Offloading beats RDMA when host-memory la-
+disaggregated memory exhibit pure pointer chasing. A 𝑘-hop query                         tency < RTT.
+(friend-of-friend, influence propagation, community detection) reads
+a node, follows an edge to a neighbor, and repeats; each hop’s                           reads (level-1 → level-2 → level-3 entry → physical address): one-
+address depends on the previous hop’s data, so no prefetching is                         sided RDMA costs 4 RTTs, while Tiara resolves all three levels lo-
+possible. Knowledge graphs and graph-based retrieval-augmented                           cally in 1 RTT. This page table is not the OS page table but the block-
+generation (graph-RAG) pipelines face the same bottleneck: multi-                        indirection table disaggregated runtimes build over remote pools
+hop reasoning requires sequential node fetches whose addresses                           for dynamic reallocation, of which vLLM’s Block Table and MoE’s
+are discovered only at runtime. With one-sided RDMA, latency                             expert table are instances. ConnectX MTTs translate one flat re-
+grows as 𝑘 × RTT; Tiara resolves all hops via local DRAM reads,                          gion but cannot represent multi-level or application-managed indi-
+keeping latency near 1 RTT regardless of depth (§4.2).                                   rection, and IOMMUs operate only on host-side IO mappings. This
+                                                                                         is the on-demand remote-paging path of systems such as ODRP [44]:
+   Case Study: Page-Table Walk. Consider a compute node access-                          a node faulting on a remote page must walk a memory-node-resident
+ing remote memory through a 3-level page table on the memory                             translation structure before the fetch, a walk Tiara collapses into
+node. Translating a virtual address chains three strictly dependent                      the same round-trip as the fetch.
+                                                                                     2
+Tiara: A Programmable Line-Rate ISA for Remote Memory Access
+
+
+                                             Remote Nodes                                           hard to realize in fixed logic. Tiara trades that generality for two
+                                                      RDMA                                          properties these designs cannot match. Latency: BF-3 DPA’s 0.85 𝜇s
+      Tiara NIC
+                                                                                                    host access nearly matches Tiara’s 0.75 𝜇s, but Tiara’s hardware
+                                                 RDMA Engine
+                                                                                                    MPs commit a load one cycle after writeback with no dispatch,
+                                             Task Dispatcher                           Memcpy       while off-path BF-2 ARM cores regress (Fig. 2). BF-3 DPA’s 0.85 𝜇s
+                                                                                                    stays below the RTT crossover (Fig. 3), a viable target that narrows
+                MP0                     MP1
+                                                              ...
+                                                                        MP7                         the gap. One could instead restrict the source language and target
+             Regs, ALU               Regs, ALU                       Regs, ALU
+               IStore                  IStore                          IStore                       an existing ISA (Tiara itself compiles from a restricted OpenCL C
+                                                                                                    subset, §3.3), but that buys static safety on any target, not the
+                                           PCIe DMA Engine                                          sub-𝜇s per-hop cost. The minimal ISA is what makes this cheap:
+                                                       PCIe               register operators        a 2.95 K-LUT MP (§4.1) replicates 8× in ∼3% of a ConnectX die,
+      Host                                                                                          whereas a RISC-V/ARM core is one-to-two orders larger and can-
+                  Host DRAM                                         Compiler &
+                  (Memory Regions)
+                                                  Host CPU
+                                                                     Verifier                       not be replicated at line rate; the contribution is this hardware/ISA
+                                                                                                    co-design, not verification alone. Safety: NAAM leans on eBPF’s
+                    Figure 4: Tiara NIC architecture.                                               runtime verifier, while Tiara proves termination and region isola-
+2.2    Existing Approaches                                                                          tion statically with no runtime guard. Stateless data planes (P4 [5],
+                                                                                                    NPUs such as Netronome) cannot express data-dependent loops or
+Figure 1 contrasts three approaches. CPU-based RPC (b) resolves
+                                                                                                    dependent loads against host memory, so none of the workloads in
+all levels on the memory node in 1 RTT, but dedicates CPU cores
+                                                                                                    Table 1 fit.
+to address arithmetic. NIC-side approaches (c) avoid CPU involve-
+ment but, as we show below, each introduces its own bottleneck.
+                                                                                                    3     Tiara Design
+   Verb chaining. RedN [41] proved RDMA Turing-complete by chain-
+                                                                                                    Figure 4 shows the overall architecture. The Tiara NIC contains an
+ing self-modifying work requests (WRs, the descriptors that tell the
+                                                                                                    RDMA engine, a task dispatcher, and 8 lightweight memory pro-
+NIC what operation to perform). RedN executes on the memory-
+                                                                                                    cessors (MPs), each with a register file (16×64 b), an integer ALU, a
+side NIC, resolving indirection in a single RTT. However, it relies
+                                                                                                    depth-8 loop stack, a 32-entry in-flight async counter, and a BRAM
+on doorbell ordering: the CPU must signal (“ring a doorbell” via a
+                                                                                                    instruction store for pre-registered operators. At registration time
+PCIe write) after posting each WR, and the NIC processes them
+                                                                                                    (dashed path), the host-side compiler and static verifier check op-
+one at a time. This forces the NIC to fetch each WR individually
+                                                                                                    erators before loading them into the NIC’s instruction stores via
+from host memory (∼0.54 𝜇s per WR [41]), limiting throughput to
+                                                                                                    PCIe. At execution time (solid paths), incoming RDMA requests are
+∼1 Mops, 65× below raw RDMA Read rates (§4.2).
+                                                                                                    dispatched to an MP, which accesses host DRAM via PCIe DMA.
+   CPU-based RPC.. Two-sided RPC resolves addresses in 1 RTT,                                       We detail the programming model (§3.1), instruction set (§3.2), and
+but software RPC consumes 22 CPU cores to saturate a 25 Gbps                                        compiler and verifier (§3.3) below.
+NIC’s message rate [18]. Disaggregated memory nodes increasingly
+lack general-purpose CPUs entirely (CXL memory pools, memory                                           Execution and multi-tenant operation. An MP is a sequential scalar
+blades) [1]. Even when a CPU is available, RPC dispatch overhead                                    core (11-state FSM, no cache, no branch prediction, no out-of-order):
+adds 1 to 3 𝜇s [18, 36], often exceeding the useful work.                                           register-chained loads are made correct by stalling fetch until write-
+                                                                                                    back. A 256-entry op_id → start_pc table in front of the dispatcher
+    SmartNIC offloading. Running C/C++ on off-path SmartNIC ARM                                     routes incoming requests to any registered operator in O(1), so
+cores BlueField DPU [9] and FlexIO DPA [34] avoid the host CPU                                      one NIC hosts many tenants’ operators concurrently, an opaque
+but offer no termination guarantee or memory sandboxing. Worse,                                     per-task tag routing responses to the right caller. Isolation is static:
+it is not even faster. To validate this, we implement Tiara oper-                                   every operator is verified at registration to access only its declared
+ators on NVIDIA BlueField-2 [29, 45], where the ARM cores ac-                                       regions, so the runtime needs no per-access check and one ten-
+cess host memory via internal RDMA. Two servers are connected                                       ant’s operator cannot reach another tenant’s memory regardless of
+back-to-back via a DAC cable (RTT ∼1.9 𝜇s), giving the SmartNIC                                     how it executes. The memory subsystem is uncached and region-
+the shortest possible network RTT. Figure 2 shows that offloading                                   partitioned (a device-id router sends local accesses to PCIe DMA,
+to BlueField-2 increases latency for every operator: an atomic                                      remote ones to the RDMA engine); we add no MP-side cache, since
+read regresses by 38%. The root cause is that each host-memory ac-                                  indirection’s poor locality offers nothing to cache. The shared re-
+cess costs 1.7 𝜇s via internal RDMA, close to the 1.9 𝜇s cable RTT.                                 sources are the 8 MPs and the host PCIe channel; the current dis-
+Figure 3 sweeps host-memory latency analytically: the crossover                                     patcher is work-conserving but not weighted, and per-tenant token-
+where offloading becomes worthwhile occurs at the network RTT.                                      bucket scheduling is a one-state extension left to future work. Higher
+Tiara’s PCIe DMA at 0.75 𝜇s places it well below the crossover.                                     line rates scale by instantiating more MPs, each only ∼3 K LUT
+                                                                                                    (§4.1).
+   Active messaging and on-path DPA.. NAAM [3] runs pre-registered
+eBPF on host or SmartNIC ARM cores; BF-3 DPA [35] adds 16 on-
+path RISC-V cores with ∼0.85 𝜇s host-memory access. Both share                                      3.1    Programming Model
+Tiara’s pre-registration vision and would collapse multi-RTT chains,                                An operator is a small program of Tiara instructions, registered
+and NAAM’s eBPF offers richer programmability (maps, helpers)                                       on a NIC before use (analogous to loading an eBPF program into
+                                                                                                3
+                                                                                                                                               Bojie Li
+
+
+                 Table 2: Tiara instruction set.                                 Operator DistLock(latch, state, newVal,
+                                                                                                   r1Dev, r1Addr, r2Dev, r2Addr):
+  Instruction   Description
+                                                                                   Loop(MAX_RETRIES, 2)         // bounded CAS retry
+  Load/Store    Register ↔ local memory. A loaded value can be the                   ok = CAS(latch, 0, 1)      // local memory
+                                                                                     Jump(ok == 0, acquired)
+                next address.                                                      Ret(FAIL)
+  Memcpy        Bulk transfer with unified (device, addr) addressing;              acquired:
+                subsumes RDMA Read/Write.                                            old = Load(state)
+  CAS/CAA       Atomic compare-and-swap / compare-and-add.                           Store(state, newVal)
+                                                                                     Memcpy((r1Dev,r1Addr), state, 8) // async
+  Jump          Forward-only conditional branch.                                     Memcpy((r2Dev,r2Addr), state, 8) // async
+  Loop(M,N)     Execute next 𝑁 ops for 𝑀 iterations.                                 Wait(0)                     // both replicas ACK
+                                                                                     Store(latch, 0)             // release
+  Wait          Block until in-flight async ops ≤ threshold.                         Ret(old)
+  Ret           Return result to caller.
+  ComputeOp     Integer arithmetic, logical, shift for address computa-
+                                                                                            Figure 5: Distributed lock operator.
+                tion.
+                                                                              the operator can test via conditional Jump to execute a fallback path
+the kernel); registration triggers compilation and static verifica-           (e.g., skip the failed replica) or return an error to the caller.
+tion (§3.3). A client invokes it by sending a single message with
+the operator ID, parameters (up to 8 registers), and optional inline          3.3    Compiler and Verifier
+data. The NIC creates a task backed by a register file (16×64 b) and             Compiler. Operators are written in a restricted subset of OpenCL
+executes the operator without involving the host CPU.                         C [32] so that every operator’s control flow is a Static Control Part
+   Pre-registration is key: only the operator ID and parameters               (SCoP) [13], making termination and resource bounds decidable
+travel on the wire: one message per invocation. In contrast, PRISM [6]        at compile time. An LLVM-based [22] toolchain lowers OpenCL
+and RedN [41] transmit multiple work requests per task on every               C to IR (standard passes run unmodified); a custom Tiara back-
+call, consuming PCIe and network bandwidth proportional to task               end does linear-scan register allocation [39], flattens loops into
+complexity.                                                                   bounded Loop(M,N), selects opcodes, and inlines write data with
+   An operator accesses local memory via DMA and remote mem-                  the request to fold a 2-RTT read-then-write into 1 RTT. The result-
+ory on any node via Memcpy with unified addressing, enabling multi-           ing binaries are compact (typically 10 to 50 instructions).
+host orchestration in a single invocation, e.g., a distributed lock
+operator CAS-acquires a latch, replicates state to two replicas via              Static verification. Operators are verified at registration time, be-
+parallel async Memcpy, waits for acknowledgments, and returns, all            fore they ever execute on the data path. This is the critical differ-
+without CPU involvement on any node. PRISM’s chaining primi-                  entiator from SmartNIC C programming:
+tives are scoped to a single client-server pair; Tiara’s unified ad-          (1) Termination guarantee. Forward-only jumps (no backward
+dressing removes this limitation.                                                 branches) and bounded loop iterations give every operator a
+                                                                                  statically computable upper bound on execution steps. The ver-
+                                                                                  ifier computes this bound and rejects operators exceeding a
+3.2    Instruction Set                                                            configurable limit.
+Table 2 lists Tiara’s instructions. The design principle is minimal           (2) Fine-grained access control. One-sided RDMA exposes en-
+but sufficient: enough to express all indirection patterns in Table 1,            tire memory regions to any client with the region key. Tiara’s
+simple enough to verify statically and implement in hardware. We                  verifier checks at registration that every memory access falls
+derived this set by decomposing all workloads in Table 1 into el-                 within server-configured regions. Server-registered operators
+emental operations: every instruction is required by at least one                 can encapsulate restrictive logic (e.g., return usernames but
+workload, and removing any breaks that workload.                                  never passwords), and the client never sees raw memory, mak-
+   Three design choices merit emphasis. The key enabler is register-              ing Tiara both more secure and more flexible than one-sided
+chained loads: a Load writes its result into a register that a subse-             RDMA.
+quent Load can use as its address operand the very next cycle, turn-
+ing a multi-RTT pointer chase into local memory accesses, each                3.4    Example Operators
+∼0.75 𝜇s on our FPGA prototype versus a full network RTT.
+                                                                                  Distributed lock. Figure 5 shows a lock operator spanning three
+   Second, unified addressing: addresses are (host_id, region_id,
+                                                                              hosts: the NIC acquires a latch via local CAS (retried in a bounded
+offset) tuples. A Memcpy with remote source and local destination
+                                                                              Loop), updates state, replicates to two backups via parallel async
+is an RDMA Read; with remote destination, an RDMA Write. This
+                                                                              Memcpy, and releases, collapsing RDMA’s 5 sequential RTTs into 2
+eliminates separate verb types and simplifies multi-host operators.
+                                                                              (client→primary, then primary→replicas in parallel) with no CPU
+   Third, async + wait: Memcpy instructions execute asynchronously;
+                                                                              involved.
+Wait(threshold) synchronizes. Setting the threshold to 0 waits
+for all in-flight operations; a threshold > 0 enables quorum-style               Page-table walk. Three chained Loads (each using the previous
+synchronization (e.g., proceed when all but one replica acknowl-              result as the next address) resolve a 3-level page table; a final Memcpy
+edges). It also enables pipelining: issuing KV block reads as block-          transfers the data page. RDMA: 4 RTTs; Tiara: 1 RTT. The same
+table entries are resolved, overlapping address resolution with trans-        pattern extends to PagedAttention: a Loop iterates over block IDs,
+fer. An async op to a failed node times out and sets an error flag            resolving each via Load and issuing async Memcpy for the KV block.
+                                                                          4
+Tiara: A Programmable Line-Rate ISA for Remote Memory Access
+
+
+4 Evaluation                                                                                                25
+                                                                                                                      Tiara
+4.1 Setup                                                                                                             RDMA
+                                                                                                            20
+   Testbed. Two dual-socket Intel Xeon Gold 6326 servers are con-                                                     RPC
+
+
+
+
+                                                                                   Latency (μs)
+nected via 100 GbE QSFP28 through a single TOR switch (RDMA                                                           RedN
+                                                                                                            15        PRISM
+Read RTT ∼2.5 𝜇s). Baselines run on NVIDIA BlueField-2 NICs; for
+Tiara the memory-side NIC is an AMD Alveo U50 FPGA running
+                                                                                                            10
+the Corundum [12] NIC stack, accessing host DRAM via PCIe.
+   Implementation. We implement Tiara’s execution engine as an                                               5
+extension to the Corundum NIC pipeline on the Alveo U50: 8 mem-
+ory processors at 200 MHz, each with a 16-register file and a 1024-
+                                                                                                                  1   2      3    4   5   6   7       8   9   10
+entry BRAM instruction store. Each MP is only 2.95 K LUT (+1.69 K FF);
+                                                                                                                             Traversal depth (hops)
+the single-MP build meets timing at 200 MHz post-route with +0.184 ns
+slack (Fmax ∼208 MHz), matching the Corundum app clock. The re-                                             Figure 6: Graph traversal latency vs. depth.
+maining ∼24 K LUT is the OOC memory stub, replaced by Corun-
+
+
+
+
+                                                                                   Throughput (Mops, log)
+dum DMA in deployment.
+   Measurement methodology. Tiara latencies are cycle-accurate on
+the Verilator model (5 ns clock, 150-cycle PCIe DMA, 500-cycle
+                                                                                                            101
+RDMA RTT, calibrated to the U50 build); saturated throughput is
+derived from measured latency for 8 MPs × 12 outstanding tasks
+(96 dispatcher slots). Non-Tiara baselines are analytical models, pa-
+                                                                                                                          Tiara           RPC (22c)
+rameterized identically and printed alongside the measured data
+                                                                                                                          RDMA            RedN
+in each .dat file: RDMA [28] at 2.5 𝜇s RTT; RPC (eRPC-style [18])                                           100
+                                                                                                                          RPC (16c)       PRISM
+at 1.5 𝜇s dispatch + 0.17 𝜇s/cached-DRAM hop, at 16 and 22 (sat-
+uration) cores; RedN [41] at 1.1 𝜇s/WR; PRISM [6] at 0.5 𝜇s/hop                                                   1   2      3    4   5   6      7    8   9   10
+(graph only; it lacks arithmetic, loops, multi-host coordination). BF-                                                        Traversal depth (hops)
+2 points (Fig. 2) are measured on a physical NIC; the BF-3 DPA
+marker (Fig. 3) is from NVIDIA’s datasheet [35].                                                    Figure 7: Graph traversal throughput vs. depth.
+                                                                             ∼1 Mops, ∼26× below RDMA at depth 1, due to doorbell-ordering
+4.2    Graph Traversal                                                       overhead (§2), serializing execution across only 8 processing units.
+  Setup. A social network graph in remote RDMA-registered mem-               Tiara avoids this: operators reside in FPGA fabric with no WR
+ory; 64-byte nodes with adjacency-list pointers. The Tiara operator          fetching.
+performs a depth-limited walk.
+   Results. Figure 6 shows latency vs. depth. RDMA grows linearly
+                                                                             4.3                    Page-Table Walk
+at 𝑑×RTT. RPC is nearly flat (all hops resolve via node-local DRAM,             Setup. A 3-level page table in remote RDMA-registered memory
+∼0.17 𝜇s/hop) but dispatch overhead dominates and it consumes a              (8-byte entries, table sizes representative of a 256 GB disaggregated
+CPU core per traversal. Tiara scales at 1 RTT + 𝑑 × 0.79 𝜇s, 2.85×           memory pool).
+faster than RDMA at depth 10 (8.78 vs. 25.0 𝜇s). RedN and PRISM
+also run on the memory-side NIC; PRISM scales at ∼0.5 𝜇s/hop,                   Results. Figure 8 shows latency. RDMA needs 4 RTTs (10.0 𝜇s);
+RedN higher from doorbell ordering (§2). In a production ASIC,               Tiara resolves all three levels via PCIe in 1 RTT (3.75 𝜇s), a 62%
+Tiara’s per-hop cost would match PRISM’s with a richer ISA; the              reduction (2.7×). RedN needs extra WRs for shift/mask arithmetic
+current gap is inherent to FPGA PCIe latency [23].                           per level, amplifying its doorbell overhead. On throughput Tiara
+                                                                             sustains ∼25 Mops vs. RDMA’s 0.1 Mops, since each translation is
+   Latency vs. RPC.. Tiara’s per-hop cost is 0.79 𝜇s (PCIe to host           one network message, not four.
+DRAM) vs. 0.17 𝜇s for cached-DRAM RPC, so RPC overtakes Tiara
+on latency beyond depth 5. Tiara still wins where it matters: satu-
+                                                                             4.4                    Distributed Lock
+rated throughput (below), preserving (or eliminating) the memory
+node’s CPU (the CXL/memory-blade case RPC cannot serve), and                    Setup. A read-write lock replicated on one primary and two repli-
+footprint (8 MPs in ∼3% of a ConnectX die vs. ≥22 cores per 25 GbE           cas. Lock acquisition: CAS to acquire latch → read/update lock
+NIC for saturated RPC).                                                      state → replicate to 2 replicas → release latch.
+
+   Throughput. Figure 7 shows saturated throughput (log scale).                 Results. Figure 9 shows lock-acquire latency under 1 to 16 con-
+Tiara reaches 29.5 Mops at 𝑑=3, 6.1× higher than RPC even at its 22-         tending clients. Without contention, RDMA requires 5 sequential
+core saturation point (4.88 Mops), and 8.3× higher than RPC at the           RTTs (CAS + read + 2 replica writes + release); Tiara collapses this
+16-core paper baseline (3.55 Mops). PRISM tracks close to RDMA               to 2 RTTs: the first RTT delivers the request to the primary NIC,
+(NIC-native primitives, no doorbell ordering). RedN sustains only            which executes the CAS locally and issues parallel replica writes
+                                                                         5
+                                                                                                                                                                                         Bojie Li
+
+
+                        3-level page-table walk                     35
+
+                                 10.0
+                                                                             Tiara                                                         12   Tiara
+               10                                                   30       RDMA
+
+
+
+
+                                                                                                                       Throughput (GB/s)
+                                                                                                                                                RDMA
+                                                                                                                                           10
+                                                                             RPC
+
+
+
+
+                                                     Latency (μs)
+                                                                    25                                                                          RPC
+                8
+Latency ( s)
+
+
+
+                                                                             RedN                                                           8   RedN
+                                                                    20
+                6                            4.5                    15
+                                                                                                                                            6
+
+
+                4      3.8                                          10
+                                                                                                                                            4
+
+                                                                                                                                            2
+                2                                                    5
+
+
+                0                                                        1           2        4          8       16                             211         213       215          217
+
+                      Tiara     RDMA         RPC                                     Contending clients                                               KV block size (bytes, log)
+
+               Figure 8: Page-table walk latency.   Figure 9: Distributed lock latency vs. con-Figure 10: PagedAttention throughput vs.
+                                                    tention.                                   KV block size.
+
+   via async Memcpy; the second RTT covers the replica acknowledg-                                PRISM [6] adds NIC-native indirection and chaining; Tiara stores
+   ments (Wait). No host CPU is involved on any node. RedN reduces                                operators in NIC BRAM, avoiding per-WR PCIe fetches. RMC [2]
+   RDMA’s 5 RTTs to 1 RTT but pays doorbell-ordering overhead for                                 and NAAM [3] share Tiara’s pre-registration model (software cores
+   the replica write WR chains. Under contention (16 clients), RPC de-                            running C or eBPF); the differentiator is the hardware MP path
+   grades the least (∼1.2×) because CAS retries are nanosecond-scale                              that drops per-hop cost below the software-dispatch floor (Fig. 3).
+   CPU-local operations, overtaking Tiara at ∼4 clients, the same axis                            ODRP [44], Storm [33], and KV-Direct [23] achieve 1-RTT with
+   as the graph-traversal latency tradeoff above: RPC wins on per-                                data-structure-specific paths; Tiara supports many patterns from
+   client latency when a CPU core is available, Tiara wins when the                               one design.
+   memory node has no CPU to dedicate or when concurrent through-
+   put matters more. RedN degrades ∼4.9× from 1 to 16 clients (door-                                 SmartNIC, disaggregated memory, and in-network computing. FlexIO
+   bell overhead per retry), and RDMA 2.5× (each failed CAS incurs                                DPA [34] and BlueField DPU [9, 29] offer general-purpose C; Tiara
+   an RTT).                                                                                       trades generality for static guarantees. ClickNP [24], iPipe [26],
+                                                                                                  Floem [38], AccelTCP [31], and StRoM [43] process at the packet
+   4.5              MoE Expert Gather                                                             and transport level. FaRM [11], DrTM+R [7], FORD [49], Pilaf [30],
+                                                                                                  and AIFM [42] minimize indirection via RDMA-friendly layouts;
+   A MoE serving layer fetches 𝑘 expert-weight slabs (8 KB each) through                          Tiara handles the residual at the NIC. NetLock [47], NetCache [17],
+   a translation table indexed by selected expert IDs, structurally the                           1Pipe [25], P4 [5], and nanoPU [16] target switch-side offload; Tiara
+   same block-table indirection as PagedAttention. Tiara is cycle-accurate                        is complementary on the memory-side NIC.
+   on the prototype; RDMA/RPC use the §4.1 baselines. At 32 experts:
+   Tiara 14.2 𝜇s, RDMA 26.7 𝜇s (1.88×), RPC 41.7 𝜇s (2.93×); the gap
+                                                                                                  6   Conclusion
+   grows with 𝑘 as RPC’s per-expert dispatch dominates while Tiara
+   stays pipelined via async Memcpy.                                                              The Indirection Wall, where the remote address depends on remote
+                                                                                                  data, is a fundamental obstacle for one-sided RDMA across disag-
+   4.6              Disaggregated PagedAttention                                                  gregated memory, graph analytics, and LLM inference, and CXL
+                                                                                                  pooling that removes host CPUs will only widen it. Tiara shows
+      Setup. A memory node holds a vLLM-style paged KV cache [21].
+                                                                                                  that a compact, statically verifiable NIC-side ISA collapses multi-
+   A Block Table maps logical block IDs to physical addresses; task:
+                                                                                                  RTT indirection into a single round-trip. Extending the integer-
+   fetch 8 MB of KV data (one layer’s KV cache for 2048 tokens, LLaMA3-
+                                                                                                  only ISA to floating-point workloads without breaking static veri-
+   70B) over 100 GbE. We vary the KV block size and measure effec-
+                                                                                                  fication is future work.
+   tive throughput (GB/s), which captures both per-block overhead
+   and data transfer cost. The Tiara operator resolves each block via
+                                                                                                  7   Acknowledgments
+   Load and pipelines resolution with transfer via async Memcpy. We
+   compare against optimally batched RDMA (2 RTTs), RPC, and RedN.                                This paper was initially submitted to APNet 2026 and accepted for
+                                                                                                  publication. We thank the anonymous reviewers and our shepherd
+       Results. Figure 10 shows throughput vs. block size. At small blocks                        for their valuable feedback. We used Cursor and Claude Code ex-
+   (1 to 4 KB) per-block overhead dominates: Tiara reaches 8.7 GB/s at                            tensively for code generation and paper writing. Because ACM and
+   4 KB while batched RDMA achieves only 2.7 GB/s (client-side WR                                 APNet 2026 policies do not accept papers produced substantially
+   construction). Tiara saturates effective line rate (∼12 GB/s) at just                          by generative AI, we decided to withdraw the paper from APNet
+   8 KB blocks (2.8× batched RDMA), because its pipelined resolve-                                2026 and publish it on arXiv instead.
+   then-transfer hides resolution behind transfer; other systems con-                                This work was initially a submission to SIGCOMM 2023 during
+   verge only at ≥256 KB. RedN tracks RPC at large blocks but lags at                             the author’s time at Huawei. The current implementation is clean-
+   small ones (per-block doorbell ordering).                                                      slate and does not use any proprietary materials from Huawei. We
+                                                                                                  thank the collaborators at Huawei who gave rise to the initial idea
+   5           Related Work                                                                       and the initial experiments for this paper. The author list of that
+      Programmable RDMA and active messaging. RedN [41] chains                                    earlier version was: Chengjun Jia (Tsinghua University), Bojie Li,
+   self-modifying work requests in 1 RTT but at limited throughput (§2);                          Lijun Li, Xiaoping Fan, Changhu Chen, Haifeng Lin, Haonan Chen,
+                                                                                          6
+Tiara: A Programmable Line-Rate ISA for Remote Memory Access
+
+
+Yong Chao, Uri Hasson, Eti Siminchi, Zvika Rubin, Shamir Rabi-                              [20] Anuj Kalia, Michael Kaminsky, and David G. Andersen. 2016. FaSST: Fast, Scal-
+novitch, Mingxiang Li, Han Ruan, Kai Zheng, Jingbin Zhou, and                                    able and Simple Distributed Transactions with Two-Sided (RDMA) Datagram
+                                                                                                 RPCs. In Proceedings of the 12th USENIX Conference on Operating Systems De-
+Kun Tan (all Huawei).                                                                            sign and Implementation (Savannah, GA, USA) (OSDI’16). USENIX Association,
+                                                                                                 USA, 185–201.
+                                                                                            [21] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng,
+References                                                                                       Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient
+ [1] Marcos K Aguilera, Kimberly Keeton, Stanko Novakovic, and Sharad Singhal.                   Memory Management for Large Language Model Serving with PagedAttention.
+     2019. Designing far memory data structures: Think outside the box. In Proceed-              In SOSP. 611–626.
+     ings of the Workshop on Hot Topics in Operating Systems. 120–126.                      [22] Chris Lattner. 2008. LLVM and Clang: Next generation compiler technology. In
+ [2] Emmanuel Amaro, Zhihong Luo, Amy Ousterhout, Arvind Krishnamurthy, Au-                      The BSD conference, Vol. 5. 1–20.
+     rojit Panda, Sylvia Ratnasamy, and Scott Shenker. 2020. Remote Memory Calls.           [23] Bojie Li, Zhenyuan Ruan, Wencong Xiao, Yuanwei Lu, Yongqiang Xiong, An-
+     In Proceedings of the 19th ACM Workshop on Hot Topics in Networks (Virtual                  drew Putnam, Enhong Chen, and Lintao Zhang. 2017. KV-Direct: High-
+     Event, USA) (HotNets ’20). Association for Computing Machinery, New York,                   Performance In-Memory Key-Value Store with Programmable NIC (SOSP).
+     NY, USA, 38–44. doi:10.1145/3422604.3425923                                                 16 pages. doi:10.1145/3132747.3132756
+ [3] Anonymous. 2025. NAAM: NIC-Accelerated Active Messaging for Disaggre-                  [24] Bojie Li, Kun Tan, Layong (Larry) Luo, Yanqing Peng, Renqian Luo, Ningyi Xu,
+     gated Memory. arXiv preprint arXiv:2509.07431.                                              Yongqiang Xiong, Peng Cheng, and Enhong Chen. 2016. ClickNP: Highly Flexi-
+ [4] Luiz Barroso, Mike Marty, David Patterson, and Parthasarathy Ranganathan.                   ble and High Performance Network Processing with Reconfigurable Hardware
+     2017. Attack of the Killer Microseconds. Commun. ACM 60, 4 (mar 2017), 48–54.               (SIGCOMM). 14 pages. doi:10.1145/2934872.2934897
+     doi:10.1145/3015146                                                                    [25] Bojie Li, Gefei Zuo, Wei Bai, and Lintao Zhang. 2021. 1Pipe: Scalable total or-
+ [5] Pat Bosshart, Dan Daly, Glen Gibb, Martin Izzard, Nick McKeown, Jennifer                    der communication in data center networks. In Proceedings of the 2021 ACM
+     Rexford, Cole Schlesinger, Dan Talayco, Amin Vahdat, George Varghese, and                   SIGCOMM 2021 Conference. 78–92.
+     David Walker. 2014. P4: Programming Protocol-Independent Packet Processors.            [26] Ming Liu, Tianyi Cui, Henry Schuh, Arvind Krishnamurthy, Simon Peter, and
+     SIGCOMM Comput. Commun. Rev. 44, 3 (jul 2014), 87–95. doi:10.1145/2656877.                  Karan Gupta. 2019. Offloading Distributed Applications onto SmartNICs Using
+     2656890                                                                                     IPipe (SIGCOMM). 16 pages. doi:10.1145/3341302.3342079
+ [6] Matthew Burke, Sowmya Dharanipragada, Shannon Joyner, Adriana Szekeres,                [27] Yuhan Liu, Hanchen Li, Yihua Cheng, Siddhant Ray, Yuyang Huang, Qizheng
+     Jacob Nelson, Irene Zhang, and Dan R. K. Ports. 2021. PRISM: Rethinking the                 Zhang, Kuntai Du, Jiayi Yao, Shan Lu, Ganesh Ananthanarayanan, Michael
+     RDMA Interface for Distributed Systems (SOSP). doi:10.1145/3477132.3483587                  Maire, Henry Hoffmann, Ari Holtzman, and Junchen Jiang. 2024. CacheGen:
+ [7] Yanzhe Chen, Xingda Wei, Jiaxin Shi, Rong Chen, and Haibo Chen. 2016. Fast                  KV Cache Compression and Streaming for Fast Large Language Model Serving.
+     and General Distributed Transactions Using RDMA and HTM. In Proceedings of                  In SIGCOMM.
+     the Eleventh European Conference on Computer Systems (London, United King-             [28] Mellanox. 2015. RDMA Aware Networks Programming User Manual Rev
+     dom) (EuroSys ’16). Association for Computing Machinery, New York, NY, USA,                 1.7. https://network.nvidia.com/related-docs/prod_software/RDMA_Aware_
+     Article 26, 17 pages. doi:10.1145/2901318.2901349                                           Programming_user_manual.pdf Accessed: 2021-11-22.
+ [8] DeepSeek-AI. 2024.         DeepSeek-V3 Technical Report.          arXiv preprint       [29] Mellanox. 2021. NVIDIA BLUEFIELD-2 DPU. https://www.nvidia.com/content/
+     arXiv:2412.19437 (2024).                                                                    dam/en-zz/Solutions/Data-Center/documents/datasheet-nvidia-bluefield-2-
+ [9] KEVIN DEIERLING. 2020. What Is a DPU. https://blogs.nvidia.com/blog/2020/                   dpu.pdf Accessed: 2022-04-20.
+     05/20/whats-a-dpu-data-processing-unit Accessed: 2021-11-22.                           [30] Christopher Mitchell, Yifeng Geng, and Jinyang Li. 2013.           Using { One-
+[10] Aleksandar Dragojević, Dushyanth Narayanan, Miguel Castro, and Orion Hod-                   Sided } { RDMA } Reads to Build a Fast, { CPU-Efficient } { Key-Value } Store. In
+     son. 2014. FaRM: Fast Remote Memory. In NSDI. https://www.usenix.org/                       2013 USENIX Annual Technical Conference (USENIX ATC 13). 103–114.
+     conference/nsdi14/technical-sessions/dragojevic                                        [31] YoungGyoun Moon, SeungEon Lee, Muhammad Asim Jamshed, and KyoungSoo
+[11] Aleksandar Dragojević, Dushyanth Narayanan, Edmund B Nightingale,                           Park. 2020. AccelTCP: Accelerating Network Applications with Stateful TCP Of-
+     Matthew Renzelmann, Alex Shamis, Anirudh Badam, and Miguel Castro. 2015.                    floading. In Proceedings of the 17th Usenix Conference on Networked Systems De-
+     No compromises: distributed transactions with consistency, availability, and                sign and Implementation (Santa Clara, CA, USA) (NSDI’20). USENIX Association,
+     performance. In Proceedings of the 25th symposium on operating systems prin-                USA, 77–92.
+     ciples. 54–70.                                                                         [32] Aaftab Munshi. 2009. The opencl specification. In 2009 IEEE Hot Chips 21 Sym-
+[12] Alex Forencich, Alex C. Snoeren, George Porter, and George Papen. 2020. Corun-              posium (HCS). IEEE, 1–314.
+     dum: An Open-Source 100-Gbps NIC. In Proceedings of the 28th IEEE Interna-             [33] Stanko Novakovic, Yizhou Shan, Aasheesh Kolli, Michael Cui, Yiying Zhang,
+     tional Symposium on Field-Programmable Custom Computing Machines (FCCM).                    Haggai Eran, Boris Pismenny, Liran Liss, Michael Wei, Dan Tsafrir, and Marcos
+     38–46. doi:10.1109/FCCM48280.2020.00015                                                     Aguilera. 2019. Storm: A Fast Transactional Dataplane for Remote Data Struc-
+[13] Sylvain Girbal, Nicolas Vasilache, Cédric Bastoul, Albert Cohen, David Parello,             tures. In Proceedings of the 12th ACM International Conference on Systems and
+     Marc Sigler, and Olivier Temam. 2006. Semi-automatic composition of loop                    Storage (SYSTOR). doi:10.1145/3319647.3325827
+     transformations for deep parallelism and memory hierarchies. In International          [34] NVIDIA. 2023. NVIDIA DOCA FlexIO SDK. https://developer.nvidia.com/
+     Journal of Parallel Programming, Vol. 34. Springer, 261–317.                                networking/flexio
+[14] Toke Höiland-Jørgensen, Jesper Dangaard Brouer, Daniel Borkmann, John                  [35] NVIDIA. 2024. NVIDIA BlueField-3 DPU Datasheet – Datapath Accelerator.
+     Fastabend, Tom Herbert, David Ahern, and David Miller. 2018. The eXpress                    https://www.nvidia.com/en-us/networking/products/data-processing-unit/.
+     Data Path: Fast Programmable Packet Processing in the Operating System Ker-            [36] Amy Ousterhout, Joshua Fried, Jonathan Behrens, Adam Belay, and Hari Balakr-
+     nel. In CoNEXT. 54–66.                                                                      ishnan. 2019. Shenango: Achieving High CPU Efficiency for Latency-sensitive
+[15] Yibo Huang, Zhenning Yang, Jiarong Xing, Yi Dai, Yiming Qiu, Dingming Wu,                   Datacenter Workloads.. In NSDI, Vol. 19. 361–378.
+     Fan Lai, and Ang Chen. 2024. Disaggregating Embedding Recommendation                   [37] Pratyush Patel, Esha Choukse, Chaojie Zhang, Í nigo Goiri, Aashaka Shah, Saeed
+     Systems with FlexEMR. arXiv preprint arXiv:2410.12794 (2024).                               Maleki, and Ricardo Bianchini. 2024. Splitwise: Efficient Generative LLM Infer-
+[16] Stephen Ibanez, Alex Mallery, Serhat Arslan, Theo Jepsen, Muhammad Shah-                    ence Using Phase Splitting. In ISCA.
+     baz, Changhoon Kim, and Nick McKeown. 2021. The nanoPU: A Nanosec-                     [38] Phitchaya Mangpo Phothilimthana, Ming Liu, Antoine Kaufmann, Simon Peter,
+     ond Network Stack for Datacenters. In 15th USENIX Symposium on Operating                    Rastislav Bodik, and Thomas Anderson. 2018. Floem: A Programming System
+     Systems Design and Implementation (OSDI 21). USENIX Association, 239–256.                   for NIC-Accelerated Network Applications. In OSDI. https://www.usenix.org/
+     https://www.usenix.org/conference/osdi21/presentation/ibanez                                conference/osdi18/presentation/phothilimthana
+[17] Xin Jin, Xiaozhou Li, Haoyu Zhang, Robert Soulé, Jeongkeun Lee, Nate Foster,           [39] Massimiliano Poletto and Vivek Sarkar. 1999. Linear scan register allocation.
+     Changhoon Kim, and Ion Stoica. 2017. NetCache: Balancing Key-Value Stores                   ACM Transactions on Programming Languages and Systems (TOPLAS) 21, 5
+     with Fast In-Network Caching. In Proceedings of the 26th Symposium on Operat-               (1999), 895–913.
+     ing Systems Principles (Shanghai, China) (SOSP ’17). Association for Computing         [40] Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin
+     Machinery, New York, NY, USA, 121–136. doi:10.1145/3132747.3132764                          Zheng, and Xinran Xu. 2025. Mooncake: A KVCache-centric Disaggregated
+[18] Anuj Kalia, Michael Kaminsky, and David Andersen. 2019. Datacenter RPCs can                 Architecture for LLM Serving. In FAST.
+     be General and Fast. In 16th USENIX Symposium on Networked Systems Design              [41] Waleed Reda, Marco Canini, Dejan Kostić, and Simon Peter. 2022. RDMA is
+     and Implementation (NSDI 19). USENIX Association, Boston, MA, 1–16. https:                  Turing complete, we just did not know it yet! (NSDI).
+     //www.usenix.org/conference/nsdi19/presentation/kalia                                  [42] Zhenyuan Ruan, Malte Schwarzkopf, Marcos K. Aguilera, and Adam Belay. 2020.
+[19] Anuj Kalia, Michael Kaminsky, and David G. Andersen. 2014. Using RDMA                       AIFM: High-Performance, Application-Integrated Far Memory. In OSDI.
+     Efficiently for Key-Value Services. In Proceedings of the 2014 ACM Conference on       [43] David Sidler, Zeke Wang, Monica Chiosa, Amit Kulkarni, and Gustavo Alonso.
+     SIGCOMM (Chicago, Illinois, USA) (SIGCOMM ’14). Association for Computing                   2020. StRoM: Smart Remote Memory (EuroSys). Article 29, 16 pages. doi:10.
+     Machinery, New York, NY, USA, 295–306. doi:10.1145/2619239.2626299                          1145/3342195.3387519
+                                                                                        7
+                                                                                                                                                                   Bojie Li
+
+
+[44] Zixuan Wang, Xingda Wei, Jinyu Gu, Hongrui Xie, Rong Chen, and Haibo Chen.                Architectures, and Protocols for Computer Communication (Virtual Event, USA)
+     2025. ODRP: On-Demand Remote Paging with Programmable RDMA. In 22nd                       (SIGCOMM ’20). Association for Computing Machinery, New York, NY, USA,
+     USENIX Symposium on Networked Systems Design and Implementation (NSDI 25).                126–138. doi:10.1145/3387514.3405857
+     USENIX Association, 1101–1115.                                                       [48] Shengnan Yue, Mowei Wang, Yu Yan, Weiqiang Cheng, Zihan Jiang, and Zhen-
+[45] Xingda Wei, Rongxin Cheng, Yuhan Yang, Rong Chen, and Haibo Chen. 2023.                   hui Zhang. 2025. RTT-or Bandwidth-Bound? Demystifying the KV Cache Trans-
+     Characterizing Off-path SmartNIC for Accelerating Distributed Systems. In 17th            fer in Large Language Model Serving. In Proceedings of the 2nd Workshop on
+     USENIX Symposium on Operating Systems Design and Implementation (OSDI                     Networks for AI Computing. 5–7.
+     23). USENIX Association, Boston, MA, 987–1004. https://www.usenix.org/               [49] Ming Zhang, Yu Hua, Pengfei Zuo, and Lurong Liu. 2022. FORD: Fast One-sided
+     conference/osdi23/presentation/wei-smartnic                                               RDMA-based Distributed Transactions for Disaggregated Persistent Memory.
+[46] Xingda Wei, Zhiyuan Dong, Rong Chen, and Haibo Chen. 2018. Deconstructing                 In 20th USENIX Conference on File and Storage Technologies (FAST 21). USENIX
+     RDMA-Enabled Distributed Transactions: Hybrid is Better (OSDI).                           Association.
+[47] Zhuolong Yu, Yiwen Zhang, Vladimir Braverman, Mosharaf Chowdhury, and                [50] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu,
+     Xin Jin. 2020. NetLock: Fast, Centralized Lock Management Using Pro-                      Xin Jin, and Hao Zhang. 2024. DistServe: Disaggregating Prefill and Decoding
+     grammable Switches. In Proceedings of the Annual Conference of the ACM Spe-               for Goodput-optimized Large Language Model Serving. In OSDI.
+     cial Interest Group on Data Communication on the Applications, Technologies,
+
+
+
+
+                                                                                      8
+

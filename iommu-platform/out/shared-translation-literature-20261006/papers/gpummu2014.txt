@@ -1,0 +1,820 @@
+              Supporting x86-64 Address Translation for 100s of GPU Lanes
+              Jason Power                            Mark D. Hill                         David A. Wood
+                                       Department of Computer Sciences
+                                       University of Wisconsin–Madison
+                                     {powerjg,markhill,david}@cs.wisc.edu
+
+
+
+Abstract                                                      CPUs have long used virtual memory to simplify data
+  Efficient memory sharing between CPU and GPU threads        sharing between threads, but GPUs still lag behind.
+can greatly expand the effective set of GPGPU workloads.        A shared virtual address space allows “pointer-is-a-
+For increased programmability, this memory should be          pointer” semantics [30] which enable any pointer to be
+uniformly virtualized, necessitating compatible address       dereferenced on the CPU and the GPU (i.e., each data
+translation support for GPU memory references. However,       element only has a single name). This model simplifies
+even a modest GPU might need 100s of translations per         sharing data between the CPU and GPU by removing the
+cycle (6 CUs * 64 lanes/CU) with memory access patterns       need for explicit copies, as well as allowing the CPU and
+designed for throughput more than locality.                   GPU to share access to rich pointer-based data structures.
+  To drive GPU MMU design, we examine GPU memory                Unfortunately, there is no free lunch. Translating from
+reference behavior with the Rodinia benchmarks and a          virtual to physical addresses comes with overheads.
+database sort to find: (1) the coalescer and scratchpad       Translation look-aside buffers (TLBs) consume a significant
+memory are effective TLB bandwidth filters (reducing the      amount of power due to their high associativity [15, 16, 33],
+translation rate by 6.8x on average), (2) TLB misses occur    and TLB misses can significantly decrease performance [6,
+in bursts (60 concurrently on average), and (3) post-         17, 20]. Additionally, correctly designing the memory
+coalescer TLBs have high miss rates (29% average).            management unit (MMU) is tricky due to rare events such
+  We show how a judicious combination of extant CPU           as page faults and TLB shootdown [10].
+MMU ideas satisfies GPU MMU demands for 4 KB pages              Current GPUs have limited support for virtualized ad-
+with minimal overheads (an average of less than 2% over       dresses [11, 12, 36]. However, this support is poorly
+ideal address translation). This proof-of-concept design      documented publicly and has not been thoroughly evaluated
+uses per-compute unit TLBs, a shared highly-threaded page     in the literature. Additionally, industry has implemented
+table walker, and a shared page walk cache.                   limited forms of shared virtual address space. NVIDIA
+                                                              proposed Unified Virtual Addressing (UVA) and OpenCL
+1. Introduction                                               has similar mechanisms. However, UVA requires special
+  Graphics processing units (GPUs) have transformed from      allocation and pinned memory pages [25]. The HSA
+fixed function hardware to a far more general compute         foundation announced heterogeneous Uniform Memory
+platform. Application developers exploit this programmabil-   Accesses (hUMA) which will implement a shared virtual
+ity to expand GPU workloads from graphics-only to more        address space in future heterogeneous processors [28], but
+general purpose (GP) applications. Compared with multi-       details of this support are neither published nor evaluated in
+core CPUs, GPGPU computing offers the potential for both      public literature.
+better performance and lower energy [23]. However, there is     Engineering a GPU MMU appears challenging, as GPU
+still room for improvement; complex programming models        architectures deviate significantly from traditional multi-
+and data movement overheads impede further expansion of       core CPUs. Current integrated GPUs have hundreds of
+the workloads that benefit from GPGPU computing [29].         individual execution lanes, and this number is growing. For
+  Currently, processor manufacturers including AMD, Intel,    instance the AMD A10 APU, with 400 lanes, can require up
+and NVIDIA integrate CPUs and GPUs on the same chip.          to 400 unique translations in a single cycle! In addition, the
+Additionally, a coalition of companies including AMD,         GPU is highly multithreaded which leads to many memory
+ARM, Qualcomm, and Samsung recently formed the                requests in flight at the same time.
+Heterogeneous System Architecture (HSA) Foundation to           To drive GPU MMU design, we present an analysis of the
+support heterogeneous computation [34].                       memory access behavior of current GPGPU applications.
+  Although physical integration is becoming widespread, the   Our workloads are taken from the Rodinia benchmark suite
+GPGPU compute platform is still widely separated from         [9] and a database sort workload. We present three key
+conventional CPUs in terms of its programming model.          findings and a potential MMU design motivated by each
+                                                              finding:
+                                                          Shared page                     Compute Unit                                             GPU                    CPU
+       CU          CU               CU          CU         walk unit                                                                                 Compute
+                                                                                           Instruction Fetch / Decode                                  Unit                     CPU
+                                                                                                                                                                                Core
+     Coalescer   Coalescer        Coalescer   Coalescer    Highly-threaded
+                                                              Page table
+                                                                                                          Register File
+                                                                                                                                                     Compute
+
+
+
+
+                                                                                                                                                               L2 Cache
+                                                                walker                                                                                                           L1
+       TLB         TLB              TLB         TLB                                                                                                    Unit
+
+
+
+
+                                                                                          Lane
+                                                                                                  Lane
+                                                                                                         Lane
+                                                                                                                Lane
+                                                                                                                       Lane
+                                                                                                                              Lane
+                                                                                                                                     Lane
+                                                                                                                                            Lane
+                                                                                                                                                                                Cache
+
+      L1          L1                L1         L1
+
+
+
+
+                                                                      Page fault
+                                                                                                                                                     Compute
+
+
+
+
+                                                           Pagewalk
+
+
+
+
+                                                                       register
+                                                            buffers
+     Cache       Cache             Cache      Cache                                                                                                    Unit                 L2 Cache
+                                                                                                 Coalescer                    Shared
+                                                                                                                                                     Compute
+                                                                                                                              Memory
+                                                             Page walk                           L1 Cache                                              Unit
+                             L2 Cache                          cache
+                                                                                                                                                               DRAM
+
+        Figure 1: Proposed proof-of-concept GPU MMU.
+                                                                                                                  (a)                                            (b)
+
+  1. The coalescing hardware and scratchpad memory                                 Figure 2: Overview of the heterogeneous architecture used.
+     effectively filter the TLB request rate. Therefore, the L1
+     TLB should be placed after the coalescing hardware to                              An evaluation of our GPU MMU design that shows a
+     leverage the traffic reduction.                                                     GPU MMU can be implemented without significant
+  2. Concurrent TLB misses are common on GPUs with an                                    performance degradation.
+     average of 60 to a maximum of over 1000 concurrent                              This paper is organized as follows. First, Section 2 dis-
+     page walks! This fact motivates a highly-threaded page                        cusses background on GPU architecture, GPU virtual
+     table walker to deliver the required throughput.                              memory support, and CPU MMU design. Section 3 explains
+  3. GPU TLBs have a very high miss rate with an average                           our simulation infrastructure and workloads. Then, Section
+     of 29%. Thus, reducing TLB miss penalty is crucial to                         4 presents our three data-driven GPU MMU designs
+     reducing the pressure on the page table walker, and                           concluding with our proof-of-concept design. Section 5
+     thus, we employ a page walk cache.                                            discusses correctness issues. Next, Section 6 shows other
+  Through this data-driven approach we develop a proof-of-                         possible designs we considered, and finally, Section 7
+concept GPU MMU design that is fully compatible with                               discusses related work and Section 8 concludes.
+CPU page tables (x86-64 in this work). Figure 1 shows an
+overview of the GPU MMU evaluated in this paper. This                              2. Background
+design uses a TLB per GPU compute unit (CU) and a shared                             This section first introduces the GPU architecture and
+page walk unit to avoid excessive per-CU hardware. The                             current GPU virtual memory support. Then, we discuss the
+shared page walk unit contains a highly-threaded page table                        memory model of current GPUs and our target system.
+walker and a page walk cache.                                                      Finally, we cover background on CPU MMUs.
+  The simplicity of this MMU design shows that address                             2.1.          GPU Architecture
+translation can be implemented on the GPU without exotic                             The important details of the GPGPU architecture are
+hardware. We find that using this GPU MMU design incurs                            shown in Figure 2. Figure 2b shows an overview of the
+modest performance degradation (an average of less than                            heterogeneous architecture used in this paper. In this
+2% compared to an ideal MMU with an infinite sized TLB                             architecture, the CPU and GPU share main memory. The
+and minimal latency page walks) while simplifying the                              CPU and GPU share a virtual address space and cache
+burden on the programmer.                                                          coherence is maintained between the CPU and GPU caches.
+  In addition to our proof-of-concept design, we present a                         Only a single CPU core is shown in Figure 2b; however,
+set of alternative designs that we also considered, but did                        this architecture supports any number of CPU cores. This
+not choose due to poor performance or increased complexi-                          design is loosely based on future features announced for
+ty. These designs include adding a shared L2 TLB, includ-                          HSA [29].
+ing a TLB prefetcher, and alternative page walk cache                                Figure 2a shows an overview of the GPU Compute Unit
+designs. We also analyzed the impact of large pages on the                         (CU)—called a streaming multiprocessor (SM) in NVIDIA
+GPU TLB. We find that large pages do in fact decrease the                          terminology. Within each CU is a set of lanes—called
+TLB miss rate. However, in order to provide compatibility                          shader processors (SPs) or CUDA cores by NVIDIA and
+with CPU page tables, and ease the burden of the program-                          stream processors by AMD—which are functional units that
+mer, we cannot rely solely on large pages for GPU MMU                              can execute one lane instruction per cycle. Instructions are
+performance.                                                                       fetched, decoded and scheduled by the instruction fetch unit
+  The contributions of this work are:                                              which is shared by all lanes of the CU. The lanes on each
+     An analysis of the GPU MMU usage characteristics                             CU also share a large, banked, register file. Each lane is
+       for GPU applications,                                                       associated with a scalar thread, and a set of concurrently
+     A proof-of-concept GPU MMU design which is                                   executing threads on the CU lanes is a warp. We model a
+       compatible with x86-64 page tables, and                                     32-thread warp similar to NVIDIA GPU architecture.
+  Due to the parallelism available in GPUs, it is difficult to   __device__ void vectorCopy(int *in, int *out) {
+                                                                      out[threadId.idx] = in[threadId.idx];
+describe the performance in CPU terms. In this paper, we         }
+
+use instruction to refer to the static instruction that all                          (a) Simple vector copy kernel
+threads execute. We use the term warp instruction to             void main() {
+                                                                      int *d_in, *d_out;
+represent a dynamic instruction which is executed by all              int *h_in, *h_out;
+lanes on a single cycle per the Single-Instruction Multiple-          // allocate input array on host
+Thread (SIMT) execution model. And we use lane instruc-               h_in = new int[1024];
+                                                                      h_in = ... // Initial host array
+tion to mean a dynamic instruction executed by a single lane          // allocate output array on host
+on a CU.                                                              h_out = new int[1024];
+
+  GPUs provide developers with different kinds of memory              // allocate input array on device
+                                                                      d_in = cudaMalloc(sizeof(int)*1024);
+accesses. Most memory operations can be separated into                // allocate output array on device
+                                                                      d_out = cudaMalloc(sizeof(int)*1024);
+two categories: Scratchpad memory—small, directly
+addressed software-managed caches private to each CU                  // copy input array from host to device
+                                                                      cudaMemcpy(d_in, h_in, sizeof(int)*1024, HtD);
+(called “shared memory” and “local memory” by NVIDIA
+                                                                      vectorCopy<<<1,1024>>>(d_in, d_out);
+and AMD, respectively)—and global memory that is shared
+                                                                      // copy the output array from device to host
+by all CUs and addressed with CPU virtual addresses in our            cudaMemcpy(h_out, d_out, sizeof(int)*1024, DtH);
+shared virtual memory system. Accesses to scratchpad                  // continue host computation with result
+memory cannot cause cache misses and use direct addresses             ... h_out
+
+that are not translated. All accesses to global memory are            //Free memory
+issued to the coalesce unit. This logic examines the                  cudaFree(d_in); cudaFree(d_out);
+                                                                      delete[] h_in; delete[] h_out;
+addresses from all lanes and attempts to minimize the            }
+                                                                          (b) Separate memory space implementation
+memory requests required. If all addresses issued by the
+lanes are contiguous and within a single cache block—the         int main() {
+                                                                      int *h_in, h_out;
+common case for graphics workloads—the coalescer takes
+                                                                      // allocate input/output array on host
+the lane requests (which number up to the size of the warp)           h_in = cudaHostMalloc(sizeof(int)*1024);
+and generates a single memory access. After coalescing, the           h_in = ... // Initial host array
+                                                                      h_out = cudaHostMalloc(sizeof(int)*1024);
+memory request is issued to a write-through L1 cache.
+                                                                      vectorCopy <<<1,1024>>> (h_in, h_out);
+Figure 2 shows that each CU’s L1 cache is backed by a
+write-back L2 cache shared by all CUs on the GPU.                     // continue host computation with result
+                                                                      ... h_out
+
+2.2.   GPU TLB and Virtual Memory Support                             //Free memory
+                                                                      cudaHostFree(h_in); cudaFree(h_out);
+  Although current GPUs have virtual memory support, it is       }
+incompatible with the CPU virtual memory. Current GPU                     (c) “Unified virtual address” implementation
+virtual memory, including IOMMU implementations [38],            int main() {
+                                                                      int *h_in, h_out;
+use a separate page table from the CPU process which is
+initialized by the GPU driver when the kernel is launched.            // allocate input/output array on host
+                                                                      h_in = new int[1024];
+Additionally, GPU virtual memory does not support demand              h_in = ... // Initial host array
+                                                                      h_out = new int[1024];
+paging or on the fly page table modifications by the
+                                                                      vectorCopy <<<1,1024>>> (h_in, h_out);
+operating system. This lack of compatibility increases the
+difficulty of writing truly heterogeneous applications.               // continue host computation with result
+                                                                      ... h_out
+  Designs for TLBs specific to GPUs have been published
+                                                                      delete[] h_in; delete[] h_out;
+in the form of patents [11, 36]. However, there has been no      }
+evaluation of these techniques in the public literature.                (d) Shared virtual address space implementation
+Additionally, Wong et al. found evidence of TLBs imple-
+                                                                              Figure 3: Example GPGPU application
+mented in NVIDIA GPUs [37]. However, the specific TLB
+design is not publicly documented.                               paradigm. In addition to allocating the required memory on
+2.3.   GPU Programming Model                                     the host CPU and initializing the data, memory also is
+  Current GPGPU programming models consider the GPU              explicitly allocated on, and copied to, the GPU before
+as a separate entity with its own memory, virtual address        running the kernel. After the kernel completes, the CPU
+space, scheduler, etc. Programming for the GPU currently         copies the data back so the application can use the result of
+requires careful management of data between CPU and              the GPU computation.
+GPU memory spaces.                                                 There are many drawbacks to this programming model.
+  Figure 3 shows an example CUDA application. Figure 3a          Although array-based data structures are straightforward to
+shows a simple kernel that copies from one vector ( in) to       move from the CPU to the GPU memory space, pointer-
+another (out). Figure 3b shows the code required to use the      based data structures, like linked-lists and trees, present
+vectorCopy kernel using the current separate address space       complications. Also, separate virtual address spaces cause
+data to be replicated. Even on shared physical memory                       Table 1: Details of simulation parameters
+devices, like AMD Fusion, explicit memory allocation and           CPU                  1 core, 2 GHz, 64 KB L1, 2 MB L2
+                                                                   GPU                  16 CUs, 1.4 GHz, 32 lanes
+data replication is still widespread due to separate virtual
+                                                                   L1 cache (per-CU)    64 KB, 4-way set associative, 15 ns latency
+address spaces. Additionally, due to replication, only a           Scratchpad memory    16 KB, 15 ns latency
+subset of the total memory in a system is accessible to GPU        GPU L2 cache         1 MB, 16-way set associative, 130 ns latency
+programs. Finally, explicit separate allocation and data           DRAM                 2GB, DDR3 timing, 8 channels, 667 MHz
+movement makes GPU applications difficult to program and
+understand as each logical variable has multiple names          memory accesses are required. The page table walker
+(d_in, h_in and d_out, h_out in the example).                   (PTW) traverses the tree from the root which is found in the
+  Beginning with the Fermi architecture, NVIDIA intro-          CR3 register. The PTW issues memory requests to the page
+duced “unified virtual addressing” (UVA) [25] (OpenCL           walk cache that caches data from the page table. Requests
+has a similar feature as well). Figure 3c shows the imple-      that hit in the page walk cache decrease the TLB miss
+mentation of vectorCopy with UVA. The vectorcopy                penalty. Memory requests that miss in the page walk cache
+kernel is unchanged from the separate address space kernel.     are issued to the memory system similar to CPU memory
+In the UVA example, instead of allocating two copies of the     requests and can be cached in the data caches.
+input and output vectors, only a single allocation is neces-      The x86-64 ISA has extensions for 2 MB and 1 GB pages
+sary. However, this allocation requires a special API which     in addition to the default 4 KB page size. However, few
+creates difficulties in using pointer-based data structures.    applications currently take advantage of this huge page
+Separate allocation makes composability of GPU kernels in       support. Additionally, it is important for an MMU to
+library code difficult as well, because the allocation is a     support 4 KB pages for general compatibility with all
+CUDA runtime library call, not a normal C or C++ alloca-        applications.
+tion (e.g. new/malloc/mmap). Memory allocated via
+                                                                3. Simulation Methodology and Workloads
+cudaMallocHost can be implemented in two different ways.
+Either the memory is pinned in the main memory of the             We used a cycle-level heterogeneous simulator, gem5-gpu
+host, which can lead to poor performance [24], or the data is   [27], to simulate the heterogeneous system. gem5-gpu is
+implicitly copied to a separate virtual address space which     based on the gem5 simulator [8], and integrates the GPGPU
+has the previously discussed drawbacks.                         timing model from GPGPU-Sim [1]. We used gem5’s full-
+  Figure 3d shows the implementation with a shared virtual      system mode, running the Linux operating system. gem5-
+address space (the programming model used in this paper).       gpu models full coherence between the CPU and GPU
+In this implementation, the application programmer is free      caches as future systems have been announced supporting
+to use standard memory allocation functions. Also, there is     cache coherence [28]. Results are presented for 4 KB pages.
+no extra memory allocated, reducing the memory pressure.        Large page support is discussed in Section 6.4. Table 1
+Finally, by leveraging the CPU operating system for             shows the configuration parameters used in obtaining our
+memory allocation and management, the programming               results.
+model allows the GPU to take page faults and access               We use a subset of the Rodinia benchmark suite [9] for
+memory mapped files. From publicly available information,       our workloads. We do not use some Rodinia benchmarks as
+HSA hUMA seems to take this approach [28].                      the input sizes are too large to simulate. The Rodinia
+                                                                benchmarks are GPU-only workloads, and we use these
+2.4.   CPU MMU Design                                           workloads as a proxy for the GPU portion of future
+  The memory management unit (MMU) on CPUs translates           heterogeneous workloads. We add one workload, sort, to
+virtual addresses to physical address as well as checks page    this set. Sort is a database sorting kernel that sorts a set of
+protection. In this paper we focus on the x86-64 ISA;           records with 10 byte keys and 90 byte payloads. All
+however, our results generalize to any multi-level hardware-    workloads are modified to remove the memory copies, and
+walked page table structure. The CPU MMU for the x86-64         all allocations are with general allocators (new/malloc/
+ISA consists of three major components: 1) logic to check       mmap). Although we are running in a simulation environ-
+protection and segmentation on each access, 2) a translation    ment and using reduced input sized, many of our working
+look-aside buffer to cache virtual to physical translations     sets are much larger than the TLB reach; thus, we expect
+and protection information to decrease translation latency,     our general findings to hold as working set size increases.
+and 3) logic to walk the page table in the case of a TLB          As a baseline, we use an ideal, impossible to implement
+miss. In this work, we use the term MMU to refer to the unit    MMU. We model an ideal MMU with infinite sized per-CU
+that contains the TLB and other supporting structures. Many     TLBs and minimal latency (1 cycle cache hits) for page
+modern CPU MMU designs contain other structures to              walks. This is the minimum translation overhead in our
+increase TLB hit rates and decrease TLB miss latency.           simulation infrastructure.
+  The x86-64 page table is a 4-level tree structure. By
+default, the TLB holds page table entries, which reside in
+the leaves of the tree. Therefore, on a TLB miss, up to four
+Table 2: Configurations under study. Structures are sized so each
+              configuration uses 16 KB of storage.
+                Per-CU     Highly-threaded Page walk     Shared
+               L1 TLB          page table  cache size    L2 TLB
+                entries         walker                   entries
+ Ideal MMU     Infinite    Infinite        Infinite     None
+ Section 4
+ Design 0      N/A: Per-lane MMUs          None         None
+ Design 1      128         Per-CU walkers  None         None
+ Design 2      128         Yes (32-way)    None         None
+ Design 3      64          Yes (32-way)    8 KB         None
+ Section 6
+ Shared L2     64          Yes (32-way)    None         1024        Figure 4: All memory operations global memory operations,
+ Shared L2                                                              and global memory accesses per thousand cycles.
+               32          Yes (32-way)    8 KB         512
+ & PWC
+ Ideal PWC     64          Yes (32-way)    Infinite     None
+                                                                    memory lane instructions (per thousand cycles) by 32x to 9,
+ Latency       1 cycle     20 cycles       8 cycles     20 cycles
+                                                                    which is much less than the 39 observed.
+                                                                      To benefit from this bandwidth filtering, Design 1 in-
+ 4. Designing a GPU MMU through Analysis                            cludes a private per-CU L1 TLB after scratchpad memory
+   We meet the challenges of designing a GPU MMU by                 access and after the coalescing hardware. Thus, the MMU is
+ using data to evolve through three architectures to our            only accessed on global memory accesses. Figure 5 shows
+ proof-of-concept recommendation (Design 3). Design 3               Design 1 in light gray and Table 2 details the configuration
+ enables full compatibility with x86-64 page tables with less       parameters.
+ than 2% performance overhead, on average. Table 2 details          4.2.   Motivating Design 2: Highly-threaded page
+ the designs in this section as well as the additional designs             table walker
+ from Section 6.                                                      Here we show that Design 1 fails to perform well (average
+   We start with a CPU-like MMU (Design 0) and then                 performance is 30% of an ideal MMU), isolate the problem
+ modify it as the GPU data demands. Design 0 follows CPU            to bursts of TLBs misses (60 concurrent), and advocate for a
+ core design with a private MMU at each lane (or “core” in          highly-threaded PTW (Design 2).
+ NVIDIA terminology). Design 0 has the same problems as a             Now that we have mitigated the bandwidth issues, we
+ CPU MMU—high power, on the critical path, etc.—but                 might expect Design 1 to perform well; it does not. For each
+ they are multiplied by the 100s of GPU lanes. For these            benchmark and the average, Figure 6 shows the perfor-
+ reasons, we do not quantitatively evaluate Design 0.               mance of Design 1 (leftmost, blue) compared to an ideal
+ 4.1.   Motivating Design 1: Post-coalescer MMU                     MMU with an impossibly low latency and infinite sized
+   Here we show that moving the GPU MMU from before to              TLBs. Performance is good when it is close to the ideal
+ after the coalescer (Design 0 → Design 1) reduces address          MMU’s 1.0. (Designs 2 (green) and 3 (brown) will be
+ translation traffic by 85%.                                        discussed later.)
+   GPU memory referencing behavior differs from that of               Figure 6 results show that Design 1 (blue) performs:
+ CPUs. For various benchmarks, Figure 4 presents opera-                  Poorly on average (30% of ideal’s),
+ tions per thousand cycles for scratchpad memory lane                    Sometimes very poorly (about 10% of ideal for back-
+ instructions (left bar, top, blue), pre-coalescer global                  prop, bfs, and pathfinder), and
+ memory lane instructions (left bar, bottom, green), and post-           Occasionally adequately (gaussian and lud).
+ coalescer global memory accesses (right bar, brown). The             These performance variations occur for various reasons.
+ “average” bars represent the statistic if each workload was        For example, bfs is memory bound—having few instruc-
+ run sequentially, one after the other.                             tions per memory operation—making it particularly
+   Figure 4 shows that, for every thousand cycles, the              sensitive to global memory latency. On the other hand,
+ benchmarks average:                                                gaussian and lud perform well, in part because the working
+      602 total memory lane instructions,                          set sizes are relatively small.
+      268 of which are global memory lane instructions               Investigating Design 1’s poor performance lead to an
+        (with the other 334 to scratchpad memory), and              obvious culprit: bursts of TLB misses. For each benchmark
+      Coalescing reduces global memory lane instructions           and the average, Figure 7 shows the average (left, blue) and
+        to only 39 global memory accesses.                          maximum across CUs (right, green) occupancy of the page
+   In total, the rate of memory operations is reduced from          walk queue when each page walk begins. Note that the y-
+ 602 to 39 per thousand cycles for an 85% reduction.                axis is logarithmic.
+   Although the coalescing hardware is effective, the bench-          Figure 7 shows that when each page walk is issued:
+ marks do show significant memory divergence. Perfect                    An average of 60 page table walks are active at that
+ coalescing on 32 lanes per CU would reduce 268 global                     CU, and
+        Coalescer       Coalescer        Coalescer     Coalescer
+          ①
+                    ③                                                  Highly-threaded
+       ② TLB              TLB              TLB           TLB
+                                                                   ④      page table
+                                                                            walker
+
+                                               Shared page
+
+
+
+
+                                                                       Page walk
+
+
+
+                                                                                   Page fault
+       ⑨
+
+
+
+
+                                                                                    register
+                                                                        buffers
+                                                walk unit          ⑤                            ⑧
+
+
+         L1              L1                L1            L1
+        Cache           Cache             Cache         Cache
+                                                                         Page walk
+                                                                   ⑥       cache
+                                               ⑦
+
+                                                                                                    Figure 6: Performance of each design relative to an ideal MMU.
+                                    L2 Cache                                                                   See Table 2 for details of configurations.
+   Figure 5: Overview of the GPU MMU designs. Design 1 is
+ shown in light gray. Design 2 is shown in light and dark gray.
+   And Design 3 is shown in light and dark gray and black.
+
+     The worst workload averages 140 concurrent page
+       table walks.
+  Moreover, additional data show that, for these workloads,
+over 90% of page walks are issued within 500 cycles of the
+previous page walk, which is significantly less than the
+average page walk latency in this design. Also, almost all
+workloads use many more than 100 concurrent page walks
+at the maximum. Therefore, these workloads will experience
+high queuing delays with a conventional blocking page table
+                                                                                                        Figure 7: Average and max size of the page walk queue for
+walker. This also shows that the GPU MMU requires                                                         each per-CU MMU in Design 1. Log scale, bold line at 2.
+changes from the CPU-like single-threaded page-table
+walker of Design 1.                                                                                    We find the workloads that perform best have been tuned
+  This high page walk traffic is primarily because GPU                                               to tolerate long-latency memory operations and the addition
+applications can be very bandwidth intensive. GPU                                                    of the TLB miss latency is hidden by thread parallelism.
+hardware is built to run instructions in lock step, and                                                On the other hand, some workloads, e.g., bfs and nw,
+because of this characteristic, many GPU threads simultane-                                          actually perform worse with Design 2 than Design 1. We
+ously execute a memory instruction. This, coupled with the                                           isolated the problem to the many requests from one CU
+fact each CU supports many simultaneous warp instructions,                                           queuing in front of another CU’s requests rather than being
+means GPU TLB miss traffic will be high.                                                             handled more round-robin as in the single-threaded page-
+  Therefore, Design 2 includes a shared multi-threaded page                                          table walker of Design 1. While this specific effect might be
+table walker with 32 threads. Figure 5 shows how Design 2                                            fixed by changing PTW queuing from first-come-first-serve,
+builds on Design 1 in dark gray and Table 2 details the                                              we seek a more broadly effective solution.
+configuration parameters. The page walk unit is shared                                                 To better understand why Design 2 falls short of ideal, we
+between all CUs on the GPU to eliminate duplicate                                                    examined the TLB miss rates. Figure 8 shows the miss rates
+hardware at each CU and reduce the hardware overhead. On                                             (per-CU, 128 entry) for each benchmark and the average.
+a TLB miss in the per-CU L1 TLBs, the shared page walk                                                 Figure 8 results show that per-CU TLB miss rates:
+unit is accessed and executes a page walk.                                                                Average 29% across benchmarks and
+4.3.      Motivating Design 3: Add a page walk cache                                                      Can be as high as 67% (nw).
+                                                                                                       Needless to say, these rates are much higher than one
+  Here we show that Design 2 performs much better than
+                                                                                                     expects for CPU TLBs. Gaussian is a low outlier, because of
+Design 1 for most workloads but still falls short of an ideal
+                                                                                                     high computational density (compute operations per byte of
+MMU (30% of ideal on average). For this reason, we
+                                                                                                     data) and small working set (so all TLB misses are compul-
+introduce Design 3 that adds a shared page walk cache to
+                                                                                                     sory misses).
+perform within 2% of ideal.
+                                                                                                       This high miss rate is not surprising. With many simulta-
+  The second bars in Figure 6 (green) show the performance
+                                                                                                     neous warps and many threads per warp, a GPU CU can
+of each benchmark for Design 2. Results from this figure
+                                                                                                     issue memory requests to a very large number of pages. In
+show that Design 2:
+                                                                                                     addition, many GPU applications exhibit a memory access
+     Often performs much better than Design 1, but
+                                                                                                     pattern with poor temporal locality reducing the effective-
+     That these benefits are inconsistent and short of ideal                                        ness of caching translations. If an access pattern has no
+                                                                                                     temporal locality (e.g. streaming), even with perfect
+                                                                               Per-CU TLBs:    TLB       TLB           TLB
+
+
+
+                                                                              Page walk buffers
+                                                                            Outstanding addr     State
+                                                                            Outstanding addr     State              Page walk
+                                                                            Outstanding addr     State            state machine
+                                                                            Outstanding addr     State
+
+                                                                            Outstanding addr     State
+
+                                                                          From memory                          To memory
+ Figure 8: Miss rate for a 128 entry per-CU L1 TLB averaged
+                        across all CUs.                            Figure 9: Details of the highly-threaded page table walker
+coalescing, each CU could potentially access 128 bytes per         Per-CU post-coalescer L1 TLBs—Each CU has a private
+cycle. This translates to only 32 cycles to access an entire 4   TLB that is accessed after coalescing and scratchpad
+KB page, in the worst case.                                      memory to leverage the traffic reduction. On TLB hits, the
+  As discussed previously, the global memory access rate on      memory request is translated then forwarded to the L1
+GPUs is quite low (39 accesses per thousand cycles on            cache. On TLB misses, the warp instruction is stalled until
+average) and consequently the TLB request rate is small.         the shared page walk unit completes the page table lookup
+Therefore, it’s possible that even though the GPU TLB            and returns the virtual to physical address translation.
+exhibits high miss rates the miss traffic (misses per cycle)     Stalling at this point in the pipeline is common for memory
+could be relatively low. However, this is not the case. There    divergent workloads, and the associated hardware is already
+is an average of 1.4 TLB misses per thousand cycles and a        present in the CUs.
+maximum of 13 misses per thousand cycles.                          Highly-threaded page table walker—The PTW design
+  We investigated several alternatives to improve on Design      consists of a hardware state machine to walk the x86-64
+2, discussed further in Section 6, and settled on one. Our       page table and a set of page walk buffers that hold the
+preferred Design 3 includes a page walk cache with the           current state of each outstanding page walk, shown in
+shared page walk unit to decrease the TLB miss latency.          Figure 9. On a TLB miss, the page walk state machine
+Figure 5 shows how Design 3 builds on Design 2 in black          allocates a page walk buffer entry and initializes the
+and Table 2 details the configuration parameters.                outstanding address to the value in the CR3 register, which
+  Returning to Figure 6, the third bars (brown) show per-        holds the address of the root of the page table. Next, the
+formance of Design 3 relative to an ideal MMU (1.0):             page walk state machine issues the memory request
+     Design 3 increases performance for all benchmarks          corresponding to the buffer entry. When memory responds,
+       over Design 2 and                                         the page walk buffers are queried for the match, and the
+     Design 3 is within 2% of the ideal MMU on average.         state for that request is sent to page walk state machine,
+  This increase in overall performance occurs because the        which then issues the next memory request or returns final
+page walk cache significantly reduces the average page           translation.
+walk time reducing the number of cycles the CU is stalled.         The PTW also has supporting registers and logic to handle
+Adding a page walk cache reduces the average latency for         faults that occur when walking the page table. Concurrent
+page table walks by over 95% and correspondingly                 page faults are serialized and handled one at a time by the
+increases the performance. The performance improvement           operating system. Page faults are discussed in detail in
+of Design 3 is in part due to reducing the occupancy of the      Section 5.1
+page walk buffers since the page walk latency decreased.           This design can also extend to other ISAs that have
+This fact is most pronounced for bfs and nw, which suffered      hardware page table walkers. For example, the ARM MMU
+from queuing delays.                                             also defines a hardware page table walker and this can be
+4.4.   Summary of Proof-of-Concept Design                        used in place of the x86-64 page walk state machine
+       (Design 3)                                                included in our current design.
+                                                                   Page walk cache—Many modern CPUs contain a small
+  This section summarizes our proof-of-concept Design 3
+                                                                 cache within the memory management unit to accelerate
+and presents additional details to explain its operation.
+                                                                 page table walks. Since the latency of the L2 cache of a
+Figure 5 details Design 3. The numbers correspond to the
+                                                                 GPU is very long (nearly 300 cycles) a cache close to the
+order in which each structure is accessed. Design 3 is made
+                                                                 MMU decreases the page walk latency significantly. We use
+up of three main components, the per-CU post-coalescer L1
+                                                                 a page walk cache design similar to AMD [3]. It caches
+TLBs, the highly-threaded page table walker, and a shared
+                                                                 non-leaf levels of the page table, decreasing the number of
+page walk cache, discussed below.
+                                                                 L2 cache and DRAM accesses required for a page table
+                                                                 walk. Other page walk cache designs are discussed in
+Section 6.2. However, we do not see a significant perfor-         thereof, could be preempted similar to a context switch on a
+mance improvement over Design 3 with these alternatives.          CPU. However, this technique has drawbacks since the
+                                                                  GPU’s context is very large (e.g., 2 MB of register file on
+5. Correctness Issues                                             NVIDIA Fermi [25]). Another possibility is to leverage
+  In this section, we discuss the issues and implementation       checkpointing, and restart the offending applications after
+of page faults and TLB shootdown for the GPU architecture.        the page fault has been handled. There are proposals like
+We expect these events to be rare. For instance, often            iGPU [21] to reduce the overhead of these events. However,
+workloads are sized to fit in main memory virtually               none of our workloads have any major page faults so we do
+eliminating major page faults. Nevertheless, we correctly         not focus on this case.
+implement page faults and TLB shootdown in Linux 2.6.22             Page fault discussion—We implemented a hardware-
+on top of gem5 full-system simulation, to our knowledge a         based technique to handle page faults in the gem5 simulator
+first in public literature.                                       running Linux in full-system mode. Using this implementa-
+5.1.   Page fault handling                                        tion, the Linux kernel correctly handles minor page faults
+                                                                  for all of our GPU applications.
+  Although rare, the GPU memory management unit archi-
+                                                                    For this implementation, the page fault handling logic
+tecture must be able to handle page faults to have correct
+                                                                  assumes that the GPU process is still running on the CPU
+execution. Although there are many ways to implement
+                                                                  core. This will be true if the application can run on the CPU
+handling page faults, in this GPU MMU architecture we
+                                                                  and GPU at the same time, or the CPU runtime puts the
+chose to slightly modify the CPU hardware by changing the
+                                                                  CPU core into a low power state and does not change
+interrupt return microcode and adding hardware registers to
+                                                                  contexts.
+support GPU page faults. With these changes, the GPU
+                                                                    However, the CPU runtime may yield the CPU core while
+MMU can handle page faults with no modifications to the
+                                                                  the GPU is running. In this situation, page faults are still
+operating system. Our page fault handling logic leverages
+                                                                  handled correctly, but they are longer latency since the CPU
+the operating system running on the CPU core similar to
+                                                                  core must context switch to the process which spawned the
+CPU MMU page fault logic. We use this design for two
+                                                                  GPU kernel before the operating system begins handling the
+reasons. First, this design does not require any changes to
+                                                                  page fault. An alternative option is to include a separate
+the GPU execution hardware as it does not need to run a
+                                                                  general purpose core to handle operating system kernel
+full-fledged operating system. Second, this design does not
+                                                                  execution for the GPU. This core can then handle any page
+require switching contexts on the GPU as it can handle
+                                                                  faults generated by the running kernel.
+minor page faults by stalling the faulting instruction. Details
+of our page fault implementation can be found in the              5.2.   TLB Flushes and shootdown
+appendix and the gem5-gpu repository [14].                          The GPU MMU design handles TLB flushes similarly to
+  There are two different categories of page faults, major        the CPU MMU. When the CR3 register is written on the
+and minor. Below we give details on how each is handled.          CPU core that launched the GPU application, the GPU
+  Minor page faults—A minor page fault occurs when the            MMU is notified via inter-processor communication and all
+operating system has already allocated virtual memory for         of the GPU TLBs are flushed. This is a rare event, so
+an address, but it has not yet allocated a physical frame and     performance is not a first order concern. Since there is a
+written the page table. Minor page faults often occur when        one-to-one relation between the CPU core executing the
+sharing virtual memory between processes, copy-on-write           CPU process and the GPU kernel, on TLB a shootdown to
+memory, and on the initial accesses after memory alloca-          the CPU core, the GPU TLBs are also flushed. The GPU
+tion. The last is common in our workloads as there are many       cannot initiate a shootdown, only participate. When a CPU
+large calls to malloc in which the memory is not touched by       initiates a shootdown, it sends a message to the GPU MMU
+the CPU process. As an example, in Figure 3c, h_out is            which responds after it has been handled by flushing the
+allocated by the CPU process, but is not accessed until the       TLBs. If the GPU runtime allows the CPU processes to be
+copyVector kernel and causes a minor page fault.                  de-scheduled during GPU kernel execution, TLB flushes
+  Minor page faults are low latency, about 5000 cycles on         and shootdown become more complicated. However, this
+average in our workloads. The operating system only needs         can be handled in a similar way as page faults. If TLB
+to allocate a physical frame and modify the page table with       shootdown to GPU CUs becomes common, there are many
+the new physical page number. Since the page fault is low         proposals to reduce the overheads for TLB shootdown [31,
+latency, we stall the faulting warp instruction in the same       35].
+way as a TLB miss.
+  Major page faults—For major page faults, the operating          6. Alternative Designs
+system must perform a long-latency action, such as a disk           Here, we discuss some alternative designs we considered
+access. Stalling an application for milliseconds—while            as we developed our proof-of-concept design. These design
+likely correct—wastes valuable GPU execution resources.           either do not perform as well or are more complex than
+To handle this case, the GPU application, or a subset             Design 3. We first evaluate the addition of a shared L2 TLB
+Figure 10: Sharing pattern for the 512 entry L2 TLB. 16 sharers    Figure 11: Performance of a shared L2 TLB and an ideal PWC
+             implies all CUs sharing each entry.                  relative to ideal MMU. See Table 2 for details of configurations.
+
+and then alternative page walk cache designs. Next, we            this workload. On average, there is more than a 2x slow-
+discuss adding a TLB prefetcher and the impact of large           down when using a shared L2 TLB instead of a page walk
+pages. Finally, we consider the impact of alternative MMU         cache.
+designs on area and energy.                                         Shared L2 & PWC—per-CU private L1 TLBs, a shared
+                                                                  L2 TLB, and a page walk cache: The second bars (green) in
+6.1.   Shared L2 TLB                                              Figure 11 show the performance with both a shared L2 TLB
+  A shared L2 TLB can capture multiple kinds of data              and a page walk cache compared to an ideal MMU. In this
+sharing between execution units [5]. This cache can exploit       configuration, even though the L1 TLB size is reduced,
+sharing of translations between separate CUs, effectively         performance does not significantly decrease; the average
+prefetching the translation for all but the first CU to access    performance is within 0.1%. Using both a shared L2 TLB
+the page. The shared L2 TLB can also exploit striding             and a page walk cache achieves the benefits of both: it takes
+between CUs where the stride is within the page size (e.g.,       advantage of sharing between CUs and reduces the average
+CU 1 accesses address 0x100, CU 2 0x200, etc.).                   page walk latency. We chose to not include an L2 TLB in
+  The shared L2 TLB is most effective when each entry is          our proof-of-concept design as it adds complexity without
+referenced by many CUs. Figure 10 shows the number of             affecting performance.
+CUs that access each L2 TLB entry before eviction. 16
+sharers show all CUs share each entry, and one sharer shows       6.2.   Alternative Page Walk Cache Designs
+no overlap in the working sets. Figure 10 shows most                In this work, we use a page walk cache similar to the
+applications share each L2 TLB entries with many CUs and          structure implemented by AMD [3]. In this design, physical
+some share entries with all CUs. In these cases, the shared       addresses are used to index the cache. Other designs for a
+L2 TLB can improve performance by sharing the capacity            page walk cache that index the cache based on virtual
+of the L2 TLB between CUs.                                        addresses, including Intel-style translation caches, have
+  Due to this potential, we investigated two MMU designs          been shown to increase performance for CPUs [2]. We
+with shared L2 TLBs. The first design (Shared L2) has             chose to use an AMD-style page walk cache primarily for
+private L1 TLBs with a shared L2 TLB and no page walk             ease of implementation in our simulator infrastructure.
+cache. In this design the area that is devoted to the page          To evaluate the possible effects of other page walk cache
+walk cache in Design 3 is instead used for the L2 TLB. The        designs, we evaluated our workloads with an ideal (infinite-
+second design we evaluate (Shared L2 & PWC) contains              ly sized) page walk cache with a reduced latency to model a
+private L1 TLBs, a shared L2 TLB, and a page walk cache.          single access, the best case for the translation cache. The
+In this design each L1 TLB size is reduced to accommodate         rightmost (brown) bars in Figure 11 show the performance
+an L2 TLB. All of the designs evaluated use a total of 16         with a 64 entry L1 TLB and the ideal page walk cache
+KB of storage for their implementation.                           compared to an ideal MMU. The ideal page walk cache
+  Figure 11 shows the performance of these two designs            increases performance by an average of 1% over our proof-
+relative to an ideal MMU in the first two bars. Parameters        of-concept Design 3. For bfs the ideal page walk cache
+for each configuration are in Table 2.                            increases performance by a more significant 10% over
+  Shared L2—per-CU private L1 TLBs and a shared L2                Design 3 as this workload is sensitive to the page walk
+TLB: With a shared L2 TLB, many applications perform as           latency. From this data, a different page walk cache design
+well as the ideal, like Design 3 (Figure 11 leftmost bars in      may be able to increase performance, but not significantly.
+blue). However, bfs, nw, and sort perform at least 2x worse.      6.3.   TLB prefetching
+For these applications, decreasing the page walk latency is
+                                                                    We evaluated Design 3 with the addition of a one-ahead
+very important as the L1 TLBs experience a high miss rate.
+                                                                  TLB prefetcher [18]. The TLB prefetcher issues a page walk
+nn sees a slowdown when using the Shared L2 design
+                                                                  for the next page on each L1 TLB miss and on each prefetch
+because there is no sharing of TLB entries between CUs.
+                                                                  buffer hit. The TLB prefetcher does not affect the perfor-
+Thus, area dedicated to a page walk cache is more useful for
+                                                                The design with both a page walk cache and shared L2 TLB
+                                                                (Shared L2 & PWC) has the smallest area, but has a modest
+                                                                energy increase (25%) over Design 2. Here, there is a
+                                                                tradeoff between energy and area reduction.
+                                                                7. Related Work
+                                                                  In this work we build on research accelerating CPU
+                                                                MMUs. Page walk caches and translation caches improve
+                                                                MMU performance by accelerating the page table walk [3,
+                                                                39]. Barr et al. explored other MMU cache structures as
+ Figure 12: Energy and area of MMU configurations relative to
+                          Design 2
+                                                                well and found that a unified translation cache can outper-
+                                                                form both the page walk cache and the translation cache [2].
+mance of our workloads. Prefetching, on average, has a less       Sharing resources between CPU cores has been studied as
+than 1% impact on performance. One hypothesis as to the         a way to decrease CPU TLB miss rate. Bhattacharjee and
+ineffectiveness of TLB prefetching is the bursty-ness of        Martonosi examine a shared last level TLB [7] and a shared
+demand misses. Other, more complicated, prefetching             page walk cache [4]. These accelerate multithreaded
+schemes may show more performance improvement, but are          applications on the CPU by sharing translations between
+out of the scope of this paper.                                 cores. These works target multithreaded applications on the
+                                                                CPU and apply similarly to the GPU since, in the common
+6.4.   Large pages
+                                                                case, all CUs of the GPU are running the same application.
+  Large pages reduce the miss rate for TLBs on CPUs. On           There are also several patents for industrial solutions for
+GPUs, due to the high spatial locality of accesses, large       GPU virtual address translation [11, 36]. However, these
+pages should also work well. When evaluated, for all of our     patents have no evaluation and little implementation details.
+workloads except gaussian, 2MB pages reduce the TLB               There are multiple attempts to reduce the complexity of
+miss rate by more than 99%, resulting in more than 100          the GPGPU programming model through software [13, 32].
+times fewer TLB misses. As previously mentioned, since          While these frameworks simplify the code for straightfor-
+the working set for Gaussian fits in the TLB, large pages do    ward applications, like the UVA implementation of the
+not provide as much benefit, although the miss rate is          vectorcopy example presented, it is still difficult to
+reduced by over 80%.                                            represent complex data structures.
+  Large pages work well for the workloads under study in          GPUfs presents a POSIX-like API for the GPU that allows
+this paper, but may not perform as well for future, larger      the GPU to access files mapped by the operating system.
+memory footprint, workloads. Additionally, to maintain          Similar to GPUfs, this paper simplifies programming the
+compatibility with today’s CPU applications, the MMU            GPU by providing developers with a well-known interface
+requires 4 KB pages. Alternatively, requiring applications to   (shared virtual address space). Additionally, as a conse-
+use large pages would place a burden on the application         quence of correctly handling page faults on the GPU, this
+developer to use a special allocator API for memory that is     paper also provides a method for the GPU to access files.
+accessed by the GPU.                                            GPUfs accomplishes these goals on current hardware
+6.5.   Energy and area                                          through a complicated software library whereas this paper
+  Figure 12 shows the relative area and energy of the MMU       implements solutions for future hardware similar to how
+for a subset of designs. We used a combination of Cacti [22]    conventional CPUs solve these problems.
+and McPAT [19] to determine relative area and dynamic             Concurrent with our work, Bharath et al. also investigate
+access energy of each structure.                                address translation for GPGPUs [26]. Both papers show that
+  Figure 12a shows that all configurations are less area than   modest hardware changes can enable low-overhead GPU
+the L1 TLB-only Design 2. This is because Design 2 has          address translation, but with different designs and emphasis.
+many large and highly associative TLBs, one per CU. The         For example, Bharath et al. use a 4-ported TLB and PTW
+other configurations that share structures can amortize the     scheduling, while we use a single-ported TLB and highly-
+overheads and provide higher performance. The shared L2         threaded PTW. Bharath et al. additionally explore address
+design is much more energy hungry than the other configu-       translation effects on GPU warp scheduling, while we
+rations. This is because the L1 TLBs do not filter a large      explore MMU correctness issues, like page faults, in a CPU-
+percentage of requests (the average miss rate is 27%) and       GPU system using gem5-gpu full-system simulation.
+accesses to a large associative structure are high energy.
+                                                                8. Conclusions
+  Design 3 with only a page walk cache shows a modest
+energy reduction (20%) and increases performance signifi-         As GPGPUs can issue 100s of per-lane instructions per
+cantly over the Design 2. This energy reduction comes from      cycle, supporting address translation appears formidable.
+having smaller highly associative structures (L1 TLBs) and      Our analysis, however, shows that a non-exotic GPU MMU
+a larger lower associativity structure (the page walk cache).   design performs well with commonly-used 4 KB pages: per-
+CU post-coalescer TLBs, a shared 32-way highly-threaded                    [13] Gelado, I. et al. 2010. An asymmetric distributed shared memory
+                                                                                     model for heterogeneous parallel systems. Proceedings of the
+page table walker, and a shared page walk cache. We
+                                                                                     fifteenth edition of ASPLOS on Architectural support for
+focused on the x86-64 ISA in this work. However, our                                 programming languages and operating systems - ASPLOS ’10
+findings generalize to any ISA with a hardware walked and                            (New York, New York, USA, Mar. 2010), 347.
+tree-based page table structure. The proof-of-concept GPU                  [14] gem5-gpu: http://gem5-gpu.cs.wisc.edu.
+                                                                           [15] Juan, T. et al. 1997. Reducing TLB power requirements. Proceedings
+MMU design analyzed in this paper shows that decreasing
+                                                                                     of the 1997 international symposium on Low power electronics
+the complexity of programming the GPU without incurring                              and design - ISLPED ’97 (New York, New York, USA, 1997),
+significant overheads is possible, opening the door to novel                         196–201.
+heterogeneous workloads.                                                   [16] Kadayif, I. et al. 2002. Generating physical addresses directly for
+                                                                                     saving instruction TLB energy. 35th Annual IEEE/ACM
+9. Acknowledgements                                                                  International Symposium on Microarchitecture, 2002. (MICRO-
+                                                                                     35). Proceedings. (2002), 185–196.
+  This work is supported in part by the National Science                   [17] Kandiraju, G.B. and Sivasubramaniam, A. 2002. Characterizing the d
+Foundation (CCF-1017650, CNS-1117280, CCF-1218323                                    -TLB behavior of SPEC CPU2000 benchmarks. Proceedings of
+and CNS-1302260) and a University of Wisconsin Vilas                                 the 2002 ACM SIGMETRICS international conference on
+                                                                                     Measurement and modeling of computer systems -
+award. The views expressed herein are not necessarily those                          SIGMETRICS ’02 (New York, New York, USA, 2002), 129.
+of the NSF. Professors Hill and Wood have significant                      [18] Kandiraju, G.B. and Sivasubramaniam, A. 2002. Going the distance
+financial interests in AMD. The authors would like to                                for TLB prefetching. ACM SIGARCH Computer Architecture
+acknowledge Brad Beckmann, Karu Sankaralingam,                                       News. 30, 2 (May. 2002), 195.
+                                                                           [19] Li, S. et al. 2009. McPAT : An Integrated Power , Area , and Timing
+members of the Multifacet research group, and our anony-                             Modeling Framework for Multicore and Manycore Architectures.
+mous reviewers for their comments on the paper.                                      42nd Annual IEEE/ACM International Symposium on
+                                                                                     Microarchitecture (2009), 469–480.
+References                                                                 [20] McCurdy, C. et al. 2008. Investigating the TLB Behavior of High-end
+[1]  Bakhoda, A. et al. 2009. Analyzing CUDA workloads using a                       Scientific Applications on Commodity Microprocessors. ISPASS
+         detailed GPU simulator. Performance Analysis of Systems and                 2008 - IEEE International Symposium on Performance Analysis
+         Software, 2009. ISPASS 2009. IEEE International Symposium on                of Systems and software (Apr. 2008), 95–104.
+         (Apr. 2009), 163–174.                                             [21] Menon, J. et al. 2012. iGPU. ACM SIGARCH Computer Architecture
+[2] Barr, T.W. et al. 2010. Translation caching: Skip, Don’t Walk (the               News. 40, 3 (Sep. 2012), 72.
+         Page Table). Proceedings of the 37th annual international         [22] Muralimanohar, N. et al. 2009. CACTI 6.0: A Tool to Model Large
+         symposium on Computer architecture - ISCA ’10 (New York,                    Caches.
+         New York, USA, 2010), 48.                                         [23] Nickolls, J. and Dally, W.J. 2010. The GPU Computing Era. IEEE
+[3] Bhargava, R. et al. 2008. Accelerating two-dimensional page walks                Micro. 30, 2 (Mar. 2010), 56–69.
+         for virtualized systems. Proceedings of the 13th international    [24] NVIDIA 2011. NVIDIA CUDA C Programming Guide Version 4.0.
+         conference on Architectural support for programming languages               Changes.
+         and operating systems - ASPLOS XIII (New York, New York,          [25] NVIDIA 2009. NVIDIA’s Next Generation CUDA Compute
+         USA, 2008), 26.                                                             Architecture: Fermi.
+[4] Bhattacharjee, A. 2013. Large-reach memory management unit             [26] Pichai, B. et al. 2013. Architectural Support for Address Translation
+         caches. Proceedings of the 46th Annual IEEE/ACM International               on GPUs.
+         Symposium on Microarchitecture - MICRO-46 (New York, New          [27] Power, J. et al. 2014. gem5-gpu: A Heterogeneous CPU-GPU
+         York, USA, 2013), 383–394.                                                  Simulator. Computer Architecture Letters. 13, 1 (2014).
+[5] Bhattacharjee, A. et al. 2011. Shared last-level TLBs for chip         [28] Rogers, P. et al. 2013. AMD heterogeneous Uniform Memory
+         multiprocessors. 2011 IEEE 17th International Symposium on                  Access. AMD.
+         High Performance Computer Architecture. (Feb. 2011), 62–63.       [29] Rogers, P. 2013. Heterogeneous System Architecture Overview. Hot
+[6] Bhattacharjee, A. and Martonosi, M. 2009. Characterizing the TLB                 Chips 25 (2013).
+         Behavior of Emerging Parallel Workloads on Chip                   [30] Rogers, P. 2011. The programmer’s guide to the apu galaxy.
+         Multiprocessors. 2009 18th International Conference on Parallel   [31] Romanescu, B.F. et al. 2010. UNified Instruction/Translation/Data
+         Architectures and Compilation Techniques (Sep. 2009), 29–40.                (UNITD) coherence: One protocol to rule them all. HPCA - 16
+[7] Bhattacharjee, A. and Martonosi, M. 2010. Inter-core cooperative                 2010 The Sixteenth International Symposium on High-
+         TLB Prefetchers for chip multiprocessors. Proceedings of the                Performance Computer Architecture (Jan. 2010), 1–12.
+         fifteenth edition of ASPLOS on Architectural support for          [32] Rossbach, C.J. et al. 2011. PTask. Proceedings of the Twenty-Third
+         programming languages and operating systems - ASPLOS ’10                    ACM Symposium on Operating Systems Principles - SOSP ’11
+         (New York, New York, USA, 2010), 359.                                       (New York, New York, USA, 2011), 233.
+[8] Binkert, N. et al. 2011. The gem5 simulator. ACM SIGARCH               [33] Sodani, A. 2011. Race to Exascale: Opportunities and Challenges
+         Computer Architecture News. 39, 2 (Aug. 2011), 1.                           Intel Corporation.
+[9] Che, S. et al. 2009. Rodinia: A benchmark suite for heterogeneous      [34] Stoner, G. 2012. HSA Foundation Overview. HSA Foundation.
+         computing. 2009 IEEE International Symposium on Workload          [35] Teller, P.J. 1990. Translation-lookaside buffer consistency.
+         Characterization (IISWC). 2009, (Oct. 2009), 44–54.                         Computer. 23, 6 (Jun. 1990), 26–36.
+[10] Chip problem limits supply of quad-core Opterons: 2007.               [36] Tong, P.C. et al. 2008. Dedicated mechanism for page mapping in a
+         http://techreport.com/news/13721/chip-problem-limits-supply-of-             gpu. U.S. Patent #US20080028181. 2008.
+         quad-core-opterons. Accessed: 2013-03-09.                         [37] Wong, H. et al. 2010. Demystifying GPU microarchitecture through
+[11] Danilak, R. 2009. System and method for hardware-based GPU                      microbenchmarking. 2010 IEEE International Symposium on
+         paging to system memory. U.S. Patent #7623134. 2009.                        Performance Analysis of Systems & Software (ISPASS). (Mar.
+[12] envytools: 2013.                                                                2010), 235–246.
+         https://github.com/pathscale/envytools/blob/master/hwdocs/mem     [38] 2011. AMD I/O Virtualization Technology (IOMMU) Specification.
+         ory/nv50-vm.txt.                                                  [39] 2013. Volume 3A: System Programming Guide Part 1. Intel® 64 and
+                                                                                     IA-32 Architectures Software Developer’s Manual. 4.35–4.38.
+Appendix: GPU Page Fault Handler Imple-
+mentation                                                                                  Page table
+
+  Although rare, the GPU memory management unit archi-
+                                                                             CPU core
+tecture must be able to handle page faults to have correct
+execution. Although there are many ways to implement                           CR3
+handling page faults, in this GPU MMU architecture we                          CR2
+chose to slightly modify the CPU hardware and make no
+modifications to the operating system. Our page fault
+handling logic leverages the operating system running on                    GPU MMU
+the CPU core similar to CPU MMU page fault logic. We                           CR3
+use this design for two reasons. First, this design does not
+require any changes to the GPU execution hardware as it                     PF register
+does not need to run a full-fledged operating system.
+Second, this design does not require switching contexts on
+                                                                       Figure 13: Page walk and page fault overview
+the GPU as it can handle minor page faults by stalling the
+faulting instruction.                                           run on the CPU and GPU at the same time, or the CPU
+  The only CPU change necessary is modification of the          runtime puts the CPU core into a low power state and does
+microcode that implements the IRET (return from interrupt)      not change contexts.
+instruction. When a page fault is detected by the page table      However, the CPU runtime may yield the CPU core while
+walker logic, the address which generated the fault is          the GPU is running. In this situation, page faults are still
+written into the page fault register in the GPU page walk       handled correctly, but they are longer latency as there is a
+unit. Then, the page fault proceeds similar to a page fault     context switch to the process which spawned the GPU work
+generated by the CPU MMU. The faulting address is written       before the operating system begins handling the page fault.
+into the CPU core’s CR2 register, which hold the faulting       This is similar to what happens when other process-specific
+address for CPU page faults, and a page fault interrupt is      hardware interrupts are encountered. Another option is to
+raised. Then, the page fault handler in the operating system    include a separate general purpose core to handle operating
+runs on the CPU core. The operating system is responsible       system kernel execution for the GPU. This core can handle
+for writing the correct translation into the page table, or     any page faults generated by the running GPU kernel in the
+generating a signal (e.g. SEGFAULT) if the memory               same way as described above.
+request is faulting. Once the page fault handler is complete,
+the operating system executes an IRET instruction on the
+CPU core to return control to the user-level code. To signal
+the GPU that the page fault is complete, on GPU page
+faults, we add a check of the GPU page fault register in the
+IRET microcode implementation. If the address in that
+register matches the CR2 address then the page fault may be
+complete (it is possible the operating system could have
+finished some other interrupt instead). To check if the page
+fault is complete, the page walk unit on the GPU performs a
+second page table walk for the faulting address. If the
+translation is found, then the page fault handler was
+successful and the page fault register on both the page walk
+unit and the CPU are cleared. If the second page walk was
+not successful then the GPU MMU continues to wait for the
+page fault handler to complete.
+  There are two different categories of page faults, major
+and minor. Details of each are discussed in Section 5.1.
+Page fault discussion
+  We implemented the above technique to handle page
+faults in the gem5 simulator running Linux in full-system
+mode. Using this implementation, the Linux kernel correctly
+handles minor page faults for all of our GPU applications.
+  For this implementation, the page fault handling logic
+assumes that the GPU process is still running on the CPU
+core. This will be true if, for instance, the application can
+

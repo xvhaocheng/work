@@ -1,0 +1,1459 @@
+          Memento: Architectural Support for Ephemeral Memory
+               Management in Serverless Environments
+                     Ziqi Wang                                             Kaiyang Zhao                                        Pei Li
+          Carnegie Mellon University                              Carnegie Mellon University                      Carnegie Mellon University
+               Pittsburgh, USA                                         Pittsburgh, USA                                  Pittsburgh, USA
+              ziqiw@cs.cmu.edu                                      kaiyang2@cs.cmu.edu                             peili@andrew.cmu.edu
+
+                  Andrew Jacob                                             Michael Kozuch                              Todd C. Mowry
+          Carnegie Mellon University                                      Intel Labs                              Carnegie Mellon University
+               Pittsburgh, USA                                        Pittsburgh, USA                                  Pittsburgh, USA
+           ajacob@andrew.cmu.edu                                 michael.a.kozuch@intel.com                           tcm@cs.cmu.edu
+
+                                                                     Dimitrios Skarlatos
+                                                                  Carnegie Mellon University
+                                                                       Pittsburgh, USA
+                                                                     dskarlat@cs.cmu.edu
+ABSTRACT                                                                                 We evaluate Memento with full-system simulations across a
+Serverless computing is an increasingly attractive paradigm in the                    diverse set of containerized serverless workloads and language run-
+cloud due to its ease of use and fine-grained pay-for-what-you-use                    times. The results show that Memento achieves function execution
+billing. However, serverless computing poses new challenges to                        speedups ranging between 8–28% and 16% on average. Furthermore,
+system design due to its short-lived function execution model. Our                    Memento hardware allocators and main memory bypass mecha-
+detailed analysis reveals that memory management is responsible                       nisms drastically reduce main memory traffic by 30% on average.
+for a major amount of function execution cycles. This is because                      The combined effects of Memento reduce the pricing cost of func-
+functions pay the full critical-path costs of memory management in                    tion execution by 29%. Finally, we demonstrate the applicability of
+both userspace and the operating system without the opportunity                       Memento beyond functions, to major serverless platform operations
+to amortize these costs over their short lifetimes.                                   and long-running data processing applications.
+   To address this problem, we propose Memento, a new hardware-
+centric memory management design based upon our insights that                         CCS CONCEPTS
+memory allocations in serverless functions are typically small, and                   • Computer systems organization → Cloud computing; • Soft-
+either quickly freed after allocation or freed when the function                      ware and its engineering → Memory management.
+exits. Memento alleviates the overheads of serverless memory man-
+agement by introducing two key mechanisms: (i) a hardware object
+allocator that performs in-cache memory allocation and free op-                       KEYWORDS
+erations based on arenas, and (ii) a hardware page allocator that                     Cloud computing, Serverless, Function-as-a-Service, Memory Man-
+manages a small pool of physical pages used to replenish arenas of                    agement
+the object allocator. Together these mechanisms alleviate memory
+management overheads and bypass costly userspace and kernel                           ACM Reference Format:
+operations. Memento naturally integrates with existing software                       Ziqi Wang, Kaiyang Zhao, Pei Li, Andrew Jacob, Michael Kozuch, Todd C.
+stacks through a set of ISA extensions that enable seamless integra-                  Mowry, and Dimitrios Skarlatos. 2023. Memento: Architectural Support
+                                                                                      for Ephemeral Memory Management in Serverless Environments. In 56th
+tion with multiple languages runtimes. Finally, Memento leverages
+                                                                                      Annual IEEE/ACM International Symposium on Microarchitecture (MICRO
+the newly exposed memory allocation semantics in hardware to in-                      ’23), October 28–November 01, 2023, Toronto, ON, Canada. ACM, New York,
+troduce a main memory bypass mechanism and avoid unnecessary                          NY, USA, 15 pages. https://doi.org/10.1145/3613424.3623795
+DRAM accesses for newly allocated objects.
+
+
+                                                                                      1    INTRODUCTION
+                                                                                      Memory management is responsible for a major chunk of datacen-
+                                                                                      ter cycles as revealed by Google’s internal profiling [20, 25], despite
+This work is licensed under a Creative Commons Attribution International
+4.0 License.                                                                          significant efforts in optimizing them in software [16, 32]. Unfor-
+                                                                                      tunately, while long-running workloads have some opportunity to
+MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada                          amortize part of their memory management costs over their long
+© 2023 Copyright held by the owner/author(s).
+ACM ISBN 979-8-4007-0329-4/23/10.                                                     runtimes, this is not the case for short-lived functions. Prior work on
+https://doi.org/10.1145/3613424.3623795                                               serverless computing [17, 22–24, 29, 43, 45–47, 50, 51, 53, 54, 58, 59],
+
+
+
+
+                                                                                122
+MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada                                                                        Ziqi Wang et al.
+
+
+has mostly focused on reducing the cold-start effects of func-               constitute arenas; and (ii) backing virtual pages with physical mem-
+tions [2, 3, 6, 14, 18, 39, 48, 52, 55, 56, 60]. However, memory manage-     ory on-demand when a virtual page is accessed for the first time.
+ment still relies on expensive allocation and deallocation paths on          The hardware page allocator removes the kernel path of memory
+the critical path of function execution, leading to major overheads          management from the critical path of function execution, thereby
+in serverless environments.                                                  avoiding invoking expensive system calls and page fault handlers.
+    In particular, functions pay the full cost of memory allocation          Furthermore, for allocations that are batch-freed at the end of func-
+and deallocation in both userspace and the OS on the critical path of        tion execution, the hardware page allocator can deallocate their
+their short runtime. For example, consider the overheads of typical          memory with low latency.
+memory management operations. For starters, applications must                    Overall, these two mechanisms work together in a complemen-
+pay the cost of memory management in userspace, where each                   tary fashion that resembles the userspace and kernel path in the
+allocation and free typically requires tens of instructions in popular       current software stack. Memento naturally integrates with the ex-
+high-level languages for serverless environments (e.g., Python).             isting software stack by adding two new instructions to the ISA for
+Furthermore, userspace allocator rely on the OS to actually allocate         allocation and deallocation of memory. The hardware design and
+physical memory. However, the allocation path in the OS, either              interface of Memento enable seamless integration with both com-
+performed at system call time, such as mmap or later on at access time       piled and interpreted languages, including those with and without
+through page faults, is inherently expensive. This is because of the         garbage collection.
+creation of page tables and the actual physical memory allocation                Finally, Memento leverages the newly exposed memory alloca-
+and bookkeeping, requiring additional thousands of instructions.             tion semantics in hardware to introduce a main memory bypass
+    In this paper, we focus on reducing the performance overhead of          mechanism. Memento detects newly allocated objects and avoids
+memory management for serverless functions. To better understand             unnecessary DRAM accesses. Instead, Memento instantiates lines
+the characteristics of memory management in serverless functions             entirely in the cache hierarchy.
+and to expose opportunities for optimization, we first start with                We evaluate Memento with full-system simulations running a
+a detailed investigation of function behavior across several func-           diverse set of serverless workloads and three language runtimes
+tions and three language runtimes that cover a wide spectrum of              in a containerized environment. The results show that Memento
+memory management behavior. Beyond serverless functions, we                  achieves function execution speedups ranging between 8–28% and
+further investigate serverless platform operations such as func-             16% on average. Furthermore, Memento’s hardware allocators and
+tion deployment, and long-running data processing applications.              memory bypass mechanisms drastically reduces main memory
+Our analysis reveals three key insights. First, the vast majority            traffic by 30%. The combined effects of Memento reduce the pricing
+of allocations are relatively small, no larger than 512 bytes. This          cost of function execution by 29%. Finally, we demonstrate the
+characteristic is partly due to the usage of high-level languages,           applicability of Memento beyond functions, to major serverless
+where small objects are used extensively. Second, the allocation             platform operations responsible for deploying function instances,
+lifetime is bimodal based on the language runtime. In particular,            and long-running data processing applications.
+objects are either allocated and freed shortly after, usually within             This paper’s contributions are:
+less than 16 other allocations of the same size class. Alternatively,
+allocations are often not freed due to the short runtime of functions
+and they are instead batch-freed by the OS when the function exits.
+Finally, memory management spends a significant amount of cycles
+in userspace and within the OS. Especially in high-level language                • A detailed study of the memory management behavior of
+runtimes, almost half of memory allocation cycles are spent in the                 serverless functions that identifies the costs and optimization
+OS.                                                                                opportunities of memory management operations in both
+    Based on these insights we propose Memento, a holistic hardware-               userspace and the OS kernel.
+centric design that optimizes memory management by moving most                   • A novel arena-based hardware object allocator and a Hard-
+of the work on the software critical path to hardware. Memento                     ware Object Table(HOT) that enables hardware to fully man-
+introduces two key mechanisms that operate in tandem. The first                    age userspace memory allocations.
+is a hardware object allocator that tracks objects using arenas and              • A hardware page allocator that manages virtual and physi-
+performs memory allocations and frees in novel per-core metadata                   cal address assignment to allocation arenas, replenishes the
+cache called the Hardware Object Table (HOT). Due to the small                     hardware object allocator, and eliminates the OS costs of
+sizes of allocations, a small number of size classes can be efficiently            memory management.
+cached. Furthermore, for allocations that are allocated and quickly              • A main memory bypass mechanism that leverages the in-
+freed allocation metadata exhibit temporal locality. Therefore, the                troduction of memory allocation semantics in hardware to
+hardware object allocator can satisfy requests entirely in the meta-               avoid unnecessary DRAM accesses.
+data cache within only a few cycles.                                             • The evaluation of Memento across a large set of serverless
+    The second mechanism in Memento is a hardware page alloca-                     functions that shows Memento significantly improves their
+tor that manages a small pool of free virtual and physical pages.                  performance, bandwidth usage, and runtime cost. It fur-
+The hardware page allocator serves the dual purpose of (i) replen-                 ther shows that Memento is applicable beyond functions
+ishing the hardware object allocator with free virtual pages that                  to serverless platform operations and data processing appli-
+                                                                                   cations.
+
+
+
+
+                                                                       123
+Memento: Architectural Support for Ephemeral Memory Management in Serverless Environments        MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada
+
+
+
+         A=allocate(8)
+                                Used pools       Size Classes                      Instead, the system call only returns the region’s start address to
+                                       2                                           the userspace without setting up any virtual-to-physical mapping.
+             1
+                                  Allocated                                            As a result, when the software accesses a newly allocated virtual
+         access(A)                Free
+                           5    Free pools              …       3                  memory page for the first time, a page fault will be raised (Step ○)
+                                                                                                                                                     6
+         free(A)
+                                                                                   by hardware due to lacking a valid address mapping. The page fault
+                     6            User space
+                                  Kernel space
+                                                                                   is serviced by a kernel handler, which finds the mapping metadata
+         7 PF Handler          Buddy Allocator        4 mmap                       set up earlier by mmap on the faulting address. In this stage, the
+                                                                                   handler performs physical memory allocation by requesting a free
+           Figure 1: Memory management overview.                                   physical page from the kernel’s physical page allocator and then
+                                                                                   setting the corresponding page table entry to point to the physical
+                                                                                   page (Step ○).
+                                                                                                7 Eventually, the faulting memory access is retried
+2     BACKGROUND AND OPPORTUNITIES ON                                              and will land on the newly allocated physical page.
+                                                                                       Applications deallocate memory through the munmap [36] system
+      MEMORY MANAGEMENT                                                            call that performs the opposite steps. First, munmap tears down the
+This section first provides a background on memory management                      mapping metadata. Then it walks the page table entries describing
+in userspace and the OS. Then we showcase the memory behavior                      the mapping, clears page table entries, and returns physical pages to
+of serverless workloads.                                                           the kernel as needed. Finally, if relevant page tables become empty,
+                                                                                   they are also freed.
+2.1    A Day in the Life of a Memory Allocation
+Memory management is split between userspace and OS operations.                    2.2      Memory Management Behavior
+Typically, variable byte-sized allocations are performed in userspace              Short-lived functions pose new challenges to memory management.
+while the OS manages memory resources at the granularity of pages.                 In this section, we study the memory behavior of function execution
+Referencing Fig. 1, we describe the steps and effects of memory                    across serverless workloads based on four suites [11, 19, 28, 40]
+allocation and free, based on a typical example of userspace memory                and three languages, Python, C++, and Golang. To characterize
+allocation, and then shed light on the steps performed by the OS.                  the allocation sizes and lifetimes of functions we instrumented
+Userspace Operations. We use the CPython implementation of the                     the allocators of each language and collected allocation traces. We
+heap allocator, pymalloc [1], as an example to describe the allocator              normalize the number of allocations of each function, then we ag-
+procedure. Allocators in other high-level language runtimes also                   gregate across functions, and show the per language breakdown.
+follow similar steps. The allocator requests memory from the OS at                 We further characterize separately four long-running data process-
+the granularity of 256KB arenas and then splits them into smaller                  ing applications (Data Proc) written in C++ and three key serverless
+4KB pools. Free objects within a pool are organized as linked lists,               platform operations (FaaS Pltf ) written in Golang. We further show
+and each pool serves allocation requests of a particular size class.               a breakdown between userspace and kernel memory management.
+On an allocation request, the size class is computed by aligning the               We discuss our workloads in detail in Section 5.
+requested size up to the nearest 8-byte boundary (Step ○      1 in Fig. 1).        Allocation Sizes and Object Lifetimes in Userspace . Fig. 2
+Then, the allocator checks the per-size class free pool list, and                  shows the object size distribution in 512-byte increments. The re-
+if a pool with free objects is present, the head entry of the free                 sults show that allocations are small. Specifically, 93% of allocations
+list is returned to the caller (Step ○).
+                                      2 However, if no free objects                are smaller than 512 bytes. For several workloads, small allocations
+can be found, the allocator attempts to grab a new free pool from                  can account for more than 98% of all allocations. Large allocations
+the free pool list (Step ○)  3 and tries again. If there are no free               are a rare occurrence. Size distributions within 512 bytes are heavily
+pools, mmap in the kernel is called to allocate more arenas (Step ○).  4           workload-dependent and we did not observe any consistent pat-
+Allocation requests that are larger than 512 bytes by default are                  terns for small allocations across the workloads. In data processing
+directly serviced by malloc in glibc, which eventually calls mmap                  applications, small allocations account for 98%, while for the server-
+as well.                                                                           less platform, 99% of allocations are smaller than 512 bytes. Overall,
+    On a free operation (Step ○),5 the pool header is first obtained               small allocations dominate across Python, C++, and Golang.
+by aligning the address down to the nearest 4KB boundary. Then                        To characterize object lifetimes, we define a lifetime metric based
+the object is returned to the pool by linking it to the head of the                on the malloc-free distance. In particular, we compute the number
+free list. If the free operation turns the pool entirely free, then the            of allocations of the same size class before the object is freed. This
+pool is returned to the free pool list. Finally, if all pools in an arena          is a good predictor of allocation metadata locality. Fig. 3 shows
+become free, the allocator returns its memory by calling munmap.                   the average lifetime distribution of object allocations. The results
+Kernel Space Operations. Userspace allocators request memory                       show that function allocation lifetimes exhibit a bimodal behavior.
+allocations from the kernel through system calls. Continuing the                   Specifically, 71% of allocations are short-lived as they are freed
+above example, when the mmap [36] system call is invoked (Step ○), 4               within only 16 allocations of the same size class. On the other hand,
+it performs the following. First, mmap finds an unused region of                   27% of allocations are long-lived and rely on OS deallocation when
+addresses in the virtual address space of the process and then sets up             the function exits. Furthermore, object lifetime is highly depen-
+mapping metadata describing the allocation. Note that no physical                  dent on the language runtime. Specifically, for C++ the majority
+storage backs the virtual address region allocated in this stage.                  of allocations are short-lived, while for Python they are primarily
+
+
+
+
+                                                                            124
+MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada                                                                                                                   Ziqi Wang et al.
+
+
+                                                        100                                                                                                          FaaS     Data
+                               % of Total Allocations
+
+                                                                                               Python                                   Python    C++      Golang
+                                                         80                                                                                                          Platform Proc.
+                                                                                               C++
+                                                                                               Golang
+                                                                                                                           User/Kernel 48%/52% 96%/4% 56%/44% 59%/41%            38%/62%
+                                                         60
+                                                                                               Data Proc                    Table 2: Memory Management Cycles Breakdown.
+                                                         40                                    Serverless Pltf
+                                                         20
+
+                                                          0                                                            Kernel Impact. We further characterize the impact of kernel mem-
+                                                                    ]
+
+                                                                                        4]
+
+
+                                                                             [2 ,20 ]
+
+
+
+
+                                                                                         f]
+                                                                             [2 ,25 ]
+
+                                                                             [3 ,30 ]
+
+                                                                             [3 ,35 ]
+                                                                                  5, 4]
+
+                                                                                    7, ]
+                                                                                                                       ory management in serverless workloads for different languages. Ta-
+                                                                   12
+
+
+
+
+                                                                                        6
+                                                                                      48
+
+                                                                                      60
+
+                                                                                      72
+
+
+
+                                                                                 09 6
+                                                                                      In
+                                                                          02
+
+                                                                               53 53
+
+
+
+
+                                                                                      8
+                                                                               [4 09
+                                                               ,5
+
+
+
+
+                                                                                                                       ble 2 shows the breakdown. In C++ workloads, the majority of the
+                                                                        ,1
+
+                                                                                    1
+
+
+
+
+                                                                                    4
+                                                              [1
+
+
+
+
+                                                                                 5,
+
+                                                                                  7
+
+                                                                                  9
+
+                                                                                  1
+
+                                                                                  3
+                                                                    13
+
+
+
+
+                                                                               04
+
+                                                                               56
+
+                                                                               07
+
+                                                                               58
+                                                                          02
+
+
+
+
+                                                                                                                       memory management overhead originates from userspace, account-
+                                                                   [5
+
+
+
+                                                                               [1
+                                                                         [1
+
+
+
+
+                                                                                                                       ing for 96% of the total memory management costs. We find that
+                                                               Figure 2: Allocation size (Bytes)                       such behavior is due to the smaller heap working set size of C++ ap-
+                                                                                                                       plications. On the other hand, for Python and Golang runtimes, the
+                                                                                                                       kernel memory management overhead is substantial, accounting
+short-lived except for a few long-lived ones. Furthermore, Golang
+                                                                                                                       for 52% and 46% respectively, due to their relatively larger working
+allocations are long-lived because garbage-collection is not invoked
+                                                                                                                       sets. For the serverless platform, userspace accounts for 59% while
+due to the short runtime of functions and allocations are batch-
+                                                                                                                       the kernel accounts for 41%. In data processing applications, the
+freed at the end of function execution. Finally, in the serverless
+                                                                                                                       split is 38% and 62%. Overall, both userspace and kernel memory
+platform case, most allocations are long-lived due to the Golang
+                                                                                                                       management play a critical role in serverless functions.
+garbage collection. Data processing applications written in C++
+exhibit primarily short-lived allocations.                                                                             Insights and Implications. Our detailed study illustrates three
+                                                                                                                       prominent memory management behaviors of serverless workloads.
+                                                                                                                       First, most objects exhibit varying patterns in small objects under
+                         100
+                                                                                                                       512 bytes. Therefore, the allocator should optimize for small and
+% of Total Allocations
+
+
+
+
+                          80                                                                                           varying size classes. Second, most objects are freed shortly after
+                                                                                     Python                            allocation, indicating that they are short-lived. The allocator should
+                          60
+                                                                                     C++                               prioritize short-lived object handling and take advantage of the
+                          40                                                         Golang                            strong allocation metadata locality. Third, our detailed study of
+                          20
+                                                                                     Data Proc                         serverless functions highlights that both userspace and kernel allo-
+                                                                                     Serverless Pltf                   cations play a substantial role. Especially for Python and Golang
+                           0                                                                                           runtimes, addressing only the userspace component would leave
+                                           7- ]
+                                           3 ]
+                                           9 ]
+                                           5 ]
+                                           1 ]
+
+                                       [1 -1 ]
+                                       [1 3-1 ]
+                                       [1 9-1 8]
+                                       [1 5-1 4]
+                                       [1 1-1 0]
+                                       [1 7-1 6]
+                                       [2 3-2 2]
+                                       [2 9-2 8]
+                                       [2 5-2 4]
+                                        [2 -2 ]
+                                            -In ]
+                                               f]
+
+
+
+
+                                                                                                                       almost half of the memory management overhead intact. Beyond
+                                         [1 16
+                                         [3 32
+                                         [4 -48
+                                         [6 -64
+                                         [8 -80
+
+                                          7 6
+                                         1 12
+
+
+
+
+                                         41 40
+                                          57 56
+                                        [9 -9
+
+
+                                         2 2
+                                         4 4
+                                         6 6
+                                         7 7
+                                         9 9
+                                         0 0
+                                         2 2
+                                             -
+                                          [1
+
+
+
+
+                                                                                                                       functions, we observe similar behavior in the serverless platform
+                                                                                                                       operations and the data processing applications.
+                                                                                                                       Guiding the Design of Memento. Based on these insights, we
+                          Figure 3: Allocation lifetime (Malloc-Free distance).                                        design Memento, a holistic hardware-centric approach to eliminate
+                                                                                                                       the overheads of memory management. To handle varying patterns
+    In Table 1 we show the joint distribution of allocation size and                                                   of object sizes under 512 bytes, Memento maintains multiple size
+lifetime for functions. On average, 61% of allocations are both small                                                  classes. Allocations in each size class are satisfied by the dedicated
+and short-lived. These objects are small in size and freed quickly                                                     metadata for that particular size class. Furthermore, Memento lever-
+after allocation. For several workloads, short-lived and small al-                                                     ages the strong temporal locality of allocation metadata by adding a
+locations account more than 80% and up to 96% of all allocations.                                                      hardware object allocator that caches allocation metadata near the
+Furthermore, 32% of allocations are long-lived and small. Finally,                                                     processor. Hence, Memento fulfills most allocation requests in only
+larger allocations account for 7% of total allocations with the major-                                                 a few cycles. Then, Memento introduces a hardware page allocator
+ity being short-lived. Separately from the table, in data processing                                                   to fulfill the needs of the object allocator and eliminate the cost of
+applications, 97% of the allocations are both small and short-lived.                                                   kernel memory management for serverless workloads. Finally, Me-
+In the case of the serverless platform, 99% of the allocations are                                                     mento leverages the newly exposed memory allocation semantics
+small while being long-lived.                                                                                          in hardware to introduce a main memory bypass mechanism and
+                                                                                                                       avoid unnecessary DRAM accesses for newly allocated objects.
+
+                                                                                      Small   Large                    3    MEMENTO DESIGN
+                                                                    Short-lived        61%     6.55%                   The design of Memento consists of two mechanisms that operate
+                                                                        Long-lived     32%     0.45%                   in tandem to handle userspace and kernel memory management
+                                                                                                                       operations. The first mechanism is an arena-based hardware object
+                          Table 1: Combined distribution of size and lifetime.                                         allocator that is located close to the core and it is responsible for
+                                                                                                                       object allocation and deallocation. The hardware object allocator
+
+
+
+
+                                                                                                                 125
+Memento: Architectural Support for Ephemeral Memory Management in Serverless Environments            MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada
+
+
+       Application                  Size Class               Arena                                    Arena Header                                         Arena Body
+                     1
+ 1. obj1 = malloc(8)   Hardware      Arenas           Header        …                                                   Bypass
+ 2. …                                                      7           3                VA   Bitmap [00| 11|…|0255]               Prev Next         Obj0     Obj1 … Obj255
+                        Object   2 Arena List                                                                           Counter
+ 3. free(obj2)
+     free(ptr)         Allocator                     Body obj2    obj1 …                                 +                                                         (a)
+                     6
+                                                            Page Pool                         PA    Arena Header
+                                                                                                                      Available   Full List
+                              4 Request  Hardware                                                                     List Head    Head       (b)
+                                                        5
+                                 Arena Page Allocator
+                                                                                                   Hardware Object Table Entry
+   Figure 4: Memento’s memory management workflow.                                 Figure 5: Memento’s layout of the (a) arena header and body,
+                                                                                   and (b) hardware object table entries.
+
+interfaces with the software stack through a set of ISA extensions
+                                                                                   this interface, we extend the ISA with two new instructions for
+that provide malloc and free semantics and enable a seamless
+                                                                                   allocating and freeing objects: obj-alloc and obj-free.
+integration with language runtimes. Next, Memento introduces a
+                                                                                       The obj-alloc instruction carries the requested allocation size
+hardware page allocator at the memory controller that manages
+                                                                                   as an operand. When executed, it returns the virtual address point-
+physical pages. The hardware page allocator replenishes the object
+                                                                                   ing to a memory block that is available for use and satisfies the
+allocator with physical memory-backed arenas on-demand. Finally,
+                                                                                   requested size. The obj-free instruction has the virtual address to
+Memento builds on top of the newly exposed memory allocation
+                                                                                   be freed as its operand, and it deallocates the block so that future
+semantics in hardware to design an effective main memory by-
+                                                                                   allocations can reuse the block.
+pass mechanism that enables newly allocated objects to completely
+                                                                                       We next discuss the two main components of the hardware ob-
+avoid expensive DRAM accesses. Through this set of mechanisms,
+                                                                                   ject allocator: (i) Memento arenas that track object-level allocations,
+Memento drastically reduces the cost of memory management in
+                                                                                   and (ii) the hardware object table (HOT) that facilitates arena man-
+userspace and kernel by servicing most memory allocation and deal-
+                                                                                   agement in hardware.
+location requests with a latency equivalent to a single roundtrip to
+the L1 cache, improving performance and reducing main memory                       Memento Arenas. The object allocator tracks the allocation status
+memory traffic.                                                                    of memory addresses by maintaining bookkeeping information in
+                                                                                   the unit of arenas. An Memento arena is a consecutive range of
+Memento’s Workflow In Fig. 4 we show a high-level overview                         virtual addresses and it serves allocation and free requests of only
+of Memento’s workflow and how the hardware object and page                         one specific size class during its lifetime. Fig. 5(a) shows the arena
+allocator cooperate to satisfy memory management operations.                       layout, which includes the header and the body.
+First, upon an allocation (step ○),
+                                  1 the hardware object allocator will                 An arena header includes four parts: (i) a virtual address (VA)
+identify the size class of the request. In step ○,2 the corresponding              field, (ii) an allocation bitmap, (iii) a bypass counter, and (iv) two
+arena from the arena list will be selected. Next, in step ○,     3 the             pointers to doubly-linked lists of same-size-class arenas. The VA
+hardware object allocator (which caches arena headers) will identify               field stores the base virtual address of the arena. The bitmap is
+and mark a free location within the arena’s header where allocation                used for tracking the allocation status of objects. A set bit in the
+metadata is stored. The arena metadata can be used to identify                     bitmap indicates that the object at the corresponding offset has
+the location of the body of the arena storing the allocated objects.               been allocated. The arena body is an array of objects of the same
+Finally, the allocated virtual address is returned to the caller.                  size. The combination of the VA field with the offset of a bitmap
+   In the scenario that an arena containing free objects is unavail-               entry points to the allocated object in the arena body. Each arena
+able, the hardware object allocator requests an arena from the                     contains a fixed number of objects. In our experiments, we set this
+hardware page allocator, as shown in step ○.     4 The hardware page               parameter to 256 objects per arena, balancing metadata cost and
+allocator then allocates the appropriate number of pages from the                  internal fragmentation.
+page pool (shown in step ○)  5 and returns the new arena to the hard-                  Arenas are organized into arena lists for each size class. Specifi-
+ware object allocator. Upon a free operation (step ○), 6 the hardware              cally, two lists are maintained per size class. The first is an available
+object allocator performs the reverse operations that undo object                  list tracking arenas with at least one free object, and the second
+allocation. Specifically, the allocator will clear the appropriate meta-           is a full list tracking arenas without any available objects. In addi-
+data entry of the arena header, as shown in step ○.     7 Similarly, the           tion, arenas are connected to the the appropriate list through the
+hardware object allocator notifies the hardware page allocator to                  prev and next pointers. The bypass counter is used to support main
+free arenas and returns pages to the free page pool.                               memory bypass of new allocations. We further discuss the main
+                                                                                   memory bypass design of Memento in Section 3.3.
+3.1    Hardware Object Allocator                                                   Hardware Object Table. The core of the hardware object alloca-
+Conceptually, the hardware object allocator performs userspace-                    tor is the Hardware Object Table (HOT). The HOT holds the most
+level memory management operations. The goal of Memento is to                      recently used arena header for each size class. Based on our analy-
+provide a general interface that can seamlessly support language                   sis in Section 2.2 we opt to support allocations up to 512 bytes in
+runtimes instead of hardwiring the design to any particular software               8-byte increments, resulting in a total of 64 size classes. Fig. 5(b)
+allocator. To this end, in Memento we opt to provide the abstraction               shows the HOT entry layout. Each entry stores a cached copy of the
+of an object allocator through an interface similar to malloc and                  arena’s header fields, which are loaded from memory. Additionally,
+free drastically simplifying integration with software. To realize                 to support operations on the available and full list, HOT entries also
+
+
+
+
+                                                                            126
+MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada                                                                                               Ziqi Wang et al.
+
+
+contain the following: (i) the PA field storing the physical address               Initialization 1              Allocation 5                         Free 10
+
+of the arena, and (ii) two pointers, the available list head and full            Request Arena from              Lookup HOT 6                     Lookup HOT 11
+list head pointers, which store the physical addresses of the first               Page Allocator 2
+                                                                                                           Hit                  Miss        Hit                     Miss
+arenas in the available and full list of the size class, respectively.            Set Arena Header 3
+    The hardware object allocator manipulates the hardware object                                       Set Bitmap 7      Load Arena 8   Clear Bitmap 12     Load Arena 13
+
+table for initialization, allocation, and free operations following the           Load HOT Entry 4
+                                                                                                       No Valid Arena 9
+steps in Fig. 6.
+Initialization. On initialization (○),
+                                    1 an arena is allocated for each            Figure 6: Hardware object allocator steps for initialization,
+size class by requesting free pages from the page allocator (○). 2 We           allocation, and free operations.
+further describe the design of the hardware page allocator in Sec-
+tion 3.2. Individual arenas are initialized by preparing the arena
+header (○)3 via clearing the bitmap and the linked list prev and                common case, the VA matches, and the free “hits” in the HOT. The
+next pointers. The arena header’s VA field is set to the virtual ad-            appropriate bit in the bitmap is cleared, and the free operation com-
+dress assigned to the arena. The PA of the HOT entry is set to the              pletes (12○). If the VA does not match, the free “misses” in the HOT,
+header’s physical address returned from the page allocator. The                 and the following steps are performed (13  ○). First, the hardware allo-
+available and full list head pointers are set to indicate that both lists       cator translates the arena’s base address to the physical address by
+are empty. Finally, the initialized arena header is loaded into the             requesting a translation from the TLB. Next, the hardware allocator
+corresponding HOT entry of the allocator (○).    4                              fetches the header from the memory hierarchy using the physical
+Allocation. On an allocation request (○),  5 the size class is computed         address from the previous step. Finally, the hardware clears the
+by rounding the requested size up to the nearest 8-byte boundary.               appropriate bit in the header’s bitmap and writes the header back.
+Then the HOT entry is located swiftly using the size class as an index              In the case of a HOT miss, if the arena is in the full list (having
+without any associative search (○).    6 Next, the bitmap is scanned.           its all its bitmap set) before the free operation, then the arena will
+Three cases might occur in this step which we discuss next.                     be moved to the available list. The hardware removes the arena
+    In the most common case, a cleared bit is found, and the alloca-            from the full list and inserts it into the head of the available list by
+tion completes quickly by setting it (○).   7 The allocator computes            updating the appropriate pointers.
+the address of the allocated object based on the entry’s VA field and
+the position of the bit in the bitmap before returning the computed             3.2     Hardware Page Management
+address to the core. We refer to this scenario as an allocation “HOT            As our study in Section 2.2 revealed, the cost of OS memory manage-
+hit”.                                                                           ment operations can be significant in serverless functions. A major
+    In the rare scenario that a zero bit cannot be found, indicating            challenge to reduced this cost in hardware is how to efficiently
+that the arena is currently full, the hardware will then use the                manage the virtual and physical page assignments. To address this
+available list pointer to load the next arena header into the HOT               challenge, Memento introduces a lightweight page allocator that
+entry from the memory hierarchy (○).      8 Meanwhile, the hardware             drastically reduce the cost of memory management costs induced
+replaces the existing entry by writing it back to the corresponding             by the OS.
+memory location using the PA field of the replaced entry. The                      The Memento page allocator is a hardware component located
+hardware also performs two additional list operations. First, the               on the memory controller, and it interfaces with the object allocator
+full arena being replaced is inserted into the full list as the head.           for page-level operations. The two primary responsibilities of the
+Furthermore, the newly loaded arena is removed from the head of                 page allocator are: (i) allocating arenas to the object allocator in the
+the available list.                                                             virtual address space, and (ii) managing a small pool of physical
+    Finally, if the available list field indicates that no valid arenas         pages and using them to allocate arenas. Next we discuss how
+exist, a new arena is allocated and loaded into the HOT entry                   Memento manages virtual and physical addresses for arenas.
+by requesting more pages from the page allocator (○).       9 The new           Managing Arena Virtual Addresses. For each process that uses
+arena is initialized following the initialization procedure described           Memento, the OS reserves a region of virtual addresses from the pro-
+earlier. Finally, the current full arena is inserted into the full list. We     cess’s address space. The OS exposes the begin and end addresses
+refer to the last two scenarios as an allocation “HOT miss”. As an              of the region to the hardware through special region control regis-
+optimization, the hardware allocator may eagerly load an available              ters on the core and the memory controller, which we refer to as
+list arena or requests a new arena at the moment the last valid object          MementoRegion Start (MRS) and MementoRegion End (MRE). These
+of the current HOT entry is allocated. The hardware allocator can               two registers are managed in a multicore system at a per-address
+hide the potential latency of HOT misses in this manner.                        space level, i.e., each executing process maintains its private pair
+Free. On a free request (10
+                         ○), the hardware identifies the appropriate            of registers backed by per-process memory locations. The OS is
+arena by calculating the base virtual address and size class of the             responsible for spilling and loading the region control registers into
+arena.This is performed by using the operand of obj-free, which                 and from memory on context switches.
+is the virtual address of the object. The calculation only requires                Memento divides the reserved virtual address region evenly into
+simple bit operations, as we will discuss shortly in Section 3.2.               64 size classes. This key design decision enables the hardware object
+    After obtaining the size class, the arena’s base address is com-            allocator to calculate the size class and the arena’s base address
+pared to the VA field of the corresponding HOT entry (11  ○). In the            by simple bit operations. Given an object’s address, the hardware
+
+
+
+
+                                                                          127
+Memento: Architectural Support for Ephemeral Memory Management in Serverless Environments         MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada
+
+
+calculates the size class by dividing the address offset in the region             marked with a special flag that will be identified by the page allo-
+by 64. The arena base address is calculated by further rounding the                cator. The hardware page allocator manages a Memento page table
+offset within the size class down to the arena size of that particular             for each process similarly to the kernel. The only exception is that
+size class. Note that the rounding can be implemented in hardware                  the page allocator constructs the Memento page table on page walk
+efficiently because the arena sizes are known in advance.                          requests and automatically expands the table when encountering
+   The first responsibility of the page allocator is to allocate virtual           invalid entries.
+addresses to arenas. This scenario occurs when the object allocator                    On receiving the page walk request, the page allocator fetches
+runs out of arenas and requests a new one from the page allocator.                 and returns the Memento page table entry using the physical ad-
+In Memento, an arena can consist of single or multiple pages de-                   dress in the walk request, if the entry is valid. If, however, the valid
+pending on the particular size class of the arena. Therefore, the page             bit of the entry is 0, meaning the virtual address is currently not
+allocator maintains a per-size-class pointer as the starting address               mapped, then one of the following happens before the page alloca-
+of the next allocation. On receiving an allocation request for a new               tor returns the entry. In the first case, the walk is on the leaf level.
+arena, the page allocator bumps the pointer of the requested size                  The page allocator will proceed to allocate a new physical page
+class forward by the arena size of that size class. In addition, a phys-           and populate the leaf entry with the page’s address. Otherwise,
+ical page is also eagerly allocated to back the first page of the arena            if the entry is higher up in the page table tree (e.g., it could be a
+containing the header. Both the virtual and physical addresses are                 PGD, PUD, or PMD entry on x86), the next level of the Memento
+sent back to the object allocator, which then uses them to initialize              page table is allocated from the pool and zeroed out (i.e., all entries
+the VA field of the arena header and the PA field of the HOT entry,                are invalid). Eventually, all levels on the page walk path will be
+respectively.                                                                      populated, after which the page walk concludes.
+   On a multiprocessor system, the page allocator maintains per-                       The TLB inserts the mapping after the page walk is complete.
+size-class pointers for each core in a reserved memory block, and                  Future memory access will proceed as any other memory accesses.
+enables fast access to frequently used entries with a small on-chip                Moreover, future page walks on the arena address will not cause
+cache called the Arena Allocation Cache (AAC). The AAC is direct-                  new allocation since both the Memento page table and the address
+mapped using core IDs as indexes, and each entry stores the pointers               are backed by physical memory.
+for frequently used size classes. In practice, a small number of size                  Memento sets the permissions of all arena pages to readable,
+classes per workload is sufficient to cover most of its memory                     writeable, and non-executable. The page allocator sets this per-
+allocation activities.                                                             mission combination in the mapping entry returned to the page
+                                                                                   walker. While other combinations are also generally valid, in Me-
+                                                                                   mento, we choose to solely support heap memory allocation, where
+Assigning Physical Pages to Arenas. The second responsibil-                        this combination alone is sufficient. This design decision dramati-
+ity of the page allocator is to assign physical pages to the arenas                cally simplifies Memento by avoiding complex use cases such as
+handed out to the object allocator. For this purpose, the page allo-               file-backed allocation.
+cator implements two additional components. The first is a simple                      The page allocator also handles arena frees, which occurs when
+physical page pool consisting of free physical pages replenished                   the object allocator has freed the last live object within an arena.
+by the OS on-demand. The second is a hardware-managed page                         The page allocator walks the Memento page table and reclaims
+table that tracks the virtual-to-physical address mapping for arenas.              physical pages backing the arena. The corresponding page table
+We next describe how Memento’s hardware page allocator maps                        entries are also invalidated, with page table pages freed if the last
+arenas to the physical address space.                                              valid entry in it is invalidated.
+   As mentioned earlier, when the hardware page allocator gives                        When freeing an arena, TLB shootdowns are sent to cores that
+out new arenas, it physically backs only their first page. This de-                have issued page walk requests on the address space in the past.
+sign decision is deliberately made to simplify the operation of the                To identify which cores should receive the shootdown request, the
+object allocator, as the object allocator will initialize the metadata             hardware page allocator tracks per-process shootdown information
+located on the first page of the arena right after an arena is allo-               using a hardware bit vector, the length of which equals the number
+cated. However, the page allocator does not back the rest of the                   of cores in the system. Note that typical serverless workloads are
+arena’s virtual addresses. Instead, physical pages are assigned to                 single-process and single-threaded, and as a result, this procedure’s
+these virtual addresses only on the first access, reducing potential               cost is negligible. Overall, the hardware page allocator in Memento
+memory waste.                                                                      enables applications to acquire memory from the Memento address
+   When arena memory is accessed for the first time, the MMU                       region without incurring any OS costs, saving on both context
+attempts to translate the accessed virtual address, which will incur               switch and kernel code execution.
+a TLB miss and a subsequent page walk. Then the MMU will first
+check whether the virtual address lies in the process’s reserved
+Memento address region by comparing the requested virtual ad-                      3.3      Main Memory Bypass
+dress against the pair of region control registers. Supposing that                 By exposing memory management semantics to hardware, Me-
+the address lies in the Memento address region, the MMU then                       mento can enable previously difficult optimizations. To this end,
+conducts the page walk from a different page table root address,                   Memento takes a first stab at this direction by leveraging alloca-
+specified by a Memento Page Table Root (MPTR) register (instead                    tion semantics in hardware to introduce a main memory bypass
+of the regular one, e.g., CR3). The MMU issues page walk requests                  mechanism. Our main insight is that newly allocated objects do not
+
+
+
+
+                                                                            128
+MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada                                                                          Ziqi Wang et al.
+
+
+
+       1 p=obj-alloc(8) obj-free(p)                                          page walks to traverse the page tables that belong to the Memen-
+                                                                             tomemory region. Memento may instantiate a new object in the
+           L1-I                          Page Pool                           last level cache upon first access and bypass DRAM, if possible
+                                3                                            (○)
+                                                                               3 Finally, to allocate new arenas, the hardware object allocator
+          L1-D          L2              4 Page                               requests free pages from the hardware page allocator that lives in
+             MMU                         Allocator
+                               L3                          DRAM              the memory controller (○).5
+                  HOT
+                Object 2                 Memory                              4   DISCUSSION
+       Core
+               Allocator                 Controller
+                                                                             Integrating With Software Memory Allocators. Memento fo-
+              Figure 7: Memento Design Overview                              cuses primarily on small object allocations within 512 bytes. Larger
+                                                                             allocations, which are rare in serverless workloads, are handled
+                                                                             by software. We propose two approaches that enable Memento
+need to be fetched from main memory and hence can be entirely                to integrate with software allocators. The first approach is to let
+instantiated in the cache hierarchy. This is safe because software           malloc check the allocation size. If the size is within 512, the soft-
+should not have any expectation of data in newly allocated objects,          ware malloc will use Memento to fulfill the allocation. Similarly,
+hence Memento can simply provide a zeroed line.                              free will check whether the object pointer to be deallocated lies in
+    The primary challenge lies in identifying which requests can             the Memento memory region. In this scenario, Memento executes
+bypass main memory. Since Memento is responsible for handling                the free. An alternative approach is to expose the address of the
+allocation and free operations identifying newly allocated objects           software allocation and free function calls and let Memento redi-
+is feasible. However, tracking which cache lines of an object can            rect control accordingly. For simplicity, our design opts for the first
+bypass main memory is difficult. This is because maintaining a full          approach so that the existing malloc/free interfaces exposed to
+bitmap for every allocation would be prohibitively expensive.                the application remain unchanged.
+    As we revealed in Section 2.2, function allocations are short-lived.     Interaction with Garbage Collection. Memento naturally sup-
+As a result, our insight is that allocations tend to have high reuse         ports garbage collection (GC). For example, both the Python and
+and enjoy high cache locality. Hence, it is important to bypass main         Golang frameworks that we use in our experiments have GC run-
+memory at the first allocation. Furthermore, allocation metadata             times: they use reference counting and mark-and-sweep, respec-
+maintained in the arena header are densely populated and cold                tively. Memento integrates seamlessly with both of these GC run-
+allocations are performed the first time an entry in Memento’s               times as follows: when the GC algorithm decides to free allocated
+arena header bitmap is set.                                                  objects, it uses Memento’s obj-free interface to perform the free
+    Based on these insights, Memento introduces an effective track-          operation, thereby enjoying the same benefits from Memento’s
+ing mechanism that sequentially counts the lines of an allocation            hardware support as non-GC’ed languages. Looking ahead toward
+that have been accessed. To this end, Memento leverages the Bypass           potential future research, Memento creates interesting opportuni-
+Counter in the arena header (Fig. 5) to track accessed cache lines.          ties for extending GC algorithms to take advantage of Memento
+Specifically, cachelines with indices higher than the counter are            to manage ephemeral objects more efficiently. For example, al-
+guaranteed to have not been accessed before and hence it is safe to          though Memento does not help with tracking liveness, it could
+bypass main memory. The counter is only 11-bits which is sufficient          be integrated with an enhanced GC algorithm to help differenti-
+to track the maximum number of cache lines in an arena. When                 ate between ephemeral and non-ephemeral allocations. Once this
+there is an access to a line of an object allocated by Memento, the          distinction is made, the GC algorithm could leverage Memento
+corresponding Bypass Counter is set to the index of the line if it           to proactively free dead ephemeral objects before they create too
+is higher than the counter value. Similarly, the counter is decre-           much cache pressure rather that waiting to free objects when there
+mented on a free if the index matches the counter. On an L1 miss,            is too much memory pressure. We leave this exploration to future
+Memento’s HOT identifies if this request is a main memory bypass             work.
+request. To simplify integration with cache coherence, Memento               Multi-core Support. Current serverless workloads are single-
+allows the request to propagate regularly to the LLC where the line          process, but multiple independent functions can be collocated on
+is instantiated instead of being fetched from DRAM. As a result,             the same server. To support multi-tenancy, the OS flushes the HOT
+costly DRAM access for newly allocated objects are avoided.                  table before a process is context switched. As we will see in Sec-
+                                                                             tion 6.6, this operation is inexpensive as the HOT table is small.
+3.4    Putting It All Together                                                  Although today’s serverless function workloads are typically
+Fig. 7 shows overall design of Memento with the main compo-                  single-threaded, Memento does support multi-threaded applica-
+nents depicted in gray. The OS exposes Mementomemory regions                 tions. Existing software allocators rely on locks to atomically modify
+to the processor through control registers, MRS and MRE. Appli-              allocation metadata. To avoid frequent synchronization overheads,
+cations communicate with Memento through the ISA extensions                  modern allocators often leverage per-thread pools. In Memento,
+obj-alloc and obj-free that allocate and free objects (○).1 The              we follow a similar design where each thread in Memento man-
+hardware object allocator (○)
+                           2 is responsible for managing the mem-            ages its own arena whose virtual address range is maintained by
+ory arenas and the corresponding arena lists. The MMU further                hardware. As a result, allocations within each thread’s own arena
+maintains an additional control register, the MPTR, that enables             are managed the same way as in a single-threaded case. Note that
+
+
+
+
+                                                                       129
+Memento: Architectural Support for Ephemeral Memory Management in Serverless Environments         MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada
+
+
+since allocations are performed within a thread’s arena there are                       CPU        4-issue OOO, 3 GHz, 256-Entry ROB, 64-Entry LSQ
+no races on the allocation path.
+                                                                                        TLB            L1 64-Entry, 4-Way; L2 2048-Entry, 12-Way
+    The interesting scenario is when an object that is allocated by
+one thread is deallocated by a different thread. In practice, we do                         L1d          32KB, 8-Way, 2 Cycle, LRU Replacement
+not expect this to be the common case, because it would require                             L1i          32KB, 8-Way, 2 Cycle, LRU Replacement
+passing pointers through shared memory between threads; while
+                                                                                        HOT        3.4KB, Direct-Mapped, 2 Cycle, 1.32mW, 0.0084mm2
+this is possible, allocated objects are more typically deallocated by
+the same thread. The first step in handling this case is recognizing                        L2         256KB, 8-Way, 14 Cycle, LRU Replacement
+that the object was allocated by a different thread, which Memento                      LLC          2MB Slice, 16-Way, 40 Cycle, LRU Replacement
+does by comparing the virtual address of the object with the virtual
+                                                                                        AAC       32-Entry, Direct-Mapped, 1 Cycle, 0.43mW, 0.0023mm2
+address range of its own arena (which is maintained by hardware).
+Once this scenario is recognized, Memento can use either software-                     DRAM                    64GB, DDR4 3200, 16 Banks
+assisted or hardware-only approaches to deallocate the object. To                           OS                        Ubuntu 20.04
+amortize the overhead of invoking a software handler, Memento can
+                                                                                                  Table 3: Simulation configuration.
+batch these non-local free operations in a thread-local buffer and
+only signal the software to perform batch deallocation when the
+buffer becomes full or when a context switch occurs. The software                  5    EVALUATION METHODOLOGY
+handler manages such deallocations in the same manner as existing
+software allocators to perform the deallocations atomically and                    Simulation platform and Hardware Cost. We evaluate Memento
+avoid potential races.                                                             with full-system simulation using QEMU [5] integrated with the
+    For the hardware-only design, Memento can leverage existing                    SST [44] and DRAMSim3 [33]. The simulated architecture is pre-
+cache-coherence mechanisms to perform deallocations inexpen-                       sented in Table 3. We use Linux kernel 5.18. We further show the
+sively without software locks. Instead, Memento performs the read-                 two main hardware structures of Memento, the hardware object
+modify-write operation in the HOT atomically. In particular, if the                table (HOT) modeled as a 3.4KB direct-mapped cache and the arena
+object lies outside the current thread’s arena, a deallocation is per-             allocation cache (AAC) of the hardware page allocator modeled
+formed by the local HOT by first issuing a BusRdX to the cache                     as a 32-entry direct-mapped cache. We evaluate hardware energy
+hierarchy to acquire exclusive ownership of the arena’s metadata                   and area cost of HOT and ACC using CACTI 6.5 [38] under 22nm
+header (Fig. 5). The local HOT then updates the metadata header as                 technology node. The results are shown inline in Table 3. Overall,
+in a regular free. Metadata headers are tracked by the existing co-                the hardware cost of Memento is minimal.
+herence protocol of the system as normal data. For example, when                      We instrumented both userspace and kernel functions to cap-
+a HOT receives a coherence invalidation message to one of its en-                  ture memory management routines. For Python workloads, we in-
+tries, the HOT entry will be invalidated and supplied to the request.              strumented CPython 3.8 [42] heap allocation functions. For C/C++
+Overall, this design avoids potential races as the arena header entry              workloads, we link them against an instrumented jemalloc [15, 21].
+is in the dirty state in the private cache of the core that performs               For Golang workloads, we instrumented heap memory allocation
+the free, and it relies on existing hardware cache-coherence mecha-                and garbage collection functions in go-1.13 and linked them against
+nisms that provide write serialization. Finally, in the case of page               Golang binaries. To capture page faults, we instrumented the page
+allocations, the hardware page allocator simply serves requests in                 fault handler functions in Linux. We also instrumented system calls
+a first-come first-serve order based on the serialization of requests              to mmap and munmap. The simulator replaces calls to memory allo-
+provided by the interconnect.                                                      cation and free functions with the corresponding ISA extensions of
+    In summary, we avoid data races in Memento through the com-                    Memento. Allocations of size greater than 512 bytes and addresses
+bination of two things. First, because each thread allocates from its              outside of the reserved address region are handled by software
+own arena, we avoid potential races that might arise from multiple                 without Memento’s intervention.
+threads attempting to allocate from the same arena. Second, we                     Benchmarks. To evaluate Memento, we use a total of fourteen
+avoid potential data races in setting bits in the allocation meta-                 benchmarks. We focus our evaluation on functions that exhibit at
+data by performing these read-modify-write operations atomically                   least 0.5 MallocPKI (malloc per kilo instructions) on average. All
+in the HOT on metadata cachelines that are already in the dirty                    functions executes within a crun [12] container. We use function
+state (leveraging the normal cache coherence protocol). Page allo-                 workloads from FunctionBench [28], and the serverless benchmark
+cations in the memory controller are serialized by the interconnect.               suite SeBS [11]. dynamic-html(dh), image-recognition (ir),
+With this support, both allocations and deallocations avoid race                   graph-bfs(bfs) , dna-visualisation (dna) are from SeBS, and
+conditions in Memento. Other multi-threaded challenges such as                     pyaes (aes), feature_reducer (fr) are from FunctionBench.
+double-free attempts due to application bugs are independent of                    We further perform experiments with pyperformance [40] using
+the allocation implementation in software or in Memento’s hard-                    memory management benchmarks json_loads (jl), json_dumps
+ware. In Memento such cases are handled graciously by raising an                   (jd), and mako (mk). In addition, we adapted UrlShorten (US),
+exception to software.                                                             UserMentions (UM), ComposeMedia (CM) and MovieID (MI) from
+                                                                                   DeathStarBench [19], written in C++, into function-like units [49].
+                                                                                   We ported the Python dynamic-html, graph-bfs, and pyaes func-
+                                                                                   tions to Golang (dh-go, bfs-go, and aes-go). Before simulation
+
+
+
+
+                                                                            130
+MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada                                                                      Ziqi Wang et al.
+
+
+begins, we perform a system-level only warm-up and then we simu-           of the serverless platform operations, the majority of the gains,
+late functions workloads from the beginning to completion. Beyond          71%, come from object allocations with a smaller percentage be-
+function execution, serverless computing involves a significant plat-      ing attributed to page management. The results are similar within
+form software stack [10, 12, 13, 30, 41], including those providing        workloads and operations across the two environments hence we
+container runtime, orchestration, event routing, and other func-           show only the average.
+tionalities. To this end, we evaluate the OpenFaaS [41] serverless            Individual function workloads demonstrate different gains from
+platform when performing three important operations, namely up             either or both sources, further highlighting the need for both hard-
+that starts up the serverless platform, deploy that registers a func-      ware object and page management proposed by Memento. Seven
+tion in the function store and prepares it for execution, and invoke       of the nine Python workloads and two out of three Golang work-
+that routes a request to an instance of the function. For these opera-     loads get at least 40% of the gains from Memento’s hardware page
+tions, we send a request for these operations to OpenFaaS Gateway          management. This observation is explained by the larger heap size,
+after the platform has been warmed up and simulate the regions of          which causes a higher number of page faults that increases propor-
+interest of each operation. We further evaluate four long-running          tionally to the number of pages in the heap memory. The majority
+data processing applications, including two key-value stores, Redis        of the page management gains come from dynamic page allocations
+and Memcached, and two in-memory databases, Silo and SQLite3.              in hardware that eliminate costly OS page fault handling. In the
+We use the value size distribution from [37] to drive the workloads        case of aes and jl, more than 90% of the gains come from hardware
+and perform measurements at the steady state.                              object management. This is because their working sets are much
+   All workloads use the default input if possible. Workload exe-          smaller, shifting the critical path from page allocation to object
+cution time ranges from sub-second level to a few seconds, and             allocation.
+memory consumption numbers are from low to tens of MBs. Func-                 In the case of data processing workloads Memento provides
+tions communicate via RPCs with a Redis backend to fetch inputs            significant benefits between 5–11%. Redis benefits the most from
+and store results at the beginning and end of function execution. We       Memento, achieving an 11% throughput increase on mixed PUT-
+measure RPC costs to be at between hundreds of microseconds to             GET (50% each) workload. We attribute the result to the usage of the
+a few milliseconds across our workloads depending on input/result          SDS string library, which allocates strings on the heap to store keys
+size. This is a small portion of the total function runtime. RPCs          and values and as temporary buffers. Both Memcached and Silo
+have been the focus of recent works [31].                                  saw moderate throughput increase of 6.5% and 7.5% respectively.
+                                                                           Both applications experience frequent page faults on heap memory,
+6 EVALUATION                                                               resulting in significant cycle reduction in the kernel with Memento.
+                                                                           SQLite3 allocates many small and short-lived objects when parsing
+6.1 Speedup                                                                SQL queries. Consequently, SQLite3 can also benefit from Memento
+Fig. 8 shows the execution time reduction of Memento as the                with 5% improvement when processing SQL SELECT statements.
+speedup over the baseline system. We group results in Fig. 8 by            The above study reveals that Memento is also applicable to long
+the language runtime (Python, C++, Golang). We show the average            running workloads that often rely on short-lived allocations. The
+of functions as func-avg. We further distinguish between data pro-         gains are due the ability of Memento to improve both userspace
+cessing applications (data-avg) and serverless platform operations         allocations and kernel memory management that account for 38%
+(pltf-avg).                                                                and 62% of the memory manangement cycles respectively in the
+   Overall, Memento achieves substantial speedups between 8–               case of data processing applications. Serverless platform operations
+28% and 16% on average for functions. These are substantial gains          also enjoy significant speedups with Memento between 4%-7%. The
+achieved by Memento for serverless functions. Data processing ap-          gains are similar across operations, with 59% being attributed to
+plications and serverless platform operations also enjoy substantial       userspace allocations and 41% to kernel memory management.
+gains between 4-11%.                                                          The main memory bypass mechanism can also be beneficial for
+   To further study the source of speedups, we present in Fig. 9 a         certain workloads such as dh as it saves 6% of execution cycles
+breakdown of the performance gains of Memento. The figure shows            leading to a 28% function speedup. The DeathStarBench C++ work-
+four main sources of gains that can be achieved by Memento: (i)            loads show significant speedups of 16% on average. The majority
+hardware object allocations (obj-alloc), (ii) hardware object frees        of the gains come from hardware object management. The page
+(obj-free), (iii) hardware page management operations (page-mgmt),         management gains are smaller because jemalloc pre-maps and pre-
+and (iv) main memory bypass (bypass). Memento can satisfy mem-             faults a small pool of memory during library initialization. This
+ory management operations with latency equivalent to a single              mechanism instead turns object allocation and free operations into
+cache access in most cases, and hence significantly reduces func-          a performance bottleneck that Memento addresses. Overall, the
+tion execution time. On average for functions, 33% of the gains are        results highlight the importance of Memento’s mechanisms.
+attributed to hardware object allocation and 32% to free. The main
+memory bypass mechanism attains a 2% improvement on average,               Iso-storage Comparison. Finally, we compare Memento to an
+and it can reach up to 17% improvement depending on the func-              iso-storage architecture where the HOT storage is provided to
+tion’s sensitivity to bandwidth. The hardware page management              the L1 cache instead. Specifically, we consider a hypothetical 9-
+component is responsible for 33%. In data processing applications          way L1D cache that incurs the same SRAM overhead as the HOT
+the gains are primarily split between object allocation and page           while maintaining the same latency. Our results show that while
+management, that account for 37% and 58% respectively. In the case         dedicating Memento’s HOT storage to the L1D results in an overall
+
+
+
+
+                                                                     131
+Memento: Architectural Support for Ephemeral Memory Management in Serverless Environments                                                                                 MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada
+
+
+                                                                       Python                               C++              Golang                                      Data                                      Serverless
+                                               1.3
+                                                                                                                                                                      Processing                                    Platform
+                                               1.2
+                                               1.1
+
+
+                                     Speedup
+                                               1.0
+                                               0.9
+                                               0.8
+                                               0.7
+                                               0.6
+                                               0.5
+
+
+
+
+                                                                                                                                                                                                                                invoke
+                                                     html
+                                                            ir
+                                                                 bfs
+                                                                       dna
+                                                                             aes
+                                                                                   fr
+                                                                                        jl
+                                                                                             jd
+                                                                                                  mk
+                                                                                                       US
+                                                                                                            UM
+                                                                                                                 CM
+                                                                                                                      MI
+                                                                                                                           html-go
+                                                                                                                                     bfs-go
+                                                                                                                                              aes-go
+                                                                                                                                                       func-avg
+
+                                                                                                                                                                  Redis
+                                                                                                                                                                          Memcached
+                                                                                                                                                                                      Silo
+                                                                                                                                                                                             SQLite3
+                                                                                                                                                                                                       data-avg
+
+                                                                                                                                                                                                                  up
+                                                                                                                                                                                                                       deploy
+
+
+                                                                                                                                                                                                                                         pltf-avg
+                                                                                             Figure 8: Normalized speedup.
+
+
+                       obj-alloc       obj-free                   page-mgmt                            bypass                    instruction and data movement caused by memory management in
+                                   Python                        C++           Golang                                            userspace and the kernel. Finally, Memento’s main memory bypass
+Speedup Breakdown
+
+
+
+
+                     100
+  (% Saved Cycles)
+
+
+
+
+                      90                                                                                                         mechanism provides provides savings of 5% on average and up to
+                      80                                                                                                         34%.
+                      70
+                      60
+                      50
+                      40
+                      30                                                                                                         6.3                   Aggregate Main Memory Usage.
+                      20
+                      10                                                                                                        Fig. 11 presents normalized aggregated memory usage results. We
+                       0
+                                                                                                                                measure aggregated memory usage as the total number of physical
+                                 html
+                                     ir
+                                   bfs
+                                  dna
+                                  aes
+                                     fr
+                                      jl
+                                    jd
+                                   mk
+                                   US
+                                  UM
+                                   CM
+                                    MI
+                             html-go
+                              bfs-go
+                              aes-go
+                            func-avg
+                            data-avg
+                             pltf-avg
+
+
+
+
+                                                                                                                                pages allocated during simulated execution. We present normal-
+                                                                                                                                ized user and kernel space memory separately in addition to the
+                                                                                                                                total memory usage. Memento achieves an overall 15% reduction
+                            Figure 9: Performance gains breakdown.                                                              in aggregate memory usage for functions. When we look at the
+                                                                                                                                userspace and kernel usage, we see that userspace reduction is
+                                                                                                                                about 10% and kernel is 28%. In the case of serverless platform
+Bandwidth Reduction
+
+
+
+
+                                   Python                         C++              Golang
+Normalized Memory
+
+
+
+
+                      0.6
+                                                                                                                                operations the memory usage remains almost the same. Further-
+                      0.5
+                                                                                                                                more, looking at the aggregate memory usage for data processing
+                      0.4
+                                                                                                                                applications, we see that Memento achieves significant savings of
+                      0.3
+                                                                                                                                5% in userspace, 50% in the kernel, and total savings of 23%.
+                      0.2
+                                                                                                                                   By examining the behavior of functions, we see that Memento in-
+                      0.1
+                                                                                                                                creases userspace memory usage for Python and Golang workloads.
+                      0.0
+                                                                                                                                A primary reason is that the software allocators for these two lan-
+                                 html
+                                     ir
+                                   bfs
+                                  dna
+                                  aes
+                                     fr
+                                      jl
+                                    jd
+                                   mk
+                                   US
+                                  UM
+                                   CM
+                                    MI
+                             html-go
+                              bfs-go
+                              aes-go
+                            func-avg
+                            data-avg
+                             pltf-avg
+
+
+
+
+                                                                                                                                guages share free pages among size classes, which reduces external
+                                                                                                                                fragmentation. We choose not to include this potential optimiza-
+                                                                                                                                tion and trade-off userspace memory instead for a less complicated
+Figure 10: Normalized memory bandwidth usage reduction.                                                                         hardware design. Nonetheless, Memento reduces kernel memory
+Yellow highlights main memory bypass savings.                                                                                   usage for these workloads by 29%. In workloads like dh, Memento
+                                                                                                                                can achieve major kernel memory usage reductions, more than 60%,
+                                                                                                                                due to the reduction of kernel metadata needed to manage memory
+speedup of 3%, this is significantly smaller than the 28% speedup
+                                                                                                                                regions. For C++ workloads from DeathStarBench [19], Memento
+provided by Memento.
+                                                                                                                                achieves 41% userspace memory savings. We attribute this to the
+6.2                     Memory Bandwidth Savings.                                                                               low utilization of jemalloc’s memory pool, which ends up wasting
+                                                                                                                                userspace memory resources. Memento instead can dynamically
+To study the effect of Memento on main memory traffic, we present                                                               respond to the memory usage of each function. Furthermore, Me-
+results on normalized memory bandwidth savings in Fig. 10. Over-                                                                mento achieves significant kernel savings for DeathStarBench, with
+all, Memento reduces memory bandwidth usage by 30%. For two                                                                     an average of 25%.
+workloads, UM and CM, Memento achieves a 31% and 35% reduction
+of DRAM traffic for functions. The gains for the serverless platform
+are smaller. In the case of data processing applications Memento                                                                 6.4                   Characterizing Memento
+significantly reduces memory bandwidth usage by 33%. Memento’s
+bandwidth savings are attributed to three sources. First, the hard-                                                              Hardware object table hit rate. We present the hit rate of the
+ware object table (HOT) absorbs allocation traffic to memory as                                                                  hardware object table (HOT) in Fig. 12. On allocations, a HOT hit
+objects can be instantiated in the cache without adding unnecessary                                                              happens when a request finds an available entry in the cached
+traffic to the main memory. Furthermore, Memento eliminates the                                                                  header bitmap. Similarly, on free operations, a HOT hit happens
+
+
+
+
+                                                                                                                  132
+MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada                                                                                             Ziqi Wang et al.
+
+
+                                     User        Kernel       Total                                                           obj-alloc           obj-free
+                       1.4                                                                                           Python                 C++     Golang
+                                   Python          C++    Golang
+Normalized Aggregate
+
+
+
+
+                                                                                               100
+                       1.2
+
+
+
+
+                                                                              HOT Hit Rate %
+   Memory Usage
+
+
+
+
+                       1.0                                                                       80
+                       0.8                                                                       60
+                       0.6
+                                                                                                 40
+                       0.4
+                                                                                                 20
+                       0.2
+                       0.0                                                                             0
+
+
+
+
+                                                                                                                 html
+                                                                                                                     ir
+                                                                                                                   bfs
+                                                                                                                  dna
+                                                                                                                  aes
+                                                                                                                     fr
+                                                                                                                      jl
+                                                                                                                    jd
+                                                                                                                   mk
+                                                                                                                   US
+                                                                                                                  UM
+                                                                                                                   CM
+                                                                                                                    MI
+                                                                                                             html-go
+                                                                                                              bfs-go
+                                                                                                              aes-go
+                                                                                                            func-avg
+                                                                                                            data-avg
+                                                                                                             pltf-avg
+                                  html
+                                      ir
+                                    bfs
+                                   dna
+                                   aes
+                                      fr
+                                       jl
+                                     jd
+                                    mk
+                                    US
+                                   UM
+                                    CM
+                                     MI
+                              html-go
+                               bfs-go
+                               aes-go
+                             func-avg
+                             data-avg
+                              pltf-avg
+                        Figure 11: Normalized aggregate memory usage.                                         Figure 12: Hardware object table hit rate.
+
+                                                                                                                                obj-alloc         obj-free
+when the cached header can fulfill the free request without incur-                                                     Python               C++     Golang
+
+
+
+
+                                                                              (% obj-alloc/obj-free)
+                                                                               Arena list operations
+ring additional memory operations. A miss in the HOT causes a                                          1.0%
+cache request to be issued to load the appropriate entry from mem-                                     0.8%
+ory. Hits in the HOT are completed in two cycles without issuing                                       0.6%
+memory requests.
+                                                                                                       0.4%
+    Overall, allocations in Memento enjoy a high hit rate of 99.8%
+                                                                                                       0.2%
+for functions. Furthermore, they exhibit a uniform behavior across
+functions as well as data processing applications and serverless                                       0.0%
+
+
+
+
+                                                                                                                     html
+                                                                                                                         ir
+                                                                                                                       bfs
+                                                                                                                      dna
+                                                                                                                      aes
+                                                                                                                         fr
+                                                                                                                          jl
+                                                                                                                        jd
+                                                                                                                       mk
+                                                                                                                       US
+                                                                                                                      UM
+                                                                                                                       CM
+                                                                                                                        MI
+                                                                                                                 html-go
+                                                                                                                  bfs-go
+                                                                                                                  aes-go
+                                                                                                                func-avg
+                                                                                                                data-avg
+                                                                                                                 pltf-avg
+platform operations. Free operations show an average hit rate of
+83%. We observe that Python workloads generally exhibit lower free
+hit rate, while Golang and C++ workloads show a very high free hit
+rate. Further investigation reveals that C++ workloads operate on                                             Figure 13: Arena list operation frequency.
+tight loops with objects being allocated at the beginning of the loop
+and freed at the end. Golang workloads, on the other hand, rely on
+                                                                              linked list operations only constitute a tiny fraction of total memory
+garbage collection to batch-free objects. Therefore, they never need
+                                                                              accesses (≤ 0.01%). We also evaluated an ideal environment without
+to call free on individual objects. For Python workloads, some of the
+                                                                              the linked list operations and saw minimal changes in the result.
+allocations are made by the interpreter to store global information
+                                                                              Overall, the performance implications of arena list operations are
+that tends to live much longer than other local objects (e.g., those
+                                                                              negligible.
+created in tight loops). These long-lived objects cause low HOT hit
+rates. Nevertheless, Memento handles them correctly by performing
+the free operation out of the execution critical path. As a result,
+                                                                              6.5                          Function Pricing
+Memento is still able to eliminate their overheads successfully,              We compute the cost of running functions on both the baseline
+despite low HOT hit rates.                                                    system and Memento according to AWS pricing [4]. Fig. 14 shows
+    The results further corroborate the insights from Section 2.2 as          the runtime cost based on execution time and memory usage. The
+function workloads are short-lived in nature with short malloc-free           current AWS pricing policy computes the cost of functions in the
+distances. When an object is allocated from the HOT and freed                 granularity of milliseconds for runtime and MB for consumed mem-
+shortly afterward, the free request will very likely result in a hit.         ory. On average, we can see from the results that Memento can
+Consequently, Memento achieves a high HOT hit rate even with a                achieve a significant runtime cost saving of 29%. Function providers
+small direct-mapped structure.                                                add a fixed per-invocation cost that accounts for the infrastruc-
+    While not shown in the figure, Memento’s arena allocation cache           ture management and deployment costs outside the function costs.
+(AAC) enjoys uniformly high hit rates as only a few size classes are          While this cost is outside the scope of Memento, when included for
+utilized in each of the workloads.                                            end-to-end pricing cost, Memento is able to achieve cost savings
+                                                                              up to 31%, and 11% on average.
+Arena list operations. Fig. 13 presents the frequency of linked
+list operations for arena management during allocation and free.
+These operations occur when the object allocator puts arenas on/off
+                                                                              6.6                          Sensitivity Studies
+the full/available arena lists (Section 3.1). We characterize them            Populating pages on mmap. mmap supports a flag that will force
+by calculating the percentage of allocations or frees that include            the OS to eagerly populate virtual pages with physical memory
+arena list operations. For all workloads, less than 1% of allocations         (MAP_POPULATE) , hence reducing the page fault overhead. However,
+and 0.6% of frees need to operate on linked lists. Workloads with             eagerly populating pages may cause an increased physical memory
+smaller working sets require fewer linked list operations because             footprint. To evaluate the effect, we instrumented the software
+there are fewer arenas to manage, and the locality of allocation and          allocators under comparison to pass the flag to mmap and evaluated
+free is high. Compared with the total number of instructions, the             Memento on this setting. For Golang workloads we observed that
+
+
+
+
+                                                                        133
+Memento: Architectural Support for Ephemeral Memory Management in Serverless Environments                            MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada
+
+
+on average performance improved by 3% from the baseline but                                                                      Python                              C++               Golang
+
+
+
+
+                                                                                   Normalized Runtime
+                                                                                                        1.0
+physical memory footprint increased by 8.6×, due to the large
+mmap size of Golang allocator. For Python and C++ workloads, we                                         0.8
+
+
+
+
+                                                                                         Pricing
+did not observe any significant change in speedup, with physical                                        0.6
+memory increasing by an average of 9.6%. We conclude that eagerly                                       0.4
+populating allocations is not cost-efficient for serverless functions                                   0.2
+based on the AWS pricing model in Section 6.5 due to the increased
+                                                                                                        0.0
+physical memory footprint.
+
+
+
+
+                                                                                                              html
+                                                                                                                     ir
+                                                                                                                          bfs
+                                                                                                                                dna
+                                                                                                                                      aes
+                                                                                                                                            fr
+                                                                                                                                                 jl
+                                                                                                                                                      jd
+                                                                                                                                                           mk
+                                                                                                                                                                US
+                                                                                                                                                                     UM
+                                                                                                                                                                          CM
+                                                                                                                                                                               MI
+                                                                                                                                                                                    html-go
+                                                                                                                                                                                              bfs-go
+                                                                                                                                                                                                       aes-go
+                                                                                                                                                                                                                func-avg
+Multi-process environments. To evaluate Memento in multi-
+process environments, where a single core is over-subscribed by
+several time-sharing function instances, we ran the simulation by
+                                                                                                         Figure 14: Normalized function runtime pricing.
+starting four randomly selected function instances and pinning
+them to the same core. We repeated the experiment ten times, with
+different workloads each time. The main potential overhead of Me-                  hardware, Memento is able to explore previously hard-to-perform
+mento is the flushing of the HOT table. Specifically, the core issues              optimizations such as main memory bypass. In addition, while Mal-
+flush operations for every entry in the HOT table. Compared with                   lacc is hardwired to TCMalloc and only supports C++ workloads,
+the typical context-switch time that is in the order of microseconds,              Memento is agnostic to the language runtime, as demonstrated by
+and the frequency of context switches that is in the order of a few                our integration of Memento with Python, C++, and Golang.
+milliseconds, the overall performance effect is negligible.                           To provide a quantitative comparison, we simulate an idealized
+Tuning software allocators. We manually tuned the available                        version of Mallacc where the Mallacc cache has zero latency and
+configuration knobs of software allocators to study their effects                  always hits. Because Mallacc only supports C++ workloads, we
+on Memento. Our results show that while changing most of the                       only compare it to Memento on DeathStarBench. Whereas this ide-
+knobs does not affect Memento’s speedup, enlarging the arena size                  alized Mallacc configuration achieves speedups ranging from 5-10%
+of software allocators causes a noticeable but less than 1% speedup.               (8% on average), Memento doubles these performance gains with
+Further investigation revealed that using larger arenas reduces the                speedups ranging from 12-20% (16% on average). At the same time
+frequency of mmap at the potential cost of fragmentation. Physical                 Memento provides substantial gains (between 8-28%) for other lan-
+memory footprint is unaffected as mmap reserves physical pages                     guage runtimes (Python and Golang) that Mallacc cannot support.
+lazily.                                                                            Memento’s design for kernel memory management in hardware
+Fragmentation. To identify potential fragmentation induced by                      is especially crucial for high-level languages such as Python and
+Memento, we measured fragmentation as the percentage of actual                     Golang (as shown in Section 6.1), and this is not supported by Mal-
+amount of memory allocated to small objects and the total amount                   lacc. Memento successfully eliminates the kernel overheads that
+of memory given to HOT. Our results show that on average, only                     account for 33% on average and up to 68% of function memory
+3.68% of the slots in the arena headers are not active. (This result               management overheads.
+is the combination of fragmentation and free memory, since it is
+difficult to disambiguate between the two.) We further compared                    7                    RELATED WORK
+these fragmentation results to the software-only allocators, and                   Reducing Cold Starts for Serverless Functions A body of work
+observed similar results within a ± 2% of hardware design across                   has focused on reducing the cold start effects of serverless work-
+applications. Meanwhile, Memento reduces the overall memory                        loads by focusing on system-level effects such as creating VMs and
+usage as we discussed in Section 6.3.                                              containers. These works seek to reduce the cold start latency using
+Warm-start versus cold-start. Our earlier experiments warm-                        process snapshots [6, 14, 39, 57], lightweight kernels [2], record-and-
+started functions, i.e., functions are executed by an existing con-                replay [56], application-level sandboxing [3], low-latency serverless
+tainer process and skip the container set-up stage. However, in                    frameworks [23], and live container caching [18, 48, 52]. These ap-
+practice, functions may also experience cold-starts where the la-                  proaches motivated by the short-lived function execution and are
+tency of setting up containers are added to their execution latency.               orthogonal to Memento and can be adopted together.
+To study the effect of cold-started functions on Memento, we ran                   Hardware Memory Management Prior work has explored a
+experiments where containers are set up before executing the func-                 simplified version of page management with hardware buddy allo-
+tion. Our results show that, even with cold-starts, Memento can                    cators [7–9, 34, 35]. These works aim to provide physical memory
+still gain a speedup of 7%–22% compared with the baseline.                         management for embedded platforms with limited OS support or
+                                                                                   simple runtimes. Instead, Memento relies on a fully-fledged OS
+6.7    Comparison with Related Work                                                and only manages a small pool of physical pages used for arena
+The mostly closely related work to Memento is Mallacc [26], which                  allocations in tandem with the hardware object allocator. We have
+introduces hardware extensions to accelerate certain userspace                     discussed Mallac [26] extensively in Section 6.7.
+malloc operations. In contrast, Memento is a holistic hardware                     Memory Management in Datacenters The cost of memory man-
+design that accelerates both userspace and kernel memory man-                      agement in datacenters has been under active investigation [20, 25].
+agement, both of which are very important for performance (as                      Recent work by Google [20] has shown that the cost of memory al-
+shown in Fig. 9). By exposing memory allocation semantics to the                   location remains high in data processing applications. In this work,
+
+
+
+
+                                                                            134
+MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada                                                                                                      Ziqi Wang et al.
+
+
+we have shown that Memento can be beneficial for data processing                            [12] crun.      2023.               crun     container      official   github     repo.
+applications by eliminating wasted cycles in userspace memory allo-                              https://github.com/containers/crun/.
+                                                                                            [13] Docker. 2023. Docker: Accelerated Container Application Development.
+cations and offloading expensive kernel operations to hardware. By                               https://www.docker.com.
+eliminating the compound effects of memory management across                                [14] Dong Du, Tianyi Yu, Yubin Xia, Binyu Zang, Guanglu Yan, Chenggang Qin, Qix-
+                                                                                                 uan Wu, and Haibo Chen. 2020. Catalyzer: Sub-millisecond startup for serverless
+the stack, Memento can achieve major efficiency gains for datacen-                               computing with initialization-less booting. In Proceedings of the Twenty-Fifth
+ter workloads. Finally, by exposing memory management semantics                                  International Conference on Architectural Support for Programming Languages and
+to hardware, future work on accelerator design for other prevalent                               Operating Systems. 467–481.
+                                                                                            [15] Jason Evans. 2006. A scalable concurrent malloc implementation for FreeBSD. In
+datacenter operations such as compression, croptography, protocol                                Proc. of the bsdcan conference, ottawa, canada.
+buffers [27], and RPC [31] can benefit significantly by chaining                            [16] Tais B. Ferreira, Rivalino Matias, Autran Macedo, and Lucio B. Araujo. 2011.
+multiple accelerator operations together while performing memory                                 An Experimental Study on Memory Allocators in Multicore and Multithreaded
+                                                                                                 Applications. In 2011 12th International Conference on Parallel and Distributed
+management with Memento.                                                                         Computing, Applications and Technologies. 92–98. https://doi.org/10.1109/PDCAT.
+                                                                                                 2011.18
+8    CONCLUSION                                                                             [17] Sadjad Fouladi, Riad S. Wahby, Brennan Shacklett, Karthikeyan Vasuki Bal-
+                                                                                                 asubramaniam, William Zeng, Rahul Bhalerao, Anirudh Sivaraman, George
+This paper presented Memento, a novel hardware-centric design                                    Porter, and Keith Winstein. 2017. Encoding, Fast and Slow: Low-Latency Video
+                                                                                                 Processing Using Thousands of Tiny Threads. In 14th USENIX Symposium on
+that alleviates the overheads of serverless memory management.                                   Networked Systems Design and Implementation (NSDI 17). USENIX Association,
+Memento introduces two key mechanisms in hardware for object                                     Boston, MA, 363–376. https://www.usenix.org/conference/nsdi17/technical-
+allocation and page management that operate in tandem and alle-                                  sessions/presentation/fouladi
+                                                                                            [18] Alexander Fuerst and Prateek Sharma. 2021. FaasCache: keeping serverless
+viate both userspace and kernel memory management overheads.                                     computing alive with greedy-dual caching. In Proceedings of the 26th ACM In-
+It further leverages the exposed memory management semantics                                     ternational Conference on Architectural Support for Programming Languages and
+in hardware to introduce a main memory bypass mechanism for                                      Operating Systems. 386–400.
+                                                                                            [19] Yu Gan, Yanqi Zhang, Dailun Cheng, Ankitha Shetty, Priyal Rathi, Nayan Katarki,
+newly allocated objects. Our evaluation shows that Memento re-                                   Ariana Bruno, Justin Hu, Brian Ritchken, Brendon Jackson, et al. 2019. An
+duces main memory traffic by 30%, speeds up function execution by                                open-source benchmark suite for microservices and their hardware-software
+                                                                                                 implications for cloud & edge systems. In Proceedings of the Twenty-Fourth In-
+8-28%, and further reduces the runtime pricing cost of functions by                              ternational Conference on Architectural Support for Programming Languages and
+29%. Finally, we demonstrated the applicability of Memento beyond                                Operating Systems. 3–18.
+functions, to major serverless platform operations and long-running                         [20] Abraham Gonzalez, Aasheesh Kolli, Samira Khan, Sihang Liu, Vidushi Dadu,
+                                                                                                 Sagar Karandikar, Jichuan Chang, Krste Asanovic, and Parthasarathy Ran-
+data processing applications.                                                                    ganathan. 2023. Profiling Hyperscale Big Data Processing. In Proceedings of
+                                                                                                 the 50th Annual International Symposium on Computer Architecture (Orlando, FL,
+ACKNOWLEDGMENTS                                                                                  USA) (ISCA ’23). Association for Computing Machinery, New York, NY, USA,
+                                                                                                 Article 47, 16 pages. https://doi.org/10.1145/3579371.3589082
+This work was funded in part by NSF grants CNS-2107307, CNS-                                [21] jemalloc.       2023.                 jemalloc       official    github      repo.
+2239311 and a Meta Faculty Award. We thank Gennady Pekhimenko                                    https://github.com/jemalloc/jemalloc/.
+                                                                                            [22] Zhipeng Jia and Emmett Witchel. 2021. Boki: Stateful Serverless Computing with
+and the anonymous reviewers for all of their valuable feedback.                                  Shared Logs. In Proceedings of the ACM SIGOPS 28th Symposium on Operating
+                                                                                                 Systems Principles (Virtual Event, Germany) (SOSP ’21). Association for Comput-
+REFERENCES                                                                                       ing Machinery, New York, NY, USA, 691–707. https://doi.org/10.1145/3477132.
+                                                                                                 3483541
+ [1] 2023.        Python Memory Management and pymalloc, home page:                         [23] Zhipeng Jia and Emmett Witchel. 2021. Nightcore: Efficient and Scalable Server-
+     https://docs.python.org/3/c-api/memory.html.                                                less Computing for Latency-Sensitive, Interactive Microservices. In Proceedings of
+ [2] Alexandru Agache, Marc Brooker, Alexandra Iordache, Anthony Liguori, Rolf                   the 26th ACM International Conference on Architectural Support for Programming
+     Neugebauer, Phil Piwonka, and Diana-Maria Popa. 2020. Firecracker: Lightweight              Languages and Operating Systems (ASPLOS 2021). Association for Computing
+     virtualization for serverless applications. In 17th USENIX symposium on networked           Machinery, New York, NY, USA. https://doi.org/10.1145/3445814.3446701
+     systems design and implementation (NSDI 20). 419–434.                                  [24] Jiawei Jiang, Shaoduo Gan, Yue Liu, Fanlin Wang, Gustavo Alonso, Ana Klimovic,
+ [3] Istemi Ekin Akkus, Ruichuan Chen, Ivica Rimac, Manuel Stein, Klaus Satzke,                  Ankit Singla, Wentao Wu, and Ce Zhang. 2021. Towards Demystifying Serverless
+     Andre Beck, Paarijaat Aditya, and Volker Hilt. 2018. SAND: towards high-                    Machine Learning Training. In Proceedings of the 2021 International Conference
+     performance serverless computing. In Proceedings of the 2018 USENIX Conference              on Management of Data (Virtual Event, China) (SIGMOD ’21). https://doi.org/10.
+     on Usenix Annual Technical Conference (USENIX ATC ’18). USENIX Association,                 1145/3448016.3459240
+     USA, 923–935.                                                                          [25] Svilen Kanev, Juan Pablo Darago, Kim Hazelwood, Parthasarathy Ranganathan,
+ [4] Amazon. 2023. AWS Lambda Pricing. https://aws.amazon.com/lambda/pricing/.                   Tipp Moseley, Gu-Yeon Wei, and David Brooks. 2015. Profiling a warehouse-
+ [5] Fabrice Bellard. 2005. QEMU, a fast and portable dynamic translator.. In USENIX             scale computer. In Proceedings of the 42nd Annual International Symposium on
+     annual technical conference, FREENIX Track, Vol. 41. Califor-nia, USA, 10–5555.             Computer Architecture. 158–169.
+ [6] James Cadden, Thomas Unger, Yara Awad, Han Dong, Orran Krieger, and                    [26] Svilen Kanev, Sam Likun Xi, Gu-Yeon Wei, and David Brooks. 2017. Mallacc:
+     Jonathan Appavoo. 2020. SEUSS: skip redundant paths to make serverless fast.                Accelerating memory allocation. ACM SIGPLAN Notices 52, 4 (2017), 33–45.
+     In Proceedings of the Fifteenth European Conference on Computer Systems. 1–15.         [27] Sagar Karandikar, Chris Leary, Chris Kennelly, Jerry Zhao, Dinesh Parimi,
+ [7] Hasan Cam, Mostafa Abd-El-Barr, and Sadiq M Sait. 1999. A high-performance                  Borivoje Nikolic, Krste Asanovic, and Parthasarathy Ranganathan. 2021. A
+     hardware-efficient memory allocation technique and design. In Proceedings 1999              Hardware Accelerator for Protocol Buffers. In MICRO-54: 54th Annual IEEE/ACM
+     IEEE International Conference on Computer Design: VLSI in Computers and Proces-             International Symposium on Microarchitecture (Virtual Event, Greece) (MICRO
+     sors. IEEE, 274–276.                                                                        ’21). Association for Computing Machinery, New York, NY, USA, 462–478.
+ [8] J. Morris Chang and Edward F. Gehringer. 1996. A high performance memory                    https://doi.org/10.1145/3466752.3480051
+     allocator for object-oriented systems. IEEE Trans. Comput. 45, 3 (1996), 357–366.      [28] Jeongchul Kim and Kyungyong Lee. 2019. Functionbench: A suite of workloads
+ [9] J Morris Chang, Witawas Srisa-An, and C-TD Lo. 2000. Architectural support for              for serverless cloud function service. In 2019 IEEE 12th International Conference
+     dynamic memory management. In Proceedings 2000 International Conference on                  on Cloud Computing (CLOUD). IEEE, 502–504.
+     Computer Design. IEEE, 99–104.                                                         [29] Ana Klimovic, Yawen Wang, Patrick Stuedi, Animesh Trivedi, Jonas Pfefferle,
+[10] containerd. 2023. containerd - An industry-standard container runtime with an               and Christos Kozyrakis. 2018. Pocket: Elastic Ephemeral Storage for Server-
+     emphasis on simplicity, robustness and portability. https://containerd.io.                  less Analytics. In 13th USENIX Symposium on Operating Systems Design and
+[11] Marcin Copik, Grzegorz Kwasniewski, Maciej Besta, Michal Podstawski, and                    Implementation (OSDI 18). USENIX Association, Carlsbad, CA, 427–444. https:
+     Torsten Hoefler. 2021. Sebs: A serverless benchmark suite for function-as-a-                //www.usenix.org/conference/osdi18/presentation/klimovic
+     service computing. In Proceedings of the 22nd International Middleware Conference.     [30] Knative. 2023. Knative. https://knative.dev/docs/.
+     64–78.
+
+
+
+
+                                                                                      135
+Memento: Architectural Support for Ephemeral Memory Management in Serverless Environments                    MICRO ’23, October 28–November 01, 2023, Toronto, ON, Canada
+
+
+[31] Nikita Lazarev, Neil Adit, Shaojie Xiang, Zhiru Zhang, and Christina Delimitrou.           International Conference on Architectural Support for Programming Languages and
+     2021. Dagger: Towards Efficient RPCs in Cloud Microservices with Near-Memory               Operating Systems (ASPLOS 2022). Association for Computing Machinery, New
+     Reconfigurable NICs. In Proceedings of the Twenty Sixth International Conference           York, NY, USA, 753–767. https://doi.org/10.1145/3503222.3507750
+     on Architectural Support for Programming Languages and Operating Systems              [49] David Schall, Artemiy Margaritov, Dmitrii Ustiugov, Andreas Sandberg, and Boris
+     (ASPLOS) (Virtual).                                                                        Grot. 2022. Lukewarm serverless functions: characterization and optimization..
+[32] Sangho Lee, Teresa Johnson, and Easwaran Raman. 2014. Feedback Directed                    In ISCA. 757–770.
+     Optimization of TCMalloc. In Proceedings of the Workshop on Memory Sys-               [50] Johann Schleier-Smith, Vikram Sreekanti, Anurag Khandelwal, Joao Carreira,
+     tems Performance and Correctness (Edinburgh, United Kingdom) (MSPC ’14).                   Neeraja J. Yadwadkar, Raluca Ada Popa, Joseph E. Gonzalez, Ion Stoica, and
+     Association for Computing Machinery, New York, NY, USA, Article 3, 8 pages.                David A. Patterson. 2021. What Serverless Computing is and Should Become:
+     https://doi.org/10.1145/2618128.2618131                                                    The next Phase of Cloud Computing. Commun. ACM 64, 5 (apr 2021), 76–84.
+[33] Shang Li, Zhiyuan Yang, Dhiraj Reddy, Ankur Srivastava, and Bruce Jacob. 2020.             https://doi.org/10.1145/3406011
+     DRAMsim3: a cycle-accurate, thermal-capable DRAM simulator. IEEE Computer             [51] Mohammad Shahrad, Jonathan Balkind, and David Wentzlaff. 2019. Architectural
+     Architecture Letters 19, 2 (2020), 106–109.                                                Implications of Function-as-a-Service Computing. In Proceedings of the 52nd
+[34] Wentong Li, Saraju Mohanty, and Krishna Kavi. 2006. A page-based hybrid                    Annual IEEE/ACM International Symposium on Microarchitecture (Columbus, OH,
+     (software-hardware) dynamic memory allocator. IEEE Computer Architecture                   USA) (MICRO ’52). Association for Computing Machinery, New York, NY, USA,
+     Letters 5, 2 (2006), 13–13.                                                                1063–1075. https://doi.org/10.1145/3352460.3358296
+[35] Wentong Li, Mehran Rezaei, Krishna Kavi, Afrin Naz, and Philip Sweany. 2007.          [52] Mohammad Shahrad, Rodrigo Fonseca, Íñigo Goiri, Gohar Chaudhry, Paul Ba-
+     Feasibility of decoupling memory management from the execution pipeline.                   tum, Jason Cooke, Eduardo Laureano, Colby Tresness, Mark Russinovich, and
+     Journal of Systems Architecture 53, 12 (2007), 927–936.                                    Ricardo Bianchini. 2020. Serverless in the wild: Characterizing and optimizing the
+[36] Linux manual. 2023. mmap(2) - Linux manual page. https://man7.org/linux/man-               serverless workload at a large cloud provider. In 2020 USENIX Annual Technical
+     pages/man2/mmap.2.html.                                                                    Conference (USENIX ATC 20). 205–218.
+[37] Sara McAllister, Benjamin Berg, Julian Tutuncu-Macias, Juncheng Yang, Sathya          [53] Simon Shillaker and Peter Pietzuch. 2020. Faasm: Lightweight isolation for effi-
+     Gunasekar, Jimmy Lu, Daniel S Berger, Nathan Beckmann, and Gregory R Ganger.               cient stateful serverless computing. In 2020 USENIX Annual Technical Conference
+     2021. Kangaroo: Caching billions of tiny objects on flash. In Proceedings of the           (USENIX ATC 20). 419–433.
+     ACM SIGOPS 28th Symposium on Operating Systems Principles. 243–262.                   [54] Arjun Singhvi, Arjun Balasubramanian, Kevin Houck, Mohammed Danish Shaikh,
+[38] Naveen Muralimanohar, Rajeev Balasubramonian, and Norman P Jouppi. 2009.                   Shivaram Venkataraman, and Aditya Akella. 2021. Atoll: A Scalable Low-Latency
+     CACTI 6.0: A tool to model large caches. HP laboratories 27 (2009), 28.                    Serverless Platform. In Proceedings of the ACM Symposium on Cloud Computing
+[39] Edward Oakes, Leon Yang, Dennis Zhou, Kevin Houck, Tyler Harter, Andrea                    (Seattle, WA, USA) (SoCC ’21). Association for Computing Machinery, New York,
+     Arpaci-Dusseau, and Remzi Arpaci-Dusseau. 2018. { SOCK } : Rapid task provision-           NY, USA, 138–152. https://doi.org/10.1145/3472883.3486981
+     ing with { Serverless-Optimized } containers. In 2018 USENIX Annual Technical         [55] Jovan Stojkovic, Tianyin Xu, Hubertus Franke, and Josep Torrellas. 2023. MXFaaS:
+     Conference (USENIX ATC 18). 57–70.                                                         Resource Sharing in Serverless Environments for Parallelism and Efficiency. In
+[40] CPython official repo. 2023.                The Python Benchmark Suite.                    Proceedings of the 50th Annual International Symposium on Computer Architecture
+     https://github.com/python/pyperformance/.                                                  (Orlando, FL, USA) (ISCA ’23). Association for Computing Machinery, New York,
+[41] OpenFaaS. 2023. OpenFaaS. https://www.openfaas.com.                                        NY, USA, Article 34, 15 pages. https://doi.org/10.1145/3579371.3589069
+[42] Python. 2023. CPython official github repo. https://github.com/python/cpython/.       [56] Dmitrii Ustiugov, Plamen Petrov, Marios Kogias, Edouard Bugnion, and Boris Grot.
+[43] Haoran Qiu, Weichao Mao, Archit Patke, Chen Wang, Hubertus Franke, Zbig-                   2021. Benchmarking, analysis, and optimization of serverless function snapshots.
+     niew T. Kalbarczyk, Tamer Başar, and Ravishankar K. Iyer. 2022. Reinforcement              In Proceedings of the 26th ACM International Conference on Architectural Support
+     Learning for Resource Management in Multi-Tenant Serverless Platforms. In                  for Programming Languages and Operating Systems. 559–572.
+     Proceedings of the 2nd European Workshop on Machine Learning and Systems              [57] Kai-Ting Amy Wang, Rayson Ho, and Peng Wu. 2019. Replayable Execution Op-
+     (Rennes, France) (EuroMLSys ’22). Association for Computing Machinery, New                 timized for Page Sharing for a Managed Runtime Environment. In Proceedings of
+     York, NY, USA, 20–28. https://doi.org/10.1145/3517207.3526971                              the Fourteenth EuroSys Conference 2019 (EuroSys ’19). Association for Computing
+[44] Arun F Rodrigues, Gwendolyn Renae Voskuilen, Simon David Hammond, and                      Machinery, New York, NY, USA, 1–16. https://doi.org/10.1145/3302424.3303978
+     Karl Scott Hemmert. 2016. Structural Simulation Toolkit (SST). Technical Report.      [58] Yanan Yang, Laiping Zhao, Yiming Li, Huanyu Zhang, Jie Li, Mingyang Zhao,
+     Sandia National Lab.(SNL-NM), Albuquerque, NM (United States).                             Xingzhen Chen, and Keqiu Li. 2022. INFless: A Native Serverless System for Low-
+[45] Francisco Romero, Gohar Irfan Chaudhry, Íñigo Goiri, Pragna Gopa, Paul Batum,              Latency, High-Throughput Inference. In Proceedings of the 27th ACM International
+     Neeraja J. Yadwadkar, Rodrigo Fonseca, Christos Kozyrakis, and Ricardo Bian-               Conference on Architectural Support for Programming Languages and Operating
+     chini. 2021. Faa$T: A Transparent Auto-Scaling Cache for Serverless Applications.          Systems (Lausanne, Switzerland) (ASPLOS ’22). Association for Computing Ma-
+     In Proceedings of the ACM Symposium on Cloud Computing (Seattle, WA, USA)                  chinery, New York, NY, USA, 768–781. https://doi.org/10.1145/3503222.3507709
+     (SoCC ’21). Association for Computing Machinery, New York, NY, USA, 122–137.          [59] Yanqi Zhang, Íñigo Goiri, Gohar Irfan Chaudhry, Rodrigo Fonseca, Sameh El-
+     https://doi.org/10.1145/3472883.3486974                                                    nikety, Christina Delimitrou, and Ricardo Bianchini. 2021. Faster and Cheaper
+[46] Francisco Romero, Qian Li, Neeraja J. Yadwadkar, and Christos Kozyrakis.                   Serverless Computing on Harvested Resources. In Proceedings of the ACM
+     2021. INFaaS: Automated Model-less Inference Serving. In 2021 USENIX An-                   SIGOPS 28th Symposium on Operating Systems Principles (Virtual Event, Ger-
+     nual Technical Conference (USENIX ATC 21). USENIX Association, 397–411.                    many) (SOSP ’21). Association for Computing Machinery, New York, NY, USA,
+     https://www.usenix.org/conference/atc21/presentation/romero                                724–739. https://doi.org/10.1145/3477132.3483580
+[47] Francisco Romero, Mark Zhao, Neeraja J. Yadwadkar, and Christos Kozyrakis.            [60] Zhuangzhuang Zhou, Yanqi Zhang, and Christina Delimitrou. 2022. AQUATOPE:
+     2021. Llama: A Heterogeneous & Serverless Framework for Auto-Tuning Video                  QoS-and-Uncertainty-Aware Resource Management for Multi-Stage Serverless
+     Analytics Pipelines. In Proceedings of the ACM Symposium on Cloud Computing                Workflows. In Proceedings of the 28th ACM International Conference on Archi-
+     (Seattle, WA, USA) (SoCC ’21). Association for Computing Machinery, New York,              tectural Support for Programming Languages and Operating Systems, Volume 1
+     NY, USA, 1–17. https://doi.org/10.1145/3472883.3486972                                     (Vancouver, BC, Canada) (ASPLOS 2023). Association for Computing Machinery,
+[48] Rohan Basu Roy, Tirthak Patel, and Devesh Tiwari. 2022. IceBreaker: warming                New York, NY, USA, 1–14. https://doi.org/10.1145/3567955.3567960
+     serverless functions better with heterogeneity. In Proceedings of the 27th ACM
+
+
+
+
+                                                                                     136
+

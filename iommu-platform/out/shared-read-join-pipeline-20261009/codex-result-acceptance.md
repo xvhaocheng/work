@@ -1,0 +1,5 @@
+# §67 Root acceptance: closure gain survives ordinary B pipeline, narrowly
+
+Four builds succeeded.32newexecutions:30fullcopyPASS +2 strictactual-handoverrequirement rejections(run12/14), notwatchdogdeadlocks. Max2 changedtriggerEto256; burst-end J256 rejectsroutehandover safely. Explicitfallback runs31/32 withrequire0 pass ordinaryindependent completion; failedrequestrecordsretained. SixMax1runs match§65 actualCSV andnestedmetrics exactly(onlytraceignored). AllPASS independentlychecksourceAR/R and256Wperflow/2048verifiedbytes; actualpendingB2 eachflow. Rootdirectlyreadcriticalpipeline/protocol sources.
+
+SameE comparisons:K16minimal4509/4508 vsburstEnd4557/4548 (~0.97%mean lower); pressureF1minimal9697/9706 vsburst9940/9941 (~2.40%); K127minimal4583/4574 vsburst4781/4780 (~4.22%). RawW/BpipelinechangesJ/E timing; do notcomparefixedK asifactualEidenticalacrossMax. Minimalsurvives thisparticularstrongordinarycontrol butdoesnotproveindependentnovelty or universalchoice. E256 can tradeV/A forordinaryfallback. NeedactualparallelindependentREADcontrolandliterature boundaries.

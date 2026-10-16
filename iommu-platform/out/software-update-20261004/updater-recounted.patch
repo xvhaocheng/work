@@ -1,0 +1,523 @@
+diff --git a/bench/platform_sd_update.c b/bench/platform_sd_update.c
+--- a/bench/platform_sd_update.c
++++ b/bench/platform_sd_update.c
+@@ -5,11 +5,15 @@
+  *   - the target must be a plain /dev/mmcblk<number>p1 block device with no
+  *     symlink anywhere in its path, and the process must run as root;
+  *   - the partition must report exactly 32 MiB through BLKGETSIZE64 and the
+- *     matching sysfs attributes (partition 1, start 2048, size 65536);
++ *     matching sysfs attributes (partition 1, start 2048, size 65536); the
++ *     target, parent and image are opened with O_NOFOLLOW, both block devices
++ *     must report a 512 byte logical sector size, and the sysfs dev attributes
++ *     must match the opened device numbers and the real sysfs parent;
+  *   - the GPT in the parent disk is validated through a read-only descriptor:
+  *     signature, revision, header size, header CRC32, entry array CRC32, the
+- *     boot partition type GUID, its unique GUID, the first and last LBA, and
+- *     that the partition fits inside the parent capacity;
++ *     boot partition type GUID, its unique GUID, the first and last LBA, the
++ *     usable LBA range and backup header position, the overflow checked entry
++ *     array bounds, and that no other partition overlaps the boot partition;
+  *   - a mounted target or a second updater holding the parent lock is refused;
+  *   - the image is loaded into a calloc'ed 32 MiB buffer before any writable
+  *     descriptor exists, so a changing or short source file can never leak
+@@ -37,6 +41,9 @@
+ #ifndef BLKGETSIZE64
+ #define BLKGETSIZE64 _IOR(0x12, 114, size_t)
+ #endif
++#ifndef BLKSSZGET
++#define BLKSSZGET _IO(0x12, 104)
++#endif
+ 
+ #define PATH_BUF 4096
+ #define NAME_BUF 256
+@@ -124,6 +131,24 @@
+     return 0;
+ }
+ 
++static int mul_u64_checked(uint64_t left, uint64_t right, uint64_t *result)
++{
++    if (left != 0 && right > UINT64_MAX / left) {
++        return -1;
++    }
++    *result = left * right;
++    return 0;
++}
++
++static int add_u64_checked(uint64_t left, uint64_t right, uint64_t *result)
++{
++    if (right > UINT64_MAX - left) {
++        return -1;
++    }
++    *result = left + right;
++    return 0;
++}
++
+ static uint32_t crc32_table[256];
+ static int crc32_ready = 0;
+ 
+@@ -350,6 +375,21 @@
+     return 0;
+ }
+ 
++static int block_logical_sector_size(int descriptor, const char *description, uint64_t *size)
++{
++    int sector = 0;
++    if (ioctl(descriptor, BLKSSZGET, &sector) != 0) {
++        report("BLKSSZGET failed on %s: %s", description, strerror(errno));
++        return -1;
++    }
++    if (sector <= 0) {
++        report("%s reports an invalid logical sector size %d", description, sector);
++        return -1;
++    }
++    *size = (uint64_t)sector;
++    return 0;
++}
++
+ static int sysfs_says(const char *name, const char *attribute, const char *expected)
+ {
+     char path[PATH_BUF];
+@@ -366,15 +406,87 @@
+     return 0;
+ }
+ 
+-static int verify_sysfs_layout(const char *partition_name, const char *parent_name)
++static int sysfs_device_matches(const char *name, dev_t device)
++{
++    char path[PATH_BUF];
++    char value[128];
++    unsigned int field_major = 0;
++    unsigned int field_minor = 0;
++    snprintf(path, sizeof(path), "/sys/class/block/%s/dev", name);
++    if (read_sysfs_value(path, value, sizeof(value)) != 0) {
++        report("cannot read %s: %s", path, strerror(errno));
++        return -1;
++    }
++    if (sscanf(value, "%u:%u", &field_major, &field_minor) != 2) {
++        report("sysfs reports %s %s, expected a MAJ:MIN pair", path, value);
++        return -1;
++    }
++    if (field_major != (unsigned int)major(device) ||
++        field_minor != (unsigned int)minor(device)) {
++        report("sysfs %s reports %u:%u, expected %u:%u", path, field_major, field_minor,
++               (unsigned int)major(device), (unsigned int)minor(device));
++        return -1;
++    }
++    return 0;
++}
++
++static int sysfs_real_parent(const char *name, char *parent, size_t parent_size)
++{
++    char path[PATH_BUF];
++    char resolved[PATH_BUF];
++    ssize_t length;
++    char *slash;
++    snprintf(path, sizeof(path), "/sys/class/block/%s", name);
++    length = readlink(path, resolved, sizeof(resolved) - 1);
++    if (length < 0) {
++        report("cannot resolve %s: %s", path, strerror(errno));
++        return -1;
++    }
++    resolved[length] = '\0';
++    slash = strrchr(resolved, '/');
++    if (slash == NULL || slash == resolved) {
++        report("unexpected sysfs layout for %s", name);
++        return -1;
++    }
++    *slash = '\0';
++    slash = strrchr(resolved, '/');
++    if (slash == NULL || slash[1] == '\0') {
++        report("unexpected sysfs layout for %s", name);
++        return -1;
++    }
++    if (strlen(slash + 1) + 1 > parent_size) {
++        report("sysfs parent name for %s is too long", name);
++        return -1;
++    }
++    snprintf(parent, parent_size, "%s", slash + 1);
++    return 0;
++}
++
++static int verify_sysfs_layout(const char *partition_name, const char *parent_name,
++                               dev_t partition_device, dev_t parent_device)
+ {
+     char expected_start[32];
+     char expected_size[32];
+     char path[PATH_BUF];
+     char value[128];
++    char resolved_parent[NAME_BUF];
+     unsigned long long parent_sectors;
+     snprintf(expected_start, sizeof(expected_start), "%llu", (unsigned long long)PARTITION_START_LBA);
+     snprintf(expected_size, sizeof(expected_size), "%llu", (unsigned long long)PARTITION_SECTORS);
++    if (sysfs_device_matches(partition_name, partition_device) != 0) {
++        return -1;
++    }
++    if (sysfs_device_matches(parent_name, parent_device) != 0) {
++        return -1;
++    }
++    if (sysfs_real_parent(partition_name, resolved_parent, sizeof(resolved_parent)) != 0) {
++        return -1;
++    }
++    if (strcmp(resolved_parent, parent_name) != 0) {
++        report("sysfs reports %s under parent %s, expected %s",
++               partition_name, resolved_parent, parent_name);
++        return -1;
++    }
+     if (sysfs_says(partition_name, "partition", "1") != 0) {
+         return -1;
+     }
+@@ -471,17 +583,23 @@
+     uint32_t header_size;
+     uint32_t header_crc;
+     uint64_t current_lba;
++    uint64_t backup_lba;
++    uint64_t first_usable;
++    uint64_t last_usable;
+     uint64_t entries_lba;
+     uint32_t entry_count;
+     uint32_t entry_size;
+     uint32_t entries_crc;
+     uint64_t entries_bytes;
+     uint64_t entries_offset;
++    uint64_t entries_end;
++    uint64_t parent_sectors;
+     uint32_t computed_crc;
+     const uint8_t *entry;
+     uint64_t first_lba;
+     uint64_t last_lba;
+     uint8_t scratch[GPT_HEADER_BYTES];
++    uint32_t index;
+ 
+     if (parse_guid(BOOT_TYPE_GUID, expected_type) != 0 ||
+         parse_guid(BOOT_UNIQUE_GUID, expected_unique) != 0) {
+@@ -500,6 +618,9 @@
+     header_size = read_le32(header + 12);
+     header_crc = read_le32(header + 16);
+     current_lba = read_le64(header + 24);
++    backup_lba = read_le64(header + 32);
++    first_usable = read_le64(header + 40);
++    last_usable = read_le64(header + 48);
+     entries_lba = read_le64(header + 72);
+     entry_count = read_le32(header + 80);
+     entry_size = read_le32(header + 84);
+@@ -525,6 +646,17 @@
+         report("the GPT header is not the primary header at LBA 1");
+         return -1;
+     }
++    parent_sectors = parent_capacity / SECTOR_SIZE;
++    if (first_usable < 2u || first_usable > PARTITION_START_LBA ||
++        last_usable < first_usable || last_usable >= parent_sectors) {
++        report("the GPT usable LBA range %llu..%llu is inconsistent with the parent device",
++               (unsigned long long)first_usable, (unsigned long long)last_usable);
++        return -1;
++    }
++    if (parent_sectors == 0u || backup_lba != parent_sectors - 1) {
++        report("the GPT backup header is not at the last sector of the parent device");
++        return -1;
++    }
+     if (entry_count == 0u || entry_count > GPT_MAX_ENTRIES) {
+         report("unsupported GPT partition entry count %u", entry_count);
+         return -1;
+@@ -534,10 +666,15 @@
+         report("unsupported GPT partition entry size %u", entry_size);
+         return -1;
+     }
+-    entries_bytes = (uint64_t)entry_count * entry_size;
+-    entries_offset = entries_lba * SECTOR_SIZE;
+-    if (entries_lba < 2u || entries_offset + entries_bytes > parent_capacity) {
+-        report("the GPT partition entry array lies outside the parent device");
++    if (mul_u64_checked((uint64_t)entry_count, (uint64_t)entry_size, &entries_bytes) != 0 ||
++        mul_u64_checked(entries_lba, SECTOR_SIZE, &entries_offset) != 0 ||
++        add_u64_checked(entries_offset, entries_bytes, &entries_end) != 0) {
++        report("the GPT partition entry array range overflows");
++        return -1;
++    }
++    if (entries_lba < 2u || entries_end > parent_capacity ||
++        entries_end > first_usable * SECTOR_SIZE) {
++        report("the GPT partition entry array lies outside the primary partition table area");
+         return -1;
+     }
+     entries = malloc((size_t)entries_bytes);
+@@ -591,6 +728,31 @@
+         free(entries);
+         return -1;
+     }
++    for (index = 1; index < entry_count; index++) {
++        static const uint8_t empty_guid[16] = {0};
++        const uint8_t *item = entries + (size_t)index * entry_size;
++        uint64_t item_first;
++        uint64_t item_last;
++        if (memcmp(item, empty_guid, 16) == 0) {
++            continue;
++        }
++        item_first = read_le64(item + 32);
++        item_last = read_le64(item + 40);
++        if (item_first > item_last ||
++            item_first < first_usable || item_last > last_usable) {
++            report("GPT partition %u has an invalid LBA range %llu..%llu",
++                   index + 1u, (unsigned long long)item_first,
++                   (unsigned long long)item_last);
++            free(entries);
++            return -1;
++        }
++        if (item_first <= PARTITION_START_LBA + PARTITION_SECTORS - 1 &&
++            item_last >= PARTITION_START_LBA) {
++            report("GPT partition %u overlaps the boot partition", index + 1u);
++            free(entries);
++            return -1;
++        }
++    }
+     free(entries);
+     boot->start_lba = first_lba;
+     boot->sectors = last_lba - first_lba + 1;
+@@ -600,9 +762,13 @@
+ static int load_image(const char *path, uint8_t *buffer, size_t buffer_size, size_t *image_size)
+ {
+     struct stat status;
+-    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
++    int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+     if (descriptor < 0) {
+-        report("cannot open image %s: %s", path, strerror(errno));
++        if (errno == ELOOP) {
++            report("image %s must not be a symbolic link", path);
++        } else {
++            report("cannot open image %s: %s", path, strerror(errno));
++        }
+         return -1;
+     }
+     if (fstat(descriptor, &status) != 0) {
+@@ -755,6 +921,10 @@
+             report("target %s is not a block device", target);
+             goto cleanup;
+         }
++        if (strcmp(dir, "/dev") != 0) {
++            report("target %s must live under /dev as /dev/mmcblk<number>p1", target);
++            goto cleanup;
++        }
+         if (parse_boot_partition_name(base, parent_base, sizeof(parent_base)) != 0) {
+             report("target basename %s is not mmcblk<number>p1", base);
+             goto cleanup;
+@@ -769,7 +939,7 @@
+         parent_description = target;
+     }
+ 
+-    target_fd = open(target, O_RDONLY | O_CLOEXEC);
++    target_fd = open(target, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+     if (target_fd < 0) {
+         report("cannot open %s read-only: %s", target, strerror(errno));
+         goto cleanup;
+@@ -808,6 +978,18 @@
+             goto cleanup;
+         }
+         {
++            uint64_t logical_sector = 0;
++            if (block_logical_sector_size(target_fd, target, &logical_sector) != 0) {
++                goto cleanup;
++            }
++            if (logical_sector != SECTOR_SIZE) {
++                report("partition %s reports a %llu byte logical sector, expected %llu",
++                       target, (unsigned long long)logical_sector,
++                       (unsigned long long)SECTOR_SIZE);
++                goto cleanup;
++            }
++        }
++        {
+             int mounted = device_is_mounted(target_device, target);
+             if (mounted < 0) {
+                 report("cannot read /proc/self/mountinfo: %s", strerror(errno));
+@@ -821,7 +1003,7 @@
+         write_offset = 0;
+     }
+ 
+-    parent_fd = open(parent_description, O_RDONLY | O_CLOEXEC);
++    parent_fd = open(parent_description, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+     if (parent_fd < 0) {
+         report("cannot open %s read-only: %s", parent_description, strerror(errno));
+         goto cleanup;
+@@ -852,6 +1034,18 @@
+             goto cleanup;
+         }
+         parent_capacity = size;
++        {
++            uint64_t logical_sector = 0;
++            if (block_logical_sector_size(parent_fd, parent_description, &logical_sector) != 0) {
++                goto cleanup;
++            }
++            if (logical_sector != SECTOR_SIZE) {
++                report("parent %s reports a %llu byte logical sector, expected %llu",
++                       parent_description, (unsigned long long)logical_sector,
++                       (unsigned long long)SECTOR_SIZE);
++                goto cleanup;
++            }
++        }
+     }
+ 
+     if (flock(parent_fd, LOCK_EX | LOCK_NB) != 0) {
+@@ -859,7 +1053,8 @@
+         goto cleanup;
+     }
+ 
+-    if (!simulated && verify_sysfs_layout(base, parent_base) != 0) {
++    if (!simulated &&
++        verify_sysfs_layout(base, parent_base, target_device, parent_stat.st_rdev) != 0) {
+         goto cleanup;
+     }
+ 
+@@ -890,7 +1085,7 @@
+         goto cleanup;
+     }
+ 
+-    write_fd = open(target, O_RDWR | O_CLOEXEC);
++    write_fd = open(target, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+     if (write_fd < 0) {
+         report("cannot open %s for writing: %s", target, strerror(errno));
+         goto cleanup;
+@@ -922,6 +1117,17 @@
+         }
+     }
+ 
++    if (!simulated) {
++        int mounted = device_is_mounted(target_device, target);
++        if (mounted < 0) {
++            report("cannot read /proc/self/mountinfo: %s", strerror(errno));
++            goto cleanup;
++        }
++        if (mounted) {
++            report("target %s became mounted; refusing to write", target);
++            goto cleanup;
++        }
++    }
+     if (pwrite_full(write_fd, image, (size_t)PARTITION_SIZE, (off_t)write_offset) != 0) {
+         report("writing %s failed: %s", target, strerror(errno));
+         goto cleanup;
+diff --git a/tests/test_platform_sd_update.py b/tests/test_platform_sd_update.py
+--- a/tests/test_platform_sd_update.py
++++ b/tests/test_platform_sd_update.py
+@@ -3,7 +3,7 @@
+ 
+ The tool is compiled twice: a production binary without test hooks and a
+ test binary built with -DPLATFORM_SD_UPDATE_TEST. Every case runs against a
+-synthetic sparse 64 MiB GPT image in a temporary directory: no board, no
++synthetic sparse 80 MiB GPT image in a temporary directory: no board, no
+ root and no real device are involved.
+ """
+ import fcntl
+@@ -27,7 +27,7 @@
+ PART_SIZE = PART_SECTORS * SECTOR
+ SECOND_LBA = 69632
+ SECOND_SECTORS = 65536
+-DISK_SIZE = 64 * 1024 * 1024
++DISK_SIZE = 80 * 1024 * 1024
+ 
+ TYPE_GUID = '7412F7D5-A156-4B13-81DC-867174929325'
+ UNIQUE_GUID = '46298C61-BAC2-44C9-A8FF-8FA61CF2BEE0'
+@@ -68,31 +68,49 @@
+     entries = bytearray(entry_count * entry_size)
+     entries[0:128] = entry0
+     entries[128:256] = entry1
+-    header = bytearray(512)
+-    header[0:8] = signature
+-    struct.pack_into('<I', header, 8, revision)
+-    struct.pack_into('<I', header, 12, header_size)
+-    struct.pack_into('<I', header, 20, 0)
+-    struct.pack_into('<Q', header, 24, current_lba)
+-    struct.pack_into('<Q', header, 32, disk_size // SECTOR - 1)
+-    struct.pack_into('<Q', header, 40, 34)
+-    struct.pack_into('<Q', header, 48, disk_size // SECTOR - 34)
+-    header[56:72] = guid_bytes(disk_guid)
+-    struct.pack_into('<Q', header, 72, entries_lba)
+-    struct.pack_into('<I', header, 80, entry_count)
+-    struct.pack_into('<I', header, 84, entry_size)
+-    struct.pack_into('<I', header, 88, zlib.crc32(bytes(entries)) & 0xFFFFFFFF)
+-    struct.pack_into('<I', header, 16, zlib.crc32(bytes(header[:header_size])) & 0xFFFFFFFF)
++    entries_crc = zlib.crc32(bytes(entries)) & 0xFFFFFFFF
++    disk_sectors = disk_size // SECTOR
++
++    def build_header(entries_lba_value, current_lba_value, backup_lba_value):
++        header = bytearray(512)
++        header[0:8] = signature
++        struct.pack_into('<I', header, 8, revision)
++        struct.pack_into('<I', header, 12, header_size)
++        struct.pack_into('<I', header, 20, 0)
++        struct.pack_into('<Q', header, 24, current_lba_value)
++        struct.pack_into('<Q', header, 32, backup_lba_value)
++        struct.pack_into('<Q', header, 40, 34)
++        struct.pack_into('<Q', header, 48, disk_sectors - 34)
++        header[56:72] = guid_bytes(disk_guid)
++        struct.pack_into('<Q', header, 72, entries_lba_value)
++        struct.pack_into('<I', header, 80, entry_count)
++        struct.pack_into('<I', header, 84, entry_size)
++        struct.pack_into('<I', header, 88, entries_crc)
++        struct.pack_into('<I', header, 16,
++                         zlib.crc32(bytes(header[:header_size])) & 0xFFFFFFFF)
++        return header
++
++    primary_header = build_header(entries_lba, current_lba, disk_sectors - 1)
++    backup_entries_sectors = (len(entries) + SECTOR - 1) // SECTOR
++    backup_entries_lba = disk_sectors - 1 - backup_entries_sectors
++    backup_header = build_header(backup_entries_lba, disk_sectors - 1, 1)
++    entries_offset = entries_lba * SECTOR
++    entries_fit = 0 <= entries_lba and entries_offset + len(entries) <= disk_size
+     with open(path, 'wb') as handle:
+         handle.truncate(disk_size)
+         handle.write(bytes((offset * 31 + 7) & 0xFF for offset in range(4096)))
+         handle.seek(SECTOR)
+-        handle.write(bytes(header))
+-        handle.seek(entries_lba * SECTOR)
+-        handle.write(bytes(entries))
++        handle.write(bytes(primary_header))
++        if entries_fit:
++            handle.seek(entries_offset)
++            handle.write(bytes(entries))
+         if (SECOND_LBA + 8) * SECTOR <= disk_size:
+             handle.seek(SECOND_LBA * SECTOR)
+             handle.write(bytes((offset * 13 + 5) & 0xFF for offset in range(4096)))
++        handle.seek(backup_entries_lba * SECTOR)
++        handle.write(bytes(entries))
++        handle.seek((disk_sectors - 1) * SECTOR)
++        handle.write(bytes(backup_header))
+     return Path(path)
+ 
+ 
+@@ -168,6 +186,10 @@
+         self.assertEqual(after[:PART_OFFSET], before[:PART_OFFSET], 'GPT area changed')
+         self.assertEqual(after[PART_OFFSET + PART_SIZE:], before[PART_OFFSET + PART_SIZE:],
+                          'data after the boot partition changed')
++        backup_header_offset = (DISK_SIZE // SECTOR - 1) * SECTOR
++        self.assertEqual(after[backup_header_offset:backup_header_offset + SECTOR],
++                         before[backup_header_offset:backup_header_offset + SECTOR],
++                         'backup GPT header changed')
+         self.assertEqual(after[PART_OFFSET:PART_OFFSET + len(payload)], payload)
+         padding = after[PART_OFFSET + len(payload):PART_OFFSET + PART_SIZE]
+         self.assertEqual(padding, b'\x00' * (PART_SIZE - len(payload)))
+@@ -213,10 +235,28 @@
+     def test_rejects_corrupted_entry_crc(self):
+         make_disk(self.disk)
+         self.write_payload(4096)
++        entries_size = 128 * 128
+         with open(self.disk, 'r+b') as handle:
+-            handle.seek(SECTOR + 88)
+-            handle.write(b'\xde\xad\xbe\xef')
++            handle.seek(2 * SECTOR + entries_size - 1)
++            handle.write(b'\x5a')
+         self.assert_rejected(message='entry array CRC')
++
++    def test_rejects_entry_array_overflow(self):
++        make_disk(self.disk, entries_lba=0xFFFFFFFFFFFFFFFF)
++        self.write_payload(4096)
++        self.assert_rejected(message='entry array')
++
++    def test_rejects_entry_array_overlapping_boot(self):
++        make_disk(self.disk, entries_lba=START_LBA + 4)
++        self.write_payload(4096)
++        self.assert_rejected(message='entry array')
++
++    def test_rejects_second_entry_overlapping_boot(self):
++        make_disk(self.disk, entry1=build_entry(
++            OTHER_TYPE_GUID, OTHER_UNIQUE_GUID,
++            START_LBA + 1024, START_LBA + PART_SECTORS + 1024, 'data'))
++        self.write_payload(4096)
++        self.assert_rejected(message='overlap')
+ 
+     def test_rejects_missing_gpt(self):
+         with open(self.disk, 'wb') as handle:

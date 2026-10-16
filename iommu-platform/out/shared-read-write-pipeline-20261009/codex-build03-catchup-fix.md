@@ -1,0 +1,3 @@
+# §66 build03 ordinary synchronization repair
+
+Build02 policy0/Max2 has six real watchdog failures (run04/08/12/16/20/24). At run04 termination V groups2 vs A groups3; no live W/B; equality blocks V from catching up. Root authored this out-only fixture defect; it does not establish a production PN defect. Max2 counts first child creation, therefore admits when its count <= peer count. A leader is blocked and a lagger can catch up. Max1 counts real B and retains old equality. All failures and build02 sources/executables remain sealed. This is ordinary barrier correctness, not an innovation claim.

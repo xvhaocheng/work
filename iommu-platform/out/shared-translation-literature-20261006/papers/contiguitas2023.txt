@@ -1,0 +1,1133 @@
+        Contiguitas: The Pursuit of Physical Memory Contiguity in
+                               Datacenters
+                     Kaiyang Zhao                                                     Kaiwen Xue                                     Ziqi Wang
+            Carnegie Mellon University                                      Carnegie Mellon University                      Carnegie Mellon University
+              kaiyang2@cs.cmu.edu                                           kaiwenx@andrew.cmu.edu                           ziqiw@andrew.cmu.edu
+
+                   Dan Schatzberg                                                      Leon Yang                               Antonis Manousis
+                 Meta Platforms, Inc.                                             Meta Platforms, Inc.                          Meta Platforms, Inc.
+               dschatzberg@meta.com                                                lnyng@meta.com                              amanousis@meta.com
+
+                  Johannes Weiner                                                     Rik van Riel                                Bikash Sharma
+                  Meta Platforms, Inc.                                            Meta Platforms, Inc.                          Meta Platforms, Inc.
+                  jweiner@meta.com                                                 riel@meta.com                                bsharma@meta.com
+
+                                                  Chunqiang Tang                                      Dimitrios Skarlatos
+                                                  Meta Platforms, Inc.                              Carnegie Mellon University
+                                                   tang@meta.com                                       dskarlat@cs.cmu.edu
+
+ABSTRACT                                                                                           We build the operating system component of Contiguitas into
+The unabating growth of the memory needs of emerging datacenter                                 the Linux kernel and run our experiments in a production environ-
+applications has exacerbated the scalability bottleneck of virtual                              ment at Meta’s datacenters. Our results show that Contiguitas’s OS
+memory. However, reducing the excessive overhead of address                                     component successfully confines unmovable allocations, drastically
+translation will remain onerous until the physical memory contigu-                              reducing unmovable 2MB blocks from an average of 31% scattered
+ity predicament gets resolved. To address this problem, this paper                              across the address space down to 7% confined in the unmovable re-
+presents Contiguitas, a novel redesign of memory management in                                  gion, leading to significant performance gains. Specifically, we show
+the operating system and hardware that provides ample physical                                  that for three major production services, Contiguitas achieves end-
+memory contiguity. We identify that the primary cause of memory                                 to-end performance improvements of 2-9% for partially fragmented
+fragmentation in Meta’s datacenters is unmovable allocations scat-                              servers, and 7-18% for highly fragmented servers, which account
+tered across the address space that impede large contiguity from                                for nearly a quarter of Meta’s fleet. We further use full-system simu-
+being formed. To provide ample physical memory contiguity by                                    lations to demonstrate the effectiveness of the hardware extensions
+design, Contiguitas first separates regular movable allocations from                            of Contiguitas. Our evaluation shows that Contiguitas-HW enables
+unmovable ones by placing them into two different continuous                                    the efficient migration of unmovable allocations, scales well with
+regions in physical memory and dynamically adjusts the boundary                                 the number of victim TLBs, and does not affect application perfor-
+of the two regions based on memory demand. Drastically reduc-                                   mance. We are currently in the process of upstreaming Contiguitas
+ing unmovable allocations is challenging because the majority of                                into Linux.
+unmovable pages cannot be moved with software alone given that
+access to the page cannot be blocked for a migration to take place.
+Furthermore, page migration is expensive as it requires a long
+                                                                                                CCS CONCEPTS
+downtime to (a) perform TLB shootdowns that scale poorly with                                   • Software and its engineering → Operating systems; Virtual
+the number of victim TLBs, and (b) copy the page. To this end, Con-                             memory; • Computer systems organization → Architectures.
+tiguitas eliminates the primary source of unmovable allocations by
+introducing hardware extensions in the last-level cache to enable
+the transparent and efficient migration of unmovable pages even                                 KEYWORDS
+while the pages remain in use.                                                                  Datacenters; Operating Systems; Memory Management; Virtual
+                                                                                                Memory
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+                                                                                                ACM Reference Format:
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the              Kaiyang Zhao, Kaiwen Xue, Ziqi Wang, Dan Schatzberg, Leon Yang, Anto-
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or          nis Manousis, Johannes Weiner, Rik van Riel, Bikash Sharma, Chunqiang
+republish, to post on servers or to redistribute to lists, requires prior specific permission   Tang, and Dimitrios Skarlatos. 2023. Contiguitas: The Pursuit of Physi-
+and/or a fee. Request permissions from permissions@acm.org.
+                                                                                                cal Memory Contiguity in Datacenters. In Proceedings of the 50th Annual
+ISCA ’23, June 17–21, 2023, Orlando, FL, USA.
+© 2023 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+                                                                                                International Symposium on Computer Architecture (ISCA ’23), June 17–
+ACM ISBN 979-8-4007-0095-8/23/06. . . $15.00                                                    21, 2023, Orlando, FL, USA. ACM, New York, NY, USA, 15 pages. https:
+https://doi.org/10.1145/3579371.3589079                                                         //doi.org/10.1145/3579371.3589079
+ISCA ’23, June 17–21, 2023, Orlando, FL, USA.                                                                                         Zhao et al.
+
+
+1    INTRODUCTION                                                         as userspace allocators [48, 67, 68] still rely on the OS to provide
+Memory capacity has increased dramatically over the last decades,         physical contiguity and larger mappings.
+yet modern operating systems have throughout stuck with a small              Addressing excessive memory management overhead will re-
+base page size. This divergence has resulted in excessive manage-         quire a fundamental shift towards larger page granularities. How-
+ment overhead for memory-intensive applications. In particular,           ever, fragmentation remains as the primary obstacle. Illumina-
+virtual memory implementations are plagued by expansive page              tor [78] is a major prior work that tries to address fragmentation.
+table trees, and a corresponding appetite for hardware TLB capacity       Within a 2 MB block, it prevents mixing unmovable allocations and
+that is difficult to satiate.                                             movable ones that the kernel can move on-demand. This work,
+    Even with architectural innovations such as larger and multi-         while innovative, has some key limitations.
+level TLBs and page walk caches [4, 14–16, 21–24, 29, 60, 82], appli-        First, the fundamental problem of unmovable allocations, i.e.,
+cations today suffer a substantial performance penalty due to TLB         that the OS cannot move them after their allocation, remains. Sec-
+misses. Google’s internal profiling revealed that approximately 20%       ond, avoiding mixing movable and unmovable allocations within
+of cycles are stalled on TLB misses [48]. Unfortunately, this problem     2 MB blocks still fragments the address space, prevents large con-
+is only bound to get worse due to: i) the inherent hardware limits of     tiguous regions from being formed, and consequently blocks larger
+TLB scaling, already surpassing L2 cache latencies [112], ii) terabyte-   translations. This is because it limits the maximum available con-
+scale memory capacity through technologies like CXL [56, 93], iii)        tiguity to at most 2 MB. For example, a single unmovable 4 KB
+additional levels of page tables [51], iv) the increase of memory-        page can render a 1 GB region unmovable; as a result just 0.19% of
+intensive applications, and v) upcoming confidential computing            2MB unmovable allocations can fragment the whole of memory ir-
+platforms that place security checks at page granularity during           recoverably. Third, the effectiveness of defragmentation is severely
+address translation [10, 53].                                             hindered by the presence of unmovable allocations [114]. Overall,
+    A large body of prior research has focused on reducing the            despite significant efforts in virtual memory research, eliminating
+address translation overhead [1–3, 14, 16, 20, 23, 30, 36, 45, 48,        the address translation overhead will remain onerous in real world
+60, 62, 71, 77, 83, 92, 95, 96, 98–100, 108, 115]. Conceptually, we       environments until the physical memory contiguity predicament
+can separate prior work based on the amount of physical memory            gets resolved.
+contiguity required and how it is exploited. On the one hand, earlier
+works propose leveraging physical memory contiguity to back the           1.1    This Paper: Ample Physical Memory
+application dataset [4, 16, 36, 37, 60, 61, 82]. These approaches
+                                                                                 Contiguity by Design.
+create range-based translations, similar to segments, that map large
+contiguous regions of virtual memory to equally large contiguous          In this work, we start with a detailed investigation of physical mem-
+physical memory. Their goal is to ultimately reduce the number of         ory contiguity at hyperscale across Meta’s datacenters. We sample
+TLB entries needed. However, they face the fundamental challenge          servers across the fleet and show that 23% of servers do not even have
+that it is very hard to create multi-gigabyte contiguous physical         physical memory contiguity for a single 2 MB huge page. We also
+address ranges to cover the complete application dataset.                 find that it is practically impossible to dynamically allocate 1 GB
+    On the other hand, another line of research has explored alter-       pages in a production environment. Pertinently, fragmentation af-
+native page table structures such as hashed page tables [32, 47,          fects all servers as there is little to no correlation between memory
+58, 59, 95, 99, 101, 115]. Indeed, recent work [95, 98, 99, 115] has      contiguity availability and server up-time. In practice, servers can
+solved some of their traditional shortcomings [15, 33, 41, 49, 50].       quickly get heavily fragmented within the first hour after boot-up
+Such solutions aim to replace sequential multi-level page tables          while the mean server uptime is multiple days or weeks—turning
+and drastically reduce the cost of page walks by accelerating page        memory fragmentation into a major challenge. Finally, our study ex-
+table accesses. Notably, they relax the physical memory contiguity        poses unmovable memory allocations as the root cause for the lack
+requirements to apply not on the whole dataset, but only on the           of physical memory contiguity. In particular, we identify several
+page table organization. However, they impose strict requirements         sources of unmovable allocations, including networking buffers,
+for physical memory contiguity availability on the critical path          slab, filesystem, and page tables.
+of page table creation. As a result, such approaches still remain            To address these issues, we introduce Contiguitas with the goal of
+challenging to adopt. Several other architectural extensions that         eliminating fragmentation due to unmovable allocations. Contigui-
+implicitly rely on contiguity [44, 72, 82, 108, 114] are hindered by      tas separates movable allocations from unmovable ones by placing
+the same fundamental challenge.                                           them into two different continuous regions and dynamically adjusts
+    Today’s operating systems, such as Linux, have mostly relied          the boundary of the two regions based on memory demand. To
+on 2 MB huge pages to land performance improvements. The pri-             avoid wasting memory in the unmovable region, Contiguitas solves
+mary mechanism to leverage huge pages is Transparent Huge Pages           two problems: i) how to dynamically resize the unmovable region
+(THP) [105] that opportunistically try to provide 2 MB pages. Un-         and place unmovable allocations; and ii) how to drastically reduce
+fortunately, in today’s systems, finding physical contiguity even         unmovable allocations. For the first problem, Contiguitas performs
+for 2 MB pages is often hard due to memory fragmentation [38,             resizing by tracking the demand for unmovable allocations. More-
+40, 43, 64, 77, 78, 83]. THPs have also been under scrutiny due to        over, it reduces internal fragmentation of the unmovable region by
+their performance implications such as latency spikes and mem-            differentiating different types of unmovable allocations.
+ory bloating [9, 25, 26, 38, 43, 66, 76]. Alternative approaches, such       For the second problem, Contiguitas focuses on unmovable allo-
+                                                                          cations that cannot be moved with software alone because access
+Contiguitas: The Pursuit of Physical Memory Contiguity in Datacenters                                   ISCA ’23, June 17–21, 2023, Orlando, FL, USA.
+
+
+to the page cannot be blocked for a migration to take place. At         with additional hardware support. Huge pages reduce the number
+Meta, networking allocations account for 73% of unmovable pages         of translation entries and further shorten page walks.
+(Section 2.5). We expect unmovable allocation to become an increas-        Linux has two primary mechanisms to allow applications to
+ingly bigger problem. This is because of new I/O technologies such      leverage huge pages. The HugeTLB subsystem allows a system
+as kernel-bypass and RDMA for networking and storage, GPUs,             administrator to allocate a certain number of persistent huge pages
+and other accelerators that heavily really on unmovable pages.          which can then be explicitly mapped by userspace applications.
+   To this end, Contiguitas introduces a set of surgical hardware       HugeTLB requires careful coordination between system adminis-
+extensions in the last-level cache (LLC) that enable the transparent    trators and application developers to ensure a proper number of
+migration of unmovable pages while in use. Contiguitas’s design         huge pages are available.
+builds off of two ideas: First, Contiguitas introduces migration           Alternatively, Transparent Huge Pages (THP) [105] can be used
+mappings in the LLC, enabling hardware to redirect traffic to the       to allocate huge pages transparently to the application. THPs only
+appropriate cache line of each page based on the progress of the mi-    support 2MB pages and opportunistically assign huge pages to ap-
+gration. Second, Contiguitas relaxes the TLB shootdown operation        plications, either in page fault handling or through background page
+from being synchronous and requiring acknowledgements from all          promotion. The OS forms huge pages on top of contiguous physical
+victim TLBs to a local TLB invalidation that can be performed by        memory regions that it keeps on free lists. However, userspace
+each core independently and in a lazy manner. Naturally, movable        memory pages, kernel structures, and other sources can cause a
+page migrations can also benefit from this hardware support.            fragmented physical address space with no huge pages available.
+   We build the OS component of Contiguitas into the Linux kernel       Memory Fragmentation. Memory fragmentation can be allevi-
+and run our experiments in Meta’s production environment. Our           ated by memory compaction, also known as defragmentation. Mem-
+results show that this component successfully confines unmovable        ory compaction [28] tries to consolidate physical pages by moving
+allocations, drastically reducing unmovable 2MB blocks from an          them around, freeing up contiguous memory areas for huge page
+average of 31% scattered across the address space down to 7% con-       allocations. During movement, the page becomes temporarily un-
+fined in the unmovable region, leading to significant performance       available until the page is copied to the new location and the new
+gains. Specifically, we show that for three major production ser-       mapping is established.
+vices, Contiguitas achieves performance improvements between            Page Migration and TLB shootdowns. Figure 1 shows the pro-
+2-9% for partially fragmented servers that represent the majority       cess of page migration. A translation for a page is cached in the
+of the servers, and between 7-18% for highly fragmented servers         TLBs. However, in contemporary processors TLBs are not cache-
+representative of nearly a quarter of the fleet at Meta. Notably,       coherent. Hence, the OS needs to invalidate all potential victim
+Contiguitas’s contiguity gains enable Web, one of Meta’s largest        TLBs of cores that might be caching the translation. First, in Step 1
+services, to dynamically allocate 1 GB huge pages, leading to a 7.5%    the OS running on top of the initiator core clears the present bit of
+performance win that is unattainable with 2 MB pages alone. We          the page table entry of the page under migration. Then, the initia-
+use full-system simulations to demonstrate the effectiveness of the     tor invalidates the entry from the local TLB and initiates the TLB
+hardware extensions of Contiguitas. Our evaluation shows that           shootdown procedure, in Step 2 . Specifically, the OS sends inter-
+Contiguitas-HW enables the efficient migration of unmovable al-         processor interrupts (IPIs) in Step 3 to all remote victim cores. Each
+locations while scaling the number of victim TLBs and does not          core receiving an IPI invokes an interrupt handler that flushes their
+affect application performance. We are currently in the process of      private TLB, shown in Step 4 , and then sends an acknowledgment
+upstreaming Contiguitas into Linux.                                     in Step 5 . After the initiator receives all the required acknowl-
+                                                                        edgments, it performs the copy of the page in Step 6 . Finally, it
+2     MEMORY CONTIGUITY CHALLENGES AND                                  updates the PTE in Step 7 .
+      OPPORTUNITIES IN DATACENTERS
+                                                                                           !                       #
+In this section, we first provide a brief overview of memory man-                                #%           &   
+agement of modern operating systems. Then we showcase the
+                                                                                   ##!  "                       "
+challenges and opportunities of memory contiguity across Meta’s
+                                                                                   #        $#       
+datacenters through a detailed study of i) memory capacity and                     #                                    
+                                                                                                  $# 
+TLB trends, ii) performance implications of address translation, iii)
+memory fragmentation, and iv) unmovable allocations and their                        Figure 1: Page migration procedure.
+sources.                                                                   TLB shootdowns are very costly as they scale poorly with the
+                                                                        number of involved cores and may require several thousands of
+2.1     Memory Management                                               cycles to complete [7, 8, 12, 17, 63, 63, 90, 109]. Upcoming hard-
+Multiple Page Sizes. Modern operating systems, such as Linux,           ware [6, 11, 54] aims to reduce the TLB invalidation overhead,
+manage memory in small 4 KB page granularity. The primary reason        but a page still becomes unavailable during migration. The same
+behind this decision is to reduce memory bloating and expensive IO      steps are followed by processors that make use of IOMMUs with
+operations during paging. However, 4 KB pages cause significant         IOTLBs [5, 55, 80] and NICs with private TLBs [84, 104].
+address translation overhead due to the limited capacity of the TLBs    Unmovable Allocations. An impediment to memory compaction
+and expensive page walks in the event of a TLB miss. To that end,       is unmovable allocations that cannot be migrated. Unmovable al-
+huge pages of 2 MB and 1 GB have been retrofitted in the kernel         locations exist across different operating systems, called wired
+ISCA ’23, June 17–21, 2023, Orlando, FL, USA.                                                                                                                              Zhao et al.
+
+
+
+                             Main Memory           TLB 4KB           TLB 2MB                                                                 Data        Instructions
+
+
+
+
+                                                                                                   Page Walk Cycles %
+                                                                                                                        20%
+ Relative Capacity
+
+
+
+
+                     8x                                                        80%
+
+
+
+
+                                                                                   TLB Coverage
+                     6x                                                        60%                                      15%
+
+                     4x                                                        40%                                      10%
+
+                     2x                                                        20%                                      5%
+
+                                                                                                                        0%
+                     Gen 1      Gen 2          Gen 3         Gen 4         Gen 5                                              4KB 2MB 1GB     4KB 2MB     4KB 2MB       4KB 2MB
+                                        Hardware Generations                                                                      Web         Cache A     Cache B         Ads
+Figure 2: Memory and TLB coverage of computing hardware                                                                 Figure 3: Percentage of cycles lost due to page walks.
+across generations.
+
+allocations in FreeBSD, and non-paged in Windows [74, 91, 114].                                   2.3                     Lost Cycles Due to Lack of Contiguity
+While there are many sources of unmovable allocations such as                                     To quantify the potential of memory contiguity we select a few
+slab, page tables, and other kernel structures, they can be catego-                               representative services across Meta’s fleet and measure the im-
+rized into two types. The first type of unmovable allocations are                                 pact of contiguity. We perform measurements using: i) only 4 KB
+formed because the kernel opts for faster translation of kernel ob-                               pages, ii) 2 MB pages, iii) 2 MB and 1 GB. For 2 MB we use THP and
+jects through a simple offset into a linear map [107]. Addresses to                               further reserve huge pages through HugeTLB [106] for services
+these data structures may be stored all over memory. As a result,                                 that have already been optimized to support HugeTLB. To leverage
+such data structures cannot be moved.                                                             1 GB pages we solely rely on HugeTLB. We focus the evaluation on
+    Other types of unmovable allocations are related to I/O and the                               the most widely used machine type which has 64GB memory. At
+IOMMU, including memory for kernel-bypass networking and stor-                                    Meta, services are deployed directly on Linux servers within con-
+age, GPUs, accelerators, and in general operations that mark pages                                tainers. Furthermore, services are optimized heavily to fit within
+as busy and thus unmovable. Such allocations are impossible to                                    the available memory. Hence, the results provide a lower bound of
+move with software alone. The reason is that the software cannot                                  the potential address translation overhead and gains from larger
+atomically perform both the translation update and the page copy.                                 page sizes—we expect such overheads to be further exacerbated as
+Hence, the only way for software to migrate a page without poten-                                 memory capacity increases.
+tial spurious writes to the page taking place during migration is to                                 Figure 3 shows page walk cycles as percentages of the total
+first block access to the page, perform the copy, and then update the                             cycles, due to Data and Instructions, using performance counters
+translation. However, access to such unmovable pages cannot be                                    of production workloads. For Data we show the aggregate of loads
+blocked as incoming operations from a device need to be serviced.                                 and stores. We observe that page walk cycles can account for close
+Even if access to the page could be blocked, page migration itself                                to 20% of total cycles in Meta’s datacenters. Memory contiguity
+is expensive because it requires a long downtime to (a) perform a                                 has the potential to significantly alleviate TLB overheads of both
+TLB shootdown procedure that scales poorly with the number of                                     instructions and data. Focusing on Web, one of the largest services
+victim TLBs, and (b) copy the page.                                                               within Meta, we see that 2 MB huge pages can halve the number of
+                                                                                                  instruction page walk cycles. Notably, while 2 MB pages offer little
+2.2                       Memory Capacity and TLB Trends                                          improvement for data page walk cycles, 1 GB huge pages have a
+Trends in Meta’s hardware show increases in memory capacity                                       major impact by reducing such cycles from 14% down to 8%.
+without comparable increases in TLB capacity. This discrepancy
+puts increased emphasis on contiguity availability to reduce address                              2.4                     Memory Fragmentation
+translation overheads.
+                                                                                                  Memory fragmentation prevents the OS from creating large con-
+   Figure 2 shows the relative increase of memory capacity and TLB
+                                                                                                  tiguous regions. To quantify fragmentation across Meta’s fleet, we
+coverage of computing infrastructure across hardware generations
+                                                                                                  randomly sample tens of thousands of 64GB servers in produc-
+in Meta’s datacenters. The x-axis shows different hardware genera-
+                                                                                                  tion independently of workloads and perform a full scan of each
+tions. The Gen-1 hardware is near its end of life while Gen-4 and
+                                                                                                  server’s physical memory. Figure 4 shows the cumulative distri-
+Gen-5 are expected to be deployed in the near future. We normalize
+                                                                                                  bution function (CDF) of memory contiguity as a percentage of
+the results based on the first generation. Memory capacity is bound
+                                                                                                  free memory at the 2 MB, 4 MB, 32 MB and 1 GB allocation levels.
+to increase by almost 8×. However, the number of TLB entries
+                                                                                                  Servers having less than 1 GB of free memory are filtered out. We
+and consequently TLB coverage remain stagnant. Specifically, the
+                                                                                                  observe that memory fragmentation is severe across the fleet i.e.,
+number of TLB entries has steadily remained in the range of a few
+                                                                                                  23% of the servers do not have enough contiguity for even a single
+thousands in the last few generations. As a result, TLB coverage
+                                                                                                  2 MB allocation. This number increases to 59% for 32 MB alloca-
+with contemporary 4 KB pages, and even larger 2 MB pages will be
+                                                                                                  tions. Dynamically allocating 1 GB pages is practically impossible
+significantly insufficient. 1 GB pages do provide sufficient coverage
+                                                                                                  in production.
+that is larger than the main memory capacity of Gen-5 hardware.
+Reducing translation overheads will require ever larger page sizes,                               Correlation With Uptime. It is commonly assumed that memory
+and hence contiguity, in hand with techniques to reduce page walk                                 fragmentation is correlated with server up-time [78, 114]. In partic-
+latency.                                                                                          ular, freshly brought-up servers are expected to have an abundance
+Contiguitas: The Pursuit of Physical Memory Contiguity in Datacenters                                                               ISCA ’23, June 17–21, 2023, Orlando, FL, USA.
+
+
+                  1.0                                                                              1.0
+                  0.9                                               2MB                            0.9         2MB
+                  0.8                                               4MB                            0.8         4MB
+ CDF of Servers
+
+
+
+
+                                                                                  CDF of Servers
+                  0.7                                                                              0.7
+                                                                    32MB                                       32MB
+                  0.6                                                                              0.6
+                  0.5                                               1GB                            0.5         1GB
+                  0.4                                                                              0.4
+                  0.3                                                                              0.3
+                  0.2                                                                              0.2
+                  0.1                                                                              0.1
+                   0%        5%   10%        15%      20%     25%       30%                         0%            20%            40%        60%            80%          100%
+                                        Free memory %                                                                          % of Unmovable Pages
+Figure 4: Contiguity availability as the percentage of free                   Figure 5: Distribution of unmovable pages in contiguous
+memory.                                                                       regions of 2MB, 4MB, 32MB, and 1GB.
+
+of available memory contiguity that slowly deteriorates as work-              the number of networking-related pages constantly remains high.
+loads execute. Interestingly, our analysis showed there is little to          More importantly, we expect unmovable networking allocations
+no correlation between memory contiguity availability and server              to become an increasingly bigger problem for two reasons. First,
+uptime, with the Pearson correlation coefficient between server               with the adoption of high bandwidth NICs [103] and the increased
+uptime and the number of free 2 MB pages being only 0.00286. We               number of queues based on the number of cores, the number of
+further looked into servers with only a few hours of uptime and dis-          networking allocations are expected to increase drastically. Second,
+covered that the correlation still remained weak, with a coefficient          with kernel bypass and RDMA technologies [34, 42, 73, 85, 117] in
+of 0.16. Finally, we performed a set of experiments that indicated            datacenters, networking pages are pinned to memory and remain
+that servers can get highly fragmented within the first hour of               unmovable for the lifetime of an application.
+running workloads. Given that the mean uptime of Meta’s servers
+is multiple days or weeks, memory fragmentation affects nearly all                                       Networking     Slab       File systems    Page tables      Others
+
+servers.
+                                                                                    0%                        20%         40%        60%           80%                  100%
+                                                                                                                 Percentage of Unmovable Allocations
+2.5                     Unmovable Memory Allocations                                                      Figure 6: Sources of unmovable allocations.
+Despite high amounts of fragmentation, the kernel could succeed
+                                                                                 The second source, which accounts for 12%, is related to slab
+in allocating huge pages by compacting allocated pages into fewer
+                                                                              allocations. The slab allocator is the small object allocator in the
+contiguous regions. Unmovable allocations inherently limit mem-
+                                                                              Linux kernel that packs objects in pages obtained from the page
+ory contiguity as they impede memory compaction. To quantify
+                                                                              allocator. It is the primary memory source for kernel data structures
+unmovable allocations we follow the same process for studying
+                                                                              which cannot be moved. File systems frequently allocate pages as
+memory fragmentation. Figure 5 shows the percentage of 2 MB
+                                                                              buffers for compression and decompression. Page tables are used to
+unmovable pages relative to the total memory. As we can see, a
+                                                                              store translation entries from virtual addresses to physical addresses.
+median server has 34% of its memory occupied by unmovable al-
+                                                                              About 4% of allocations are related to other sources.
+locations. As a result, a significant portion of the memory cannot
+                                                                                 In the future, we expect additional sources of unmovable mem-
+be used for huge pages, and forming any larger contiguous regions
+                                                                              ory driven by the increased deployment of heterogeneous hardware
+(at 4 MB, 32 MB or 1GB) will be even harder. Furthermore, the
+                                                                              such as GPUs, accelerators, and other devices that rely on unmov-
+variance across machines is a major obstacle for using huge pages.
+                                                                              able allocations. As a result, managing unmovable allocations is
+At Meta it is desirable to treat the servers interchangeably so that a
+                                                                              critical for efficient memory management.
+workload can potentially land on any available server in the fleet. In
+practice, for some critical services that depend on the existence of
+sufficient huge pages, automatic server reboots are used to resolve
+                                                                              3                    CONTIGUITAS DESIGN
+high fragmentation.                                                           The goal of Contiguitas is to provide ample physical memory conti-
+   Furthermore, we identified that unmovable allocations are scat-            guity by reducing memory fragmentation due to unmovable allo-
+tered across the address space. The median ratio of the number of             cations. To that end, Contiguitas redesigns memory management
+unmovable 4 KB pages over the total number of pages is only 7.6%,             in the OS to confine unmovable allocations and completely sepa-
+but it makes 34% of 2MB pages unmovable, showing that scattering              rate them from movable ones. In addition, Contiguitas drastically
+is greatly exacerbating the unmovable memory issue.                           reduces unmovable pages in datacenters. Specifically, Contiguitas
+   To identify the sources of unmovable allocations, we track all allo-       introduces a set of hardware extensions in the last-level cache (LLC)
+cations marked as unmovable and backtrace their allocation sources.           that enable the transparent migration of unmovable pages while in
+Figure 6 shows the breakdown of various sources of unmovable                  use.
+allocations. Networking-related operations are a major source of
+unmovable allocations, accounting for more than 73%. Such alloca-             3.1                        Overview
+tions include send and receive buffers maintained by the OS. These            Figure 7 provides a high level overview of Contiguitas and how it
+buffers carry the data received or to be sent through the processing          transforms the physical address space. There are two key design
+of different layers of the networking stack, from the applications            principles guiding Contiguitas. The first one, is to strictly separate
+that own the sockets down to NICs [46]. In Meta’s environment                 unmovable from movable allocations using two dedicated regions
+ISCA ’23, June 17–21, 2023, Orlando, FL, USA.                                                                                                    Zhao et al.
+
+
+                                                                         Dynamic Region Resizing. As the need for movable or unmov-
+                                               
+       
+                                                                                    able memory may change across applications and their phases,
+                                                                                    static sizing would be ineffective. To this end, Contiguitas dynami-
+                                                                            cally resizes the two regions to keep the unmovable region small
+                                                                 while not negatively affecting application performance. Contiguitas
+                                                            
+                                                                                    sets up the physical memory layout during system boot-up, and
+                                                                       gives the unmovable region a configurable initial size based on the
+                                                              memory capacity of the system and the behavior of workloads in
+                                                          
+                                                                  our fleet. For our 64GB servers, we configure this initial size to
+              Figure 7: Contiguitas design overview.                                4GB. The boundary of the two regions is then tracked in the OS
+                                                                                    to support resizing. To expand the unmovable region, Contiguitas
+                                                                                    adjusts the boundary, moves away allocated pages, and takes over
+and, thus, prevent unmovable allocations from scattering across                     space from the movable region, adding pages to the unmovable free
+the address space. The result is shown in Step 1 . Next, Contiguitas                list.
+introduces a dynamic resizing mechanism in Step 2 , that monitors                       Dynamic resizing of the unmovable region introduces three
+the demand for allocations in each region and grows or shrinks                      major design challenges. The first challenge is to move resizing
+the corresponding region accordingly. Contiguitas further reduces                   operations off the critical path of memory allocation. The second
+internal fragmentation of the unmovable region by placing certain                   challenge is to choose the placement policy of unmovable alloca-
+types of allocations away from the region’s border.                                 tions within the unmovable region and avoid internal fragmenta-
+   The second design principle of Contiguitas, is to drastically re-                tion. Allocations exhibit various lifetimes and as a result, placing
+duce the amount of unmovable allocations by turning them into                       an unmovable allocation with a long lifetime close to the bound-
+movable ones. Our study at Meta’s datacenters in Section 2.5 re-                    ary, might unnecessarily block the shrinking of the region even if
+vealed that a significant portion of unmovable allocations are impos-               free space is abundant within the region. The last challenge is to
+sible to move as access to the page cannot be blocked for a software                choose the proper size of the unmovable region, which is workload
+migration to take place. Hence, a software solution is inadequate.                  dependent.
+To this end, Contiguitas introduces a set of hardware extensions in                     Contiguitas performs resizing off the critical path of memory
+step 3 that enable the transparent migration of unmovable alloca-                   allocation to avoid latency overheads. This is accomplished by
+tions. Naturally, these hardware extensions can further be leveraged                monitoring the amount of free memory when periodic memory
+by movable pages.                                                                   reclaim is triggered by the kernel. Contiguitas extends reclaim to
+                                                                                    wake up a kernel thread to perform resizing when the free memory
+3.2      Confining Unmovable Allocations                                            in either region falls below a low-watermark threshold.
+Contiguitas separates the physical address space into two contin-                       In addition, Contiguitas introduces a bias to prefer physical pages
+uous regions, one for movable and one for unmovable memory.                         further away from the region border. Some unmovable allocations
+Allocations are confined in their respective region. Contiguitas                    that are inherently long lived, e.g., kernel code pages, are safely
+categorizes the physical pages based on their addresses and keeps                   placed by Contiguitas early on, at the end of the unmovable region
+them on distinct free lists for each region. Memory in each region                  that is farthest from the movable region. On the other hand, pages
+can only be allocated from pages in the free lists belonging to that                that are initially in the movable region and later on migrated to
+region. When a page is freed, it is returned back to its respective                 the unmovable region often exhibit short lifetimes. In general, Con-
+list. This approach simplifies the critical path of allocations as the              tiguitas prefers allocating pages away from the region border as
+OS can quickly pick a free page while avoiding mixing different                     long as sufficient free space is available. This approach increases
+types of allocations.                                                               the chance that shrinking will be successful. Later on, in Section 3.3
+    Confinement is sufficient for allocations that are deemed un-                   we will further introduce the hardware extensions of Contiguitas
+movable during their whole lifetime. However, some allocations                      that enables the migration of unmovable pages.
+might first be allocated as movable but later become unmovable.                         Finally, to aide in deciding when and how much to resize, Con-
+For example, due to operations such as memory pinning for zero-                     tiguitas introduces the concept of per-region memory pressure,
+copy network send operations. In such scenarios, Contiguitas first                  which builds on top of the kernel’s pressure stall information (PSI)
+migrates them to the unmovable region and then marks them as                        used for reclaim [110]. PSI tracks the percentage of time wasted due
+unmovable. This approach avoids the dynamic pollution of the                        to lack of free memory (e.g. due to page faults of recently resident
+movable region and subsequent compaction failures.                                  memory, or direct reclaim). We extend PSI to track time wasted due
+    The major challenge in designing confinement is the sizing of the               to lack of free memory in both the movable and unmovable region
+unmovable region. If it is too big, unused memory in the unmovable                  separately.
+region is wasted while there is limited movable memory for the ap-                      The resizing algorithm is depicted in Algorithm 1. Given per-
+plications, causing frequent reclaims, swapping, or even allocation                 region pressure, 𝑃𝑟𝑒𝑠𝑠𝑢𝑟𝑒𝑢𝑛𝑚𝑜𝑣 |𝑚𝑜𝑣 , configurable thresholds,
+failures. On the other hand, if the unmovable region is too small,                  𝑇ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑𝑢𝑛𝑚𝑜𝑣 |𝑚𝑜𝑣 , and coefficients that fine-tune the expansion
+it may fail unmovable allocations. Therefore, Contiguitas needs                     and shrinkage of the region, 𝑐𝑢𝑒 , 𝑐𝑚𝑒 , 𝑐𝑢𝑠 , and 𝑐𝑚𝑠 , the algorithm
+to dynamically balance the sizes of the movable and unmovable                       resizes the unmovable region. Depending on pressure the kernel
+regions.
+Contiguitas: The Pursuit of Physical Memory Contiguity in Datacenters                                        ISCA ’23, June 17–21, 2023, Orlando, FL, USA.
+
+
+ Algorithm 1: Region resizing algorithm.                                                      $&       $&                    $%*     
+                                                                                                                                          
+1  function Resize(𝑃𝑟𝑒𝑠𝑠𝑢𝑟𝑒𝑢𝑛𝑚𝑜𝑣 , 𝑇 ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑𝑢𝑛𝑚𝑜𝑣 , 𝑃𝑟𝑒𝑠𝑠𝑢𝑟𝑒𝑚𝑜𝑣 ,                                                         (&       
+                                                                                  
+
+
+
+
+                                                                                                                        +
+
+
+
+
+                                                                                                                                              +
+    𝑇 ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑𝑚𝑜𝑣 , 𝑐𝑢𝑒 , 𝑐𝑢𝑠 , 𝑐𝑚𝑒 , 𝑐𝑚𝑠 )                                                                
+                                                                                                                                               
+ 2      if 𝑃𝑟𝑒𝑠𝑠𝑢𝑟𝑒𝑢𝑛𝑚𝑜𝑣 ≥ 𝑇 ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑𝑢𝑛𝑚𝑜𝑣 and                                                                          &          '(
+          𝑃𝑟𝑒𝑠𝑠𝑢𝑟𝑒𝑚𝑜𝑣 < 𝑇 ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑𝑚𝑜𝑣 then                                                                                      
+ 3           // Expand unmovable upon high pressure                                              
+                                                                                                                 &        '(  (&
+ 4             𝐹 ← 𝑇𝑃𝑟𝑒𝑠𝑠𝑢𝑟𝑒  𝑢𝑛𝑚𝑜𝑣          𝑇 ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑𝑚𝑜𝑣
+                     ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑𝑢𝑛𝑚𝑜𝑣 · 𝑐𝑢𝑒 + max(𝑃𝑟𝑒𝑠𝑠𝑢𝑟𝑒𝑚𝑜𝑣 ,1) · 𝑐𝑚𝑒                                                                          
+ 5             𝑈 ← (1 + 𝐹 ) · 𝑀𝑒𝑚𝑢𝑛𝑚𝑜𝑣                                              $ &#(#(&$##(
+ 6      else                                                                    "$&*      "$&*       "$&*          $#(!)!('     
+ 7             // Shrink for all other cases
+ 8             𝐹 ← 𝑇𝑃𝑟𝑒𝑠𝑠𝑢𝑟𝑒  𝑚𝑜𝑣          𝑇 ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑𝑢𝑛𝑚𝑜𝑣
+                     ℎ𝑟𝑒𝑠ℎ𝑜𝑙𝑑𝑚𝑜𝑣 · 𝑐𝑚𝑠 + max(𝑃𝑟𝑒𝑠𝑠𝑢𝑟𝑒𝑢𝑛𝑚𝑜𝑣 ,1) · 𝑐𝑢𝑠    Figure 8: Contiguitas hardware overview. (a) shows the hard-
+ 9             𝑈 ← (1 − 𝐹 ) · 𝑀𝑒𝑚𝑢𝑛𝑚𝑜𝑣                                  ware extension of Contiguitas-HW in the LLC. (b) shows the
+10      return 𝑈 ;
+                                                                        metadata table of Contiguitas-HW. (c) shows the page migra-
+                                                                        tion process followed by Contiguitas-HW.
+expands or shrinks the unmovable region. Contiguitas sets parame-
+                                                                        Hardware Operations. At a high level, Contiguitas-HW aliases a
+ters for dynamically resizing empirically by observing the patterns
+                                                                        physical page under migration with a destination page and redirects
+for movable and unmovable allocations of the workloads, and tunes
+                                                                        appropriate traffic to the destination page based on the progress of
+the parameters iteratively. Contiguitas uses global parameters that
+                                                                        the migration.
+work well for a diverse set of workloads, and we leave automated
+                                                                            Specifically, a page migration is initiated in Step 1 by the OS
+parameter space search as future work.
+                                                                        that provides the source and destination physical page numbers
+3.3     Architectural Support for Transparent Page                      (PPNs) to the Contiguitas-HW. Contiguitas-HW stores them in a
+                                                                        metadata table shown in Figure 8(b). In addition, Contiguitas-HW
+        Mobility                                                        stores a Ptr field that points to the next line to be copied [18, 86, 95].
+The goal of the hardware extensions of Contiguitas, Contiguitas-        It effectively tracks the number of cache lines that have been copied.
+HW, is to enable the migration of the subset of unmovable pages             Before a cache line can be copied, Contiguitas-HW issues BusRdX
+that must remain accessible even during migration. Such pages           events for both the source and the destination cache lines, shown
+represent a major chunk of allocations in datacenters that is bound     in Step 2 . This step guarantees that the most recent version of the
+to increase in the near future (Section 2.5). Hardware support is       source cache line is located in the LLC and that both source and
+required because it is impossible for software to move such pages       destination cache lines are invalidated in higher level caches. Next,
+as it cannot atomically perform both the translation update and the     Contiguitas-HW copies the line from the source to the destination,
+page copy operation. Hence, software has to block access to the         as shown in Step 3 . Then, it increments Ptr by one. This process
+page for the duration of page migration in order to avoid spurious      continues until the page is completely copied.
+writes to it. Even if access to the page could be blocked, software         During the migration process, a request, e.g., 𝐿𝐷𝐴𝑖 may arrive
+page migration induces a long downtime due to (a) TLB shootdowns        at the LLC, as shown in Step 4 . If the request is for the source
+that scale poorly with the number of victim TLBs, and (b) the page      page then Contiguitas-HW uses the page offset of the address and
+copy.                                                                   compares it to the value of Ptr. For addresses less than Ptr, the LLC
+   To this end, Contiguitas-HW enables transparent page migration       returns the line from the destination page. This is because the cache
+while the page remains in use. Such migrations can substantially        line has already been migrated. Otherwise, the LLC returns the line
+reduce the size of the unmovable region and lead to more efficient      from the source page.
+defragmentation and memory management as the vast majority                  When the copy of the page is complete, Contiguitas-HW sets
+of pages can be moved on demand. While Contiguitas-HW is mo-            a flag that is periodically checked by the OS. In our design, we
+tivated by unmovable allocations, its design is suitable for both       opt to perform this check whenever the kernel naturally runs next
+movable and unmovable allocations.                                      on each core e.g., due to context switches or system calls. When
+Platform Overview. Figure 8(a) shows a high-level overview of           the OS detects that the flag is set, it updates the page table entry
+the hardware platform of Contiguitas-HW. The hardware exten-            to point to the destination page. Then, the OS performs a local
+sions of Contiguitas-HW are located in the LLC. Contiguitas-HW          TLB invalidation, shown in Step 5 . When all TLBs are eventually
+targets environments that are representative of current and upcom-      invalidated, the OS clears the entry from the metadata table in
+ing hardware platforms such as those based on CXL [27]. Specifi-        Figure 8(b).
+cally, Contiguitas-HW targets a multi-core processor with a cache-          Critically, Contiguitas-HW opts to maintain both mappings con-
+coherent interconnect. The hardware platform further includes           currently active for the duration of page migration and rely on the
+an IOMMU [5, 55] with local TLBs. The IOMMU performs simi-              LLC to redirect traffic. This approach allows TLBs to switch from
+lar duties to the MMU on the CPU side, such as page walks and           the source to the destination mapping without a long downtime,
+caching of translations in the TLB for devices. The NIC includes a      greatly simplifying the TLB shootdown procedure. In Contiguitas-
+TLB and is cache-coherent with the LLC. The core performs IOTLB         HW, TLB shootdowns do not require inter-processor interrupts
+shootdowns by putting invalidation requests onto a queue in mem-        (IPIs), as each TLB can be locally invalidated without coordination
+ory [55]. Device TLBs cache translations from the IOMMU, and            and synchronous acknowledgements. Similarly, any available core
+the core can synchronize them with the IOMMU by submitting              can issue a TLB invalidation to the NIC and the IOMMU. During
+invalidation requests through the aforementioned queue.                 this process the page under migration is always accessible.
+ISCA ’23, June 17–21, 2023, Orlando, FL, USA.                                                                                                        Zhao et al.
+
+
+   Ultimately, Contiguitas-HW enables the a page under migration                                                            !"!
+                                                                                                              
+to be accessed by the source and destination mappings. Depend-                                                                              
+                                                                                                                                    
+                                                                                                                             
+ing on the underlying cache microarchitecture, Contiguitas-HW is                                                                              
+
+
+
+
+                                                                                    $
+
+
+
+
+                                                                                                                                                 $
+amenable to multiple optimizations. Next we discuss two design                                             
+                                                                                                                                                    
+points that shed light on the trade-offs between noncacheable and                                                                        !
+                                                                                                                                  
+cacheable accesses for the page under migration based on underlin-                            " #                   
+ing microarchitecture mechanisms.
+                                                                           Figure 9: Contiguitas operations in a sliced last-level cache
+Noncacheable Accesses. One approach to realize the Contiguitas-            architecture.
+HW is to rely on noncheable accesses during migration. When a
+cache line in the source page has been copied, the LLC treats it from      can reside in private caches. Second, it eliminates the need to notify
+then on as noncacheable for the L1 and L2 caches. This optimization        the private cache agents to handle migration pages as noncacheable.
+is useful because at any point a core may issue requests based on             To achieve this goal, Contiguitas-HW performs the following
+the source mapping found in the TLB while Contiguitas-HW may               steps. First, when the OS notifies the Contiguitas-HW to start mi-
+respond based on the data in the destination mapping.                      grating a page, the hardware enables traffic redirection but does
+    While it is possible to allow the caching of the line in the private   not start the copy process. Instead, the OS immediately modifies
+caches, this approach would introduce two implications: First, it          the page table entry to point to the destination page and starts
+would require Contiguitas-HW to keep track of such lines to main-          invalidating each TLB. During this process, a page may be accessed
+tain coherence. Second, writes performed to the source page would          with either the source or the destination mapping. If a request hits
+have to be propagated to the destination as well. Noncacheables            in the private caches, it is serviced without further action as in a
+accesses resolve this issue as all traffic is redirected to the LLC.       regular cache hit. Otherwise, on a miss the Contiguitas-HW checks
+    Noncacheable accesses are already supported by contemporary            whether a line is currently stored in private caches with the op-
+processors [52]. In existing processors, page table entries maintain       posite mapping of the request i.e., if a request is for the source
+a page-level cache disable (PCD) bit that is also installed in the TLB.    mapping and the line is stored with the destination mapping, and
+Requests for a page with the PCD bit set in the TLB are performed          vice versa. If the condition is true, the request invalidates any cached
+as noncacheable accesses. However, in current processors such              copy. Otherwise, the request is serviced regularly. This invariant
+accesses bypass the complete cache hierarchy, including the LLC.           allows the caching of lines under migration as only the source or
+Contiguitas-HW piggybacks on existing hardware support for non-            the destination mapping is active in the private caches.
+cacheable accesses, but instead selectively activates noncacheable            When the TLB invalidations are complete, the OS notifies the
+accesses while allowing caching in the LLC.                                Contiguitas-HW to start the copy. At this point only the destination
+    At a high level, one possible approach would be for Contiguitas-       mapping is active at any given TLB. During the copy process, a
+HW to set the noncacheable bit when a line is returned from the            request for the destination mapping might be in a modified state.
+LLC to the private caches, notifying them to not cache the line.           In that case, the copying of that line is skipped as the destination
+However, since noncacheable information is available a priori, at          already contains the most up-to-date data. Other operations are
+translation time, noncacheable requests issued by the core may             handled regularly. By the end of the migration the Contiguitas-HW
+follow a different and simpler path when traversing the cache hier-        notifies the OS as before.
+archy.
+                                                                           Distributed Last-level Cache Slices. So far we have discussed the
+    To this end, Contiguitas can integrate with existing noncacheable
+                                                                           operations of Contiguitas-HW in the context of a monolithic last-
+mechanisms as follows. When Contiguitas-HW issues a BusRdX
+                                                                           level cache (LLC). In practice, the LLC usually consists of multiple
+it also notifies the cache agents in the private caches to install an
+                                                                           slices that communicate over an interconnect such as a ring bus [52].
+entry in their miss status holding registers (MSHRs) corresponding
+                                                                           Figure 9 shows a high level overview of a sliced cache architecture.
+to the source PPN, marking it as noncacheable. When the migration
+                                                                           In this environment, a physical address is passed through a hash
+is complete Contiguitas-HW notifies the private caches to clear
+                                                                           function 𝑓 that spreads the cache lines of the page across different
+the entry. Finally, there is one special case that Contiguitas-HW
+                                                                           slices. As a result, a given source page A and destination page B,
+needs to handle—a core that has not received an invalidation is-
+                                                                           𝑓 (𝐴𝑖 ) and 𝑓 (𝐵𝑖 ), may map each of their source and destination
+sues a request for the source page for the first time. In this case,
+                                                                           cache lines to different slices.
+Contiguitas-HW nacks the request and notifies the private caches
+                                                                              In this environment, Contiguitas-HW and its metadata table are
+as before. Then the cache agent will retry the cache access as non-
+                                                                           replicated across each slice. In addition, Contiguitas-HW adds a
+cacheable. This mechanism can further be implemented on top of
+                                                                           copy of the slice selection hash function. This is needed because
+upcoming hardware extensions [54] that will support efficient and
+                                                                           the hash function is usually located at the private L2 caches. The
+extensible IPIs in hardware.
+                                                                           added hardware is cheap because such hash functions are a simple
+Cacheable Accesses. Noncacheable accesses resolve the challenge            combination of logic gates e.g., XOR [116]. To use the Src PPN to
+of maintaining coherence for a line that can be accessed by different      initiate the copy of the lines, it first computes the slice selection
+mappings. However, with careful examination of the migration               function, 𝑓 (𝐴𝑖 ) and checks if the address corresponds to the local
+process, we identify that private caching can stay enabled as long         slice.
+as only a single mapping is used to cache a line at any given time.           If the line belongs to this slice, then Contiguitas-HW issues a
+The benefit of this approach is twofold. First, lines under migration      BusRdX event as before, in Step 1 . When the line is invalidated in
+Contiguitas: The Pursuit of Physical Memory Contiguity in Datacenters                                     ISCA ’23, June 17–21, 2023, Orlando, FL, USA.
+
+
+the private caches and the most recent version of the line is in the          Contiguitas-HW accepts commands from the OS via a work
+LLC slice, Contiguitas-HW uses the Dst PPN, 𝑓 (𝐵𝑖 ) to identify the        queue similarly to Intel’s DSA [57]. The OS prepares a work descrip-
+“home" slice of the destination line. If the home is the current slice     tor in memory containing commands and parameters to Contiguitas-
+then the copy is performed locally as before. Otherwise, Contiguitas-      HW, and submits the descriptor to the work queue using the existing
+HW sends a Write request to the destination slice, shown in Step 2 .       ENQCMD instruction [31]. The work descriptor contains a completion
+After the write is complete, the destination slice responds in Step 3      address that Contiguitas-HW writes to indicate to the OS that a
+with an acknowledgement. At this point, in Step 4 Contiguitas              work is completed.
+increments Ptr. If the line does not belong to this slice, Contiguitas-
+HW increments Ptr until it reaches a line that belongs to the local        4   EVALUATION METHODOLOGY
+slice. This is correct because each local slice is only responsible for    To evaluate Contiguitas, we follow a two-pronged approach. We
+the lines within the slice.                                                evaluate the OS components of Contiguitas in Meta’s production
+    Meanwhile, a request for the source page 𝐴𝑖 may arrive at a slice,     environment and further perform full-system simulations for the
+shown in Step 5 . The slice responds in the following manner. First,       hardware components.
+it compares the address to Ptr to identify the migration status of         Production Environment. Unless otherwise noted, the hardware
+the line as before. If the line has been migrated then Contiguitas-        used for the production experiments is Intel Cooper Lake single-
+HW uses 𝑓 (𝐵𝑖 ) to identify the destination slice. If the destination      socket 64GB servers running Linux 5.12. We implement Contiguitas
+slice is the current one, then the operation continues locally as          on top of Linux 5.12. In the rest of this section, we refer to the
+before. Otherwise, Contiguitas-HW does not need to perform the             default kernel as Linux, our kernel implementation on top of Linux
+lookup in this slice. Instead, in Step 6 it forwards the request to        as Contiguitas, and the combination of our kernel implementation
+the destination slice that then responds to the request. Overall, this     and hardware extensions as Contiguitas-HW. Since it is hard to run
+process is similar to handling the case that a request arrives at an       our production workloads on a simulator, we evaluate Contiguitas-
+LLC slice but the line is dirty in a private cache.                        HW with a page migration microbenchmark on top of NGINX [88],
+    The final piece of this process is how slices coordinate on when       and memcached [35].
+to perform their local copy procedures for a given page. With the
+                                                                           Production Workloads With Live Traffic. Our production eval-
+above protocol in place and the natural parallelism provided by a
+                                                                           uation leverages three major workloads at Meta, Web, Cache A,
+distributed cache architecture, each slice could operate indepen-
+                                                                           and Cache B. Web is a web server and one of the largest appli-
+dently. This approach would significantly improve the performance
+                                                                           cations in deployment across Meta’s fleet. Cache A and Cache B
+of the copy operation. However, it would also add additional pres-
+                                                                           are the two largest in-memory caching services that handle traf-
+sure to the interconnect during the copy operation. Instead, given
+                                                                           fic for most of the internal services at Meta. Cache B is a forked
+the target operation of Contiguitas-HW of moving unmovable allo-
+                                                                           version of memcached. We leverage production-grade load-testing
+cations, we opt for a simpler and less aggressive design. Specifically,
+                                                                           A/B infrastructure that has been developed internally at Meta to
+after each slice completes its portion of the copies, it then sends a
+                                                                           evaluate hardware selection and software optimizations. During
+notification to the next slice to start. In the future, if an even lower
+                                                                           our experiments, all workloads receive real production traffic.
+latency page copy might be beneficial, leveraging slice parallelism
+might be more attractive.                                                  Full-system Simulation. To evaluate the hardware components of
+                                                                           Contiguitas we use full-system cycle-level simulations. We integrate
+                                                                           QEMU [19] with SST [89] and DRAMSim3 [65]. We model a server
+Variable Buffer Sizes. Depending on the application characteris-           architecture with 8 cores, 64GB of main memory. We run Linux
+tics it might be beneficial to support variable mapping sizes for          5.12 as the baseline and compare it with Contiguitas-HW. The
+device TLBs. Contiguitas-HW naturally supports this use case.              architecture parameters are shown in Table 1. Each out-of-order
+When a mapping is composed of smaller independent translations,            core has private L1 and L2 caches, and a slice of the shared L3
+Contiguitas-HW can independently move each mapping one at                  cache. In addition, each core has private L1 and L2 TLBs and fully
+at time. Alternatively, the metadata table of Contiguitas can be           associative (FA) page walk caches. For Contiguitas’s metadata table
+extended to maintain a Size field that defines the range of the trans-     we use a fully associative structure with 16 entries per slice. To
+lation. Depending on how the OS opts to map the allocation on the          model TLB invalidations we intercept INVLPG instructions [52]
+CPU side, the OS can perform TLB updates at a finer granularity            issued by the OS and perform a traversal of the TLB hierarchy and
+than device TLB ones. Overall, Contiguitas-HW enables a large              page walk caches. Through measurements on a real processor, we
+optimization space depending on the application characteristics.           find that the cost of the INVLPG instruction is substantially higher
+                                                                           than the TLB round-trip and close to 250 cycles. We believe that it
+                                                                           is due to the interactions of the instruction with the core pipeline.
+Interface Contiguitas-HW supports two commands to interact                 We model this behavior by adding a fixed penalty of 250 cycles,
+with the OS. Migrate (PPN_Src, PPN_Dst, Flag) sets up a mi-                accounting for the cost of a full pipeline flush when an INVLPG
+gration mapping by providing the source and destination physical           instruction is issued.
+page numbers. Based on the flag argument the mapping is simply
+installed or a migration is initiated based on the cacheable model of
+the microarchitecture. Clear(PPN_Src) clears the metadata table
+entry, ending a page migration.
+ISCA ’23, June 17–21, 2023, Orlando, FL, USA.                                                                                                            Zhao et al.
+
+                 Table 1: Architectural parameters.
+                                                                                                            Linux Full         Linux Partial          Contiguitas
+                          Full-System Simulation Parameters                                        1.2
+            Multicore Chip    8 4-issue OoO cores, 200-entry ROB, 2GHz                             1.1
+
+
+
+
+                                                                                 Relative Perf
+            L1 Cache          32KB, 8-way, 2 cycles round trip (RT), 64B line                      1.0
+            L1 TLB            64 entries, 4-way, 2 cycles RT                                       0.9
+            L2 TLB            1536 entries, 16-way, 12 cycles RT
+            Page Walk Cache   3 levels, 32 entries per level, FA, 2 cycles                         0.8
+            L2 cache          256KB, 8-way, 14 cycles RT                                           0.7
+            L3 cache          2MB slice, 16-way, 40 cycles RT                                      0.6
+            Contiguitas-HW    16 entries, FA, 1 cycle                                              0.5
+            Main memory       64GB, DDR4 3200, 16 Banks, 1GHz
+                                                                                                   0.4
+            OS                Linux 5.12
+                                                                                                               Web             Cache A             Cache B
+                                                                                Figure 10: End-to-end performance over Meta’s production
+5     EVALUATION
+                                                                                workloads. The red bar of Contiguitas for Web shows the
+Our evaluation attempts to answer the following questions:                      performance gains from 1GB pages.
+  (1) Does Contiguitas improve application’s end-to-end perfor-
+      mance?
+                                                                                of 2 MB huge pages compared to 20 GB allocated by Contiguitas. For
+  (2) What is Contiguitas’s impact on unmovable allocations?
+                                                                                1 GB huge pages, Contiguitas allocated 4GB in total whereas Linux
+  (3) What is Contiguitas’s impact on memory contiguity?
+                                                                                allocated none. Note that, in Contiguitas, 1 GB pages provided a
+  (4) Does page migration in Contiguitas-HW scale with the num-
+                                                                                major performance win of 7.5%, which highlights the importance of
+      ber of cores?
+                                                                                bigger contiguity beyond 2 MB. Finally, we compared Contiguitas
+  (5) How do Contiguitas-HW page migrations affect page avail-
+                                                                                and Linux when both were forced to use only 4 KB pages. While the
+      ability and application performance?
+                                                                                results are not shown in the figure, they had identical performance,
+  (6) What are the hardware resource requirements of Contiguitas-
+                                                                                showing that Contiguitas introduces no measurable overhead even
+      HW?
+                                                                                if it finds no opportunities to allocate huge pages in the worst case.
+5.1     End-to-end Performance Impact
+                                                                                5.2                      Unmovable Allocations and Memory
+We evaluate the performance of three major workloads at Meta,
+Web, Cache A, and Cache B. The performance metric is requests per
+                                                                                                         Contiguity.
+second under certain latency SLAs based on the characteristics of
+each workload. In all cases, THP is set to “always”. Additionally,
+                                                                                                   60%
+Web attempts to allocate 2MB and 1GB huge pages directly.                                                     Linux                                 Contiguitas
+   We consider two setups, Full Fragmentation and Partial Fragmen-                                 50%
+                                                                                 Unmovable Pages
+
+
+
+
+tation. Full Fragmentation represents the case where a workload                                    40%
+lands on a server whose memory is already fully fragmented. As                                     30%
+we showed in Section 2.4, 23% of production servers are fully frag-
+                                                                                                   20%
+mented. To represent this scenario, we run a fragmentation process
+to fragment the server fully before the workload is deployed.                                      10%
+
+   Partial Fragmentation represents the case where a workload                                       0%
+                                                                                                              CI         Web             Cache A     Cache B
+lands on a partially fragmented server that is representative of                Figure 11: Unmovable 2 MB pages for Meta’s production work-
+the majority of servers at Meta. As each workload fragments the                 loads.
+address space at different levels, we first run the same workload
+to fragment the server and then restart the workload before our                 Unmovable allocations. To assess the impact of Contiguitas on
+experiment. This behavior is common in production due to frequent               unmovable allocations, we compare the percentage of memory that
+code deployments.                                                               becomes unmovable for different workloads at Meta. We further
+   Figure 10 shows the results. Contiguitas produces the same re-               include Meta’s continuous-integration (CI) workload that executes
+sult under Full Fragmentation and Partial Fragmentation and hence               various build and test jobs. For this experiment, we start our work-
+we show one bar. In "Linux Partial" and "Linux Full", dynamically               loads on freshly booted servers and then profile the servers once
+allocating 1GB HugeTLB pages always fails due the lack of conti-                every 15 minutes.
+guity. For Web, we show a stacked bar for Contiguitas to highlight                 Figure 11 shows the percentages of 2 MB unmovable pages. We
+the gain with 1 GB pages. Overall, Contiguitas delivers substan-                observe that for all workloads we consider, unmovable memory
+tial performance improvements between 2% and 18% across major                   increases drastically within the first hour and then plateaus. There-
+workloads at Meta.                                                              fore, we show the percentages at their stable state. As we discussed
+   Looking at Web, compared to Linux in the fully fragmented case,              in Section 2.4, given the long uptime of servers, fragmentation
+Contiguitas achieves 18% higher performance. Compared to Linux                  is ubiquitous across the fleet. Under Linux, the unmovable mem-
+in the partial fragmented case, Contiguitas delivers a performance              ory is between 19% to 42%, with an average of 31%. In contrast,
+gain of 9%. Notably, looking at the breakdown of Contiguitas we see             Contiguitas has the highest value at 9%, with an average of 7%.
+that substantial gains are due to Contiguitas being able to dynam-              This demonstrates that Contiguitas’s confinement strategy success-
+ically allocate 1 GB HugeTLB pages. Diving deeper, we find that                 fully restricts the spread of unmovable 2MB pages and keeps the
+Linux with partial fragmentation was able to allocate 14 GB worth               unmovable region small.
+Contiguitas: The Pursuit of Physical Memory Contiguity in Datacenters                                                    ISCA ’23, June 17–21, 2023, Orlando, FL, USA.
+
+
+
+                                      Linux       Contiguitas                                     8000
+
+
+
+
+                                                                             Unavailable Cycles
+                 100%
+ Movable Mem %
+
+
+
+
+                                                                                                  6000
+                 75%
+                                                                                                  4000
+                 50%
+                                                                                                  2000
+                 25%
+                                                                                                           Linux-Real         Linux-Sim             Contiguitas
+                  0%                                                                                 0
+                        2M 32M 1G   2M 32M 1G   2M 32M 1G       2M 32M 1G                             1     2       3     4           5       6         7         8
+                            CI         Web       Cache A         Cache B                                                      Cores
+Figure 12: Potential memory contiguity as a percentage of                                         Figure 13: Page unavailable cycles during migration.
+total memory.
+                                                                            of Contiguitas-HW is constant and equal to a local TLB invalidation,
+                                                                            because its TLB shootdowns do not require inter-processor inter-
+   To understand the internals of the unmovable region, we charac-
+                                                                            rupts and each TLB can be locally invalidated without coordination
+terize its fragmentation. Specifically, we scan the unmovable region
+                                                                            or synchronous acknowledgements. The cost of a 4 KB page mi-
+and count the number of unmovable pages within each 2 MB block.
+                                                                            gration in Contiguitas-HW is close to 2us in our microbenchmark.
+Note that, in the unmovable region a page is either unmovable
+                                                                            Although the absolute migration time will vary based on the cache
+or free. We find that 22% of the pages in a typical 2 MB block in
+                                                                            behavior of the page, access to the page is never blocked during a
+the unmovable region are free. This internal fragmentation of the
+                                                                            migrations.
+unmovable region further motivates the need for Contiguitas-HW,
+especially as the number of unmovable allocations increases (Sec-           Performance. We evaluate with full system simulations the per-
+tion 2.5).                                                                  formance implications of Contiguitas-HW on two open source
+                                                                            applications NGINX and Memcached. We select these workloads
+Potential memory contiguity. To quantify the impact of Conti-
+                                                                            to cover both ends of the spectrum. NGINX is insensitive to huge
+guitas on memory contiguity, we compare each workload’s steady
+                                                                            pages and it makes use of networking buffers. In this scenario, our
+state under Linux and Contiguitas. Specifically, we quantify the
+                                                                            goal is to move umovable pages that will benefit other applica-
+contiguous regions that can be formed if we hypothetically run a
+                                                                            tions without interfering with the application that makes use of
+perfect software compaction in order to service allocation requests
+                                                                            unmovable allocations. Memcached is a close proxy to our Cache
+of 2 MB, 32 MB, and 1 GB. Figure 12 shows the results. With Linux
+                                                                            B workload, which is a fork of memcached; it is sensitive to huge
+we see that some 2 MB allocation are possible given that less than
+                                                                            page availability and also relies on networking buffers.
+half the memory is composed of unmovable 2MB pages as we dis-
+                                                                               In both cases we consider an aggressively disadvantageous sce-
+cussed above. However, Linux struggles as we search for larger
+                                                                            nario where Contiguitas-HW moves unmovable networking buffers
+contiguous regions, and fails to find even a single 1 GB page. On the
+                                                                            only of the application while the application serves requests at peak
+other hand, Contiguitas, by design, isolates the unmovable region
+                                                                            throughput without any available slack. We consider two rates: (i)
+and hence the whole movable region can potentially be used after
+                                                                            Regular is the expected rate of unmovable page movement set at
+compaction for large contiguous allocations, even 1 GB pages as
+                                                                            100/second based on the ratio of unmovable and movable pages, (ii)
+we showed in Section 5.1.
+                                                                            Very High which is the rate if we were to move unmovable pages
+                                                                            at the highest rate we observed our production systems to move
+5.3                Contiguitas-HW Characterization.
+                                                                            movable pages, set at 1000/second. We evaluate both workloads
+Scalability. To evaluate the scalability of Contiguitas-HW with re-         without huge pages in order to understand any potential negative
+spect to the number of cores we use full system simulations. Specif-        performance impact by unmovable page movement without any
+ically, we develop a micro-benchmark that triggers page migrations          performance gains from huge pages.
+in software and Contiguitas-HW. We simulate all the operations of              At Regular rate Contiguitas-HW with noncacheable and cacheable
+Contiguitas-HW and instrument Linux to track the page migration             accesses do not have an impact on application performance. Even
+procedure, including TLB shootdowns and page copy operations.               at Very High rate, which would be unwarranted for a real environ-
+We then measure the number of cycles a page is unavailable during           ment, Contiguitas-HW with noncacheable accesses only shows a
+migration from the perspective of a memory operation to that page.          marginal overhead of 0.2% for NGINX and 0.3% for memcached.
+Figure 13 shows the results. The measurement with one core means            The Contiguitas-HW with cacheable accesses does not have an
+that we perform a TLB shootdown on one remote core. Linux-Sim               impact on application performance even at this rate. This is be-
+shows the result of a simulated system, which is compared to the            cause Contiguitas-HW is able to very efficiently redirect traffic and
+result of a real system, denoted Linux-Real. We see that the two            perform copy operations in the background.
+systems match well (-6% to +10% difference), which confirms the                When combined with the benefits of contiguity and 2MB huge
+accuracy of the simulation.                                                 pages, memcached performance improves by 7%. Overall, Contiguitas-
+   From the results we see that as the number of cores/TLBs in-             HW does not negatively impact applications that do not benefit
+volved in the TLB shootdown increases, the amount of time during            from contiguity while improving contiguity for those that do. In ad-
+which access to the page is blocked increases linearly. The cost            dition, Contiguitas-HW successfully achieves its goal to drastically
+of the page copy remains the same, at approximately 1,300 cycles.           reduce the unmovable region. Specifically, it enables the migra-
+Finally, we plot the result from Contiguitas-HW. By design, the cost        tion of the majority of the unmovable pages and further enables
+ISCA ’23, June 17–21, 2023, Orlando, FL, USA.                                                                                                             Zhao et al.
+
+
+the defragmentation of the unmovable region that can potentially           address translation cost. Work on capabilities [111] can reduce ad-
+unblock 22% of the region’s memory (Section 5.2).                          dress translation overheads; the approach of Contiguitas could be
+                                                                           useful in such environments in order to efficiently manage DMA
+Sizing and Hardware Requirements. To size the metadata table               and other sources of unmovable pages. More recent proposals have
+of Contiguitas-HW we consider the following parameters. First,             also focused on improving the efficiency of userspace allocators
+Contiguitas-HW enables local TLB invalidations that can occur              to better utilize huge pages [48, 67, 68]. Contiguitas can further
+whenever the kernel naturally executes on top of a core. Hence,            boost the efficiency of userspace allocators as they rely on the OS
+we need to take into account the amount of time a mapping needs            to provide contiguity.
+to be maintained. To this end we consider the rate of system calls            Another body of work has focused on improving TLB shootdown
+and context switches on a core that is observed to be 40K-100K per         operations [7, 8, 12, 17, 63, 63, 90, 109]. For example, UNITD [90] pro-
+second in production. This provides a window of at least 25us for          poses TLBs to be included in the regular cache coherence protocol
+an invalidation to take place. Accounting conservatively for 5us for       in order to reduce their overhead. LATR [63] proposes asynchro-
+a 4KB page copying to take place this provides us with 30us per            nous TLB invalidation’s for operations that are amenable to lazy
+migration. As a result, a single entry already provides a very high        TLB shootdowns but this mechanism is not applicable to unmovable
+theoretical number of migrations/second.                                   pages because such mappings cannot afford to become unavailable.
+   To facilitate concurrent migrations, we size the metadata table         Overall, the primary focus of these works is to perform fast TLB
+to store 16 entries as a fully associative structure. Requests across      shootdown operations so their frequency can be increased [12].
+slices are buffered in existing slice queues that handle regular cache     Instead, the goal of Contiguitas is to enable transparent migration
+requests. Contiguitas-HW augments messages to pass additional              of unmovable pages while in use. As a result, Contiguitas arrives
+information e.g., noncacheable. However, it does not require addi-         at a vastly different design point that requires minimal hardware
+tional buses as requests and responses are flowing in existing paths       changes in the last-level cache.
+between L3 slices and the L2 caches. Our Cacti [13] analysis for
+a 22𝑛𝑚 technology node shows that the area for Contiguitas-HW
+                                                                           8      CONCLUSION
+per slice is 0.0038𝑚𝑚 2 , the energy per access is 0.0017𝑛 𝑗, and the
+leakage power is 0.64𝑚𝑊 . We conservatively account for 2-cycle            This paper presented Contiguitas, a holistic solution across the op-
+access time to the metadata table. Compared to the size of a core,         erating system and hardware that reduces memory fragmentation
+the cost of Contiguitas-HW is only 0.014%. Overall, the hardware           due to unmovable allocations. Our evaluation at Meta’s datacenters
+cost of Contiguitas-HW is negligible.                                      and full-system simulations showed that Contiguitas is a generic,
+                                                                           production-ready solution to provide ample memory contiguity for
+                                                                           not only the current demand but also a future where the optimal
+6    DISCUSSION                                                            page size will continue to grow alongside ever-increasing memory
+As server memory capacity increases drastically, resolving excessive       capacities.
+memory management overheads will require a fundamental rebuild
+of the operating system and hardware layers. Contiguitas tames             ACKNOWLEDGMENTS
+unmovable allocations and introduces a reliable source of physical         This work was funded in part by NSF grants CNS-2239311, CNS-
+memory contiguity that can enable a plethora of prior [38, 40, 43,         2107307, CCF-2217016, by Intel Corp under the SRS award, and a
+44, 48, 64, 67, 68, 72, 77, 78, 82, 83, 95, 98, 99, 108, 114, 115] and     Meta Faculty Award. We thank David Koufaty, Nastaran Hajinazar,
+future works that aim to tackle the address translation overhead.          Alex Daglis and the anonymous reviewers for all of their valuable
+In the near term, we expect that 2 MB huge pages can become a              feedback.
+primary choice for memory intensive applications and curb the
+address translation overhead. Finally, existing 1 GB huge pages can
+                                                                           REFERENCES
+provide major performance benefits for certain applications when               [1] Keith Adams and Ole Agesen. 2006. A Comparison of Software and Hardware
+carefully deployed, however we believe that additional support                     Techniques for x86 Virtualization. In Proceedings of the 12th International Confer-
+and research is needed as the substantial increase in page size can                ence on Architectural Support for Programming Languages and Operating Systems
+                                                                                   (ASPLOS XII).
+exacerbate the severity of data movement overheads and memory                  [2] Jeongseob Ahn, Seongwook Jin, and Jaehyuk Huh. 2012. Revisiting Hardware-
+bloating.                                                                          assisted Page Walks for Virtualized Systems. In Proceedings of the 39th Annual
+                                                                                   International Symposium on Computer Architecture (ISCA’12). Portland, Oregon.
+                                                                               [3] Hana Alam, Tianhao Zheng, Mattan Erez, and Yoav Etsion. 2017. Do It Yourself
+7    RELATED WORK                                                                  Virtual Memory Translation. In the Proceedings of ISCA. Toronto, Canada, 1—12.
+                                                                                   https://doi.org/10.1145/3079856.3080209
+TLB efficiency has been a major target of prior work [15, 23, 29,              [4] Chloe Alverti, Stratos Psomadakis, Vasileios Karakostas, Jayneel Gandhi, Kon-
+60, 60, 69, 72, 75, 79, 81, 82, 94, 97, 108, 114]. Works have focused              stantinos Nikas, Georgios Goumas, and Nectarios Koziris. 2020. Enhancing and
+                                                                                   Exploiting Contiguity for Fast Memory Virtualization. In Proceedings of the 47th
+on coalesced [81], range-based [60], and part of memory TLB de-                    International Symposium on Computer Architecture (ISCA’20).
+signs [70, 92]. Contiguitas can boost their efficiency by providing            [5] AMD. 2022.        AMD I/O Virtualization Technology (IOMMU) Specifica-
+                                                                                   tion.     https://www.amd.com/en/support/tech-docs/amd-io-virtualization-
+ample contiguity.                                                                  technology-iommu-specification.
+   Huge page support has received significant attention in the                 [6] AMD. 2022. Invalidate TLB Entry(s) with Broadcast. https://www.amd.com/
+past [39, 48, 64, 67, 68, 77, 78, 87, 102, 113, 114]. Other efforts have           system/files/TechDocs/24594.pdf.
+                                                                               [7] Nadav Amit. 2017. Optimizing the TLB Shootdown Algorithm with Page Access
+focused on upstreaming 1GB THP support [113]. As we showed                         Tracking. In Proceedings of the 2017 USENIX Conference on Usenix Annual Tech-
+in Section 2.2, 1GB huge pages can be effective in reducing the                    nical Conference (Santa Clara, CA, USA) (USENIX ATC ’17). USENIX Association,
+Contiguitas: The Pursuit of Physical Memory Contiguity in Datacenters                                                            ISCA ’23, June 17–21, 2023, Orlando, FL, USA.
+
+
+      USA, 27–39.                                                                          [32] Cort Dougan, Paul Mackerras, and Victor Yodaiken. 1999. Optimizing the Idle
+  [8] Nadav Amit, Amy Tai, and Michael Wei. 2020. Don’t Shoot down TLB Shoot-                   Task and Other MMU Tricks. In Proceedings of the Third Symposium on Operating
+      downs!. In Proceedings of the Fifteenth European Conference on Computer Systems           Systems Design and Implementation (OSDI’99).
+      (Heraklion, Greece) (EuroSys ’20). Association for Computing Machinery, New          [33] Stephane Eranian and David Mosberger. 2000. The Linux/ia64 Project: Kernel
+      York, NY, USA, Article 35, 14 pages. https://doi.org/10.1145/3342195.3387518              Design and Status Update. Technical Report HPL-2000-85. HP Labs.
+  [9] ArangoDB. 2018. Transparent Huge Pages Warning. https://github.com/                  [34] Daniel Firestone, Andrew Putnam, Sambhrama Mundkur, Derek Chiou, Alireza
+      arangodb/arangodb/blob/2b84348b7789893878ebd0c8b552dc20416c98f0/lib/                      Dabagh, Mike Andrewartha, Hari Angepat, Vivek Bhanu, Adrian Caulfield, Eric
+      ApplicationFeatures/EnvironmentFeature.cpp.                                               Chung, Harish Kumar Chandrappa, Somesh Chaturmohta, Matt Humphrey, Jack
+ [10] ARM.       2023.             Arm      Confidential    Compute       Architecture.         Lavier, Norman Lam, Fengfen Liu, Kalin Ovtcharov, Jitu Padhye, Gautham Pop-
+      https://www.arm.com/architecture/security-features/arm-confidential-                      uri, Shachar Raindel, Tejas Sapre, Mark Shaw, Gabriel Silva, Madhan Sivakumar,
+      compute-architecture.                                                                     Nisheeth Srivastava, Anshuman Verma, Qasim Zuhair, Deepak Bansal, Doug
+ [11] ARM. 2023. TLBI (A64). https://developer.arm.com/documentation/dui0801/l/                 Burger, Kushagra Vaid, David A. Maltz, and Albert Greenberg. 2018. Azure
+      A64-General-Instructions/TLBI--A64-.                                                      Accelerated Networking: SmartNICs in the Public Cloud. In 15th USENIX Sym-
+ [12] Amro Awad, Arkaprava Basu, Sergey Blagodurov, Yan Solihin, and Gabriel H.                 posium on Networked Systems Design and Implementation (NSDI 18). USENIX
+      Loh. 2017. Avoiding TLB Shootdowns Through Self-Invalidating TLB Entries.                 Association, Renton, WA, 51–66. https://www.usenix.org/conference/nsdi18/
+      In 2017 26th International Conference on Parallel Architectures and Compilation           presentation/firestone
+      Techniques (PACT). 273–287. https://doi.org/10.1109/PACT.2017.38                     [35] Brad Fitzpatrick. 2004. Distributed Caching with Memcached. Linux Journal
+ [13] Rajeev Balasubramonian, Andrew B. Kahng, Naveen Muralimanohar, Ali Shafiee,               2004, 124 (2004).
+      and Vaishnav Srinivas. 2017. CACTI 7: New Tools for Interconnect Exploration         [36] Jayneel Gandhi, Arkaprava Basu, Mark D. Hill, and Michael M. Swift. 2014. Effi-
+      in Innovative Off-Chip Memories. ACM Transactions on Architecture and Code                cient Memory Virtualization: Reducing Dimensionality of Nested Page Walks.
+      Optimization 14, 2, Article 14 (June 2017), 14:1–14:25 pages.                             In Proceedings of the 47th Annual IEEE/ACM International Symposium on Mi-
+ [14] Thomas W. Barr, Alan L. Cox, and Scott Rixner. 2010. Translation Caching: Skip,           croarchitecture (MICRO-47). Cambridge, United Kingdom.
+      Don’t Walk (the Page Table). In Proceedings of the 2010 International Conference     [37] Jayneel Gandhi, Mark D. Hill, and Michael M. Swift. 2016. Agile Paging: Exceed-
+      on Computer Architecture (ISCA’10).                                                       ing the Best of Nested and Shadow Paging. In Proceedings of the 43rd International
+ [15] Thomas W. Barr, Alan L. Cox, and Scott Rixner. 2011. SpecTLB: A Mechanism for             Symposium on Computer Architecture (ISCA’16).
+      Speculative Address Translation. In Proceedings of the 38th Annual International     [38] Fabien Gaud, Baptiste Lepers, Jeremie Decouchant, Justin Funston, Alexandra
+      Symposium on Computer Architecture (ISCA’11).                                             Fedorova, and Vivien Quéma. 2014. Large Pages May Be Harmful on NUMA Sys-
+ [16] Arkaprava Basu, Jayneel Gandhi, Jichuan Chang, Mark D. Hill, and Michael M.               tems. In Proceedings of the 2014 USENIX Conference on USENIX Annual Technical
+      Swift. 2013. Efficient Virtual Memory for Big Memory Servers. In Proceedings of           Conference (USENIX ATC’14).
+      the 40th Annual International Symposium on Computer Architecture (ISCA’13).          [39] Mel Gorman and Patrick Healy. 2008. Supporting superpage allocation without
+ [17] Andrew Baumann, Paul Barham, Pierre-Evariste Dagand, Tim Harris, Rebecca                  additional hardware support. In Proceedings of the 7th international symposium
+      Isaacs, Simon Peter, Timothy Roscoe, Adrian Schüpbach, and Akhilesh Singhania.            on Memory management (ISMM ’08). Association for Computing Machinery,
+      2009. The Multikernel: A New OS Architecture for Scalable Multicore Systems. In           New York, NY, USA, 41–50. https://doi.org/10.1145/1375634.1375641
+      Proceedings of the ACM SIGOPS 22nd Symposium on Operating Systems Principles         [40] Mel Gorman and Patrick Healy. 2010. Performance Characteristics of Explicit Su-
+      (Big Sky, Montana, USA) (SOSP ’09). Association for Computing Machinery,                  perpage Support. In Proceedings of the 2010 International Conference on Computer
+      New York, NY, USA, 29–44. https://doi.org/10.1145/1629575.1629579                         Architecture (ISCA’10).
+ [18] N. Beckmann, P. Tsai, and D. Sanchez. 2015. Scaling distributed cache hierarchies    [41] Charles Gray, Matthew Chapman, Peter Chubb, David Mosberger-Tang, and
+      through computation and data co-scheduling. In 2015 IEEE 21st International               Gernot Heiser. 2005. Itanium — A System Implementor’s Tale. In Proceedings of
+      Symposium on High Performance Computer Architecture (HPCA). IEEE Computer                 the 2005 USENIX Annual Technical Conference (USENIX ATC’05).
+      Society, Los Alamitos, CA, USA, 538–550.                                             [42] Chuanxiong Guo, Haitao Wu, Zhong Deng, Gaurav Soni, Jianxi Ye, Jitu Pad-
+ [19] Fabrice Bellard. 2005. QEMU, a fast and portable dynamic translator.. In USENIX           hye, and Marina Lipshteyn. 2016. RDMA over Commodity Ethernet at Scale.
+      annual technical conference, FREENIX Track, Vol. 41. Califor-nia, USA, 10–5555.           In Proceedings of the 2016 ACM SIGCOMM Conference (Florianopolis, Brazil)
+ [20] Ravi Bhargava, Benjamin Serebrin, Francesco Spadini, and Srilatha Manne.                  (SIGCOMM ’16). Association for Computing Machinery, New York, NY, USA,
+      2008. Accelerating Two-dimensional Page Walks for Virtualized Systems. In                 202–215. https://doi.org/10.1145/2934872.2934908
+      Proceedings of the 13th International Conference on Architectural Support for        [43] Fei Guo, Seongbeom Kim, Yury Baskakov, and Ishan Banerjee. 2015. Proactively
+      Programming Languages and Operating Systems (ASPLOS XIII).                                Breaking Large Pages to Improve Memory Overcommitment Performance in
+ [21] Abhishek Bhattacharjee. 2013. Large-reach Memory Management Unit Caches.                  VMware ESXi. In Proceedings of the 11th ACM International Conference on Virtual
+      In Proceedings of the 46th Annual IEEE/ACM International Symposium on Mi-                 Execution Environments (VEE’15).
+      croarchitecture (MICRO-46).                                                          [44] Siddharth Gupta, Atri Bhattacharyya, Yunho Oh, Abhishek Bhattacharjee, Babak
+ [22] Abhishek Bhattacharjee. 2017. Translation-Triggered Prefetching. In Proceedings           Falsafi, and Mathias Payer. 2021. Rebooting Virtual Memory with Midgard. In
+      of the 22nd International Conference on Architectural Support for Programming             2021 ACM/IEEE 48th Annual International Symposium on Computer Architecture
+      Languages and Operating Systems (ASPLOS’17).                                              (ISCA). 512–525. https://doi.org/10.1109/ISCA52012.2021.00047
+ [23] Abhishek Bhattacharjee, Daniel Lustig, and Margaret Martonosi. 2011. Shared          [45] Swapnil Haria, Mark D. Hill, and Michael M. Swift. 2018. Devirtualizing Memory
+      Last-level TLBs for Chip Multiprocessors. In Proceedings of the 2011 IEEE 17th            in Heterogeneous Systems. In Proceedings of the 23rd International Conference
+      International Symposium on High Performance Computer Architecture (HPCA’11).              on Architectural Support for Programming Languages and Operating Systems
+ [24] Abhishek Bhattacharjee and Margaret Martonosi. 2010. Inter-Core Cooperative               (ASPLOS’18). Williamsburg, VA, USA.
+      TLB Prefetchers for Chip Multiprocessors. In Proceedings of the 15th International   [46] Red Hat. 2015. Red Hat Enterprise Linux Network Performance Tuning
+      Conference on Architectural Support for Programming Languages and Operating               Guide. https://access.redhat.com/sites/default/files/attachments/20150325_
+      Systems (ASPLOS XV).                                                                      network_performance_tuning.pdf.
+ [25] Travis Campbell. 2015. Transparent Huge Pages on Hadoop makes me                     [47] Jerry Huck and Jim Hays. 1993. Architectural Support for Translation Table
+      sad. https://www.ghostar.org/2015/02/transparent-huge-pages-on-hadoop-                    Management in Large Address Space Machines. In Proceedings of the 20th Annual
+      makes-me-sad.                                                                             International Symposium on Computer Architecture (ISCA’93).
+ [26] Cloudera. 2021. Transparent Huge Pages Warning. https://www.cloudera.com/            [48] A.H. Hunter, Chris Kennelly, Paul Turner, Darryl Gove, Tipp Moseley, and
+      documentation/enterprise/latest/topics/cdh_admin_performance.html.                        Parthasarathy Ranganathan. 2021. Beyond malloc efficiency to fleet efficiency:
+ [27] Compute Express Link Consortium. 2022.                    CXL 3.0 White Pa-               a hugepage-aware memory allocator. In 15th USENIX Symposium on Operating
+      per.                  https://www.computeexpresslink.org/_files/ugd/0c1418_               Systems Design and Implementation (OSDI 21). USENIX Association, 257–273.
+      a8713008916044ae9604405d10a7773b.pdf.                                                     https://www.usenix.org/conference/osdi21/presentation/hunter
+ [28] Jonathan Corbet. 2010. Memory compaction. https://lwn.net/Articles/368869/.          [49] IBM. 2005. PowerPC Microprocessor Family: The Programming Environments
+ [29] Guilherme Cox and Abhishek Bhattacharjee. 2017. Efficient Address Trans-                  Manual for 32 and 64-bit Microprocessors. https://wiki.alcf.anl.gov/images/f/fb/
+      lation for Architectures with Multiple Page Sizes. In Proceedings of the 22nd             PowerPC_-_Assembly_-_IBM_Programming_Environment_2.3.pdf.
+      International Conference on Architectural Support for Programming Languages          [50] Intel. 2010. Itanium Architecture Software Developer’s Manual (Volume
+      and Operating Systems (ASPLOS’17).                                                        2).    https://www.intel.com/content/www/us/en/products/docs/processors/
+ [30] Christoffer Dall and Jason Nieh. 2014. KVM/ARM: The Design and Implemen-                  itanium/itanium-architecture-vol-1-2-3-4-reference-set-manual.html.
+      tation of the Linux ARM Hypervisor. In Proceedings of the 19th International         [51] Intel. 2015. 5-Level Paging and 5-Level EPT (White Paper). https://software.
+      Conference on Architectural Support for Programming Languages and Operating               intel.com/sites/default/files/managed/2b/80/5-level_paging_white_paper.pdf.
+      Systems (ASPLOS’14).                                                                 [52] Intel. 2019. 64 and IA-32 Architectures Software Developer’s Manual.
+ [31] The Linux Kernel Documentation. 2023. Shared Virtual Addressing (SVA) with           [53] Intel. 2021. Intel Trusted Domain Extensions. https://www.intel.com/content/
+      ENQCMD. https://docs.kernel.org/x86/sva.html.                                             dam/develop/external/us/en/documents/tdx-whitepaper-v4.pdf.
+ISCA ’23, June 17–21, 2023, Orlando, FL, USA.                                                                                                                         Zhao et al.
+
+
+ [54] Intel. 2021. Remote Action Request White Paper. https://www.intel.com/                   Valas Valancius, Xi Wang, and Amin Vahdat. 2019. Snap: A Microkernel Ap-
+      content/dam/develop/external/us/en/documents/341431-remote-action-                       proach to Host Networking (SOSP ’19). Association for Computing Machinery,
+      request-white-paper.pdf.                                                                 New York, NY, USA, 399–413. https://doi.org/10.1145/3341301.3359657
+ [55] Intel. 2022.      Intel Virtualization Technology for Directed I/O.        https:   [74] Marshall Kirk McKusick, George V Neville-Neil, and Robert NM Watson. 2014.
+      //edc.intel.com/content/www/xl/es/publications/specification-nuc12dcm-                   The design and implementation of the FreeBSD operating system. Pearson Educa-
+      nuc12edb/intel-virtualization-technology-for-directed-i-o/.                              tion.
+ [56] Intel. 2022. Intel® Optane™ Persistent Memory. https://www.intel.com/content/       [75] S. Mirbagher-Ajorpaz, E. Garza, G. Pokam, and D. A. Jimenez. 2020. CHiRP:
+      www/us/en/architecture-and-technology/optane-dc-persistent-memory.html.                  Control-Flow History Reuse Prediction. In Proceedings of the 53rd Annual
+ [57] Intel. 2023. Introducing the Intel Data Streaming Accelerator. https://01.org/           IEEE/ACM International Symposium on Microarchitecture (MICRO-53).
+      blogs/2019/introducing-intel-data-streaming-accelerator.                            [76] MongoDB. 2018. Transparent Huge Pages Warning. https://github.com/
+ [58] Bruce L. Jacob and Trevor N. Mudge. 1998. A Look at Several Memory Manage-               mongodb/mongo/blob/eeea7c2f80bdaf49a197a1c8149d7bc6cbc9395e/src/
+      ment Units, TLB-refill Mechanisms, and Page Table Organizations. In Proceedings          mongo/db/startup_warnings_mongod.cpp.
+      of the 8th International Conference on Architectural Support for Programming        [77] Ashish Panwar, Sorav Bansal, and K. Gopinath. 2019. HawkEye: Efficient Fine-
+      Languages and Operating Systems (ASPLOS VIII).                                           grained OS Support for Huge Pages. In Proceedings of the Twenty-Fourth Inter-
+ [59] Joefon Jann, Paul Mackerras, John Ludden, Michael Gschwind, Wade Ouren,                  national Conference on Architectural Support for Programming Languages and
+      Stuart Jacobs, Brian F. Veale, and David Edelsohn. 2018. IBM POWER9 system               Operating Systems (ASPLOS’19).
+      software. IBM Journal of Research and Development 62, 4/5 (June 2018).              [78] Ashish Panwar, Aravinda Prasad, and K. Gopinath. 2018. Making Huge Pages Ac-
+ [60] Vasileios Karakostas, Jayneel Gandhi, Furkan Ayar, Adrián Cristal, Mark D. Hill,         tually Useful. In Proceedings of the 23rd International Conference on Architectural
+      Kathryn S. McKinley, Mario Nemirovsky, Michael M. Swift, and Osman Ünsal.                Support for Programming Languages and Operating Systems (ASPLOS’18).
+      2015. Redundant Memory Mappings for Fast Access to Large Memories. In Pro-          [79] Chang Hyun Park, Taekyung Heo, Jungi Jeong, and Jaehyuk Huh. 2017. Hybrid
+      ceedings of the 42nd Annual International Symposium on Computer Architecture             TLB Coalescing: Improving TLB Translation Coverage under Diverse Frag-
+      (ISCA’15).                                                                               mented Memory Allocations. In Proceedings of the 44th Annual International
+ [61] V. Karakostas, J. Gandhi, A. Cristal, M. D. Hill, K. S. McKinley, M. Nemirovsky,         Symposium on Computer Architecture (ISCA’17).
+      M. M. Swift, and O. S. Unsal. 2016. Energy-Efficient Address Translation. In        [80] Omer Peleg, Adam Morrison, Benjamin Serebrin, and Dan Tsafrir. 2015. Utilizing
+      Proceedings of 2016 IEEE International Symposium on High Performance Computer            the IOMMU Scalably. In 2015 USENIX Annual Technical Conference (USENIX
+      Architecture (HPCA’16).                                                                  ATC 15). USENIX Association, Santa Clara, CA, 549–562. https://www.usenix.
+ [62] Samuel T. King, George W. Dunlap, and Peter M. Chen. 2003. Operating System              org/conference/atc15/technical-session/presentation/peleg
+      Support for Virtual Machines. In Proceedings of the 2003 USENIX Annual Technical    [81] Binh Pham, Abhishek Bhattacharjee, Yasuko Eckert, and Gabriel H. Loh. 2014.
+      Conference (USENIX ATC’03).                                                              Increasing TLB Reach by Exploiting Clustering in Page Translations. In Pro-
+ [63] Mohan Kumar Kumar, Steffen Maass, Sanidhya Kashyap, Ján Veselý, Zi Yan,                  ceedings of the 2014 IEEE 20th International Symposium on High Performance
+      Taesoo Kim, Abhishek Bhattacharjee, and Tushar Krishna. 2018. LATR: Lazy                 Computer Architecture (HPCA’14).
+      Translation Coherence. In Proceedings of the Twenty-Third International Confer-     [82] Binh Pham, Viswanathan Vaidyanathan, Aamer Jaleel, and Abhishek Bhat-
+      ence on Architectural Support for Programming Languages and Operating Systems            tacharjee. 2012. CoLT: Coalesced Large-Reach TLBs. In Proceedings of the 45th
+      (Williamsburg, VA, USA) (ASPLOS ’18). Association for Computing Machinery,               IEEE/ACM International Symposium on Microarchitecture (MICRO-45).
+      New York, NY, USA, 651–664. https://doi.org/10.1145/3173162.3173198                 [83] Binh Pham, Ján Veselŷ, Gabriel H. Loh, and Abhishek Bhattacharjee. 2015. Large
+ [64] Youngjin Kwon, Hangchen Yu, Simon Peter, Christopher J. Rossbach, and Em-                Pages and Lightweight Memory Management in Virtualized Environments:
+      mett Witchel. 2016. Coordinated and Efficient Huge Page Management with                  Can You Have it Both Ways?. In Proceedings of the 48th Annual IEEE/ACM
+      Ingens. In Proceedings of the 12th USENIX Conference on Operating Systems                International Symposium on Microarchitecture (MICRO-48). Waikiki, Hawaii,
+      Design and Implementation (OSDI’16).                                                     USA.
+ [65] Shang Li, Zhiyuan Yang, Dhiraj Reddy, Ankur Srivastava, and Bruce Jacob. 2020.      [84] Boris Pismenny, Liran Liss, Adam Morrison, and Dan Tsafrir. 2022. The benefits
+      DRAMsim3: a cycle-accurate, thermal-capable DRAM simulator. IEEE Computer                of general-purpose on-NIC memory. In ACM International Conference on Archi-
+      Architecture Letters 19, 2 (2020), 106–109.                                              tectural Support for Programming Languages and Operating Systems (ASPLOS).
+ [66] Matt Loughran. 2015. How Okta Chased Down Severe System CPU Contention                   Lausanne, Switzerland, 1130–1147.
+      in MySQL. https://developer.okta.com/blog/2015/05/22/tcmalloc.                      [85] DPDK Project. 2019. Memory in DPDK, Part 1: General Concepts. https:
+ [67] Martin Maas, David G. Andersen, Michael Isard, Mohammad Mahdi Javanmard,                 //www.dpdk.org/blog/2019/08/21/memory-in-dpdk-part-1-general-concepts/.
+      Kathryn S. McKinley, and Colin Raffel. 2020. Learning-based Memory Allocation       [86] Moinuddin K. Qureshi. 2018. CEASER: mitigating conflict-based cache at-
+      for C++ Server Workloads. In 25th ACM International Conference on Architectural          tacks via encrypted-address and remapping. In Proceedings of the 51st Annual
+      Support for Programming Languages and Operating Systems (ASPLOS).                        IEEE/ACM International Symposium on Microarchitecture (MICRO-51). IEEE Press,
+ [68] Martin Maas, Chris Kennelly, Khanh Nguyen, Darryl Gove, Kathryn S. McKinley,             Fukuoka, Japan, 775–787. https://doi.org/10.1109/MICRO.2018.00068
+      and Paul Turner. 2021. Adaptive Huge-Page Subrelease for Non-Moving Memory          [87] Venkat Sri Sai Ram, Ashish Panwar, and Arkaprava Basu. 2021. Trident: Harness-
+      Allocators in Warehouse-Scale Computers. In Proceedings of the 2021 ACM                  ing Architectural Resources for All Page Sizes in X86 Processors. In MICRO-54:
+      SIGPLAN International Symposium on Memory Management (Virtual, Canada)                   54th Annual IEEE/ACM International Symposium on Microarchitecture (Virtual
+      (ISMM 2021). Association for Computing Machinery, New York, NY, USA, 28–38.              Event, Greece) (MICRO ’21). Association for Computing Machinery, New York,
+      https://doi.org/10.1145/3459898.3463905                                                  NY, USA, 1106–1120. https://doi.org/10.1145/3466752.3480062
+ [69] Moshe Malka, Nadav Amit, Muli Ben-Yehuda, and Dan Tsafrir. 2015. rIOMMU:            [88] Will Reese. 2008. Nginx: The High-Performance Web Server and Reverse Proxy.
+      Efficient IOMMU for I/O Devices that Employ Ring Buffers. In Proceedings of              Linux J. (2008).
+      the Twentieth International Conference on Architectural Support for Programming     [89] Arun F Rodrigues, Gwendolyn Renae Voskuilen, Simon David Hammond, and
+      Languages and Operating Systems (ASPLOS ’15). Association for Computing                  Karl Scott Hemmert. 2016. Structural Simulation Toolkit (SST). Technical Report.
+      Machinery, New York, NY, USA, 355–368. https://doi.org/10.1145/2694344.                  Sandia National Lab.(SNL-NM), Albuquerque, NM (United States).
+      2694355                                                                             [90] Bogdan F. Romanescu, Alvin R. Lebeck, Daniel J. Sorin, and Anne Bracy. 2010.
+ [70] Yashwant Marathe, Nagendra Gulur, Jee Ho Ryoo, Shuang Song, and Lizy K.                  UNified Instruction/Translation/Data (UNITD) coherence: One protocol to rule
+      John. 2017. CSALT: Context Switch Aware Large TLB. In Proceedings of the 50th            them all. In HPCA - 16 2010 The Sixteenth International Symposium on High-
+      Annual IEEE/ACM International Symposium on Microarchitecture (MICRO-50).                 Performance Computer Architecture. 1–12. https://doi.org/10.1109/HPCA.2010.
+      Cambridge, MA, USA.                                                                      5416643
+ [71] Artemiy Margaritov, Dmitrii Ustiugov, Edouard Bugnion, and Boris Grot. 2019.        [91] Mark E Russinovich, David A Solomon, and Alex Ionescu. 2012. Windows
+      Prefetched Address Translation. In Proceedings of the 52nd Annual IEEE/ACM               internals, part 2. Pearson Education.
+      International Symposium on Microarchitecture (Columbus, OH, USA) (MICRO             [92] Jee Ho Ryoo, Nagendra Gulur, Shuang Song, and Lizy K. John. 2017. Rethinking
+      ’52). Association for Computing Machinery, New York, NY, USA, 1023–1036.                 TLB Designs in Virtualized Environments: A Very Large Part-of-Memory TLB. In
+      https://doi.org/10.1145/3352460.3358294                                                  Proceedings of the 44th Annual International Symposium on Computer Architecture
+ [72] Artemiy Margaritov, Dmitrii Ustiugov, Edouard Bugnion, and Boris Grot. 2019.             (ISCA’17). Toronto, ON, Canada.
+      Prefetched Address Translation. In Proceedings of the 52nd Annual IEEE/ACM          [93] Samsung. 2019. Samsung Electronics Introduces Industry’s First 512GB
+      International Symposium on Microarchitecture (MICRO-52).                                 CXL Memory Module. https://news.samsung.com/global/samsung-electronics-
+ [73] Michael Marty, Marc de Kruijf, Jacob Adriaens, Christopher Alfeld, Sean Bauer,           introduces-industrys-first-512gb-cxl-memory-module.
+      Carlo Contavalli, Michael Dalton, Nandita Dukkipati, William C. Evans, Steve        [94] Dimitrios Skarlatos, Umur Darbaz, Bhargava Gopireddy, Nam Sung Kim, and
+      Gribble, Nicholas Kidd, Roman Kononov, Gautam Kumar, Carl Mauer, Emily                   Josep Torrellas. 2020. BabelFish: Fusing Address Translations for Containers. In
+      Musick, Lena Olson, Erik Rubow, Michael Ryan, Kevin Springborn, Paul Turner,             2020 ACM/IEEE 47th Annual International Symposium on Computer Architecture
+                                                                                               (ISCA) (ISCA 2020). https://doi.org/10.1109/ISCA45697.2020.00049
+Contiguitas: The Pursuit of Physical Memory Contiguity in Datacenters                                                           ISCA ’23, June 17–21, 2023, Orlando, FL, USA.
+
+
+ [95] Dimitrios Skarlatos, Apostolos Kokolis, Tianyin Xu, and Josep Torrellas. 2020.     [107] The Linux Kernel Archives. 2023. x86 virtual memory map. https://www.kernel.
+      Elastic Cuckoo Page Tables: Rethinking Virtual Memory Translation for Par-               org/doc/Documentation/x86/x86_64/mm.txt.
+      allelism. In Proceedings of the Twenty-Fifth International Conference on Archi-    [108] Georgios Vavouliotis, Lluc Alvarez, Vasileios Karakostas, Konstantinos Nikas,
+      tectural Support for Programming Languages and Operating Systems (Lausanne,              Nectarios Koziris, Daniel A. Jiménez, and Marc Casas. 2021. Exploiting
+      Switzerland) (ASPLOS ’20).                                                               Page Table Locality for Agile TLB Prefetching. In 2021 ACM/IEEE 48th An-
+ [96] J. E. Smith and Ravi Nair. 2005. The Architecture of Virtual Machines. IEEE              nual International Symposium on Computer Architecture (ISCA). 85–98. https:
+      Computer 38, 5 (2005), 32–38. https://doi.org/10.1109/MC.2005.173                        //doi.org/10.1109/ISCA52012.2021.00016
+ [97] Shekhar Srikantaiah and Mahmut Kandemir. 2010. Synergistic TLBs for High           [109] Carlos Villavieja, Vasileios Karakostas, Lluis Vilanova, Yoav Etsion, Alex
+      Performance Address Translation in Chip Multiprocessors. In Proceedings of the           Ramirez, Avi Mendelson, Nacho Navarro, Adrian Cristal, and Osman S. Un-
+      43rd Annual IEEE/ACM International Symposium on Microarchitecture (MICRO-                sal. 2011. DiDi: Mitigating the Performance Impact of TLB Shootdowns Using a
+      43).                                                                                     Shared TLB Directory. In 2011 International Conference on Parallel Architectures
+ [98] Jovan Stojkovic, Namrata Mantri, Dimitrios Skarlatos, Tianyin Xu, and Josep              and Compilation Techniques. 340–349. https://doi.org/10.1109/PACT.2011.65
+      Torrellas. 2023. Memory-Efficient Hashed Page Tables. In 2023 IEEE International   [110] Johannes Weiner, Niket Agarwal, Dan Schatzberg, Leon Yang, Hao Wang, Blaise
+      Symposium on High-Performance Computer Architecture (HPCA). 1221–1235.                   Sanouillet, Bikash Sharma, Tejun Heo, Mayank Jain, Chunqiang Tang, and
+      https://doi.org/10.1109/HPCA56546.2023.10071061                                          Dimitrios Skarlatos. 2022. TMO: Transparent Memory Offloading in Datacenters.
+ [99] Jovan Stojkovic, Dimitrios Skarlatos, Apostolos Kokolis, Tianyin Xu, and Josep           In Proceedings of the 27th ACM International Conference on Architectural Support
+      Torrellas. 2022. Parallel Virtualized Memory Translation with Nested Elastic             for Programming Languages and Operating Systems (ASPLOS 2022). https:
+      Cuckoo Page Tables. In Proceedings of the 27th ACM International Conference              //doi.org/10.1145/3503222.3507731
+      on Architectural Support for Programming Languages and Operating Systems           [111] Jonathan Woodruff, Robert N.M. Watson, David Chisnall, Simon W. Moore,
+      (ASPLOS 2022). https://doi.org/10.1145/3503222.3507720                                   Jonathan Anderson, Brooks Davis, Ben Laurie, Peter G. Neumann, Robert Norton,
+[100] Madhusudhan Talluri and Mark D. Hill. 1994. Surpassing the TLB Performance               and Michael Roe. 2014. The CHERI Capability Model: Revisiting RISC in an Age
+      of Superpages with Less Operating System Support. In Proceedings of the Sixth            of Risk. In Proceeding of the 41st Annual International Symposium on Computer
+      International Conference on Architectural Support for Programming Languages              Architecture (ISCA’14) (Minneapolis, Minnesota, USA).
+      and Operating Systems (San Jose, California, USA) (ASPLOS VI). Association for     [112] www.7-cpu.com. 2023. Intel Skylake Timing. https://www.7-cpu.com/cpu/
+      Computing Machinery, New York, NY, USA, 171–182. https://doi.org/10.1145/                Skylake.html.
+      195473.195531                                                                      [113] Zi Yan. 2020. 1GB THP support on x86_64. https://lwn.net/Articles/830435/.
+[101] Madhusudhan Talluri and Mark D. Hill. 1994. Surpassing the TLB Performance         [114] Zi Yan, Daniel Lustig, David Nellans, and Abhishek Bhattacharjee. 2019. Trans-
+      of Superpages with Less Operating System Support. In Proceedings of the 6th              lation Ranger: Operating System Support for Contiguity-Aware TLBs. In Pro-
+      International Conference on Architectural Support for Programming Languages              ceedings of the 46th Annual International Symposium on Computer Architecture
+      and Operating Systems (ASPLOS VI).                                                       (ISCA’19). Phoenix, AZ, USA.
+[102] Madhusudhan Talluri, Shing Kong, Mark D. Hill, and David A. Patterson. 1992.       [115] Idan Yaniv and Dan Tsafrir. 2016. Hash, Don’t Cache (the Page Table). In Pro-
+      Tradeoffs in Supporting Two Page Sizes. In 19th International Symposium on               ceedings of the 2016 ACM SIGMETRICS International Conference on Measurement
+      Computer Architecture (ISCA’92).                                                         and Modeling of Computer Science (SIGMETRICS’16).
+[103] Mellanox Technologies. 2019. Introducing 200G HDR InfiniBand Solu-                 [116] Yuval Yarom, Qian Ge, Fangfei Liu, Ruby B. Lee, and Gernot Heiser. 2015. Map-
+      tions. https://network.nvidia.com/files/doc-2020/wp-introducing-200g-hdr-                ping the Intel Last-Level Cache. IACR Cryptology ePrint Archive 2015 (2015),
+      infiniband-solutions.pdf.                                                                905. https://eprint.iacr.org/2015/905
+[104] Mellanox Technologies. 2020. Mellanox Adapters Programmer’s Refer-                 [117] Yibo Zhu, Haggai Eran, Daniel Firestone, Chuanxiong Guo, Marina Lipshteyn,
+      ence Manual. https://network.nvidia.com/files/doc-2020/ethernet-adapters-                Yehonatan Liron, Jitendra Padhye, Shachar Raindel, Mohamad Haj Yahia, and
+      programming-manual.pdf.                                                                  Ming Zhang. 2015. Congestion Control for Large-Scale RDMA Deployments.
+[105] The Linux Kernel Archives. 2019. Transparent Hugepage Support. https:                    In Proceedings of the 2015 ACM Conference on Special Interest Group on Data
+      //www.kernel.org/doc/Documentation/vm/transhuge.txt.                                     Communication (London, United Kingdom) (SIGCOMM ’15). Association for
+[106] The Linux Kernel Archives. 2023. HugeTLB Pages. https://www.kernel.org/doc/              Computing Machinery, New York, NY, USA, 523–536. https://doi.org/10.1145/
+      html/latest/admin-guide/mm/hugetlbpage.html.                                             2785956.2787484
+

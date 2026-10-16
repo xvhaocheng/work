@@ -1,0 +1,1645 @@
+  Batch-Aware Unified Memory Management in GPUs
+              for Irregular Workloads
+                  Hyojong Kim                                          Jaewoong Sim                                Prasun Gera
+       Georgia Institute of Technology                                      Intel Labs                    Georgia Institute of Technology
+
+                                           Ramyad Hadidi                                     Hyesoon Kim
+                                  Georgia Institute of Technology                    Georgia Institute of Technology
+
+Abstract                                                                            Keywords. graphics processing units; unified memory man-
+While unified virtual memory and demand paging in modern                            agement; memory oversubscription; virtual memory
+GPUs provide convenient abstractions to programmers for                            ACM Reference Format:
+working with large-scale applications, they come at a signif-                      Hyojong Kim, Jaewoong Sim, Prasun Gera, Ramyad Hadidi, and Hye-
+icant performance cost. We provide the first comprehensive                         soon Kim. 2020. Batch-Aware Unified Memory Management in
+analysis of major inefficiencies that arise in page fault han-                     GPUs for Irregular Workloads. In Proceedings of the Twenty-Fifth
+dling mechanisms employed in modern GPUs. To amortize                              International Conference on Architectural Support for Programming
+the high costs in fault handling, the GPU runtime processes                        Languages and Operating Systems (ASPLOS ’20), March 16–20, 2020,
+a large number of GPU page faults together. We observe that                        Lausanne, Switzerland. ACM, New York, NY, USA, 14 pages. https:
+this batched processing of page faults introduces large-scale                      //doi.org/10.1145/3373376.3378529
+serialization that greatly hurts the GPU’s execution through-
+put. We show real machine measurements that corroborate                             1    Introduction
+our findings.                                                                       Graphics processing units (GPUs) have been successful in
+   Our goal is to mitigate these inefficiencies and enable ef-                      providing substantial compute performance and have now
+ficient demand paging for GPUs. To this end, we propose                             become one of the major computing platforms in servers
+a GPU runtime software and hardware solution that (1) in-                           and datacenters [21, 23]. As an accelerator device, however,
+creases the batch size (i.e., the number of page faults handled                     a conventional discrete GPU only allows access to its own
+together), thereby amortizing the GPU runtime fault han-                            device memory, so programmers need to design their appli-
+dling time, and reduces the number of batches by supporting                         cations carefully to fit in the limited capacity of the device
+CPU-like thread block context switching, and (2) takes page                         memory. This makes it very challenging and costly to run
+eviction off the critical path with no hardware changes by                          large-scale applications with hundreds of GBs of memory
+overlapping evictions with CPU-to-GPU page migrations.                              footprint, such as graph computing workloads, because it
+Our evaluation demonstrates that the proposed solution pro-                         requires careful data and algorithm partitioning in addition
+vides an average speedup of 2x over the state-of-the-art page                       to purchasing more GPUs just for memory capacity.
+prefetching. We show that our solution increases the batch                              To address this issue, recent GPUs support Unified Virtual
+size by 2.27x and reduces the total number of batches by 51%                        Memory (UVM) [1, 38, 39]. UVM provides a coherent view of
+on average. We also show that the average batch processing                          a single virtual address space between CPUs and GPUs with
+time is reduced by 27%.                                                             automatic data migration via demand paging. This allows
+CCS Concepts. • Computer systems organization → Sin-                                GPUs to access a page that resides in the CPU memory as
+gle instruction, multiple data; • Software and its engi-                            if it were in the GPU memory, thereby allowing GPU appli-
+neering → Virtual memory;                                                           cations to run without worrying about the device memory
+                                                                                    capacity limit. As such, UVM frees programmers from tuning
+                                                                                    an application for each individual GPU and allows the appli-
+Permission to make digital or hard copies of all or part of this work for           cation to run on a variety of GPUs with different physical
+personal or classroom use is granted without fee provided that copies are not
+made or distributed for profit or commercial advantage and that copies bear         memory sizes without any source code changes. This is good
+this notice and the full citation on the first page. Copyrights for components      for programmability and portability.
+of this work owned by others than ACM must be honored. Abstracting with                 While the feature sounds promising, in reality, the benefit
+credit is permitted. To copy otherwise, or republish, to post on servers or to      comes with a non-negligible performance cost. Virtual mem-
+redistribute to lists, requires prior specific permission and/or a fee. Request     ory support requires address translation for every memory
+permissions from permissions@acm.org.
+ASPLOS ’20, March 16–20, 2020, Lausanne, Switzerland
+                                                                                    request, and its performance impact is more substantial than
+© 2020 Association for Computing Machinery.                                         in CPUs because GPUs can issue a significantly larger num-
+ACM ISBN 978-1-4503-7102-5/20/03. . . $15.00                                        ber of memory requests in a short period of time [8, 47]. In
+https://doi.org/10.1145/3373376.3378529                                             addition, paging in and out of GPU memory requires costly
+              100%
+                                 Working Set Characteristics for Regular Workloads
+                                                                                                              for UVM (Section 2). The GPU runtime processes a group
+                                                                                                      CFD
+                                                                                                              of GPU page faults together, rather than processing each
+Working Set
+
+
+
+
+              75%                                                                                     DWT
+              50%                                                                                     GM
+                                                                                                      H3D
+                                                                                                              individual one, in order to amortize the overhead of multiple
+              25%
+               0%
+                                                                                                      HS
+                                                                                                      LUD
+                                                                                                              round-trip latencies over the PCIe bus and to avoid invoking
+                     1   2   3      4    5    6    7   8    9   10   11   12   13      14   15   16
+                                                                                                              multiple interrupt service routines (ISRs) in the operating
+              100%
+                                 Working Set Characteristics for Irregular Workloads
+                                                                                                              system (OS). To efficiently process an excessive number of
+                                                                                                      BC
+Working Set
+
+
+
+
+              75%                                                                                     BFS     page faults, the GPU runtime performs a series of opera-
+              50%                                                                                     GC
+              25%
+                                                                                                      KCORE   tions such as preprocessing all the page faults and inserting
+                                                                                                      PR
+               0%
+                     1   2   3      4    5    6    7   8    9   10   11   12   13   14      15   16
+                                                                                                      SSSP    page prefetching requests, which takes a significant amount
+                                         Number of active GPU cores (SMs)                                     of time (in the range of tens to hundreds of microseconds).
+                                                                                                              Once all the operations (e.g., CPU page table walks for all
+Figure 1. Working set size vs. active GPU core count. For                                                     the page faults, page allocation and eviction scheduling, etc.)
+most of the regular workloads, the working set size is pro-                                                   are finished, page migrations between the CPU and the GPU
+portional to the number of active GPU cores. In many large-                                                   begin. Section 3 describes our findings in detail along with
+scale, irregular applications, however, most memory pages                                                     the assessment of processing a group of page faults in a real
+are shared across GPU cores, so GPU core throttling is in-                                                    GPU system.
+effective in reducing the working set size. All lines without                                                    Based on our in-depth analysis of how the GPU runtime
+markers are overlapped in each figure.                                                                        handles GPU page faults, schedules page migrations, and
+                                                                                                              interacts with the GPU hardware, we propose two novel tech-
+                                                                                                              niques that work in synergy: (1) Thread Oversubscription
+communications between CPU and GPU over an intercon-                                                          (TO), a CPU-like thread block context switching technique,
+nect such as PCIe [44] and an interrupt handler invocation.                                                   to effectively amortize the GPU runtime fault handling time
+Prior work reports that page fault handling latency ranges                                                    by increasing the batch size (i.e., the number of page faults
+from 20µs to 50µs [53]. We find that these numbers are con-                                                   handled together), and (2) Unobtrusive Eviction (UE) to take
+servative and can be worse depending on the applications                                                      GPU page evictions off the critical path with no hardware
+and systems. Unfortunately, this page fault latency, which is                                                 changes based on the idea of overlapping page evictions with
+in the order of microseconds, cannot be easily hidden even                                                    CPU-to-GPU page migrations. The key contributions of this
+with ample thread-level parallelism (TLP) in GPUs, especially                                                 paper are as follows:
+when GPU memory is oversubscribed.                                                                                  • This is the first work to discuss that a group of page
+   Recently, Li et al. [29] proposed a memory management                                                              faults are handled together in a batch in contempo-
+framework, called eviction-throttling-compression (ETC), to                                                           rary GPUs. We provide a comprehensive analysis of
+improve GPU performance under memory oversubscription.                                                                major inefficiencies that arise in the batch processing
+Depending on the application characteristics, the framework                                                           mechanism.
+selectively employs proactive eviction, memory-aware core                                                           • Our main insight is that when page migrations account
+throttling (i.e., disabling a subset of GPU cores), and capac-                                                        for a significant portion of the total execution time,
+ity compression techniques. However, for many large-scale,                                                            we should consider dispatching more thread blocks to
+irregular applications, we found that the ETC framework                                                               each GPU core despite the additional cost of (thread-
+is ineffective. First, the proactive eviction heavily relies on                                                       block) context switches.
+predicting the correct timing to avoid both early and late                                                          • We demonstrate that these inefficiencies can be allevi-
+evictions. Since irregular applications access a large number                                                         ated with lightweight and practical solutions, thereby
+of pages within a short period of time, predicting correct                                                            enabling more efficient demand paging for GPUs.
+timing is not trivial [29]. Second, the memory-aware throt-                                                         • We improve performance by 2x and 1.79x over the
+tling technique aims to reduce the application working set by                                                         state-of-the-art page prefetching mechanism [53] and
+disabling a subset of GPU cores. For this to be effective, the                                                        ETC mechanism [29], respectively.
+working set size has to be reduced when GPU cores are throt-
+tled. This is the case for most regular workloads, as shown in
+Figure 1. However, this is not the case for many large-scale,
+                                                                                                              2     Background
+irregular applications because most of the memory pages are                                                   In this section, we first provide a brief background on GPUs
+shared across GPU cores, and thus, memory-aware throttling                                                    in the context of thread concurrency. We then delve into the
+is not effective in reducing the working set size.                                                            unified virtual memory feature offered by modern GPUs.
+   The goal of this work is to support the efficient execution
+of large-scale irregular applications, such as graph comput-                                                  2.1    Thread Concurrency in GPUs
+ing workloads, in the UVM model. We first investigate how                                                     GPUs offer a high degree of data-level parallelism by exe-
+the current GPU runtime software and hardware operates                                                        cuting thousands of scalar threads concurrently. To do so, a
+  1             Handling A fault         2   3
+          GPU Runtime Fault Handling Page A
+A fault                                          GPU Runtime Fault Handling Page B                4
+                        B fault                  GPU Runtime Fault Handling              Page C         5
+                                   C fault            Handling B, C faults                                      GPU Runtime Fault Handling Page D
+                                                                                                                                                     time
+                                                                                                      D fault         Handling D fault
+                                                     Fault Handling Time       Migration Time
+
+                                                             Batch Processing Time
+
+
+                               Figure 2. Overview of how GPU page faults are handled by the GPU runtime.
+
+GPU shader core, such as NVIDIA Streaming Multiproces-                               the page table walk fails. Then, the GPU generates a page
+sor (SM), AMD Compute Unit (CU), or Intel Execution Unit                             fault and the GPU runtime migrates the requested page to the
+(EU), provides hardware resources that are required to keep                          GPU memory. This page fault handling is expensive because
+the contexts of multiple threads without doing conventional                          (1) it requires long latency communications between the
+context switching. In each architecture, a number of fac-                            CPU and GPU over the PCIe bus, and (2) the GPU runtime
+tors influence thread concurrency. For example, in NVIDIA                            performs a very expensive fault handling service routine. To
+GPUs, the maximum concurrency is capped by the maxi-                                 amortize the overhead, the GPU runtime processes a group
+mum number of threads and thread blocks (e.g., 2048 and 32,                          of page faults together, which we refer to as batch processing.
+respectively), the register file size (e.g., 64k 32-bit registers),                     Figure 2 shows an overview of how GPU page faults are
+and the maximum number of registers per thread (e.g., 255),                          handled by the GPU runtime. When a page fault exception
+among others [38]. When a GPU kernel is launched, the GPU                            is raised by the GPU memory management unit (MMU),
+runtime decides the number of thread blocks to dispatch to                           the GPU runtime begins to handle the exception ( 1 ). The
+each SM based on its hardware resources.                                             exception handling starts by draining all of the page fault
+                                                                                     buffer entries (page A in the figure). We use one or two
+2.2   Unified Virtual Memory in GPUs                                                 pages in the figure for simplicity, but in reality, a number
+Modern GPUs offer unified virtual memory (UVM) that pro-                             of page faults are generated within a short period of time
+vides a coherent view of virtual memory address space be-                            since thousands of threads are concurrently running un-
+tween CPUs and GPUs in the system [1, 38, 39]. To do so, the                         der the single-instruction multiple-threads (SIMT) execution
+GPU runtime software and hardware takes care of migrating                            model used in GPUs. To handle a multitude of page faults effi-
+pages to the memory of the accessing processor. This elimi-                          ciently, the GPU runtime preprocesses the page faults before
+nates the need for manual page migrations, which greatly                             performing page table walks. This preprocessing includes
+reduces the programmer’s burden. It also allows us to run                            sorting the page faults in ascending order of page addresses
+GPU applications that are otherwise unable to run due to                             (to accelerate the page table walks) and the analysis of page
+memory capacity constraints. In this section, we describe in                         addresses to insert page prefetching requests.1 We refer to
+more detail how UVM works.                                                           the time taken by the GPU runtime to perform a collection
+                                                                                     of operations to handle many page faults together as GPU
+   Virtual Memory. To allow any processor in the system
+                                                                                     runtime fault handling time. Specifically, the GPU runtime
+to access the same data, virtual memory support is required.
+                                                                                     fault handling time is defined as the time between the begin-
+The virtual-to-physical mapping is stored in a multi-level
+                                                                                     ning of batch processing and the beginning of the first page
+page table in GPUs. To translate a virtual address into a
+                                                                                     transfer to the GPU’s memory by the runtime. GPU runtime
+physical address, the GPU performs a page table walk. To ac-
+                                                                                     fault handling time varies depending on the batch size (i.e.,
+celerate this, translation lookaside buffers (TLBs) are adopted
+                                                                                     the number of page faults handled together in a batch) and
+from CPUs and optimized for GPUs [8, 9, 46, 47]. GPUs ac-
+                                                                                     contiguity of the pages.
+cess an order of magnitude more pages than CPUs, requiring
+                                                                                        The subsequent page faults generated after the batch pro-
+a commensurate number of translations. In light of this, a
+                                                                                     cessing begins (pages B and C in the figure) cannot be han-
+highly threaded page table walker is proposed [47]. A multi-
+                                                                                     dled along with page A. Instead, they are inserted into the
+level page table requires many memory accesses to translate
+                                                                                     page fault buffer and wait until the current batch is processed
+a single address. Exploiting the fact that the accesses to the
+upper-level page table entries have significant temporal lo-
+cality, a page walk cache [10] is also adopted for GPUs [47].
+                                                                                     1 Details on the preprocessing operations performed in real GPU runtime
+  Demand Paging. When a GPU tries to access a physical                               software can be found in the preprocess_fault_batch() function in
+memory page that is not currently resident in device memory,                         NVIDIA driver v396.37 [41].
+( 3 ). Once the page table walks are completed, the GPU run-                    it is challenging to increase the batch size, and propose a
+time begins to migrate pages to the GPU’s memory ( 2 ).                         technique to achieve it.
+Every time a page is migrated ( 3 ), the GPU MMU updates
+its page table and resumes the threads that are waiting for                                                     100,000
+
+
+
+
+                                                                                 Per-page Fault Handling Time
+the page. Once the last page is migrated ( 3 and 4 ), the                                                        10,000
+
+batch’s processing ends. We refer to the time between the                                                         1,000
+
+beginning of a batch’s processing and the migration of the
+
+
+
+
+                                                                                             (us)
+                                                                                                                   100
+last page as batch processing time. When batch processing
+                                                                                                                    10
+ends, the GPU runtime checks whether there are waiting
+page faults (pages B and C in the figure). Then, the GPU                                                             1
+                                                                                                                          0   5   10         15          20   25   30
+
+runtime begins to handle them immediately. This is an op-                                                                              Batch Size (MB)
+
+timization to reduce the unpredictable overhead that arises
+due to the interrupt-based service of the OS.2 Otherwise, the                   Figure 3. Per-page fault handling time (us) vs. batch size
+batch processing routine ends ( 4 ). This process is repeated                   (MB) for breadth first search (BFS) on an NVIDIA Titan Xp
+when a new page fault interrupt is raised by the GPU ( 5 ).                     GPU using the NVIDIA Visual Profiler [42].
+
+3    Motivation                                                                     Second, we observe that page evictions introduce unnec-
+We make two observations on the batch processing mecha-                         essary serialization in page migrations. We examine a GPU
+nism. First, batch processing introduces a significant delay                    runtime implementation (NVIDIA driver v396.37 [41]) to un-
+to the subsequent page fault group (or batch). As an exam-                      derstand how modern GPUs perform memory management
+ple, take the page B fault in Figure 2, which is generated                      and when the decision on eviction is made. When the GPU
+in the GPU after the first batch’s processing begins. Since                     runtime handles a page fault, the physical memory allocator
+it cannot be handled along with page A, it has to wait un-                      in the GPU runtime tries to allocate a new page (or a free
+til the current batch is processed. To provide perspective,                     root chunk) in the GPU memory (alloc_root_chunk()).
+we profile a breadth first search (BFS) application on an                       If such an allocation fails, which indicates that the GPU
+NVIDIA Titan Xp [38] GPU. For this, we use the NVIDIA                           memory runs out of space, a page eviction is requested
+Visual Profiler [42] with --unified-memory-profiling and -                      (pick_and_evict_root_chunk()). The physical memory man-
+-track-memory-allocations on. It provides timestamps for                        ager in the GPU runtime then checks whether it can evict
+every event throughout the execution, including when the                        any user memory chunks to satisfy the request.4 Once a suit-
+runtime starts to handle a GPU page fault group and when                        able root chunk is selected for eviction, its eviction flag is set
+each page migration begins and ends. The GPU runtime fault                      (chunk_start_eviction()), and subsequently, the eviction
+handling time is calculated to be the duration between when                     begins (evict_root_chunk()). Once the eviction is com-
+it starts to handle a GPU page fault group and when it begins                   pleted, the metadata (e.g., tracker and status data) associated
+to migrate the first page of the group. The batch processing                    with the chunk is freed and the frame in the GPU memory
+time can be obtained from the timestamps for the GPU page                       becomes available. Subsequently, the new page migration
+fault group event. The batch processing time is measured to                     begins.
+be in the range of 223µs to 553µs with a median of 313µs, of                        From this, we conclude that page evictions and new page
+which, GPU runtime fault handling accounts for an average                       allocations are serialized in modern GPUs to prevent the
+of 46.69% of the time (measured to be in the range of 50µs to                   new pages from overwriting the evicted pages. Note that an
+430µs with a median of 140µs).                                                  eviction is required on every page fault once the pages resi-
+    Fundamentally, two methods can mitigate the impact of                       dent in the GPU’s memory are at capacity. Figure 4 depicts
+this delay. The first method is to reduce the GPU runtime                       these operations. When the GPU runtime fails to allocate
+fault handling time itself by optimizing the GPU runtime                        page A, it initiates an eviction of page X, reactively ( 1 ). Once
+software, which is beyond the scope of our work. The second                     page X is evicted from the GPU’s memory, both the master
+method is to amortize the GPU runtime fault handling time.                      page table in the CPU’s memory and the GPU page table
+This can be attained by increasing the batch size (i.e., the                    are updated for the evicted page X, and the frame is freed (
+number of page faults handled together in a batch). Figure 3                     2 ). Once the frame is freed, page A’s migration begins ( 3
+shows that per-page fault handling time decreases as the                        ). In Section 4.2, we propose a technique to eliminate this
+batch size increases.3 In Section 4.1, we discuss the reason                    serialization.
+2 Details on this optimization performed in real GPU runtime software           4 All allocated user memory root chunks are tracked in an LRU list
+
+can be found in the uvm_gpu_service_replayable_faults() function in             (root_chunks.va_block_used). A root chunk is moved to the tail of the
+NVIDIA driver v396.37 [41].                                                     LRU list whenever any of its sub-chunks is allocated. This is the policy
+3 Fault handling time per page is calculated by dividing the batch processing   referred to as aged-based LRU in literature [4, 5, 29]. To examine the head
+time by the number of pages in the batch.                                       of the LRU list, list_first_chunk() is used.
+                              Allocation   Eviction                                   (i.e., physical resource constraints, such as register file and
+                                     3 Begins page A migration after page table       shared memory), while ignoring the scheduling limit (i.e.,
+ A,B fault                            for page X is updated and the frame is freed.   scheduler resource constraints, such as program counters
+             Fault Handling                Page A              Page B
+                                                                             time
+                                                                                      and SIMT stacks). It dispatches thread blocks in active and
+                                Page X                Page Y                          inactive states, such that the number of active thread blocks
+      1 Fails to allocate page A.              2 Update page table for                does not exceed the scheduling limit. Once all the warps in
+    Begins page X eviction reactively.         page X and free the frame.             an active thread block are descheduled due to long latency
+                                                                                      operations, the active thread block is context switched, and
+Figure 4. Overview of how and when GPU runtime evicts a                               the next ready, but inactive, thread block takes its place. Since
+page from GPU memory, and why it is on the critical path.                             both active and inactive thread blocks fit within the capacity
+                                                                                      limit, the need to save and restore large amounts of contexts
+                                                                                      (e.g., register files) is obviated.
+4     Challenges and Solutions                                                            Our primary objective is to increase the batch size to
+In this section, we present two techniques to mitigate the                            amortize the impact of batch processing rather than just
+inefficiencies described in Section 3. In Section 4.1, we pro-                        to increase TLP. However, we found that baseline VT is not
+pose a technique that increases the batch size to amortize the                        applicable to most of our evaluated graph workloads as is
+GPU runtime fault handling time and reduce the number of                              because not enough resources are available to host even a sin-
+batches. In Section 4.2, we propose a technique that reduces                          gle additional thread block. The reason is that the number of
+the page migration time by overlapping page evictions with                            thread blocks that can be scheduled to an SM is often limited
+CPU-to-GPU page migrations without relying on precise                                 by the maximum number of threads per SM for most graph
+timing of evictions.                                                                  workloads. When the maximum number of threads per SM
+                                                                                      is scheduled to an SM, the maximum number of registers per
+4.1     Thread Oversubscription                                                       SM is easily exhausted. Take NVIDIA Titan Xp [38] as an
+In GPUs, the primary execution unit is a warp, which is a                             example. If the maximum number of threads per SM is 2048
+collection of scalar threads (e.g., 32 in NVIDIA GPUs) that                           and the maximum number of registers per SM is 65536 [38],
+run in a single-instruction multiple-thread (SIMT) fashion. A                         each thread can use up to 32 registers. If each thread uses
+warp is stalled once it generates a page fault. Provided that                         more than 16 registers (i.e., a half of 32 registers), which is
+only up to 64 warps (or 2048 threads) can concurrently run                            the case for most of our evaluated workloads, baseline VT
+in an SM [38, 39], it does not take much time before the GPU                          cannot host even a single additional thread block due to the
+becomes crippled due to lack of runnable warps. The num-                              register file resource constraints.
+ber of concurrently running threads has been engineered to
+provide enough TLP to hide memory latencies in traditional
+                                                                                                              1.00
+GPUs, where no page migrations between the CPU and GPU
+                                                                                       Relative Performance
+
+
+
+
+occur. We find that the level of thread concurrency opti-                                                     0.80
+mized for traditional GPUs is not sufficient to amortize the                                                  0.60
+GPU runtime fault handling time in the presence of demand                                                     0.40
+paging.
+                                                                                                              0.20
+   Two approaches can increase the batch size. The first ap-
+proach is to use the stalled warps to generate more page                                                      0.00
+faults. For this, runahead execution [36] or speculative ex-
+                                                                                                                               TA
+
+
+
+
+                                                                                                                        GC C
+
+
+
+
+                                                                                                                                           AV PR
+                                                                                                                      BF BC
+
+
+
+
+                                                                                                                               TC
+                                                                                                                       BF F
+
+
+
+
+                                                                                                                       SP E
+                                                                                                                                C
+
+
+
+
+                                                                                                                                                   E
+                                                                                                                               TC
+                                                                                                                                C
+
+
+
+
+                                                                                                                                C
+                                                                                                                               R
+                                                                                                                              W
+
+
+
+                                                                                                                                                AG
+                                                                                                                               T
+                                                                                                                             TT
+                                                                                                                           TW
+                                                                                                                          DW
+
+
+
+                                                                                                                             S-
+
+
+
+
+                                                                                                                             O
+                                                                                                                            -D
+
+                                                                                                                            -T
+                                                                                                                            S-
+
+
+
+
+                                                                                                                          -T
+                                                                                                                          S-
+
+
+
+
+                                                                                                                         KC
+
+
+
+
+                                                                                                                                             ER
+                                                                                                                         BF
+
+
+
+
+ecution [18, 19, 31] techniques can be employed. However,
+                                                                                                                        GC
+                                                                                                                        BF
+
+
+
+
+                                                                                                                         S-
+                                                                                                                        S-
+
+
+
+
+                                                                                                                      BF
+
+
+
+
+                                                                                                                     SS
+
+
+
+
+these techniques are likely less effective to generate a large
+number of page faults in a short amount of time because                               Figure 5. Performance degradation when provisioning an
+each thread block typically runs short due to the GPU pro-                            additional thread block to each SM requires context switch-
+gramming model. The second approach is to increase thread                             ing in traditional GPUs.
+concurrency by dispatching more thread blocks to an SM.
+However, the number of threads (or thread blocks) per SM is
+dictated by the physical resource constraint. We want a solu-                            Hosting an additional (or more) thread blocks in an SM
+tion that can increase thread concurrency without increasing                          in this case requires more expensive thread-block context
+the physical resource requirement.                                                    switching [30, 43, 49, 52]. This includes saving and restoring
+   To this end, we develop thread oversubscription, a GPU vir-                        the per-thread-block state information (e.g., warp identifiers,
+tualization technique. We utilize the Virtual Thread (VT) [52]                        thread block identifiers, and SIMT stack including the pro-
+as our baseline architecture for GPU virtualization. The VT                           gram counter) and register files to the global memory. Note
+architecture assigns thread blocks up to the capacity limit                           that using shared memory to store the context information
+is no longer feasible.5 This cost is intolerable in the tradi-                                           Allocate additional
+                                                                                                              thread blocks
+tional GPU computing model (i.e., when no page migrations                                                                                     SM
+                                                                                  GPU Runtime          Thread            1
+between CPU and GPU memory occur). Figure 5 shows the                             GPU Hardware     Oversubscription            Active      Inactive      Inactive
+performance impact assuming we provision an additional
+thread block to each SM with context switching in tradi-                           Premature Eviction Rates        Low
+                                                                                                                                  2 Context switch
+tional GPUs. We see that the context switching overhead                                                                         if active block is stalled
+                                                                                                      Block Status Table
+leads to a non-negligible performance degradation across
+                                                                                                       Context Handler                    3 Context switch
+all the evaluated workloads (49% on average). This indicates                                                                   High            not allowed
+                                                                                                   Virtual Thread Controller
+that the context switching overhead caused by adding an
+additional thread block to each SM outweighs the benefit of
+increasing thread concurrency if the running workloads fit                                 Figure 6. Thread oversubscription scheme.
+in the GPU memory.
+   However, we observe that in the presence of page migra-                       In Section 6.1, we provide a detailed analysis of the impact on
+tions between CPU and GPU memory, increasing thread con-                         premature eviction that the thread oversubscription causes.
+currency is beneficial despite the expensive context switch-                        Figure 6 shows how our thread oversubscription technique
+ing overhead. To this end, we extend VT in three ways. First,                    works. We enable thread oversubscription from the begin-
+we employ an additional mapping table so that different Vir-                     ning of the execution by allocating one additional thread
+tual Warp IDs (VWIs) can access the same set of register files                   block to each SM ( 1 ). The thread block additionally allocated
+when they are context switched. Note that VWI is a unique                        to each SM is inactive at first. It is important to note that the
+warp identifier across all the assigned warps to an SM, in-                      number of active thread blocks does not exceed that of the
+cluding both active and inactive thread blocks [52]. Only                        baseline, which is determined by the physical resource con-
+when a thread block finishes execution are its VWIs released                     straints. Once all of the warps in an active thread block are
+and reused for another thread block. Second, we extend the                       stalled due to page faults, the thread oversubscription mech-
+operation performed by the Virtual Thread Controller (VTC).                      anism context switches the active (but stalled) thread block
+The VTC keeps track of the state of all thread blocks in order                   with an inactive thread block ( 2 ). The thread oversubscrip-
+to determine which thread blocks can be brought back from                        tion mechanism can be detrimental if it causes premature
+the inactive to an active state, or vice versa, when a thread                    evictions. To prevent this, the GPU runtime monitors the
+block is swapped out. Baseline VT only stores the per-thread-                    premature eviction rates by periodically estimating the run-
+block state information in the shared memory through the                         ning average of the lifetime of pages by tracking when each
+context handler. We extend this operation to store register                      page is allocated and evicted. We use the running average as
+files as well. Since the register files that a thread block uses                 an indicator of premature evictions. If the running average
+can easily exceed tens of KBs, we use global memory instead                      is decreased by a certain threshold, the thread oversubscrip-
+of shared memory.                                                                tion mechanism does not allow any more context switching
+   Third, we dynamically control the degree of thread over-                      by decrementing (and limiting) the number of concurrently
+subscription based on the rate at which premature eviction                       runnable thread blocks ( 3 ).6 Otherwise, thread oversubscrip-
+occurs. Premature eviction occurs when a page is evicted                         tion allocates one additional thread block to each SM in an
+earlier than it should be, and a page fault is generated for                     incremental manner.
+the page again by the GPU. Since thread oversubscription in-                        Figure 7 demonstrates how our thread oversubscription
+creases the number of concurrently running threads, it may                       technique can increase the batch size. For ease of explana-
+lead to an increase in the working set size, which increases                     tion, we assume that up to one thread block (TB) can be
+the likelihood of premature evictions. This is detrimental be-                   dispatched to an SM. We also assume that pages A, B, and C
+cause when premature eviction occurs, the evicted page has                       are accessed by TB1, and page D is accessed by TB2. In the
+to be brought back to the GPU memory. On the other hand,                         baseline, TB2 can be executed only after TB1 is retired. With
+an increase in thread concurrency can lead to better page                        thread oversubscription, TB1 is context switched with TB2
+utilization, reducing premature evictions. Hence, we modify                      when all of its warps are stalled (after a page fault for page C
+the GPU runtime to monitor premature eviction rates and                          is generated). After the context switching overhead, TB2 is
+dynamically control the degree of thread oversubscription.                       executed and a page fault for page D is generated, which can
+                                                                                 be handled along with those for pages B and C. Once page C
+5 Assume each thread block consists of 2048 threads and each thread uses 10
+                                                                                 is migrated, TB1 can be resumed and retired. Once page D is
+32-bit registers. In this case, 85KB = 80KB (2048 * 10 * 4 bytes) for register   migrated, TB2 is context switched in, resumed, and retired.
+files + 5KB for thread block state information has to be stored and restored
+for context switching. The size of the thread block state information is         6 The number of concurrently runnable thread blocks is set to the number of
+
+estimated according to [52]. According to [38, 39], shared memory size can       allocated thread blocks at first. This does not mean all of them are running
+be configured up to 64KB per SM. Therefore, it is infeasible to use shared       simultaneously. The warp scheduler picks a warp from active thread blocks
+memory for context switching.                                                    only.
+ TB1 accesses page A, B, C                    A BC                                                                           D fault
+ TB2 accesses page D                                                                         TB1 is retired
+ (a) Baseline                                  Fault Handling Page A Fault Handling Page B Page C                                Fault Handling Page D
+                                        TB1                                                                     TB1 TB2                                               TB2         time
+     Thread                                                                                                                         Context switch in TB2
+ (b)
+     Oversubscription Fault Handling Page A Fault Handling                                   Page B Page C Page D
+                                                                                                                                                                                  time
+                                   Context switching                                       Context switching                                    Saved Cycles
+                                 between TB1 and TB2
+                                                        TB2 D fault                      between TB2 and TB1
+                                                                                                                       TB1      TB2
+
+
+                            Figure 7. Overview of how thread oversubscription can increase the batch size. TB is short for thread block.
+
+As we can see in the figure, thread oversubscription elimi-                                     from overwriting the evicted page, as discussed in Section 3.
+nates the need for the third batch, reducing the overall batch                                  Our goal is to devise a mechanism that exploits bidirectional
+processing time. Note that the GPU runtime fault handling                                       transfers without violating the serialization requirement. The
+time for the second batch is slightly increased to handle an                                    key idea is to preemptively initiate a single page’s eviction
+additional page fault for page D.                                                               and enable pipelined bidirectional transfers afterwards. To
+                                                                                                perform this preemptive eviction promptly at the beginning
+4.2                Unobtrusive Eviction                                                         of batch processing, we modify the GPU runtime and add
+While the thread oversubscription technique alleviates the                                      a new GPU memory status tracker. This does not affect the
+performance impact of demand paging by amortizing the                                           GPU runtime fault handling performance since the tracking
+GPU runtime fault handling time and reducing the number                                         is performed only when a new page is allocated in the GPU’s
+of batches, there is an opportunity to reduce the page mi-                                      memory.
+gration time itself. Figure 8 shows the performance impact                                         When a page fault interrupt is raised by the GPU MMU, the
+of page eviction by comparing the performance of a GPU                                          top-half interrupt service routine (ISR) responds. It checks
+with 50% memory oversubscription (denoted as baseline) to                                       whether the number of GPU resident pages is at capacity via
+the performance of a GPU with unlimited memory, where                                           the GPU memory status tracker. If so, it sends a preemptive
+no page evictions occur. The GPU with 50% memory over-                                          eviction request to the GPU. The rest of the fault handling
+subscription experiences an average performance loss of                                         (e.g., preprocessing of the page faults, CPU-side page table
+46%. We compare this to the performance of a GPU with an                                        walks) is performed by the bottom-half ISR. Since the GPU
+instant page eviction capability (denoted as ideal eviction).                                   runtime fault handling time (i.e., the time between when
+Removing the page eviction latency achieves an average                                          a batch’s processing begins and when the first page migra-
+performance improvement of 16%. To this end, we propose                                         tion for the batch begins) is at least tens of microseconds,
+unobtrusive eviction, a mechanism that eliminates the page                                      the single page eviction is completed before the first page
+eviction latency by overlapping page evictions with page                                        migration begins. By doing so, the first page migration can
+migrations to the GPU.                                                                          proceed without any delay. If a subsequent page eviction is
+                                                                                                required, the bottom-half ISR of the GPU runtime schedules
+                                                 BASELINE   IDEAL EVICTION                      the next page eviction along with the page migration to the
+                            1                                                                   GPU memory. Note that since the single page preemptive
+  Performance Normalized
+
+
+
+
+                                                                                                eviction is initiated by the GPU runtime when the batch pro-
+   to Unlimited Memory
+
+
+
+
+                           0.8
+                           0.6                                                                  cessing begins, no additional overhead (e.g., communications
+                           0.4                                                                  with GPU) is required. Figure 9 shows how the unobtrusive
+                           0.2
+                                                                                                eviction is implemented.
+                            0
+                                                                                                              GPU Runtime
+                                   GC C
+
+
+
+
+                                                                             AV PR
+                                   BF F
+
+
+
+
+                                 SS ORE
+                                          TA
+                                             C
+                                  BF BC
+
+
+
+
+                                           TC
+                                            C
+
+
+
+
+                                            C
+
+
+
+                                                                                     E
+                                    GC C
+
+
+
+
+                                                                                                                                       1 Raise a page fault interrupt
+                                         W
+                                           T
+                                         TT
+                                       TW
+
+
+
+
+                                                                                  AG
+                                           T
+                                      DW
+
+
+
+                                        S-
+
+
+
+
+                                       -D
+
+                                        -T
+                                        S-
+
+
+
+
+                                                                                                              Top-half ISR
+                                      -T
+                                      S-
+
+
+
+
+                                    KC
+
+
+
+
+                                                                               ER
+                                    BF
+                                    BF
+
+
+
+
+                                                                                                                                                                                GPU
+                                     S-
+                                    S-
+
+
+
+
+                                   SP
+                                  BF
+
+
+
+
+                                                                                                                                       2 Preemptive Eviction Request            MMU
+                                                                                                     GPU Memory Status Tracker
+                                                                                                                                       4.1. Preprocess page fault group
+Figure 8. Performance of a GPU with 50% memory oversub-                                                   Bottom-half ISR       4      4.2. Perform CPU-side page table walks
+scription compared to a GPU with unlimited memory, and                                                   5
+                                                                                                                                       4.3. Schedule page migrations
+
+how the performance changes with ideal eviction.                                                                                3 Preemptive Eviction
+                                                                                                              CPU Memory                                       GPU Memory
+
+   DMA engines in modern CPUs and GPUs [6, 7, 40, 44, 45]                                                                     6 Bidirectional Migrations
+
+allow bidirectional transfers. However, page evictions and
+new page allocations are serialized to prevent the new page                                                    Figure 9. Unobtrusive eviction scheme.
+                              Allocation   Eviction                             include the context switching overhead (i.e., timing overhead
+                                    3 Begin page A and B migration
+                                                                                of storing and restoring context, such as register files and
+ A,B fault                                 without any delay.                   per-thread-block state information, to/from global memory
+             Fault Handling      Page A    Page B                               whenever a context switch occurs) in the evaluation for
+                                                                         time
+             Page X             Page Y                                          thread oversubscription. For premature eviction rates, we
+                                            2 Update page table for             calculate the running average of the lifetime of pages at every
+    1 Initiate page X eviction proactively. page X and free the frame.
+                                                                                100k cycles. The threshold is empirically set to 20% for our
+                                                                                evaluation.
+ Figure 10. Overview of how unobtrusive eviction works.                            We also evaluate unobtrusive eviction using the simulator,
+                                                                                in which we faithfully model the scheme described in Sec-
+                                                                                tion 4.2. We were not able to implement the mechanism in
+   Figure 10 provides a timeline example of how the unobtru-                    real NVIDIA runtime software because the open source part
+sive eviction works. When the GPU runtime begins a batch’s                      of the runtime software does not include the part where it
+processing, it checks the GPU memory status. If it is at ca-                    interacts with the driver entirely. Table 1 shows the configu-
+pacity, it initiates a single page eviction ( 1 ). Once page X is               ration of the simulated system.
+evicted from the GPU’s memory, both CPU and GPU page ta-
+bles are updated ( 2 ). Unlike the baseline case (Figure 4), page                    Table 1. Configuration of the simulated system.
+A can be migrated to the GPU memory without any delay ( 3
+). At the same time, page Y can be evicted using bidirectional
+                                                                                                       GPU Configuration
+transfers. Since the data transfer speed from the GPU to CPU
+memory is faster than the other way around [29], eviction                          Core                16 SMs, 1GHz, 1024 threads per SM,
+is completely unobtrusive and migrations to the GPU can                                                256KB register files per SM
+occur without any delay.                                                           Private L1 Cache    16KB, 4-way, LRU, L1 misses are
+                                                                                                       coalesced before accessing L2
+5     Evaluation                                                                   Private L1 TLB      64 entries per core, fully associative, LRU
+In this section, we describe our evaluation methodology and
+evaluate our proposed techniques. We provide more detailed                                            Memory Configuration
+analyses in Section 6.
+                                                                                   Shared L2 Cache     2MB total, 16-way, LRU
+5.1    Methodology                                                                 Shared L2 TLB       1024 entries total, 32-way associative, LRU
+   Simulator. We use MacSim [27], a cycle-level microar-                           Memory              200 cycle latency
+chitecture simulator. We modify the simulator to support
+virtual memory, demand paging [4, 5, 8, 9, 29, 38, 39, 45, 53],
+                                                                                                  Unified Memory Configuration
+and the Virtual Thread (VT) [52]. Our virtual memory imple-
+mentation includes TLBs, page tables, and a highly threaded                        Fault Buffer        1024 entries
+page table walker [46, 47, 53]. Demand paging is modeled                           Fault Handling      64KB page size, 20µs GPU runtime fault
+based on the GPU runtime software for NVIDIA PASCAL                                                    handling time, 15.75GB/s PCIe bandwidth
+GPUs (driver v396.37) [4, 5, 38, 40, 41, 45]. We also model
+the batch processing mechanism that handles a multitude
+of outstanding faults together. We use a 1024-entry fault                          Workloads. We select 11 workloads from the GraphBIG
+buffer [45] to handle up to 1024 simultaneous page faults.                      benchmark suite [37]. These include Betweenness Central-
+The page table walker is shared across all the SMs in the                       ity (BC), Breadth-First Search (BFS), Graph Coloring (GC),
+GPU, allowing up to 64 concurrent page walks [47]. Each                         Single-Source Shortest Path (SSSP), K-core decomposition
+TLB contains the miss-status-holding-registers (MSHRs) to                       (KCORE), and Page Rank (PR). BC is an algorithm that de-
+track in-flight page table walks [53].                                          tects the amount of influence a node has over the flow of
+   We use 20µs as the conservative value for the GPU runtime                    information in a graph [33]. Graph traversal is the most
+fault handling time similar to other works [8, 9, 29, 44, 53].                  fundamental operation of graph computing, for which we
+The benefits of our mechanism would be more pronounced                          include five different implementations of BFS: data-warp-
+if this overhead were larger, which is often the case based                     centric (DWC), topological-atomic (TA), topological-frontier
+on our profiling experiments. We also employ the state-of-                      (TF), topological-thread-centric (TTC), and topological-warp-
+the-art page prefetching mechanism [53]. The GPU memory                         centric (TWC). GC performs the assignment of labels or col-
+capacity is configured to be fractions (50% and 75%) of the                     ors to the graph elements (i.e., vertices or edges) subject
+memory footprint of each workload as in prior works [29,                        to certain constraints [22, 24], for which we include two
+53]. We use LRU for page replacement policy [4, 5, 45]. We                      different implementations: data-thread-centric (DTC) and
+                                 BASELINE       BASELINE with PCIe Compression                                      TO    UE        TO+UE          ETC
+            3.0
+                                    4.13
+            2.5
+            2.0
+  Speedup
+
+
+
+
+            1.5
+            1.0
+            0.5
+            0.0
+                  BC
+
+
+
+
+                                                                                                                                E
+                                       A
+
+
+                                                   F
+                            C
+
+
+
+
+                                                                                  TC
+                                                                          C
+
+
+
+
+                                                                                                                                               C
+                                                                                                                    TC
+
+
+
+
+                                                                                                                                                     PR
+                                                              TC
+
+
+
+
+                                                                                                                                                               GE
+                                                   T
+
+
+
+
+                                                                                                                             OR
+                                                                         W
+
+
+
+
+                                                                                                                                              W
+                            DW
+
+
+
+                                         T
+
+
+                                                S-
+
+
+
+
+                                                                                -D
+
+
+                                                                                                                  -T
+                                                               T
+                                      S-
+
+
+
+
+                                                                                                                                                            RA
+                                                                         T
+
+
+
+
+                                                                                                                                           -T
+                                                            S-
+                                              BF
+
+
+
+
+                                                                                                                          KC
+                                    BF
+
+
+
+
+                                                                                                                GC
+                                                                              GC
+                                                                      S-
+                         S-
+
+
+
+
+                                                          BF
+
+
+
+
+                                                                                                                                        SP
+
+
+
+
+                                                                                                                                                             E
+                                                                    BF
+
+
+
+
+                                                                                                                                                          AV
+                       BF
+
+
+
+
+                                                                                                                                     SS
+Figure 11. Performance comparison among baselines with the state-of-the-art page prefetching [53] with and without PCIe
+compression, eviction-throttling-compression (ETC) [29], and our proposed mechanisms (thread oversubscription is denoted
+as TO, and unobtrusive eviction is denoted as UE), normalized to the baseline.
+
+topological-thread-centric (TTC). KCORE partitions a graph                    pages are shared in many large-scale, irregular workloads,
+into layers from external to more central vertices [34]. SSSP                 MT is not effective.
+finds the shortest path from the given source to each ver-                       The performance improvement achieved by our mecha-
+tex, for which we include a topological-warp-centric (TWC)                    nism is mainly attributed to the following two key factors.
+implementation. PR is an algorithm that evaluates the impor-                  First, as described in Section 4.1, our thread oversubscription
+tance of web pages [16]. The footprints of these workloads                    technique effectively reduces the total number of batches,
+range from 26MB to 349MB, with an average of 74MB. Im-                        thereby mitigating the overall page fault handling overhead.
+practically long simulation times prevent us from using the                   For the evaluated workloads, we see that the number of
+entire real-world data set. Note, however, that the footprints                batches is reduced by 51% on average because we process
+are larger than the ones used in prior works [29, 53].                        2.27x more page faults per batch, as shown in Figures 12
+                                                                              and 13. This corroborates our observation that it is benefi-
+5.2         Performance                                                       cial to increase thread concurrency in the presence of fre-
+Figure 11 shows the performance of the proposed thread                        quent page migrations, even at the cost of expensive context
+oversubscription and unobtrusive eviction mechanisms (de-                     switches.
+noted as TO and UE, respectively). The performance is nor-
+malized to that of a baseline (denoted as BASELINE) that uses                                                             BASELINE        THREAD-OVERSUBSCRIPTION
+the state-of-the-art page prefetching technique, proposed
+                                                                                Relative Number of Batches
+
+
+
+
+                                                                                                             100%
+by Zheng et al. [53]. We also evaluate how the performance                                                   75%
+changes when PCIe (de)compression is utilized (denoted as
+                                                                                                             50%
+BASELINE with PCIe Compression). Last, we compare our
+mechanisms with the eviction-throttling-compression (ETC)                                                    25%
+
+mechanism [29]. Our mechanism (TO+UE) achieves an aver-                                                       0%
+age speedup of 2x and 1.81x relative to the BASELINE and
+                                                                                                                      GC C
+
+
+
+
+                                                                                                                                                              AV PR
+                                                                                                                      BF F
+
+
+
+
+                                                                                                                    SS ORE
+                                                                                                                             TA
+                                                                                                                                C
+                                                                                                                     BF BC
+
+
+
+
+                                                                                                                              TC
+                                                                                                                               C
+
+
+
+
+                                                                                                                               C
+
+
+
+                                                                                                                                                                      E
+                                                                                                                       GC C
+
+
+
+
+                                                                                                                            W
+                                                                                                                              T
+                                                                                                                            TT
+                                                                                                                          TW
+
+
+
+
+                                                                                                                                                                   AG
+                                                                                                                              T
+                                                                                                                         DW
+
+
+
+                                                                                                                           S-
+
+
+
+
+                                                                                                                          -D
+
+                                                                                                                           -T
+                                                                                                                           S-
+
+
+
+
+BASELINE with PCIe Compression, respectively. Our mecha-
+                                                                                                                         -T
+                                                                                                                         S-
+
+
+
+
+                                                                                                                       KC
+
+
+
+
+                                                                                                                                                                ER
+                                                                                                                       BF
+                                                                                                                       BF
+
+
+
+
+                                                                                                                        S-
+                                                                                                                       S-
+
+
+
+
+                                                                                                                      SP
+                                                                                                                     BF
+
+
+
+
+nism even outperforms ETC by 79% on average. ETC includes
+three components: proactive eviction (PE), memory-aware
+throttling (MT), and capacity compression (CC). However,                                                            Figure 12. Total number of batches.
+the authors of ETC disable PE for irregular applications as
+it hurts performance, and we replicate this behavior.7 The                       Second, the unobtrusive eviction technique reduces the
+memory-aware throttling (MT) technique can be beneficial                      average batch processing time significantly. As seen in Fig-
+when memory is oversubscribed if it can reduce the working                    ure 14, when employed with the thread oversubscription
+set size and thus decrease the page thrashing rates.8 How-                    technique, it reduces the average batch processing time by
+ever, as we discussed in Section 1, since most of the memory                  60%. The unobtrusive eviction technique is more effective in
+7 We faithfully model ETC to the best of our knowledge.
+                                                                              larger batches, where the page migration time dominates the
+8 When triggered, MT statically throttles half of the SMs in the beginning.   execution epoch. Depending on the behavior monitored during the detection
+After the initial phase, it repeats two epochs, the detection epoch and the   epoch, MT decides to throttle or unthrottle SMs.
+                                               BASELINE       THREAD-OVERSUBSCRIPTION          how the premature evictions change when the thread over-
+                           400%                                                                subscription technique is employed, compared to the base-
+     Relative Batch Size
+
+
+
+
+                           300%                                                                line. Surprisingly, the thread oversubscription technique de-
+                                                                                               creases premature evictions in most of the workloads. The
+                           200%
+                                                                                               reason is that it increases the likelihood of GPU resident
+                           100%                                                                pages being used before evicted. This is particularly the case
+                               0%                                                              for topological graph workloads since the input graph is
+                                                                                               traversed or processed in a topological order by each thread
+
+                                         GC C
+
+
+
+
+                                                                                   AV PR
+                                        BF F
+
+
+
+
+                                        SP E
+                                               TA
+                                       BF BC
+
+
+
+
+                                                TC
+                                                 C
+                                                 C
+
+
+
+
+                                                 C
+
+
+
+                                                                                           E
+                                         GC C
+
+
+                                                R
+                                              W
+                                                T
+                                              TT
+                                            TW
+
+
+
+
+                                                                                        AG
+                                                T
+                                           DW
+
+
+
+
+                                                                                               block in the topological graph workloads. Since the thread
+                                             S-
+
+
+
+
+                                              O
+                                            -D
+
+                                             -T
+                                             S-
+
+
+
+
+                                           -T
+                                           S-
+
+
+
+
+                                          KC
+
+
+
+
+                                                                                     ER
+                                          BF
+                                         BF
+
+
+
+
+                                          S-
+                                         S-
+
+
+
+
+                                       BF
+
+                                                                                               oversubscription technique increases thread concurrency
+
+
+
+                                      SS
+                                                                                               and makes their memory accesses more parallel, there is a
+                                          Figure 13. Average batch sizes.                      higher chance of concurrently running thread blocks access-
+                                                                                               ing similar sets of pages while they are residing in the GPU
+                                                                                               memory.
+overall batch processing time, and the thread oversubscrip-
+tion technique provides that opportunity. The unobtrusive                                                                        BASELINE    THREAD-OVERSUBSCRIPTION
+eviction technique is particularly effective for BFS-DWC. From                                                       100%
+
+
+
+
+                                                                                                Premature Eviction
+further investigation, we see that BFS-DWC has an extremely                                                          80%
+high divergent memory access pattern. Because of this, con-                                                          60%
+stant page thrashing occurs throughout the execution. There-                                                         40%
+fore, the unobtrusive eviction technique, which hides the                                                            20%
+eviction latency, leads to a 4.13x performance improvement.
+                                                                                                                      0%
+When both of them are employed (denoted as TO+UE), we
+
+
+
+
+                                                                                                                              BF F
+
+
+
+
+                                                                                                                              SP E
+                                                                                                                                     TA
+
+
+
+
+                                                                                                                                       C
+
+
+
+
+                                                                                                                                                                       PR
+                                                                                                                             BF BC
+
+
+
+
+                                                                                                                                      TC
+                                                                                                                                       C
+
+
+
+
+                                                                                                                                      TC
+                                                                                                                                       C
+
+
+
+
+                                                                                                                                       C
+find that the average batch processing time is reduced by
+
+
+
+
+                                                                                                                                    OR
+                                                                                                                                      T
+
+
+
+
+                                                                                                                                     W
+                                                                                                                                    TT
+
+                                                                                                                                  TW
+                                                                                                                                 DW
+
+
+
+
+                                                                                                                                    S-
+
+
+
+
+                                                                                                                                   -D
+
+                                                                                                                                   -T
+                                                                                                                                   S-
+
+
+
+
+                                                                                                                                 -T
+                                                                                                                                 S-
+
+
+
+
+                                                                                                                                KC
+                                                                                                                                BF
+
+
+
+
+                                                                                                                               GC
+                                                                                                                               BF
+
+
+
+
+                                                                                                                                S-
+
+                                                                                                                               GC
+                                                                                                                               S-
+27% compared to the baseline even though we handle more
+
+
+
+
+                                                                                                                             BF
+
+
+
+
+                                                                                                                            SS
+page faults per batch. As a result, the thread oversubscrip-
+tion technique achieves 22% performance improvement and                                                                 Figure 15. Premature eviction comparison.
+the unobtrusive eviction technique achieves 61% additional
+performance improvement, as shown in Figure 11.                                                   The only exception is BFS-TWC. This happens when the
+                                                                                               working sets of existing thread blocks and additional thread
+                                                   BASELINE      TO   TO+UE
+                                                                                               blocks (context switched in) are distinct (as in the case of
+                                                                                               BFS-TWC), thrashing each other. We observe that premature
+time normarlized to baseline
+
+
+
+
+                               2.5
+  Average batch processing
+
+
+
+
+                               2.0                                                             evictions increase as we increase the number of concurrently
+                               1.5                                                             runnable thread blocks for some workloads (e.g., BFS-TWC
+                               1.0
+                                                                                               and SSSP-TWC). In the case of BFS-TWC, the premature evic-
+                               0.5
+                                                                                               tions increase by 4% and 38% compared to the baseline as
+                                                                                               we increase the number of concurrently runnable thread
+                               0.0
+                                                                                               blocks by 2x and 3x, respectively. In the case of SSSP-TWC,
+                                        GC C
+
+
+
+
+                                                                                  AV PR
+                                               TC
+                                       BF F
+
+
+
+
+                                       SP E
+                                              TA
+                                                C
+                                      BF BC
+
+
+
+
+                                                                                          E
+                                        GC C
+                                                C
+
+
+
+
+                                                C
+
+
+
+
+                                                                                               the premature evictions decrease by 2% but increased by 27%
+                                               R
+                                              W
+
+
+
+                                                                                       AG
+                                               T
+                                             TT
+                                           TW
+
+                                               T
+                                          DW
+
+
+
+                                             S-
+
+
+
+
+                                             O
+                                            -D
+
+                                            -T
+                                            S-
+
+
+
+
+                                          -T
+                                          S-
+
+
+
+
+                                         KC
+
+
+
+
+                                                                                    ER
+                                         BF
+                                        BF
+
+
+
+
+                                         S-
+                                        S-
+
+
+
+
+                                                                                               compared to the baseline as we increase the number of con-
+                                      BF
+
+
+
+
+                                     SS
+
+
+
+
+                                                                                               currently runnable thread blocks by 2x and 3x, respectively.
+                                     Figure 14. Average batch processing time.                 As shown in Figure 15, however, this detrimental effect is
+                                                                                               delimited since our technique monitors the premature evic-
+                                                                                               tion rates and dynamically controls the degree of thread
+                                                                                               oversubscription, as described in Section 4.1.
+6                          Analysis
+In this section, we provide in-depth analyses of our proposed                                  6.2                    Effect on Batch Size
+mechanisms.                                                                                    Figure 16 compares the distribution of batch size. Batch size
+                                                                                               is computed as the summation of all the pages in each batch
+6.1                            Effect on Premature Eviction                                    in size. Efficiency is computed as the reciprocal of an av-
+Since the thread oversubscription technique increases the                                      erage time to handle each page. The line chart shows that
+batch size, premature evictions can also increase. Therefore,                                  as the number of page faults per batch increases, efficiency
+premature eviction is a key metric to evaluate the efficacy                                    increases since the GPU runtime fault handling time is amor-
+of the thread oversubscription technique. Figure 15 shows                                      tized. It is clearly seen that bigger batches appear when the
+                                 BASELINE               THREAD-OVERSUBSCRIPTION                                      EFFICIENCY                            6.4         Sensitivity to GPU Fault Handling Time
+                           30%                                                                                                  100%                       Figure 18 shows the average performance improvement of
+                           25%                                                                                                  95%                        all workloads when the GPU runtime fault handling time is
+    Distribution
+
+
+
+
+                           20%                                                                                                  90%
+
+
+
+
+                                                                                                                                       Efficiency
+                                                                                                                                                           varied from 20µs to 50µs. Each bar is normalized to its own
+                           15%                                                                                                  85%
+                           10%                                                                                                  80%
+                                                                                                                                                           baseline (i.e., baseline configuration with 20µs, 30µs, 40µs,
+                            5%                                                                                                  75%                        and 50µs). The data shows that the performance improve-
+                            0%                                                                                                  70%                        ment that our proposed techniques can bring increases as the
+                                                                                                                                                           GPU runtime fault handling time becomes larger. To give per-
+                                        10MB
+                                               15MB
+                                                      20MB
+                                                             25MB
+                                                                    30MB
+                                                                           35MB
+                                                                                  40MB
+                                                                                         45MB
+                                                                                                50MB
+                                                                                                       55MB
+                                                                                                              60MB
+                                                                                                                     65MB
+                                  5MB
+
+
+
+
+                                                                                                                                                           spective, we profile a regular application (e.g., vectoradd) in
+                                                               Batch Size (MB)
+                                                                                                                                                           addition to the BFS measurement (Section 4.1). We observe
+                                                                                                                                                           that the GPU runtime fault handling time is higher for an
+                                        Figure 16. Batch size comparison.                                                                                  irregular application (with a minimum of 50µs) than for a
+                                                                                                                                                           regular application (with a minimum of 20µs). Provided that
+thread oversubscription is employed. From this, we conclude                                                                                                a batch processing usually takes more than 300µs in real
+that thread oversubscription effectively increases the batch                                                                                               GPUs, we believe that our proposed techniques can bring
+size.                                                                                                                                                      higher performance improvement when employed in real
+                                                                                                                                                           GPUs.
+6.3                         Sensitivity to Oversubscription Ratio
+Figure 17 shows the performance impact of memory over-                                                                                                                2.5
+subscription (bar chart) and the performance improvement
+                                                                                                                                                                      2.0
+of the unobtrusive eviction technique (line chart) when the
+memory oversubscription ratio is varied from 0.1 (i.e., the                                                                                                 Speedup   1.5
+GPU physical memory capacity is set to 10% of each appli-                                                                                                             1.0
+cation’s working set size) to 1.0 (i.e., all application data fits                                                                                                    0.5
+in the GPU memory). We observe the following. First, the
+                                                                                                                                                                      0.0
+performance impact of memory oversubscription increases
+                                                                                                                                                                              20           30              40             50
+as the GPU memory becomes smaller. With smaller GPU                                                                                                                                GPU Runtime Fault Handling Time (µs)
+memory, a smaller fraction of the application fits in the GPU
+memory. This causes more frequent page evictions to oc-
+cur, requiring more page migrations between the CPU and                                                                                                       Figure 18. Sensitivity to the GPU fault handling time.
+GPU. Second, the unobtrusive eviction technique provides
+a scalable performance benefit. Obviously, when all appli-
+cation data fits in the GPU memory, it is ineffective (i.e.,                                                                                               6.5         Context Switching Overhead
+speedup of 1). As the memory size becomes smaller, its effi-
+                                                                                                                                                           For thread oversubscription evaluation, we include the con-
+cacy increases, as page evictions occur more frequently. The
+                                                                                                                                                           text switching overhead (i.e., timing overhead of storing
+unobtrusive eviction technique provides an average speedup
+                                                                                                                                                           and restoring context, such as register files and per-thread-
+of 1.63x when the oversubscription ratio is 0.1. Therefore,
+                                                                                                                                                           block state information, to/from global memory whenever
+we conclude that the unobtrusive eviction technique can
+                                                                                                                                                           a context switching occurs). Although not shown, we also
+provide a commensurate amount of performance benefit as
+                                                                                                                                                           evaluated a close-to-ideal context switching overhead using
+the application requires more memory.
+                                                                                                                                                           an infinite-size shared memory. For this infinite-size shared
+                                                                                                                                                           memory, we used the latencies computed according to Equa-
+                                        Relative Execution Time                                    Speedup of UE
+                                                                                                                                                           tions 1 and 2 in [52] as follows:
+                           64                                                                                                     2.2
+ Relative Execution Time
+
+
+
+
+                           32                                                                                                     2.0
+                                                                                                                                           Speedup of UE
+
+
+
+
+                           16                                                                                                     1.8
+                                                                                                                                                                                                  Context (Bits)
+                                                                                                                                                                      Overhead (Cycles) =
+                            8                                                                                                     1.6                                                        Bandwidth (Bits Per Cycle)
+                            4                                                                                                     1.4                         For example, assume that a shared memory has 32 banks,
+                            2                                                                                                     1.2                      and each bank provides 32-bit data per cycle. The total band-
+                            1                                                                                                     1.0                      width of the shared memory is 1024 bits per cycle. For a
+                                 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9                                                        1                              thread block that consists of 2048 threads where each thread
+                                            Oversubscription Ratio                                                                                         uses 10 32-bit registers, the total context size is estimated
+                                                                                                                                                           to be 85KB (see footnote 5). In this case, the close-to-ideal
+ Figure 17. Sensitivity to memory oversubscription ratio.                                                                                                  context switching overhead is computed as 680 cycles, which
+                                                                                                                                                           is less than a microsecond. From this, we observed that the
+overall execution time is insensitive to the context switching       to maximize GPU throughput on a heterogeneous memory
+overhead.                                                            system.
+                                                                        Li et al. [29] propose ETC, a memory management frame-
+                                                                     work to improve GPU performance under memory oversub-
+7   Related Work                                                     scription. The ETC framework categorizes applications into
+To our knowledge, this paper provides the first comprehen-           three categories (regular applications with and without data
+sive analysis of where the major inefficiencies arise in the         sharing, and irregular applications) and applies three tech-
+page fault handling mechanism used in modern GPUs [4, 5,             niques (proactive eviction, memory-aware throttling, and
+38, 39, 45], and proposes a solution to mitigate the inefficien-     capacity compression) differently. The proactive eviction
+cies and regain the performance lost due to demand paging.           mechanism is ineffective (or rather detrimental) for irregular
+This section briefly discusses related work.                         applications. The reason is that it heavily relies on predicting
+                                                                     correct timing to avoid both early and late evictions. Since
+   Virtual Memory Support in GPUs. Address translation               irregular applications access a large number of pages within
+is required for memory references in virtualized memory.             a short period of time, it becomes ineffective. However, our
+The performance implications of address translation are              UE mechanism relies on neither the timing nor size predic-
+widely known, and considerable research has been done to             tion. All we need is to initiate a single page eviction before
+reduce the overheads [10–15, 25, 32, 35, 46, 47, 50, 51]. Power      the first page migration begins. This is based on our in-depth
+et al. [47] study a memory management unit (MMU) design              analysis of how GPU runtime schedules page migrations and
+for GPUs and propose per-compute unit TLBs and a shared              how it interacts with the DMA engine and the GPU hard-
+page walk unit. Pichai et al. [46] also explore GPU MMUs and         ware (via command buffer). Their memory-aware throttling
+propose modest TLB and page table walker augmentations.              and capacity compression techniques are orthogonal to our
+Ausavarungnirun et al. [8] propose a GPU memory manager              work.
+that provides an application-transparent multiple page size
+support in GPUs to increase the TLB reach. Ausavarungnirun           8    Conclusion
+et al. [9] propose an address-translation-aware GPU mem-
+                                                                     We proposed a GPU runtime software and hardware solu-
+ory hierarchy design that reduces the overhead of address
+                                                                     tion that enables efficient demand paging for GPUs. To this
+translation by prioritizing memory accesses for page table
+                                                                     end, we first inspected a real GPU runtime software im-
+walks over data accesses. Shin et al. [48] propose a SIMT-
+                                                                     plementation to find major sources of inefficiencies in the
+aware page table walk scheduling mechanism to improve
+                                                                     page fault handling mechanisms employed in modern GPUs.
+address translation performance in irregular GPU workloads.
+                                                                     Based on two key observations we made (the large scale
+Cong et al. [17] propose a two-level TLB design for a unified
+                                                                     serialization introduced by the batch processing mechanism
+virtual address space between the host CPU and customized
+                                                                     and the serialization observed in the page migrations), we
+accelerators.
+                                                                     proposed two co-operative techniques: (1) thread oversub-
+                                                                     scription, which increases the batch size to amortize the
+   Demand Paging in GPUs. Unlike traditional GPUs, where             GPU runtime fault handling time and reduce the number of
+GPU runtime must migrate all pages to the GPU memory                 batches, and (2) unobtrusive eviction, which eliminates the
+before launching a kernel, modern GPUs support on-demand             page migration delay caused by page evictions. Our exten-
+page faulting and migration (i.e., demand paging) [4, 5, 38,         sive evaluation showed that the proposed solution achieves
+39, 45]. The demand paging support eliminates the need for           an average speedup of 2x over the baseline that employs the
+manual data migration, thereby reducing programmer effort            state-of-the-art prefetching.
+and enabling GPU applications to compute across datasets
+that exceed the GPU memory capacity. However, its impli-
+cation on performance is considerable and has been studied
+                                                                     Acknowledgments
+a lot recently [2, 3, 8, 9, 20, 26, 28, 29, 53]. Zheng et al. [53]   We thank the anonymous reviewers and HPArch group mem-
+explore the problem of PCIe bus being underutilized for              bers for their feedback. This research was partially supported
+demand-based page migration and propose a software page              by Intel Corporation.
+prefetcher to better utilize PCIe bus bandwidth and hide
+page migration overheads. Agarwal et al. [2] investigate the         References
+problem of demand-based page migration policy and pro-                [1] Advanced Micro Devices Inc. 2012. AMD Graphics Cores Next (GCN)
+pose using virtual-address-based program locality to enable               Architecture. https://www.amd.com/Documents/GCN_Architecture_
+aggressive prefetching and achieve bandwidth balancing.                   whitepaper.pdf.
+                                                                      [2] Neha Agarwal, David Nellans, Mike O’Connor, Stephen W. Keckler,
+Agarwal et al. [3] further explore page placement policies                and Thomas F. Wenisch. 2015. Unlocking Bandwidth for GPUs in
+and propose using characteristics (i.e., bandwidth) of het-               CC-NUMA Systems. In Proceedings of the International Symposium on
+erogeneous memory systems and program-annotated hints                     High Performance Computer Architecture (HPCA).
+ [3] Neha Agarwal, David Nellans, Mark Stephenson, Mike O’Connor, and          [20] Debashis Ganguly, Ziyu Zhang, Jun Yang, and Rami Melhem. 2019.
+     Stephen W. Keckler. 2015. Page Placement Strategies for GPUs Within            Interplay Between Hardware Prefetcher and Page Eviction Policy in
+     Heterogeneous Memory Systems. In Proceedings of the International              CPU-GPU Unified Virtual Memory. In Proceedings of the International
+     Conference on Architectural Support for Programming Languages and              Symposium on Computer Architecture (ISCA).
+     Operating Systems (ASPLOS).                                               [21] Google. [n.d.]. Google GPUs Cloud Computing. https://cloud.google.
+ [4] Nikoly Akhenykh. 2017. Unified Memory On Pascal and Volta.                     com/gpu.
+     http://on-demand.gputechconf.com/gtc/2017/presentation/s7285-             [22] Andre Vincent Pascal Grosset, Peihong Zhu, Shusen Liu, Suresh
+     nikolay-sakharnykh-unified-memory-on-pascal-and-volta.pdf.                     Venkatasubramanian, and Mary Hall. 2011. Evaluating Graph Coloring
+ [5] Nikoly Akhenykh. 2018. Everything You Need to Know About Unified               on GPUs. In Proceedings of the Symposium on Principles and Practice of
+     Memory. http://on-demand.gputechconf.com/gtc/2018/presentation/                Parallel Programming (PPoPP).
+     s8430-everything-you-need-to-know-about-unified-memory.pdf.               [23] IBM. [n.d.]. GPUs Cloud Computing. https://www.ibm.com/cloud/
+ [6] AMD. 2011. AMD Accelerated Processing Units. https://www.amd.                  gpu.
+     com/us/products/technologies/apu/Pages/apu.aspx.                          [24] Mark T. Jones and Paul E. Plassmann. 1993. A Parallel Graph Coloring
+ [7] AMD. 2012. AMD Graphics Cores Next (GCN) Architecture. https:                  Heuristic. SIAM J. Sci. Comput. 14, 3 (May 1993), 654–669. http:
+     //www.amd.com/Documents/GCN_Architecture_whitepaper.pdf.                       //dx.doi.org/10.1137/0914041
+ [8] Rachata Ausavarungnirun, Joshua Landgraf, Vance Miller, Saugata           [25] Gokul B. Kandiraju and Anand Sivasubramaniam. 2002. Going the Dis-
+     Ghose, Jayneel Gandhi, Christopher J. Rossbach, and Onur Mutlu.                tance for TLB Prefetching: An Application-driven Study. In Proceedings
+     2017. Mosaic: A GPU Memory Manager with Application-transparent                of the International Symposium on Computer Architecture (ISCA).
+     Support for Multiple Page Sizes. In Proceedings of the International      [26] Jens Kehne, Jonathan Metter, and Frank Bellosa. 2015. GPUswap:
+     Symposium on Microarchitecture (MICRO).                                        Enabling Oversubscription of GPU Memory Through Transparent
+ [9] Rachata Ausavarungnirun, Vance Miller, Joshua Landgraf, Saugata                Swapping. In Proceedings of the International Conference on Virtual
+     Ghose, Jayneel Gandhi, Adwait Jog, Christopher J. Rossbach, and Onur           Execution Environments (VEE).
+     Mutlu. 2018. MASK: Redesigning the GPU Memory Hierarchy to Sup-           [27] Hyesoon Kim, Jaekyu Lee, Nagesh B. Lakshminarayana, Jaewoong Sim,
+     port Multi-Application Concurrency. In Proceedings of the International        Jieun Lim, Tri Pho, Hyojong Kim, and Ramyad Hadidi. 2012. MacSim:
+     Conference on Architectural Support for Programming Languages and              A CPU-GPU Heterogeneous Simulation Framework User Guide.
+     Operating Systems (ASPLOS).                                               [28] Janghaeng Lee, Mehrzad Samadi, and Scott Mahlke. 2014. VAST:
+[10] Thomas W. Barr, Alan L. Cox, and Scott Rixner. 2010. Translation               The illusion of a large memory space for GPUs. In Proceedings of
+     Caching: Skip, Don’T Walk (the Page Table). In Proceedings of the              the International Conference on Parallel Architectures and Compilation
+     International Symposium on Computer Architecture (ISCA).                       Techniques (PACT).
+[11] Ravi Bhargava, Benjamin Serebrin, Francesco Spadini, and Srilatha         [29] Chen Li, Rachata Ausavarungnirun, Christopher J. Rossbach, Youtao
+     Manne. 2008. Accelerating Two-dimensional Page Walks for Virtual-              Zhang, Onur Mutlu, Yang Guo, and Jun Yang. 2019. A Framework for
+     ized Systems. In Proceedings of the International Conference on Archi-         Memory Oversubscription Management in Graphics Processing Units.
+     tectural Support for Programming Languages and Operating Systems               In Proceedings of the International Conference on Architectural Support
+     (ASPLOS).                                                                      for Programming Languages and Operating Systems (ASPLOS).
+[12] Abhishek Bhattacharjee. 2013. Large-reach Memory Management               [30] Zhen Lin, Lars Nyland, and Huiyang Zhou. 2016. Enabling Efficient Pre-
+     Unit Caches. In Proceedings of the International Symposium on Microar-         emption for SIMT Architectures with Lightweight Context Switching.
+     chitecture (MICRO).                                                            In International Conference for High Performance Computing, Network-
+[13] Abhishek Bhattacharjee, Daniel Lustig, and Margaret Martonosi. 2011.           ing, Storage and Analysis (SC).
+     Shared Last-level TLBs for Chip Multiprocessors. In Proceedings of the    [31] Shaoshan Liu, Christine Eisenbeis, and Jean-Luc Gaudiot. 2010. Spec-
+     International Symposium on High Performance Computer Architecture              ulative Execution on GPU: An Exploratory Study. In International
+     (HPCA).                                                                        Conference on Parallel Processing (ICPP).
+[14] Abhishek Bhattacharjee and Margaret Martonosi. 2009. Characteriz-         [32] Daniel Lustig, Abhishek Bhattacharjee, and Margaret Martonosi. 2013.
+     ing the TLB Behavior of Emerging Parallel Workloads on Chip Multi-             TLB Improvements for Chip Multiprocessors: Inter-Core Cooperative
+     processors. In Proceedings of the International Conference on Parallel         Prefetchers and Shared Last-Level TLBs. ACM Trans. Archit. Code
+     Architectures and Compilation Techniques (PACT).                               Optim. 10, 1, Article 2 (April 2013), 38 pages. https://doi.org/10.1145/
+[15] Abhishek Bhattacharjee and Margaret Martonosi. 2010. Inter-core Co-            2445572.2445574
+     operative TLB for Chip Multiprocessors. In Proceedings of the Interna-    [33] Kamesh Madduri, David Ediger, Karl Jiang, David A. Bader, and Daniel
+     tional Conference on Architectural Support for Programming Languages           Chavarria-Miranda. 2009. A Faster Parallel Algorithm and Efficient
+     and Operating Systems (ASPLOS).                                                Multithreaded Implementations for Evaluating Betweenness Central-
+[16] Sergey Brin and Lawrence Page. 1998. The Anatomy of a Large-scale              ity on Massive Datasets. In Proceedings of the International Conference
+     Hypertextual Web Search Engine. In Proceedings of the International            on Parallel and Distributed Processing (IPDPS).
+     Conference on World Wide Web (WWW).                                       [34] David W. Matula and Leland L. Beck. 1983. Smallest-last Ordering and
+[17] Jason Cong, Zhenman Fang, Yuchen Hao, and Glenn Reinman. 2017.                 Clustering and Graph Coloring Algorithms. J. ACM 30, 3 (July 1983),
+     Supporting Address Translation for Accelerator-Centric Architectures.          417–427. http://doi.acm.org/10.1145/2402.322385
+     In Proceedings of the International Symposium on High Performance         [35] Collin McCurdy, Alan L. Coxa, and Jeffrey Vetter. 2008. Investigating
+     Computer Architecture (HPCA).                                                  the TLB Behavior of High-end Scientific Applications on Commodity
+[18] Alvaro Estebanez, Diego R. Llanos, and Arturo Gonzalez-Escribano.              Microprocessors. In Proceedings of the International Symposium on
+     2016. A Survey on Thread-Level Speculation Techniques. ACM Comput.             Performance Analysis of Systems and Software (ISPASS).
+     Surv. 49, 2, Article 22 (June 2016), 39 pages. https://doi.org/10.1145/   [36] Onur Mutlu, Jared Stark, Chris Wilkerson, and Yale N. Patt. 2003. Runa-
+     2938369                                                                        head Execution: An Alternative to Very Large Instruction Windows for
+[19] Xu Fan, Shen Li, and Wang Zhiying. 2012. HVD-TLS: A Novel Frame-               Out-of-Order Processors. In Proceedings of the International Symposium
+     work of Thread Level Speculation. In International Conference on Trust,        on High Performance Computer Architecture (HPCA).
+     Security and Privacy in Computing and Communications (TrustCom).          [37] Lifeng Nai, Yinglong Xia, Ilie G. Tanase, Hyesoon Kim, and Ching-
+                                                                                    Yung Lin. 2015. GraphBIG: Understanding Graph Computing in the
+     Context of Industrial Solutions. In International Conference for High           International Symposium on High Performance Computer Architecture
+     Performance Computing, Networking, Storage and Analysis (SC).                   (HPCA).
+[38] NVIDIA Corp. 2016. NVIDIA Tesla P100. https://images.nvidia.com/           [48] Seunghee Shin, Guilherme Cox, Mark Oskin, Gabriel H. Loh, Yan Soli-
+     content/pdf/tesla/whitepaper/pascal-architecture-whitepaper.pdf.                hin, Abhishek Bhattacharjee, and Arkaprava Basu. 2018. Scheduling
+[39] NVIDIA Corp. 2016. NVIDIA Tesla V100. http://images.nvidia.com/                 Page Table Walks for Irregular GPU Applications. In Proceedings of
+     content/volta-architecture/pdf/volta-architecture-whitepaper.pdf.               the International Symposium on Computer Architecture (ISCA).
+[40] NVIDIA Corp. 2017. CUDA Toolkit Documentation. https://docs.               [49] Ivan Tanasic, Isaac Gelado, Javier Cabezas, Alex Ramirez, Nacho
+     nvidia.com/cuda/index.html.                                                     Navarro, and Mateo Valero. 2014. Enabling Preemptive Multipro-
+[41] NVIDIA Corp. 2018. NVIDIA Driver Downloads. https://www.nvidia.                 gramming on GPUs. In Proceedings of the International Symposium on
+     com.                                                                            Computer Architecture (ISCA).
+[42] NVIDIA Corp. 2019. NVIDIA Visual Profiler. https://developer.nvidia.       [50] Hongil Yoon, Jason Lowe-Power, and Gurindar S. Sohi. 2018. Filtering
+     com/nvidia-visual-profiler.                                                     Translation Bandwidth with Virtual Caching. In Proceedings of the
+[43] Jason Jong Kyu Park, Yongjun Park, and Scott Mahlke. 2015. Chimera:             International Conference on Architectural Support for Programming
+     Collaborative Preemption for Multitasking on a Shared GPU. In Pro-              Languages and Operating Systems (ASPLOS).
+     ceedings of the International Conference on Architectural Support for      [51] Hongil Yoon and Gurindar S. Sohi. 2016. Revisiting virtual L1 caches:
+     Programming Languages and Operating Systems (ASPLOS).                           A practical design using dynamic synonym remapping. In Proceed-
+[44] PCI-SIG. 2015. PCI Express Base Specification Revision 3.1a.                    ings of the International Symposium on High Performance Computer
+[45] Peng Wang. 2017. UNIFIED MEMORY ON P100. https://www.olcf.ornl.                 Architecture (HPCA).
+     gov/wp-content/uploads/2018/02/SummitDev_Unified-Memory.pdf.               [52] M. K. Yoon, K. Kim, S. Lee, W. W. Ro, and M. Annavaram. 2016. Virtual
+[46] Bharath Pichai, Lisa Hsu, and Abhishek Bhattacharjee. 2014. Architec-           Thread: Maximizing Thread-Level Parallelism beyond GPU Scheduling
+     tural Support for Address Translation on GPUs: Designing Memory                 Limit. In Proceedings of the International Symposium on Computer
+     Management Units for CPU/GPUs with Unified Address Spaces. In                   Architecture (ISCA).
+     Proceedings of the International Conference on Architectural Support for   [53] Tianhao Zheng, David Nellans, Arslan Zulfiqar, Mark Stephenson,
+     Programming Languages and Operating Systems (ASPLOS).                           and Stephen W. Keckler. 2016. Towards High Performance Paged
+[47] Jason Power, Mark D. Hill, and David A. Wood. 2014. Supporting x86-             Memory for GPUs. In Proceedings of the International Symposium on
+     64 Address Translation for 100s of GPU Lanes. In Proceedings of the             High Performance Computer Architecture (HPCA).
+

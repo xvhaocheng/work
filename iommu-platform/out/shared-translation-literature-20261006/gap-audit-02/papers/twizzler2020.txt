@@ -1,0 +1,1042 @@
+            Twizzler: a Data-Centric OS for
+                Non-Volatile Memory
+Daniel Bittman and Peter Alvaro, UC Santa Cruz; Pankaj Mehra, IEEE Member;
+Darrell D. E. Long, UC Santa Cruz; Ethan L. Miller, UC Santa Cruz / Pure Storage
+           https://www.usenix.org/conference/atc20/presentation/bittman
+
+
+
+
+       This paper is included in the Proceedings of the
+         2020 USENIX Annual Technical Conference.
+                                July 15–17, 2020
+                                978-1-939133-14-4
+
+
+
+
+                                       Open access to the Proceedings of the
+                                     2020 USENIX Annual Technical Conference
+                                             is sponsored by USENIX.
+                       Twizzler: a Data-Centric OS for Non-Volatile Memory
+
+    Daniel Bittman            Peter Alvaro              Pankaj Mehra          Darrell D. E. Long             Ethan L. Miller
+    UC Santa Cruz            UC Santa Cruz              IEEE Member            UC Santa Cruz                 UC Santa Cruz
+                                                                                                              Pure Storage
+
+
+
+                          Abstract                                  use of load and store instructions to directly access persistent
+   Byte-addressable, non-volatile memory (NVM) presents             data, simplifying applications by enabling persistent data ma-
+an opportunity to rethink the entire system stack. We present       nipulation without the need to transform it between in-memory
+Twizzler, an operating system redesign for this near-future.        and on-storage data formats. Thus, the model that best exploits
+Twizzler removes the kernel from the I/O path, provides pro-        the low latency nature of NVM is one in which persistent data
+grams with memory-style access to persistent data using small       is maintained as in-memory data structures and not serialized
+(64 bit), object-relative cross-object pointers, and enables sim-   or explicitly loaded or unloaded. To avoid serialization, this
+ple and efficient long-term sharing of data both between appli-     model must support persistent pointers that are valid in any
+cations and between runs of an application. Twizzler provides       execution context, not just the one in which they were created.
+a clean-slate programming model for persistent data, realizing         Trying to mold NVM into existing models will not enable its
+the vision of Unix in a world of persistent RAM.                    fullest potential, just as SSDs did not reach their full potential
+   We show that Twizzler is simpler, more extensible, and more      until they transcended the disk paradigm. To explore a “clean-
+secure than existing I/O models and implementations by build-       slate” approach, we are building Twizzler, an OS designed to
+ing software for Twizzler and evaluating it on NVM DIMMs.           take full advantage of this new technology by rethinking the
+Most persistent pointer operations in Twizzler impose less          abstractions OSes provide in the context of NVM. Twizzler
+than 0.5 ns added latency. Twizzler operations are up to 13×        divides NVM into objects within a global object space, and
+faster than Unix, and SQLite queries are up to 4.2× faster than     pointers are interpreted in the context of the object in which
+on PMDK. YCSB workloads ran 1.1–2.9× faster on Twizzler             they reside. This decouples pointers from the address space of
+than on native and NVM-optimized SQLite backends.                   an individual thread, providing a data-centric programming
+                                                                    model rather than a process-centric one. The result is a vastly
+                                                                    simpler environment in which the OS’s primary function is to
+1    Introduction
+                                                                    support manipulating, sharing, and protecting persistent data
+Byte-addressable non-volatile memory (NVM) on the mem-              using few kernel interpositions.
+ory bus with DRAM-like latency [23, 38] will fundamentally             We implemented a simple, standalone kernel that supports
+shift the way that we program computers. The two-tier mem-          a userspace for NVM-based applications, with compatibil-
+ory hierarchy split between high-latency persistent storage and     ity layers for legacy programs. We wrote a set of libraries
+low latency volatile memory may evolve into a single level of       and portability layers that provide a rich environment for ap-
+large, low latency, and directly-addressable persistent memory.     plications to access persistent data that takes into account
+Mere incremental change will leave dramatic improvements in         both semantics (persistent pointers) and safety (building crash-
+programmability, performance, and simplicity on the table. It       consistent data structures). We then performed a case-study
+is essential that operating systems and system software evolve      by writing software for Twizzler, taking into account the new
+to make the best use of this new technology.                        flexibility and power gained by our model and evaluating our
+   These opportunities motivate us to revisit how programs          software for complexity and performance. We ported SQLite
+operate on persistent data. The separation of volatile memory       to Twizzler, showing how our approach can provide significant
+and high-latency persistent storage at the core of OS design        performance gains on existing applications as well.
+requires the OS to manage ephemeral copies of data and in-             In a world where in-memory data can last forever, the con-
+terpose itself on persistence operations, a penalty that will       text required to manipulate that data is best coupled with the
+consume an increasing fraction of time as NVM performance           data rather than the process. This key insight manifests itself
+increases [64]. The direct-access nature of NVM invites the         in the three primary contributions of this paper:
+
+
+
+USENIX Association                                                             2020 USENIX Annual Technical Conference            65
+     • We discuss (§ 2) our vision for a data-centric OS and               a form that is conducive to sharing without needing the
+       the requirements that it must meet to provide low latency           ephemeral context associated with a particular actor.
+       memory-style access to NVM with efficient data sharing.          We call an OS that meets both of these requirements data-
+     • We present Twizzler (§ 3) and describe its mechanisms         centric, as opposed to current OSes, which are process-centric.
+       to meet those requirements, including decoupling tradi-       Operations on persistent, in-memory data structures are the
+       tionally linked concerns, reducing kernel involvement in      primary functions of a data-centric OS, which tries to avoid
+       address space management, and providing a rich model          interposing on such operations, preferring instead to intervene
+       for constructing in-memory persistent data structures that    only when necessary to ensure properties such as security and
+       can be easily shared between programs and machines.           isolation. To meet both of these requirements a data-centric
+     • We evaluate (§ 4) the ease-of-use, security advantages,       OS must provide effective abstractions for identifying data
+       and programmability offered by our environment, for           independent of data location, constructing persistent data re-
+       both new and existing, ported software (SQLite), along        lationships that do not depend on ephemeral context, and fa-
+       with performance improvements (§ 5) on NVM DIMMs.             cilitating sharing and protection of persistent data.
+
+2     The Data-Centric OS                                            2.1    Existing Interfaces
+Operating systems provide abstractions for data access that          Current OS techniques do not meet these requirements—file
+reflect the hardware for which they were designed. Current I/O       read and write interfaces, designed for sequential media and
+interfaces and abstractions reflect the structure of mutually        later expanded for block-based media, require significant ker-
+exclusive volatile and persistent domains, the hallmarks of          nel involvement and serialization, violating both requirements.
+which are heavy kernel involvement for persisting data, a need       While support for these interfaces can be useful for legacy ap-
+for data serialization, and complexity in data sharing requiring     plications, as we will demonstrate, providing the programmer
+the overhead of pipes or the management cost of shared virtual       with abstractions designed for NVM both reduces complexity
+memory. However, the introduction of low latency and directly        and improves performance.
+attached NVM into the memory hierarchy requires that we                 The mmap call attempts to hide storage behind a memory
+rethink key assumptions such as the use of virtual addresses,        interface through hidden data copies. But, with NVM, these
+the kernel’s involvement in persistent I/O, and the way that         copies are wasteful, and mmap still has significant kernel in-
+programs operate on and share persistent data [30].                  volvement and the need for explicit msync calls. “Direct Ac-
+   The first key characteristic of NVM is low latency: only          cess” (DAX) tries to retrofit mmap for NVM by removing the
+1.5–8× the latency of DRAM in most cases [38], so the cost           redundant copy, but this fails to address requirement two! Oper-
+of a system call to access NVM dominates the latency of the          ating on persistent data through mmap requires the programmer
+access itself. The second key characteristic is that the pro-        to use either fixed virtual addresses, which presents an infea-
+cessor can directly access persistent storage using load and         sible coordination problem as we scale across machines, or
+store instructions. Direct, low latency access to NVM means          virtual addresses directly, which are ephemeral and require
+that explicit serialization is a poor fit—it adds complexity, as     the context of the process that created them.
+programmers must maintain different data formats and the                Attempting to shoehorn NVM programming atop POSIX
+transformations between them, and the overhead is intolera-          interfaces (including mmap) results in complexity that arises
+ble due to NVM’s low latency. Hence, we should design the            from combining multiple partial solutions. Given some feature
+semantics of the programming model around in-memory per-             desired by an application, the NVM framework can provide an
+sistent data structures, giving programs direct access to them       integrated solution that meshes well with the existing support
+without explicit persistence calls or serialization methods.         for persistent data structure manipulation and access, or it can
+   These characteristics imply two basic requirements for OSes       fall-back to POSIX resulting in the programmer needing to
+to most effectively use NVM:                                         understand two different “feature namespaces” and their inter-
+  1. Remove the kernel from the persistence path. This               actions. An example of this is naming, where a programmer
+      addresses both characteristics. System calls to persist data   may need to turn to the filesystem to manage names in a com-
+      are costly; we must provide lightweight, direct, memory-       pletely orthogonal way to how the NVM frameworks handles
+      style access for programs to operate on persistent data.       data references. We will discuss another example, security, in
+  2. Design for pointers that last forever. Long-lived data          our case study (§ 4).
+      structures can directly reference persistent data, so point-      Additionally, models that layer NVM programming atop
+      ers must have the same lifetime as the data they point to.     existing interfaces often fail to facilitate effective persistent
+      Virtual memory mappings are, by contrast, ephemeral            data sharing and protection. PMDK, an NVM programming li-
+      and so cannot effectively name persistent data. Persistent     brary, makes design choices that limit scalability, since its data
+      data is, by definition, accessed by multiple actors, both      objects are not self-contained and do not have a large enough
+      simultaneously and over time, and thus must be stored in       ID space, resulting in the need to coordinate object IDs across
+
+
+
+66     2020 USENIX Annual Technical Conference                                                                  USENIX Association
+machines [10]. For the same reason, although single-address         3      The Design of Twizzler
+space OSes [12] somewhat address our first requirement, they
+do not consider both requirements at once, nor do they provide      Twizzler is a stand-alone kernel and userspace runtime that pro-
+an effective and scalable solution to long-term data references     vides execution support for programs. It provides, as first-class
+due to that same coordination complexity [9].                       abstractions, a notion of threads, address spaces, persistent
+                                                                    objects, and security contexts. A program typically executes
+                                                                    as a number of threads in a single address space (providing
+2.2    A Data-Centric Approach                                      backwards compatibility with existing programming models),
+We cannot store virtual addresses in persistent data, so we         into which persistent objects are mapped on-demand. Instead
+need a new way to name a word of persistent memory: a per-          of providing a process abstraction, Twizzler provides views
+sistent pointer. The persistent pointer encodes a persistent        (§ 3.2) of the object space, which enable a program to map
+identification of data (§ 3.3) instead of an ephemeral address,     objects for access, and security contexts (§ 3.4) which define
+allowing any thread to access the desired word of memory            a thread’s access rights to objects in the system. Twizzler
+regardless of address space. This approach dramatically im-         provides persistent pointers (§ 3.3) for programs, as well as
+proves programmability, as programmers need not worry about         primitives to ensure crash-consistency (§ 3.5). The thread
+the complexity of referring to persistent data with ephemeral       abstraction is similar to modern OSes; the kernel provides
+constructs, improving data sharing across programs and runs         scheduling, synchronization, and management primitives. Fig-
+of a program. Twizzler still makes use of virtual memory hard-      ure 1 shows an overview of the system organization and how
+ware to provide isolation and translation, but persistent data      different parts of the system operate on data objects.
+structures should not be written in terms of virtual addresses.        Twizzler’s kernel acts much like an Exokernel [28, 41], pro-
+                                                                    viding sufficient services for a userspace library OS, called
+The Death of the Process. Processes as a first class OS ab-         libtwz, to provide an execution environment for applications.
+straction are, like virtual addresses, unnecessary; a traditional   The primary job of libtwz is to manage mappings of per-
+process couples threads of control to a virtual address space,      sistent objects into the address space (§ 3.2) and deal with
+a security role, and kernel state. However, with the kernel re-     persistent pointers (§ 3.3). Twizzler also exposes a standard
+moved from persistent data access, much of that kernel state        library that provides higher level interfaces beyond raw access
+(e.g. file descriptors) is unnecessary, leading to a decoupling     to memory. For example, software that better fits message-
+of mechanisms: nothing fundamentally connects a virtual ad-         passing semantics can use library routines that implement
+dress space (how threads access data) and a security context        message-passing atop shared memory. Twizzler’s standard
+(what data they may access). Instead, a data-centric OS can re-     library provides additional higher level interfaces, including
+place the process abstraction with security contexts, allowing      streams, logging, event notification, and many others. Applica-
+greater flexibility for how security policy is managed.             tions use these to easily build composable tools and pipelines
+   The process abstraction is just one example. Persistent data     for operating on in-memory data structures without the per-
+access plays a key role in OS abstraction design, and we need       formance loss and complexity of explicit I/O.
+to avoid complexity arising from combining old and new inter-          We provide POSIX support with twix, a library that emu-
+faces. Hence, we need to consider the wide-reaching effects of      lates Linux syscalls. We modified musl [1], a C library which
+changing the persistence model on all aspects of the system,        all programs link to, replacing invocations of the syscall
+not just I/O interfaces. NVM gives us an opportunity to de-         instruction with calls into twix, which internally tracks Unix
+sign an OS around the requirements of the target programming        state like file descriptors. This is handled entirely in userspace;
+model instead of trying to mold support libraries around exist-     calls to read and write often reduce to calls to memcpy.
+ing interfaces. While it is important that we provide support
+for legacy applications, it is these applications that should be                  direct access
+                                                                                 (memory-style)
+                                                                                                                  application
+relegated to support libraries; new applications built for the                                          musl* (libc)
+
+programming model should get first-class OS support.
+                                                                                  POSIX access                          Linux syscall
+                                                                                                           twix
+                                                                                  (read/write)                          emulation
+Targeting these Constraints with Twizzler. The conse-                    data
+quences of meeting the requirements of these hardware trends            object   metadata & FOT
+                                                                                                                       libtwz
+                                                                                                                                          view management,
+                                                                                                                                          pointer translation,
+define a bounded design space for data-centric OSes. We have                      management
+                                                                                                                             userspace
+                                                                                                                                          consistency primitives
+chosen a point in that space and built Twizzler, our approach                                                               kernelspace
+                                                                                                                                          object & thread
+to providing applications with efficient and effective access to                 create, delete, etc.
+                                                                                                               Twizzler kernel            management, trusted
+                                                                                 physical mapping
+NVM. In the following section we will discuss how our four                                                                                computing base
+
+primary abstractions—a low level persistent object model, a                       * modified musl to change linux syscalls into function calls
+
+persistent pointer design, an address space mechanism called        Figure 1: Twizzler system overview. Applications link to musl
+views, and a security context mechanism—achieve these goals         (a C library), twix (our Linux syscall emulation library), and
+of removing the kernel from the persistent data access path.        libtwz (our standard library).
+
+
+
+USENIX Association                                                                2020 USENIX Annual Technical Conference                                   67
+3.1    Object Management                                              generates many mapping operations to access persistent data,
+                                                                      so requiring system calls would be costly. Additionally, our
+Twizzler organizes data into objects, which may be persistent.        kernel avoidance necessitates an increased address space man-
+Each object is identified by a unique 128 bit object ID (though       agement responsibility for userspace. For example, executable
+larger IDs would be possible). Objects provide contiguous re-         loading and mapping is handled largely without the kernel.
+gions of memory that organize semantically related data with             To support userspace manipulation of address spaces, the
+similar lifetime. Applications access objects via mapping ser-        kernel and userspace share an object (called a “view”) that
+vices (discussed in the next section) by mapping each object          defines an address space layout. The view is just a normal
+into a contiguous range in the address space, though the ad-          object, and so standard access control mechanisms apply to
+dress space itself may be densely or sparsely mapped. Objects         enforce isolation. When applications map objects into their
+can be anywhere from 4 KiB (the size of a page) to 1 GiB;             address space, they update the view to specify that a particular
+the upper bound on object size is a prototype implementation          object should be addressable at a specific location. The kernel
+choice, and not fundamental to the design.                            then reads the object and determines the requested layout of
+   Twizzler uses objects as the unit of access control, building      the virtual address space. The view object is laid out like a
+off a read/write/execute permissions model which mirrors that         page-table, where each entry in the table corresponds to a
+of memory management units in modern processors. This is a            slot in the virtual address space. Each table entry contains
+direct consequence of avoiding the kernel for persistent data         an object ID and read, write, and execute protection bits to
+access—it can set policy by programming the MMU, but must             further protect object access (like PROT_⁎ in mmap).
+leave enforcement up to the hardware which, in-turn, defines             When a page-fault occurs, the fault handler tries to handle
+what protections are possible.                                        the fault by either doing copy-on-write, checking permissions,
+   An object, from the programmer’s perspective, is flexible in       or by trying to map an object into a slot if the view object
+its contents—for example, it could contain anywhere from a            requested one. If it cannot handle the fault (due to a protection
+single B-tree node to the entire B-tree. Often, an object would       error or an empty entry in the view object), it elevates the fault
+contain the entire tree, since the entire tree is typically subject   to userspace where libtwz handles it, possibly by killing
+to the same access semantics by programs, and there are over-         the thread, or possibly by mapping an object if the slot is
+heads associated with objects that can be amortized over larger       “on-demand”. When the kernel maps an object into a slot, it
+spaces. Data and data structures that are too large for one ob-       updates the address space’s page-tables appropriately.
+ject or require different access permissions can span multiple           When threads add entries to a view object they need not
+objects with references between them. We demonstrate the              inform the kernel—when a fault occurs, the kernel will read
+benefits of this flexibility in Section 4.                            the entry as needed. However, when changing or deleting an
+   The kernel provides services for object management, such           entry, threads must inform the kernel so it can update existing
+as creating and deleting objects. Objects are created by the          page table entries. We provide two system calls for views. The
+create system call, which returns an object ID. A program             set_view call allows a thread to change to a new view, which
+may also optionally provide an existing object ID to the              might be used to execute a new program or jump across pro-
+create call, stating that the new object should be a copy of          grams to, for example, accomplish a protected task. Twizzler’s
+the existing one, for which Twizzler uses copy-on-write. The          access control system prevents this from happening arbitrar-
+new ID is a number that is unlikely to collide with existing IDs      ily. The second system call is invalidate_view, which lets
+in the 128 bit ID space, and can be assigned using a technique        a thread inform the kernel of changed or deleted entries.
+that supports this requirement (random, hashing, etc.). Some
+forms of ID assignment support a form of access control: a pro-
+gram can only access an object whose ID it knows. Twizzler            3.3    Persistent Pointers
+provides object naming as well, discussed in Section 3.3.
+   Objects may be be deleted via the delete system call. Like         Section 2 discussed the needs for references that outlive
+Unix’s unlink, objects are reference counted, where a ref-            ephemeral actors. Twizzler provides cross-object persistent
+erence refers to a mapping in an address space. Once the              pointers so that a pointer refers not to a virtual address but to
+reference count reaches zero, the object may be deleted.              an offset within an object by encoding an object-id:offset
+                                                                      tuple. This enables a pointer to refer to persistent data, but
+                                                                      it also allows objects to have external pointers that refer to
+3.2    Address Space Management                                       data in any object in the global object space. We highlight
+                                                                      cross-object pointers’ power and flexibility by demonstrating
+Although virtual addresses are the wrong abstraction to use for       their ability to express inter-object relationships in Section 4.
+persistent data access, we do leverage virtual address hardware          To efficiently encode this tuple, we use indirection through
+in modern processors for isolation and protection. Twizzler           a per-object foreign object table (FOT), located at a known
+provides access to persistent objects by mapping them into the        offset within each object. The FOT is an array of entries that
+virtual address space behind-the-scenes (via libtwz). This            each stores an object ID (or a name that resolves into an object
+
+
+
+68    2020 USENIX Annual Technical Conference                                                                    USENIX Association
+       Pointer            Foreign Object Table
+                                                                    contain a pointer to an in-object string table that contains a
+                      1         A       flags
+  2    oﬀset
+                                                 Object B           name. Names enable late-binding [19], a vital aspect of sys-
+                      2        B        flags
+                                                 data               tems, allowing references to objects which change over time,
+                      3        C        flags
+                                                                    e.g. shared library versions. Names are passed to a resolving
+Figure 2: Pointer translation via the FOT. The pointer and the      function (specified in the FOT entry). Allowing a program to
+FOT are both contained in the same object (not shown).              specify how its names are resolved increases the flexibility of
+                                                                    the system beyond supporting Unix paths. Twizzler provides
+ID, as we will see below) and flags. A cross-object pointer is      a default name resolver that uses Unix-like paths.
+stored as a 64 bit FOT_idx:offset value, where the FOT_idx             The implementation of naming is orthogonal to Twizzler’s
+is an index into the FOT. This provides us with both large          design. We allow a range of name resolution methods within
+offsets and large object IDs, since the IDs are not stored within   the system stack and allow objects to specify their own name
+the pointer itself. If an object wishes to point to data within     resolution functions for flexibility. For example, objects could
+itself (an intra-object pointer), it stores 0 in FOT_idx. When      be organized by both a relational database and a hierarchical
+dereferencing, Twizzler uses the FOT_idx part of the pointer        namer similar to conventional file systems. Non-hierarchical
+as an index into the FOT, retrieving an object ID. The combi-       file systems are well studied [3,31,32,54,55], but these systems
+nation of a FOT and a cross-object pointer logically forms an       do not easily cooperate atop a single data space. Since Twizzler
+object-id:offset pair, as shown in Figure 2.                        uses a flat namespace as its “native” object naming scheme, it
+   Our design (discussed in prior work [9, 10]) differs from        enables the required cooperation.
+existing frameworks [6, 13, 18, 19, 57, 58] because of the indi-
+rection. Frameworks like PMDK store entire object IDs within        Pointer Translation. Current processors provide only a vir-
+pointers, increasing pointer size and reducing flexibility by       tual memory abstraction, so applications must do some extra
+removing the possibility of late-binding (discussed below).         work to dereference a pointer, translating a pointer from its
+Additionally, Twizzler extends the namespace of data objects        persistent form into a virtual address. This does not affect
+beyond one machine, as machine-independent data references          the stored pointer, which is still persistent and independent of
+are a natural consequence of cross-object pointers. Existing        any translation or address space. Thus multiple applications,
+solutions are limited in this scalability. They either limit the    possibly with different address space layouts, can translate the
+ID space (necessary for storing IDs in pointers) and thus resort    same pointer at the same time without coordination.
+to complex coordination or serialization when sharing, or they         Pointer translation occurs with the help of two libtwz func-
+require additional state (e.g. per-process or per-machine ID        tions: ptr_lea (load effective address) and ptr_store. When
+tables) that must be shared along with the data, forcing the        a program dereferences a pointer, it first calls ptr_lea. The
+receiving machine to “fix-up” references. Worse still, the fix-     pointer is resolved into an object-ID and offset pair through
+up is application-specific, since the object IDs are within any     a lookup in the FOT, after which libtwz determines if the
+pointer, not in a generically known location. Our per-object        referenced object is already mapped (by maintaining per-view
+FOT results in self-contained objects that are easier to share,     metadata). If not, it picks an empty slot in the view and maps
+thus interacting better with remote shared memory systems.          the object there (a cheap operation that does not invoke the ker-
+   Part of our motivation for this FOT indirection was to allow     nel). Once mapped, libtwz combines the object’s temporary
+a large ID space without increasing pointer size. PMDK, by          virtual base address with the offset, and returns the new pointer.
+contrast, increases pointer size to 128 bits for each pointer.      The ptr_store function does the opposite of ptr_lea—it
+Twizzler has no additional space overhead per-pointer, instead      turns a virtual pointer into a persistent one. While these are
+adding a 32-byte overhead per FOT entry. The number of FOT          done manually in our implementation, we plan to implement
+entries, however, is typically much smaller than the number         compiler support to emit these calls automatically.
+of pointers since pointers to the same external object can all         FOT management is handled by libtwz. While a lookup
+use the same FOT entry. As we will see in Section 5, this has       in the FOT is a simple array-indexing operation, a store may
+a dramatic benefit to performance.                                  require adding to the FOT. To avoid duplicate entries, libtwz
+                                                                    walks the FOT looking for a compatible entry. If one is not
+FOT Entries and Late-Binding. The FOT entry’s flags                 found, it atomically reserves a new entry and fills it (flush-
+field has bits for read, write, and execute protections. The        ing cache-lines to persist it) before storing the pointer. The
+protections are requests; Twizzler implements separate access       ptr_store operation is less common than ptr_load, and in
+control on objects. This allows some pointers to refer to data      the future we may include additional caching metadata that
+with a read-only reference while others can be used for writing,    would speed-up the FOT walk (such as storing recent IDs).
+reducing stray writes (a single ID can repeat in the FOT with          Translating pointers has a small overhead (§ 5) and the
+different protections). The FOT entries also enable atomic          result can be cached. Twizzler improves performance via a
+updates that apply to all pointers using that FOT entry.            per-object cache of prior translations. The common case, intra-
+   Instead of requiring programmers to refer to objects via         object pointers, does not require an external lookup and is
+IDs only, we allow names in FOT entries. These entries may          implemented as a simple bitwise-or operation.
+
+
+
+USENIX Association                                                             2020 USENIX Annual Technical Conference            69
+3.4    Security and Access Control                                  back cache-lines and appropriate fences. Applications use
+                                                                    these primitives today outside of Twizzler to build up larger,
+Twizzler’s focus on memory-based objects requires that we de-       more complex support for crash-consistent data structures.
+sign the security model around hardware-based enforcement,             Our goal is to provide low level primitives without restrict-
+where the MMU checks each access. This design is inevitable         ing programs or prematurely prescribing particular solutions.
+in a data-centric OS, since the kernel is not involved in every     There is a wealth of research on crash-consistent data struc-
+memory access. The kernel merely specifies the access rights        tures for NVM [15, 16, 24, 46, 50–53, 65], but it is still in flux.
+when mapping an object and then relies on the hardware to           Of course, Twizzler manages system data structures, such as
+enforce those rights with a low overhead.                           FOT entries, views, etc., in a crash-consistent manner using
+   A key design choice we make is late-binding on security.         the aforementioned primitives, locking, and fencing.
+Applications request access to an object with permissions that         Twizzler also provides a transactional-persistent logging
+they desire; if they access the object in only allowed ways         mechanism. Programmers can write TXSTART–TXEND blocks
+(e.g., only reading a read-only object), no fault occurs. This      to denote transactions and TXRECORD statements to record pre-
+is because when we map an object (via a view), the kernel is        changed values. This is similar to the mechanism provided by
+not immediately involved, and so cannot check access rights         PMDK [58]. If applications need more complex transactions
+for a particular access at the time the mapping is setup. Per-      using different logging mechanisms, they can use libraries.
+forming an access rights check on time of first access does not        Twizzler provides a mechanism for restarting threads when
+make sense either, as it associates a specific access (that might   power is restored following a crash. Since views are persistent
+be allowed) with a permissions error. For example, if a pro-        objects, all mapped objects during a thread’s execution are
+gram reads object A, and that program is allowed to read A, it      known across power cycles, and are mapped back in. The
+should be allowed to perform the read even if it requested read-    thread is then started at a special _resume entry point, allowing
+write access to the object. This late-binding enables simpler       the program to handle the power failure in an application-
+programs that need not worry about elevating access rights          specific manner with access to the state of the program (data
+through remapping data objects. Programs can make progress          segment, heap, etc.) as it was when power was cut.
+without knowing in advance the permissions of the objects
+they might access, thus enabling the reuse of the OS’s access
+control mechanism in applications. We will show the flexibil-       3.6    Implementation
+ity of this in Section 4, wherein we add access control to a        Twizzler’s kernel is similar to many microkernels, providing
+program by changing only a few lines of code.                       a small set of key primitives. It is 5,500 lines of architecture-
+   Threads run in a security context [8,25,44], which contains      independent code and 5,700 lines of architecture-dependent
+a list of access rights for objects and allows the kernel to de-    CPU driver code. The primary complexity in the system is
+termine the access rights of programs. Using these contexts,        implemented in userspace, as the design of the programming
+Twizzler is able to provide analogues to groups and owners          model greatly simplifies the kernel. Twizzler is open-source;
+in Unix while providing more fine-grained access control            more information can be found at https://twizzler.io.
+if necessary. Unlike past exploration into security contexts,          We also built a prototype of Twizzler by modifying the
+data-centric OSes offer an advantage in simplicity. A security      FreeBSD 11.0 kernel before implementing our standalone ker-
+context abstraction in a Unix-like OS needs to maintain ac-         nel. This was done both to more rapidly verify our design and
+cess rights to a set of fundamentally different things (such as     to provide a prototyping environment for developers to write
+paths, virtual memory locations, and system calls). Instead,        code for Twizzler in a familiar environment. We added Twiz-
+Twizzler’s security contexts specify access rights to an object     zler services to FreeBSD by adding system calls, modifying
+via IDs instead of virtual addresses. This also makes security      the fault-handling logic, and distinguishing Twizzler threads
+contexts persistent, allowing us to use them as the primary         from FreeBSD threads. This is also a testament to the simplic-
+way we assign security roles to threads.                            ity of the kernel in our model, since FreeBSD was relatively
+   Security contexts are implemented via virtualization hard-       easy to modify to support the Twizzler userspace. However,
+ware that maps virtual memory to an intermediate “object            the FreeBSD prototype is limited by its need to coordinate
+space” which specifies the access rights, which is then mapped      with FreeBSD’s Unix services, thus the standalone kernel is
+to physical memory [9]. This reduces the number of page-table       more efficient and simpler, and provides a better environment
+structures and mappings, as threads in the same security con-       for researching kernel design changes in the face of NVM.
+text can share the same page-tables for each object.
+
+                                                                    4     Evaluation
+3.5    Crash Consistency
+                                                                    Our primary goals for evaluating Twizzler were:
+Twizzler provides primitives for building crash-consistent data      1. Show that Twizzler meets the needs of a data-centric OS
+structures. At a low level, it provides a mechanism for writing         in enabling programs to directly access persistent data.
+
+
+
+70    2020 USENIX Annual Technical Conference                                                                  USENIX Association
+  2. Demonstrate that the programming model we defined
+      provides sufficient power to easily and effectively build
+      real applications with NVM in mind.
+  3. Measure the performance of our system to understand                           Index (I0)     Data (D0)     Data (D1)     Index (I1)
+      where we gain and lose performance.                                         Figure 3: Cross-object pointers in twzkv.
+   We approached these goals two ways: porting existing soft-
+                                                                      library (as opposed to a service). Meeting these goals on an
+ware (SQLite) and writing new software for Twizzler. The first
+                                                                      existing system would be difficult without adding significant
+demonstrates both the generality of the programming environ-
+                                                                      complexity, such as reimplementing a lot of Twizzler’s pointer
+ment (legacy software can be easily ported) and the potential
+                                                                      framework or implementing manual, redundant access control.
+performance gains to be had even for legacy software. The sec-
+                                                                         In Twizzler, implementing access control in twzkv involved
+ond demonstrates the true power of Twizzler’s programming
+                                                                      having the index refer to data in multiple data objects, assign-
+model and allows us to explore the consequences of our design
+                                                                      ing those objects different access rights, and allocating from
+choices fully without being constrained by legacy designs.
+                                                                      those objects depending on desired access rights. We were
+   We built three pieces of new software: a hash-table based
+                                                                      able to implement this while preserving the original code due
+key-value store (KVS), a red-black tree data structure, and a
+                                                                      to the transparent nature of Twizzler’s cross-object pointers.
+logging daemon. Each had different characteristics and goals,
+                                                                      Now, when inserting, the application indicates the data object
+and together they demonstrate the flexibility that Twizzler of-
+                                                                      into which to copy the data, as shown in Figure 3.
+fers in allowing simple implementation, nearly-free access
+                                                                         By supporting multiple data objects, twzkv can leverage
+control, and the ability to directly express complex relation-
+                                                                      the OS’s access control, sidestepping complexity. Unrestricted
+ships between objects. Using our KVS and red-black tree code,
+                                                                      data can go in D0 (Figure 3), whereas restricted data can go in
+we ported SQLite (a widely used SQL implementation) to
+                                                                      D1 . Since each object has distinct access control, a user can
+Twizzler along with a YCSB [17,29] driver (a common bench-
+                                                                      set the objects’ access rights, then decide where to insert data
+mark), allowing us to explore Twizzler’s model in a larger,
+                                                                      according to policy. The indexes point to the correct locations
+existing program that would let us study the performance of
+                                                                      regardless of the access restrictions of the data objects, and
+Twizzler in a complex system that stores and processes data.
+                                                                      twzkv still hands out direct pointers, but a user that is restricted
+We present the performance of SQLite and our new software,
+                                                                      from accessing data in D1 will not be able to dereference the
+along with microbenchmarks, in Section 5.
+                                                                      pointer. A further extension is to support secondary indices,
+                                                                      as shown in Figure 3, enabling alternative lookup methods
+4.1    Case Study: Key-Value Store                                    and limiting data discovery with index object access control.
+We implemented a multi-threaded hash-table based key-value            This extension is easy to implement on Twizzler.
+store (KVS), called twzkv, to study cross-object pointers and         Comparison to Unix Implementation. To compare with
+our late-binding of access control. Our KVS supports insert,          existing techniques, we built a similar KVS using only Unix
+lookup, and delete of values by key (both of arbitrary size),         features (called unixkv). It also separates index and data, but
+and hands out direct pointers to persistent data during lookup.       it must manually compute and construct pointers. Supporting
+During insert, it copies data into a data region before indexing      multiple data objects was complex in unixkv, because we had
+the inserted key and value. We built twzkv in multiple phases         to store and process file paths in the index and store references
+to study how our system handles changing requirements.                to paths for pointers, increasing overhead and code complex-
+   We built twzkv in roughly 250 lines of C. Handing out              ity by 36%—a lot for an implementation with relatively few
+direct pointers into data was trivial to implement with cross-        pointers—just to reimplement Twizzler’s support. The extra
+object pointers, requiring only a call to ptr_lea during lookup.      complexity also included code to manually open, map, and
+The initial implementation maintains two objects, one for data        grow files, much of which Twizzler handles internally. De-
+and one for the index. The complexity typically involved when         velopment time was extended by bugs that were not present
+storing both index and data in a single, flat file is not justified   when developing twzkv, due to the manual pointer process-
+in a programming model where we can express inter-object              ing. While twzkv gains transparent access control, unixkv
+relationships directly at near-zero cost in complexity or perfor-     does not due to the lack of on-demand object mapping and
+mance. In our case, a pointer from the index object to the data       late-binding of security. Instead, unixkv needs to know object
+object (such as an entry in the hash table) can be written with       permissions before mapping, a restriction that limits the ability
+a single call to ptr_store. This, combined with the simple            to reuse OS access control, something that twzkv could lever-
+requirements for an in-memory NVM KVS, resulted in a small            age through late-binding on security (§ 3.4)1 . Other frame-
+implementation that was nonetheless a usable KVS.                     works like PMDK that do not integrate access control and
+Extending Requirements. Next, we added functionality to               late-binding into their models have similar limitations.
+protect values with access control. We wanted to keep handing            1 unixkv could trap segmentation faults to do this, but that would be
+
+out direct pointers to data during lookup and to keep twzkv a         application-specific, difficult, and would reimplement Twizzler functionality.
+
+
+
+
+USENIX Association                                                                  2020 USENIX Annual Technical Conference                     71
+4.2    Case Study: Red-Black Tree                                   LMDB [14]. We chose this port because LMDB is imple-
+                                                                    mented with mmap’d files as the primary access method and
+To evaluate the process of writing persistent, “pointer-heavy”      hands out direct pointers to data as one would expect from an
+data structures, we implemented a red-black tree in C using nor-    effectively designed NVM KVS2 . Since LMDB’s SQLight-
+mal pointers (ramrbt) in 100 lines of code, and evolved it for      ning port already replaces the storage backend with calls to
+persistent memory in two ways: manually writing base+offset         LMDB, we ported SQLite to Twizzler by taking our KVS and
+style pointers, as current systems require (unixrbt), and us-       red-black tree code and implementing enough of the LMDB in-
+ing Twizzler (twzrbt). Porting existing data structure code         terface for SQLite to run using Twizzler as a backend. Outside
+to persistent memory will be common during the adoption             of the B-tree source file few changes were needed for SQLite
+of NVM, and much of the complexity therein comes from               to run on Twizzler. We further ported our modified SQLite
+dealing with persisting virtual addresses [47].                     backend to PMDK to compare directly with a commonly used
+   In developing unixrbt, we found 83 locations where we            NVM programming library that supports persistent pointers.
+had to perform pointer arithmetic for converting between per-          We also ported a C++ YCSB driver [29], which required
+sistent and virtual addresses. Consider an expression such as       porting the C++ standard template library (STL). Since we had
+root->left->right = foo. Inserting calls to translate this          already ported a standard C library, the C++ STL was easily
+directly results in L(L(root)->left)->right = C(foo),               ported, demonstrating the ease of porting software to Twizzler.
+where L converts to a virtual address and C converts back,          We have also ported some existing Unix utilities (such as bash
+which is heavily obfuscated and took more development time          and busybox), which largely require only recompiling to run
+than writing ramrbt in the first place due to debugging.            on Twizzler. Of course, to gain all of the benefits of Twizzler,
+   We built twzrbt like unixrbt, annotating pointer stores          programs will be need to be written with NVM in mind (but
+and dereferences. However, unixrbt used an application-             this is true regardless of the target OS).
+specific solution for pointer management; if other applications        Our implementation of the LMDB interface corroborated
+wanted to use the data structures created by unixrbt, they          our experience from the KVS case study: much of the com-
+would have to know the implementation details of the pointer        plexity in storage interfaces and implementations comes from
+system (or share the implementation, thus reimplementing            the separation between storage and memory. This has been
+much of Twizzler’s library). Additionally, due to Twizzler en-      studied before (as we will elucidate in Section 6), but the
+abling improved system-wide support for cross-object pointers,      advent of NVM changes the game significantly by allowing
+these transformations can be made automatic.                        programmers to think directly via in-memory data structures.
+   Unlike twzrbt, unixrbt’s tree is limited to a single persis-     The result is that interfaces like cursors in a KVS become
+tent object; a limitation that prevents the tree from growing       redundant. We implemented to this interface for LMDB, but
+arbitrarily, does not allow it to directly encode references to     the functions were largely wrappers around storing a pointer
+data outside the tree object, and does not gain it the bene-        to a B-tree node and traversing the tree directly without sep-
+fits of cross-object data references that were discussed above      arate loads and copies. The result was an extremely simple
+for twzkv. Adding support for this to unixrbt would require         implementation (500 LoC) that still met the required interface.
+modifying the core data structures to include paths and sig-        Future software for NVM can use Twizzler’s programming
+nificantly altering the code, increasing its length by at least a   model to more effectively write software that eschews the need
+factor of 2, whereas twzrbt gets this functionality for free.       for complexity forced by the two-tier storage hierarchy.
+   Another advantage of twzrbt is reduced support code com-
+pared to unixrbt; unixrbt needed code to manage and grow
+files and mappings, while we implemented twzrbt as simple           4.4    Discussion
+data structure code with Twizzler managing that complexity.         Although these implementations were simple, they represent
+The additional error handling code and pointer validity checks      the applications and data structures we expect in a data-centric
+in unixrbt (handled automatically in Twizzler) increased de-        system. Pointers we can directly use in our programming lan-
+velopment time and implementation complexity.                       guages make computing over persistent data almost transpar-
+                                                                    ent, allowing simple implementations that are nevertheless
+                                                                    easy to evolve as requirements change.
+4.3    Porting SQLite                                                  Not only does twzkv have access control, but it enables con-
+                                                                    current access via cross-object pointers. Applications can load
+We ported SQLite to Twizzler to demonstrate our support
+                                                                    indexes for multiple databases without needing to worry about
+for existing software and to evaluate the performance of a
+                                                                    address space layout and without writing complex pointer
+SQLite backend designed for Twizzler. We used our POSIX
+                                                                    management code that would be required by an implemen-
+support framework, a combination of musl and our library
+                                                                    tation using mmap. We were able to provide access control
+twix, to support much of SQLite’s POSIX use. We took a
+                                                                    without a single line of code in twzkv dedicated to checking
+modified version of SQLite called SQLightning that replaced
+SQLite’s storage backend with a memory-mapped KVS called              2 These are not persistent pointers, however, unlike Twizzler’s.
+
+
+
+
+72    2020 USENIX Annual Technical Conference                                                                        USENIX Association
+or enforcing access rights. Instead, we relied on the system’s
+                                                                        Table 1: Latency of common Twizzler operations.
+access control, something not possible with other frameworks
+                                                                     Pointer Resolution Action Average Latency (ns)
+that do not support late-binding of access rights and do not
+                                                                     Uncached FOT translation          27.9 ± 0.1
+consider security as part of their programming model. Twiz-
+                                                                      Cached FOT translation            3.2 ± 0.1
+zler thus removes the need for applications to manage their
+                                                                       Intra-object translation         0.4 ± 0.1
+own access control, which increases the security of the system
+                                                                      Mapping object overhead          49.4 ± 0.2
+by divesting programmers from the responsibility of getting
+it right. Similar functionality for current systems would tradi-
+tionally require separation of the library and application into a
+                                                                    port of SQLite against Linux (Ubuntu 19.10) instances of
+client-server model, but that additional overhead is unneeded
+                                                                    SQLite, SQLightning, and our port of SQLite to PMDK. Tests
+here and inappropriate on a persistent memory system.
+                                                                    ran on an Intel Xeon Gold 5218 CPU running at 2.30 GHz
+    Although twzrbt and twzkv had different densities of
+                                                                    with 192 GB of DRAM and 128 GB of Intel Persistent DIMMs.
+pointer operations, twzrbt being “pointer-heavy” and twzkv
+                                                                    We compiled all tests against the musl C library instead of
+being “pointer-light”, Twizzler improved the complexity of
+                                                                    glibc because Twizzler uses musl to support Unix programs.
+both over manual implementation and improved flexibility
+                                                                      All Linux tests used the NOVA filesystem [69] (a filesystem
+over existing persistent pointer methods. Using a system-wide
+                                                                    optimized for NVM) on the NVDIMMs, mounted in DAX
+standardized approach to pointer translations not only enables
+                                                                    mode. This enabled direct access to the persistent memory
+better compiler and hardware support, but it also improves
+                                                                    without a page-cache interposing on accesses.
+interoperability; because they share a common framework,
+twzkv could use the red-black tree code and data with ease,
+and even interact with the SQLite database even though they         5.1    Microbenchmarks
+were written separately without that goal in mind. The position-    Table 1 shows common Twizzler functions’ latencies, includ-
+independence afforded by this model enables both compos-            ing pointer translation. The overhead shown for resolving
+ability and concurrency, while also simplifying programming         pointers does not include dereferencing the final result, since
+on persistent data to a natural expression of data structures.      that is required regardless of how a pointer is resolved. The
+Non-Shared-Memory Programs. To push the limits of our               first row shows the latency for resolving pointers to objects the
+model and show that Twizzler does not constrain program-            first time. Twizzler makes a further optimization by caching
+mers into a shared-memory model, we implemented a log-              the results of translations for a given FOT entry. Each succes-
+ging framework (similar to syslogd). The logging daemon,            sive time that FOT entry is used to resolve a pointer, the result
+logboi, can receive log messages either synchronously or            of the original translation is returned immediately, improving
+asynchronously. In both cases, the interface is the same, but       the latency as shown on the “cached” row of Table 1. Note that
+synchronous logging uses shared-memory abstractions while           the low latency of these results is expected; the performance
+asynchronous logging relies on message-passing semantics.           critical case of these functions’ use is repeated calls, and since
+   For synchronous logging the thread switches security con-        these operations are simple, they fit within the processor cache.
+texts, which is made possible by decoupling address spaces             Twizzler translates intra-object pointers by first checking
+and security. The call to the logging framework then updates        if the pointer is internal and, if so, adding the object’s base
+the log and returns. An asynchronous logging event sends            address to it—the same operation required for application-
+data to the logging thread via a stream object (a standard API      specific persistent pointers. The expanded programming
+provided by Twizzler) that logboi and the application share.        model offered by Twizzler makes this overhead minor rel-
+The choice of asynchronous or synchronous is left to the pro-       ative to the high costs for persistent data access on current
+grammer; synchronous can have lower latency and predictable         systems, which have high-latency for equivalent operations.
+behavior while asynchronous offloads processing to logboi.             We compared our pointer translation to Unix functions. Re-
+                                                                    solving an external pointer with an ID corresponds roughly
+                                                                    to a call to open("id"), which has a latency of 1036 ± 15 ns.
+5   Performance                                                     The comparison is not exact, of course; the pointer resolution
+                                                                    also maps objects, and the call to open must handle file system
+Our evaluation’s primary focus is on the benefits of the pro-       semantics. However, the direct-access nature of NVM results
+gramming model, showing new functionality with reduced              in pointer translation achieving the same goal as opening a
+complexity at an acceptable overhead. Nevertheless, there are       file does today. The pointer operations in Twizzler accom-
+many cases where we see significant improvement (such as            plish much of the same functionality as the heavier-weight
+SQLite) because the programming model has less overhead,            I/O system calls on Unix with more utility and less overhead.
+and our pointer design is space efficient and fast to translate.       A more direct comparison is object mapping, which has
+   We measured the performance of our KVS and red-black             low latency compared to mmap (658.7 ± 12.7 ns—a 13.3×
+tree, performed microbenchmarks, and evaluated the Twizzler         speedup) though the two have similar functionality. Since map-
+
+
+
+USENIX Association                                                             2020 USENIX Annual Technical Conference            73
+                    2.0        SQL-Native       SQL-PMDK                                                               SQL-Native          SQL-PMDK
+                               SQL-LMDB         SQL-Twizzler                         4                                 SQL-LMDB            SQL-Twizzler
+ Transaction Rate
+
+
+
+
+                                                                     Query Latency
+   (normalized)
+
+
+
+
+                                                                      (normalized)
+                    1.5
+                                                                                     3
+                    1.0
+                                                                                     2
+                    0.5                                                              1
+
+                    0.0                                                              0
+                          A    B       C        D          E   F                          Sort     Mean      Median Index           Find       Probe
+                                YCSB Workload Specification                                                  Query Operation
+ Figure 4: YCSB throughput, normalized (higher is better).                   Figure 5: Query latency, normalized (lower is better).
+                                                                                   750            unixkv       twzkv
+
+
+
+
+                                                                     Nanoseconds
+ping occurs entirely in userspace, cache pollution is reduced.
+                                                                                   500
+While both mmap and Twizzler’s mapping require page-faults
+to occur before the data is actually mapped, this overhead is                      250
+
+similar in Twizzler and Unix, and so is not shown.                                   0
+                                                                                         Insert            Lookup         Insert (m)         Lookup (m)
+                                                                    Figure 6: Latency of insert and lookup in twzkv and unixkv.
+5.2                 SQLite                                          An “(m)” indicates support for multiple data objects.
+We ran four variants of SQLite, three on Linux and one on
+Twizzler, and compared their performance: “SQL-Native” (un-         The inserted items were 32-bit keys and 32-bit values, chosen
+modified SQLite), “SQL-LMDB” (SQLite using LMDB as                  to reduce the overhead of data copying since we were focusing
+the storage backend), “SQL-PMDK” (SQLite using our red-             on pointer translation overhead. Both were compared under
+black tree on PMDK), and “SQL-Twizzler” (our port of SQLite         two modes, single-data-object and multiple-data-objects. Both
+running on Twizzler). SQL-Native was run in mmap mode so            KVSes translated between virtual and persistent addresses
+that both it and SQL-LMDB used mmap to access data. We              when storing and retrieving data, but for multiple-data-objects,
+ran each on the same hardware and normalized the results.           we allow for storing the data in an arbitrary object.
+   Figure 4 shows the three variants’ throughput under stan-           Figure 6 shows the latency of lookup and insert, demonstrat-
+dard YCSB workloads. The performance improvement of the             ing that not only is the memory-based index and data object
+LMDB and Twizzler variants over SQL-Native is likely due            structure that can hand out direct data pointers sufficiently low
+to handing SQLite direct pointers to data. However, in the          latency to take advantage of NVM, but the additional over-
+Twizzler case we get an additional benefit of operating on data     head of cross-object pointers is minimal. Compared to unixkv,
+structures directly while LMDB has an abstraction cost.             twzkv has minimal overhead in the single-object case, and
+   Figure 5 shows the latency of queries on a one million row       improves lookup performance in the multiple-object case. The
+table. This is common data processing—loading and then              minor overhead in other cases comes with improved flexibility,
+examining data in a variety of ways. We measured the per-           simplicity, and access control support (unixkv does not sup-
+formance of calculating the mean and median, sorting rows,          port access control). Finally, multithreaded access on twzkv
+finding a specific row, building an index, and probing the index.   and unixkv did not improve performance; despite the pointer
+SQL-Twizzler had similar performance to SQL-LMDB and                translations, they ran at memory bandwidth (for NVM).
+SQL-Native despite comparing its extremely simple storage
+backend to optimized B-tree backends (that benefit from scan
+operations). As a more direct comparison, SQL-Twizzler sig-         5.4              Red-Black Tree
+nificantly out-performed SQL-PMDK in most tests. PMDK’s             We measured the latency of insert and lookup of 1 million
+pointer operations are more expensive than Twizzler’s, requir-      32-bit integers on both unixrbt and twzrbt. The insert and
+ing up to two hash table lookups per translation [5]. Addition-     lookup latency of twzrbt was 528 ± 3 ns and 251.8 ± 0.5 ns,
+ally, PMDK’s pointers are 128 bits, while Twizzler does not         while insert and lookup latency of unixrbt was 515 ± 2 ns
+increase pointer size. Increased pointer size results in signifi-   and 213 ± 1 ns. The modest overhead comes with significantly
+cantly worse cache performance, especially in a pointer-heavy       improved flexibility, as unixrbt does not support cross-object
+data structure like a persistent red-black tree.                    trees, and less support code (unixrbt manually implements
+                                                                    mapping and pointer translations). Note that even though there
+5.3                 Key Value Store                                 is lookup overhead in twzrbt, this overhead did not predict the
+                                                                    results of a larger program—the SQL-Twizzler port used this
+We compared twzkv to unixkv by inserting one million dis-           red-black tree, and saw performance benefits over block-based
+tinct key-value pairs, followed by looking up each in-order.        implementations.
+
+
+
+74           2020 USENIX Annual Technical Conference                                                                          USENIX Association
+6    Related Work                                                   Software persistent memory [33], designed to operate within
+                                                                    the constraints of existing systems, built a persistent pointer
+Twizzler’s design is shaped by fundamental OS research [12,         system using explicit serialization without cross-object refer-
+18, 26–28, 41, 42], which, while approaching similar topics         ences, in contrast to Twizzler. Meza [49] suggested hardware
+described in Section 2, often did not consider both design          manage a hybrid persistent-volatile store with fine-grained
+requirements simultaneously, resulting in an incomplete pic-        movement to and from persistent storage. Since persistence in
+ture for NVM. Recent research on building NVM data struc-           Twizzler is to NVM, we need not interpose on movement be-
+tures [15, 16, 22, 37, 45, 65], often focuses on building data      tween storage and memory, instead simply managing memory
+structures that provide failure atomicity and consistency. In       mappings of persistent objects, reducing OS overhead.
+contrast, we explore how NVM affects programming models.               Recently, several projects have considered the impact of
+We draw from recent work on providing OS support for NVM            non-volatile memories on OS structure. Bailey, et al. [4] sug-
+systems [11] and work providing recommendations for NVM             gest a single-level store design. Faraboschi, et al. [30] discuss
+systems [48], integrating object-oriented techniques and sim-       challenges and inevitable system organization arising from
+plified kernel design to provide high-performance OS support        large NVM, and we follow many of their recommendations.
+for applications running on a single-level store [4, 61].           The Moneta project [11] noted that removing the heavyweight
+    Multics was one of the first systems to use segments to par-    OS stack dramatically improved performance. While Moneta
+tition memory and support relocation [6,19]. It used segments       focused on I/O performance, not on rethinking the system
+to support location independence, but still stored them in a file   stack, we leverage their approach to reduce OS overhead as
+system, requiring manual linkage rather than the automated          much as possible, even when the OS must intervene. Lee and
+linkage in Twizzler. Nonetheless, Multics demonstrated that         Won [43] considered the impact of NVM on system initializa-
+the use of segmenting for memory management can be a viable         tion by addressing the issue of system boot as a way to restore
+approach, though its symbolic addresses were slow.                  the system to a known state; we may need to include similar
+    The core of Twizzler’s object space design uses concepts        techniques to address the problem of system corruption.
+from Opal [12], which used a single virtual address space              IBM’s K42 [42] inspired the high level design of Twiz-
+for all processes on a system, making it easier to share data       zler. The object-oriented approach to designing a micro or
+between programs. However, Opal was a single-address space          exokernel used in K42 is an efficient design for implementing
+OS, which is insufficient for NVM [9,10], and it did not address    modular OS components. Like K42, Twizzler lazily maps in
+issues of file storage and name resolution. It also required a      only the resources that an application needs to execute. Sim-
+file system, since there was no way to have a pointer refer to an   ilar techniques for faulting-in objects at run-time have been
+object with changing identity, whereas our approach removes         studied [36]. Communication between objects in Twizzler is,
+the need for an explicit file system. Other single-address space    in part, implemented as protected calls, similar to K42.
+OSes, such as Mungi [34], Nemesis [56], and Sombrero [63],             Emerald [39, 40] and Mesos [35] implemented networked
+show that single address spaces have merit, but, like Opal,         object mobility, which we can also support. Emerald imple-
+did not consider how the use of NVM would alter their de-           mented a kernel, language, and compiler to allow objects mo-
+sign choices; in particular, how the use of fixed addresses         bility using wrapper data structures to track metadata and
+results in a great deal of coordination that is unnecessary in      presenting objects in an object-oriented language, impacting
+our approach. OSes such as HYDRA [68] provide functional-           performance via added indirection for even simple operations.
+ity similar to cross-object pointers; however, in Twizzler, we         The Twizzler object model was shaped by NV-heaps [15],
+extend their use from procedures-referencing-data to a more         which provides memory-safe persistent objects suitable for
+general approach. Furthermore, they required heavy kernel           NVM and describes safety pitfalls in providing direct access
+involvement, an approach incompatible with our design goals.        to NVM. While they have language primitives to enable per-
+    Single-level stores [21, 60, 62] remove the memory versus       sistent structures, Twizzler provides a lower-level and unin-
+persistent storage distinction, using a single model for data at    hibited view of objects like Mnemosyne [65], allowing more
+all levels. While well-known, “little has appeared about them       powerful programs to be built. Languages and libraries may
+in the public literature” [60], even since the EROS paper. Our      impose further restrictions on NVM use, but Twizzler itself
+work is partially inspired by Grasshopper [21], AS/400, and or-     does not. Furthermore, Twizzler’s cross-object pointers al-
+thogonal persistence systems, but while these are designed to       low external data references by code, whereas NV-heap’s and
+provide an illusion of persistent memory, Twizzler is built for     DSPM’s [59] pointers are only internal. Existing work beyond
+real NVM and focuses on providing a truly global object space       Multics on external references shows and recommends hard-
+with global references without cross-machine coordination.          ware support [58,66], but provides a static or per-process view
+Clouds [20] implemented a distributed object store in which         of objects, unlike Twizzler, limiting scalability and flexibility.
+objects contained code, persistent data, and both volatile and         Projects such as PMFS [24] and NOVA [69] provide a file
+persistent heaps. Our approach uses lighter-weight objects,         system for NVM. Twizzler, in contrast, provides direct NVM
+allowing direct access to objects from outside, unlike Clouds.      access atop of a key-value interface of objects. Although Twiz-
+
+
+
+USENIX Association                                                             2020 USENIX Annual Technical Conference            75
+zler does not supply a file system, one can be built atop it.       based around extensive use of hardware virtualization in mod-
+While NOVA and PMFS provide direct access to NVM, NOVA              ern NICs. This design, which is in use in existing kernel-
+adds indirection with copies. Both use mmap (which falls short      bypass strategies, will mesh well with our core OS design of
+as discussed above) and, unlike Twizzler, require significant       reducing kernel interposition. At a higher level, we are con-
+kernel interaction when using persistent memory.                    sidering how distributed applications change in our model.
+   Our kernel that “gets out of the way” is influenced by sys-      For example, an increase in data mobility facilitated by our
+tems such as Exokernel [28] and SPIN [7], both of which drew        location-independent data references and identities means that
+on Mach [2]. In Exokernel, much of the OS is implemented in         we can manifest both data and code where they are needed
+userspace, with the kernel providing only resource protection.      without complex marshalling, turning distributed computa-
+Our approach is similar in some respects, but goes further in       tion into a rendezvous problem. We plan to build distributed
+providing a single unified namespace for all objects, making it     applications atop Twizzler to demonstrate this approach.
+simpler to develop programs that can leverage NVM to make              Of course, for compatibility we will provide a traditional
+their state persistent. In contrast, SPIN used type-safe lan-       sockets-based networking stack. However, we can use existing
+guages to provide protection and extensibility; our approach        userspace libraries that, e.g., implement TCP in userspace.
+cannot rely upon language-provided type safety since we want        Because we implemented our POSIX compatibility library
+to provide a general purpose platform.                              in userspace, applications can gain many benefits afforded
+                                                                    by kernel-bypass networking frameworks while still using
+                                                                    traditional socket interfaces.
+7    Future Work
+Compiler and Hardware Support. Clean-slate NVM ab-                  8   Conclusion
+straction reopens the possibility of coevolving OSes, compil-
+ers and languages, and hardware. Standardized OS support            Operating systems must evolve to support future trends in
+for cross-object pointers enables compiler support more ef-         memory hierarchy organization. Failing to evolve will rele-
+fectively than application-specific solutions [47] or simple        gate new technology to outdated access models, preventing it
+libraries [58]. Twizzler’s pointer translation functions are sim-   from reaching full potential, and making it difficult for OSes
+ple enough to be automatically emitted by a compiler. Simi-         to evolve in the future. Twizzler shows a way forward: an OS
+larly, designing an OS for cross-object pointers allows us to       designed around NVM that provides new, efficient, and easy to
+better state our needs to hardware, which can alleviate perfor-     use semantics for direct access to memory. Cross-object point-
+mance overheads for pointer translation [66, 67].                   ers in Twizzler allow programmers to easily build composable
+                                                                    and extensible applications with low overhead by removing the
+Security. Although we discussed the Twizzler security
+                                                                    kernel from persistent data access paths, thereby improving the
+model briefly, there is still much to do. The current model
+                                                                    flexibility and performance. Our simpler programming model
+provides access control, a basic ability to define and assign
+                                                                    improved performance despite the (small) pointer translation
+roles based on security contexts, and simple sub-process fault
+                                                                    overhead. Even a memory hierarchy with large RAM but with-
+isolation through the ability to switch security contexts. We
+                                                                    out persistent memory benefits from our design by enabling
+are exploring a flexible security model that allows program-
+                                                                    programs to operate on large, shared, in-memory data with
+mers to easily trade-off between security, transparency, and
+                                                                    ease. Our programming model is easy to work with compared
+performance using capability-based verification. For example,
+                                                                    to existing systems, and we were able to both quickly proto-
+we are implementing a call-gating mechanism that will allow
+                                                                    type real applications with advanced access control features
+us to restrict control-flow transfers between application com-
+                                                                    and port existing software (SQLite). Twizzler will give us a
+ponents, improving the security against malicious components
+                                                                    system from which we can build a full NVM-based OS around
+and reducing the possibility of memory-corrupting bugs.
+                                                                    a data-centric design and explore the future of applications,
+Networking and Distributed Twizzler. One of the key                 OSes, and processor design on a new memory hierarchy.
+principles of Twizzler is to focus the programming model
+                                                                    Availability Twizzler is available at twizzler.io.
+on data and away from ephemeral actors such as processes
+and nodes. This is enabled by our identity-based references
+that decouple location from references, and by ensuring all the     Acknowledgements
+context necessary to understand these relationships is stored
+with the data. Because our data relationships are independent       This work was supported in part by the National Science Foun-
+of the context of a particular machine, applications can more       dation (grants IIP-1266400, IIP-1841545), a grant from Intel
+easily share data. This easy sharing, combined with a large         Corporation, and the industrial members of the UCSC Center
+ID address space, motivates a truly global object ID space.         for Research in Storage Systems. We thank our shepherd, Yu
+   We are building a networking stack and support for a dis-        Hua, the anonymous reviewers, and the members of the Stor-
+tributed object space into Twizzler. Our networking stack is        age Systems Research Center for their support and feedback.
+
+
+
+76   2020 USENIX Annual Technical Conference                                                                 USENIX Association
+References                                                       [11] Adrian M. Caulfield, Arup De, Joel Coburn, Todor
+                                                                      Mollov, Rajesh Gupta, and Steven Swanson. Moneta:
+ [1] The musl C library. https://musl.libc.org/.                      A high-performance storage array architecture for next-
+                                                                      generation, non-volatile memories. In Proceedings of
+ [2] Mike Accetta, Robert Baron, William Bolosky, David
+                                                                      The 43rd Annual IEEE/ACM International Symposium
+     Golub, Richard Rashid, Avadis Tevanian, and Michael
+                                                                      on Microarchitecture (MICRO ’10), pages 385–395,
+     Young. Mach: A new kernel foundation for UNIX devel-
+                                                                      2010.
+     opment. In Proceedings of the Summer 1986 USENIX
+     Technical Conference, pages 93–112, Atlanta, GA, 1986.      [12] Jeffrey S. Chase, Henry M. Levy, Michael J. Feeley, and
+     USENIX.                                                          Edward D. Lazowska. Sharing and protection in a single-
+ [3] Sasha Ames, Nikhil Bobb, Kevin M. Greenan, Owen S.               address-space operating system. ACM Transactions on
+     Hofmann, Mark W. Storer, Carlos Maltzahn, Ethan L.               Computer Systems, 12(4):271–307, November 1994.
+     Miller, and Scott A. Brandt. LiFS: An attribute-rich file   [13] Guoyang Chen, Lei Zhang, Richa Budhiraja, Xipeng
+     system for storage class memories. In Proceedings of the         Shen, and Youfeng Wu. Efficient support of position
+     23rd IEEE / 14th NASA Goddard Conference on Mass                 independence on non-volatile memory. In Proceedings
+     Storage Systems and Technologies, College Park, MD,              of the 50th Annual IEEE/ACM International Symposium
+     May 2006. IEEE.                                                  on Microarchitecture (MICRO ’17), pages 191–203, New
+ [4] Katelin Bailey, Luis Ceze, Steven D. Gribble, and                York, NY, USA, 2017. ACM.
+     Henry M. Levy. Operating system implications of fast,
+                                                                 [14] Howard Chu and Symas. Lightning memory-mapped
+     cheap, non-volatile memory. In Proceedings of the 13th
+                                                                      database (part of the OpenLDAP project). https://
+     Workshop on Hot Topics in Operating Systems (HotOS
+                                                                      symas.com/lmdb/.
+    ’11), May 2011.
+                                                                 [15] Joel Coburn, Adrian M. Caulfield, Ameen Akel, Laura M.
+ [5] Piotr Balcer. An introduction to pmemobj (part 1) -
+                                                                      Grupp, Rajesh K. Gupta, Ranjit Jhala, and Steven Swan-
+     accessing the persistent memory. https://pmem.io/
+                                                                      son. NV-Heaps: Making persistent objects fast and safe
+     2015/06/13/accessing-pmem.html, 2015.
+                                                                      with next-generation, non-volatile memories. In Pro-
+ [6] A. Bensoussan, C. T. Clingen, and R. C. Daley. The Mul-          ceedings of the 16th International Conference on Archi-
+     tics virtual memory: Concepts and design. In Proceed-            tectural Support for Programming Languages and Op-
+     ings of the 2nd ACM Symposium on Operating Systems               erating Systems (ASPLOS ’11), pages 105–118, March
+     Principles (SOSP ’69), 1969.                                     2011.
+
+ [7] Brian N. Bershad, Stefan Savage, Przemyslaw Pardyak,        [16] Jeremy Condit, Edmund B. Nightingale, Christopher
+     Emin Gün Sirer, Marc E. Fiuczynski, David Becker,                Frost, Engin Ipek, Benjamin Lee, Doug Burger, and Der-
+     Craig Chambers, and Susan Eggers. Extensibility, safety,         rick Coetzee. Better I/O through byte-addressable, per-
+     and performance in the SPIN operating system. In Pro-            sistent memory. In Proceedings of the 22nd ACM Sym-
+     ceedings of the 15th ACM Symposium on Operating Sys-             posium on Operating Systems Principles (SOSP ’09),
+     tems Principles (SOSP ’95), December 1995.                       pages 133–146, Big Sky, MT, October 2009.
+ [8] Andrea Bittau, Petr Marchenko, Mark Handley, and Brad       [17] Brian F. Cooper, Adam Silberstein, Erwin Tam, Raghu
+     Karp. Wedge: Splitting applications into reduced-                Ramakrishnan, and Russell Sears. Benchmarking cloud
+     privilege compartments. In Proceedings of the 5th                serving systems with YCSB. In Proceedings of the
+     USENIX Symposium on Networked Systems Design and                 1st ACM Symposium on Cloud Computing (SoCC ’10),
+     Implementation (NSDI ’08), pages 309–322, Berkeley,              pages 143–154, New York, NY, USA, 2010. ACM.
+     CA, USA, 2008. USENIX Association.
+                                                                 [18] Fernando J. Corbató and Victor A. Vyssotsky. Introduc-
+ [9] Daniel Bittman, Peter Alvaro, Darrell D. E. Long, and            tion and overview of the Multics system. In Proceedings
+     Ethan L. Miller. A tale of two abstractions: The case            of the November 30 — December 1, 1965, fall joint com-
+     for object space. In Proceedings of HotStorage ’19, July         puter conference, part I, pages 185–196. ACM, 1965.
+     2019.
+                                                                 [19] Robert C. Daley and Jack B. Dennis. Virtual memory,
+[10] Daniel Bittman, Peter Alvaro, and Ethan L. Miller. A             processes, and sharing in MULTICS. Communications
+     persistent problem: Managing pointers in NVM. In Pro-            of the ACM, 11(5):306–312, May 1968.
+     ceedings of the 10th Workshop on Programming Lan-
+     guages and Operating Systems (PLOS ’19), pages 30–37,       [20] Partha Dasgupta, Richard J. LeBlanc, Jr., Mustaque
+     October 2019.                                                    Ahamad, and Umakishore Ramachandran. The Clouds
+
+
+
+USENIX Association                                                         2020 USENIX Annual Technical Conference        77
+     distributed operating system. IEEE Computer, Novem-        [30] Paolo Faraboschi, Kimberly Keeton, Tim Marsland, and
+     ber 1991.                                                       Dejan Milojicic. Beyond processor-centric operating
+                                                                     systems. In 15th Workshop on Hot Topics in Operating
+[21] Alan Dearle, Rex di Bona, James Farrow, Frans                   Systems (HotOS ’15), Kartause Ittingen, Switzerland,
+     Henskens, Anders Lindström, John Rosenberg, and Fran-           May 2015. USENIX Association.
+     cis Vaughan. Grasshopper: An orthogonally persistent
+     operating system. Computer Systems, 7(3):289–312,          [31] David K. Gifford, Pierre Jouvelot, Mark A. Sheldon,
+     June 1994.                                                      and James W. O’Toole, Jr. Semantic file systems. In
+                                                                     Proceedings of the 13th ACM Symposium on Operat-
+[22] Biplob Debnath, Sudipta Sengupta, and Jin Li. Flash-            ing Systems Principles (SOSP ’91), pages 16–25. ACM,
+     Store: High throughput persistent key-value store. In           October 1991.
+     Proceedings of the 36th Conference on Very Large
+     Databases (VLDB ’10), September 2010.                      [32] Burra Gopal and Udi Manber. Integrating content-based
+                                                                     access mechanisms with hierarchical file systems. In
+[23] Xiangyu Dong, Cong Xu, Norm Jouppi, and Yuan Xie.               Proceedings of the 3rd Symposium on Operating Systems
+     Emerging Memory Technologies: Design, Architecture,             Design and Implementation (OSDI ’99), pages 265–278,
+     and Applications, chapter 2, pages 15–50. Springer,             February 1999.
+     2014.
+                                                                [33] Jorge Guerra, Leonardo Mármol, Daniel Campello, Car-
+[24] Subramanya R Dulloor, Sanjay Kumar, Anil Keshava-               los Crespo, Raju Rangaswami, and Jinpeng Wei. Soft-
+     murthy, Philip Lantz, Dheeraj Reddy, Rajesh Sankaran,           ware persistent memory. In Proceedings of the 2012
+     and Jeff Jackson. System software for persistent mem-           USENIX Annual Technical Conference, 2012.
+     ory. In Proceedings of the 9th European Conference on
+     Computer Systems (EuroSys ’14), April 2014.                [34] Gernot Heiser, Kevin Elphinstone, Stephen Russell, and
+                                                                     Jerry Vochteloo. Mungi: a distributed single address-
+[25] Izzat El Hajj, Alexander Merritt, Gerd Zellweger, Dejan         space operating system. Technical Report 9314, School
+     Milojicic, Reto Achermann, Paolo Faraboschi, Wen-mei            of Computer Science and Engineering, University of
+     Hwu, Timothy Roscoe, and Karsten Schwan. SpaceJMP:              New South Wales, November 1993.
+     Programming with multiple virtual address spaces. In
+     Proceedings of the Twenty-First International Confer-      [35] Benjamin Hindman, Andy Konwinski, Matei Zaharia,
+     ence on Architectural Support for Programming Lan-              Ali Ghodsi, Anthony D. Joseph, Randy Katz, Scott
+     guages and Operating Systems (ASPLOS ’16), pages                Shenker, and Ion Stoica. Mesos: A platform for fine-
+     353–368, New York, NY, USA, 2016. ACM.                          grained resource sharing in the data center. In Pro-
+                                                                     ceedings of the 8th USENIX Conference on Networked
+[26] Dawson R Engler, Sandeep K Gupta, and M Frans                   Systems Design and Implementation (NSDI ’11), pages
+     Kaashoek. AVM: Application-level virtual memory.                295–308, Berkeley, CA, USA, 2011. USENIX.
+     In Fifth Workshop on Hot Topics in Operating Systems
+     (HotOS ’95), pages 72–77. IEEE, 1995.                      [36] Antony L. Hosking and J. Eliot B. Moss. Object fault
+                                                                     handling for persistent programming languages: A per-
+[27] Dawson R Engler and M Frans Kaashoek. Exterminate               formance evaluation. In Proceedings of the Eighth An-
+     all operating system abstractions. In Fifth Workshop            nual Conference on Object-oriented Programming Sys-
+     on Hot Topics in Operating Systems (HotOS ’95), pages           tems, Languages, and Applications (OOPSLA ’93), pages
+     78–83. IEEE, 1995.                                              288–303, New York, NY, USA, 1993. ACM.
+
+[28] Dawson R. Engler, M. Frans Kaashoek, and James             [37] Qingda Hu, Jinglei Ren, Anirudh Badam, and Thomas
+     O’Toole, Jr. Exokernel: An operating system architecture        Moscibrod. Log-structured non-volatile main memory.
+     for application-level resource management. In Proceed-          In Proceedings of the 2017 USENIX Annual Technical
+     ings of the 15th ACM Symposium on Operating Systems             Conference, pages 703–717, Santa Clara, CA, June 2017.
+     Principles (SOSP ’95), pages 251–266, December 1995.
+                                                                [38] Joseph Izraelevitz, Jian Yang, Lu Zhang, Juno Kim, Xiao
+[29] Hewlett Packard Enterprise.         YCSB-C.                     Liu, Amirsaman Memaripour, Yun Joon Soh, Zixuan
+     https://github.com/HewlettPackard/                              Wang, Yi Xu, Subramanya R. Dulloor, Jishen Zhao, and
+     meadowlark/tree/master/extra/YCSB-C                             Steven Swanson. Basic performance measurements of
+     https://github.com/basicthinker/YCSB-C,                         the Intel Optane DC persistent memory module. arXiv,
+     2018.                                                           abs/1903.05714, 2019.
+
+
+
+78   2020 USENIX Annual Technical Conference                                                           USENIX Association
+[39] Eric Jul, Henry Levy, Norman Hutchinson, and Andrew        [48] Pankaj Mehra and Samuel Fineberg. Fast and flexible
+     Black. Fine-grained mobility in the Emerald system.             persistence: The magic potion for fault-tolerance, scala-
+     ACM Transactions on Computer Systems, 6(1):109–133,             bility and performance in online data stores. In Proceed-
+     February 1988.                                                  ings of the 18th International Parallel and Distributed
+                                                                     Processing Symposium (IPDPS ’04), January 2004.
+[40] Eric Jul and Bjarne Steensgaard. Implementation of
+     distributed objects in Emerald. In Proceedings of Inter-   [49] Justin Meza, Yixin Luo, Samira Khan, Jishen Zhao,
+     national Workshop on Object Orientation in Operating            Yuan Xie, and Onur Mutlu. A case for efficient hard-
+     Systems, pages 130–132. IEEE, 1991.                             ware/software cooperative management of storage and
+                                                                     memory. In 5th Workshop on Energy-Efficient Design
+[41] M. Frans Kaashoek, Dawson R. Engler, Gregory R.
+                                                                     (WEED ’13), June 2013.
+     Ganger, Hector M. Briceño, Russell Hunt, David Maz-
+     ières, Thomas Pinckney, Robert Grimm, John Jannotti,       [50] Dushyanth Narayanan and Orion Hodson. Whole-system
+     and Kenneth Mackenzie. Application performance and              persistence. In Proceedings of the 17th International
+     flexibility on exokernel systems. In Proceedings of the         Conference on Architectural Support for Programming
+     Sixteenth ACM Symposium on Operating Systems Prin-              Languages and Operating Systems (ASPLOS ’12), pages
+     ciples (SOSP ’97), pages 52–65, New York, NY, USA,              401–500, March 2012.
+     1997. ACM.
+                                                                [51] Yuanjiang Ni, Jishen Zhao, Daniel Bittman, and Ethan
+[42] Orran Krieger, Marc Auslander, Bryan Rosenburg,
+                                                                     Miller. Reducing NVM writes with optimized shadow
+     Robert W. Wisniewski, Jimi Xenidis, Dilma Da Silva,
+                                                                     paging. In Proceedings of the 10th Workshop on Hot
+     Michal Ostrowski, Jonathan Appavoo, Maria Butrico,
+                                                                     Topics in Storage and File Systems (HotStorage ’18), July
+     Mark Mergen, Amos Waterland, and Volkmar Uhlig.
+                                                                     2018.
+     K42: Building a complete operating system. In Pro-
+     ceedings of the 1st ACM SIGOPS/EuroSys European            [52] Yuanjiang Ni, Jishen Zhao, Heiner Litz, Daniel Bittman,
+     Conference on Computer Systems 2006 (EuroSys ’06),              and Ethan L. Miller. SSP: Eliminating redundant writes
+     pages 133–145, New York, NY, USA, 2006. ACM.                    in failure-atomic NVRAMs via shadow sub-paging. In
+[43] Dokeun Lee and Youjip Won. Bootless boot: Reducing              Proceedings of the 52nd IEEE/ACM International Sym-
+     device boot latency with byte addressable NVRAM. In             posium on Microarchitecture, October 2019.
+     2013 International Conference on High Performance
+                                                                [53] Matheus Ogleari, Ethan L. Miller, and Jishen Zhao. Steal
+     Computing, November 2013.
+                                                                     but no force: Efficient hardware-driven undo+redo log-
+[44] James Litton, Anjo Vahldiek-Oberwagner, Eslam El-               ging for persistent memory systems. In Proceedings of
+     nikety, Deepak Garg, Bobby Bhattacharjee, and Peter             the 24th International Symposium on High-Performance
+     Druschel. Light-weight contexts: An OS abstraction              Computer Architecture (HPCA 2018), February 2018.
+     for safety and performance. In Proceedings of the 12th
+     USENIX Symposium on Operating Systems Design and           [54] Yoann Padioleau and Olivier Ridoux. A logic file system.
+     Implementation (OSDI ’16), pages 49–64, GA, 2016.               In Proceedings of the 2003 USENIX Annual Technical
+     USENIX Association.                                             Conference, pages 99–112, San Antonio, TX, June 2003.
+
+[45] Youyou Lu, Jiwu Shu, and Long Sun. Blurred persis-         [55] Aleatha Parker-Wood, Darrell D. E. Long, Ethan L.
+     tence: Efficient transactions in persistent memory. ACM         Miller, Philippe Rigaux, and Andy Isaacson. A file by
+     Transactions on Storage, 12(1), January 2016.                   any other name: Managing file names with metadata. In
+                                                                     Proceedings of the 7th Annual International Systems and
+[46] Youyou Lu, Jiwu Shu, Long Sun, and Onur Mutlu. Loose-           Storage Conference (SYSTOR ’14), June 2014.
+     ordering consistency for persistent memory. In Pro-
+     ceedings of the 32nd IEEE International Conference on      [56] Timothy Roscoe. Linkage in the Nemesis single ad-
+     Computer Design (ICCD ’14), pages 216–223. IEEE,                dress space operating system. ACM SIGOPS Operating
+     2014.                                                           Systems Review, 28(4):48–55, October 1994.
+
+[47] Virendra J. Marathe, Margo Seltzer, Steve Byan, and Tim    [57] Andy Rudoff. Persistent memory programming. In
+     Harris. Persistent memcached: Bringing legacy code to           ;Login: The Usenix Magazine, volume 42, pages 34–40.
+     byte-addressable persistent memory. In Proceedings of           USENIX Association, 2015.
+     the 9th USENIX Workshop on Hot Topics in Storage and
+     File Systems (HotStorage ’17), Santa Clara, CA, 2017.      [58] Andy Rudoff et al. Persistent memory programming
+     USENIX Association.                                             library. http://pmem.io/nvml/, 2017.
+
+
+
+USENIX Association                                                         2020 USENIX Annual Technical Conference         79
+[59] Yizhou Shan, Shin-Yeh Tsai, and Yiying Zhang. Dis-          [65] Haris Volos, Andres Jaan Tack, and Michael M. Swift.
+     tributed shared persistent memory. In Proceedings of             Mnemosyne: Lightweight persistent memory. In Pro-
+     the 2017 Symposium on Cloud Computing (SoCC ’17),                ceedings of the 16th International Conference on Ar-
+     page 323–337, New York, NY, USA, 2017. Association               chitectural Support for Programming Languages and
+     for Computing Machinery.                                         Operating Systems (ASPLOS ’11), March 2011.
+
+[60] Jonathan S. Shapiro and Jonathan Adams. Design evo-
+     lution of the EROS single-level store. In Proceedings of    [66] Tiancong Wang, Sakthikumaran Sambasivam, Yan Soli-
+     the 2002 USENIX Annual Technical Conference, pages               hin, and James Tuck. Hardware supported persistent
+     59–72, Monterey, CA, June 2002. USENIX.                          object address translation. In Proceedings of the 50th An-
+                                                                      nual IEEE/ACM International Symposium on Microar-
+[61] Jonathan S. Shapiro, Jonathan M. Smith, and David J.             chitecture (MICRO ’17), pages 800–812, New York, NY,
+     Farber. EROS: A fast capability system. In Proceedings           USA, 2017. ACM.
+     of the Seventeenth ACM Symposium on Operating Sys-
+     tems Principles (SOSP ’99), pages 170–185, New York,
+     NY, USA, 1999. ACM.                                         [67] Robert NM Watson, Jonathan Woodruff, Peter G Neu-
+                                                                      mann, Simon W Moore, Jonathan Anderson, David Chis-
+[62] Eugene Shekita and Michael Zwilling. Cricket: A                  nall, Nirav Dave, Brooks Davis, Khilan Gudka, Ben Lau-
+     mapped, persistent object store. Technical Report 956,           rie, et al. Cheri: A hybrid capability-system architecture
+     University of Wisconsin, August 1990.                            for scalable software compartmentalization. In 2015
+                                                                      IEEE Symposium on Security and Privacy, pages 20–37.
+[63] Alan Skousen and Donald Miller. Using a single ad-               IEEE, 2015.
+     dress space operating system for distributed computing      [68] William Wulf, Ellis Cohen, William Corwin, Anita
+     and high performance. In Proceedings of the 18th IEEE            Jones, Roy Levin, C. Pierson, and Fred Pollack. HY-
+     International Performance, Computing and Communi-                DRA: The kernel of a multiprocessor operating system.
+     cations Conference (IPCCC ’99), pages 8–14, February             Communications of the ACM, 17(6):337–345, June 1974.
+     1999.
+[64] Hung-Wei Tseng, Qianchen Zhao, Yuxiao Zhou, Mark            [69] Jian Xu and Steven Swanson. Nova: A log-structured file
+     Gahagan, and Steven Swanson. Morpheus: Creating ap-              system for hybrid volatile/non-volatile main memories.
+     plication objects efficiently for heterogenous computing.        In Proceedings of the 14th Usenix Conference on File
+     In 2016 ACM/IEEE 43rd Annual Intenational Sympo-                 and Storage Technologies (FAST ’16), pages 323–338,
+     sium on Computer Architecture, 2016.                             Berkeley, CA, USA, 2016. USENIX Association.
+
+
+
+
+80   2020 USENIX Annual Technical Conference                                                              USENIX Association
+

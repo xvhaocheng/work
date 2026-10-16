@@ -1,0 +1,1460 @@
+                             vIOMMU: Efficient IOMMU Emulation
+
+          Nadav Amit                          Muli Ben-Yehuda                   Dan Tsafrir         Assaf Schuster
+    Technion & IBM Research               Technion & IBM Research                Technion             Technion
+
+
+                        Abstract                               modified guest to be pinned to the host physical memory.
+   Direct device assignment, where a guest virtual ma-         This is so because I/O devices typically access the mem-
+chine directly interacts with an I/O device without host       ory by triggering DMA (direct memory access) trans-
+intervention, is appealing, because it allows an unmodi-       actions, and those can potentially target any location of
+fied (non-hypervisor-aware) guest to achieve near-native       the physical memory; importantly, unlike regular mem-
+performance. But device assignment for unmodified              ory accesses, computer systems are technically unable to
+guests suffers from two serious deficiencies: (1) it re-       gracefully tolerate DMA page misses, reacting to them
+quires pinning all of the guest’s pages, thereby disal-        by either ignoring the problem, by restarting the offend-
+lowing memory overcommitment, and (2) it exposes the           ing domain, or by panicking. The hypervisor cannot tell
+guest’s memory to buggy device drivers.                        which pages are designated by the unmodified guest for
+   We solve these problems by designing, implementing,         DMA transactions, and so, to avoid such unwarranted be-
+and exposing an emulated IOMMU (vIOMMU) to the                 havior, it must pin all the guest’s pages to physical mem-
+unmodified guest. We employ two novel optimizations            ory. This necessity negates a primary reason for using
+to make vIOMMU perform well: (1) waiting a few mil-            virtualization—server consolidation—because it hinders
+liseconds before tearing down an IOMMU mapping in              the ability of the hypervisor to perform memory over-
+the hope it will be immediately reused (“optimistic tear-      commitment, whereas memory is the main limiting fac-
+down”), and (2) running the vIOMMU on a sidecore, and          tor for server consolidation [16, 41, 47].
+thereby enabling for the first time the use of a sidecore by      The second deficiency of direct device assignment is
+unmodified guests. Both optimizations are highly effec-        that the unmodified guest is unable to utilize the IOMMU
+tive in isolation. The former allows bare-metal to achieve     (I/O memory management unit) so as to protect itself
+100% of a 10Gbps line rate. The combination of the two         against bugs in the corresponding drivers. It is well-
+allows an unmodified guest to do the same.                     known that device drivers constitute the dominant source
+                                                               of OS (operating system) bugs [5, 17, 25, 38, 43]. No-
+                                                               tably, the devices’ ability to perform DMA to arbitrary
+1     Introduction
+                                                               physical memory locations is a main reason why such
+I/O activity is a dominant factor in the performance of        bugs are detrimental. IOMMUs were introduced by all
+virtualized environments [29, 37], motivating direct de-       major chip manufacturers to solve exactly this problem.
+vice assignment whereby a guest virtual machine (VM)           They allow the OS to restrict DMA transactions to spe-
+sees a real device and interacts with it directly. As di-      cific memory locations by having devices work with IO-
+rect access does away with the software intermediary that      VAs (I/O virtual addresses) instead of physical addresses,
+other I/O virtualization approaches require, it can pro-       such that every IOVA is validated by the IOMMU hard-
+vide much better performance than the alternative I/O          ware circuitry upon each DMA transaction and is then
+virtualization approaches. This increased performance          redirected to a physical address according to the IOMMU
+comes at a cost of complicating virtualization use-cases       mappings. The hypervisor cannot allow guests to pro-
+where the hypervisor interposes on guest I/O, such as          gram the IOMMU directly (otherwise every guest would
+live migration [20, 50]. Nonetheless, the importance of        be able to access the entire physical memory), and so
+increased I/O performance cannot be overstated, as it          all the related work that provided ways for guests to en-
+makes virtualization applicable to common I/O-intensive        joy the IOMMU functionality [12, 13, 25, 35, 44, 49] in-
+workloads that would otherwise experience unacceptable         volved paravirtualization. Namely, the guest’s OS was
+performance degradation [26, 28, 33, 45, 48].                  modified to explicitly inform the hypervisor regarding
+                                                               the DMA mappings it requires. Clearly, such an ap-
+                                                               proach is inapplicable to unmodified (fully virtualized)
+1.1    Motivation                                              guests.
+Despite its advantages, direct device assignment suffers          A third deficiency of direct device assignment is that,
+from at least three serious deficiencies that limit its ap-    in general, it prevents the unmodified guest from taking
+plicability. First, it requires the entire memory of the un-   advantage of the IOMMU remapping capabilities, which
+are useful in contexts other than just defending against           is dramatic, transforming the aforesaid 43% throughput
+faulty device drivers. One such context is legacy devices          to 91% and arguably justifying the risk. Alas, the corre-
+that do not support memory addresses wider than 32bit,             sponding unmodified guest does not experience such an
+an issue that can be easily resolved by programming the            improvement, as its throughput remains more or less the
+IOMMU to map the relevant 32bit-addresses to higher                same when the protection is relaxed.
+memory locations [18]. Another such context is “nested                To improve the performance of the vIOMMU, our sec-
+virtualization”, which allows one hypervisor to run other          ond contribution is investigating a set of optimizations
+hypervisors as guests [11] and, hence, mandates granting           that exercise the protection/performance tradeoff in var-
+a nested hypervisor the ability to program the IOMMU               ious ways (see Section 3 for details). We find that the
+to protect its guests from one another (when those utilize         “optimistic teardown” optimization is the most effective.
+directly-assigned devices).                                           While the default mode of Linux removes stale IOTLB
+                                                                   entries en masse at 10ms intervals, it nevertheless tears
+                                                                   down individual invalidated IOVA translations with no
+1.2    Contributions and Preview of Results
+                                                                   delay, immediately removing them from the IOMMU
+IOMMU Emulation The root cause of all of the above                 page table. The rationale of optimistic teardown rests
+limitations is the fact that current hypervisors do not pro-       on the following observation. If a stale translation exists
+vide unmodified guests with an emulated IOMMU. Our                 for a short while in the IOTLB anyway, we might as well
+initial contribution is therefore to implement and evalu-          keep it alive (for the same period of time) within the OS
+ate such an emulation, for the first time. We do so within         mapping data structure, optimistically expecting that it
+KVM on Intel x86, following the proposal made by In-               will get reused (remapped) during that short time inter-
+tel [1]. We denote the emulation layer “vIOMMU”. And               val. As significant temporal reuse of IOVA mappings has
+we note in passing that we are aware of a similar effort           been reported [3, 44], one can be hopeful that the newly
+that is currently being done for AMD processors [31].              proposed optimization would work. Importantly, for
+   By emulating the IOMMU, our patched hypervi-                    each reused translation, optimistic teardown would avoid
+sor intercepts, monitors, and acts upon DMA remap-                 the overhead of (1) tearing the translation down from the
+ping operations. Knowing which of the unmodified                   IOMMU page table, (2) invalidating it in the IOTLB,
+guest’s memory pages serve as DMA targets allows it                (3) immediately reconstructing it, and (4) reinserting it
+to: (1) pin/unpin the corresponding host physical pages,           back to the IOTLB; all of which are costly operations, as
+and only these pages, thereby enabling memory over-                each IOTLB modification involves updating uncacheable
+commitment; (2) program the physical IOMMU to en-                  memory and teardown/reconstruction involves nontrivial
+able device access to the said physical pages, and only            logic and several memory accesses.
+to these pages, thereby enabling the guest to protect its             Optimistic teardown is remarkably successful, push-
+memory image against faulty drivers; and (3) redirect              ing the throughput of bare metal from 91% to 100%
+DMA transactions through the physical IOMMU accord-                (and reducing its CPU consumption from 100% to 60%).
+ing the unmodified guest’s wishes, thereby retrieving the          The improvement is more pronounced for an unmodified
+indirection level needed to support legacy 32bit devices,          guest with vIOMMU: from 11% throughput to 82%.
+certain user-mode DMA usage models, and nested virtu-                 Sidecore Emulation To further improve the per-
+alization. (See Section 2 for details.)                            formance of the unmodified guest, we implement the
+   Utilizing the IOMMU without relaxing the protection             vIOMMU functionality on an auxiliary sidecore. Tradi-
+it offers is costly, even for a bare metal (unvirtualized)         tional “samecore” emulation of hardware devices (where
+OS. Our experiments using Netperf [19] show that bare              hypervisor invocations occur on the guest’s core) has
+metal Linux 2.6.35 achieves only 43% of the line-rate              been extensively studied in the literature [6, 10, 21, 37].
+of a 10Gbps NIC when the IOMMU is used with strict                 Likewise, offloading of computation to a sidecore for
+protection; the corresponding unmodified guest achieves            speeding up I/O in a paravirtualized system has been ex-
+less than one fourth of that with the vIOMMU.                      plored as well [15, 23, 27]. But in this paper, for the
+   Optimistic Teardown The default mode of Linux,                  first time, we present “sidecore emulation”, which com-
+however, relaxes IOMMU protection. It does so by                   bines the best of both approaches. Specifically, sidecore
+batching the invalidation of stale IOTLB entries and by            emulation maintains the exact same hardware interface
+collectively purging them from the IOTLB every 10ms                between the guest and the sidecore as exists in a non-
+(IOTLB is the I/O translation look-aside buffer within             virtualized setting between a bare metal OS and the real
+the IOMMU). The protection is relaxed, because, dur-               hardware device. Consequently, sidecore emulation is
+ing this short interval, a faulty device might success-            able to offload the computation while requiring no guest
+fully perform a DMA transaction through a stale entry.             modifications. (See details in Section 4.)
+Nonetheless, for bare metal, the resulting improvement                By running the vIOMMU on a sidecore, we triple the
+
+
+                                                               2
+         setting    strict     relaxed      optimistic                  Guest                      Emulation                                  System
+                              (default)     teardown                   Domain                       Domain                                    Domain
+      samecore       10%          11%            82%                                             (Same-Core)
+       sidecore      30%          49%           100%                                                                                           Memory
+     bare metal      43%          91%           100%                                                    (2) Update
+                                                                                                         Mappings
+                                                                                                                                                Emul.
+                                                                       IOMMU                                                                    PTE
+Table 1: Summary of preview of results (percent of line-rate           Mapping
+throughput on 10GbE).                                                   Layer
+                                                                                       (3
+                                                                                    In ) IO                                                     Emul.
+                                                                                      va T
+                                                                                         lid LB                                                IOMMU
+                                                                                            at                          d                in
+                                                                                               i on                                  inta
+                                                                                                                      ea         a              Regs.
+                                                                                                           (5
+                                                                                                              )   R         (4) M
+throughput of the strict unmodified guest, quintuple its                                                                    (6) Update
+                                                                                                       IOMMU                                   Physical
+throughput if its protection is relaxed, and achieve 100%                                             Emulation
+                                                                                                                             Mappings
+                                                                                                                                                PTE
+of the line-rate if employing optimistic teardown. The
+results mentioned so far are summarized in Table 1.                              (1)                                                             I/O
+
+
+
+
+                                                                                                                        (7 alid
+                                                                            Map / Unmap                                                         Buffer
+
+
+
+
+                                                                                                                          Inv
+                                                                                                                           )I a
+   Roadmap We describe: our “samecore” vIOMMU                                I/O Buffer                                                                          (10)
+
+
+
+
+                                                                                                                             OT tio
+                                                                                                                                                               Translate
+
+
+
+
+                                                                                                                               LB n
+design (§2); the set of optimizations we explore and                                                                                                 (11)
+the associated performance/protection tradeoffs (§3); our                                                                                          Physical
+                                                                                                                                                   Access
+“sidecore” vIOMMU design (§4); how to reason about
+risk and protection (§5); evaluation of the performance of                                                                                     IOMMU
+
+our proposals using micro and macro benchmarks (§6);                                                                                                (9) IOVA
+the related work (§7); and our conclusions (§8).                                                                                                     Access
+
+                                                                       I/O Device
+                                                                                                                                              I/O Device
+                                                                          Driver                  (8) Transaction
+                                                                                                      to IOVA
+2   Samecore IOMMU Emulation
+I/O device emulation for virtualized guests is usually im-              Figure 1: IOMMU emulation architecture (samecore).
+plemented by trapping guest accesses to device registers
+and emulating the appropriate behavior [2, 10, 37]. Cor-
+respondingly, in this section, we present the rudiments            vice driver (2); the layer performs an explicit mapping
+of emulating an IOMMU. We choose to emulate Intel’s                invalidation of these PTEs (3), thereby triggering a write
+VT-d IOMMU [18], as it is commonly available and as                access to a certain IOMMU register, which traps to the
+most x86 OSes/hypervisors have drivers for it. Con-                hypervisor; the hypervisor then updates the status of the
+veniently, Intel’s VT-d specification [18] proposes how            emulated IOMMU registers (4), reads the IOVA-to-GPA
+to emulate an IOMMU. We largely follow their sugges-               mapping from the updated emulated IOMMU PTEs (5),
+tions.                                                             pins the relevant page to the host physical memory (not
+   The emulated guest BIOS uses its ACPI (Advanced                 shown), and generates physical IOMMU PTEs to per-
+Configuration and Power Interface) tables to report to             form IOVA-to-HPA (host physical address) mapping (6);
+the guest that the (virtual) hardware includes Intel’s             when the physical hardware requires it, the hypervisor
+IOMMU. Recognizing that the hardware supports an                   also performs physical IOTLB invalidation (7); the guest
+IOMMU, the guest will ensure that any DMA buffer in                is then resumed, and the I/O device driver initiates the
+use will first be mapped in the IOMMU for DMA [12].                DMA transaction, delivering the IOVA as the destina-
+The emulated IOMMU registers reside in memory pages                tion address to the device (8); the device performs mem-
+that the hypervisor marks as “not present”, causing any            ory access to the IOVA (9), which is appropriately redi-
+guest access to them to trap to the hypervisor. The hy-            rected by the physical IOMMU (10-11); the guest OS
+pervisor monitors the emulated registers and configures            can then unmap the IOVA, triggering a flow similar to
+the platform’s physical IOMMU accordingly. The hyper-              the mapping flow except that the hypervisor unmaps the
+visor further monitors changes in related data structures          I/O buffer and unpins its page-frames.
+such as the IOMMU page tables in guest memory.
+   Figure 1 illustrates the flow of a single DMA trans-
+action in an emulated environment: a guest I/O device              3      Optimizing IOMMU Mapping Strategies
+calls the IOMMU mapping layer when it wishes to map
+an I/O buffer (1); the layer accordingly allocates an              Operating systems can employ multiple mapping strate-
+IOVA region and, within the emulated IOMMU, maps                   gies when establishing and tearing down IOMMU map-
+the corresponding page table entries (PTEs) to point to            pings. Different mapping strategies tradeoff performance
+the GPA (guest physical address) given by the I/O de-              vs. memory consumption vs. protection [13, 44, 49].
+
+
+                                                               3
+Taking Linux as an example, the default mapping strat-            temporal locality in I/O buffers allocation in order to
+egy of the Intel VT-d IOMMU driver is to defer and                perform well, in addition to spatial locality of the I/O
+batch IOTLB invalidations, thereby improving perfor-              buffers. Many applications experience such temporal lo-
+mance at the expense of reduced protection from er-               cality [44].
+rant DMAs. Batching IOTLB invalidations helps perfor-
+mance because IOTLB invalidations are expensive. Un-
+like an MMU TLB, which resides on a CPU core, an
+                                                                  3.2    Asynchronous Invalidations
+IOMMU and its IOTLB usually reside away from the                  IOTLB invalidation is a lengthy process that on bare
+CPU on the PCIe bus.                                              metal takes over 40% of the overall unmapping process.
+   An alternative mapping strategy is the strict mapping          Asynchronous invalidation is an invalidation scheme tar-
+strategy. In the strict strategy Linux’s IOMMU mapping            geted at alleviating the cost of the lengthy IOTLB inval-
+layer executes IOTLB invalidations as soon as device              idation process by a minor relaxation of protection. The
+drivers unmap their I/O buffers and waits for the inval-          default IOTLB invalidation scheme is synchronous: the
+idations to complete before continuing.                           OS writes an invalidation request to the IOMMU’s inval-
+   In this section we investigate the different tradeoffs         idation register or (when the hardware supports it) to an
+possible on bare metal and in a virtualized system em-            invalidation queue [18] and blocks the execution thread
+ploying an emulated IOMMU, where both the guest and               until the IOMMU completes the invalidation. In asyn-
+the host may employ different mapping strategies. We              chronous invalidation, the OS does not wait for the in-
+discuss different IOMMU mapping performance opti-                 validation to complete before continuing. Doing so on
+mizations and their effect on system safety, starting with        bare metal can save the few hundred cycles it takes the
+the least dangerous strategy and ending with the best             IOMMU to write the invalidation completion message
+performing—but also most dangerous—strategy.                      back to memory after the invalidation is done.
+                                                                     Asynchronous invalidation enables multiple in-flight
+                                                                  invalidations when the hardware supports an invalidation
+3.1    Approximate Shared Mappings
+                                                                  queue. However, to maintain correctness, asynchronous
+Establishing a new mapping in the IOMMU translation               invalidation must not permit an IOVA range which is be-
+table and later tearing it down are inherently costly op-         ing invalidated to be mapped again to a different phys-
+erations. Shared mappings can alleviate some of the               ical address until the invalidation process is completed.
+costs [44]. We can reuse a mapping when another valid             Unfortunately there is no practical way to ensure with
+mapping which points to the same physical page frame              Linux that the page allocator will not reuse the physical
+already exists. Using the same mapping for two map-               memory backing those IOVAs while the invalidation is
+ping requests saves the time required for the setup and           outstanding [49].
+eventual teardown of a new mapping.                                  On bare metal asynchronous invalidation relaxes pro-
+   Willmann, Rixner and Cox propose a precise lookup              tection only slightly, since the IOMMU hardware per-
+method for an existing mapping. Their approach relies             forms the invalidation process in silicon, taking only
+on an inverted data structure translating from physical           hundreds of cycles to complete. In our experiments with
+address to IOVA for all mapped pages [44]. This ap-               asynchronous invalidation, the invalidation queue never
+proach is problematic with modern IOMMUs that can                 held more than two pending invalidations at the same
+map all of physical memory and employ a separate I/O              time.
+virtual address space for each protection context (usu-
+ally for each I/O device). Maintaining a direct-map data          3.3    Deferred Invalidation
+structure to enable precise lookups is impractical for such
+IOMMUs as it would require too much memory. We ex-                Deferring IOTLB invalidations, as currently imple-
+pect that using a smaller but more complex data struc-            mented by Linux, makes it possible to aggregate IOTLB
+ture, such as a red-black tree, will incur prohibitively          invalidations together and possibly coalesce multiple in-
+high overhead [32].                                               validation requests so that they will be invalidated in a
+   To avoid the overhead associated with complex data-            single request, if the hardware supports it. Instead of the
+structures, we propose approximate shared mappings.               OS invalidating each translation entry as it is torn down,
+Instead of maintaining a precise inverted data struc-             the OS collects multiple invalidations in a queue, which
+ture, we perform reverse lookups using heuristics which           it then flushes periodically. The current Linux implemen-
+may fail to find a translation from physical address to           tation coalesces up to 250 invalidations for periods of no
+IOVA, even though there exists a mapping of that physi-           longer than 10ms.
+cal address. Our implementation of approximate shared                 Holding back the invalidations makes the deferred
+mappings used a software LRU cache, which requires                method less secure than the asynchronous method, where
+
+                                                              4
+the “window of vulnerability” for an errant DMA is only         in use are also kept in a deferred-unmappings first-in
+hundreds of cycles. But deferred invalidation reduces the       first-out (FIFO) queue with a fixed size limit. The queue
+number of software/hardware interactions, since a whole         size and the residency constraints are checked whenever
+batch of invalidations is executed at once. This savings        the queue is accessed, and also periodically. Invalida-
+is more pronounced when the hardware is emulated by             tions are performed when mappings are removed from
+software, in which case deferred invalidation can save          the queue.
+multiple, expensive guest/host interactions.
+                                                                4   Sidecore IOMMU Emulation
+3.4   Optimistic Teardown
+                                                                Samecore emulation uses the classical approach of trap-
+Reusing IOVA translations is key to IOMMU perfor-               ping device register access and switching to the hypervi-
+mance [3, 13, 44, 49]. Reusing a translation avoids             sor for handling. We now present an alternative, novel
+the overhead of (1) tearing a translation down from             approach for device emulation which uses a second core
+the IOMMU page table, (2) invalidating it from the              to handle device register accesses, thus avoiding expen-
+IOTLB, (3) immediately reconstructing it in the page            sive VM-exits. We call this sidecore emulation. While
+table, and (4) reinserting it back to the IOTLB; all of         the discussion below focuses on Intel’s VT-d, our ap-
+which are costly operations, as each IOTLB modifica-            proach is generic and can be applied to most other IOM-
+tion involves updating uncacheable memory and tear-             MUs and I/O devices.
+down/reconstruction involves nontrivial logic and several          Samecore hardware emulation suffers from an inher-
+memory accesses.                                                ent limitation. Each read or write access to the hard-
+   Even when approximate shared mapping is used, the            ware registers requires a VM-transition to the hypervi-
+opportunities to reuse IOVA translations are limited. The       sor, which then emulates the hardware behavior. VM-
+default Linux deferred invalidation scheme removes stale        transitions are known to be expensive, partly due to cache
+IOTLB entries en masse at 10ms intervals, but never-            pollution [2, 11].
+theless tears down individual unmapped IOVA transla-               Offloading computation to a sidecore for speeding up
+tions with no delay, immediately removing them from             I/O for modified (paravirtualized) guests has been ex-
+the IOMMU page tables.                                          plored by Kumar et al. [23], Gavrilovska et al. [15], and
+   The rationale of optimistic teardown rests on the fol-       Liu and Abali [27]. Sidecore emulation offloads de-
+lowing observation. If a stale translation exists for a         vice emulation to a sidecore. In contrast with previous
+short while in the IOTLB anyway, we might as well               paravirtualized sidecore approaches, which require guest
+keep it alive (for the same period of time) within the          modifications, sidecore emulation maintains the same
+IOMMU page table, optimistically expecting that it will         hardware interface between the guest and the sidecore as
+get reused (remapped) during that short time interval. As       between a bare-metal OS and the real hardware device,
+significant temporal reuse of IOVA mappings has been            and thus requires no guest modifications. As we show
+reported [3, 44, 49], one can be hopeful that the newly         in Section 6, sidecore emulation on its own can achieve
+proposed optimization would work.                               69% of bare metal performance—for unmodified guests
+   We thus developed an optimistic teardown mapping             and without any protection relaxation.
+strategy, which keeps mappings around even after an un-            In general, hardware emulation by a sidecore follows
+mapping request for them has been received. Unmap-              the same principles as samecore emulation. The guest
+ping operations of I/O buffers are deferred and executed        programs the device, the hypervisor detects that the guest
+at a later, configurable time. If an additional mapping         has accessed the device, decodes the semantics of the ac-
+request of the same physical memory page arrives to the         cess, and emulates the hardware behavior. But sidecore
+IOMMU mapping layer while a mapping already exists              emulation differs from samecore emulation in two funda-
+for that page, the old mapping is reused. If an old map-        mental aspects. First, there are no expensive traps from
+ping is not used within the pre-defined time limit, it is       the guest to the hypervisor when the guest accesses de-
+unmapped completely and the corresponding IOMMU                 vice registers. Instead, the device register memory areas
+PTEs are invalidated, limiting the overall window of vul-       are shared between the guest and the hypervisor, and the
+nerability for an errant DMA to the pre-defined time            hypervisor polls the emulated control registers for up-
+limit. We determined experimentally that on our system          dates. Second, the guest code and the hypervisor code
+a modest limit of ten milliseconds is enough to achieve a       run on different cores, leading to reduced cache pollution
+92% hit rate.                                                   and improved utilization of each core’s exclusive caches.
+   We keep track of all cached mappings in the same soft-          Efficient hardware emulation by a sidecore is depen-
+ware LRU cache, regardless of how many times each               dent on the interface between the I/O device and the guest
+mapping is shared. Mappings which are not currently             OS, since the sidecore polls memory regions instead of
+
+                                                            5
+receiving notifications on discrete register access events.       5     Reasoning About Risk and Protection
+In general, efficient sidecore emulation requires that the
+physical hardware have the following (commonly found)
+properties.                                                       5.1    Risk and Protection Types
+   Synchronous Register Write Protocol Sidecore
+emulation relies on a synchronous protocol between the            The IOMMU was designed to protect those pages which
+device driver and the device for a single register’s up-          do not hold I/O buffers from errant DMA transactions.
+dates, in the sense that the device driver expects some           To achieve complete protection, the IOMMU mapping
+indication from the hardware before writing to a register         layer must ensure a page is accessible for DMA transac-
+a second time. Such a protocol ensures that the sidecore          tions only if it holds an I/O buffer that may be used for
+has time to process the first write before a second write         DMA transaction and only while a valid DMA transac-
+to the same register overwrites the first write’s contents.       tion may target this page [49].
+   A Single Register Holds Only Read-Only or Write                   However, IOMMU mapping layer optimizations may
+Fields Registers which hold both read-only and write              relax protection by completing the synchronous unmap
+fields are challenging for a sidecore to handle, since the        function call by the I/O device driver (logical unmap-
+sidecore has no efficient way of ensuring the guest device        ping) before tearing down the mapping in the physi-
+driver would not change read-only fields.                         cal IOMMU page-tables and completing the physical
+   Loose Response Time Requirements Sidecore em-                  IOTLB invalidation (physical unmapping).
+ulation is likely to be slower than physical hardware.
+                                                                     Deferring physical unmapping this way, as done by the
+If the device has strict specifications of the “wall time”
+                                                                  deferred invalidation scheme, the asynchronous invalida-
+device operations take (e.g., “this operation completes
+                                                                  tion scheme, and the optimistic teardown scheme, could
+within 3ns”) or the device driver makes other strong tim-
+                                                                  potentially compromise protection for any page which
+ing assumptions which hold for real hardware but not for
+                                                                  has been logically unmapped but not yet physically un-
+emulated hardware, then the device driver might assume
+                                                                  mapped. We differentiate, however, between inter-guest
+that the hardware is malfunctioning when operations take
+                                                                  protection, protection between different guest OS in-
+longer than expected. This property must hold for device
+                                                                  stances, and intra-guest protection, protection within a
+emulation in general.
+                                                                  particular guest OS [44].
+   Explicit Update of Memory-Resident Data Struc-
+                                                                     vIOMMU maintains full inter-guest protection—full
+tures Since the sidecore cannot poll large memory
+                                                                  isolation between VMs—in all configurations. It main-
+regions efficiently, update to its memory-resident data
+                                                                  tains inter-guest protection by keeping pages pinned in
+structures should be explicit, by requiring the device-
+                                                                  physical memory until they have been physically un-
+driver to perform a write-access to the device control reg-
+                                                                  mapped. vIOMMU pins a page in physical memory be-
+isters indicating exactly which data structure it updated.
+                                                                  fore mapping it in the IOMMU page table, and only un-
+                                                                  pins it once the IOMMU mapping of that page is torn
+   An additional, optional property that can boost
+                                                                  down and the IOTLB invalidation is complete. Conse-
+sidecore emulation performance is a limited number of
+                                                                  quently, any page that is used for a DMA transaction by
+control registers. Since the sidecore needs to sample the
+                                                                  a guest OS will not be re-allocated to any other guest OS
+control registers of the emulated hardware, a large num-
+                                                                  as long as it may be the target of a valid DMA transaction
+ber of registers would result in long latency between the
+                                                                  by the first guest OS.
+time the guest sets the control register and the time the
+sidecore detects the change. In addition, polling a large            Full intra-guest protection—protecting a guest OS
+number of registers may result in cache thrashing.                from itself—is arguably less important than inter-guest
+   Intel’s IOMMU has all of the properties required               protection in a virtualized setting. Intra-guest protection
+for efficient sidecore emulation. This is in contrast to          may be relaxed by both the host’s and the guest’s map-
+AMD’s IOMMU, which cannot require the OS’s map-                   ping layer optimizations. Maintaining complete intra-
+ping layer to explicitly update the IOMMU registers               guest protection with optimal performance in an oper-
+upon every change to the memory-resident page tables.             ating system such as Linux without modifying all drivers
+We note, however, that the emulated IOMMU and the                 remains an open challenge [49], since Linux drivers as-
+platform’s physical IOMMU are orthogonal, and Intel’s             sume that any page that has been logically unmapped is
+IOMMU can be emulated when only AMD’s IOMMU is                    also physically unmapped. Consequently, such pages are
+physically present or even when no physical IOMMU is              often re-used by the driver or the I/O stack for other pur-
+present and bounce buffers are used instead [12].                 poses as soon as they have been logically unmapped.
+
+
+                                                              6
+5.2    Quantifying Risk                                            invalidation queue. In our experimental setup the queue
+                                                                   was sized to hold at most 128 outstanding entries.
+We do not assess the risk posed by arbitrary malicious
+adversaries, since such adversaries might sometimes be                Millisecond Risk Millisecond risk applies when ei-
+able exploit even very short vulnerability windows [40].           ther the guest or the host uses the deferred invalidation
+In our discussion of protection and risk we focus instead          or optimistic teardown strategies. Regardless of whether
+on the “window of vulnerability”, when an errant DMA               the guest or the host defers invalidations or keeps around
+may sneak in and read or write an exposed I/O buffer               cached mappings, the window of vulnerability is likely to
+through a stale mapping. A stale mapping is a mapping              be in the order of milliseconds. Software configures the
+which exists after a page has been logically unmapped              stale mappings bounds by setting a quota on the number
+but before it has been physically unmapped. A stale                of cached mappings and a residency time limit on each
+mapping occurs when the device driver asks to unmap                mapping.
+an IOVA translation and receives an affirmative response,
+                                                                      Overall Risk When a guest OS uses an emulated
+despite the actual teardown of the physical IOMMU PTE
+                                                                   IOMMU, the combination of the guest’s and host’s map-
+or physical IOTLB invalidation having been deferred.
+                                                                   ping strategies determines the overall protection level.
+   We quantify risk along two axes: the duration of vul-
+                                                                   The hypervisor cannot override the guest mapping strat-
+nerability during which an I/O buffer is open for reading
+                                                                   egy to provide greater protection, since the hypervisor is
+or writing through a stale mapping, and the stale map-
+                                                                   unaware of any cached mappings or deferred invalida-
+ping bound, which indicates the maximum number of
+                                                                   tions in the guest until the guest unmaps them and exe-
+stale mappings at any given point in time.
+                                                                   cutes the invalidations. Therefore, the hypervisor can ei-
+   We classify the mapping strategies mentioned above              ther keep the guest’s level of protection by using a strict
+into four classes according to their duration: no risk,            invalidation scheme, or relax it for better performance.
+nanosecond risk, microsecond risk, and millisecond risk.
+   No Risk The only times when there is no risk are
+when an OS on bare metal uses the strict mapping strat-            6     Performance Evaluation
+egy, or when both guest and host use the strict mapping
+strategy. Since buffers are unmapped and their mappings            6.1    Methodology
+invalidated without any delay, there can be no stale map-
+                                                                   Experimental Setup We implement the samecore and
+pings regardless of whether we run on bare metal, use
+                                                                   sidecore emulation of Intel IOMMU, as well as the map-
+samecore emulation, or sidecore emulation. The use of
+                                                                   ping layer optimizations presented above. We use the
+approximate shared mappings does not affect the risk.
+                                                                   KVM hypervisor [21] and Ubuntu 9.10 running Linux
+   Nanosecond Risk The time that elapses between the               2.6.35 for both host and guest. Our experimental setup is
+moment when the host posts an invalidation request to              comprised of an IBM System x3550 M2, which is a dual-
+the invalidation queue and the invalid translation is ac-          socket, four-cores per socket server equipped with Intel
+tually flushed from the physical IOTLB can be mea-                 Xeon X5570 CPUs running at 2.93GHz. The Chipset is
+sured in nanoseconds. Since the flush happens in sili-             Intel 5520, which supports VT-d. The system includes
+con, this duration is a physical property of the platform          16GB of memory and an Emulex OneConnect 10Gbps
+IOMMU, and the risk only applies to bare metal with                NIC. We use another identical remote server (connected
+asynchronous invalidation. With samecore or sidecore               directly by 10Gbps optical fiber) as a workload genera-
+emulation, guest/host communication costs overshadow               tor and a target for I/O transactions. In order to obtain
+this duration. We determined experimentally that on our            consistent results and to avoid reporting artifacts caused
+system the stale mapping bound for nanosecond risk is at           by nondeterministic events, all power optimizations are
+most two mappings, and the duration of vulnerability is            turned off, namely, sleep states (C-states) and DVFS (dy-
+128 cycles per entry on average.                                   namic voltage and frequency scaling).
+                                                                      To have comparable setups, guest-mode configura-
+   Microsecond Risk Microsecond risk only applies to
+                                                                   tions execute with a single VCPU (virtual CPU), and
+sidecore emulation and comes into play when the guest
+                                                                   native-mode configurations likewise execute with a sin-
+does not wait for the host to process an invalidation (i.e.,
+                                                                   gle core enabled. In guest-mode setups, the VCPU and
+when the guest uses asynchronous invalidation). Here,
+                                                                   the sidecore are pinned to two different cores on the same
+inter-core communication costs determine the window of
+                                                                   die, and 2GB of memory is allocated to the guest.
+vulnerability, since the host must realize that the guest
+posted an invalidation before it can handle it. In general,          Microbenchmarks We use two well-known Net-
+the stale mapping bound for microsecond risk is the num-           perf [19] instances in order to assess the overheads in-
+ber of outstanding invalidation requests in the emulated           duced by vIOMMU in terms of throughput, CPU cycles,
+
+
+                                                               7
+               guest/native    guest/native     guest/native     host            native         guest             duration
+  config.      invalidation    reuse            Linux            invalidation    max stale#     max stale#        magnitude
+  strict       strict          none             unpatched        strict          none           none              0
+  shared       strict          shared           patched          strict          none           none              0
+  async        async           shared           patched          async           32             128+32            µsec
+  deferred     deferred        none             unpatched        deferred        32             250+32            ms
+  opt256       async           shared+tear      patched          deferred        256+32         256+128+32        ms
+  opt4096      async           shared+tear      patched          deferred        4096+32        4096+128+32       ms
+  off          n/a             n/a              unpatched        deferred        all            all               ∞
+
+
+Table 2: Evaluated configurations. The host column is meaningless when running the native configuration. The maximal number
+of stale mappings for async and deferred host is the size of the IOTLB, namely, 32.
+
+
+and latency. The first instance—Netperf TCP stream—                 serviced by a host, and a “native” setting with only the
+attempts to maximize the amount of data sent over a sin-            bare metal OS running. The latter scenario provides a
+gle TCP connection, simulating an I/O-intensive work-               baseline. It is addressed because our optimizations apply
+load. The second instance–Netperf UDP RR (request-                  to virtualized settings and bare metal settings alike. We
+response)—models a latency-sensitive workload by re-                next describe the configurations one by one, from safest
+peatedly sending a single byte and waiting for a matching           to riskiest.
+single byte response. Latency is calculated as the inverse             The strict configuration involves no optimizations in
+of the number of transactions per second.                           guest, host, or native modes, and hence it involves no
+                                                                    risk; it is the least performant configuration. While strict
+   Macrobenchmarks We use two macrobenchmarks
+                                                                    is not the default mode of Linux, it requires no OS mod-
+to asses the performance of vIOMMU on real ap-
+                                                                    ification, but rather setting an already-existing config-
+plications.    The first is MySQL SysBench OLTP
+                                                                    urable parameter. Hence it is marked as “unpatched”.
+(version 0.4.12; executed with MySQL database ver-
+                                                                       The shared configuration is nearly identical to strict
+sion 5.1.37), which was created for benchmarking the
+                                                                    except that it adds the approximate shared mapping op-
+MySQL database server by generating OLTP inspired
+                                                                    timization (Section 3.1); it is still risk-free, merely at-
+workloads. To simulate high-performance storage, the
+                                                                    tempting to avoid allocating more than one IOVA for a
+database is placed on a remote machine’s RAM-drive,
+                                                                    given physical location and preferring instead to reuse.
+which is accessed through NFS and mounted in syn-
+                                                                    Notice that for the virtualized setting this optimization is
+chronous mode. The database contains two million
+                                                                    meaningless for the host, as the hypervisor cannot over-
+records, which collectively require about 1GB. We dis-
+                                                                    ride the IOVA chosen by the guest. The OS is patched be-
+able data caching on the server by using the InnoDB en-
+                                                                    cause Linux does not natively support shared mappings.
+gine and the O DIRECT flush method.
+                                                                       The async configuration is similar to the shared con-
+   The second macrobenchmark we use is Apache
+                                                                    figuration, yet in addition it utilizes the asynchronous
+Bench, evaluating the performance of the Apache web
+                                                                    IOTLB invalidation optimization (Section 3.2). The lat-
+server. Apache Bench is a workload generator that is dis-
+                                                                    ter immediately invalidates unmapped translations, but
+tributed with Apache to help assess the number of con-
+                                                                    does not wait for the IOTLB invalidation to complete, re-
+current requests per second that the server is capable of
+                                                                    ducing invalidation cost by the time it takes the IOMMU
+handling. The benchmark is executed with 25 concurrent
+                                                                    to write its invalidation completion message back to
+requests. The logging is disabled to avoid the overhead
+                                                                    memory. Realistically, the risk exists only for the
+of writing to disk.
+                                                                    sidecore setting, which is dominated by inter-core com-
+   Configurations There are many possible combina-                  munication cost that is approximated by not more than
+tions of emulation approaches, which are comprised of               a handful of µsecs. The theoretical maximal number of
+the guest and host mapping layers and their reuse and               stale entries is the size of the IOTLB (32) in the host and
+invalidation strategies. Each such combination is as-               native settings; in this guest’s case, this is supplemented
+sociated with different protection and performance lev-             by the default size of the invalidation queue (128).
+els. We cannot evaluate all combinations. We instead                   The deferred configuration is the default configura-
+choose to present several meaningful ones in the hope               tion of Linux, whereby IOTLB invalidations are aggre-
+that they provide reasonable coverage. The configura-               gated and processed together every 10ms (Section 3.3).
+tions are listed in Table 2. Each line in the table per-            In the guest’s case, stale entries might reside in the
+tains to two scenarios: a virtualized setting, with a guest         IOTLB (32) or in the deferred entries queue (up to 250 by
+
+
+                                                                8
+                         20                                                                        is mandated to first invalidate every new mapping it cre-
+                                        logic
+                         18      invalidation                                                      ates (which allows the hypervisor to track this activity).
+CPU cycles (thousands)
+
+
+                         16                                                                        Most evident in the figure is the fact that the sidecore
+                         14                                                                        dramatically cuts down the price of invalidation when
+                         12                                                                        compared to samecore, which is a direct result of elim-
+                         10
+                                                                                                   inating the associated VM exits and associated world
+                         8
+                                                                                                   switches. The other interesting observation is that the
+                         6
+                                                                                                   rest of the (un)map logic can be accomplished faster by
+                         4
+                         2
+                                                                                                   the vIOMMU. This better-than-native performance is a
+                         0
+                                                                                                   product of the vIOMMU registers being cacheable, as
+                                                                                                   opposed to those of the physical IOMMU.
+                                     na
+
+                                              sa
+
+                                                     si
+
+
+
+
+                                                                  na
+
+                                                                           sa
+
+                                                                                  si
+                                                        de
+
+
+
+
+                                                                                     de
+                                                m
+
+
+
+
+                                                                            m
+                                       tiv
+
+
+
+
+                                                                   tiv
+                                                          co
+
+
+
+
+                                                                                       co
+                                                   ec
+
+
+
+
+                                                                                ec
+                                          e
+
+
+
+
+                                                                       e
+                                                             re
+
+
+
+
+                                                                                          re
+                                                    or
+
+
+
+
+                                                                                 or
+                                                      e
+
+
+
+
+                                                                                   e
+                                       map                        unmap
+                                                                                                   6.3    Benchmark Results
+Figure 2: Average breakdown of (un)mapping a single page                                           Figure 3(a) depicts the throughput of Netperf/TCP for
+using the strict invalidation scheme.
+                                                                                                   each configuration, from safest to riskiest, along the X
+                                                                                                   axis. The values displayed are normalized by the max-
+                                                                                                   imal throughput achieved by bare metal and off, which
+default). While the entries are in the guest’s queue, the
+                                                                                                   in this case is 100% of the attainable bandwidth of the
+host does not know about them and hence cannot inval-
+                                                                                                   10Gbps NIC. Figure 3(b) presents the very same data,
+idate them. As both guest and host use a 10ms interval,
+                                                                                                   but the normalization is done against native on a per-
+the per-entry maximal vulnerability window is 20ms for
+                                                                                                   configuration basis; accordingly, the native curve coin-
+the guest and half that much for the host and bare metal.
+                                                                                                   cides with the “1” grid line. Figure 3(c) presents the CPU
+   The opt configuration (short for “optimistic”) deploys
+                                                                                                   consumed by Netperf/TCP while doing the correspond-
+all optimizations save deferred invalidation, which is
+                                                                                                   ing work; observe that the sidecore is associated with two
+substituted by optimistic teardown (Section 3.4). The
+                                                                                                   curves in this figure, the lower one corresponds to the
+maximal number of stale entries we keep alive (for up
+                                                                                                   useful work done by the sidecore (aside from polling)
+to 10ms) is 256, similarly to the 250 of deferred; in a
+                                                                                                   and the upper one pertains to the main core.
+more aggressive configuration we increase that number
+                                                                                                      The safe (shared) or nearly safe (async) configura-
+to 4096.
+                                                                                                   tions provide no benefit for the samecore setting, but
+   Finally, the off configuration does not employ an
+                                                                                                   they can slightly improve the performance of sidecore
+IOMMU in the native setting, and does not employ a
+                                                                                                   and native by 2–5 percentage points each. Deferred de-
+vIOMMU in the virtualized setting. (In the latter case the
+                                                                                                   livers a much more pronounced improvement, especially
+physical IOMMU is nevertheless utilized by the host, be-
+                                                                                                   in the native case, which manages to attain 91% of the
+cause the device is still assigned to the guest.) In this con-
+                                                                                                   line-rate. By consulting Figure 3(c), we can see that na-
+figuration, neither the guest nor the native bare metal en-
+                                                                                                   tive/deferred is not attaining 100%, because the CPU is
+joy any form of protection, which is why we marked “all”
+                                                                                                   a bottleneck. Utilizing opt solves this problem, not only
+the mappings as unsafe for their entire lifetime (“∞”).
+                                                                                                   for the native setting, but also for the sidecore; opt allows
+                                                                                                   both to fully exploit the NIC. The sidecore/CPU curve
+6.2                           Overhead of (Un)mapping                                              (bottom of Figure 3(c)) implies that the work required
+                                                                                                   form the IOMMU software layer is little when optimal
+The IOMMU layer provides exactly two primitives: map                                               teardown is employed, allowing the sidecore to catch up
+and unmap. Before we delve into the benchmark results,                                             with native performance and the samecore to reduce to
+we first profile the overhead induced by the vIOMMU                                                gap to 0.82x the optimum.
+with respect to these two operations. Figure 2 presents                                               Similarly to the above, Figure 4 depicts the latency
+the cycles breakdown of each operation to IOTLB “inval-                                            as measured with Netperf/UDP-RR and the associated
+idation”, which is the direct interactions of the OS with                                          CPU consumption. The results largely agree with what
+the IOMMU, and to “logic”, which encapsulates the rest                                             we have seen for Netperf/TCP. Deferring the IOTLB in-
+of the code that builds and destroys the mappings within                                           validation allows the native setting to achieve optimal
+the I/O page tables.                                                                               latency, but only slightly improves the virtualized set-
+   Notice that guest invalidation overhead is induced                                              tings. However, when optimistic teardown is employed,
+even when performing the map operation; this happens                                               the latency of both sidecore and samecore drops signif-
+because the hypervisor turns on the “caching mode bit”,                                            icantly (by about 60 percentage point in the latter case),
+which, by the IOMMU specification, means that the OS                                               and they manage attain the optimum. Importantly, the
+
+
+                                                                                               9
+      normalized throughput            t/p ratio relative to native                   CPU [%]
+  1                                   1                                  100
+0.9                                 0.9                                   90
+0.8                                 0.8                                   80
+0.7                                 0.7                                   70                                native
+0.6                                 0.6                                   60                             sidecore
+0.5                                 0.5                                   50                            samecore
+0.4                                 0.4                                   40
+0.3                                 0.3                                   30
+0.2                                 0.2                                   20
+0.1                                 0.1                                   10
+  0                                   0                                    0
+      st
+      sh t
+      as red
+      de nc
+      op erre
+      op 256
+      of 409
+
+
+
+                                          st
+                                          sh t
+                                          as red
+                                          de c
+                                          op erre
+                                          op 256
+                                          of 409
+
+
+
+                                                                               st
+                                                                               sh t
+                                                                               as red
+                                                                               de nc
+                                                                               op erre
+                                                                               op 256
+                                                                               of 409
+         ric
+
+
+
+
+                                             ric
+
+
+
+
+                                                                                  ric
+         f 6
+
+
+
+
+                                             f 6
+
+
+
+
+                                                                                  f 6
+          a
+          y
+
+
+
+
+                                              a
+                                              yn
+
+
+
+
+                                                                                   a
+                                                                                   y
+          f
+          t d
+          t
+
+
+
+
+                                              f
+                                              t d
+                                              t
+
+
+
+
+                                                                                   f
+                                                                                   t d
+                                                                                   t
+                (a)                                (b)                                   (c)
+
+Figure 3: Measuring throughput with Netperf TCP; the baseline for normalization is the optimal throughput attainable by our
+10Gbps NIC.
+
+
+       normalized latency              latency relative to native                     CPU [%]
+  2                                  2                                   100
+1.8                               1.75                                    90
+1.6                                1.5                                    80
+1.4                                                                       70                                native
+1.2                               1.25                                    60                             sidecore
+  1                                  1                                    50                            samecore
+0.8                               0.75                                    40
+0.6                                0.5                                    30
+0.4                                                                       20
+0.2                               0.25                                    10
+  0                                  0                                     0
+      st
+      sh t
+      as red
+      de nc
+      op erre
+      op 256
+      of 409
+
+
+
+                                          st
+                                          sh t
+                                          as red
+                                          de nc
+                                          op erre
+                                          op 256
+                                          of 409
+
+
+
+                                                                               st
+                                                                               sh t
+                                                                               as red
+                                                                               de nc
+                                                                               op erre
+                                                                               op 256
+                                                                               of 409
+        ric
+
+
+
+
+                                            ric
+
+
+
+
+                                                                                 ric
+         f 6
+
+
+
+
+                                             f 6
+
+
+
+
+                                                                                  f 6
+          a
+          y
+
+
+
+
+                                              a
+                                              y
+
+
+
+
+                                                                                   a
+                                                                                   y
+          f
+          t d
+          t
+
+
+
+
+                                              f
+                                              t d
+                                              t
+
+
+
+
+                                                                                   f
+                                                                                   t d
+                (a)                                (b)                             t     (c)
+
+Figure 4: Measuring latency with the Netperf UDP request-response benchmark; the baseline for normalization (latency of bare
+metal with no IOMMU) is 41 µsecs.
+
+
+optimum for the samecore and sidecore settings is not                samecore for MySQL and Apache, respectively. But
+the “1” that is shown in Figure 4(a); rather, it is the value        once it is applied, then these figures respectively drop to
+that is associated with the off configuration of the virtual-        1.12x and 1.10x. In other words, for the real applications
+ized settings (guest with no IOMMU protection), which                that we have chosen, sidecore is better than samecore
+is roughly 1.2 in this case.                                         by 50%–60% for safe configurations (as well as for de-
+                                                                     ferred), but when optimistic teardown is applied, this gap
+   Examining Figure 4(c), we unsurprisingly see that the
+                                                                     is reduced to around 10%. This should come as no sur-
+CPU is not a bottleneck for this benchmark. We further
+                                                                     prise as we have already established above that optimistic
+see that optimistic teardown is the most significant opti-
+                                                                     teardown dramatically reduces the IOMMU overhead.
+mization for this metric, allowing the virtualized settings
+to nearly reach the bare metal optimum.                                 It is important to note, once again, that the optimum
+                                                                     for sidecore and samecore is the off configuration in the
+   Figures 5–6 present the results of the macrobench-
+                                                                     virtualized setting, namely 0.86 and 0.68 for MySQL and
+marks, showing trends that are rather similar. Optimistic
+                                                                     Apache in Figures 5(a) and 6(a), respectively. Thus, it is
+teardown is most meaningful to the samecore setting,
+                                                                     not that the optimistic teardown all of a sudden became
+boosting its throughput by about 1.5x. For sidecore,
+                                                                     less effective for the macrobenchmarks; rather, it is that
+however, the optimization has a lesser effect. Specifi-
+                                                                     in comparison to the microbenchmarks the applications
+cally, opt4096 improves upon deferred by 1.07x in the
+                                                                     attain much higher throughput to begin with, and so the
+case of MySQL, and by 1.04x in the case of Apache.
+                                                                     optimization has less room to shine.
+Before the optimistic teardown is applied, the sidecore
+setting delivers 1.52x and 1.63x better throughput than                The bottom line is that combining sidecore and op-
+
+
+                                                                10
+      normalized throughput            t/p ratio relative to native                 CPU [%]
+  1                                   1                                100
+0.9                                 0.9                                 90
+0.8                                 0.8                                 80
+0.7                                 0.7                                 70                                native
+0.6                                 0.6                                 60                             sidecore
+0.5                                 0.5                                 50                            samecore
+0.4                                 0.4                                 40
+0.3                                 0.3                                 30
+0.2                                 0.2                                 20
+0.1                                 0.1                                 10
+  0                                   0                                  0
+      st
+      sh t
+      as red
+      de nc
+      op erre
+      op 256
+      of 409
+
+
+
+                                          st
+                                          sh t
+                                          as red
+                                          de c
+                                          op erre
+                                          op 256
+                                          of 409
+
+
+
+                                                                             st
+                                                                             sh t
+                                                                             as red
+                                                                             de nc
+                                                                             op erre
+                                                                             op 256
+                                                                             of 409
+         ric
+
+
+
+
+                                             ric
+
+
+
+
+                                                                                ric
+         f 6
+
+
+
+
+                                             f 6
+
+
+
+
+                                                                                f 6
+          a
+          y
+
+
+
+
+                                              a
+                                              yn
+
+
+
+
+                                                                                 a
+                                                                                 y
+          f
+          t d
+          t
+
+
+
+
+                                              f
+                                              t d
+                                              t
+
+
+
+
+                                                                                 f
+                                                                                 t d
+                                                                                 t
+                (a)                                (b)                                 (c)
+
+             Figure 5: Measuring MySQL throughput; the baseline for normalization is 243 transactions per second.
+
+
+      normalized throughput            t/p ratio relative to native                 CPU [%]
+  1                                   1                                100
+0.9                                 0.9                                 90
+0.8                                 0.8                                 80
+0.7                                 0.7                                 70                                native
+0.6                                 0.6                                 60                             sidecore
+0.5                                 0.5                                 50                            samecore
+0.4                                 0.4                                 40
+0.3                                 0.3                                 30
+0.2                                 0.2                                 20
+0.1                                 0.1                                 10
+  0                                   0                                  0
+      st
+      sh t
+      as red
+      de nc
+      op erre
+      op 256
+      of 409
+
+
+
+                                          st
+                                          sh t
+                                          as red
+                                          de nc
+                                          op erre
+                                          op 256
+                                          of 409
+
+
+
+                                                                             st
+                                                                             sh t
+                                                                             as red
+                                                                             de nc
+                                                                             op erre
+                                                                             op 256
+                                                                             of 409
+        ric
+
+
+
+
+                                            ric
+
+
+
+
+                                                                               ric
+         f 6
+
+
+
+
+                                             f 6
+
+
+
+
+                                                                                f 6
+          a
+          y
+
+
+
+
+                                              a
+                                              y
+
+
+
+
+                                                                                 a
+                                                                                 y
+          f
+          t d
+          t
+
+
+
+
+                                              f
+                                              t d
+                                              t
+
+
+
+
+                                                                                 f
+                                                                                 t d
+                                                                                 t
+                (a)                                (b)                                 (c)
+
+              Figure 6: Measuring Apache throughput; the baseline for normalization is 6828 requests per second.
+
+
+             Throughput(Mbps) VCPUs load Sidecore load             tiple guest CPUs. Table 3 presents the performance of
+ samecore         1345 (+49%)       76%                            a 2 VCPUs setup, using the strict configuration, relative
+  sidecore        4312 (+54%)       83% 49% (+50%)                 to a single VCPU setup. As shown, sidecore emulation
+                                                                   scales up similarly to samecore emulation, and the per-
+Table 3: Measuring the Netperf TCP throughput of 2-VCPUs           formance of both improves by approximately 50% in 2
+with strict configuration compared to a single VCPU.
+                                                                   VCPUs setup.
+
+                                                                      This method, however, may encounter additional la-
+timistic teardown brings both MySQL and Apache                     tency in a system that consists multiple sockets (dies),
+throughputs to be only 3% less than their respective op-           as the affinity of the sidecore thread has special impor-
+tima.                                                              tance in such systems. If both the virtual guest and the
+                                                                   sidecore are located on the same die, fast cache-to-cache
+6.4    Sidecore Scalability               and      Power-          micro-architectural mechanisms can be used to propa-
+       Efficiency                                                  gate modifications of the IOMMU data structures, and
+                                                                   the interconnect imposes no additional latency. In con-
+Performance gain from the sidecore approach requires               trast, when the sidecore is located on a different die, the
+the emulating sidecore to be co-scheduled with the VC-             latency of accessing the emulated IOMMU data struc-
+PUs to achieve low-latency IOMMU emulation. There-                 tures is increased by interconnect imposed latency. The
+fore, it is highly important that the sidecore performs its        Intel QuickPath Interconnect (QPI) protocol used on our
+tasks efficiently with high utilization.                           system requires write-backs of modified cache lines to
+   One method for better utilizing the sidecore is to set          main memory, which results in latency that can exceed
+one emulating sidecore to serve multiple VCPUs or mul-             100ns—over four times the latency of accessing a modi-
+
+
+                                                              11
+fied cache line on the same die [30].                                                        8
+                                                                                                        logic
+    Another method for better utilizing the sidecore is to                                   7   invalidation
+
+
+
+
+                                                                    CPU cycles (thousands)
+use its spare cycles productively. Even though the nature                                    6
+of the sidecore is that it is constantly working, a sidecore                                 5
+can have spare cycles—those cycles in which it polled                                        4
+memory and realized it has no pending emulation tasks.                                       3
+One way of improving the system’s overall efficiency is                                      2
+to use such cycles for polling paravirtual devices in ad-
+                                                                                             1
+dition to emulated devices. Another way is to allow the
+                                                                                             0
+sidecore to enter a low-power sleep state when it is oth-
+
+
+
+
+                                                                                                    sa pa
+
+                                                                                                    an pa e
+
+
+                                                                                                    m
+
+
+
+
+                                                                                                                       sa pa
+
+                                                                                                                       an pa e
+
+
+                                                                                                                       m
+                                                                                                      w
+
+
+
+
+                                                                                                                         w
+                                                                                                      m ck
+
+
+
+
+                                                                                                                         m ck
+                                                                                                      ot ck
+
+
+
+
+                                                                                                                         ot ck
+                                                                                                        ai
+
+
+
+
+                                                                                                                          ai
+erwise idle. We can make sidecore IOMMU emulation
+
+
+
+
+                                                                                                         e a
+
+
+
+
+                                                                                                                           e a
+                                                                                                         he a
+
+
+
+
+                                                                                                                           he a
+                                                                                                           t(
+
+
+
+
+                                                                                                                             t(
+                                                                                                             r ge
+
+
+
+
+                                                                                                                               r ge
+                                                                                                              C
+
+
+
+
+                                                                                                                                C
+                                                                                                               C
+
+
+
+
+                                                                                                                                  C
+more power-efficient by using the CPU’s monitor/mwait
+
+
+
+
+                                                                                                                g
+
+
+
+
+                                                                                                                                  g
+                                                                                                                  1)
+
+
+
+
+                                                                                                                                    1)
+capability, which enables the core to enter a low-power                                                map              unmap
+
+state until a monitored cache range is modified [4].
+    However, current x86 architecture only enables mon-             Figure 7: The effect of power-saving and CPU affinity on the
+itoring of a single cache line, and the Linux scheduler             mapping/unmapping cost of a single page.
+already uses the monitoring hardware for its internal pur-
+poses. Moreover, the sidecore must monitor and respond
+to writes to multiple emulated registers which do not re-           7                        Related Work
+side in the same cache line.
+    We overcame these challenges by using the mapping               We survey related work along the following dimensions:
+hardware to monitor the invalidation queue tail (IQT)               I/O device emulation for virtual machines, IOMMU
+register of the IOMMU invalidation queue while we peri-             mapping strategies for paravirtualized and unmodified
+odically monitored the remaining emulated IOMMU reg-                guests, and offloading computation to a sidecore.
+isters. (This is possible because the IOMMU mapping                    All common hypervisors in use today on x86 sys-
+layer performs most of its writes to a certain IQT regis-           tems emulate I/O devices. Sugerman, Venkitachalam,
+ter.) We also relocated the memory range monitored by               and Lim discuss device emulation in the context of
+the scheduler (the need resched variable) to a mem-                 VMware’s hypervisor [37], Barham et al. discuss it in
+ory area which is reserved according to the IOMMU                   the context of the Xen hypervisor [6], Kivity et al. dis-
+specifications and resides in the same cache line as the            cuss it in the context of the KVM hypervisor [21], and
+IQT register.                                                       Bellard discusses it in the context of QEMU [10]. In all
+    Nonetheless, entering a low-power sleep state is suit-          cases, device emulation suffered from prohibitive per-
+able only in an extended quiescence period, in which                formance [11], which led to the development of par-
+no accesses to the IOMMU take place. This is because                avirtualized I/O [6, 34] and direct device assignment
+entering and exiting low power state takes considerable             I/O [25, 26]. To our knowledge, we are the first to
+time [39]. Thus, sidecore emulation is ideally suited for           demonstrate the feasibility of high-speed I/O device em-
+an asymmetric system [22]. Such systems, which include              ulation with performance approaching that of bare metal.
+both high power high performance cores and low power                   Maximizing OS protection from errant DMAs by min-
+low performance cores, can schedule the hardware emu-               imizing the DMA vulnerability duration is important, be-
+lation code to a core which will provide the desired per-           cause devices might be buggy or exploited [9, 14, 25, 46].
+formance/power consumption tradeoff.                                Several IOMMU mapping strategies have been sug-
+    The impact of these two scaling related methods, us-            gested for trading off protection and performance [44,
+ing sidecore to serve a guest whose VCPU is located on              49]. For unmodified guests, the only usable mapping
+another package, and entering low power state instead               strategy prior to this work was the direct mapping strat-
+of polling, appear in Figure 7. According to our experi-            egy [44], which provides no protection to the guest OS.
+ments, when the sidecore was set on another package, the            Once we expose an emulated IOMMU to the guest OS,
+mapping and unmapping cost increased by 23%, result-                the guest OS may choose to use any mapping strategy it
+ing in 25% less TCP throughput than when the sidecore               wishes to protect itself from buggy or malicious devices.
+was located on the same package. Entering low-power                    Additional mapping strategies were possible for par-
+state increased the cycle cost of mapping and unmapping             avirtualized guests. The single-use mapping and the
+by 13%, and optimally would decrease performance very               shared mapping strategies provide full protection at siz-
+little using good heuristics for detecting idle periods. Re-        able cost to performance [44]. The persistent mappings
+gardless, in both cases, the cost of sidecore emulation is          strategy provides better performance at the expense of
+still considerably lower than that of samecore emulation.           reduced protection. In the persistent mapping strategy
+
+
+                                                               12
+mappings persist forever. The on-demand mapping strat-              Acknowledgments
+egy [49] refines persistent mapping by tearing down
+mappings once a set quota on the number of mappings                 We thank Ben-Ami Yassour, Abel Gordon, Nadav
+was reached. On-demand mapping, however, does not                   Har’El, and Alex Landau for their insightful comments
+limit the duration of vulnerability. Optimistic teardown            and joyful discussions. We also thank the anonymous re-
+provides performance that is equivalent to that of persis-          viewers and Carl Waldspurger (our shepherd) for their
+tent and on-demand mapping, but does so while limiting              much appreciated feedback. The research leading to
+the duration of vulnerability to mere milliseconds.                 the results presented in this paper is partially supported
+   Offloading computation to a dedicated core is a well-            by the European Community’s Seventh Framework Pro-
+known approach for speeding up computation [7, 8, 36].              gramme ([FP7/2001-2013]) under grant agreement num-
+Offloading computation to a sidecore in order to speed              bers 248615 (IOLanes) and 248647 (ENCORE).
+up I/O for paravirtualized guests was explored by Kumar
+et al. [23], Gavrilovska et al. [15], and in the virtualiza-        References
+tion polling engine (VPE) [27]. In order to achieve near
+                                                                     [1] D. Abramson, J. Jackson, S. Muthrasanallur, G. Neiger, G. Reg-
+native performance for 10GbE, VPE required modifica-                     nier, R. Sankaran, I. Schoinas, R. Uhlig, B. Vembu, and
+tions of the guest OS and a set of paravirtualized drivers               J. Wiegert. Intel virtualization technology for directed I/O. Intel
+for each emulated device. In contrast, our sidecore emu-                 Technology Journal, 10(3):179–192, Aug 2006.
+lation approach requires no changes to the guest OS.                 [2] K. Adams and O. Agesen. A comparison of software and hard-
+                                                                         ware techniques for x86 virtualization. In ACM Archit. Support
+   Building in part upon vIOMMU, the SplitX                              for Prog. Lang. & Operating Syst. (ASPLOS), pages 2–13, 2006.
+project [24] takes the sidecore approach one step                    [3] N. Amit, M. Ben-Yehuda, and B.-A. Yassour. IOMMU: Strate-
+further. SplitX aims to run each unmodified guest and                    gies for mitigating the IOTLB bottleneck. In Workshop on In-
+the hypervisor on a disjoint set of cores, dedicating a                  teraction between Opearting Syst. & Comput. Archit. (WIOSCA),
+                                                                         2010.
+set of cores to each guest and offloading all hypervisor
+                                                                     [4] N. Anastopoulos and N. Koziris. Facilitating efficient synchro-
+functionality to a disjoint set of sidecores.                            nization of asymmetric threads on hyper-threaded processors. In
+                                                                         IEEE Int’l Parallel & Distributed Processing Symp. (IPDPS),
+                                                                         pages 1–8, 2008.
+8   Conclusions                                                      [5] T. Ball, E. Bounimova, B. Cook, V. Levin, J. Lichtenberg, C. Mc-
+                                                                         Garvey, B. Ondrusek, S. K. Rajamani, and A. Ustuner. Thorough
+We presented vIOMMU, the first x86 IOMMU emula-                          static analysis of device drivers. In ACM SIGOPS European Conf.
+tion for unmodified guests. By exposing an IOMMU to                      on Comput. Syst. (EuroSys), pages 75–85, 2006.
+                                                                     [6] P. Barham, B. Dragovic, K. Fraser, S. Hand, T. Harris, A. Ho,
+the guest we enable the guest to protect itself from buggy               R. Neugebauer, I. Pratt, and A. Warfield. Xen and the art of virtu-
+device drivers, while simultaneously making it possible                  alization. In ACM Symp. on Operating Syst. Principles (SOSP),
+for the hypervisor to overcommit memory. vIOMMU                          pages 164–177, 2003.
+employs two novel optimizations to perform well. The                 [7] A. Baumann, P. Barham, P.-E. Dagand, T. Harris, R. Isaacs, S. Pe-
+                                                                         ter, T. Roscoe, A. Schüpbach, and A. Singhania. The multikernel:
+first, “optimistic teardown”, entails simply waiting a few
+                                                                         a new OS architecture for scalable multicore systems. In ACM
+milliseconds before tearing down an IOMMU mapping                        Symp. on Operating Syst. Principles (SOSP), pages 29–44, 2009.
+and demonstrates that a minuscule relaxation of protec-              [8] A. Baumann, S. Peter, A. Schüpbach, A. Singhania, T. Roscoe,
+tion can lead to large performance benefits. The second,                 P. Barham, and R. Isaacs. Your computer is already a distributed
+running IOMMU emulation on a sidecore, demonstrates                      system. Why isn’t your OS? In USENIX Workshop on Hot Topics
+                                                                         in Operating Syst. (HOTOS), page 12, 2009.
+that given the right software/hardware interface and de-             [9] M. Becher, M. Dornseif, and C. N. Klein. FireWire: all your
+vice emulation, unmodified guests can perform just as                    memory are belong to us. In CanSecWest, 2005.
+well as paravirtualized guests.                                     [10] F. Bellard. QEMU, a fast and portable dynamic translator. In
+   The benefits of IOMMU emulation rely on the guest                     USENIX Ann. Technical Conf. (ATC), pages 41–46, 2005.
+using the IOMMU. Introducing software and hardware                  [11] M. Ben-Yehuda, M. D. Day, Z. Dubitzky, M. Factor, N. Har’El,
+                                                                         A. Gordon, A. Liguori, O. Wasserman, and B.-A. Yassour. The
+support for I/O page faults could relax this requirement                 turtles project: Design and implementation of nested virtualiza-
+and enable seamless memory overcommitment even for                       tion. In USENIX Symp. on Opearting Syst. Design & Implemen-
+non-cooperative guests. Likewise, introducing software                   tation (OSDI), pages 423–436, 2010.
+and hardware support for multiple levels of IOMMU                   [12] M. Ben-Yehuda, J. Mason, O. Krieger, J. Xenidis, L. Van Doorn,
+                                                                         A. Mallick, J. Nakajima, and E. Wahlig. Utilizing IOMMUs for
+page tables [11] could in theory provide perfect protec-                 virtualization in Linux and Xen. In Ottawa Linux Symp. (OLS),
+tion without any decrease in performance. In practice,                   pages 71–86, 2006.
+multiple MMU levels cause more page-faults and higher               [13] M. Ben-Yehuda, J. Xenidis, M. Ostrowski, K. Rister, A. Bruem-
+TLB miss-rates, resulting in lower performance for many                  mer, and L. van Doorn. The price of safety: Evaluating IOMMU
+                                                                         performance. In Ottawa Linux Symp. (OLS), pages 9–20, 2007.
+workloads [42]. Similarly, a single level of IOMMU                  [14] B. D. Carrier and J. Grand. A hardware-based memory acqui-
+emulation may perform better than multiple levels of                     sition procedure for digital investigations. Digital Investigation,
+IOMMU page tables, depending on workload.                                1(1):50–60, 2004.
+
+
+                                                               13
+[15] A. Gavrilovska, S. Kumar, H. Raj, K. Schwan, V. Gupta,                           32(1):410–411, Jun 2004.
+     R. Nathuji, R. Niranjan, A. Ranadive, and P. Saraiya. High-                 [33] H. Raj and K. Schwan. High performance and scalable I/O virtu-
+     performance hypervisor architectures: Virtualization in HPC sys-                 alization via self-virtualized devices. In Int’l Symp. on High Per-
+     tems. In Workshop on System-level Virtualization for HPC                         formance Distributed Comput. (HPDC), pages 179–188, 2007.
+     (HPCVirt), 2007.                                                            [34] R. Russell. virtio: towards a de-facto standard for virtual I/O
+[16] D. Gupta, S. Lee, M. Vrable, S. Savage, A. C. Snoeren, G. Vargh-                 devices. ACM SIGOPS Operating Syst. Review (OSR), 42(5):95–
+     ese, G. M. Voelker, and A. Vahdat. Difference engine: harness-                   103, Jul 2008.
+     ing memory redundancy in virtual machines. Comm. of the ACM                 [35] A. Seshadri, M. Luk, N. Qu, and A. Perrig. SecVisor: a tiny
+     (CACM), 53(10):85–93, Oct 2010.                                                  hypervisor to provide lifetime kernel code integrity for commod-
+[17] J. N. Herder, H. Bos, B. Gras, P. Homburg, and A. S. Tanenbaum.                  ity OSes. In ACM Symp. on Operating Syst. Principles (SOSP),
+     Failure resilience for device drivers. In IEEE Int’l Conf. on De-                pages 335–350, 2007.
+     pendable Syst. & Networks (DSN), pages 41–50, 2007.                         [36] L. Shalev, J. Satran, E. Borovik, and M. Ben-Yehuda. IsoStack:
+[18] Intel virtualization technology for directed I/O, architecture spec-             highly efficient network processing on dedicated cores. In
+     ification. ftp://download.intel.com/technology/                                  USENIX Ann. Technical Conf. (ATC), page 5, 2010.
+     computing/vptech/Intel(r)_VT_for_Direct_IO.                                 [37] J. Sugerman, G. Venkitachalam, and B.-H. Lim. Virtualizing I/O
+     pdf, Feb 2011. Revision 1.3. Intel Corporation. (Accessed Apr                    devices on VMware workstation’s hosted virtual machine moni-
+     2011).                                                                           tor. In USENIX Ann. Technical Conf. (ATC), pages 1–14, 2001.
+[19] R. Jones. The netperf benchmark. http://www.netperf.                        [38] M. M. Swift, B. N. Bershad, and H. M. Levy. Improving the
+     org. (Accessed Apr, 2011).                                                       reliability of commodity operating systems. ACM Trans. Comput.
+[20] A. Kadav and M. M. Swift. Live migration of direct-access                        Syst. (TOCS), 23(1):77–110, Feb 2005.
+     devices. In USENIX Workshop on I/O Virtualization (WIOV),                   [39] D. Tsafrir, Y. Etsion, and D. G. Feitelson. General purpose tim-
+     page 2, 2008.                                                                    ing: the failure of periodic timers. Technical Report 2005-6,
+[21] A. Kivity, Y. Kamay, D. Laor, U. Lublin, and A. Liguori. KVM:                    School of Computer Science & Engineering, the Hebrew Uni-
+     the Linux virtual machine monitor. In Ottawa Linux Symp.                         versity, Feb 2005.
+     (OLS), pages 225–230, 2007. http://www.kernel.org/                          [40] D. Tsafrir, T. Hertz, D. Wagner, and D. Da Silva. Portably solving
+     doc/ols/2007/ols2007v1-pages-225-230.pdf.                                        file TOCTTOU races with hardness amplification. In USENIX
+     (Accessed Apr, 2011).                                                            Conf. on File & Storage Technologies (FAST), pages 189–206,
+[22] R. Kumar, D. M. Tullsen, P. Ranganathan, N. P. Jouppi, and K. I.                 2008.
+     Farkas. Single-ISA heterogeneous multi-core architectures for               [41] C. A. Waldspurger. Memory resource management in VMware
+     multithreaded workload performance. ACM/IEEE Int’l Symp. on                      ESX server. In USENIX Symp. on Opearting Syst. Design & Im-
+     Comput. Archit. (ISCA), pages 81–92, 2004.                                       plementation (OSDI), volume 36, pages 181–194, 2002.
+[23] S. Kumar, H. Raj, K. Schwan, and I. Ganev. Re-architecting                  [42] X. Wang, J. Zang, Z. Wang, Y. Luo, and X. Li. Selective hard-
+     VMMs for multicore systems: The sidecore approach. In Work-                      ware/software memory virtualization. In ACM/USENIX Int’l
+     shop on Interaction between Opearting Syst. & Comput. Archit.                    Conf. on Virtual Execution Environments (VEE), pages 217–226,
+     (WIOSCA), 2007.                                                                  2011.
+[24] A. Landau, M. Ben-Yehuda, and A. Gordon. SplitX: Split                      [43] D. Williams, P. Reynolds, K. Walsh, E. G. Sirer, and F. B. Schnei-
+     guest/hypervisor execution on multi-core. In USENIX Workshop                     der. Device driver safety through a reference validation mecha-
+     on I/O Virtualization (WIOV), 2011.                                              nism. In USENIX Symp. on Opearting Syst. Design & Implemen-
+[25] J. LeVasseur, V. Uhlig, J. Stoess, and S. Götz. Unmodified de-                  tation (OSDI), pages 241–254, 2008.
+     vice driver reuse and improved system dependability via virtual             [44] P. Willmann, S. Rixner, and A. L. Cox. Protection strategies for
+     machines. In USENIX Symp. on Opearting Syst. Design & Im-                        direct access to virtualized I/O devices. In USENIX Ann. Techni-
+     plementation (OSDI), pages 17–30, 2004.                                          cal Conf. (ATC), pages 15–28, 2008.
+[26] J. Liu. Evaluating standard-based self-virtualizing devices: A              [45] P. Willmann, J. Shafer, D. Carr, A. Menon, S. Rixner, A. L. Cox,
+     performance study on 10 GbE NICs with SR-IOV support. In                         and W. Zwaenepoel. Concurrent direct network access for virtual
+     IEEE Int’l Parallel & Distributed Processing Symp. (IPDPS),                      machine monitors. In IEEE Int’l Symp. on High Performance
+     pages 1–12, 2010.                                                                Comput. Archit. (HPCA), pages 306–317, 2007.
+[27] J. Liu and B. Abali. Virtualization polling engine (VPE): Using             [46] R. Wojtczuk. Subverting the Xen hypervisor. In Black Hat,
+     dedicated CPU cores to accelerate I/O virtualization. In ACM                     2008. http://www.invisiblethingslab.com/bh08/
+     Int’l Conf. on Supercomputing (ICS), pages 225–234, 2009.                        papers/part1-subverting_xen.pdf. (Accessed Apr,
+[28] J. Liu, W. Huang, B. Abali, and D. K. Panda. High performance                    2011).
+     VMM-bypass I/O in virtual machines. In USENIX Ann. Technical                [47] T. Wood, G. Tarasuk-Levin, P. Shenoy, P. Desnoyers, E. Cecchet,
+     Conf. (ATC), pages 29–42, 2006.                                                  and M. D. Corner. Memory buddies: exploiting page sharing for
+[29] A. Menon, J. R. Santos, Y. Turner, G. Janakiraman, and                           smart colocation in virtualized data centers. In ACM/USENIX
+     W. Zwaenepoel. Diagnosing performance overheads in the Xen                       Int’l Conf. on Virtual Execution Environments (VEE), pages 31–
+     virtual machine environment. In ACM/USENIX Int’l Conf. on                        40, 2009.
+     Virtual Execution Environments (VEE), pages 13–23, 2005.                    [48] B.-A. Yassour, M. Ben-Yehuda, and O. Wasserman. Direct de-
+[30] D. Molka, D. Hackenberg, R. Schone, and M. Muller. Memory                        vice assignment for untrusted fully-virtualized virtual machines.
+     performance and cache coherency effects on an Intel Nehalem                      Technical Report H-0263, IBM Research, 2008.
+     multiprocessor system. In ACM/IEEE Int’l Conf. on Parallel Ar-              [49] B.-A. Yassour, M. Ben-Yehuda, and O. Wasserman. On the DMA
+     chit. & Compilation Techniques (PACT), pages 261–270, 2009.                      mapping problem in direct device assignment. In Haifa Experi-
+[31] E. G. Munteanu. AMD IOMMU emulation patchset. KVM                                mental Syst. Conf. (SYSTOR), 2010.
+     mailing list, http://www.spinics.net/lists/kvm/                             [50] E. Zhai, G. D. Cummings, and Y. Dong. Live migration with
+     msg38514.html, Jul 2010. (Accessed Apr, 2011).                                   pass-through device for Linux VM. In Ottawa Linux Symp.
+[32] B. Pfaff. Performance analysis of BSTs in system software.                       (OLS), pages 261–268, 2008.
+     ACM SIGMETRICS Performance Evaluation Review (PER),
+
+
+
+
+                                                                            14
+

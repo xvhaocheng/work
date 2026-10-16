@@ -1,0 +1,11 @@
+# §65: Do two irrevocable frontiers yield a useful joint-latency choice?
+
+Codex root personal design. §59minimalclosureJ=max(actualVreturned,irrevocableV-Wpromise),roundedeven. CurrentoldphysicalchildendpointE>=J cannotberetracted. Physicalsourcecostafterhandoveris E+(256−FA), independentofwhereJwithinlegalrangeisplaced, aslongsameoldE andsameAinitialFA. ExistingprotocolsinkoldR[J,E), thenA repairsFA..256, VjoinsatJ. Conventionalalternatefrontier J=E continuesVtotheoldphysicalburstend, thenA prefixrepair/catch-up andjointtail. Neithergenericcatch-up norchoosingburstboundary isclaimednew; thisisthecriticalstrongcomparison beforelookingforanonlinejoint policy/bound.
+
+CompileparameterClosureAtBurstEnd0/1 intwotopcopiesforwardedtohelper, samephase registers/newpayloadzero. J=E requiresE<256 toactuallyshareatail;E256fallsbacksafeindependentmode3, reportedactual0—notpretendhandover1. All comparisonsactualJ/E/FA/physicalRmustbechecked; unequalE/Rarenotequalread-costclaims.
+
+Phase1 V maycreatenewq2AW whoseend<=chosenJ withoutwaitingpayloadresident: onlyVparticipatesinthedeliveredoldphysicalR, AnewWhelduntilrepair, andfullVWRITEpermissionssucceedbeforetrigger. Pre-existingA data obligations wereclosedbeforedeparture/mode3Auntouched, andoldsAW/W/B remainirrevocable. V AWcannotcrossJ; actualVrawW mustreachJ beforephase2. RegisteredheldAW/R/Warenotretracted. Laterjointrepairkeeps§59peer-start rule/nativeApageclipping/terminalparkingfix; allnormalindependentREAD/WRITEcertconditionssame.
+
+Needbuildtwoextremaandsameconfigs: sourceK2/16/64/128 andoriginalK256fallback, F1/127/255, selectedPTE/B64/backpressure/Afirst conditions, nocutoverordinaryindependentandcommonresident comparisonsfromsamebrancheswhere valid. Do notrunrandomthresholdscan. CompareVlatency,Alatency,meanandmakespanseparately; determinePareto/tradeoff. Ifsimpleburstboundarysufficesorbothfrontiersdifferonlyordinaryschedule,stopindependentalgorithmlabel. Onlyifaspecificsafecommit/read-obligationpropertyandsamecostadvantagecannotbereproducedbystrongordinarydoesfurthernewruleproofmakesense.
+
+2KiBstaticimmutable/twojobs/q2B3/behavioralDDR; nofault/invalidation/liveepoch/pause/board/MIG/synthesisclaim. SourceJboundsandin-flightWorderroot-ownedcriticalanalysis.

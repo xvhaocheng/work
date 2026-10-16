@@ -1,0 +1,890 @@
+diff --git a/scripts/platform.py b/scripts/platform.py
+--- a/scripts/platform.py
++++ b/scripts/platform.py
+@@ -165,6 +165,8 @@
+     run([CC+'gcc', '-O2', '-static', '-Wall', '-Wextra',
+          ROOT/'bench/idma_e3_controlled.c', '-o', dest/'idma_e3_controlled'])
+     run([CC+'gcc', '-O2', '-static', '-Wall', '-Wextra',
+          ROOT/'bench/platform_timeout.c', '-o', dest/'platform-timeout'])
++    run([CC+'gcc', '-O2', '-static', '-Wall', '-Wextra',
++         ROOT/'bench/platform_sd_update.c', '-o', dest/'platform-sd-update'])
+ 
+ def rootfs():
+     bench()
+
+diff --git a/scripts/build_update_software.py b/scripts/build_update_software.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/build_update_software.py
+@@ -0,0 +1,228 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""Build the cpn2-net1 software update delivery (authorized working tree).
++
++Only the software side is built here.  This module never runs the pinned clean
++check() and never runs fpga()/Vivado: the component trees are intentionally
++dirty (authorized working tree) and RTL/fpga-src must not change in this batch.
++
++The caller owns stdout/stderr; this module prints nothing and redirects
++nothing.  The state file in out/software-update-20261004 is running -> complete
++or failed, and finished_at is always written from a finally block.  On failure
++the original exception (and its exit code, when present) is preserved.
++"""
++from __future__ import annotations
++
++import importlib.util
++import json
++import shutil
++from datetime import datetime, timezone
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++BASE = ROOT / 'out' / 'software-update-20261004'
++DELIVERY = BASE / 'delivery'
++PREVIOUS = BASE / 'previous'
++STATE_PATH = BASE / 'software-update-state.json'
++
++LOCAL_VERSION = '-cpn2-net1'
++JOBS = 12
++MAX_PAYLOAD = 33554432  # 32 MiB OpenSBI payload window
++
++KERNEL_IMAGE = ROOT / 'out' / 'linux' / 'arch' / 'riscv' / 'boot' / 'Image'
++PLATFORM_DTB = ROOT / 'out' / 'linux' / 'platform.dtb'
++ROOTFS = ROOT / 'out' / 'rootfs.cpio'
++FW_PAYLOAD = ROOT / 'out' / 'opensbi' / 'platform' / 'fpga' / 'ariane' / 'firmware' / 'fw_payload.bin'
++SD_TOOL = ROOT / 'out' / 'bench' / 'platform-sd-update'
++LEGACY_STATE = ROOT / 'out' / 'paper-route-review-20261004' / 'software-build-state.json'
++
++PREVIOUS_SOURCES = {
++    'Image': KERNEL_IMAGE,
++    'platform.dtb': PLATFORM_DTB,
++    'rootfs.cpio': ROOTFS,
++    'fw_payload.bin': FW_PAYLOAD,
++    'software-build-state.json': LEGACY_STATE,
++}
++
++DELIVERY_SOURCES = {
++    'Image': KERNEL_IMAGE,
++    'platform.dtb': PLATFORM_DTB,
++    'rootfs.cpio': ROOTFS,
++    'fw_payload.bin': FW_PAYLOAD,
++    'platform-sd-update': SD_TOOL,
++}
++
++INPUT_PATTERNS = {
++    'config': ['configs/linux_defconfig'],
++    'dts': ['configs/platform.dts'],
++    'driver': [
++        'linux/drivers/misc/idma.c',
++        'linux/drivers/misc/idma_research.h',
++        'linux/include/uapi/linux/idma.h',
++        'linux/drivers/net/ethernet/lowrisc/**/*.c',
++        'linux/drivers/net/ethernet/lowrisc/**/*.h',
++    ],
++    'firmware': [
++        'opensbi/platform/fpga/ariane/platform.c',
++        'opensbi/lib/utils/reset/*.c',
++    ],
++    'rootscripts': ['scripts/rootfs.py'],
++    'tool': ['bench/platform_sd_update.c'],
++}
++
++REQUIRED_CONFIG_Y = (
++    'CONFIG_RISCV',
++    'CONFIG_BLK_DEV_INITRD',
++)
++
++
++def utc_now():
++    return datetime.now(timezone.utc).isoformat()
++
++
++def write_state(state):
++    BASE.mkdir(parents=True, exist_ok=True)
++    tmp = STATE_PATH.with_suffix(STATE_PATH.suffix + '.tmp')
++    tmp.write_text(json.dumps(state, indent=2) + '\n')
++    tmp.replace(STATE_PATH)
++
++
++def load_platform():
++    spec = importlib.util.spec_from_file_location('cpn_platform', ROOT / 'scripts' / 'platform.py')
++    if spec is None or spec.loader is None:
++        raise RuntimeError('cannot load scripts/platform.py')
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def ensure_previous(sha):
++    manifest_path = PREVIOUS / 'previous-manifest.json'
++    if PREVIOUS.exists():
++        if manifest_path.is_file():
++            return json.loads(manifest_path.read_text())
++        return {'existing': True}
++    PREVIOUS.mkdir(parents=True, exist_ok=False)
++    manifest = {}
++    for name, source in PREVIOUS_SOURCES.items():
++        entry = {'source': str(source), 'copied': False}
++        if source.is_file() and source.stat().st_size:
++            destination = PREVIOUS / name
++            shutil.copy2(source, destination)
++            entry['copied'] = True
++            entry['size'] = destination.stat().st_size
++            entry['sha256'] = sha(destination)
++        else:
++            entry['missing'] = True
++        manifest[name] = entry
++    manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
++    return manifest
++
++
++def capture_inputs(sha):
++    inputs = {}
++    for group, patterns in INPUT_PATTERNS.items():
++        entries = {}
++        for pattern in patterns:
++            for path in sorted(ROOT.glob(pattern)):
++                if not path.is_file():
++                    continue
++                relative = str(path.relative_to(ROOT))
++                entries[relative] = {'size': path.stat().st_size, 'sha256': sha(path)}
++        inputs[group] = entries
++    return inputs
++
++
++def read_config():
++    path = ROOT / 'out' / 'linux' / '.config'
++    if not path.is_file():
++        raise RuntimeError('missing kernel config: ' + str(path))
++    values = {}
++    for raw in path.read_text(errors='replace').splitlines():
++        line = raw.strip()
++        if not line or line.startswith('#') or '=' not in line:
++            continue
++        key, value = line.split('=', 1)
++        values[key.strip()] = value.strip()
++    return values
++
++
++def check_config(values):
++    for key in REQUIRED_CONFIG_Y:
++        if values.get(key) != 'y':
++            raise RuntimeError('critical kernel config is not y: '
++                               + key + '=' + repr(values.get(key)))
++    source = values.get('CONFIG_INITRAMFS_SOURCE', '')
++    if not source:
++        raise RuntimeError('CONFIG_INITRAMFS_SOURCE is empty; the initramfs would not be embedded')
++    return {
++        'required_y': {key: values.get(key) for key in REQUIRED_CONFIG_Y},
++        'initramfs_source': source,
++    }
++
++
++def check_payload():
++    if not FW_PAYLOAD.is_file() or FW_PAYLOAD.stat().st_size == 0:
++        raise RuntimeError('missing firmware payload: ' + str(FW_PAYLOAD))
++    size = FW_PAYLOAD.stat().st_size
++    if size > MAX_PAYLOAD:
++        raise RuntimeError('fw_payload.bin is ' + str(size) + ' bytes, over ' + str(MAX_PAYLOAD))
++    return size
++
++
++def deliver(sha):
++    DELIVERY.mkdir(parents=True, exist_ok=True)
++    manifest = {}
++    for name, source in DELIVERY_SOURCES.items():
++        if not source.is_file() or source.stat().st_size == 0:
++            raise RuntimeError('delivery artifact missing or empty: ' + str(source))
++        destination = DELIVERY / name
++        shutil.copy2(source, destination)
++        manifest[name] = {'source': str(source), 'size': destination.stat().st_size,
++                          'sha256': sha(destination)}
++    return manifest
++
++
++def main():
++    BASE.mkdir(parents=True, exist_ok=True)
++    state = {
++        'started_at': utc_now(),
++        'source_mode': 'authorized_working_tree',
++        'check_bypassed': 'authorized_software_working_tree',
++        'fpga': 'not_run',
++        'localversion': LOCAL_VERSION,
++        'secrets_excluded': True,
++        'status': 'running',
++    }
++    write_state(state)
++    try:
++        platform = load_platform()
++        platform.ENV['LOCALVERSION'] = LOCAL_VERSION
++        state['platform_commit'] = platform.capture(['git', 'rev-parse', 'HEAD'])
++        state['platform_dirty'] = bool(platform.capture(['git', 'status', '--porcelain']))
++
++        state['previous'] = ensure_previous(platform.sha)
++        state['inputs'] = capture_inputs(platform.sha)
++
++        platform.kernel(JOBS)
++        platform.firmware(JOBS)
++
++        state['config'] = check_config(read_config())
++        state['fw_payload_size'] = check_payload()
++        state['artifacts'] = deliver(platform.sha)
++
++        state['status'] = 'complete'
++        state['exit_code'] = 0
++    except BaseException as exc:
++        state['status'] = 'failed'
++        state['exit_code'] = int(getattr(exc, 'returncode', None) or 1)
++        state['error'] = type(exc).__name__ + ': ' + str(exc)
++        raise
++    finally:
++        state['finished_at'] = utc_now()
++        write_state(state)
++
++
++if __name__ == '__main__':
++    main()
+
+diff --git a/scripts/mac_update_reboot.py b/scripts/mac_update_reboot.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/mac_update_reboot.py
+@@ -0,0 +1,323 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""External reboot helper for the cpn2-net1 software update (Mac host).
++
++mac_composition.py is attach-only: it never writes a BIT.  This runner is the
++opposite, deliberately narrow external path used after the SD card is updated:
++
++  1. confirm a live board shell over the boot UART with
++     sync; echo <unique token>, then wait for a line that is exactly the token
++     (the command echo is never accepted as confirmation);
++  2. load the given .bit into FPGA SRAM with openFPGALoader over JTAG so the
++     board re-runs ROM -> OpenSBI -> Linux from the SD card;
++  3. re-read the boot UART, wait for login/prompt, and read uname -r and
++     /proc/sys/kernel/random/boot_id.
++
++Safety:
++  * default is dry-run; without --run the serial port is never opened and
++    pyserial is never imported, and nothing is written to disk;
++  * --run requires an explicit --port, --bit, --expected-kernel and a fresh
++    --out; there is no port auto-scan and no BIT auto-selection;
++  * openFPGALoader only ever loads the given BIT into SRAM; it never writes the
++    configuration flash and never touches the SD card;
++  * a single serial owner at a time;
++  * any error stops the run: no retry, no resume;
++  * success is never inferred from a boot log marker.  It requires a real
++    uname -r equal to --expected-kernel and a non-empty boot_id.
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import pathlib
++import re
++import secrets
++import subprocess
++import sys
++import time
++
++BAUD = 115200
++FPGA_BOARD = 'genesys2'
++FPGA_FREQ = '1000000'
++BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
++TOKEN_PREFIX = 'IDMA-REBOOT-'
++
++SCHEMA = 'mac-update-reboot-v1'
++
++UNAME_START = '__IDMA_UNAME_START__'
++UNAME_END = '__IDMA_UNAME_END__'
++CAPTURE_END = '__IDMA_CAPTURE_END__'
++
++LOGIN_RE = re.compile(r'(?i)login:\s*$')
++PASSWORD_RE = re.compile(r'(?i)password:\s*$')
++PROMPT_RE = re.compile(r'[#$]\s*$')
++
++NEWLINE = chr(10)
++
++
++class UpdateError(Exception):
++    """Technical failure: stop immediately, keep the evidence, never retry."""
++
++
++def utc_now():
++    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
++
++
++def sha256_file(path):
++    digest = hashlib.sha256()
++    with open(path, 'rb') as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def write_json(path, payload):
++    path = pathlib.Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_suffix(path.suffix + '.tmp')
++    with open(tmp, 'w', encoding='utf-8') as handle:
++        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
++        handle.write(NEWLINE)
++    tmp.replace(path)
++
++
++def default_serial_factory(port):
++    import serial  # local import: dry-run never needs pyserial
++    return serial.Serial(port, BAUD, timeout=0.2)
++
++
++def default_process_runner(argv, cwd=None):
++    return subprocess.run(list(map(str, argv)), cwd=cwd,
++                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
++
++
++class Console:
++    """Owns the pyserial link and appends every UART byte to the raw log."""
++
++    def __init__(self, link, raw_path, clock, sleeper):
++        self._link = link
++        self._raw = open(raw_path, 'ab')
++        self._buffer = b''
++        self._clock = clock
++        self._sleeper = sleeper
++
++    def send_line(self, text):
++        data = (text + NEWLINE).encode('utf-8')
++        self._raw.write(b'>>> ' + data)
++        self._raw.flush()
++        self._link.write(data)
++
++    def _pump(self):
++        chunk = self._link.read(256)
++        if not chunk:
++            return False
++        self._raw.write(chunk)
++        self._raw.flush()
++        self._buffer += chunk
++        return True
++
++    def read_line(self, deadline):
++        while True:
++            if b'\n' in self._buffer:
++                raw, self._buffer = self._buffer.split(b'\n', 1)
++                return raw.decode('utf-8', 'replace').rstrip('\r')
++            if self._clock() >= deadline:
++                return None
++            if not self._pump():
++                self._sleeper(0.05)
++
++    def close(self):
++        try:
++            self._link.close()
++        finally:
++            self._raw.close()
++
++
++class RebootRunner:
++    def __init__(self, args, out_dir, serial_factory, process_runner, clock, sleeper):
++        self.args = args
++        self.out_dir = pathlib.Path(out_dir)
++        self.serial_factory = serial_factory
++        self.process_runner = process_runner
++        self.clock = clock
++        self.sleeper = sleeper
++        self.raw_log = self.out_dir / 'uart.log'
++        self.token = TOKEN_PREFIX + secrets.token_hex(8).upper()
++        self.result = {}
++
++    def _console(self):
++        return Console(self.serial_factory(self.args.port), self.raw_log,
++                       self.clock, self.sleeper)
++
++    def _confirm_shell_alive(self, console):
++        console.send_line('sync; echo ' + self.token)
++        deadline = self.clock() + self.args.token_timeout
++        while True:
++            line = console.read_line(deadline)
++            if line is None:
++                raise UpdateError('did not observe the exclusive token line before timeout')
++            if line.strip() == self.token:
++                return
++
++    def _drain(self, console, quiet=1.0, limit=10.0):
++        end = self.clock() + limit
++        while self.clock() < end:
++            if console.read_line(self.clock() + quiet) is None:
++                return
++
++    def _load_bit(self):
++        argv = ['openFPGALoader', '-b', FPGA_BOARD, '--freq', FPGA_FREQ, str(self.args.bit)]
++        proc = self.process_runner(argv, None)
++        (self.out_dir / 'fpga-load.stdout').write_bytes(proc.stdout or b'')
++        (self.out_dir / 'fpga-load.stderr').write_bytes(proc.stderr or b'')
++        self.result['fpga'] = {'board': FPGA_BOARD, 'freq': FPGA_FREQ, 'argv': argv,
++                               'returncode': proc.returncode}
++        if proc.returncode != 0:
++            raise UpdateError('openFPGALoader exit=' + str(proc.returncode))
++
++    def _wait_for_shell(self, console):
++        deadline = self.clock() + self.args.boot_timeout
++        while True:
++            line = console.read_line(deadline)
++            if line is None:
++                raise UpdateError('no login prompt or shell prompt before boot timeout')
++            text = line.strip()
++            if PASSWORD_RE.search(text):
++                console.send_line('')
++                continue
++            if LOGIN_RE.search(text):
++                console.send_line('root')
++                continue
++            if PROMPT_RE.search(text):
++                return
++
++    def _read_identity(self, console):
++        command = ('echo ' + UNAME_START + '; uname -r; echo ' + UNAME_END
++                   + '; cat ' + BOOT_ID_PATH + '; echo ' + CAPTURE_END)
++        console.send_line(command)
++        deadline = self.clock() + self.args.command_timeout
++        uname = None
++        boot_id = None
++        section = None
++        while True:
++            line = console.read_line(deadline)
++            if line is None:
++                raise UpdateError('identity capture timed out')
++            text = line.strip()
++            if text == UNAME_START:
++                section = 'uname'
++                continue
++            if text == UNAME_END:
++                section = 'boot_id'
++                continue
++            if text == CAPTURE_END:
++                return uname, boot_id
++            if section == 'uname' and text and uname is None:
++                uname = text
++            elif section == 'boot_id' and text and boot_id is None:
++                boot_id = text
++
++    def run(self):
++        self.out_dir.mkdir(parents=True, exist_ok=False)
++        self.result = {
++            'schema': SCHEMA,
++            'mode': 'run',
++            'started_at': utc_now(),
++            'port': self.args.port,
++            'bit': str(self.args.bit),
++            'bit_sha256': sha256_file(self.args.bit),
++            'expected_kernel': self.args.expected_kernel,
++            'token': self.token,
++            'uart_log': 'uart.log',
++            'success_requires': ['uname -r == expected_kernel', 'non-empty boot_id'],
++            'status': 'running',
++        }
++        console = None
++        try:
++            console = self._console()
++            self._confirm_shell_alive(console)
++            self._drain(console)
++            self._load_bit()
++            self._wait_for_shell(console)
++            uname, boot_id = self._read_identity(console)
++            if uname != self.args.expected_kernel:
++                raise UpdateError('uname -r mismatch: ' + repr(uname)
++                                  + ' != expected ' + repr(self.args.expected_kernel))
++            if not boot_id:
++                raise UpdateError('boot_id is empty after reboot')
++            self.result['uname_r'] = uname
++            self.result['boot_id'] = boot_id
++            self.result['status'] = 'complete'
++            return 0
++        except BaseException as exc:
++            self.result['status'] = 'failed'
++            self.result['error'] = type(exc).__name__ + ': ' + str(exc)
++            raise
++        finally:
++            if console is not None:
++                try:
++                    console.close()
++                except Exception:
++                    pass
++            self.result['finished_at'] = utc_now()
++            write_json(self.out_dir / 'result.json', self.result)
++
++
++def build_arg_parser():
++    parser = argparse.ArgumentParser(
++        description='External JTAG BIT reload and boot UART verification')
++    parser.add_argument('--run', action='store_true',
++                        help='open the serial port and load the BIT; default is dry-run')
++    parser.add_argument('--port', help='serial device (required with --run, never auto-scanned)')
++    parser.add_argument('--bit', help='local BIT file (required with --run, never auto-selected)')
++    parser.add_argument('--expected-kernel', help='exact uname -r expected after reboot')
++    parser.add_argument('--out', help='new output directory (required with --run)')
++    parser.add_argument('--token-timeout', type=float, default=30.0)
++    parser.add_argument('--boot-timeout', type=float, default=180.0)
++    parser.add_argument('--command-timeout', type=float, default=30.0)
++    return parser
++
++
++def dry_run(args, stream=None):
++    stream = sys.stdout if stream is None else stream
++    print('mode=dry-run (no serial, no JTAG load, no writes)', file=stream)
++    print('port=' + str(args.port), file=stream)
++    print('bit=' + str(args.bit), file=stream)
++    print('expected_kernel=' + str(args.expected_kernel), file=stream)
++    print('out=' + str(args.out), file=stream)
++    print('fpga_command=openFPGALoader -b ' + FPGA_BOARD + ' --freq ' + FPGA_FREQ + ' <BIT>',
++          file=stream)
++    return 0
++
++
++def main(argv=None, *, serial_factory=None, process_runner=None, clock=None, sleeper=None):
++    args = build_arg_parser().parse_args(argv)
++    if not args.run:
++        return dry_run(args)
++    if not args.port:
++        raise SystemExit('--port is required with --run (no auto scan)')
++    if not args.bit:
++        raise SystemExit('--bit is required with --run (no BIT auto selection)')
++    if not args.expected_kernel:
++        raise SystemExit('--expected-kernel is required with --run')
++    if not args.out:
++        raise SystemExit('--out is required with --run')
++    bit = pathlib.Path(args.bit)
++    if not bit.is_file():
++        raise SystemExit('--bit is not a local file: ' + str(bit))
++    if bit.stat().st_size == 0:
++        raise SystemExit('--bit is empty: ' + str(bit))
++    out_dir = pathlib.Path(args.out)
++    if out_dir.exists():
++        raise SystemExit('--out already exists: ' + str(out_dir))
++    runner = RebootRunner(args, out_dir,
++                          serial_factory or default_serial_factory,
++                          process_runner or default_process_runner,
++                          clock or time.monotonic,
++                          sleeper or time.sleep)
++    return runner.run()
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+
+diff --git a/tests/test_mac_update_reboot.py b/tests/test_mac_update_reboot.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_mac_update_reboot.py
+@@ -0,0 +1,308 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""Unit tests for scripts/mac_update_reboot.py.
++
++No real serial port, no real JTAG and no real subprocess: the serial factory, the
++process runner, the clock and the sleeper are all injected fakes, so the runner's
++real control flow is exercised end to end.
++"""
++from __future__ import annotations
++
++import contextlib
++import importlib.util
++import io
++import json
++import pathlib
++import sys
++import tempfile
++import types
++import unittest
++
++HERE = pathlib.Path(__file__).resolve()
++REPO = HERE.parent.parent
++SCRIPT = REPO / 'scripts' / 'mac_update_reboot.py'
++
++KERNEL = '6.1.0-cpn2-net1'
++BOOT_ID = '01234567-89ab-cdef-0123-456789abcdef'
++
++
++def load_module():
++    spec = importlib.util.spec_from_file_location('mac_update_reboot', SCRIPT)
++    if spec is None or spec.loader is None:
++        raise RuntimeError('cannot load ' + str(SCRIPT))
++    module = importlib.util.module_from_spec(spec)
++    sys.modules['mac_update_reboot'] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++mac = load_module()
++
++
++class FakeClock:
++    def __init__(self):
++        self.t = 0.0
++
++    def __call__(self):
++        return self.t
++
++    def sleep(self, seconds):
++        self.t += max(0.0, float(seconds))
++
++
++class FakeSerial:
++    def __init__(self):
++        self.to_read = bytearray()
++        self.written = []
++        self.closed = 0
++        self.on_write = None
++
++    def feed(self, data):
++        if isinstance(data, str):
++            data = data.encode('utf-8')
++        self.to_read += data
++
++    def write(self, data):
++        data = bytes(data)
++        self.written.append(data)
++        if self.on_write is not None:
++            self.on_write(data)
++
++    def read(self, count):
++        if not self.to_read:
++            return b''
++        out = bytes(self.to_read[:count])
++        del self.to_read[:count]
++        return out
++
++    def close(self):
++        self.closed += 1
++
++
++class FakeBoard:
++    """Models just enough of the SD-boot board shell over the fake UART."""
++
++    def __init__(self, kernel=KERNEL, boot_id=BOOT_ID, execute_token=True,
++                 prompt_on_boot=True, echo=True):
++        self.serial = FakeSerial()
++        self.kernel = kernel
++        self.boot_id = boot_id
++        self.execute_token = execute_token
++        self.prompt_on_boot = prompt_on_boot
++        self.echo = echo
++        self.serial.on_write = self._on_write
++
++    def _emit(self, text):
++        self.serial.feed(text)
++
++    def _on_write(self, data):
++        line = data.decode('utf-8', 'replace').rstrip()
++        if self.echo:
++            self._emit(line + '\r\n')
++        prefix = 'sync; echo '
++        if line.startswith(prefix):
++            if self.execute_token:
++                self._emit(line[len(prefix):].strip() + '\r\n')
++        elif line.startswith('echo ' + mac.UNAME_START):
++            self._emit(mac.UNAME_START + '\r\n')
++            self._emit(self.kernel + '\r\n')
++            self._emit(mac.UNAME_END + '\r\n')
++            self._emit(self.boot_id + '\r\n')
++            self._emit(mac.CAPTURE_END + '\r\n')
++            self._emit('# \r\n')
++
++    def reboot(self):
++        if self.prompt_on_boot:
++            self._emit('# \r\n')
++
++
++class FakeProcessRunner:
++    def __init__(self, board=None, returncode=0):
++        self.board = board
++        self.returncode = returncode
++        self.calls = []
++
++    def __call__(self, argv, cwd=None):
++        self.calls.append(list(argv))
++        if self.board is not None and self.returncode == 0:
++            self.board.reboot()
++        return types.SimpleNamespace(returncode=self.returncode,
++                                     stdout=b'fake openFPGALoader\n', stderr=b'')
++
++
++class MacUpdateRebootTests(unittest.TestCase):
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory(prefix='idma-mac-update-')
++        self.tmp = pathlib.Path(self._tmp.name)
++        self.addCleanup(self._tmp.cleanup)
++        self.bit = self.tmp / 'known.bit'
++        self.bit.write_bytes(b'\x00' * 32)
++        self.clock = FakeClock()
++
++    def _no_serial(self, port):
++        raise AssertionError('the serial port must not be opened')
++
++    def _no_process(self, argv, cwd=None):
++        raise AssertionError('no process may be started')
++
++    def _inject(self, **kwargs):
++        kwargs.setdefault('serial_factory', self._no_serial)
++        kwargs.setdefault('process_runner', self._no_process)
++        kwargs.setdefault('clock', self.clock)
++        kwargs.setdefault('sleeper', self.clock.sleep)
++        return kwargs
++
++    def run_args(self, out_dir, port='FAKE0', kernel=KERNEL, bit=None):
++        return ['--run', '--port', port, '--bit', str(bit or self.bit),
++                '--expected-kernel', kernel, '--out', str(out_dir)]
++
++    def test_dry_run_writes_nothing_and_touches_no_host(self):
++        out_dir = self.tmp / 'never-created'
++        calls = []
++
++        def factory(port):
++            calls.append(port)
++            raise AssertionError('serial must not be opened in dry-run')
++
++        with contextlib.redirect_stdout(io.StringIO()):
++            rc = mac.main(['--port', 'FAKE0', '--bit', str(self.bit),
++                           '--expected-kernel', KERNEL, '--out', str(out_dir)],
++                          **self._inject(serial_factory=factory))
++        self.assertEqual(rc, 0)
++        self.assertEqual(calls, [])
++        self.assertFalse(out_dir.exists())
++        self.assertEqual([p.name for p in self.tmp.iterdir()], ['known.bit'])
++
++    def test_run_requires_explicit_port_bit_kernel_and_out(self):
++        cases = [
++            ['--run'],
++            ['--run', '--bit', str(self.bit), '--expected-kernel', KERNEL,
++             '--out', str(self.tmp / 'a')],
++            ['--run', '--port', 'FAKE0', '--expected-kernel', KERNEL,
++             '--out', str(self.tmp / 'b')],
++            ['--run', '--port', 'FAKE0', '--bit', str(self.bit),
++             '--out', str(self.tmp / 'c')],
++            ['--run', '--port', 'FAKE0', '--bit', str(self.bit),
++             '--expected-kernel', KERNEL],
++        ]
++        for argv in cases:
++            with self.assertRaises(SystemExit):
++                mac.main(argv, **self._inject())
++
++    def test_missing_or_empty_bit_is_refused(self):
++        missing = self.tmp / 'missing.bit'
++        empty = self.tmp / 'empty.bit'
++        empty.write_bytes(b'')
++        for bit in (missing, empty):
++            with self.assertRaises(SystemExit):
++                mac.main(self.run_args(self.tmp / 'never', bit=bit), **self._inject())
++        self.assertFalse((self.tmp / 'never').exists())
++
++    def test_existing_out_is_refused_and_never_overwritten(self):
++        out_dir = self.tmp / 'existing'
++        out_dir.mkdir()
++        marker = out_dir / 'keep.txt'
++        marker.write_text('old')
++        with self.assertRaises(SystemExit):
++            mac.main(self.run_args(out_dir), **self._inject())
++        self.assertEqual(marker.read_text(), 'old')
++        self.assertEqual([p.name for p in out_dir.iterdir()], ['keep.txt'])
++
++    def test_command_echo_is_not_accepted_as_token_confirmation(self):
++        board = FakeBoard(execute_token=False)
++        runner = FakeProcessRunner(board)
++        out_dir = self.tmp / 'echo-only'
++        with self.assertRaises(mac.UpdateError):
++            mac.main(self.run_args(out_dir),
++                     **self._inject(serial_factory=lambda port: board.serial,
++                                    process_runner=runner))
++        self.assertEqual(runner.calls, [])
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual(result['status'], 'failed')
++        self.assertIn('token', result['error'].lower())
++        self.assertTrue((out_dir / 'uart.log').is_file())
++
++    def test_flash_failure_stops_without_retry(self):
++        board = FakeBoard()
++        runner = FakeProcessRunner(board, returncode=1)
++        out_dir = self.tmp / 'flash-fail'
++        with self.assertRaises(mac.UpdateError):
++            mac.main(self.run_args(out_dir),
++                     **self._inject(serial_factory=lambda port: board.serial,
++                                    process_runner=runner))
++        self.assertEqual(len(runner.calls), 1)
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual(result['status'], 'failed')
++        self.assertEqual(result['fpga']['returncode'], 1)
++        self.assertEqual(board.serial.closed, 1)
++
++    def test_boot_timeout_stops(self):
++        board = FakeBoard(prompt_on_boot=False)
++        runner = FakeProcessRunner(board)
++        out_dir = self.tmp / 'boot-timeout'
++        with self.assertRaises(mac.UpdateError):
++            mac.main(self.run_args(out_dir),
++                     **self._inject(serial_factory=lambda port: board.serial,
++                                    process_runner=runner))
++        self.assertEqual(len(runner.calls), 1)
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual(result['status'], 'failed')
++        self.assertIn('prompt', result['error'].lower())
++
++    def test_uname_mismatch_fails(self):
++        board = FakeBoard(kernel='9.9.9-wrong')
++        runner = FakeProcessRunner(board)
++        out_dir = self.tmp / 'uname-bad'
++        with self.assertRaises(mac.UpdateError):
++            mac.main(self.run_args(out_dir),
++                     **self._inject(serial_factory=lambda port: board.serial,
++                                    process_runner=runner))
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual(result['status'], 'failed')
++        self.assertNotIn('uname_r', result)
++
++    def test_empty_boot_id_fails(self):
++        board = FakeBoard(boot_id='')
++        runner = FakeProcessRunner(board)
++        out_dir = self.tmp / 'bootid-bad'
++        with self.assertRaises(mac.UpdateError):
++            mac.main(self.run_args(out_dir),
++                     **self._inject(serial_factory=lambda port: board.serial,
++                                    process_runner=runner))
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual(result['status'], 'failed')
++        self.assertIn('boot_id', result['error'])
++
++    def test_success_requires_kernel_and_boot_id(self):
++        board = FakeBoard()
++        runner = FakeProcessRunner(board)
++        out_dir = self.tmp / 'success'
++        opened = []
++
++        def factory(port):
++            opened.append(port)
++            return board.serial
++
++        rc = mac.main(self.run_args(out_dir),
++                      **self._inject(serial_factory=factory, process_runner=runner))
++        self.assertEqual(rc, 0)
++        self.assertEqual(opened, ['FAKE0'])
++        self.assertEqual(board.serial.closed, 1)
++        self.assertEqual(len(runner.calls), 1)
++        argv = runner.calls[0]
++        self.assertEqual(argv[0], 'openFPGALoader')
++        self.assertIn('genesys2', argv)
++        self.assertIn('1000000', argv)
++        self.assertIn(str(self.bit), argv)
++        self.assertNotIn('--write-flash', argv)
++        result = json.loads((out_dir / 'result.json').read_text())
++        self.assertEqual(result['status'], 'complete')
++        self.assertEqual(result['uname_r'], KERNEL)
++        self.assertEqual(result['boot_id'], BOOT_ID)
++        self.assertEqual(result['bit_sha256'], mac.sha256_file(self.bit))
++        self.assertTrue((out_dir / 'uart.log').is_file())
++        self.assertTrue((out_dir / 'fpga-load.stdout').is_file())
++
++
++if __name__ == '__main__':
++    unittest.main()

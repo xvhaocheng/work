@@ -1,0 +1,304 @@
+# 数据搬运 / 间接访问 / 布局 / 动态内存 / 同步 文献地图报告
+
+> 范围声明：本报告只基于 `papers/*.txt` 提取文本与 `MAP_BRIEF.md`、`source-manifest.json` 提供的信息。行号均指该提取文本的行号。对题录不确定处照 `MAP_BRIEF.md` §"已核对题录提醒" 标注。所有"实测事实 / 作者解释 / 我的综合推断 / 研究机会"四类已分开标注。未运行任何实验。
+
+分配论文（12 篇）：dae1982、impica2016、nds2021、gps2021、bypassd2024、dx1002025、vattention2024、vtensor2024、gmlake2024、minisa2026、tiara2026、wic2025。
+
+---
+
+## 0. 先给结论：这条线真正的问题结构
+
+用户强调的四个问题，先用一句话各自定位，后面逐条给证据：
+
+1. **"零散数据/零拷贝/预取/epoch"口号不足以成为新问题**：因为 (a) 可批量发出的散读（gather/scatter）本就能被重排、合并、流水，DX100 把它做成一行 ISA；而 (b) 真正吃 RTT 的是"地址依赖远端返回数据"的串行链（Tiara 明确把两者切开）。没有把这两者分开的口号（"间接访问慢"、"拷贝多"、"要 epoch"）无法定义可验证的缺口。证据：`dx1002025.txt:479-495`、`tiara2026.txt:150-157`、`impica2016.txt:50-53`。
+2. **数据依赖无法预知地址 vs 可批量发出的散读**：这是本线唯一的硬分界。前者 = pointer chasing / multi-level translation / conditional multi-host，作者们一致承认 prefetcher 与 reorder 都无能为力（`impica2016.txt:8-14`、`dx1002025.txt:1085-1093`、`tiara2026.txt:60-68`）；后者 = scatter/gather，可重排/合并/交错（`dx1002025.txt:71-163`）。
+3. **动态内存限制不能假设总是瓶颈**：vAttention 用同一套 CUDA VMM API，证明"每迭代 1 token、需求可预知"时映射延迟可被后台线程完全隐藏，并且分配带宽（7.6–70 GB/s）比实际需求（≤600 MB/s）高一个量级以上（`vattention2024.txt:342-355, 554-611, 832-861`）。GMLake 反过来证明"未加缓存池的裸 VMM API"确实慢到 115×（`gmlake2024.txt:336-361`）。所以瓶颈位置取决于**是否可预知 + 是否有缓存池/重叠**，不是 VMM 本身。
+4. **同步成本与合法语义要分开**：GPS 用 relaxed memory model 合并弱写、sys-scoped 保持强语义（`gps2021.txt:373-430, 576-591`）；WIC 把 polling 换成 warp 级中断（`wic2025.txt:44-65`）；Tiara 用静态验证换取"注册期无运行期检查"（`tiara2026.txt:303-330`）。三者都在改**同步/控制面**，均未宣称 IOMMU 必须全局停机。
+
+---
+
+## 1. 演变：经典问题 → 方法族 → 旧假设吃紧 → 2024–2026 前沿
+
+按因果关系（不是年份）组织：
+
+### 1.1 根问题（1982）
+内存通信时间是第一约束，而虚拟内存+保护检查让它更慢（`dae1982.txt:11-24`）。对策：把"算地址/发访存"与"执行"解耦（DAE），让地址流跑在执行流前面，用队列隐藏延迟（`dae1982.txt:117-151`）。关键假设：标量流水线、地址可提前算好、编译器/程序员能协调两条流（`dae1982.txt:129-135, 531-545`）。这个假设在"地址本身来自内存"时立刻失效——这正是后续 40 年反复出现的那道墙。
+
+### 1.2 间接访问问题族（2016 → 2025）
+- **pointer chasing**（真串行依赖）：`impica2016.txt:50-53` 明确"下一个节点地址只有取到当前节点后才知道"，`impica2016.txt:8-14` 把它与 prefetcher 的效果差列成三条缺点。对策是 PIM + address-access decoupling（借用 DAE 思想但目标是**跨线程 TLP**而非单线程 ILP，`impica2016.txt:338-344`）。
+- **bulk 间接访问**（可批量散读）：`dx1002025.txt` 把问题重新定义为"DRAM controller 可见窗口只有 32–128 条请求，不够 indirect 应用重排"（`dx1002025.txt:71-163`），从而把可行的重排窗口做到 16K。
+- **"Indirection Wall"**（跨节点版）：Tiara 把三类模式（pointer chase / multi-level translation / conditional multi-host）统一为"地址依赖远端数据"（`tiara2026.txt:60-68`）。
+
+### 1.3 布局/维度问题族（2021）
+NDS 指出 accelerator（2D tensor）、存储设备（多 channel/bank）、应用三者维度不匹配，导致 P1 序列化 marshalling、P2 互联带宽欠用、P3 设备带宽欠用（`nds2021.txt:137-270`）。对策：多维地址空间 + building blocks（`nds2021.txt:426-540`）。
+
+### 1.4 多 GPU 数据搬运/同步（2021 → 2025）
+GPS：local vs remote 带宽差 3×，UM 的 fault 与 peer load 都在关键路径上（`gps2021.txt:92-204`）。对策：publish-subscribe + 本地副本 + 主动广播（`gps2021.txt:190-204`）。它利用 GPU 弱内存模型做合并，但 sys-scoped 写要坍缩到单副本并 TLB shootdown（`gps2021.txt:576-591`）。WIC（2025）把战场从设备间搬到**warp 级 polling**（`wic2025.txt:90-121`）。
+
+### 1.5 用户态 I/O 与 IOMMU 复用（2024）
+BypassD 指出低延迟 SSD 下内核栈是主要 overhead（`bypassd2024.txt:14-124`），并把 IOMMU 从"虚拟地址→物理地址"复用为"VBA→LBA + 权限检查"（`bypassd2024.txt:215-251, 460-497`）。它同时回答"共享/保护"这一零拷贝方案回避的问题。
+
+### 1.6 GPU 动态内存（2024 三条不同路线）
+- **vAttention**：保留虚拟连续 + demand paging，关键是"分配延迟可被隐藏"（`vattention2024.txt:407-458, 554-611`）。
+- **vTensor/FlexInfer**：把内存管理与 compute kernel 解耦，用 CPU 侧管理 VMM，让 kernel 能重新用 tensor core（`vtensor2024.txt:64-140, 270-350`）。它指出 vLLM 因只能用 CUDA core，在 MQA 上被限制在 3.6 TFLOP/s（`vtensor2024.txt:322-335`）。
+- **GMLake**：训练场景的碎片整理，VMS 缝合（`gmlake2024.txt:105-116`）。
+
+### 1.7 ISA / 可重配置加速器（2025–2026）
+- **DX100**：可编程数据访问加速器，用 8 条 ISA 覆盖 indirect load/store/RMW + range fusing（`dx1002025.txt:256-271`）。
+- **MINISA**：把 FEATHER+ 的控制从 switch 级升到 Virtual Neuron 级，压缩指令足迹（`minisa2026.txt:253-270`）。它解决的是**控制面**，与数据搬运正交。
+
+### 1.8 远程内存 ISA（2026）
+Tiara 把 indirection 解算放到内存侧 NIC，用 eBPF 式预注册程序把多 RTT 链折叠成 1 RTT（`tiara2026.txt:22-32`）。
+
+**因果主线总结**：每当延迟可被"提前算地址/批量重排/主动推送/后台重叠/本地解链"隐藏时，问题就变成工程问题；只有当地址**必须等他方数据返回**且**无法并发**时，才是结构性缺口。这条线 44 年来的所有方案成败，都落在这一分界上。
+
+---
+
+## 2. 证据卡（12 篇）
+
+> 格式：题录 → 针对问题 → 核心机制 → 适用假设/代价 → 平台/负载/强基线 → 一条不可外推的结论 → 引用。每卡 ≤ ~200 英文词等量。
+
+### 卡 1 — DAE
+- **题录**：*Decoupled Access/Execute Computer Architectures*, James E. Smith, ISCA 1982（`dae1982.txt:1, 4, 70`）。状态：ISCA 1982 归档 PDF。
+- **问题**：处理器-内存通信时间成为性能约束，虚拟内存/保护检查加剧（`dae1982.txt:11-24`）。
+- **机制**：A-processor 负责地址计算与访存，E-processor 负责执行；AEQ/EAQ 队列；store 一旦算出地址即发，WAQ 存地址等数据（`dae1982.txt:117-151`）；分支队列 EABQ/AEBQ（`dae1982.txt:226-238`）；队列用寄存器堆环形缓冲实现（`dae1982.txt:295-304`）。
+- **假设/代价**：需两条指令流，编译器/程序员负责协调；正确 interleaving 才无死锁（`dae1982.txt:481-530, 593-618`）。
+- **评估**：简化的 CRAY-1 标量模型，手工编译 14 个 Lawrence Livermore Loops；平均 ~1.7×，最高 2.5×（`dae1982.txt:358-477`）。
+- **不可外推**：这不是实测硬件，也无现代多核/IOMMU；不能拿 1.7× 直接外推到任何现代系统。
+- **引用**：`papers/dae1982.txt:11-24, 117-151, 358-477 §2-§6/Fig.5`。
+
+### 卡 2 — IMPICA
+- **题录**：*Accelerating Pointer Chasing in 3D-Stacked Memory*, ICCD 2016（`impica2016.txt:1-2`；brief 行 28 确认 ICCD 2016）。
+- **问题**：pointer chasing 内存 bound 且延迟敏感；依赖链限制 ILP/MLP（`impica2016.txt:8-14, 50-53`）。
+- **机制**：把指针追逐放进 3D 堆叠内存逻辑层；address-access decoupling（借鉴 DAE，但目标是跨线程 TLP 而非 ILP，且无需程序员/编译器参与，`impica2016.txt:338-344`）；region-based page table（RPT）代替复制 CPU TLB（`impica2016.txt:384-471`）。
+- **假设/代价**：只处理可映射到连续区域的链表结构；一致性靠"所有操作都在 accelerator 执行"（`impica2016.txt:89-113, 452-458, 503-509`）。面积约 Cortex-A57 的 7.6%（`impica2016.txt:586-589`）。
+- **评估**：gem5 + DRAMSim2，ARMv8 4 核（`impica2016.txt:462-484`）；linked list 1.92×、hash 1.29×、B-tree 1.18×；DBx1000 +16% 吞吐 / −13% 延迟（`impica2016.txt:119-124, 653-662`）。强基线：面积等价的 +128KB L2（仅 1.03×）；RPT 比常规 4 级页表快 2×（`impica2016.txt:464-466, 611-618`）；TLB 32→64 几乎无差别（`impica2016.txt:706-708`）。
+- **不可外推**：不能推出"TLB 大小无关"是普遍规律——作者解释是 pointer chasing 本身不规则（`impica2016.txt:708-712`）。
+- **引用**：`papers/impica2016.txt:8-14, 338-344, 462-484, 586-589, 653-708 §3-§7`。
+
+### 卡 3 — NDS
+- **题录**：*NDS: N-Dimensional Storage*, MICRO 2021（`nds2021.txt:1, 44-47`）。
+- **问题**：accelerator/设备/应用三者维度不匹配 → P1 marshalling、P2 互联带宽欠用、P3 设备带宽欠用（`nds2021.txt:137-270`）。
+- **机制**：多维地址空间；Space Translation Layer（STL）；building blocks（跨 channel/bank 逻辑块）；B-tree 定位（`nds2021.txt:426-540, 617-655`）；硬件版把 STL 放进 SSD 控制器（`nds2021.txt:792-847`）。
+- **假设/代价**：producer/consumer 维度可不同但体积需匹配（`nds2021.txt:488-491`）；NVM 有 channel/bank 并行；硬件版控制器比 host CPU 弱，写入有 17% 损失（`nds2021.txt:1322-1326`）。加密要求 building block 维度 > 加密块（`nds2021.txt:849-875`）。
+- **评估**：AMD RyZen 3700X + RTX 2080 + 自建 32 通道 TLC-NAND SSD（`nds2021.txt:844-862`）；10 个应用；软件版 5.07×、硬件版 5.73×（`nds2021.txt:30-31, 105-118`）。强基线：row/column-store + oracle 软件布局（`nds2021.txt:1314-1349`）。
+- **不可外推**：不能推出"硬件 NDS 一定优于软件"——作者承认硬件控制器更弱，只靠内部带宽（`nds2021.txt:1324-1332`）。
+- **引用**：`papers/nds2021.txt:137-270, 426-540, 844-862, 1322-1349 §2-§7`。
+
+### 卡 4 — GPS
+- **题录**：*GPS: A Global Publish-Subscribe Model for Multi-GPU Memory Management*, MICRO 2021（`gps2021.txt:1, 15-19`）。
+- **问题**：multi-GPU strong scaling 被互联带宽与 UM fault 限制（`gps2021.txt:92-204`）。
+- **机制**：按页追踪订阅者、本地副本、主动广播 store；GPS PTE 位 + GPS 页表 + remote write queue 合并 + access tracking unit（`gps2021.txt:190-204, 469-620`）。主动利用 GPU 弱内存模型对非 sys-scoped 写做合并（`gps2021.txt:373-430`）。
+- **假设/代价**：auto subscription 需迭代/相位行为（`gps2021.txt:343-345`）；sys-scoped 写要坍缩单副本 + TLB shootdown，成本高因此假设其稀少（`gps2021.txt:415-425, 576-591`）；仍受 false sharing 与 cacheline 粒度影响（`gps2021.txt:1228-1243`）。
+- **评估**：NVAS 模拟 4×GV100 PCIe（`gps2021.txt:615-653`）；3.0× vs 单 GPU、比次优高 2.3×（`gps2021.txt:34-36`）；16-GPU + 投影 PCIe 6.0 得 7.9×、达无限带宽的 80%（`gps2021.txt:36-39, 1119-1143`）。强基线：UM、UM+hints、RDL、memcpy、无限带宽（`gps2021.txt:696-706`）。
+- **不可外推**：仿真而非硬件，且互联参数部分为 projection（`gps2021.txt:664-666`）——不能当成真实 NVLink 系统的实测结论。
+- **引用**：`papers/gps2021.txt:92-204, 343-430, 615-706, 1228-1243 §2-§7`。
+
+### 卡 5 — BypassD
+- **题录**：*BypassD: Enabling fast userspace access to shared SSDs*, ASPLOS 2024（`bypassd2024.txt:1, 14-18`）。
+- **问题**：低延迟 SSD 下内核 I/O 栈 overhead 占大头（4KB read 总共 7850ns，device 只 4020ns，`bypassd2024.txt:69-74`）；用户态方案难做安全共享（`bypassd2024.txt:78-124`）。
+- **机制**：VBA（Virtual Block Address）→ LBA，复用 IOMMU 做翻译 + 权限检查；FTE 放进进程页表；`fmap()` 建映射（`bypassd2024.txt:215-290, 460-497`）；元数据走内核、数据走用户态（`bypassd2024.txt:255-276, 382-403`）。
+- **假设/代价**：ext4（非数据日志）、NVMe、同步完成；不支持 CoW；不支持 BypassD 与内核接口并发（`bypassd2024.txt:370-373, 499-541`）；ret 路径依赖 ATS（`bypassd2024.txt:443-444, 453-459`）。
+- **评估**：Xeon Gold 5317 + Optane P5800X（`bypassd2024.txt:554-558`）；4KB 延迟较 Linux 内核降 42%，接近不支持共享的 SPDK（`bypassd2024.txt:34-39`）。强基线：sync、libaio、io_uring、SPDK、XRP、KVell（`bypassd2024.txt:663-668, 951-1005`）。VBA 翻译 550ns；IOTLB miss 仅多 183ns（`bypassd2024.txt:251, 603-604, 648-649`）；IOMMU overhead 不随翻译条数线性增长（`bypassd2024.txt:650-658`）。
+- **不可外推**：IOMMU 改动是用延迟模型模拟的（`bypassd2024.txt:637-662`），不能当成真实硬件 IOMMU 已支持 VBA 翻译。IOTLB 命中与否只差 183ns，也不能外推成"所有 IOMMU 可缓存无关"。
+- **引用**：`papers/bypassd2024.txt:69-124, 215-290, 460-541, 554-668 §1-§6`。
+
+### 卡 6 — DX100
+- **题录**：*DX100: A Programmable Data Access Accelerator for Indirection*, ISCA 2025（`dx1002025.txt:1-2, 56-63`）。
+- **问题**：间接访问导致 row-buffer hit 低、MLP 受限、controller 重排窗口只有 32–128 请求（`dx1002025.txt:9-49, 71-204`）。
+- **机制**：共享可编程数据访问加速器；对 bulk indices 做 reorder/coalesce/interleave；8 条 ISA（ILD/IST/IRMW/SLD/SST/ALUV/ALUS/RNG）；Row Table + Word Table（`dx1002025.txt:256-360`）。
+- **关键边界（用户强调的分界）**：DX100 **明确不支持 pointer chasing**（`*next[i]`），只做 array-based indirection（`dx1002025.txt:479-495`）；小 frontier 也不加速，退化为 C 代码（`dx1002025.txt:488-495`）。这是"可批量散读 ≠ 不可预知地址"的原文证据。
+- **假设/代价**：需 bulk 访问；DX100 独占 indirect 区域的写权限；需 huge pages + 小 TLB；要求循环迭代间无数据依赖（`dx1002025.txt:199-211, 449-452, 501-521`）。
+- **评估**：gem5 + Ramulator2，4 核 DDR4-3200（`dx1002025.txt:522-580`）；12 负载 2.6× vs 多核基线、2.0× vs DMP 间接预取器（`dx1002025.txt:37-38, 742-743`）；带宽利用率 3.9×、row-buffer hit 2.7×（`dx1002025.txt:719-720, 874-881`）。最坏 index pattern 仍有 9.9×（`dx1002025.txt:717-721`）。面积 4.061mm² @28nm，折合 14nm 约 1.5mm²、3.7% 核开销（`dx1002025.txt:1180-1190`）。
+- **不可外推**：不能把 DX100 的 2.0× 外推成"对指针链也有效"——语义限制明说不行。
+- **引用**：`papers/dx1002025.txt:9-49, 256-360, 479-521, 742-743, 1180-1190 §1-§6`。
+
+### 卡 7 — vAttention
+- **题录**：*vAttention: Dynamic Memory Management for Serving LLMs without PagedAttention*, arXiv 2024（`vattention2024.txt:1-2`；brief 行 29：arXiv 2024，与 Sarathi-Serve 集成不等于 OSDI 2024）。
+- **问题**：PagedAttention 要重写 attention kernel、在 serving 框架里重实现分页、并引入运行时 overhead（`vattention2024.txt:98-124, 216-361`）。
+- **机制**：KV-cache 保留虚拟连续；用 CUDA 低层 VMM API 分开虚拟/物理；改开源 UVM driver 支持 64–256KB 页；优化：分配与 compute 重叠、延迟回收 + 提前分配（`vattention2024.txt:407-458, 460-611`）。
+- **假设/代价**：每迭代 KV 需求可预知（Observation 1，`vattention2024.txt:337-341`）；分配带宽需求 ≤600MB/s（Observation 2，`vattention2024.txt:342-355`）；需后台线程与 driver 改动。
+- **评估**：1–2×A100，Yi-6B/Llama-3-8B/Yi-34B（`vattention2024.txt:537-541, 554-555`）；decode 比 vLLM 快至 1.97×，TTFT 相对 FlashInfer paged 降 1.45×（`vattention2024.txt:49-52`）。分配带宽 7.59–70.34 GB/s（Table 7，`vattention2024.txt:832-836`），比 600MB/s 需求高一个量级；重叠可完全隐藏分配延迟（Fig 10，`vattention2024.txt:817-845`）。64KB 页最坏每请求浪费 4–15MB（Table 8，`vattention2024.txt:872-882`）。
+- **不可外推**：不能推出"动态映射永远不是瓶颈"——作者条件是"需求可预知 + 有重叠"。反例由 GMLake 提供（见卡 9）。
+- **引用**：`papers/vattention2024.txt:98-124, 337-355, 407-611, 832-882 §3-§7`。
+
+### 卡 8 — vTensor / FlexInfer
+- **题录**：*vTensor: Flexible Virtual Tensor Management for Efficient LLM Serving*（FlexInfer），arXiv 2407.15309v1（`vtensor2024.txt:1, 7`；brief 行 30：此 vTensor 为 LLM Serving/FlexInfer 那篇，与同名 tensor 工作不同）。
+- **问题**：paged Attention 把内存管理与 compute kernel 绑死：只能跑 CUDA core（在 MQA 上被压到 3.6 TFLOP/s），且要独占预分配内存（`vtensor2024.txt:33-36, 270-350`）。
+- **机制**：vTensor 抽象；把内存管理与计算解耦；CPU 侧 vTensor Manager（VTP/VTO/VTS）；radix tree 做 prefix match；2MB chunk（`vtensor2024.txt:38-55, 375-401, 448-458`）。
+- **假设/代价**：2MB chunk；LLM 推理的规律性；物理 handle 存 CPU 内存；提前 Extend 下一物理块以重叠（`vtensor2024.txt:380-402, 506-533`）。
+- **评估**：8×A100 80GB（`vtensor2024.txt:615-620`）；端到端平均 1.86×、多轮对话最高 2.42×；kernel 评价 2.12×/3.15×，最高 3.27×/3.92×（`vtensor2024.txt:46-52`）；相对 vLLM 释放 71.25%（57GB）（`vtensor2024.txt:52-54`）；MQA 下 27.3 vs 3.6 TFLOP/s（`vtensor2024.txt:324-335`）。
+- **不可外推**：不能把 kernel 级加速（3.92×）等同端到端加速（1.86×），也不能把与 vAttention 同名机制混同——vTensor 是 CPU 侧主动管理，vAttention 是系统 demand paging。
+- **引用**：`papers/vtensor2024.txt:33-55, 270-350, 375-458, 615-620 §3-§7`。
+
+### 卡 9 — GMLake
+- **题录**：*GMLake: Efficient and Transparent GPU Memory Defragmentation for Large-scale DNN Training with Virtual Memory Stitching*, ASPLOS 2024（`gmlake2024.txt:1-3, 55-59`）。
+- **问题**：PyTorch caching allocator 在 recomputation/offloading/LoRA/分布式训练下碎片高达 30%（`gmlake2024.txt:24-113`）。
+- **机制**：VMS（Virtual Memory Stitching）；pBlock 物理原语池 + sBlock 缝合池；用 VMM API 把多个非连续物理块映射到一个虚拟地址（`gmlake2024.txt:105-116, 364-466`）；BestFit 四状态（`gmlake2024.txt:469-522`）。
+- **假设/代价 — 动态内存"总是瓶颈"的反证据**：裸 VMM API 用 2MB chunk 分配 2GB 比 cudaMalloc 慢 115×（`gmlake2024.txt:286-361`，Fig 6/Table 1）；因此 GMLake 必须有缓存池 + 2MB 以上才用 VMM + 利用训练周期性让缝合降到 0（`gmlake2024.txt:364-402, 572-597`）。
+- **评估**：8×A100 80GB（`gmlake2024.txt:641-663`）；8 个 LLM 平均省 9.2GB（最高 25GB），碎片降 15%（最高 33%）（`gmlake2024.txt:31-34, 633-637`）；吞吐与基线持平，大 batch 时甚至更高（`gmlake2024.txt:999-1005`）。
+- **不可外推**：这是训练场景，不能直接外推到推理；"训练有周期性所以缝合可摊销"这一前提不适用于推理。（与 vAttention 互补：vAttention 用重叠，GMLake 用周期性。）
+- **引用**：`papers/gmlake2024.txt:24-116, 286-361, 364-466, 572-597, 999-1005 §2-§5`。
+
+### 卡 10 — MINISA
+- **题录**：*MINISA: Minimal Instruction Set Architecture for Next-gen Reconfigurable Inference Accelerator*, ISPASS 2026（`minisa2026.txt:1, 4-5`；brief 行 31：已在 ISPASS 2026 官方 program 核对，本地为 arXiv v1）。
+- **问题**：可重配置 AI 加速器的控制 overhead：指令 fetch 挤压片内存储、降低 tile size、成为一阶瓶颈（16×256 时 stall 占 96.9%，`minisa2026.txt:15-68, 226-234`）。
+- **机制**：以 Virtual Neuron（VN = AH-element dot product）为抽象粒度；FEATHER+；8 条指令（SetIVN/SetWVN/SetOVN Layout + ExecuteMapping/Streaming + Load/Write/Activation）；3 位排列编码（`minisa2026.txt:253-270, 241-256, 308-348`）。
+- **假设/代价**：针对 FEATHER+ 可重配置阵列；GEMM/conv（及 FHE/ZKP）；VN 粒度需保留映射/布局灵活性（`minisa2026.txt:253-306`）。
+- **评估**：RTL + 分析模型，50 个 GEMM（GPT-OSS/FHE/ZKP）；指令流量降 35×–4×10⁵×；16×256 下最高 31.6× 加速；相对 RTX5090/TPUv6e 在等功耗下 23.7×/7.8×（`minisa2026.txt:40-46, 782-841, 869-877`）。
+- **不可外推**：MINISA 解决的是控制面，不能推出它对数据搬运/IOMMU/间接访问有直接贡献——它与本线其它论文正交。
+- **引用**：`papers/minisa2026.txt:15-68, 241-348, 782-877 §1-§6`。
+
+### 卡 11 — Tiara
+- **题录**：*Tiara: A Programmable Line-Rate ISA for Remote Memory Access*, arXiv 2026（`tiara2026.txt:1, 11`；brief 行 35：2026-06 arXiv remote-memory ISA，**不是** NSDI 2022 同名负载均衡器）。
+- **问题**：Indirection Wall——RDMA one-sided verb 需精确远端地址，地址依赖远端数据时每层代价一个 RTT（`tiara2026.txt:60-68`）。
+- **机制**：NIC-side 静态可验证 ISA；预注册 operator（类 eBPF）；register-chained load 使 Load 结果可直接当下一 Load 地址；unified addressing；async+wait；注册期静态验证终止性与内存区域（`tiara2026.txt:22-32, 262-331`）。
+- **关键区分（用户强调）**：Table 1 明确 pointer chase（d RTTs）vs page-table walk（3+1 RTTs）vs **PagedAttention（160†/2‡）**，其中 † 是未优化 stop-and-wait、**‡ 是最优批处理仅 2 RTT**（`tiara2026.txt:83-99`）；且明确"embedding table lookup 不是 indirection，可并行 scatte-gather"（`tiara2026.txt:150-157`）。这就是"不能只拿 160 RTT 讲必要性"的原文出处。
+- **假设/代价**：需内存侧 NIC；仅整数运算（浮点为 future work，`tiara2026.txt:493-495`）；静态验证要求受限 OpenCL 子集。
+- **评估**：Alveo U50 + Corundum，2×Xeon + 100GbE（`tiara2026.txt:340-359`）；depth-10 graph traversal 2.85× 延迟、depth-3 吞吐 3.4×；page-table walk 延迟降 62%；分布式锁 2.9×（16 客户端）；PagedAttention 8KB 块 2.8×；MoE 32 experts 1.88×（`tiara2026.txt:27-32, 102-107`）。**强对手反证**：depth>5 时 RPC 在延迟上反超 Tiara（0.17 vs 0.79 μs/hop，`tiara2026.txt:399-401`）；16 客户端锁竞争下 RPC ~4 客户端即反超（`tiara2026.txt:465-469`）。
+- **不可外推**：不能推出"offsloading 一律优于 RPC"；也不能把 FPGA 的 0.79μs/hop 当作 ASIC 性能。
+- **引用**：`papers/tiara2026.txt:22-32, 60-107, 150-157, 262-331, 399-469 §1-§5`。
+
+### 卡 12 — WIC
+- **题录**：*WIC: Hiding Producer-Consumer Synchronization Delays with Warp-Level Interrupt-based GPU Communications*, USENIX ATC 2025（`wic2025.txt:1-8, 13-15`）。
+- **问题**：GPU 通信中 consumer 侧 polling 是主瓶颈，早期 polling 抢占计算资源（`wic2025.txt:33-65, 90-121`）。
+- **机制**：warp 级中断替代轮询；Interrupter/Monitor/Activator；集成进 UVM，用人为 page fault 挂起 warp、replay 恢复（`wic2025.txt:44-64, 494-564`）。
+- **假设/代价**：需 UVM；生产者数据可用性靠 PAT 页故障通知；host-side UVM driver 修改；消费者数据被当作只读传输（`wic2025.txt:496-580`）。
+- **评估**：RTX 4090 + 4×A800（`wic2025.txt:293-296`）；相对轮询平均 1.13×，通信密集 C_H3D 最高 >30%；overhead ~1.4%（`wic2025.txt:62-65, 778, 887-890`）。强基线：NBlocking、DemandCpy、EffShare、GPS、FinePack（`wic2025.txt:945-953`）。**限制**：UVM 一次只能处理 256 faults，超出的要排队，成为扩展瓶颈（`wic2025.txt:887-890`）。
+- **不可外推**：G_BS 无提升甚至略降（Scenario 1，数据已预生成时中断反而多余，`wic2025.txt:796-801`）——不能推出"中断替代轮询总是更好"。
+- **引用**：`papers/wic2025.txt:33-121, 494-580, 778-890 §1-§6`。
+
+---
+
+## 3. 跨论文对照
+
+### 3.1 已有成熟机制（多篇一致、平台多、基线强）
+| 机制 | 成熟度证据 | 边界条件 |
+|---|---|---|
+| 地址生成与执行解耦（DAE 家族） | `dae1982`、`impica2016`、`dx1002025` 都独立用 | 见 3.4 分界 |
+| bulk 数据重排/合并/交错提升 DRAM 效率 | `dx1002025:71-163, 719-720` 多负载 | 需 bulk + 无迭代间依赖 |
+| IOMMU 做翻译+保护复用 | `bypassd2024` 实测 + 延迟模型 | ext4 类工作负载、需 ATS |
+| VMM 解耦虚拟/物理 + 缓存池 | `vattention2024`、`vtensor2024`、`gmlake2024` 三条独立实现 | **必须**有缓存池/重叠，否则裸 VMM 慢 100×+ |
+| 弱内存模型下合并写 | `gps2021:373-430` | sys-scoped 写必须保强语义 |
+
+### 3.2 只在特定条件下解决（论文自己划了条件）
+- **pointer chasing**：只在能放进 PIM/近内存/近 NIC 且结构受限时解决（`impica2016:89-113`、`tiara2026:60-68`）。DX100 明确不覆盖它。
+- **多 GPU publish-subscribe**：只在迭代/相位可 profile 的负载上（`gps2021:343-345`），且是仿真。
+- **用户态 I/O 共享保护**：只在 ext4 非日志、无 CoW、非并发双接口（`bypassd2024:499-541`）。
+- **动态 GPU 内存**：只有"每迭代需求可预知 + 有重叠"时不是瓶颈（`vattention2024:337-355`）。
+
+### 3.3 有公开证据显示仍受限（作者实测承认）
+- **TLB 大小对不规则访问帮助有限**：IMPICA 32→64 几乎无差别（`impica2016:706-708`）；BypassD IOTLB 命中与否差 183ns（`bypassd2024:648-649`）。这是"TLB miss ≠ 未缓存 page walk"的实证支撑。
+- **对 RPC 的劣势**：Tiara depth>5 延迟输 RPC（`tiara2026:399-401`），锁竞争 ~4 客户端即输（`tiara2026:465-469`）。
+- **UVM 256 fault 上限**：WIC 的扩展瓶颈（`wic2025:887-890`）。
+- **NIC-side offload 不一定更快**：BlueField-2 上每个 operator 反而变慢，atomic read 回退 38%（`tiara2026:237-249`）。
+
+### 3.4 关键分界（本报告最重要的一张表，回应"口号不够"）
+
+| 模式 | 是否可由"可预知地址"批量发出 | 现有机制 | 原文 |
+|---|---|---|---|
+| gather/scatter（embedding、CSR 索引） | ✅ 可并行 | DX100 reorder/coalesce/interleave；Tiara 散射列表 | `dx1002025:479-495`、`tiara2026:150-157` |
+| bulk indirect（A[B[i]]） | ✅（有界并行） | DX100 8 条 ISA | `dx1002025:256-271` |
+| pointer chase（*next[i]） | ❌ 地址依赖返回数据 | 只能 PIM/NIC 内解链 | `impica2016:50-53`、`dx1002025:479-495`、`tiara2026:60-68` |
+| multi-level translation | ❌（跨节点串行） | Tiara 本地解链 | `tiara2026:83-99` |
+| conditional multi-host | ❌ | Tiara async+CAS | `tiara2026:83-99` |
+
+**"零散数据/零拷贝/预取/epoch"为什么不够**：
+- "零散数据"没区分 3.4 的两行——DX100 的全部贡献就是证明第一行不需要新问题、第二行它也不碰。
+- "零拷贝"在 BypassD 里根本不是目标：它连用户 buffer 都不用，专门用 DMA buffer（`bypassd2024:429-437`）。零拷贝是手段不是缺口。
+- "预取"在 IMPICA 与 DX100 里都被列为已知不够的基线（`impica2016:8-14`、`dx1002025:1085-1093`），且 DX100 的强基线就是 state-of-the-art 间接预取器 DMP，直接以 2.0× 击败（`dx1002025:37-38`）。
+- "epoch"在本批论文中没有任何一篇把它当机制核心——它们用的是弱内存模型的**作用域**（GPS sys-scoped，`gps2021:415-425`）和**静态可验证**（Tiara，`tiara2026:303-330`）。把 epoch 当作新口号会重复 GPS 已做过的事。
+
+---
+
+## 4. 真正的矛盾/瓶颈（每个 ≥2 种原始证据）
+
+### 矛盾 1 — "间接访问慢"到底是地址不可知还是带宽欠用？
+- **证据 A（真串行）**：IMPICA 把 pointer chasing 定义为"地址只有取到当前节点才知道"，prefetcher 对发散无效（`impica2016.txt:8-14, 50-53`）。
+- **证据 B（可批量）**：DX100 把所有间接访问重定义为"controller 可见窗口只有 32–128 条请求"，扩大窗口即得 9.9×–3.9×（`dx1002025.txt:71-163, 719-721`）；DX100 同时**明确不支持** pointer chasing（`dx1002025.txt:479-495`）。
+- **性质区分**：A 是作者实测事实（profiling，`impica2016:224-235`）；B 是作者实测事实 + 作者解释；合起来的综合推断是我加的——"间接访问"是两类问题的并集，单一方案无法覆盖。**尚未验证的机会**：一个能同时覆盖两类、且说清何时用哪条路径的设计。
+
+### 矛盾 2 — 动态映射是瓶颈还是可隐藏？
+- **证据 A（是瓶颈）**：GMLake 实测裸 VMM 2MB chunk 分配 2GB 比 cudaMalloc 慢 115×（`gmlake2024.txt:286-361`）；Fig 3 显示复杂策略下碎片 >20%（`gmlake2024.txt:817-836`）。
+- **证据 B（非瓶颈）**：vAttention 实测分配带宽 7.59–70.34 GB/s，远高于 LLM 需求 ≤600MB/s（`vattention2024.txt:342-355, 832-836`），并可用后台线程完全隐藏（Fig 10，`vattention2024.txt:817-845`）。
+- **性质区分**：两者都是作者实测事实。综合推断：瓶颈源于"无缓存池 + 无重叠 + 细粒度裸调用"，不是"动态映射"本身。**研究机会**：量化"需求可预知度"到"是否需要隐藏/缓存"的相变点——目前没有论文给出这一定量边界。
+
+### 矛盾 3 — offload 到设备侧 vs 留在主机/近主机
+- **证据 A（offload 劣势）**：Tiara 实测 BlueField-2 上所有 operator 都变慢，atomic read 退 38%，根因 host-memory access 1.7μs 接近 RTT 1.9μs（`tiara2026.txt:237-249`）；Tiara 自己的 FPGA per-hop 0.79μs 也慢于 RPC 的 0.17μs（`tiara2026.txt:399-401`）。
+- **证据 B（offload 优势）**：Tiara 的吞吐在高并发下反超（29.5 vs 4.88 Mops，6.1×，`tiara2026.txt:409-411`），无 CPU 的内存节点只有它能服务（`tiara2026.txt:399-406`）；NDS 硬件版比软件版再快 1.13× 是因为避开主机组装（`nds2021.txt:1329-1332, 1359-1362`）。
+- **性质区分**：三条都是作者实测事实。综合推断：offload 的胜负在**延迟 vs 吞吐 vs 是否有 CPU** 三轴上取不同点；Tiara 作者自己划了这条线（`tiara2026.txt:468-469`）。**不成立的说法**："offload 一律更好"或"一律更差"。
+
+### 矛盾 4 — 同步/中断替代轮询总是更好？
+- **证据 A（更好）**：WIC 把轮询换成 warp 中断，平均 1.13×，通信密集 >30%，overlap 从 ~10% 升到 >80%（`wic2025.txt:62-65, 778, 855`）。
+- **证据 B（不总是）**：G_BS（数据已预生成、Scenario 1）WIC 无提升甚至略降（`wic2025.txt:796-801`）；UVM 256 fault 上限使它在大规模下有瓶颈（`wic2025.txt:887-890`）。
+- **性质区分**：都是作者实测事实。综合推断：中断替代轮询的收益取决于"是否真有可隐藏的等待 + 是否有其他可执行 warp"。**研究机会**：一个根据 load/架构决定轮询 vs 中断的准则（论文只给了 G_BS 一个反例，没有系统规则）。
+
+### 矛盾 5 — publish-subscribe 广播 vs 按需拉取
+- **证据 A（广播更好）**：GPS 主动广播弱写、本地读，4-GPU 3.0×、16-GPU 7.9×，coalescing 显著省带宽（`gps2021.txt:34-39, 190-204, 1156-1165`）。
+- **证据 B（广播有反例）**：GPS 自己在 ALS/CT 上几乎全员订阅，收益最差（`gps2021.txt:1047-1049`）；WIC 的 SOTA 对比里 GPS 在 G_BS/G_BFS 上仍略胜 WIC（`wic2025.txt:954-958`）。
+- **性质区分**：A/B 都是作者实测事实（GPS 仿真 + WIC 复现 GPS）。综合推断：广播 vs 拉取的胜负取决于订阅集是否稀疏；GPS 原文也承认这点（`gps2021.txt:1239-1246`）。**尚未验证**：真实硬件（非仿真）上的 crossover。
+
+---
+
+## 5. 误判、强对手、需补分支、精读顺序
+
+### 5.1 最容易被误判为创新的普通方案
+1. **"把零拷贝/直接映射用于 I/O"**：BypassD 证明关键不是零拷贝，而是**硬件权限检查 + 文件元数据在内核**（`bypassd2024:186-251`）。零拷贝本身在 `bypassd2024:429-437` 被明确放弃。
+2. **"加一个预取器/更大 TLB"**：IMPICA 实测 TLB 32→64 无差别（`impica2016:706-708`）；DX100 直接以间接预取器 DMP 为强基线并 2.0× 击败（`dx1002025:37-38`）。
+3. **"给 IOMMU 加 cache/更大 IOTLB"**：BypassD 实测命中与否仅差 183ns（`bypassd2024:648-649`），并明确"需要更大 translation cache 但不一定更大 IOTLB"（`bypassd2024:487-497`）。
+4. **"用 epoch/epoch 式刷新"**：本批论文用的是作用域 + 静态验证（`gps2021:415-425`、`tiara2026:303-330`），epoch 口号没有独立证据支撑。
+5. **"动态映射是新瓶颈"**：vAttention 用同一套 API 证明可隐藏（`vattention2024:554-611, 832-861`）；GMLake 则证明**不加缓存池**才是瓶颈（`gmlake2024:286-361`）。
+
+### 5.2 强对手（写新工作必须对照）
+- **DX100 的 DMP 间接预取器**（`dx1002025:37-38`）；**GPS 的 UM+hints / RDL / memcpy / infinite-BW**（`gps2021:696-706`）；**BypassD 的 SPDK / XRP / KVell**（`bypassd2024:663-668, 951-1005`）；**vAttention 的 vLLM / FlashAttention paged / FlashInfer paged**（`vattention2024:668-748`）；**Tiara 的 RPC / RedN / PRISM / BF-3 DPA**（`tiara2026:367-381, 511-522`）；**WIC 的 GPS / EffShare / FinePack / DemandCpy / NBlocking**（`wic2025:945-953`）。
+
+### 5.3 仍需补齐的经典或前沿分支
+- **经典**：DAE 的队列/死锁条件（`dae1982:552-618`）在现代多设备场景下没有等价分析；本批论文都跳过死锁。
+- **前沿缺环**：动态内存的"需求可预知度→是否需要隐藏/缓存"的定量边界（矛盾 2）；offload 胜负的系统化准则（矛盾 3）；轮询 vs 中断的判定准则（矛盾 4）；广播订阅稀疏度的 crossover（矛盾 5）。这四个边界目前都只有零散反例，没有系统规则。
+
+### 5.4 最值得精读的 3–5 篇与顺序
+1. **`tiara2026`（先读 Table 1 + §2.1 + §2.2）**——它把"indirection ≠ scatter/gather"和"PagedAttention 最优批处理只需 2 RTT"钉死，是摧毁口号式问题的关键。注意：已从 APNet 2026 撤回、仅 arXiv（`tiara2026:502-506`）。
+2. **`dx1002025`（§1 + §4.1 Legality + Table 1/2）**——同一分界的另一侧：可批量散读如何处理，以及为什么明确不支持 pointer chasing。
+3. **`vattention2024` + `gmlake2024` 对读**——同一 VMM API，一个证明动态映射可隐藏、一个证明裸用慢 115×。这是"不能假设动态映射总是瓶颈"的两端证据。
+4. **`gps2021`（§3.3 合并 + §7.2/§7.5 局限）**——publish-subscribe 与弱内存模型合并的原型，同时也是"广播有稀疏度反例"的证据。
+5. **`impica2016`（§1 + §3.1 + §7.3）**——pointer chasing 真串行的最早系统化证据，以及"TLB 不等于 walk cache"的实测。
+
+**建议顺序**：tiara2026 → dx1002025 → impica2016 → vattention2024 ⊕ gmlake2024 → gps2021（其余按 3.4 表对号入座）。
+
+---
+
+## 6. 对本平台（CVA6 + 4×iDMA + RISC-V IOMMU + Linux/Genesys2）的适用范围
+
+**能支持**：
+- "IOMMU 翻译 + 权限复用"这一模式在 FPGA 上有先例可参照（BypassD 的 VBA 翻译用延迟模型，`bypassd2024:637-662`），本平台的 IOMMU 可用来验证类似"翻译命中 vs miss"的成本分离（与 `bypassd2024:648-649`、`impica2016:706-708` 呼应）。
+- 静态容量 / 动态映射控制面 / 数据路径 / 布局变换 / 同步成本**分开测量**这一方法论，本平台的 S/N/P/PN 干预恰可对应（但根因与可泛化性未确立，见 MAP_BRIEF §项目定位）。
+
+**不能支持**：
+- 任何实际 GPU / CXL / PCIe ATS 结论（GPS、vAttention、vTensor、GMLake 全在 GPU/CUDA 栈上）。
+- 任何 pointer chasing PIM / NIC-side ISA 结论（IMPICA、Tiara 需 3D 堆叠内存或内存侧 NIC）。
+- 多 GPU publish-subscribe 与 warp-level interrual（GPS、WIC 负载 4×GV100 / 4×A800，与四 iDMA 非同量级）。
+- "offload 一律更好"之类跨设备结论（Tiara 自己就给出反例）。
+
+**方法学可迁移**：把"数据依赖无法预知地址 vs 可批量发出的散读"作为分类轴去标定本平台工作负载，是低风险且直接可做的第一步。
+
+---
+
+## 7. 假设、未决与不确定性
+- 未运行实验；所有数字均来自提取文本。
+- dae1982 的 venue 从 `dae1982.txt:70` 的 ©1982 IEEE 推定为 ISCA 1982，符合 manifest hint；未独立核对会议届次。
+- minisa2026 用本地 arXiv v1 行号；brief 行 31 已确认 ISPASS 2026 program，但 v1 细节可能与终稿有出入。
+- tiara2026 已从 APNet 2026 撤稿、仅 arXiv（`tiara2026:502-506`），评估为 FPGA 原型，非生产 ASIC。
+- bypassd2024 的 IOMMU VBA 翻译是模型/延迟注入，不是真实 IOMMU 支持。
+- gps2021 为 NVAS 仿真，互联参数含 projection。
+- vattention2024 与 vtensor2024 均为 arXiv（brief 行 29–30），与 Sarathi-Serve 集成不等于 vAttention 是 OSDI 2024。
+
+**接受检查（供 Codex 验证）**：
+1. `dae1982.txt:379` 是否确为 "average speedup is just over 1.7"。
+2. `impica2016.txt:706-708` 是否确为 TLB 32→64 无显著提升。
+3. `dx1002025.txt:479-495` 是否确为 pointer chasing 不支持。
+4. `tiara2026.txt:90, 96-99` 是否确为 PagedAttention 160†/2‡ 且 ‡ 为最优批处理。
+5. `vattention2024.txt:832-836` Table 7 的 7.59–70.34 GB/s 是否与正文 600MB/s 需求呼应。
+6. `gmlake2024.txt:286-361` 是否确为裸 VMM 慢 115×。
+7. `gps2021.txt:1047-1049` 是否确为 ALS/CT 多数全员订阅。
+8. `wic2025.txt:887-890` 是否确为 UVM 256 fault 上限。
+9. `minisa2026.txt:226-234` 是否确为 96.9% stall。

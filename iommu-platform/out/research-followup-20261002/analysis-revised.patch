@@ -1,0 +1,341 @@
+diff --git a/scripts/research_results.py b/scripts/research_results.py
+--- a/scripts/research_results.py
++++ b/scripts/research_results.py
+@@ -1143,20 +1143,26 @@ def analyze_e2(raw, case, mapping, problems, unknowns):
+                 classification = "other_unresolved"
+                 cause = "no_committed_update_record_explains_the_first_probe_result"
+ 
+-        change_events = [
+-            event
+-            for event in post_warm
+-            if deadline <= event["ts"] < probe["time"]
+-            and touches_target(event["old"], event["new"], ident)
+-        ]
++        # The presence-change cross-check belongs to this target's own first probe.
++        # The two probes are taken at different times (the dst target is probed
++        # first, a refill is committed, then the src target is probed), so the other
++        # probe's cross view samples a later instant than this target's own probe.
++        # Comparing that later cross view against a window that ends at this
++        # target's own probe time raises a false "presence changed with no record".
++        own_probe = probes[index]
++        own_live_self = own_probe["live_self"]
++        change_events = [
++            event
++            for event in post_warm
++            if deadline <= event["ts"] < own_probe["time"]
++            and touches_target(event["old"], event["new"], ident)
++        ]
+         probe0_bits = probes[0]["live_self"] if index == 0 else probes[0]["live_other"]
+         probe1_bits = probes[1]["live_self"] if index == 1 else probes[1]["live_other"]
+-        if deadline_ok != bool(probe0_bits) and not change_events:
++        if deadline_ok != bool(own_live_self) and not change_events:
+             unknowns.append(
+-                "target %s presence changed between the deadline snapshot (%s) and the first "
+-                "probe live bitmap (%#06x) with no update record in between"
+-                % (roles[index], deadline_ok, probe0_bits)
++                "target %s presence changed between the deadline snapshot (%s) and its own "
++                "first probe %d at ts %d (live bitmap %#06x) with no update record in between"
++                % (roles[index], deadline_ok, index, own_probe["time"], own_live_self)
+             )
+         target_report.append(
+             {
+                 "role": roles[index],
+@@ -1186,8 +1192,22 @@ def analyze_e2(raw, case, mapping, problems, unknowns):
+                 "presence_cross_check": {
+                     "deadline_present": deadline_ok,
++                    "own_probe_index": index,
++                    "own_probe_time": own_probe["time"],
++                    "own_probe_live_bitmap": own_live_self,
++                    "own_probe_hit": own_probe["hit"],
+                     "probe0_live_bitmap": probe0_bits,
+                     "probe1_live_bitmap": probe1_bits,
+-                    "changing_events_between_deadline_and_probe": [
+-                        event["index"] for event in change_events
+-                    ],
++                    "changing_events_between_deadline_and_own_probe": [
++                        event["index"] for event in change_events
++                    ],
++                    # Compatibility alias: this list was always windowed by the
++                    # target's own first probe time; the canonical name above says so
++                    # explicitly and both names always carry the same value.
++                    "changing_events_between_deadline_and_probe": [
++                        event["index"] for event in change_events
++                    ],
++                    "note": (
++                        "the presence-change check ends at this target's own first probe; "
++                        "probe0/probe1 are reported for comparison only"
++                    ),
+                 },
+             }
+         )
+@@ -1398,13 +1418,8 @@ def analyze_cost(raw, case, p4m, cli_rates, problems, unknowns):
+     carry_in = word("carry_in")
+     carry_out = word("carry_out")
+     check(carry_in <= 1 and carry_out <= 1, "carry flags are not single bits")
+     lane_active = word("lane_active")
+-    if lane_active:
+-        unknowns.append(
+-            "raw[0x%03x] shows a lane still active at capture (%#x); reported, not judged"
+-            % (w("lane_active"), lane_active)
+-        )
+ 
+     samples = [decode_cost_sample(raw, index) for index in range(min(sample_count, SAMPLE_DEPTH))]
+     for sample in samples:
+         if sample["main"] > sample["duration"]:
+@@ -1518,13 +1533,46 @@ def analyze_cost(raw, case, p4m, cli_rates, problems, unknowns):
+     if a_pages == 0:
+         if a_issue or a_done or a_done_window:
+             problems.append("Solo has unexpected A activity")
+             unknowns.append(
+                 "no-A (solo) case records A activity (issue %d, done %d, window done %s); kept "
+                 "as reported, not dropped" % (a_issue, a_done, a_done_window)
+             )
+     elif not a_issue:
+         unknowns.append("A pages were mapped but no A copy was issued")
+ 
++    # ---------------------------------------------------- close-latched lane state
++    # raw 0xc2c is lane_active_q.  In COST the lane latches are only updated while
++    # the cost session is active and are frozen at the closing edge, so the captured
++    # value is the close-latched lane state: a carry-out latches the A lane at the
++    # closing edge.  It is a latch, never a capture-time busy or drain flag, and it
++    # never replaces the hard checks above.  The window-closed state, the V/A
++    # completion accounting and the p4m.experiment submitted/completed/
++    # data_errors/quarantine fields stay authoritative.
++    lane_active_verified = (
++        session_state == 0b110
++        and isinstance(p4m, dict)
++        and not p4m_problems
++        and not problems
++    )
++    evidence["lane_active"] = {
++        "raw_word": "0x%03x" % w("lane_active"),
++        "value": lane_active,
++        "v_lane": bool(lane_active & 0x1),
++        "a_lane": bool(lane_active & 0x2),
++        "meaning": (
++            "close-latched lane state: lane_active_q is only updated while the cost "
++            "session is active and is frozen at the closing edge; a natural carry-out "
++            "legitimately latches the A lane and is not an error"
++        ),
++        "carry_in": carry_in,
++        "carry_out": carry_out,
++        "success_context_verified": lane_active_verified,
++        "note": (
++            "information only: reported, never used to pass or fail a case, and it "
++            "never suppresses the closed-window, completion-accounting or "
++            "quarantine/data-error checks"
++        ),
++    }
++
+     # ------------------------------------------------------------------ rates
+     v_rate = None
+     a_rate = None
+@@ -1954,7 +2002,20 @@ def summarize_cost(records):
+     return {
+         "per_case": per_case,
+         "rate_denominator": "raw[0x%03x] (win_cycles, the common hardware window)" % w("window_cycles"),
+         "a_numerator": "p4m.window[3]",
++        "lane_active_field": "raw[0x%03x] (close-latched lane state, never capture-time busy)"
++                             % w("lane_active"),
++        "lane_active_note": (
++            "raw[0x%03x] lane_active is only updated while the cost session is active and is "
++            "frozen at the closing edge; it is a close-latched lane state, reported as "
++            "information only, and a natural carry-out legitimately latches the A lane"
++            % w("lane_active")
++        ),
++        "sampling_phase_note": (
++            "samples are taken every 16th eligible A copy, so the sampler observes one fixed "
++            "phase of the copy cadence; per-sample and grouped statistics describe only that "
++            "sampled phase and are never extrapolated to the whole A population"
++        ),
+         "whole_arm_fields": ["raw[0x%03x]" % w("cost_cycles")] + [
+             "raw[0x%03x]" % w(name)
+             for name in ("arm_main_v", "arm_main_a", "arm_comp_v", "arm_comp_a")
+         ],
+@@ -2064,6 +2125,8 @@ def render_chinese(report):
+     add("  速率分母：%s；A 分子：%s" % (cost["rate_denominator"], cost["a_numerator"]))
+     add("  从启动到结束的计数字段：%s" % ", ".join(cost["whole_arm_fields"]))
+     add("  共同窗口字段：%s" % ", ".join(cost["common_window_fields"]))
++    add("  关窗锁存字段：%s" % cost["lane_active_note"])
++    add("  抽样相位说明：%s" % cost["sampling_phase_note"])
+     for item in cost["per_case"]:
+         if item["status"] != "ok":
+             add("  %s：未通过证据检查，原始字段保留，不列入有效统计。" % item["id"])
+ 
+diff --git a/tests/test_research_results.py b/tests/test_research_results.py
+--- a/tests/test_research_results.py
++++ b/tests/test_research_results.py
+@@ -519,6 +519,87 @@ class E2AnalyzerTests(unittest.TestCase):
+         evidence, problems, unknowns = self.analyze(words, mapping, case=case)
+         self.assertTrue(evidence["no_a_anomaly"])
+         self.assertTrue(any("W0" in item for item in unknowns))
++
++    def test_dst_a_evicted_then_miss_then_refill_then_src_probe_has_no_false_alarm(self):
++        # Board order: the A phase evicts the dst target; the dst probe (which runs
++        # first) misses; a dst refill is committed; only then does the src probe run,
++        # so the src probe's cross view of the dst target is taken after that refill.
++        # The presence-change check must use each target's own probe time and its own
++        # probe bitmap, otherwise this later cross view raises a false alarm.
++        warm = {0: self.t0, 1: self.t1, 5: self.other}
++        a_event = {"ts": 10_100, "slot": 1, "old": self.t1, "new": plain(0x500),
++                   "phase": PHASE_A, "did": DID_A}
++        refill = {"ts": 5_010_030, "slot": 2, "old": (0, 0), "new": self.t1,
++                  "phase": PHASE_PROBE, "did": DID_V}
++        deadline = apply_events(warm, [a_event])
++        probe_state = {0: apply_events(deadline, [refill]), 1: deadline}
++        freeze = apply_events(deadline, [refill])
++        words, mapping = build_e2(
++            targets=self.targets, warm=warm, deadline=deadline, freeze=freeze,
++            probe_state=probe_state, probe_times=(5_010_040, 5_010_020),
++            events=[a_event, refill], astart=10_000, window=5_000_000,
++            a_count=self.case["acount"])
++        evidence, problems, unknowns = self.analyze(words, mapping)
++        self.assertEqual(problems, [])
++        self.assertEqual(unknowns, [])
++        src, dst = evidence["targets"]
++        self.assertEqual(src["classification"], "resident_hit_negative")
++        self.assertEqual(dst["classification"], "A_evicted_then_first_miss")
++        self.assertFalse(dst["first_probe"]["hit"])
++        self.assertEqual(dst["A_removal_events"], [0])
++        cross_check = dst["presence_cross_check"]
++        self.assertEqual(cross_check["own_probe_index"], 1)
++        self.assertEqual(cross_check["own_probe_time"], 5_010_020)
++        self.assertEqual(cross_check["own_probe_live_bitmap"], 0)
++        self.assertTrue(cross_check["probe0_live_bitmap"])
++        self.assertEqual(cross_check["changing_events_between_deadline_and_own_probe"], [])
++        self.assertEqual(
++            cross_check["changing_events_between_deadline_and_probe"],
++            cross_check["changing_events_between_deadline_and_own_probe"])
++
++    def test_src_first_and_same_cycle_probe_orders_stay_clean(self):
++        warm = {0: self.t0, 1: self.t1, 5: self.other}
++        deadline = dict(warm)
++        probe_state = {0: dict(deadline), 1: dict(deadline)}
++        for probe_times in ((5_010_020, 5_010_040), (5_010_020, 5_010_020)):
++            with self.subTest(probe_times=probe_times):
++                words, mapping = build_e2(
++                    targets=self.targets, warm=warm, deadline=deadline,
++                    freeze=dict(deadline), probe_state=probe_state,
++                    probe_times=probe_times, events=[], astart=10_000,
++                    window=5_000_000, a_count=self.case["acount"])
++                evidence, problems, unknowns = self.analyze(words, mapping)
++                self.assertEqual(problems, [])
++                self.assertEqual(unknowns, [])
++
++    def test_unexplained_presence_change_still_warns(self):
++        warm = {0: self.t0, 1: self.t1, 5: self.other}
++        deadline = dict(warm)
++        probe_state = {0: {1: self.t1}, 1: {1: self.t1}}
++        words, mapping = build_e2(
++            targets=self.targets, warm=warm, deadline=deadline,
++            freeze=dict(deadline), probe_state=probe_state,
++            probe_times=(5_010_020, 5_010_040), events=[], astart=10_000,
++            window=5_000_000, a_count=self.case["acount"])
++        evidence, problems, unknowns = self.analyze(words, mapping)
++        self.assertEqual(evidence["targets"][0]["classification"], "other_unresolved")
++        self.assertTrue(any("presence changed" in item for item in unknowns))
++        self.assertTrue(any("live bitmap" in item for item in problems))
++
++    def test_own_probe_window_event_explains_the_presence_change(self):
++        warm = {0: self.t0, 1: self.t1, 5: self.other}
++        deadline = dict(warm)
++        evict = {"ts": 5_010_010, "slot": 0, "old": self.t0, "new": plain(0x800),
++                 "phase": PHASE_PROBE, "did": DID_V}
++        probe_state = {0: apply_events(deadline, [evict]),
++                       1: apply_events(deadline, [evict])}
++        words, mapping = build_e2(
++            targets=self.targets, warm=warm, deadline=deadline,
++            freeze=apply_events(deadline, [evict]), probe_state=probe_state,
++            probe_times=(5_010_020, 5_010_040), events=[evict], astart=10_000,
++            window=5_000_000, a_count=self.case["acount"])
++        evidence, problems, unknowns = self.analyze(words, mapping)
++        self.assertEqual(problems, [])
++        self.assertEqual(unknowns, [])
+ 
+ 
+ class CostAnalyzerTests(unittest.TestCase):
+@@ -611,6 +692,80 @@ class CostAnalyzerTests(unittest.TestCase):
+         p4m = cost_p4m(window_cycles=1000, a_done=0, flags=0x2)
+         evidence, problems, unknowns = self.analyze(words, p4m=p4m)
+         self.assertTrue(any("no-A" in item or "solo" in item for item in unknowns))
++
++    def test_lane_active_is_close_latched_information_not_capture_busy(self):
++        words = list(build_cost(samples=[], eligible=0, sample_count=0))
++        words[0xC2C] = "0x%016x" % 2
++        evidence, problems, unknowns = self.analyze(words)
++        self.assertEqual(problems, [])
++        self.assertEqual(unknowns, [])
++        lane = evidence["lane_active"]
++        self.assertEqual(lane["value"], 2)
++        self.assertFalse(lane["v_lane"])
++        self.assertTrue(lane["a_lane"])
++        self.assertTrue(lane["success_context_verified"])
++        self.assertIn("close-latched", lane["meaning"])
++        self.assertEqual(lane["carry_in"], 1)
++        self.assertEqual(lane["carry_out"], 0)
++
++    def test_lane_active_survives_a_natural_arm_carry_out(self):
++        # A natural carry-out: the whole-arm A lane had issued more than it had
++        # retired when the window closed, while the p4m.experiment final A/V
++        # accounting shows drained, fully completed work.  This must not be turned
++        # into a failure and must not raise a fabricated warning.
++        words = list(build_cost(samples=[], eligible=0, sample_count=0, a_done=100))
++        words[0xC0F] = "0x%016x" % 101
++        words[0xC2C] = "0x%016x" % 2
++        evidence, problems, unknowns = self.analyze(words)
++        self.assertEqual(problems, [])
++        self.assertEqual(unknowns, [])
++        lane = evidence["lane_active"]
++        self.assertEqual(lane["value"], 2)
++        self.assertFalse(lane["v_lane"])
++        self.assertTrue(lane["a_lane"])
++        self.assertTrue(lane["success_context_verified"])
++
++    def test_lane_active_does_not_mask_an_open_window(self):
++        words = list(build_cost(samples=[], eligible=0, sample_count=0))
++        words[0xC01] = "0x%016x" % 0b011
++        words[0xC2C] = "0x%016x" % 2
++        evidence, problems, unknowns = self.analyze(words)
++        self.assertTrue(any("session is not" in item for item in problems))
++        self.assertFalse(evidence["lane_active"]["success_context_verified"])
++        self.assertEqual(unknowns, [])
++
++    def test_lane_active_does_not_mask_incomplete_final_a_work(self):
++        words = list(build_cost(samples=[], eligible=0, sample_count=0))
++        words[0xC2C] = "0x%016x" % 2
++        p4m = cost_p4m()
++        p4m["experiment"]["aggressor"]["completed"] = 99
++        evidence, problems, unknowns = self.analyze(words, p4m=p4m)
++        self.assertTrue(any("P4M A completion" in item for item in problems))
++        self.assertFalse(evidence["lane_active"]["success_context_verified"])
++
++    def test_lane_active_does_not_mask_a_victim_quarantine(self):
++        words = list(build_cost(samples=[], eligible=0, sample_count=0))
++        words[0xC2C] = "0x%016x" % 2
++        p4m = cost_p4m()
++        p4m["experiment"]["victim"]["quarantined"] = 1
++        evidence, problems, unknowns = self.analyze(words, p4m=p4m)
++        self.assertTrue(any("quarantined" in item for item in problems))
++        self.assertFalse(evidence["lane_active"]["success_context_verified"])
++
++    def test_lane_active_does_not_mask_missing_p4m_fields(self):
++        words = list(build_cost(samples=[], eligible=0, sample_count=0))
++        words[0xC2C] = "0x%016x" % 2
++        p4m = cost_p4m()
++        del p4m["experiment"]["victim"]["completed"]
++        evidence, problems, unknowns = self.analyze(words, p4m=p4m)
++        self.assertTrue(any("victim completed" in item for item in problems))
++        self.assertFalse(evidence["lane_active"]["success_context_verified"])
++
++    def test_lane_active_zero_is_reported_without_a_warning(self):
++        words = build_cost(samples=[], eligible=0, sample_count=0)
++        evidence, problems, unknowns = self.analyze(words)
++        self.assertEqual(problems, [])
++        self.assertEqual(unknowns, [])
++        self.assertEqual(evidence["lane_active"]["value"], 0)
++        self.assertFalse(evidence["lane_active"]["v_lane"])
++        self.assertFalse(evidence["lane_active"]["a_lane"])
+ 
+ 
+ class FakePlan:
+

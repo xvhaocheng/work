@@ -1,0 +1,918 @@
+            DAMN: Overhead-Free IOMMU Protection for
+                         Networking
+    Alex Markuze†,                              Igor Smolyar†                           Adam Morrison‡                       Dan Tsafrir†,
+           † Technion – Israel Institute of Technology                          ‡ Tel Aviv University          VMware Research Group
+
+
+
+Abstract                                                                             1   Introduction
+DMA operations can access memory buffers only if they are                            Bandwidth demands of servers in modern data centers scale
+“mapped” in the IOMMU, so operating systems protect them-                            with the number of cores per server, requiring support for
+selves against malicious/errant network DMAs by mapping                              ever-growing networking speeds both at the endpoints and
+and unmapping each packet immediately before/after it is                             at the data center fabric. Google’s Jupiter fabric [36], for
+DMAed. This approach was recently found to be riskier and                            example, assumed 40 Gb/s endpoints, and 100 Gb/s network
+less performant than keeping packets non-DMAable and                                 cards (NICs) have since been made available. Data center
+instead copying their content to/from permanently-mapped                             servers must also offer strong security guarantees to their
+buffers. Still, the extra copy hampers performance of multi-                         clients, one aspect of which includes protection from compro-
+gigabit networking.                                                                  mised or malicious devices, a threat that is explicitly consid-
+    We observe that achieving protection at the DMA (un)map                          ered in Google’s security design [18, Secure Data Storage].
+boundary is needlessly constraining, as devices must be pre-                            Presently, however, an operating system (OS) cannot de-
+vented from changing the data only after the kernel reads                            fend against malicious NICs without paying a significant
+it. So there is no real need to switch ownership of buffers                          performance penalty. This limitation results from the use of
+between kernel and device at the DMA (un)mapping layer,                              I/O memory management units (IOMMUs) [2, 4, 19, 23] to
+as opposed to the approach taken by all existing IOMMU                               restrict device direct memory access (DMA), as unrestricted
+protection schemes. We thus eliminate the extra copy by                              DMAs allow malicious devices to steal secret data or com-
+(1) implementing a new allocator called DMA-Aware Malloc                             promise the OS [5, 7, 11, 14, 16, 37–39]. The IOMMU views
+for Networking (DAMN), which (de)allocates packet buffers                            DMA addresses as I/O virtual addresses (IOVAs) [25], and
+from a memory pool permanently mapped in the IOMMU;                                  it blocks DMAs whose target IOVA does not have a valid
+(2) modifying the network stack to use this allocator; and                           mapping to a physical address.
+(3) copying packet data only when the kernel needs it, which                            OSes deploy their IOMMU-based DMA attack protection
+usually morphs the aforementioned extra copy into the ker-                           model in the existing DMA APIs [3, 9, 20, 28]. The DMA
+nel’s standard copy operation performed at the user-kernel                           API seems a perfect fit for such a protection model, as it
+boundary. DAMN thus provides full IOMMU protection with                              requires drivers to dma_map and dma_unmap memory buffers
+performance comparable to that of an unprotected system.                             before/after they are DMAed (e.g., to resolve coherency is-
+                                                                                     sues and support bounce buffering [10]), and so OSes natu-
+CCS Concepts • Security and privacy → Operating sys-
+                                                                                     rally adopted a protection model in which a device may DMA
+tems security; • Software and its engineering → Mem-
+                                                                                     to/from a buffer if and only if the buffer is DMA mapped.
+ory management;
+                                                                                        The straightforward implementation of this protection
+Keywords IOMMU, DMA attacks                                                          model—where the OS creates IOMMU mappings in dma_map
+                                                                                     and destroys them in dma_unmap—proved crippling to multi-
+ACM Reference Format:
+                                                                                     gigabit NICs, because the overhead of destroying IOMMU
+Alex Markuze, Igor Smolyar, Adam Morrison, and Dan Tsafrir. 2018.
+DAMN: Overhead-Free IOMMU Protection for Networking. In Pro-
+                                                                                     mappings on each DMA becomes prohibitive for millions of
+ceedings of 2018 Architectural Support for Programming Languages                     DMAs per second [27, 34]. Consequently, several protection
+and Operating Systems (ASPLOS’18). ACM, New York, NY, USA,                           schemes with improved performance have been proposed,
+15 pages. https://doi.org/10.1145/3173162.3173175                                    by practitioners [24, 41] and researchers [27, 29, 34] alike,
+                                                                                     with some [27, 34] adopted by Linux.
+ASPLOS’18, March 24–28, 2018, Williamsburg, VA, USA                                     Still, all existing work compromises on either performance
+© 2018 Copyright held by the owner/author(s). Publication rights licensed            or security, as it adheres to the DMA API-based protection
+to the Association for Computing Machinery.
+                                                                                     model. On one hand, it seems impossible to enforce a protec-
+This is the author’s version of the work. It is posted here for your personal
+use. Not for redistribution. The definitive Version of Record was published          tion boundary that makes buffers inaccessible to the device
+in Proceedings of 2018 Architectural Support for Programming Languages and           on dma_unmap without imposing overhead on each DMA.
+Operating Systems (ASPLOS’18), https://doi.org/10.1145/3173162.3173175.              On the other hand, relaxing the protection boundary [34]
+opens a vulnerability window in which the device can ac-          thus accessed by the OS, whereas packet data remains opaque
+cess unmapped buffers. The device can then mount “time of         to the OS until it gets copied at the kernel/user boundary
+check to time of use” (TOCTTOU) attacks such as modifying         and removed from the device’s reach. (Any malicious DMA
+a packet after it passes firewall checks, or access sensitive     performed before this copy is indistinguishable from a valid
+data if the unmapped buffer is reused by the OS.                  DMA performed while the packet was mapped.) Therefore,
+   Shadow buffers [29] attempt to alleviate the map-unmap         in the common case, only header data will require copying;
+overhead by copying packets to non-DMAable buffers in-            this copy is virtually free due to the small size of headers.
+stead of (un)mapping them in the IOMMU, but this approach
+does not scale with growing networking speeds, cannibaliz-        Effectiveness of DAMN DAMN is the first system that pro-
+ing the system’s CPU and memory bandwidth (§ 4).                  vides full DMA attack protection with comparable network
+   We show that the above security/performance dichotomy          performance to an unprotected system at 100 Gb/s speeds.
+can be made false by changing the DMA attack protection           With a 100 Gb/s NIC, Linux/DAMN achieves 90% of the TCP
+model. We propose a conceptually different model, whose           throughput of an unprotected multi-core system, and only
+DMA protection boundary lies at the user/kernel boundary,         3% less than the default, partially-secured protection model.
+where packet data is already copied and thus made inacces-        Relative to shadow buffers—the only IOMMU protection sys-
+sible to devices without imposing extra overhead relative         tem with equivalent security guarantees—DAMN provides
+to unprotected networking. Our model uses the IOMMU to            7% more throughput using half the CPU cycles; when using
+prevent arbitrary DMAs—particularly to data copied to/from        only a single core, DAMN’s throughput is 2.7× higher.
+user-level applications—and not to restrict DMAs only to
+                                                                  Non-networking devices DAMN co-exists with prior DMA
+buffers mapped by the DMA API. In fact, we explicitly allow
+                                                                  API-based IOMMU protection schemes (§ 5.3), so all de-
+devices to access packet buffers as they are processed by the
+                                                                  vices remain IOMMU-protected. Most non-networking de-
+OS; we protect OS processing by dynamically copying only
+                                                                  vice classes have low DMA rates, i.e., they perform few DMAs
+the data accessed by the OS—typically, just the headers—
+                                                                  per second. These devices thus suffer negligible overhead
+when it is first accessed.
+                                                                  even from protection schemes that (un)map DMA buffers
+   We implement our new DMA attack protection model
+                                                                  from the IOMMU on each DMA. NVMe storage media sup-
+with DAMN, a DMA-Aware Malloc for Networking. DAMN
+                                                                  ports high DMA rates, but the DAMN approach is incom-
+shifts IOMMU management from the DMA API to a higher
+                                                                  patible with storage devices, as we discuss in detail in § 2.2.
+OS level—the memory allocator. It satisfies packet buffer
+                                                                  Fortunately, however, the DMA rate of NVMe storage media
+allocations from a set of buffers permanently mapped in the
+                                                                  is not as high as that of a multi-gigabit NIC, and we find that
+IOMMU, obviating the need to set up and destroy IOMMU
+                                                                  shadow buffers can protect NVMe storage media without
+mappings on each DMA. Shadow buffers [29] also restrict
+                                                                  noticeable overhead (§ 6.5). Overall, DAMN’s compatibility
+the NIC to such permanently-mapped buffers, but since they
+                                                                  with prior protection schemes allows the OS to fully protect
+implement the DMA API-based protection model, the OS
+                                                                  itself from DMA attacks by any of the attached devices.
+cannot directly work with the permanently-mapped buffers.
+Instead, data must be copied to/from these buffers on each        Contributions To summarize, we make three contribu-
+DMA. DAMN’s new protection model eliminates this extra            tions: (1) a conceptually different DMA attack protection
+copy, and thus DAMN is essentially overhead-free, while still     model, which relaxes the protection boundary enforced by
+providing DMA attack protection, due to the following.            the DMA API; (2) design and implementation of DAMN,
+   DAMN-allocated buffers cannot be reused to contain sensi-      which realizes our new model and offers nearly overhead-
+tive data, because DAMN is distinct from the kernel malloc.       free protection; and (3) experimental evaluation of DAMN
+Every page that DAMN maps is exclusively used to sat-             with 100 Gb/s networking workloads.
+isfy packet buffer allocations, so such pages always con-
+tain data that the OS allowed the device to access at some        2     Scope: attack model, goals & limitations
+point, and nothing else. Separation from the kernel allocator
+also guarantees that DMA buffers never get co-located on          2.1   Attack Model
+the same page with unrelated kernel data, and so DAMN             The attacker controls some DMA-capable hardware devices
+provides byte-granularity IOMMU protection instead of the         but cannot access OS constructs, e.g., to reconfigure the
+page-granularity protection of most prior schemes.                IOMMU. Our focus is protection from unauthorized DMAs
+   DAMN efficiently defends against TOCTTOU attacks by            to target buffers not mapped with the DMA API; attacks
+dynamically copying OS-accessed bytes, removing them              carried out with authorized DMAs, such as tampering with
+from the device’s reach. To intercept all OS accesses to packet   contents of packets, are out of scope. In the case of malicious
+buffers, DAMN interposes on the special accessor methods          NICs, such out-of-scope attacks are essentially man-in-the-
+that OS packet accesses must already go through. We observe       middle attacks that could also be performed elsewhere on
+that only packet headers are typically security sensitive and     the network. We therefore assume that the system uses other
+means to protect against such attacks (e.g., encryption and      IOMMUs cache IOVA-to-PA mappings in an IOTLB. To de-
+authentication).                                                 stroy a mapping, the OS must remove it from the page tables
+  The attacker’s target is the OS. Peer-to-peer attacks by one   and invalidate the IOTLB entries associated with the map-
+device against another [42] are also out of scope; they can      ping. The OS controls the IOTLB via an invalidation queue,
+be prevented using PCIe Access Control Services (ACS) [42].      a cyclic buffer from which the IOMMU reads commands.1
+
+Assumptions The OS, device drivers, and the IOMMU are            DMA API Device drivers must use the DMA API to man-
+trusted. We assume that the IOMMU is secure, that DMAs           age DMA buffers. Drivers dma_map a buffer before initiat-
+cannot be “spoofed” to appear to come from another device,       ing a DMA to that buffer, thereby passing ownership of
+and that the IOMMU blocks all DMAs during OS boot [21, 22],      the buffer to the device. Drivers dma_unmap the buffer upon
+before its page tables are configured.                           DMA completion, thereby regaining ownership of the buffer.
+                                                                 The dma_map call returns a DMA address (let us denote it
+2.2   Goals and limitations                                      as α). The driver must configure the device to DMA to α;
+Goal DAMN addresses the main networking use case of              dma_unmap later takes α as its parameter. There are analo-
+commodity OSes: serving as an endpoint for applications          gous methods to (un)map non-contiguous scatter/gather lists.
+that use a POSIX-like kernel interface, which creates a copy
+of I/O buffers on the kernel-user boundary.                      4    Motivation: IOMMU protection tradeoffs
+                                                                 Here, we make the case for abandoning the low-level DMA
+Zero-copy The DAMN approach does not apply to end-to-            API as the OS layer implementing IOMMU protection of
+end zero-copy paths, such as sendfile() or zero-copy IP          high-speed networking cards. The generality of the DMA
+forwarding. In these cases, the OS falls back to DMA API-        API dictates that (1) it provides an overly strict security
+based protection.                                                guarantee, namely that a buffer must be inaccessible to the
+                                                                 device once unmapped; and (2) it protects arbitrary buffers,
+Kernel bypasses Similarly, we target applications that rely
+                                                                 which may reside on the same page as unrelated sensitive
+on the OS for managing the networking data plane. Appli-
+                                                                 data. Both properties inherently create a tension between
+cations that implement their own data plane, bypassing the
+                                                                 security and performance, because achieving them requires
+OS and interacting directly with the device (e.g., with newer
+                                                                 performing work on each DMA.
+OS designs like Arrakis [35], or with mainstream kernel-
+                                                                    We demonstrate this tension by analyzing existing IOMMU
+bypasses mechanisms such RDMA and DPDK [15]) are out
+                                                                 protection schemes. We perform all experiments on a ma-
+of scope. Applications that bypass the kernel’s data plane
+                                                                 chine with two 14-cores Intel Xeon E5-2660 v4 CPUs (28
+management inherently cannot rely on the kernel for DMA
+                                                                 cores overall), equipped with a dual-port Mellanox ConnectX-
+attack protection and must implement their own protection
+                                                                 4 100 Gb/s NIC. Each port is connected back-to-back to a ded-
+model. It seems, however, that the techniques used in DAMN
+                                                                 icated traffic generation machine equipped with the same
+can be ported to such applications.
+                                                                 NIC. (§ 6 describes our setup in detail.)
+Storage media The DAMN approach is incompatible with                Table 1 summarizes the tradeoffs associated with differ-
+storage media. Unlike received packets, data received from       ent protection schemes (further discussed below). The only
+storage media is cached in the OS page cache. It is impossible   scheme with negligible overhead is Linux’s default scheme,
+to protect a DMA buffer stored in the page cache from TOCT-      deferred protection, which trades off security for perfor-
+TOU attacks without copying it all. Some applications bypass     mance by delaying (batching) IOMMU unmappings, creat-
+the page cache by directly accessing the storage media (via      ing a vulnerability window in which a device can access
+the O_DIRECT flag to open()). In such cases, the OS uses the     dma_unmap()ed buffers.
+user’s buffers as DMA buffers. This approach is essentially a       The remaining schemes trade off significant performance
+kernel bypass and thus DAMN cannot be used in this case,         (e.g., network throughput, CPU utilization, or memory traffic)
+for the reasons discussed above.                                 to provide protection. Despite making these tradeoffs, only
+                                                                 one protection scheme, DMA shadow buffers [29], offers sub-
+3     Background                                                 page protection of DMA buffers, which prevents sensitive
+                                                                 data co-located on the buffer’s page from being accessible to
+IOMMUs IOMMUs virtualize the address space of devices,           the device. Sub-page protection in the DMA API, however,
+from using physical addresses (PAs) to using I/O virtual ad-     comes at the price of additional per-DMA overhead, as it
+dresses (IOVAs). The OS maintains per-device page tables         requires copying the entire DMA buffer.
+that define IOVA-to-PA mappings at page granularity. Map-
+pings also specify the allowed access types—read, write, or
+both. The IOMMU routes a DMA to the PA that corresponds          1 This discussion describes Intel’s x86 IOMMU architecture [23], but other
+
+to the IOVA or blocks the DMA if no valid mapping exists.        architectures have similar designs [2, 4, 19].
+iommu                                   secure          perform                     a. throughput [Gb/s]                     b. CPU [%]
+                                                                             200                                    100
+protection                         subpage window multi-Gbps zero-copy
+                                                                             160                                     80
+partial                                                                      120                                     60
+deferred Linux≥4.7 (ATC’15 [34])     ✗        ✗          ✓            ✓       80                                     40
+strict Linux≥4.7 (ATC’15 [34])       ✗        ✓          ✗            ✓       40                                     20
+                                                                               0                                      0
+full                                                                                 iom de str sh da                     iom de str sh da
+shadow buffers (ASPLOS’16 [29])      ✓        ✓          ✓            ✗                 mu ferr ict l ado mn                 mu ferr ict l ado mn
+                                                                                           off ed l inux w b                    off ed l inux w b
+DAMN                                 ✓        ✓          ✓            ✓                            inu      uff                         inu       uff
+                                                                                                       x        s                           x         s
+Table 1. IOMMU protection-performance tradeoffs. (Deferred is the
+                                                                                  no protection             partial protection       full protection
+default on Linux.)
+
+                                                                            Figure 1. Protection-performance tradeoffs. Bars show aggregated
+                                                                            TCP throughput and CPU consumption of multiple netperf instances.
+4.1   Linux IOMMU protection
+Linux offers two IOMMU protection models with different
+tradeoffs, strict protection and deferred protection, which                 cores = 3.57% utilization). Deferred protection achieves 90%
+is the default.2 In both models, dma_map allocates an IOVA                  of the throughput obtained without IOMMU protection, with
+range for the target buffer, maps the two in the IOMMU                      similar CPU utilization. Strict protection, on the other hand,
+page tables, and returns the IOVA to the driver. Likewise, in               achieves only 58% of the unprotected throughput due to the
+both models, dma_unmap removes these mappings from the                      cost of (1) the contended lock protecting the invalidation
+IOMMU page tables. Because IOMMU protection works at                        queue and (2) waiting for the invalidation to complete.
+the granularity of pages, both models provide only partial
+                                                                            4.2    Shadow buffers
+protection, as they allow devices to access sensitive data that
+might be co-located on pages IOMMU-mapped for a device;                     DMA shadow buffers provide full IOMMU protection at byte-
+this can happen because the mapped buffers are allocated                    granularity. But they trade off extra CPU and memory band-
+with the standard kernel malloc, which can satisfy unrelated                width to obtain it. With shadow buffers, the OS restricts
+allocations from the same page.                                             device access to a set of permanently-mapped pages, and the
+   Linux’s protection models differ in how they invalidate                  DMA API copies DMAed data to/from these shadow pages.
+the IOTLB. Strict protection synchronously invalidates the                  The DMA API thus never needs to invalidate the IOTLB.
+IOTLB on dma_unmap, guaranteeing that the device can no                     However, the overhead of IOTLB invalidation is replaced by
+longer DMA to the buffer. Deferred protection batches in-                   the overhead of copying.
+validation operations, invalidating the IOTLB after suffi-                    Shadow buffers have been shown to sustain 40 Gb/s rates,
+ciently many requests accumulate or every 10 milliseconds,                  but with a ≈ 2× increase of CPU consumption [29]. The
+whichever comes first. In the window between a dma_unmap                    overhead of copying, however, is proportional to the I/O
+and the IOTLB invalidation, the device can thus still access                throughput. With faster NICs, the extra CPU cycles and mem-
+unmapped buffers. Such access enables, e.g., “time of check to              ory bandwidth demands of shadow buffer grow. Therefore,
+time of use” (TOCTTOU) attacks for DMA-writable buffers,                    unless the system is over-provisioned in terms of CPU and
+such as modifying a packet after it passes firewall checks.                 memory bandwidth, shadow buffers eventually fail to drive
+DMA-readable buffers access allows devices to steal data                    the NIC at maximum rate. Figure 1 shows this limitation.
+placed in unmapped buffers after the OS reuses them.                        Shadow buffers achieve 80% of the unprotected system’s
+   Deferred protections makes the above security compro-                    throughput, while consuming twice the CPU time (80%).
+mises to improve performance. We illustrate these tradeoffs                 Here, shadow buffers actually exhaust memory bandwidth;
+by comparing the performance of the IOMMU protection                        see § 6 for details.
+models using netperf [33], a standard TCP/IP benchmark-                       The overhead of shadow buffers additionally leaves less
+ing tool. We maximize network load by running several                       CPU and memory bandwidth available to the rest of the
+netperfs, some transmitting and some receiving traffic. We                  system, potentially leading to severe degradation in the exe-
+report the sum of receive and transmit throughputs. The                     cution efficiency of programs co-running on the same ma-
+maximum throughput achievable is 200 Gb/s, as the NICs                      chine. Figure 2 depicts an example of this problem. The figure
+are full-duplex.                                                            shows the results of running netperf concurrently with a
+   Figure 1 shows the aggregate throughput and CPU uti-                     Graph500 BFS loop on different cores. (We describe the exper-
+lization (one core at 100% would be reported as 100% / 28                   iment in detail in § 6.4.) The no graph bar shows the netperf
+                                                                            throughput obtained without the Graph500 co-runner on
+2 We use Linux as a representative study vehicle; other OSes have similar   Linux when IOMMU protection is disabled. Similarly, the no
+IOMMU protection designs [34].                                              net bar shows the speed of the Graph500 program without the
+          a. throughput [Gb/s]                 b. iteration time [sec]           a sequence of 2k physically contiguous pages (k ≥ 0 is sup-
+160                                     80                                       plied by the caller) and returns a pointer to the page structure
+120                                     60                                       of the first page in the sequence. A page structure holds the
+ 80                                     40                                       OS metadata for a physical page, and each page is associated
+ 40                                     20
+                                                                                 with its own structure. The structures are housed in an ar-
+                                                                                 ray, allowing constant-time conversions between physical
+    0                                      0
+          iom de str sh da no                  iom de str sh da no               addresses and their page structures.
+             mu ferr ict l ado mn gra             mu ferr ict l ado mn ne           The DAMN interface is specified in Table 2. It consists
+                 off ed l inux w b       ph           off ed l inux w b      t
+                         inu       uff                        inu       uff      of the functions damn_alloc and damn_alloc_pages (and
+                             x         s                          x        s
+                                                                                 their damn_free and damn_free_pages counterparts). They
+        no protection              partial protection          full protection
+                                                                                 are analogous to the kernel allocation API, but DAMN adds to
+                                                                                 them two arguments: a device pointer that specifies which
+Figure 2. Netperf throughput (a) and Graph500 BFS iteration time                 device is given permission to DMA to/from the buffer being
+(b), when each benchmark runs alone (rightmost bar) or concurrently
+                                                                                 allocated, and a rights bitmask that specifies the permitted
+(the rest of the bars). Shadow buffers cannibalize CPU and memory
+bandwidth.                                                                       access rights for that device (read, write, or both). If the
+                                                                                 device pointer is NULL, DAMN falls back to the standard
+                                                                                 kernel API. (We explain in § 5.7 how this can occur.)
+netperf tests running. Shadow buffers’ resource cannibaliza-                        Callers of damn_free and damn_free_pages do not al-
+tion causes a 1.44× increase in Graph500 iteration execution                     ways know the device and access rights associated with
+time, and it halves the netperf throughput compared to most                      the buffer they are freeing, in contrast to allocating callers.
+other protection schemes.                                                        Therefore, the DAMN API does not specify passing it, and
+                                                                                 DAMN must internally look up this information (§ 5.5).
+5       DMA-Aware Malloc for Networking
+                                                                                 5.2    TOCTTOU protection
+This section describes the design and implementation of
+                                                                                 Having network receive buffers that are permanently writable
+DAMN, our DMA-Aware Malloc for the Networking subsys-
+                                                                                 to the device raises concern that the device might exploit this
+tem. We describe DAMN in the context of Linux, but the
+                                                                                 access to launch TOCTTOU attacks. We observe, however,
+same design applies to other monolithic OSes, which have
+                                                                                 that most received bytes flow opaquely through the network
+similar network I/O subsystem designs.
+                                                                                 stack until being copied to a user-level buffer and out of the
+   DAMN eliminates the overhead of IOMMU mappings
+                                                                                 device’s reach. We thus need to protect packet headers, and
+maintenance with a similar technique to shadow DMA buffers.
+                                                                                 handle corner cases in which the OS does access packet data
+Namely, it restricts device access to a set of permanently-
+                                                                                 (e.g., a firewall rule that inspects HTTP headers). Any writes
+mapped pages. But whereas shadow buffers require copying
+                                                                                 the device makes to the other bytes have the same effect as
+of data to/from these pages, DAMN offers a conceptually
+                                                                                 valid writes performed while the packet was dma_map()ed.
+different model that allows the network stack to store data
+                                                                                     When a driver processes a received packet, it allocates a
+directly in these pages.
+                                                                                 socket buffer, or skbuff in Linux terminology.3 OS code must
+   To the networking stack and drivers, DAMN appears as
+                                                                                 use a special API to access skbuff data, because this data
+a memory allocation API, which additionally allows spec-
+                                                                                 might be held with a non-contiguous set of buffers (e.g., for
+ifying the device permitted to access the allocated buffer
+                                                                                 avoiding copying of scatter/gather lists). We interpose on this
+and the type of access allowed. DAMN leaves protection of
+                                                                                 API, and whenever the OS first accesses a byte range, we copy
+buffers not allocated through it to the DMA API, and is thus
+                                                                                 it into a new buffer—inaccessible to the device—and adjust
+compatible with any DMA API-based protection scheme.
+                                                                                 the skbuff accordingly. We expect, as explained above, to
+Deploying DAMN can therefore be done gradually, focusing
+                                                                                 copy only header bytes in the common case, which incurs
+on performance-critical flows first. Moreover, non-network
+                                                                                 negligible overhead. In fact, several Linux drivers already
+devices maintain their DMA API-based IOMMU protection.
+                                                                                 copy packet headers when constructing receive skbuffs.
+5.1     Interface                                                                5.3    DMA API compatibility
+DAMN’s memory allocation interface adheres to the ker-                           Drivers currently translate buffer addresses to IOVAs using
+nel memory allocation API. The kernel provides two al-                           the DMA API, with dma_map returning a buffer’s IOVA. To
+location functions relevant for networking: kmalloc and                          facilitate easy adoption of DAMN in commodity OSes, we
+alloc_pages. The kmalloc function returns the virtual ad-                        do not wish to modify the DMA API, nor require driver
+dress of a newly allocated, physically contiguous, 8-bytes                       changes for DAMN-allocated buffers. Such buffers thus go
+aligned object that is smaller than a page size. Larger alloca-
+tions are usually done with alloc_pages, which allocates                         3 Other OSes have similar structures, e.g., BSD mbufs [31].
+  operation                            description
+  damn_alloc (dev, riдhts, s)          Allocates an s-byte buffer that is DMA-accessible to dev as specified in riдhts (read/write).
+                                       Returns the virtual address of the buffer.
+  damn_alloc_pages (dev, riдhts, k)    Allocates a sequence of 2k physically contiguous pages that are DMA-accessible to dev as
+                                       specified in riдhts (read/write). Returns the struct page of the first page in the sequence.
+  damn_free (addr )                    Deallocate the DMA buffer whose virtual address is addr .
+  damn_free_pages (paдe, k)            Deallocate the 2k contiguous physical pages that start at paдe.
+                                         Table 2. DAMN’s memory allocation API (§ 5.1).
+
+
+
+through the standard flows in the networking stack, and              as follows. The cache has a two-level hierarchy. The bottom
+the OS will eventually attempt to dma_map/dma_unmap them.            level maintains a cache of chunks, which are sets of C physi-
+We interpose on dma_map/dma_unmap calls and check if they            cally contiguous pages, where C is big enough to satisfy the
+target a DAMN-allocated buffer (§ 5.5 details how this is            maximal supported buffer size. (Our Linux implementation
+done); if not, we fall back onto the standard DMA API (and           thus uses C = 16, for 64 KiB.) The chunks are mapped in the
+the IOMMU protection scheme it implements).                          IOMMU with the appropriate access rights for the device
+   For DAMN buffers, we perform the following actions. In            The top level consists of a per-core allocator that maintains
+dma_map, DAMN-allocated buffers have long-lived IOMMU                a chunk, acquired from the bottom level, and carves it up in
+mappings, and so there is no need to create a new IOMMU              order to satisfy DAMN allocation requests.
+mapping for them. Instead, we look up the buffer’s IOVA
+(§ 5.5 explains how this is done) and return it. In dma_unmap,       Top-level allocation I/O allocation patterns typically con-
+we determine whether the argument IOVA is associated with            sist of a producer/consumer flow, in which one core allocates
+a DAMN-allocated buffer by examining the MSB of the IOVA             a DMA buffer and hands it to the device, and the buffer is
+(see § 5.4). If so, there is no need to tear down any IOMMU          later deallocated by whichever core handles the interrupt
+mappings and we immediately return from the dma_unmap                raised by the device to notify that the DMA has completed.
+call; the buffer itself will be freed later by the networking        We thus specialize our allocation scheme to this use case; in
+subsystem. Otherwise, the legacy dma_unmap code precedes             particular, unlike standard malloc implementations, we do
+as usual.                                                            not optimize for rapid successions of allocating and deallo-
+                                                                     cating the same buffer.
+5.4   Allocator                                                         Our allocation scheme uses a simple “bump pointer” alloca-
+DAMN’s allocation interface is backed by a set of memory             tor, which satisfies allocation requests from the underlying
+allocators, one for each device and DMA access rights (read-         chunk by “bumping” a pointer, until reaching the end of
+only or read/write) combination, called DMA caches. A DMA            the chunk; at this point, a new underlying chunk must be
+cache is named thus because it is essentially a caching layer        obtained from the bottom level of the DMA cache. Each allo-
+on top of the kernel page allocator. Each page that a DMA            cation increments a reference count on the chunk, and each
+cache allocates is mapped in the IOMMU to a specific de-             deallocation decrements the reference count, returning the
+vice and access rights, and it is used to satisfy networking         chunk to the bottom level of the DMA cache if its reference
+allocation requests for that type of DMA buffer. The DMA             count reaches zero. The reference count is manipulated with
+cache design is based on magazines [8], a general method             atomic instructions, using the existing OS page reference-
+for highly scalable OS resource allocation. Magazines add a          count interface, which stores the count in the page structure
+per-core scheme for caching objects allocated by an arbitrary        of the first page in the chunk.
+resource allocator—the kernel’s page allocator, in our case.            Our Linux implementation of DAMN uses the OS-provided
+   The DMA cache subsystem supports allocations of up to             page frag API which essentially implements the scheme de-
+64 KiB. This maximal value is determined by the implemen-            scribed above; on other OSes, this scheme can be imple-
+tation of the network stack and the network device driver.           mented from scratch (it requires less than 100 LOC).
+This parameter can be tuned as required for other OS and                The DMA cache contains two of these bump pointer al-
+device driver combinations.                                          locators for each core, one for non-page-aligned allocations
+   Next, we describe the logical organization of the DMA             requests (damn_alloc), and one for page-aligned allocation
+cache, the process of satisfying an allocation request, and          requests (damn_alloc_pages). Finally, for each device and
+the implementation of the per-core physical page caches.             access rights, we maintain a DMA cache for each NUMA
+DMA cache organization For every device and access                   domain. This design leverages the NUMA-awareness capa-
+rights combination (read/write), the DMA cache is organized          bilities of the OS page allocator, allowing DMA caches to
+be populated with pages allocated from the calling core’s           having a single cache, as the buffers allocated in each context
+NUMA domain’s memory.                                               are typically disjoint: receive allocations occur in interrupt
+                                                                    context and transmit allocations occur in standard context.
+Top-level deallocation The common case of damn_free
+and damn_free_pages is to decrease the reference count of           Initialization A DMA cache is initially empty. Each time
+the appropriate chunk, as described above, and return. If,          the depot allocates a chunk, it zeroes the allocated chunk
+however, the reference count reaches zero, the chunk must           and maps it in the IOMMU. We partition the 48-bit IOVA
+be placed into a magazine; this requires looking up the appro-      address space, using the MSB of the IOVAs, to distinguish
+priate DMA cache (i.e., the device, access rights, and NUMA         between IOVAs used by DAMN-allocated buffers and IOVAs
+domain combination). Looking up this information requires           used by the standard DMA API, as explained in § 5.5.
+additional data structures, which are discussed in § 5.5.           Responding to OS memory pressure Many OS subsys-
+Bottom-level chunk cache The bottom level of the DMA                tems maintain caches of objects, and modern OSes therefore
+cache, which caches physical page chunks, is implemented            provide a standard interface for the OS to request a cache
+using magazines [8], proposed as a generic method for highly        to release memory back to the system if memory pressure
+scalable OS resource allocation. Magazines add a per-core           occurs (e.g., the Linux shrinker interface [12]). While our
+scheme for caching objects allocated by an arbitrary resource       research prototype does not implement this functionality,
+allocator. In our case, the objects managed by the magazines        it is straightforward to support it: when memory pressure
+are the physical page chunks and the underlying resources           occurs, DAMN simply has to release chunks that reside in
+allocator is the kernel’s page allocator. Next, we provide          magazines or in the depot back to the OS. Such chunks can
+background on magazines, and then describe the extensions           safely be released, since they do not contain allocated or
+we performed to obtain high performance on modern NUMA              DMA-mapped buffers.
+architectures available today.
+                                                                    5.5   Mapping from addresses to DAMN metadata
+   A magazine is an M-element per-core cache of objects,
+maintained as a LIFO stack. Being per-core, magazine ma-            Let B be an I/O buffer with virtual address Bva and IOVA
+nipulation requires no synchronization and is extremely fast.       Biova . With the help of its metadata, DAMN needs to be able
+Conceptually, a core attempts to allocate and deallocate from       to perform the following operations: (i) in dma_unmap, given
+its magazine first. If it fails—namely, it tries to allocate from   Biova , it needs to be able to determine to do nothing if B was
+an empty magazine or to deallocate into a full one—then it          allocated by DAMN, or to fall back on the standard DMA
+must access a global shared depot of magazines, protected by        API otherwise; (ii) in dma_map, given Bva , it likewise needs
+a global lock, to exchange a full magazine with an empty one        to either decide to fall back, or (if DAMN allocated B) to find
+(or an empty magazine with a full one). The depot falls back        Biova and return it to the caller; and (iii) in damn_free or
+onto the underlying resource allocator if it cannot return a        damn_free_pages, given Bva , it needs to be able to find B’s
+full magazine; it fills a new magazine with freshly allocated       allocator and decrease the corresponding reference count.
+objects and returns it. The actual magazine replenishment               A natural solution for the tasks that get Bva as input, (ii)
+policy is more sophisticated, and guarantees that a core can        and (iii), would be to store this information in the page struc-
+satisfy at least M allocations and at least M deallocations         ture of the pages allocated by DAMN. But enlarging the page
+without accessing the depot.                                        structure is considered a major OS change, which might have
+                                                                    unintended performance regressions. So we avoid modify-
+Physical DMA cache organization For performance rea-                ing the page structure by leveraging the compound pages [13]
+sons, we maintain two copies of the above described struc-          functionality of the OS. A compound page is an OS-recognized
+tures (i.e., the two bump allocators and per-core magazines).       grouping of at least two contiguous physical pages. The page
+The two copies are needed to avoid the cost of disabling            structure of the first page in the sequence (the head page)
+interrupts. Because networking allocations can come from            represents the rest of the pages, making several fields in the
+regular context or interrupt context, it is possible for a DMA      page structures of the remaining tail pages unused, which
+cache operation (called from a regular context) to be inter-        provides us with room to store DAMN’s data, notably, Biova .
+rupted, only to have the interrupt handler also invoke a DMA            A remaining question is how to identify a page as a DAMN
+cache operation. The standard solution to handle this race          page whose page structure holds a valid Biova . All tail pages
+would be to disable interrupts when a DMA cache operation           point to the compound’s head page, which has predeter-
+is invoked. We find, however, that interrupt disabling has          mined semantics that we are not allowed to change. The
+measurable negative impact on I/O throughput. Therefore,            same applies to the second page. We therefore add a flag F
+our solution is to maintain the logical DMA cache hierarchy         to the third page structure, indicating that this is a DAMN
+as two physical copies, one for standard context and one for        compound. Thus, given Bva , DAMN checks its page to see
+interrupt context. Having two per-context DMA caches does           if its a compound whose third page has F set, in which case
+not double the amount of memory consumed compared to                the corresponding Biova is valid.
+                                                                     Having done this, deploying DAMN in the TCP code only
+                                                                   requires modifying it to invoke dma_alloc_skb and passing
+                                                                   a device pointer, which is available in the TCP socket. To
+                                                                   complete the deployment, we additionally modify the NIC
+                                                                   driver to use DAMN for its allocations (2 LOC change). The
+      Figure 3. DAMN’s IOVA encoding (bit 47 is always 1).         entire effort took a graduate student who was not familiar
+                                                                   with the networking code 4 days to complete, and added
+   To accomplish task (iii), when Biova is generated, DAMN         ≈300 LOC to the kernel: 150 LOC in the skbuff code and
+encodes in its top bits: B’s allocating core, the access rights,   150 in protocol and socket code.
+and the device, as depicted in Figure 3. This encoding thus
+allows DAMN to identify Biova ’s allocator and deallocate B.       6    Evaluation
+5.6 Security                                                       Our evaluation seeks to analyze the following issues:
+We argue the security of DAMN by considering two cases:                § 6.1 Can strict, byte-granularity protection be achieved
+transmitted (TX) and received (RX) data.                                  without hampering performance? To answer this ques-
+                                                                          tion, we quantify the performance/security tradeoffs in
+TX Transmitted data is mapped with read access rights.                    DAMN and prior DMA attack protection schemes. We
+The only concern, therefore, is whether the device can read               extend the scope of the evaluation to more challenging
+sensitive information. DAMN zeroes memory it obtains from                 workloads than those evaluated in prior work [29, 34],
+the OS page allocator. We also assume that once allocated, a              including >100 Gb/s streaming data.
+packet buffer is used to hold only packet data. It follows that        § 6.2 What are the overheads imposed by DAMN’s
+any page managed by DAMN will contain zeroes or data                      TOCTTOU protection, which copies packet bytes that
+that the OS has allowed the device to read at some point, and             are accessed by the OS?
+thus cannot contain sensitive information.                             § 6.3 What is the memory overhead imposed by DAMN?
+RX Receive security follows from the property that any                 § 6.4 What is the effect that the different protection
+packet bytes accessed by the OS are copied. The OS thus                   schemes have on the performance interaction between
+observes a consistent view of a packet that the device cannot             the networking subsystem and unrelated programs
+change under its feet. Bytes that are not copied in this way are          running on the same machine?
+copied to the user’s buffer, where they cannot be modified by          § 6.5 Is the relegation of IOMMU protection of non-
+the device. It follows that any byte read from a packet could             networking device classes to prior schemes justified,
+have well been written while the buffer was dma_map()ed.                  or do we lose performance as a result of this choice?
+
+5.7   Deploying DAMN in Linux                                      Evaluated systems We implement DAMN in Linux 4.7.
+                                                                   We compare DAMN (damn) to Linux 4.7 without IOMMU
+Our DAMN implementation consists of ≈500 LOC: ≈250 LOC             protection (iommu-off ), and to Linux 4.7 in deferred and strict
+for the DMA cache implementation and ≈250 LOC for the              IOMMU protection modes. (Linux 4.7 contains the IOMMU
+magazines implementation.                                          protection scalability improvements of Peleg et al. [34].) We
+   We are able to deploy DAMN in the Linux TCP stack with-         further compare to Linux 4.7 with shadow DMA buffers [29]
+out making intrusive changes to the entire stack. Rather,          (shadow buffs), the only other DMA attack protection scheme
+we extend the internal __alloc_skb function, which allo-           that offers strict, byte-granularity, protection.
+cates skbuff structures, by adding a device argument. The
+__alloc_skb function already receives a flags argument             Experimental setup We run the evaluated kernel on a
+that specifies, among other things, whether the skbuff will        28-core Dell PowerEdge R730 machine equipped with a dual-
+be used for received or transmitted data. We rely on this flag     port Mellanox ConnectX-4 100 Gb/s Ethernet NIC. The ma-
+to define the access rights (read for TX, write for RX).           chine is a dual-socket server with 2 GHz Intel Xeon E5-2660
+   The __alloc_skb function has three classes of callers.          v4 (Broadwell) CPUs, each of which has 14 cores. The ma-
+First, it is invoked by the skbuff code itself, when skbuff        chine has 128 GiB of memory, with four 16 GiB 2400 MHz
+structures are copied or cloned. In such case, the device ar-      DDR4 DIMMs per socket. For traffic generation, we use two
+gument can be extracted from the source skbuff. Second,            16-core Dell PowerEdge R430 machines, also equipped with
+it is invoked by device-API code for allocating of packet          ConnectX-4 100 Gb/s NICs. Each such client is connected
+buffers. There, too, a device pointer is readily available. Fi-    back-to-back to one of the ports on the evaluated server NIC.
+nally, __alloc_skb is invoked indirectly by the networking         However, the PCIe 3.0 bus on the server limits the server’s
+stack through an alloc_skb method. We modify alloc_skb             receive/transmit bandwidths to 128 Gb/s [30, Section 7.4] (In
+to pass a NULL device to __alloc_skb, and create a new             practice, we do not manage to obtain more than 106 Gb/s.)
+method, dma_alloc_skb, for use by DAMN-aware flows.                The clients are dual-socket machines with 2.4 GHz Intel Xeon
+        i. throughput [Gb/s]                      ii. CPU [%]                         i. throughput [Gb/s]                         ii. CPU [%]
+  100                                    100                                  100                                     100
+   80                                     80                                   80                                      80
+   60                                     60                                   60                                      60
+   40                                     40                                   40                                      40
+   20                                     20                                   20                                      20
+    0                                      0                                    0                                       0
+         iom de str sh da                      iom de str sh da                        iom de str sh da                        iom de str sh da
+            mu ferr ict l ado mn                  mu ferr ict l ado mn                    mu ferr ict l ado mn                    mu ferr ict l ado mn
+               off ed l inux w b                     off ed l inux w b                       off ed l inux w b                       off ed l inux w b
+                       inu       uff                         inu       uff                           inu      uff                            inu       uff
+                           x         s                           x        s                              x        s                              x         s
+      no protection              partial protection       full protection         no protection                partial protection          full protection
+                                   a. RX                                                                         b. TX
+                Figure 4. Single-core TCP throughput and CPU utilization of netperf TCP-STREAM (100% CPU is one core).
+
+E5-2630 v3 (Haswell) 8-core CPUs and 32 GiB of memory.                        then breaks these segments into MTU-sized Ethernet frames
+We disable hyperthreading on all machines, and configure all                  for transmission on the wire. We configure our machines to
+machines for maximum performance, with Intel Turbo Boost                      also use the NIC’s Large Receive Offload (LRO) hardware, so
+(dynamic clock rate control) disabled. The traffic generators                 the NIC at the receiving machine symmetrically aggregates
+run with the IOMMU disabled.                                                  the frames into larger TCP segments of up to 64 KiB, before
+                                                                              handing them to the receiving kernel. We set the MTU size
+6.1   Performance vs. security tradeoffs                                      to be 9000 bytes (“jumbo frames”), and we turn Ethernet flow
+Methodology We follow the methodology we used in our                          control on to make it lossless.4
+previous IOMMU study [29]. To even the load between cores,                       Figure 4a shows the RX throughput and CPU utilization,
+we configure the NIC drivers to use one receive ring per core                 in which the evaluation system acts as the receiver. All pro-
+with even distribution of interrupts between cores. We run                    tection modes are bottlenecked by the CPU as intended. The
+the benchmarks for 60 seconds on an otherwise idle system                     throughput obtained by iommu-off , deferred and damn is
+and report averages of 10 runs.                                               65–67 Gb/s, whereas strict obtains only 50 Gb/s, because it
+                                                                              spends many CPU cycles invalidating the IOTLB, which is
+Benchmarks We use netperf [33], a standard networking                         a costly hardware operation.5 Shadow buffs obtain the low-
+benchmarking tool, to evaluate TCP/IP throughput. We eval-                    est throughput, 26 Gb/s (damn’s throughput is 2.7× higher),
+uate both receive (RX) and transmit (TX) throughput, by                       because the CPU overhead of this mode eats into the cycles
+having the evaluation machine play the role of the netperf                    required to drive the NIC. It appears that in our workload,
+receiver/transmitter. Finally, we study an application work-                  shadow buffs hit their scalability limit—compared to the other
+load using the memcached [17] key-value store. To avoid                       modes, they do much worse than at 40 Gb/s rates [29].
+lock contention in the multi-threaded version of memcached,                      Figure 4b shows the throughput and CPU utilization in the
+we run a separate memcached instance on each core. We                         TX test, in which the evaluation system acts as the sender.
+provide further details on each experiment as we present it.                  The throughput of iommu-off and damn increases by about
+                                                                              10% to 73–74 Gb/s, whereas the throughput of deferred and
+Single-core TCP throughput We measure the throughput
+                                                                              strict slightly decreases. The throughput of the shadow buffs
+obtained by netperf’s TCP-STREAM, such that all activity
+                                                                              mode improves by 1.7×, but it is still the worse-performing
+in the system (including interrupt processing) is restricted
+                                                                              setup. We verified that the throughput difference between RX
+to run on a single core. In this test, the measured application
+                                                                              and TX for this mode occurs because RX has a much bigger
+repeatedly transmits or receives a 16 KiB buffer to/from a
+                                                                              memory footprint, since it must post many more buffers for
+TCP socket without waiting for a response, and it reports
+the average throughput at the end of the execution. We                        4 This hardware configuration, coupled with running multiple netperf in-
+concurrently run four netperf instances on a single core,                     stances that utilize multiple NIC ports, makes our setup much more per-
+using both NIC ports, to bring the tested core’s utilization to               formant than in previous work [26, 27, 29], leading to higher single-core
+100%. The loader machine at the other end is not similarly                    throughput than is usually reported.
+                                                                              5 In comparison, a single RX netperf instance using only one port and
+constrained and is free to use as many cores as it pleases.
+   When transmitting, by default, Linux uses the NIC’s TCP                    running with the default Linux configuration (1500 bytes MTU and LRO
+                                                                              off) will approach 20 Gb/s if the IOMMU is turned off. This throughput will
+Segmentation Offload (TSO) hardware, allowing the network                     further drop to around 5 Gb/s if the IOMMU is turned on and deferred is
+stack to aggregate buffers that the user sends into segments                  used (or half that much if strict is used) because the core will have to handle
+as big as 64 KiB, before handing them to the NIC. The NIC                     many more incoming packets that are much smaller.
+        i. throughput [Gb/s]                       ii. CPU [%]                       i. throughput [Gb/s]                      ii. CPU [%]
+  120                                      70                                  100                                     60
+  100                                      60                                   80                                     50
+   80                                      50                                                                          40
+                                           40                                   60
+   60                                      30                                                                          30
+   40                                                                           40                                     20
+                                           20
+   20                                      10                                   20                                     10
+    0                                       0                                    0                                      0
+         iom de str sh da                       iom de str sh da                      iom de str sh da                      iom de str sh da
+            mu ferr ict l ado mn                   mu ferr ict l ado mn                  mu ferr ict l ado mn                  mu ferr ict l ado mn
+               off ed l inux w b                      off ed l inux w b                     off ed l inux w b                     off ed l inux w b
+                       inu       uff                          inu       uff                         inu      uff                          inu       uff
+                           x         s                            x        s                            x        s                            x         s
+      no protection              partial protection        full protection         no protection             partial protection        full protection
+                                   a. RX                                                                       b. TX
+                Figure 5. Multi-core TCP throughput and CPU utilization of netperf TCP-STREAM (100% CPU is 28 cores).
+
+DMA in expectation of incoming traffic. When artificially                      28-core machine to sustain 196,Gb/s (Figure 1), namely, the
+enlarging TX’s memory footprint to be as big as that of RX,                    equivalent of 11.5 cores.
+the performance of the two becomes identical.                                     Shadow buffs, which implement the only protection scheme
+                                                                               with comparable security to damn, lag behind with 160 Gb/s,
+Multi-core TCP throughput Here, we perform netperf                             namely, 0.8× that of iommu-off . As shown in Figure 1, shadow
+RX/TX tests, only this time with 28 netperf client/server                      buffs consume only 80% of the CPU resources, which is about
+instances (one per core) on the server machine. We report the                  twice that of iommu-off , damn, and deferred, but still not
+aggregate throughput and CPU utilization over all cores (i.e.,                 100%. The reason that shadow buffs do not maximize through-
+one core at 100% CPU would be reported as 100%/28 = 3.57%                      put is that the OS throttles its network I/O rate because the
+CPU utilization).                                                              NIC does not empty its rings sufficiently fast. Throttling
+   Figure 5a shows the results of the RX test. Here, the NIC                   occurs because of memory bandwidth exhaustion, as shown
+becomes the bottleneck, and all variants but strict achieve                    in Figure 6 (measured using Intel’s performance counter
+at least 100 Gb/s. Damn, iommu-off and deferred have com-                      monitor tool [40]). With shadow buffs, the system’s memory
+parable CPU utilization. The only variant failing to sustain                   bandwidth use is ≈80 GB/s, which is the advertised limit of
+100 Gb/s is strict, whose throughput throttles at 80 Gb/s and                  the processor’s memory controller, through which the NIC
+its CPU use spikes to 64%. In multi-core workloads, strict suf-                accesses memory. The resulting memory bottleneck prevents
+fers not only due to the high cost of IOTLB invalidations, but                 the NIC from operating its rings at a fast enough rate.
+also from the bottleneck created by the IOTLB invalidation                        In contrast to the previous TCP throughput experiments,
+lock [29, 34]. Deferred alleviates these bottlenecks, but trades               here damn fails to achieve the same throughput as iommu-
+off security to do so. Shadow buffs use 37% overall CPU time,                  off . We evaluate variants of damn in which we modify parts
+1.5× more than damn, deferred, and iommu-off . The results                     of the design, in an attempt to tease apart the sources of
+of the TX test (Figure 5b) show similar trends.                                the throughput difference. Table 3 shows the results. We
+                                                                               first evaluate a variant that increases the effectiveness of the
+Beyond 100 Gb/s Here, we stress the system—and the pro-                        IOTLB. In this variant, we map IOVAs using “huge” IOVA
+tection schemes—further, by running RX and TX netperf                          pages, which enables a single IOTLB entry to cache a 2 MiB
+TCP-STREAM tests simultaneously, for a peak theoretical                        IOVA range. However, damn’s policy of encoding metadata
+bidirectional bandwidth of 200 Gb/s. (This corresponds to                      in the high bits of the IOVA (§ 5.5) causes IOVAs of buffers
+the experiment discussed in § 4.1.) Figure 6 shows the re-                     allocated from different DMA caches to fall into different
+sults. IOMMU-off obtains 196 Gb/s, deferred 176 Gb/s, and                      huge pages. As a result, DAMN uses more huge IOVA pages
+damn 171 Gb/s (3% worse than deferred). The strict protection                  than are necessary for mapping the allocated DMA buffers,
+model obtains 113 Gb/s, which is 44% worse than damn.                          which makes the IOTLB less effective. Therefore, in this vari-
+   Bidirectional traffic has a detrimental effect on TCP, as                   ant we allocate IOVAs densely, using the minimum number
+ACK segments compete with data segments for resources.                         of huge pages (which means that we do not encode metadata
+Therefore, compared to previous experiments, we need more                      in the IOVAs and thus cannot free them, and so this variant
+flows, and so more cycles, to drive 100 Gb/s in each direction.                is useful for analysis only).
+For example, RX/iommu-off requires 100% CPU usage of                              Making the IOTLB more effective increases damn’s through-
+a single core to sustain 67 Gb/s (Figure 4a), whereas the                      put by 13 Gb/s (6.5% of iommu-off ). Next, we test damn with
+corresponding bidirectional experiment requires 41% of a
+        a. throughput [Gb/s]                    b. memory b/w [GB/s]                       i. throughput [kilo iops]                       ii. CPU [%]
+ 200                                      100                                       20                                            80
+ 160                                       80                                       15                                            60
+ 120                                       60
+                                                                                    10                                            40
+  80                                       40
+  40                                       20                                        5                                            20
+   0                                        0                                        0                                             0
+          iom de str sh da                        iom de str sh da                                 iom de str sh da                     iom de str sh da
+             mu ferr ict l ado mn                    mu ferr ict l ado mn                             mu ferr ict l ado mn                 mu ferr ict l ado mn
+                off ed l inux w b                       off ed l inux w b                                off ed l inux w b                    off ed l inux w b
+                        inu       uff                           inu      uff                                     inu      uff                         inu       uff
+                            x         s                             x        s                                       x        s                           x         s
+      no protection               partial protection         full protection          no protection                       partial protection       full protection
+
+Figure 6. Throughput and memory bandwidth in multi-core net-                     Figure 7. Memcached: aggregated throughput and CPU utilization
+perf TCP-STREAM test using bidirectional traffic. (Same experiment               (of 28 concurrent instances).
+as depicted in Figure 1; the left sides of both figures are identical.)
+                                                                                                   30
+   configuration                                      Gb/s                                         24
+   damn                                               170 (86.3%)
+
+
+
+
+                                                                                         CPU [%]
+   damn + huge iova pages + dense iova range          183 (92.9%)                                  18
+   damn without iommu                                 192 (97.5%)
+                                                                                                   12
+   iommu-off                                          197 (100%)
+                                                                                                                       shadow buffs
+Table 3. Factors affecting the throughput difference between damn                                    6                       damn
+and iommu-off in the multi-core bidirectional netperf TCP-STREAM                                                          iommu off
+                                                                                                     0
+test (Figure 6). The values in the parentheses show the throughput                                     32 64 12 25 51 1K 2K 4K 8K 16 32 64
+                                                                                                         B B 8B 6B 2B B B B B KB KB KB
+relative to the iommu-off configuration.
+                                                                                                                         message size
+
+
+                                                                                 Figure 8. Impact on CPU utilization of accessing a varying fraction
+the IOMMU disabled, which eliminates all IOMMU hardware-                         of packet data bytes under damn when running XOR netfilter.
+related overheads and boosts throughput by an additional
+9 Gb/s (4.5% of iommu-off ). This leaves a 5 Gb/s (2.5%) gap
+relative to iommu-off that we are unable to explain. We spec-
+ulate that the source of the remaining throughput difference                     workloads evaluated thus far, DAMN only copies packet
+is implementation artifacts that could be addressed by pro-                      header bytes. Here, we use a custom benchmark to evaluate
+filing and further optimizing damn.                                              the performance impact of TOCTTOU-defense copying.
+                                                                                    We use the Linux netfilter [32] framework to register
+memcached The memcached benchmark consists of sev-                               a callback function with the network stack that gets passed
+eral memslap [1] instances generating load on 28 memcached                       each incoming TCP segment destined to the host. Our call-
+instances that run on the evaluation machine. We use a work-                     back accesses a configurable fraction of the packet’s data
+load with 50%/50% GET/SET operations of 512 KiB keys and                         bytes; it is invoked after segment reassembly, and so can
+values. We use non-default key/value sizes to obtain signif-                     access up to 64 KiB of data. We model efficient segment pro-
+icant network traffic that stresses the protection schemes.                      cessing by simply XORing the accessed bytes with a constant
+Figure 7 shows the aggregated throughput (memcached op-                          value. Data-accessing workloads that are more computation-
+erations) obtained. Damn, shadow buffs and deferred obtain                       ally heavy, such as encrypting tunnels, incur overheads high
+comparable throughput to iommu-off , but shadow buffs use                        enough to make the resulting throughput an order of mag-
+about 1.6× the CPU as compared to damn and iommu-off .                           nitude lower than line rate, so all protection schemes have
+Due to the IOTLB invalidation rate caused by TX traffic, strict                  negligible overhead and thus become indistinguishable.
+obtains half the throughput of the other protection schemes,                        Figure 8 compares the CPU consumption of iommu-off ,
+with strict requiring 70% CPU time to drive only 8816 TPS.                       shadow buffs, and damn when running concurrent netperf
+                                                                                 RX TCP-STREAM throughput tests on all 14 cores of a CPU
+6.2    Impact of DAMN TOCTTOU protection                                         populating one socket of the test machine. (We show only
+DAMN defends against device TOCTTOU attacks on RX                                CPU use because all variants achieve the same throughput.)
+packets, whose buffers are writable by the device, by dynam-                     The lightweight XOR processing does not add measurable
+ically copying packet bytes that the OS accesses to remove                       overhead to iommu-off and shadow buffs, as indicated by
+them from the device’s reach. In the standard networking                         their CPU consumption, which remains fixed.
+                                  12                                                                   a. receive    b. transmit     c. bidirectional
+       num. of pages [millions]                ever been used for DMA                          2
+                                  10           currently used for DMA
+
+
+
+
+                                                                               memory [GiB]
+                                                                                              1.5
+                                  8
+                                  6                                                            1
+                                  4                                                           0.5
+                                                               12K
+                                  2
+                                                                                               0
+
+
+
+
+                                                                                                      0
+                                                                                                      1
+                                                                                                      2
+                                                                                                      4
+                                                                                                      8
+                                                                                                     16
+                                                                                                     32
+                                                                                                     64
+                                                                                                    128
+                                                                                                    256
+                                                                                                      0
+                                                                                                      1
+                                                                                                      2
+                                                                                                      4
+                                                                                                      8
+                                                                                                     16
+                                                                                                     32
+                                                                                                     64
+                                                                                                    128
+                                                                                                    256
+                                                                                                      0
+                                                                                                      1
+                                                                                                      2
+                                                                                                      4
+                                                                                                      8
+                                                                                                     16
+                                                                                                     32
+                                                                                                     64
+                                                                                                    128
+                                                                                                    256
+                                  0
+                                       0   5      10    15    20     25   30
+                                                  time [minutes]                                    damn            active sockets
+                                                                                                    iommu off
+Figure 9. Pages used to hold DMA I/O buffers in stock Linux. Over
+                                                                               Figure 10. Kernel memory usage during multi-core netperf TCP-
+time, many pages hold DMA buffers, potentially increasing the vul-
+                                                                               STREAM tests.
+nerability of partial protection models.
+
+
+
+
+   As expected, Damn initially resembles iommu-off , and                          The memory capacity required to house all networking
+then gradually, as more data is being accessed (and thus                       data is dictated by the running applications. Roughly speak-
+copied), damn’s CPU use grows until it approaches shadow                       ing, it is the sum of all the receive buffers populating RX
+buffs. It remains below 16% (1.2× of iommu-off and 0.6× of                     rings ready to store incoming data, plus all socket buffers
+shadow buffs) up to 1 KiB of copying, approaching 18% at                       ready to absorb application write operations. As long as a
+16 KiB (1.5× of iommu-off and 0.75× of shadow buffs). Even                     socket buffer is not exhausted, the application that writes
+when copying all the segment, damn’s CPU consumption is                        into it will continue to execute. But if the buffer becomes full,
+10% lower than that of shadow buffs, which copy to arbitrary                   the OS will suspend the writing application until enough
+kmalloc()ed kernel buffers that are colder in the cache.                       bytes are sent and sufficient room becomes available.
+   Given that typical packet inspection workloads (e.g., fire-                    To evaluate the effectiveness of DAMN in terms of mem-
+walls or virtual switches) are unlikely to access more than                    ory consumption, we run multiple netperf TCP STREAM
+1 KiB of data, it seems damn’s TOCTTOU protection imposes                      instances on multiple cores for a period of 25 seconds. Dur-
+only modest overheads compared to an unprotected system.                       ing the run, after each second, we record the overall system
+                                                                               memory usage (using Linux’s /proc/meminfo), and, at the
+6.3   Memory consumption                                                       end of the run, we compute the average consumption us-
+With DAMN, the network stack uses an allocator that perma-                     ing the 25 measurements. Figure 10 compares the average
+nently binds buffers to the I/O subsystem, to be exclusively                   memory usage of iommu-off and damn, using a set of experi-
+used for networking until global memory pressure prompts                       ments that are configured to run with an increasing number
+the OS to invoke the shrinker and reclaim unused memory                        of concurrent netperf instances. We report results for RX-
+(§ 5.4). It is therefore important for DAMN to reuse its I/O                   only, TX-only, and bidirectional streams (i.e., with half of
+buffers effectively and allocate more of them only when                        the netperfs receiving and the other half transmitting). Be-
+the aggregated size of networked data exceeds the memory                       cause damn’s DMA cache recycles allocated memory, damn
+capacity currently owned by DAMN.                                              essentially consumes only the memory required to hold the
+   Conversely, as illustrated in Figure 9, stock Linux need                    workload’s networking data. Consequently, damn’s memory
+not—and in fact does not—systematically reuse I/O buffers                      usage is comparable to that of iommu-off . The difference is
+for the purpose of DMA. Rather, it removes their mappings                      at most 270 MiB, and, except for the TX workload, neither
+from the associated I/O page tables at dma_unmap, thus mak-                    system is consistently better.
+ing them safe to use for other purposes. In the figure, we                        Memory usage with damn and iommu-off differs once the
+show the number of pages ever mapped for DMA vs. the                           experiments complete (not shown). With iommu-off , system
+number of pages currently mapped for DMA. The measure-                         memory usage drops back to near its starting level before the
+ments are taken over a period of 30 minutes while running                      experiments, with a ≈300 MiB increase. With damn, memory
+four netperf instances alongside an iterative kernel compile                   usage remains at its level during the experiment, as the net-
+job, which stresses the kernel allocator. Memory used for                      working buffers remain in the DMA cache, mapped in the
+DMA buffers remains constant, requiring less than 50 MiB                       IOMMU. Memory will be unmapped and released back to
+throughput, whereas the cumulative number of pages that                        the system only when the kernel invokes DAMN’s shrinker,
+ever held network DMA buffers monotonically increases.                         if memory pressure occurs.
+6.4   Interaction with other applications                                      a. iops [thousands]                          b. CPU [%]
+                                                                  1000                                      100
+We evaluate how the network stack affects an unrelated,
+non-networking program running on the same machine, and               800                                   80
+vice versa. The results are discussed in § 4.2 and depicted in        600                                   60
+Figure 2. Here, we detail the setup used for the experiment,
+                                                                      400                                   40
+and highlight damn’s performance.
+   We run the bidirectional netperf TCP-STREAM test on 4              200                                   20
+cores, 2 per CPU. The remaining cores run 3 instances of               0                                      0
+the Graph500 BFS loop, each using 8 cores (again divided                       51     4K    16      12                51     4K    16     12
+                                                                                 2            K        8K               2             K      8K
+equally between the two CPUs), on a graph problem with
+220 vertices and average vertex degree of 256. We measure                                        block size [bytes]
+the throughput obtained by the TCP-STREAM test and the                      no protection – iommu off
+average execution time of the BFS algorithm, measured in                    partial protection – deferred linux
+                                                                            partial protection – strict linux
+seconds/iteration.                                                          full protection – shadow buffs
+   The main takeaway from Figure 2 is damn’s advantage
+over shadow buffs. As it avoids the extra copy induced by               Figure 11. Multi-core fio/NVMe I/O rate and CPU usage.
+shadow buffs, it curbs the completion of netperf and Graph500
+over memory bandwidth, allowing one to perform as if the          attack protection from high-speed storage media, but that
+other is not present. In contrast, shadow buffs generate mem-     networking requires a specialized solution.
+ory pressure that adversely affects both, reducing netperf’s         Interestingly, with 512-byte blocks, strict achieves 6% higher
+throughput and increasing Graph500’s runtime.                     IOPS than the other schemes. As strict I/O submission is
+                                                                  slower, there are more opportunities for the device’s comple-
+6.5   Protection against NVMe DMA attacks                         tion queue to fill up and then be processed at the end of I/O
+The DAMN approach is incompatible with storage devices            submissions. The faster I/O submissions in the other protec-
+(§ 2.2). However, DAMN is compatible with prior DMA at-           tion schemes leave less time for completions to accumulate,
+tack protection schemes, which can therefore be used for          leading to more completion interrupts being generated.
+storage devices, complementing DAMN. To determine the
+effectiveness of this approach, we evaluate the prior schemes     7     Conclusion
+on a storage device with high DMA rates. We use an Intel DC       Defending against NIC DMA attacks at the DMA API level re-
+P3700 400 GiB NVMe SSD installed in a Dell R430 server. The       quires systems to compromise on either performance or secu-
+server is equipped with two Intel Xeon E5-2650 v4 (Broad-         rity. We instead propose to provide protection by: (1) modify-
+well) 12-core CPUs and 64 GiB RAM. To maximize the DMA            ing the network stack to use a new allocator, denoted DAMN,
+rate, we use the fio [6] benchmark (version 2.2.10). We run       which manages buffers that are permanently mapped in
+12 fio threads that each perform asynchronous direct se-          the IOMMU (until memory pressure occurs); (2) copying
+quential reads from the device. Using direct I/O bypasses the     DMAed data from these buffers into memory inaccessible
+page cache, so that the benchmark interacts directly with         to the NIC when the data is first accessed; and (3) avoiding
+the device. Each test runs for 60 seconds on an otherwise         the overhead of this extra copy by leveraging the fact that
+idle system, and we report an average of three runs.              standard network stacks copy data at the user-kernel bound-
+   Figure 11 depicts the CPU utilization and throughput in        ary in any case. DAMN thus provides full, byte-granularity
+terms of I/O operations per second (IOPS), as we vary the         IOMMU protection with performance rivaling that of an un-
+block size used for reads. With a 512-byte block size, we         protected system. Compared to DMA shadow buffers (the
+reach the maximal possible IOPS rate of the disk (≈900 K          only IOMMU protection scheme with equivalent security
+IOPS). In all tests the NVMe disk is the bottleneck. Tests with   guarantees), DAMN provides 7% higher throughput using
+larger block sizes are limited by the maximal disk throughput     half the CPU. When constrained to use a single core, DAMN’s
+(≈3.2 GiB/sec). Thus, no protection scheme throttles the de-      throughput becomes 2.7× higher than that of shadow buffers.
+vice speed, even when hitting the maximal IOPS limit. More-
+over, all protection schemes but strict execute the benchmark     Acknowledgments
+with roughly the same CPU utilization. In the 512-byte block      We thank Nadav Amit for many helpful discussions. This
+test, strict consumes 2× the CPU as the other schemes, but        research was funded in part by the Israel Science Foundation
+its CPU consumption is comparable for larger block sizes.         (grant 2005/17) and by Mellanox, which additionally gra-
+Importantly, shadow buffs’ performance is essentially iden-       ciously donated NICs. Adam Morrison is supported by Len
+tical to iommu-off , both in IOPS and CPU utilization. This       Blavatnik and the Blavatnik Family foundation. Igor Smolyar
+supports our premise that shadow buffs can be used for DMA        is partially supported by the Technion Hasso Plattner Center.
+References                                                                      [20] IBM Corporation. AIX kernel extensions and device support program-
+ [1] Brian Aker. Memslap - load testing and benchmarking a server. ht                ming concepts. http://public.dhe.ibm.com/systems/power/docs/aix/
+     tp://docs.libmemcached.org/bin/memslap.html. libmemcached 1.1.0                 71/kernextc_pdf.pdf, 2013. Accssed: Jan 2018.
+     documentation. Accessed: Jan 2018.                                         [21] Intel TXT Overview. https://www.kernel.org/doc/Documentation/int
+ [2] AMD Inc. AMD IOMMU architectural specification, rev 2.00. http:                 el_txt.txt. Linux kernel documentation. Accessed: Jan 2018.
+     //developer.amd.com/wordpress/media/2012/10/488821.pdf, Mar 2011.          [22] Intel Corporation.             Intel trusted execution technology.
+     Accessed: Jan 2018.                                                             http://www.intel.com/content/dam/www/public/us/en/documents
+ [3] Apple Inc. Thunderbolt device driver programming guide: Debugging               /white-papers/trusted-execution-technology-security-paper.pdf,
+     VT-d I/O MMU virtualization. https://developer.apple.com/library/ma             2012. Accessed: Jan 2018.
+     c/documentation/HardwareDrivers/Conceptual/ThunderboltDevG                 [23] Intel Corporation. Intel virtualization technology for directed
+     uide/DebuggingThunderboltDrivers/DebuggingThunderboltDrivers                    I/O, architecture specification - architecture specification - Rev.
+     .html, 2013. Accessed: Jan 2018.                                                2.5. http://www.intel.com/content/dam/www/public/us/en/docum
+ [4] ARM Holdings.         ARM system memory management unit ar-                     ents/product-specifications/vt-directed-io-spec.pdf, Nov 2017. Ac-
+     chitecture specification — SMMU architecture version 2.0.                       cessed: Jan 2018.
+     http://infocenter.arm.com/help/topic/com.arm.doc.ihi0062d.c/I              [24] Joerg Roedel. AMD IOMMU DMA-API scalability improvements, Linux
+     HI0062D_c_system_mmu_architecture_specification.pdf,               2013.        patch. https://lists.linuxfoundation.org/pipermail/iommu/2015-Dec
+     Accessed: Jan 2018.                                                             ember/015245.html, Dec 2015. Accessed: Jan 2018.
+ [5] Damien Aumaitre and Christophe Devine. Subverting Windows 7                [25] Intel-IOMMU.txt – Linux IOMMU support. https://www.kernel.org/d
+     x64 kernel with DMA attacks. In Hack In The Box Security Conference             oc/Documentation/Intel-IOMMU.txt. Linux kernel documentation.
+     (HITB), 2010. http://esec-lab.sogeti.com/static/publications/10-hitba           Accessed: Jan 2018.
+     msterdam-dmaattacks.pdf. Accessed: Jan 2018.                               [26] Moshe Malka, Nadav Amit, Muli Ben-Yehuda, and Dan Tsafrir. rI-
+ [6] Jens Axboe. Flexible I/O Tester. https://github.com/axboe/fio. Ac-              OMMU: Efficient IOMMU for I/O devices that employ ring buffers. In
+     cessed: Jan 2018.                                                               ACM International Conference on Architectural Support for Program-
+ [7] Michael Becher, Maximillian Dornseif, and Christian N. Klein.                   ming Languages and Operating Systems (ASPLOS), pages 355–368, 2015.
+     FireWire: all your memory are belong to us. In CanSecWest Applied               http://dx.doi.org/10.1145/2872362.2872379.
+     Security Conference, 2005. https://cansecwest.com/core05/2005-firew        [27] Moshe Malka, Nadav Amit, and Dan Tsafrir. Efficient intra-operating
+     ire-cansecwest.pdf. Accessed: Jan 2018.                                         system protection against harmful DMAs. In USENIX Conference on
+ [8] Jeff Bonwick and Jonathan Adams.              Magazines and Vmem:               File and Storage Technologies (FAST), pages 29–44, 2015. https://www.
+     Extending the Slab allocator to many CPUs and arbitrary re-                     usenix.org/system/files/conference/fast15/fast15-paper-malka.pdf.
+     sources. In USENIX Annual Technical Conference (ATC), pages 15–44,         [28] Vinod Mamtani.             DMA directions and Windows.              http:
+     2001. https://www.usenix.org/legacy/publications/library/proceedin              //download.microsoft.com/download/a/f/d/afdfd50d-6eb9-425e
+     gs/usenix01/full_papers/bonwick/bonwick.pdf.                                    -84e1-b4085a80e34e/sys-t304_wh07.pptx, 2007. Accessed: Jan 2018.
+ [9] James E.J. Bottomley. Dynamic DMA mapping using the generic                [29] Alex Markuze, Adam Morrison, and Dan Tsafrir. True IOMMU pro-
+     device. https://www.kernel.org/doc/Documentation/DMA-API.txt.                   tection from DMA attacks: When copy is faster than zero copy. In
+     Linux kernel documentation. Accessed: Jan 2018.                                 ACM International Conference on Architectural Support for Program-
+[10] James E.J. Bottomley. Integrating DMA into the generic device mode.             ming Languages and Operating Systems (ASPLOS), pages 249–262, 2016.
+     In Ottawa Linux Symposium (OLS), pages 63–75, 2003. https://www.ke              https://doi.org/10.1145/2872362.2872379.
+     rnel.org/doc/ols/2003/ols2003-pages-63-75.pdf. Accessed: Jan 2018.         [30] Mellanox Technologies. ConnectX-5 Ex 100 Gb/s Ethernet Single and
+[11] Jonathan Brossard. Hardware backdooring is pratical. In Black Hat,              Dual QSFP28 Port Adapter Cards User Manual. http://www.mell
+     2012. http://www.toucan-system.com/research/blackhat2012_brossa                 anox.com/related-docs/user_manuals/ConnectX-5_Ethernet_Singl
+     rd_hardware_backdooring.pdf. Accessed: Jan 2018.                                e_and_Dual_QSFP28_Port_Adapter_Card_User_Manual.pdf, 2018.
+[12] Jonathan Corbet. Smarter shrinkers. https://lwn.net/Articles/550463/,           Accessed: Jan 2018.
+     May 2013. Accessed: Jan 2018.                                              [31] Bosko Milekic. Network buffer allocation in the FreeBSD operating
+[13] Jonathan Corbet. An introduction to compound pages. https://lwn.ne              system. In The Technical BSD Conference (BSDCan), 2004. https://www.
+     t/Articles/619514/, Nov 2014. Accessed: Jan 2018.                               bsdcan.org/2004/papers/NetworkBufferAllocation.pdf. Accessed: Jan
+[14] Maximillian Dornseif. 0wned by an iPod. In PACific SECurity – applied           2018.
+     security conferences and training in Pacific Asia (PacSec), 2004. https:   [32] The netfilter.org project. http://www.netfilter.org/. Accessed: Jan 2018.
+     //pacsec.jp/psj04/psj04-dornseif-e.ppt. Accessed: Jan 2018.                [33] Netperf – a network performance benchmark. https://github.com/H
+[15] DPDK. http://dpdk.org/. Accessed: Jan 2018.                                     ewlettPackard/netperf. Accessed: Jan 2018.
+[16] Loïc Duflot, Yves-Alexis Perez, Guillaume Valadon, and Olivier Levil-      [34] Omer Peleg, Adam Morrison, Benjamin Serebrin, and Dan Tsafrir.
+     lain. Can you still trust your network card? Technical report, French           Utilizing the IOMMU Scalably. In USENIX Annual Technical Conference
+     Network and Information Security Agency (FNISA), Mar 2010. http:                (ATC), pages 549–562, 2015. https://www.usenix.org/system/files/conf
+     //www.ssi.gouv.fr/uploads/IMG/pdf/csw-trustnetworkcard.pdf. Ac-                 erence/atc15/atc15-paper-peleg.pdf.
+     cessed: Jan 2018.                                                          [35] Simon Peter, Jialin Li, Irene Zhang, Dan R. K. Ports, Doug Woos, Arvind
+[17] Brad Fitzpatrick. Distributed caching with memcached. Linux Jour-               Krishnamurthy, Thomas Anderson, and Timothy Roscoe. Arrakis:
+     nal, 2004(124), Aug 2004. http://www.linuxjournal.com/article/7451.             The operating system is the control plane. In USENIX Symposium
+     Accessed: Jan 2018.                                                             on Operating System Design and Implementation (OSDI), pages 1–16,
+[18] Google LLC. Google infrastructure security design overview. https:              2014. https://www.usenix.org/system/files/conference/osdi14/osdi
+     //cloud.google.com/security/security-design, Jan 2017. Google Cloud             14-paper-peter_simon.pdf.
+     Whitepaper. Accessed: Jan 2018.                                            [36] Arjun Singh, Joon Ong, Amit Agarwal, Glen Anderson, Ashby Armis-
+[19] IBM Corporation.          PowerLinux servers — 64-bit DMA con-                  tead, Roy Bannon, Seb Boving, Gaurav Desai, Bob Felderman, Paulie
+     cepts. http://pic.dhe.ibm.com/infocenter/lnxinfo/v3r0m0/topic/liabm/            Germano, Anand Kanagala, Hong Liu, Jeff Provost, Jason Simmons,
+     liabmconcepts.htm. Accessed: Jan 2018.                                          Eiichi Tanda, Jim Wanderer, Urs Hölzle, Stephen Stuart, and Amin
+                                                                                     Vahdat. Jupiter rising: A decade of Clos topologies and centralized
+     control in Google’s datacenter network. Communications of the ACM                 SEC08-Project-Maux-II.pdf. Accessed: Jan 2018.
+     (CACM), 59(9):88–97, Aug 2016. https://doi.org/10.1145/2975159.              [40] Thomas Willhalm, Roman Dementiev, and Patrick Fay. Intel perfor-
+[37] SPIEGEL Staff. Inside TAO: Documents Reveal Top NSA Hacking                       mance counter monitor. http://www.intel.com/software/pcm, Jan 2017.
+     Unit. Der Spiegel, Dec 2013. http://www.spiegel.de/international/w                Intel Developer Zone. Accessed: Jan 2018.
+     orld/the-nsa-uses-powerful-toolbox-in-effort-to-spy-on-global-net            [41] Mitch Williams. i40e: enable packet split only when IOMMU present,
+     works-a-940969.html. Accessed: Jan 2018.                                          Linux commit. https://github.com/torvalds/linux/commit/2bc7ee8a
+[38] Patrick Stewin and Iurii Bystrov. Understanding DMA malware.                      c5439efec66fa20a8dc01c0a2b5af739. Accessed: Aug 2018.
+     In Conference on Detection of Intrusions and Malware & Vulnerabil-           [42] Zongwei Zhou, Virgil D. Gligor, James Newsome, and Jonathan M.
+     ity Assessment (DIMVA), pages 21–41, 2012. https://doi.org/10.1007/               McCune. Building verifiable trusted path on commodity x86 computers.
+     978-3-642-37300-8_2.                                                              In IEEE Symposium on Security and Privacy (S&P), pages 616–630, 2012.
+[39] Arrigo Triulzi. I 0wn the NIC, now I want a shell! In PACific SECu-               https://doi.org/10.1109/SP.2012.42.
+     rity – applied security conferences and training in Pacific Asia (PacSec),
+     2008. http://www.alchemistowl.org/arrigo/Papers/Arrigo-Triulzi-PAC
+
