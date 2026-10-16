@@ -1,3 +1,13 @@
+# 2026年10月16日 MAP-OWNER-REPRESENTATION-COST-1：四种表示条件比较完成
+
+MAP-OWNER-REPRESENTATION-COST-1已完成四种表示的条件比较，保留V-C固定值稀疏表：seqcount稳定命中可免reader锁，odd／冲突须在同一writer锁内完整relookup。可条件免逐record grace；frame、全部片段／bias、operation及target/config/ctx/allocator整体寿命仍须保持。普通R/O3同享，不是新seqcount算法，未证独占或原生净赢，未选论文主线。 K信用、H容量及实际metadata RAM分开；固定预留字节不因空槽增加而减少。强RCU可先重发布payload、预留有界spares及批量退休；CPU、真实S/P/C/Q物理并集与分配反馈、PTE/IOVA、带宽和有效完成分别报告，native仍null。
+
+下一MAP-VALUE-TABLE-CONTRIBUTION-EVIDENCE-1为evidence_gated_not_auto_scheduled：仅新代表性完整成本／生命周期或具体部署能力差项触发；不自动开发、采集、建模、重复数据搜索／旧账或继续拆相同协议，不等待一般许可、价值确认或用户保证痛点。
+
+13处root直接读段行界、9项frame primary及13项混合表示证据、2份raw HTTP200哈希核验通过，仅属provenance；另有2次官方web open。0生产源码编辑、native／新模型／旧实验／旧账／构建、数据重搜、host设备probe或硬件动作。Codex-only；frame核查请求Sol/high、表示分析Sol/xhigh、文档Sol/medium；actual独立model/effort metadata unknown，不声称root切换。 B1/I/D/A5/A2与独立工程保持；MIG1792023314 paused及10月15—28日窗口不变。
+
+[本轮入口](../out/mapping-owner-representation-20261016/README.md)／[裁决](../out/mapping-owner-representation-20261016/root/decision-analysis.md)／[假设卡](../out/mapping-owner-representation-20261016/root/hypothesis-card.json)／[接受](../out/mapping-owner-representation-20261016/root/root-result-acceptance.json)／[下一证据gate](../out/mapping-owner-representation-20261016/root/next-minimal-contract.json)／[文档验收](../out/mapping-owner-representation-20261016/documentation/verification.json)。以下完整即时旧字节后缀保留。
+
 # 2026年10月16日 MAP-OWNER-RECALL-PUBLISH-1：冷B关联条件控制协议完成
 
 MAP-OWNER-RECALL-PUBLISH-1已完成源码绑定的条件控制协议，保留owner-assisted private alloc.cache-only冷B关联回收及低成本整合假设；未实现，未证独占创新或净收益，未选论文主线。
