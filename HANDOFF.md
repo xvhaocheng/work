@@ -1,3 +1,11 @@
+# 2026年10月16日 FIRST-PTE-INTERFACE-COST-1：首PTE与legalizer成对源码设计
+
+已完成[六段报告](iommu-platform/docs/first-pte-interface-cost-20261016.md)。M-ID f1用真实start、固定同钟传播、已知DRAM根页及既有ID建立P1关联，H只停gate；独立COPY资格不等于bank不同。O-local可复用metadata FIFO pacing，O-tail-prepared可复用A TC持有第二段，RAW=0复用marker位，新增1个完成sticky及回线，不需新header FIFO。root纠正非DRAM成功P1后P2误认边界、完成驱动不等于立即物理发布，以及旧a_split占共享server的位置。
+
+决定：保留一次局部成对实现提案，停止“字段少所以票据便宜”的论证；原模型cold票据2060/普通split2058、hot/short/long/late边界不改，不重跑70条。源码与原文版本、目标diff、假设/未知和接受范围见[接受](iommu-platform/out/first-pte-interface-cost-20261016/root/root-result-acceptance.json)；[唯一后继](iommu-platform/out/first-pte-interface-cost-20261016/root/next-minimal-contract.json)未执行，不自动启动。没有生产/ABI修改、新模型/RTL仿真/综合/板测；B1/I/D/A5/A2、MIG暂停及独立工程事项保持。实际model/effort独立元数据unknown，不以请求配置代证。
+
+写共享文件前重新读取并核对，保留下面原交接全文及CURRENT的分支/独立工程段。[本轮检查](iommu-platform/out/first-pte-interface-cost-20261016/root/verification.json)区分资料/算术检查与未执行RTL验证。
+
 # 2026年10月16日 工作区入口、规则与文献库整理
 
 根与平台AGENTS仅保留稳定工作规则，整理前工作树原文已[归档](docs/history/agent-rules-20261016/README.md)。[根README](README.md)与[研究导航](研究导航.md)提供新agent阅读路径；[仓库地图](docs/repository-layout.md)定位代码与证据，[成果索引](docs/research-results.md)串联历史结果及具体停止范围。

@@ -6,7 +6,7 @@
 
 ## 从当前问题开始
 
-- **M0首PTE票据／接口实现成本**：先读 [MASK](summaries/mask2018.md) → [AXI-REALM](summaries/axi_realm2025.md) → [iDMA](summaries/idma_tc2024.md)。MASK已联合考虑PTE/data与配额，REALM已有合法分段/预算；这些前史限定当前增量。当前模型和接口成本问题见[当前状态](../CURRENT_STATUS.md)，不是文献库选择了论文主线。
+- **M0首PTE票据／接口实现成本**：先读 [MASK](summaries/mask2018.md) → [AXI-REALM](summaries/axi_realm2025.md) → [iDMA](summaries/idma_tc2024.md)。MASK已联合考虑PTE/data与配额，REALM已有合法分段/预算；这些前史限定当前增量。当前模型和接口成本问题见[当前状态](../CURRENT_STATUS.md)，不是文献库选择了论文主线。 本轮[源码/前作成对比较](../iommu-platform/docs/first-pte-interface-cost-20261016.md#5-论文贡献判断)定向核到MASK §5.4、AXI-REALM §III-A/IV-B、iDMA §II-C；保留原阅读等级，不升级为全面查新。
 - **映射组织、持续授权、回收／CPU与内存成本**：[DAMN](summaries/damn2018.md) → [rIOMMU](summaries/riommu2015.md) → [Utilizing the IOMMU Scalably](summaries/iommu_scalable2015.md) → [IOTLB Wall](summaries/iotlb_wall2023.md) → [F&S](summaries/fastsafe2024.md) → [DMA_PMD RFC](summaries/dma_pmd_rfc2026.md)。明确区分来源已实现能力、公开补丁和普通适配。
 - **共享翻译干扰与强前作**：[Bermuda](summaries/bermuda2025.md)、[DWS](summaries/walk_stealing2021.md)、[Scheduling PTW](summaries/walk_scheduling2018.md)、[Orchestrated](summaries/orchestrated2023.md)、[ShareMMU](summaries/sharemmu2026.md)、[DATE2025 RISC-V SVA](summaries/riscvsva2025.md)。
 - **分析方法边界**：[RTAS2026 DPU](summaries/aromolo_rtas2026.md) → [TC2023完整job界](summaries/bounding_multiax2023.md) → [AXI-ICRT](summaries/axi_icrt2023.md)。FIFO外调度、合法分块、预算和一般响应分析均有前史。
