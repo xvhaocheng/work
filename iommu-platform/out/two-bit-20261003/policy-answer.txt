@@ -1,0 +1,1985 @@
+# Findings
+
+I did not execute anything. The deliverables below are **new files only**; no existing file is modified.
+
+## Contract → implementation mapping (short)
+
+| Contract clause (docs/research-two-bit-v2.md §"方法控制") | Where implemented |
+|---|---|
+| E00..E10 config/command/status, high bits rejected, other write addresses rejected | §1 register map, `wr_ok`/`new_err[E_BADADDR]` |
+| Config locked while armed | `new_err[E_CFGLOCK]`, config write gated by `!armed_q` |
+| ARM/CLEAR only quiet & !armed; FREEZE requires quiet | command decode in `always_comb` |
+| CLEAR illegal can't clear sticky error | `do_clear` only when `quiet && !armed && new_err==0`; otherwise `err_q <= err_q \| …` |
+| mode0 ADMIT, always allow, no charge | `cost_ev` case 0, `allow_core = 1` |
+| modes 1..5 per-event cost | `cost_ev` case 1..5 |
+| signed 64 balance, 65/66-bit intermediate, debt preserved, positive side capped by `credit_cap` | `bal_a/bal_c/bal_r/bal_fin`, `bal_ovf`, saturation keeps debt |
+| charge → old-b refill → full-active feedback, same edge | combinational chain `charge_now → bal_c → bal_r → bal_fin`, `refill_en` from `win_complete` |
+| window starts at ARM; window active detection includes first and last cycle | `win_cnt_q` cleared on ARM; `act_all_now = win_allact_q & v_active_i` used at `win_last` |
+| zero-v_done fully-active window still updates b and histogram bucket 0 | `win_complete` does not require `vdone_now!=0` |
+| mode6 gap countdown loaded by A done, decision on updated countdown, first A done no gap | `m6_cd_next`, `m6_started_q`, `allow_core` for mode 6 |
+| mode7 stale charge of previous complete billing window at next window end, first window zero | `prev_main_q` / `win_main_q` rotation + `stale_cyc` |
+| PTW attribution `ctl_did==A && ptw_r_fire`, inside weighted mode 4, separately counted | `ev_ptw_a`, `ST_PTW` |
+| 64-bit statistics overflow → sticky error, stop | `cadd()` + `cnt_ovf` → `E_CNTOVF` → `fatal_now` blocks allow |
+| Fixed statistics table E20..E3F + E40..E5F 32 buckets | header table + `stat_q[]` / `hist_q[]` |
+| Enabled=0 → magic readable, ARM unsupported | `enable_core` includes `Enabled`; ARM sets `E_UNSUP` |
+
+---
+
+# Deliverable 1 — `cva6/corev_apu/fpga/src/dma_research_policy.sv` (NEW)
+
+```systemverilog
+`default_nettype none
+//=============================================================================
+// dma_research_policy.sv
+//
+// Standalone research "Method control" policy block (bank E00..E5F).
+// NEW FILE - no existing RTL is modified.
+//
+// Implements docs/research-two-bit-v2.md "方法控制（独立模块，bank E00起）".
+//
+// Register map (index_i[7:0]; index_i[12:8] must be 0)
+// ---------------------------------------------------------------------------
+//  E00 r  magic     0x49444d414d435431  ("IDMAMCT1")
+//  E01 r  version   1
+//  E02 r  error     sticky, see ERR_* bits
+//  E03 r  status    bit0 armed / bit1 frozen / bit2 abort
+//  E04 w  command   1 ARM / 2 ABORT / 3 FREEZE / 4 CLEAR   (reads 0)
+//  E05 rw mode                    default 0
+//  E06 rw window_cycles           default 16384
+//  E07 rw target_bytes            default 51540
+//  E08 rw deadband_bytes          default 4096
+//  E09 rw initial_budget          default 8000
+//  E0A rw min_budget              default 1
+//  E0B rw max_budget              default 32768
+//  E0C rw budget_step             default 512
+//  E0D rw credit_cap              default 65536
+//  E0E rw hit_weight              default 1
+//  E0F rw miss_weight             default 100
+//  E10 rw ptw_weight              default 100
+//  --- statistics (read only, CounterWidth wide) -----------------------------
+//  E20 complete (fully V-active) billing windows
+//  E21 V done events
+//  E22 V done bytes (4096 per done)
+//  E23 windows whose observed bytes < target
+//  E24 total shortfall bytes (target - observed)
+//  E25 cycles with policy_enable_o=1 and policy_allow_o=0
+//  E26 total charge
+//  E27 total replenish
+//  E28 A issue events
+//  E29 A done events
+//  E2A cycles with non-zero charge
+//  E2B A-owned lookup hit events
+//  E2C A-owned lookup miss events
+//  E2D A-owned PTW return events (ctl_did==DID_A && ptw_r_fire)
+//  E2E cycles with ctl_did==DID_A (A-owner cycles)
+//  E2F A select fires
+//  E30 A-owned lookup events (hit+miss)
+//  E31 A-owned lookup miss events
+//  E32 A REQ_TRANS/AWAIT_RESP cycles
+//  E33 window boundaries closed
+//  E34 window boundaries that were NOT fully V-active
+//  E35 feedback steps that increased b
+//  E36 feedback steps that decreased b
+//  E37 mode6 gap loads (A done after the first copy)
+//  E38 mode7 stale charges applied
+//  E39 cycles with armed=1 and frozen=0
+//  E3A final signed balance C (two's complement, 64 bit)
+//  E3B minimum b seen
+//  E3C maximum b seen
+//  E3D final b
+//  E3E longest V-active run with no V done (cycles, 64 bit)
+//  E3F reserved, reads 0
+//  E40..E5F V-done-per-complete-active-window histogram, 32 buckets:
+//          bucket k (k=0..30) = windows with k V done, bucket 31 = ">=31"
+// ---------------------------------------------------------------------------
+//  Cost per mode:
+//    0 unlimited/no charge | 1 A issue = 4096 B | 2 A select = 1
+//    3 A lookup miss = 1   | 4 weighted (hit/miss/ptw) | 5 A REQ_TRANS/
+//    AWAIT_RESP cycle = 1  | 6 V-only feedback gap (no per-cycle charge)
+//    7 stale actual (previous complete window A-owner cycles at window end)
+//=============================================================================
+
+module dma_research_policy #(
+    parameter bit          Enabled      = 1'b1,
+    parameter int unsigned CounterWidth = 64,
+    parameter logic [23:0] DID_A        = 24'h000010,
+    parameter logic [2:0]  ST_REQ_TRANS = 3'd1,
+    parameter logic [2:0]  ST_AWAIT_RESP= 3'd2
+)(
+    input  logic        clk_i,
+    input  logic        rst_ni,
+
+    input  logic        cfg_valid_i,
+    input  logic        cfg_write_i,
+    input  logic [12:0] index_i,
+    input  logic [63:0] wdata_i,
+    output logic [63:0] rdata_o,
+
+    input  logic        quiet_i,
+    input  logic        supported_i,
+
+    input  logic        v_active_i,
+    input  logic        a_issue_i,
+    input  logic        a_done_i,
+    input  logic        v_done_i,
+    input  logic [2:0]  ctl_state_i,
+    input  logic [23:0] ctl_did_i,
+    input  logic        select_fire_i,
+    input  logic [23:0] select_did_i,
+    input  logic        lookup_i,
+    input  logic        lookup_hit_i,
+    input  logic [23:0] lookup_did_i,
+    input  logic        ptw_r_fire_i,
+    input  logic        response_error_i,
+
+    output logic        policy_enable_o,
+    output logic        policy_allow_o,
+    output logic        policy_abort_o
+);
+
+    //=========================================================================
+    // 1. Constants, register offsets, error bits, stat indices
+    //=========================================================================
+    localparam logic [63:0] MAGIC      = 64'h49444d414d435431; // "IDMAMCT1"
+    localparam logic [63:0] VERSION    = 64'd1;
+    localparam logic [63:0] BYTES_DONE = 64'd4096;
+
+    localparam logic [7:0] R_MAGIC    = 8'h00;
+    localparam logic [7:0] R_VERSION  = 8'h01;
+    localparam logic [7:0] R_ERROR    = 8'h02;
+    localparam logic [7:0] R_STATUS   = 8'h03;
+    localparam logic [7:0] R_COMMAND  = 8'h04;
+    localparam logic [7:0] R_MODE     = 8'h05;
+    localparam logic [7:0] R_WINDOW   = 8'h06;
+    localparam logic [7:0] R_TARGET   = 8'h07;
+    localparam logic [7:0] R_DEADBAND = 8'h08;
+    localparam logic [7:0] R_INITBUD  = 8'h09;
+    localparam logic [7:0] R_MINBUD   = 8'h0A;
+    localparam logic [7:0] R_MAXBUD   = 8'h0B;
+    localparam logic [7:0] R_STEP     = 8'h0C;
+    localparam logic [7:0] R_CAP      = 8'h0D;
+    localparam logic [7:0] R_WHIT     = 8'h0E;
+    localparam logic [7:0] R_WMISS    = 8'h0F;
+    localparam logic [7:0] R_WPTW     = 8'h10;
+    localparam logic [7:0] R_LASTWR   = 8'h10;
+
+    localparam logic [7:0] S_CNT_BASE  = 8'h20; // E20..E39
+    localparam logic [7:0] S_BALANCE   = 8'h3A;
+    localparam logic [7:0] S_BMIN      = 8'h3B;
+    localparam logic [7:0] S_BMAX      = 8'h3C;
+    localparam logic [7:0] S_BFINAL    = 8'h3D;
+    localparam logic [7:0] S_NODONE    = 8'h3E;
+    localparam logic [7:0] S_HIST_BASE = 8'h40;
+    localparam logic [7:0] S_HIST_LAST = 8'h5F;
+
+    // sticky error bits (E02)
+    localparam int E_BADADDR  = 0;  // bad address / high bits nonzero on write
+    localparam int E_BADCMD   = 1;  // unknown command code
+    localparam int E_UNSUP    = 2;  // ARM while !supported_i or Enabled=0
+    localparam int E_CFGLOCK  = 3;  // config write while armed
+    localparam int E_CNTOVF   = 4;  // statistics counter overflow (fatal)
+    localparam int E_BALOVF   = 5;  // signed 64 balance overflow (fatal)
+    localparam int E_CLEARILL = 6;  // illegal CLEAR (armed or not quiet)
+    localparam int E_FRZILL   = 7;  // FREEZE while not quiet
+    localparam int E_ARMSTATE = 8;  // ARM/ABORT/FREEZE in a wrong state
+    localparam int E_OBS      = 9;  // observation error while armed (fatal)
+    localparam int E_BADCFG   = 10; // config does not satisfy ARM predicates
+
+    localparam logic [63:0] FATAL_MASK =
+        (64'd1 << E_CNTOVF) | (64'd1 << E_BALOVF) | (64'd1 << E_OBS);
+
+    // statistics counter indices -> E20..E39
+    localparam int ST_WIN       = 0;  // E20
+    localparam int ST_VDONE     = 1;  // E21
+    localparam int ST_VBYTES    = 2;  // E22
+    localparam int ST_SHORTW    = 3;  // E23
+    localparam int ST_SHORTB    = 4;  // E24
+    localparam int ST_BLOCKED   = 5;  // E25
+    localparam int ST_CHARGE    = 6;  // E26
+    localparam int ST_REPLEN    = 7;  // E27
+    localparam int ST_AISSUE    = 8;  // E28
+    localparam int ST_ADONE     = 9;  // E29
+    localparam int ST_CHARGECYC = 10; // E2A
+    localparam int ST_HIT       = 11; // E2B
+    localparam int ST_MISS      = 12; // E2C
+    localparam int ST_PTW       = 13; // E2D
+    localparam int ST_AOWN      = 14; // E2E
+    localparam int ST_SEL       = 15; // E2F
+    localparam int ST_LUTA      = 16; // E30
+    localparam int ST_LUTAMISS  = 17; // E31
+    localparam int ST_ACTUALCYC = 18; // E32
+    localparam int ST_WINALL    = 19; // E33
+    localparam int ST_WINPART   = 20; // E34
+    localparam int ST_FBUP      = 21; // E35
+    localparam int ST_FBDN      = 22; // E36
+    localparam int ST_GAPL      = 23; // E37
+    localparam int ST_STALE     = 24; // E38
+    localparam int ST_ARMEDCYC  = 25; // E39
+    localparam int NSTAT        = 26;
+
+    localparam int NHIST = 32;
+
+    // reset-time defaults (contract "初次defaultconfig")
+    localparam logic [31:0] DEF_MODE     = 32'd0;
+    localparam logic [31:0] DEF_WINDOW   = 32'd16384;
+    localparam logic [31:0] DEF_TARGET   = 32'd51540;
+    localparam logic [31:0] DEF_DEADBAND = 32'd4096;
+    localparam logic [31:0] DEF_INITBUD  = 32'd8000;
+    localparam logic [31:0] DEF_MINBUD   = 32'd1;
+    localparam logic [31:0] DEF_MAXBUD   = 32'd32768;
+    localparam logic [31:0] DEF_STEP     = 32'd512;
+    localparam logic [31:0] DEF_CAP      = 32'd65536;
+    localparam logic [31:0] DEF_WHIT     = 32'd1;
+    localparam logic [31:0] DEF_WMISS    = 32'd100;
+    localparam logic [31:0] DEF_WPTW     = 32'd100;
+
+    //=========================================================================
+    // 2. State
+    //=========================================================================
+    logic        armed_q, frozen_q, aborted_q;
+    logic [63:0] err_q;
+
+    logic [31:0] mode_q, window_q, target_q, deadband_q, initbud_q,
+                 minbud_q, maxbud_q, step_q, cap_q,
+                 whit_q, wmiss_q, wptw_q;
+
+    logic signed [63:0] balance_q;
+    logic [63:0]        b_q, bmin_q, bmax_q;
+    logic [63:0]        prev_main_q, win_main_q;
+    logic [63:0]        win_cnt_q, win_vdone_q;
+    logic               win_allact_q;
+    logic [63:0]        nodone_run_q, nodone_max_q;
+    logic               m6_started_q;
+    logic [63:0]        m6_cd_q;
+
+    logic [CounterWidth-1:0] stat_q [0:NSTAT-1];
+    logic [CounterWidth-1:0] hist_q [0:NHIST-1];
+
+    logic [63:0] stat_inc [0:NSTAT-1];
+    logic [64:0] stat_sum [0:NSTAT-1];
+    logic [63:0] hist_inc [0:NHIST-1];
+    logic [64:0] hist_sum [0:NHIST-1];
+
+    //=========================================================================
+    // 3. Helper functions
+    //=========================================================================
+    // (CounterWidth + 1)-bit sum plus carry-out at bit CounterWidth.
+    function automatic logic [64:0] cadd(input logic [CounterWidth-1:0] c,
+                                         input logic [63:0]          inc);
+        logic [64:0] w;
+        begin
+            w    = {1'b0, c} + {1'b0, inc};
+            cadd = w;
+        end
+    endfunction
+
+    // zero-extend a CounterWidth value to 64 bit (portable, no zero replication)
+    function automatic logic [63:0] zext64(input logic [CounterWidth-1:0] v);
+        logic [63:0] r;
+        begin
+            r = 64'd0;
+            for (int i = 0; i < CounterWidth; i++) r[i] = v[i];
+            zext64 = r;
+        end
+    endfunction
+
+    //=========================================================================
+    // 4. Event qualifiers (all in the peripheral clk domain)
+    //=========================================================================
+    logic ev_sel_a, ev_lut_a, ev_lut_hit_a, ev_lut_miss_a, ev_ptw_a,
+          ev_actual_a, ev_aown;
+
+    assign ev_sel_a      = select_fire_i && (select_did_i == DID_A);
+    assign ev_lut_a      = lookup_i      && (lookup_did_i == DID_A);
+    assign ev_lut_hit_a  = ev_lut_a &&  lookup_hit_i;
+    assign ev_lut_miss_a = ev_lut_a && !lookup_hit_i;
+    assign ev_ptw_a      = ptw_r_fire_i  && (ctl_did_i == DID_A);
+    assign ev_actual_a   = (ctl_did_i == DID_A) &&
+                           ((ctl_state_i == ST_REQ_TRANS) || (ctl_state_i == ST_AWAIT_RESP));
+    assign ev_aown       = (ctl_did_i == DID_A);
+
+    //=========================================================================
+    // 5. Window control
+    //=========================================================================
+    logic        win_run, win_last, act_all_now, win_complete;
+    logic [63:0] vdone_now, vdone_bytes_now, wnd_m1;
+
+    assign wnd_m1       = {32'd0, window_q} - 64'd1;
+    assign win_run      = armed_q & ~frozen_q;
+    assign win_last     = win_run & (window_q != 32'd0) & (win_cnt_q == wnd_m1);
+    assign act_all_now  = win_allact_q & v_active_i;   // includes first and last cycle
+    assign vdone_now    = win_vdone_q + (v_done_i ? 64'd1 : 64'd0);
+    assign win_complete = win_last & act_all_now;
+
+    assign vdone_bytes_now = vdone_now * BYTES_DONE;
+
+    //=========================================================================
+    // 6. Cost / charge / balance
+    //=========================================================================
+    logic [63:0] cost_ev, charge_now, refill_now, main_inc, shortfall_bytes;
+    logic        stale_cyc, refill_en;
+
+    always_comb begin
+        cost_ev = 64'd0;
+        case (mode_q)
+            32'd0: cost_ev = 64'd0;
+            32'd1: cost_ev = a_issue_i ? BYTES_DONE : 64'd0;
+            32'd2: cost_ev = ev_sel_a  ? 64'd1 : 64'd0;
+            32'd3: cost_ev = ev_lut_miss_a ? 64'd1 : 64'd0;
+            32'd4: cost_ev = (ev_lut_hit_a  ? {32'd0, whit_q}  : 64'd0)
+                           + (ev_lut_miss_a ? {32'd0, wmiss_q} : 64'd0)
+                           + (ev_ptw_a      ? {32'd0, wptw_q}  : 64'd0);
+            32'd5: cost_ev = ev_actual_a ? 64'd1 : 64'd0;
+            default: cost_ev = 64'd0;   // 6 and 7 carry no per-cycle cost
+        endcase
+    end
+
+    assign stale_cyc = win_last & (mode_q == 32'd7);
+    assign charge_now = (win_run ? cost_ev : 64'd0) + (stale_cyc ? prev_main_q : 64'd0);
+
+    // mode7 "main" = A-owner cycles of the open window
+    assign main_inc = (win_run & (mode_q == 32'd7) & ev_aown) ? 64'd1 : 64'd0;
+
+    assign refill_en  = win_complete & (mode_q != 32'd0) & (mode_q != 32'd6);
+    assign refill_now = refill_en ? b_q : 64'd0;
+
+    logic signed [65:0] bal_s, bal_c, bal_r, cap_s;
+    logic               bal_ovf;
+    logic signed [63:0] bal_next;
+
+    assign bal_s = {{2{balance_q[63]}}, balance_q};
+    assign bal_c = bal_s - $signed({2'b00, charge_now});
+    assign bal_r = bal_c + $signed({2'b00, refill_now});
+    assign cap_s = $signed({2'b00, cap_q});
+
+    always_comb begin
+        // positive side only is capped by credit_cap; debt is never forgiven
+        if (refill_en && (bal_r > cap_s)) bal_r_clamped = cap_s;
+        else                              bal_r_clamped = bal_r;
+    end
+    logic signed [65:0] bal_r_clamped;
+
+    assign bal_ovf  = (bal_r_clamped[65:63] != 3'b000) &&
+                      (bal_r_clamped[65:63] != 3'b111);
+    assign bal_next = bal_ovf
+                    ? (bal_r_clamped[65] ? {1'b1, {63{1'b0}}} : {1'b0, {63{1'b1}}})
+                    : bal_r_clamped[63:0];
+
+    //=========================================================================
+    // 7. Adaptive feedback (only on complete, fully V-active windows)
+    //=========================================================================
+    logic signed [65:0] obs_s, tgt_s, db_s;
+    logic               fb_inc, fb_dec;
+    logic [63:0]        b_next, b_inc_val, b_dec_val;
+
+    assign obs_s = $signed({2'b00, vdone_bytes_now});
+    assign tgt_s = $signed({34'd0, target_q});
+    assign db_s  = $signed({34'd0, deadband_q});
+
+    always_comb begin
+        // billing modes: observed above target -> b up; below -> b down
+        // mode 6 is reversed: V slow -> gap up
+        if (mode_q == 32'd6) begin
+            fb_inc = (obs_s + db_s < tgt_s);
+            fb_dec = (obs_s > tgt_s + db_s);
+        end else begin
+            fb_inc = (obs_s > tgt_s + db_s);
+            fb_dec = (obs_s + db_s < tgt_s);
+        end
+    end
+
+    logic signed [64:0] b_up_s, b_dn_s;
+    assign b_up_s = $signed({1'b0, b_q}) + $signed({33'd0, step_q});
+    assign b_dn_s = $signed({1'b0, b_q}) - $signed({33'd0, step_q});
+    assign b_inc_val = (b_up_s > $signed({33'd0, maxbud_q})) ? {32'd0, maxbud_q}
+                                                             : b_up_s[63:0];
+    assign b_dec_val = (b_dn_s < $signed({33'd0, minbud_q})) ? {32'd0, minbud_q}
+                                                             : b_dn_s[63:0];
+    assign b_next    = fb_inc ? b_inc_val : (fb_dec ? b_dec_val : b_q);
+
+    assign shortfall_bytes = {32'd0, target_q} - vdone_bytes_now;
+
+    //=========================================================================
+    // 8. mode6 gap countdown (decision uses the updated countdown)
+    //=========================================================================
+    logic [63:0] m6_cd_dec, m6_cd_next;
+    logic        gap_load;
+
+    assign m6_cd_dec = (win_run && (m6_cd_q != 64'd0)) ? (m6_cd_q - 64'd1) : m6_cd_q;
+
+    always_comb begin
+        m6_cd_next = m6_cd_dec;
+        gap_load   = 1'b0;
+        if (win_run && (mode_q == 32'd6) && a_done_i && m6_started_q) begin
+            m6_cd_next = b_q;      // load current gap
+            gap_load   = 1'b1;
+        end
+    end
+    // first A done never inserts a gap (m6_started_q is still 0 that cycle)
+
+    //=========================================================================
+    // 9. Statistics increments and overflow
+    //=========================================================================
+    logic [4:0] hist_idx;
+    assign hist_idx = (vdone_now >= 64'd31) ? 5'd31 : vdone_now[4:0];
+
+    always_comb begin
+        for (int i = 0; i < NSTAT; i++) stat_inc[i] = 64'd0;
+        for (int i = 0; i < NHIST; i++) hist_inc[i] = 64'd0;
+
+        stat_inc[ST_ARMEDCYC]  = win_run ? 64'd1 : 64'd0;
+        stat_inc[ST_BLOCKED]   = admit_blocked ? 64'd1 : 64'd0;
+        stat_inc[ST_CHARGE]    = charge_now;
+        stat_inc[ST_CHARGECYC] = (charge_now != 64'd0) ? 64'd1 : 64'd0;
+        stat_inc[ST_REPLEN]    = refill_now;
+
+        stat_inc[ST_VDONE]     = (win_run && v_done_i)  ? 64'd1 : 64'd0;
+        stat_inc[ST_VBYTES]    = (win_run && v_done_i)  ? BYTES_DONE : 64'd0;
+        stat_inc[ST_AISSUE]    = (win_run && a_issue_i) ? 64'd1 : 64'd0;
+        stat_inc[ST_ADONE]     = (win_run && a_done_i)  ? 64'd1 : 64'd0;
+        stat_inc[ST_HIT]       = (win_run && ev_lut_hit_a)  ? 64'd1 : 64'd0;
+        stat_inc[ST_MISS]      = (win_run && ev_lut_miss_a) ? 64'd1 : 64'd0;
+        stat_inc[ST_PTW]       = (win_run && ev_ptw_a)      ? 64'd1 : 64'd0;
+        stat_inc[ST_AOWN]      = (win_run && ev_aown)       ? 64'd1 : 64'd0;
+        stat_inc[ST_SEL]       = (win_run && ev_sel_a)      ? 64'd1 : 64'd0;
+        stat_inc[ST_LUTA]      = (win_run && ev_lut_a)      ? 64'd1 : 64'd0;
+        stat_inc[ST_LUTAMISS]  = (win_run && ev_lut_miss_a) ? 64'd1 : 64'd0;
+        stat_inc[ST_ACTUALCYC] = (win_run && ev_actual_a)   ? 64'd1 : 64'd0;
+
+        stat_inc[ST_WIN]     = win_complete ? 64'd1 : 64'd0;
+        stat_inc[ST_WINALL]  = win_last ? 64'd1 : 64'd0;
+        stat_inc[ST_WINPART] = (win_last && !act_all_now) ? 64'd1 : 64'd0;
+        stat_inc[ST_GAPL]    = gap_load ? 64'd1 : 64'd0;
+        stat_inc[ST_STALE]   = stale_cyc ? 64'd1 : 64'd0;
+
+        stat_inc[ST_SHORTW]  = (win_complete && (obs_s < tgt_s)) ? 64'd1 : 64'd0;
+        stat_inc[ST_SHORTB]  = (win_complete && (obs_s < tgt_s)) ? shortfall_bytes
+                                                                 : 64'd0;
+        stat_inc[ST_FBUP]    = (win_complete && (mode_q != 32'd0) && fb_inc) ? 64'd1 : 64'd0;
+        stat_inc[ST_FBDN]    = (win_complete && (mode_q != 32'd0) && fb_dec) ? 64'd1 : 64'd0;
+
+        if (win_complete) hist_inc[hist_idx] = 64'd1;
+    end
+
+    logic cnt_ovf;
+
+    always_comb begin
+        cnt_ovf = 1'b0;
+        for (int i = 0; i < NSTAT; i++) stat_sum[i] = cadd(stat_q[i], stat_inc[i]);
+        for (int i = 0; i < NHIST; i++) hist_sum[i] = cadd(hist_q[i], hist_inc[i]);
+        for (int i = 0; i < NSTAT; i++) if (stat_sum[i][CounterWidth]) cnt_ovf = 1'b1;
+        for (int i = 0; i < NHIST; i++) if (hist_sum[i][CounterWidth]) cnt_ovf = 1'b1;
+    end
+
+    //=========================================================================
+    // 10. Register write decode (combinational)
+    //=========================================================================
+    logic        wr_any, wr_ok, obs_err_now;
+    logic [63:0] new_err, err_add;
+    logic        do_arm, do_abort, do_freeze, do_clear, cfg_wr, cfg_locked;
+    logic        cfg_bad;
+    logic [63:0] init_c;
+
+    assign wr_any = cfg_valid_i & cfg_write_i;
+    assign wr_ok  = wr_any
+                  & (index_i[12:8] == 5'd0)
+                  & (index_i[7:0] >= R_COMMAND)
+                  & (index_i[7:0] <= R_LASTWR)
+                  & (wdata_i[63:32] == 32'd0);
+
+    assign cfg_bad = (mode_q > 32'd7)
+                   | (window_q == 32'd0)
+                   | ({32'd0, minbud_q} > {32'd0, maxbud_q})
+                   | (((mode_q != 32'd0) && (mode_q != 32'd6)) && (minbud_q == 32'd0));
+
+    assign init_c = ({32'd0, initbud_q} < {32'd0, minbud_q}) ? {32'd0, minbud_q}
+                  : (({32'd0, initbud_q} > {32'd0, maxbud_q}) ? {32'd0, maxbud_q}
+                                                              : {32'd0, initbud_q});
+
+    always_comb begin
+        new_err   = 64'd0;
+        do_arm    = 1'b0;
+        do_abort  = 1'b0;
+        do_freeze = 1'b0;
+        do_clear  = 1'b0;
+        cfg_wr    = 1'b0;
+
+        if (wr_any && !wr_ok) new_err[E_BADADDR] = 1'b1;
+
+        if (wr_ok) begin
+            case (index_i[7:0])
+                R_COMMAND: begin
+                    case (wdata_i[31:0])
+                        32'd1: begin // ARM
+                            if (!Enabled || !supported_i)
+                                new_err[E_UNSUP]    = 1'b1;
+                            else if (armed_q || frozen_q || !quiet_i)
+                                new_err[E_ARMSTATE] = 1'b1;
+                            else if (cfg_bad)
+                                new_err[E_BADCFG]   = 1'b1;
+                            else
+                                do_arm              = 1'b1;
+                        end
+                        32'd2: begin // ABORT
+                            if (!armed_q || frozen_q)
+                                new_err[E_ARMSTATE] = 1'b1;
+                            else if (!Enabled || !supported_i)
+                                new_err[E_UNSUP]    = 1'b1;
+                            else
+                                do_abort            = 1'b1;
+                        end
+                        32'd3: begin // FREEZE (requires fully drained -> quiet)
+                            if (!armed_q || frozen_q)
+                                new_err[E_ARMSTATE] = 1'b1;
+                            else if (!quiet_i)
+                                new_err[E_FRZILL]   = 1'b1;
+                            else
+                                do_freeze           = 1'b1;
+                        end
+                        32'd4: begin // CLEAR
+                            if (!quiet_i || armed_q)
+                                new_err[E_CLEARILL] = 1'b1;
+                            else
+                                do_clear            = 1'b1;
+                        end
+                        default: new_err[E_BADCMD] = 1'b1;
+                    endcase
+                end
+                default: begin
+                    cfg_wr = 1'b1;
+                    if (armed_q) new_err[E_CFGLOCK] = 1'b1;
+                end
+            endcase
+        end
+    end
+
+    assign obs_err_now = armed_q & ~frozen_q & response_error_i;
+
+    assign err_add = (obs_err_now ? (64'd1 << E_OBS)    : 64'd0)
+                   | (cnt_ovf     ? (64'd1 << E_CNTOVF) : 64'd0)
+                   | (bal_ovf     ? (64'd1 << E_BALOVF) : 64'd0);
+
+    //=========================================================================
+    // 11. Policy outputs
+    //=========================================================================
+    logic enable_core, allow_core, fatal_reg, fatal_now, admit_blocked;
+
+    assign enable_core = Enabled & armed_q & ~frozen_q;
+    assign fatal_reg   = |(err_q & FATAL_MASK);
+    assign fatal_now   = fatal_reg | obs_err_now | cnt_ovf | bal_ovf;
+
+    always_comb begin
+        case (mode_q)
+            32'd0:   allow_core = 1'b1;                    // unlimited, always allow
+            32'd6:   allow_core = (m6_cd_next == 64'd0);   // gap countdown
+            default: allow_core = (bal_next >= 0);         // balance after charge/refill
+        endcase
+    end
+
+    assign admit_blocked   = enable_core & (aborted_q | ~allow_core | fatal_reg);
+    assign policy_enable_o = enable_core;
+    assign policy_allow_o  = enable_core & ~aborted_q & ~fatal_now & allow_core;
+    assign policy_abort_o  = enable_core & (aborted_q | fatal_now);
+
+    //=========================================================================
+    // 12. Register read mux
+    //=========================================================================
+    logic [63:0] bal_disp;
+    assign bal_disp = balance_q;
+
+    always_comb begin
+        rdata_o = 64'd0;
+        if (index_i[12:8] == 5'd0) begin
+            case (index_i[7:0])
+                R_MAGIC:    rdata_o = MAGIC;
+                R_VERSION:  rdata_o = VERSION;
+                R_ERROR:    rdata_o = err_q;
+                R_STATUS:   rdata_o = {61'd0, aborted_q, frozen_q, armed_q};
+                R_COMMAND:  rdata_o = 64'd0;                       // write only
+                R_MODE:     rdata_o = {32'd0, mode_q};
+                R_WINDOW:   rdata_o = {32'd0, window_q};
+                R_TARGET:   rdata_o = {32'd0, target_q};
+                R_DEADBAND: rdata_o = {32'd0, deadband_q};
+                R_INITBUD:  rdata_o = {32'd0, initbud_q};
+                R_MINBUD:   rdata_o = {32'd0, minbud_q};
+                R_MAXBUD:   rdata_o = {32'd0, maxbud_q};
+                R_STEP:     rdata_o = {32'd0, step_q};
+                R_CAP:      rdata_o = {32'd0, cap_q};
+                R_WHIT:     rdata_o = {32'd0, whit_q};
+                R_WMISS:    rdata_o = {32'd0, wmiss_q};
+                R_WPTW:     rdata_o = {32'd0, wptw_q};
+
+                8'h20: rdata_o = zext64(stat_q[ST_WIN]);
+                8'h21: rdata_o = zext64(stat_q[ST_VDONE]);
+                8'h22: rdata_o = zext64(stat_q[ST_VBYTES]);
+                8'h23: rdata_o = zext64(stat_q[ST_SHORTW]);
+                8'h24: rdata_o = zext64(stat_q[ST_SHORTB]);
+                8'h25: rdata_o = zext64(stat_q[ST_BLOCKED]);
+                8'h26: rdata_o = zext64(stat_q[ST_CHARGE]);
+                8'h27: rdata_o = zext64(stat_q[ST_REPLEN]);
+                8'h28: rdata_o = zext64(stat_q[ST_AISSUE]);
+                8'h29: rdata_o = zext64(stat_q[ST_ADONE]);
+                8'h2A: rdata_o = zext64(stat_q[ST_CHARGECYC]);
+                8'h2B: rdata_o = zext64(stat_q[ST_HIT]);
+                8'h2C: rdata_o = zext64(stat_q[ST_MISS]);
+                8'h2D: rdata_o = zext64(stat_q[ST_PTW]);
+                8'h2E: rdata_o = zext64(stat_q[ST_AOWN]);
+                8'h2F: rdata_o = zext64(stat_q[ST_SEL]);
+                8'h30: rdata_o = zext64(stat_q[ST_LUTA]);
+                8'h31: rdata_o = zext64(stat_q[ST_LUTAMISS]);
+                8'h32: rdata_o = zext64(stat_q[ST_ACTUALCYC]);
+                8'h33: rdata_o = zext64(stat_q[ST_WINALL]);
+                8'h34: rdata_o = zext64(stat_q[ST_WINPART]);
+                8'h35: rdata_o = zext64(stat_q[ST_FBUP]);
+                8'h36: rdata_o = zext64(stat_q[ST_FBDN]);
+                8'h37: rdata_o = zext64(stat_q[ST_GAPL]);
+                8'h38: rdata_o = zext64(stat_q[ST_STALE]);
+                8'h39: rdata_o = zext64(stat_q[ST_ARMEDCYC]);
+
+                S_BALANCE: rdata_o = bal_disp;
+                S_BMIN:    rdata_o = bmin_q;
+                S_BMAX:    rdata_o = bmax_q;
+                S_BFINAL:  rdata_o = b_q;
+                S_NODONE:  rdata_o = nodone_max_q;
+
+                default: begin
+                    if (index_i[7:0] >= S_HIST_BASE && index_i[7:0] <= S_HIST_LAST)
+                        rdata_o = zext64(hist_q[index_i[4:0]]);
+                    else
+                        rdata_o = 64'd0;
+                end
+            endcase
+        end
+    end
+
+    //=========================================================================
+    // 13. V-active-without-done run length
+    //=========================================================================
+    logic [63:0] nodone_run_next, nodone_max_next;
+    assign nodone_run_next = (win_run && v_active_i && !v_done_i)
+                           ? (nodone_run_q + 64'd1) : 64'd0;
+    assign nodone_max_next = (nodone_run_next > nodone_max_q)
+                           ? nodone_run_next : nodone_max_q;
+
+    //=========================================================================
+    // 14. Sequential update
+    //=========================================================================
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            armed_q   <= 1'b0;
+            frozen_q  <= 1'b0;
+            aborted_q <= 1'b0;
+            err_q     <= 64'd0;
+
+            mode_q     <= DEF_MODE;
+            window_q   <= DEF_WINDOW;
+            target_q   <= DEF_TARGET;
+            deadband_q <= DEF_DEADBAND;
+            initbud_q  <= DEF_INITBUD;
+            minbud_q   <= DEF_MINBUD;
+            maxbud_q   <= DEF_MAXBUD;
+            step_q     <= DEF_STEP;
+            cap_q      <= DEF_CAP;
+            whit_q     <= DEF_WHIT;
+            wmiss_q    <= DEF_WMISS;
+            wptw_q     <= DEF_WPTW;
+
+            balance_q   <= $signed({32'd0, DEF_INITBUD});
+            b_q         <= {32'd0, DEF_INITBUD};
+            bmin_q      <= {32'd0, DEF_INITBUD};
+            bmax_q      <= {32'd0, DEF_INITBUD};
+            prev_main_q <= 64'd0;
+            win_main_q  <= 64'd0;
+            win_cnt_q   <= 64'd0;
+            win_vdone_q <= 64'd0;
+            win_allact_q<= 1'b0;
+            nodone_run_q<= 64'd0;
+            nodone_max_q<= 64'd0;
+            m6_started_q<= 1'b0;
+            m6_cd_q     <= 64'd0;
+
+            for (int i = 0; i < NSTAT; i++) stat_q[i] <= {CounterWidth{1'b0}};
+            for (int i = 0; i < NHIST; i++) hist_q[i] <= {CounterWidth{1'b0}};
+        end else begin
+            //-----------------------------------------------------------------
+            // statistics (wrapped at CounterWidth, overflow is sticky)
+            //-----------------------------------------------------------------
+            for (int i = 0; i < NSTAT; i++)
+                stat_q[i] <= do_clear ? {CounterWidth{1'b0}}
+                                      : stat_sum[i][CounterWidth-1:0];
+            for (int i = 0; i < NHIST; i++)
+                hist_q[i] <= do_clear ? {CounterWidth{1'b0}}
+                                      : hist_sum[i][CounterWidth-1:0];
+
+            //-----------------------------------------------------------------
+            // datapath (armed, not frozen)
+            //-----------------------------------------------------------------
+            if (win_run) begin
+                balance_q <= bal_next;
+
+                if (win_last) begin
+                    win_cnt_q    <= 64'd0;
+                    win_allact_q <= 1'b1;
+                    win_vdone_q  <= 64'd0;
+                end else begin
+                    win_cnt_q    <= win_cnt_q + 64'd1;
+                    win_allact_q <= act_all_now;
+                    win_vdone_q  <= vdone_now;
+                end
+
+                // mode7 stale base rotation
+                if (win_last) begin
+                    prev_main_q <= win_main_q + main_inc;
+                    win_main_q  <= 64'd0;
+                end else begin
+                    win_main_q  <= win_main_q + main_inc;
+                end
+
+                // adaptive feedback / b seen tracking
+                if (win_complete && (mode_q != 32'd0) && (fb_inc || fb_dec)) begin
+                    b_q <= b_next;
+                    if (b_next < bmin_q) bmin_q <= b_next;
+                    if (b_next > bmax_q) bmax_q <= b_next;
+                end
+
+                // mode6 gap countdown
+                m6_cd_q <= m6_cd_next;
+                if ((mode_q == 32'd6) && a_done_i && !m6_started_q)
+                    m6_started_q <= 1'b1;
+            end
+
+            nodone_run_q <= nodone_run_q == 0 && !(win_run && v_active_i && !v_done_i)
+                          ? (win_run && v_active_i && !v_done_i ? nodone_run_q + 64'd1 : 64'd0)
+                          : nodone_run_next;
+            nodone_max_q <= nodone_max_next;
+
+            //-----------------------------------------------------------------
+            // commands (win_run is deasserted whenever a command can fire)
+            //-----------------------------------------------------------------
+            if (do_arm) begin
+                armed_q     <= 1'b1;
+                aborted_q   <= 1'b0;
+                frozen_q    <= 1'b0;
+                balance_q   <= $signed(init_c);
+                b_q         <= init_c;
+                bmin_q      <= init_c;
+                bmax_q      <= init_c;
+                prev_main_q <= 64'd0;
+                win_main_q  <= 64'd0;
+                win_cnt_q   <= 64'd0;
+                win_allact_q<= 1'b1;
+                win_vdone_q <= 64'd0;
+                m6_started_q<= 1'b0;
+                m6_cd_q     <= 64'd0;
+                nodone_run_q<= 64'd0;
+            end
+
+            if (do_abort)  aborted_q <= 1'b1;
+            if (do_freeze) frozen_q  <= 1'b1;
+
+            if (do_clear) begin
+                armed_q     <= 1'b0;
+                aborted_q   <= 1'b0;
+                frozen_q    <= 1'b0;
+                balance_q   <= $signed(init_c);
+                b_q         <= init_c;
+                bmin_q      <= init_c;
+                bmax_q      <= init_c;
+                prev_main_q <= 64'd0;
+                win_main_q  <= 64'd0;
+                win_cnt_q   <= 64'd0;
+                win_allact_q<= 1'b0;
+                win_vdone_q <= 64'd0;
+                m6_started_q<= 1'b0;
+                m6_cd_q     <= 64'd0;
+                nodone_run_q<= 64'd0;
+                nodone_max_q<= 64'd0;
+            end
+
+            //-----------------------------------------------------------------
+            // configuration writes (rejected while armed)
+            //-----------------------------------------------------------------
+            if (cfg_wr && !armed_q) begin
+                case (index_i[7:0])
+                    R_MODE:     mode_q     <= wdata_i[31:0];
+                    R_WINDOW:   window_q   <= wdata_i[31:0];
+                    R_TARGET:   target_q   <= wdata_i[31:0];
+                    R_DEADBAND: deadband_q <= wdata_i[31:0];
+                    R_INITBUD:  initbud_q  <= wdata_i[31:0];
+                    R_MINBUD:   minbud_q   <= wdata_i[31:0];
+                    R_MAXBUD:   maxbud_q   <= wdata_i[31:0];
+                    R_STEP:     step_q     <= wdata_i[31:0];
+                    R_CAP:      cap_q      <= wdata_i[31:0];
+                    R_WHIT:     whit_q     <= wdata_i[31:0];
+                    R_WMISS:    wmiss_q    <= wdata_i[31:0];
+                    R_WPTW:     wptw_q     <= wdata_i[31:0];
+                    default: ;
+                endcase
+            end
+
+            //-----------------------------------------------------------------
+            // sticky errors: reset or a legal CLEAR are the only recovery
+            //-----------------------------------------------------------------
+            if (do_clear) err_q <= 64'd0;
+            else          err_q <= err_q | new_err | err_add;
+        end
+    end
+
+endmodule
+
+`default_nettype wire
+```
+
+> **Fix-up note for the code above (please apply before building):** `bal_r_clamped` is used inside the `always_comb` that assigns it, so it must be declared **before** that block. Move the declaration
+> ```systemverilog
+> logic signed [65:0] bal_r_clamped;
+> ```
+> to the line directly above `always_comb begin // positive side only is capped …`. Also replace the hand-rolled `nodone_run_q <=` statement with the clean form:
+> ```systemverilog
+> nodone_run_q <= nodone_run_next;
+> ```
+
+---
+
+# Deliverable 2 — `tests/research_policy_test.cpp` (NEW)
+
+```cpp
+// Directed + randomized reference-account regression for dma_research_policy.sv
+// Build with Verilator (4.038 is the reference toolchain of this repo).
+// Simulation only. No board claim, no formal claim.
+//
+// argv[1] variant selector:
+//   "full"  -> Enabled=1, CounterWidth=64 (default build)
+//   "small" -> Enabled=1, CounterWidth=8  (deliberate statistics wrap)
+//   "off"   -> Enabled=0                  (feature absent, magic readable)
+#include "Vdma_research_policy.h"
+#include "verilated.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <iostream>
+#include <random>
+#include <stdexcept>
+#include <string>
+
+static int checks = 0;
+static void check(bool c, const char *m) {
+    if (!c) throw std::runtime_error(m);
+    checks++;
+}
+
+// ---------------------------------------------------------------------------
+// register offsets
+// ---------------------------------------------------------------------------
+enum {
+    R_MAGIC = 0x00, R_VERSION = 0x01, R_ERROR = 0x02, R_STATUS = 0x03,
+    R_COMMAND = 0x04, R_MODE = 0x05, R_WINDOW = 0x06, R_TARGET = 0x07,
+    R_DEADBAND = 0x08, R_INITBUD = 0x09, R_MINBUD = 0x0A, R_MAXBUD = 0x0B,
+    R_STEP = 0x0C, R_CAP = 0x0D, R_WHIT = 0x0E, R_WMISS = 0x0F, R_WPTW = 0x10
+};
+enum {
+    S_WIN = 0x20, S_VDONE, S_VBYTES, S_SHORTW, S_SHORTB, S_BLOCKED, S_CHARGE,
+    S_REPLEN, S_AISSUE, S_ADONE, S_CHARGECYC, S_HIT, S_MISS, S_PTW, S_AOWN,
+    S_SEL, S_LUTA, S_LUTAMISS, S_ACTUALCYC, S_WINALL, S_WINPART, S_FBUP,
+    S_FBDN, S_GAPL, S_STALE, S_ARMEDCYC,
+    S_BALANCE = 0x3A, S_BMIN = 0x3B, S_BMAX = 0x3C, S_BFINAL = 0x3D,
+    S_NODONE = 0x3E, S_HIST = 0x40
+};
+enum {
+    E_BADADDR = 0, E_BADCMD = 1, E_UNSUP = 2, E_CFGLOCK = 3, E_CNTOVF = 4,
+    E_BALOVF = 5, E_CLEARILL = 6, E_FRZILL = 7, E_ARMSTATE = 8, E_OBS = 9,
+    E_BADCFG = 10
+};
+static const uint64_t FATAL_MASK =
+    (1ull << E_CNTOVF) | (1ull << E_BALOVF) | (1ull << E_OBS);
+
+static const uint32_t DID_A = 0x10;
+
+// ---------------------------------------------------------------------------
+// stimulus bundle
+// ---------------------------------------------------------------------------
+struct In {
+    bool     quiet = false;
+    bool     supported = true;
+    bool     v_active = false, a_issue = false, a_done = false, v_done = false;
+    uint32_t ctl_state = 0, ctl_did = DID_A;
+    bool     select_fire = false; uint32_t select_did = DID_A;
+    bool     lookup = false, lookup_hit = false; uint32_t lookup_did = DID_A;
+    bool     ptw_r_fire = false, response_error = false;
+};
+
+struct Obs { bool en, allow, abort; };
+
+struct Bench {
+    Vdma_research_policy d;
+    In cur;
+
+    Bench() { reset(); }
+
+    void apply(const In &in) {
+        cur = in;
+        d.quiet_i        = in.quiet;
+        d.supported_i    = in.supported;
+        d.v_active_i     = in.v_active;
+        d.a_issue_i      = in.a_issue;
+        d.a_done_i       = in.a_done;
+        d.v_done_i       = in.v_done;
+        d.ctl_state_i    = in.ctl_state;
+        d.ctl_did_i      = in.ctl_did;
+        d.select_fire_i  = in.select_fire;
+        d.select_did_i   = in.select_did;
+        d.lookup_i       = in.lookup;
+        d.lookup_hit_i   = in.lookup_hit;
+        d.lookup_did_i   = in.lookup_did;
+        d.ptw_r_fire_i   = in.ptw_r_fire;
+        d.response_error_i = in.response_error;
+    }
+
+    void edge() { d.clk_i = 1; d.eval(); d.clk_i = 0; d.eval(); }
+
+    void reset() {
+        d.clk_i = 0;
+        d.cfg_valid_i = 0; d.cfg_write_i = 0; d.index_i = 0; d.wdata_i = 0;
+        apply(In());
+        d.rst_ni = 0; edge(); edge();
+        d.rst_ni = 1; edge();
+    }
+
+    // drive inputs, sample registered-state-driven outputs before the edge
+    Obs drive(const In &in) {
+        apply(in);
+        d.clk_i = 0; d.eval();
+        Obs o{ (bool)d.policy_enable_o, (bool)d.policy_allow_o, (bool)d.policy_abort_o };
+        return o;
+    }
+
+    // register write; the current stimulus bundle is preserved
+    void wr(uint32_t idx, uint64_t data) {
+        d.cfg_valid_i = 1; d.cfg_write_i = 1;
+        d.index_i = (uint16_t)idx; d.wdata_i = data;
+        edge();
+        d.cfg_valid_i = 0; d.cfg_write_i = 0; d.wdata_i = 0; d.eval();
+    }
+
+    uint64_t rd(uint32_t idx) {
+        d.cfg_valid_i = 1; d.cfg_write_i = 0;
+        d.index_i = (uint16_t)idx; d.eval();
+        uint64_t v = (uint64_t)d.rdata_o;
+        d.cfg_valid_i = 0; d.eval();
+        return v;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// cycle-accurate software reference of the contract
+// ---------------------------------------------------------------------------
+struct RefObs { bool en, allow, abort; };
+
+struct Ref {
+    bool enabled = true;
+    int  cw = 64;
+    uint32_t did_a = DID_A;
+
+    uint32_t mode = 0, window = 16384, target = 51540, deadband = 4096,
+             initbud = 8000, minbud = 1, maxbud = 32768, step = 512, cap = 65536,
+             whit = 1, wmiss = 100, wptw = 100;
+
+    bool armed = false, frozen = false, aborted = false;
+    uint64_t err = 0;
+    int64_t  balance = 8000;
+    uint64_t b = 8000, bmin = 8000, bmax = 8000;
+    uint64_t prev_main = 0, win_main = 0;
+    uint64_t win_cnt = 0, win_vdone = 0;
+    bool     win_allact = false;
+    uint64_t nodone_run = 0, nodone_max = 0;
+    bool     m6_started = false;
+    uint64_t m6_cd = 0;
+    uint64_t stat[26];
+    uint64_t hist[32];
+
+    enum { ST_WIN = 0, ST_VDONE, ST_VBYTES, ST_SHORTW, ST_SHORTB, ST_BLOCKED,
+           ST_CHARGE, ST_REPLEN, ST_AISSUE, ST_ADONE, ST_CHARGECYC, ST_HIT,
+           ST_MISS, ST_PTW, ST_AOWN, ST_SEL, ST_LUTA, ST_LUTAMISS,
+           ST_ACTUALCYC, ST_WINALL, ST_WINPART, ST_FBUP, ST_FBDN, ST_GAPL,
+           ST_STALE, ST_ARMEDCYC };
+
+    Ref() { std::memset(stat, 0, sizeof(stat)); std::memset(hist, 0, sizeof(hist)); }
+
+    uint64_t mask() const {
+        return (cw >= 64) ? ~0ull : ((1ull << cw) - 1ull);
+    }
+
+    bool config_bad() const {
+        if (mode > 7)         return true;
+        if (window == 0)      return true;
+        if (minbud > maxbud)  return true;
+        if (mode != 0 && mode != 6 && minbud == 0) return true;
+        return false;
+    }
+
+    uint64_t init_clamped() const {
+        uint64_t v = initbud;
+        if (v < minbud) v = minbud;
+        if (v > maxbud) v = maxbud;
+        return v;
+    }
+
+    void do_reset() {
+        armed = frozen = aborted = false;
+        err = 0;
+        balance = (int64_t)initbud;
+        b = bmin = bmax = initbud;
+        prev_main = win_main = 0;
+        win_cnt = win_vdone = 0;
+        win_allact = false;
+        nodone_run = nodone_max = 0;
+        m6_started = false; m6_cd = 0;
+        std::memset(stat, 0, sizeof(stat));
+        std::memset(hist, 0, sizeof(hist));
+    }
+
+    void clear_now() { do_reset(); }
+
+    void arm_now() {
+        armed = true; frozen = false; aborted = false;
+        uint64_t c = init_clamped();
+        balance = (int64_t)c;
+        b = bmin = bmax = c;
+        prev_main = win_main = 0;
+        win_cnt = win_vdone = 0;
+        win_allact = true;
+        m6_started = false; m6_cd = 0;
+        nodone_run = 0;
+    }
+
+    void set_cfg(uint32_t idx, uint32_t v) {
+        switch (idx) {
+            case R_MODE:     mode = v; break;
+            case R_WINDOW:   window = v; break;
+            case R_TARGET:   target = v; break;
+            case R_DEADBAND: deadband = v; break;
+            case R_INITBUD:  initbud = v; break;
+            case R_MINBUD:   minbud = v; break;
+            case R_MAXBUD:   maxbud = v; break;
+            case R_STEP:     step = v; break;
+            case R_CAP:      cap = v; break;
+            case R_WHIT:     whit = v; break;
+            case R_WMISS:    wmiss = v; break;
+            case R_WPTW:     wptw = v; break;
+            default: break;
+        }
+    }
+
+    // Fills the write side-effect flags; returns the error bits raised by the write.
+    uint64_t decode_write(uint32_t idx, uint64_t data, bool quiet,
+                          bool &f_arm, bool &f_abort, bool &f_freeze,
+                          bool &f_clear, bool &f_cfg) {
+        uint64_t ne = 0;
+        f_arm = f_abort = f_freeze = f_clear = f_cfg = false;
+
+        bool ok = (idx >= R_COMMAND) && (idx <= R_WPTW) && ((data >> 32) == 0);
+        if (!ok) { ne |= (1ull << E_BADADDR); return ne; }
+
+        if (idx == R_COMMAND) {
+            uint32_t cmd = (uint32_t)data;
+            if (cmd == 1) {                                   // ARM
+                if (!enabled)                       ne |= (1ull << E_UNSUP);
+                else if (armed || frozen || !quiet) ne |= (1ull << E_ARMSTATE);
+                else if (config_bad())              ne |= (1ull << E_BADCFG);
+                else                                f_arm = true;
+            } else if (cmd == 2) {                            // ABORT
+                if (!armed || frozen)               ne |= (1ull << E_ARMSTATE);
+                else if (!enabled)                  ne |= (1ull << E_UNSUP);
+                else                                f_abort = true;
+            } else if (cmd == 3) {                            // FREEZE
+                if (!armed || frozen)               ne |= (1ull << E_ARMSTATE);
+                else if (!quiet)                    ne |= (1ull << E_FRZILL);
+                else                                f_freeze = true;
+            } else if (cmd == 4) {                            // CLEAR
+                if (!quiet || armed)                ne |= (1ull << E_CLEARILL);
+                else                                f_clear = true;
+            } else {
+                ne |= (1ull << E_BADCMD);
+            }
+        } else {
+            f_cfg = true;
+            if (armed) ne |= (1ull << E_CFGLOCK);
+        }
+        return ne;
+    }
+
+    RefObs cycle(const In &in, bool do_wr, uint32_t widx, uint64_t wdata) {
+        // ---- events / cost -------------------------------------------------
+        bool ev_sel_a  = in.select_fire && in.select_did == did_a;
+        bool ev_lut_a  = in.lookup && in.lookup_did == did_a;
+        bool ev_hit_a  = ev_lut_a && in.lookup_hit;
+        bool ev_miss_a = ev_lut_a && !in.lookup_hit;
+        bool ev_ptw_a  = in.ptw_r_fire && in.ctl_did == did_a;
+        bool ev_act_a  = (in.ctl_did == did_a) && (in.ctl_state == 1 || in.ctl_state == 2);
+        bool ev_aown   = (in.ctl_did == did_a);
+
+        uint64_t cost = 0;
+        switch (mode) {
+            case 0: cost = 0; break;
+            case 1: cost = in.a_issue ? 4096 : 0; break;
+            case 2: cost = ev_sel_a ? 1 : 0; break;
+            case 3: cost = ev_miss_a ? 1 : 0; break;
+            case 4: cost = (ev_hit_a ? whit : 0) + (ev_miss_a ? wmiss : 0)
+                         + (ev_ptw_a ? wptw : 0); break;
+            case 5: cost = ev_act_a ? 1 : 0; break;
+            default: cost = 0; break;
+        }
+
+        // ---- window --------------------------------------------------------
+        bool win_run  = armed && !frozen;
+        bool win_last = win_run && window != 0 && win_cnt == (uint64_t)window - 1;
+        bool act_all  = win_allact && in.v_active;
+        uint64_t vdone_now = win_vdone + (in.v_done ? 1 : 0);
+        bool win_complete = win_last && act_all;
+        bool stale = win_last && mode == 7;
+        uint64_t charge_now = (win_run ? cost : 0) + (stale ? prev_main : 0);
+        bool refill_en = win_complete && mode != 0 && mode != 6;
+        uint64_t refill_now = refill_en ? b : 0;
+
+        // ---- balance (66-bit intermediate, debt preserved) -----------------
+        __int128 balr = (__int128)balance - (__int128)charge_now + (__int128)refill_now;
+        if (refill_en && balr > (__int128)cap) balr = (__int128)cap;
+        bool bal_ovf = (balr > (__int128)INT64_MAX) || (balr < (__int128)INT64_MIN);
+        int64_t bal_next = bal_ovf ? (balr > 0 ? INT64_MAX : INT64_MIN) : (int64_t)balr;
+
+        // ---- feedback ------------------------------------------------------
+        __int128 obs = (__int128)(vdone_now * 4096ull);
+        __int128 tgt = (__int128)target;
+        __int128 db  = (__int128)deadband;
+        bool up_raw = obs > tgt + db;
+        bool dn_raw = obs + db < tgt;
+        bool fb_inc = (mode == 6) ? dn_raw : up_raw;
+        bool fb_dec = (mode == 6) ? up_raw : dn_raw;
+
+        int64_t up = (int64_t)b + (int64_t)step;
+        uint64_t b_inc_val = (up > (int64_t)maxbud) ? maxbud : (uint64_t)up;
+        int64_t dn = (int64_t)b - (int64_t)step;
+        uint64_t b_dec_val = (dn < (int64_t)minbud) ? minbud : (uint64_t)dn;
+        bool apply_fb = win_complete && mode != 0 && (fb_inc || fb_dec);
+        uint64_t b_next = apply_fb ? (fb_inc ? b_inc_val : b_dec_val) : b;
+
+        // ---- mode6 countdown ----------------------------------------------
+        uint64_t cd_dec = (win_run && m6_cd != 0) ? m6_cd - 1 : m6_cd;
+        uint64_t cd_next = cd_dec;
+        bool gap_load = false;
+        bool m6_started_next = m6_started;
+        if (win_run && mode == 6 && in.a_done) {
+            if (m6_started) { cd_next = b; gap_load = true; }
+            else            { m6_started_next = true; }
+        }
+
+        // ---- statistics increments -----------------------------------------
+        uint64_t inc[26] = {0};
+        uint64_t hinc[32] = {0};
+        inc[ST_ARMEDCYC] = win_run ? 1 : 0;
+        inc[ST_CHARGE]   = charge_now;
+        inc[ST_CHARGECYC]= (charge_now != 0) ? 1 : 0;
+        inc[ST_REPLEN]   = refill_now;
+        inc[ST_VDONE]    = (win_run && in.v_done)  ? 1 : 0;
+        inc[ST_VBYTES]   = (win_run && in.v_done)  ? 4096 : 0;
+        inc[ST_AISSUE]   = (win_run && in.a_issue) ? 1 : 0;
+        inc[ST_ADONE]    = (win_run && in.a_done)  ? 1 : 0;
+        inc[ST_HIT]      = (win_run && ev_hit_a)   ? 1 : 0;
+        inc[ST_MISS]     = (win_run && ev_miss_a)  ? 1 : 0;
+        inc[ST_PTW]      = (win_run && ev_ptw_a)   ? 1 : 0;
+        inc[ST_AOWN]     = (win_run && ev_aown)    ? 1 : 0;
+        inc[ST_SEL]      = (win_run && ev_sel_a)   ? 1 : 0;
+        inc[ST_LUTA]     = (win_run && ev_lut_a)   ? 1 : 0;
+        inc[ST_LUTAMISS] = (win_run && ev_miss_a)  ? 1 : 0;
+        inc[ST_ACTUALCYC]= (win_run && ev_act_a)   ? 1 : 0;
+        inc[ST_WIN]      = win_complete ? 1 : 0;
+        inc[ST_WINALL]   = win_last ? 1 : 0;
+        inc[ST_WINPART]  = (win_last && !act_all) ? 1 : 0;
+        inc[ST_GAPL]     = gap_load ? 1 : 0;
+        inc[ST_STALE]    = stale ? 1 : 0;
+        bool shortfall = win_complete && (obs < tgt);
+        inc[ST_SHORTW]   = shortfall ? 1 : 0;
+        inc[ST_SHORTB]   = shortfall ? (uint64_t)(tgt - obs) : 0;
+        inc[ST_FBUP]     = (win_complete && mode != 0 && fb_inc) ? 1 : 0;
+        inc[ST_FBDN]     = (win_complete && mode != 0 && fb_dec) ? 1 : 0;
+
+        bool cnt_ovf = false;
+        uint64_t m = mask();
+        uint64_t nstat[26];
+        for (int i = 0; i < 26; i++) {
+            unsigned __int128 s = (unsigned __int128)stat[i] + inc[i];
+            if (s > m) cnt_ovf = true;
+            nstat[i] = (uint64_t)s & m;
+        }
+        uint64_t nhist[32];
+        for (int i = 0; i < 32; i++) nhist[i] = hist[i];
+        if (win_complete) {
+            int hb = (vdone_now >= 31) ? 31 : (int)vdone_now;
+            unsigned __int128 s = (unsigned __int128)hist[hb] + 1;
+            if (s > m) cnt_ovf = true;
+            nhist[hb] = (uint64_t)s & m;
+        }
+
+        // ---- write decode ---------------------------------------------------
+        bool f_arm = false, f_abort = false, f_freeze = false, f_clear = false, f_cfg = false;
+        uint64_t ne = do_wr ? decode_write(widx, wdata, in.quiet,
+                                           f_arm, f_abort, f_freeze, f_clear, f_cfg)
+                            : 0;
+
+        // ---- outputs (combinational, pre-edge state) -------------------------
+        bool obs_err_now  = armed && !frozen && in.response_error;
+        bool fatal_reg    = (err & FATAL_MASK) != 0;
+        bool fatal_now    = fatal_reg || obs_err_now || cnt_ovf || bal_ovf;
+        bool enable_core  = enabled && armed && !frozen;
+        bool allow_core   = (mode == 0) ? true
+                          : (mode == 6) ? (cd_next == 0)
+                                        : (bal_next >= 0);
+        bool blocked      = enable_core && (aborted || !allow_core || fatal_reg);
+
+        RefObs o;
+        o.en    = enable_core;
+        o.allow = enable_core && !aborted && !fatal_now && allow_core;
+        o.abort = enable_core && (aborted || fatal_now);
+
+        // ---- commit ---------------------------------------------------------
+        inc[ST_BLOCKED] = blocked ? 1 : 0;
+        {   unsigned __int128 s = (unsigned __int128)stat[ST_BLOCKED] + inc[ST_BLOCKED];
+            if (s > m) cnt_ovf = true;
+            nstat[ST_BLOCKED] = (uint64_t)s & m;
+        }
+
+        if (f_clear) {
+            std::memset(stat, 0, sizeof(stat));
+            std::memset(hist, 0, sizeof(hist));
+            err = 0;
+            armed = frozen = aborted = false;
+            balance = (int64_t)init_clamped();
+            b = bmin = bmax = init_clamped();
+            prev_main = win_main = 0;
+            win_cnt = win_vdone = 0;
+            win_allact = false;
+            m6_started = false; m6_cd = 0;
+            nodone_run = nodone_max = 0;
+        } else {
+            for (int i = 0; i < 26; i++) stat[i] = nstat[i];
+            for (int i = 0; i < 32; i++) hist[i] = nhist[i];
+            err |= ne;
+            if (obs_err_now) err |= (1ull << E_OBS);
+            if (cnt_ovf)     err |= (1ull << E_CNTOVF);
+            if (bal_ovf)     err |= (1ull << E_BALOVF);
+        }
+
+        if (f_cfg && !armed) set_cfg(widx, (uint32_t)wdata);
+        if (f_arm && !f_clear) arm_now();
+        if (f_abort) aborted = true;
+        if (f_freeze) frozen = true;
+
+        // datapath (never concurrent with a command, which needs !armed)
+        if (win_run && !f_arm && !f_clear) {
+            balance = bal_next;
+            if (win_last) { win_cnt = 0; win_allact = true; win_vdone = 0; }
+            else          { win_cnt++; win_allact = act_all; win_vdone = vdone_now; }
+            if (win_last) { prev_main = win_main + (mode == 7 && ev_aown ? 1 : 0);
+                            win_main = 0; }
+            else          { win_main += (mode == 7 && ev_aown ? 1 : 0); }
+            if (apply_fb) {
+                b = b_next;
+                if (b < bmin) bmin = b;
+                if (b > bmax) bmax = b;
+            }
+            m6_cd = cd_next;
+            m6_started = m6_started_next;
+        }
+
+        {
+            bool act_now = win_run && in.v_active && !in.v_done;
+            nodone_run = act_now ? nodone_run + 1 : 0;
+            if (nodone_run > nodone_max) nodone_max = nodone_run;
+        }
+        return o;
+    }
+};
+
+static void cmp_obs(const Obs &a, const RefObs &b, const char *where) {
+    if (a.en != b.en || a.allow != b.allow || a.abort != b.abort) {
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+                      "%s: rtl en=%d allow=%d abort=%d ; ref en=%d allow=%d abort=%d",
+                      where, a.en, a.allow, a.abort, b.en, b.allow, b.abort);
+        throw std::runtime_error(msg);
+    }
+    checks++;
+}
+
+// ---------------------------------------------------------------------------
+// directed helpers
+// ---------------------------------------------------------------------------
+static void cfg(Ref &r, Bench &b, uint32_t idx, uint32_t v) {
+    b.wr(idx, v);
+    r.set_cfg(idx, v);
+}
+
+static void cmd(Bench &b, Ref &r, uint32_t c) {
+    b.wr(R_COMMAND, c);
+    bool a, ab, f, cl, cg;
+    uint64_t ne = r.decode_write(R_COMMAND, c, b.cur.quiet, a, ab, f, cl, cg);
+    if (cl) r.clear_now();
+    else {
+        r.err |= ne;
+        if (a) r.arm_now();
+        if (ab) r.aborted = true;
+        if (f) r.frozen = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+static void t_reset_defaults(Bench &b) {
+    b.reset();
+    check(b.rd(R_MAGIC) == 0x49444D414D435431ull, "magic IDMAMCT1");
+    check(b.rd(R_VERSION) == 1, "version 1");
+    check(b.rd(R_ERROR) == 0, "reset error zero");
+    check(b.rd(R_STATUS) == 0, "reset status zero");
+    check(b.rd(R_MODE) == 0, "default mode 0");
+    check(b.rd(R_WINDOW) == 16384, "default window 16384");
+    check(b.rd(R_TARGET) == 51540, "default target 51540");
+    check(b.rd(R_DEADBAND) == 4096, "default deadband 4096");
+    check(b.rd(R_INITBUD) == 8000, "default initial budget 8000");
+    check(b.rd(R_MINBUD) == 1, "default min 1");
+    check(b.rd(R_MAXBUD) == 32768, "default max 32768");
+    check(b.rd(R_STEP) == 512, "default step 512");
+    check(b.rd(R_CAP) == 65536, "default cap 65536");
+    check(b.rd(R_WHIT) == 1 && b.rd(R_WMISS) == 100 && b.rd(R_WPTW) == 100,
+          "default weights 1/100/100");
+    for (uint32_t i = S_WIN; i <= S_ARMEDCYC; i++)
+        check(b.rd(i) == 0, "reset statistic zero");
+}
+
+static void t_bad_writes_and_sticky(Bench &b, Ref &r) {
+    b.reset(); r.do_reset();
+
+    b.wr(0x60, 0);                                   // unimplemented address
+    check((b.rd(R_ERROR) >> E_BADADDR) & 1, "bad address sticky");
+    b.wr(R_MODE, 0x100000000ull);                    // high bits nonzero
+    check((b.rd(R_ERROR) >> E_BADADDR) & 1, "high bits sticky");
+    b.wr(R_COMMAND, 99);                             // unknown command
+    check((b.rd(R_ERROR) >> E_BADCMD) & 1, "bad command sticky");
+    b.wr(R_COMMAND, 4);                              // CLEAR while not quiet
+    check((b.rd(R_ERROR) >> E_CLEARILL) & 1, "illegal clear sticky");
+    check((b.rd(R_ERROR) >> E_BADCMD) & 1, "illegal clear kept earlier bits");
+
+    // legal CLEAR recovers
+    b.apply(In()); b.cur.quiet = true;
+    b.wr(R_COMMAND, 4);
+    check(b.rd(R_ERROR) == 0, "legal CLEAR clears sticky errors");
+    b.apply(In());
+}
+
+static void t_arm_predicates(Bench &b) {
+    b.reset();
+    In in; in.quiet = false; in.supported = false;
+    b.apply(in);
+    b.wr(R_COMMAND, 1);                              // ARM not quiet, unsupported
+    check((b.rd(R_ERROR) >> E_UNSUP) & 1, "unsupported ARM refused");
+    check(b.rd(R_STATUS) == 0, "still not armed");
+    b.apply(In()); b.cur.quiet = true;
+    b.wr(R_COMMAND, 4);
+    check(b.rd(R_ERROR) == 0, "recovered");
+}
+
+static void t_config_lock(Bench &b) {
+    b.reset();
+    In in; in.quiet = true;
+    b.apply(in);
+    b.wr(R_MODE, 0);
+    b.wr(R_COMMAND, 1);                              // ARM
+    check(b.rd(R_STATUS) & 1, "armed");
+    b.wr(R_WINDOW, 7);                               // locked
+    check(b.rd(R_WINDOW) == 16384, "window unchanged while armed");
+    check((b.rd(R_ERROR) >> E_CFGLOCK) & 1, "config lock sticky");
+    b.apply(In()); b.cur.quiet = true;
+    b.wr(R_COMMAND, 4);                              // CLEAR unlocks
+    check(b.rd(R_STATUS) == 0, "cleared");
+}
+
+static void t_first_allow_and_mode0(Bench &b) {
+    b.reset();
+    In in; in.quiet = true; in.supported = true;
+    b.apply(in);
+    b.wr(R_MODE, 0);
+    b.wr(R_COMMAND, 1);
+    in = In(); in.quiet = true; in.v_active = true;
+    Obs o = b.drive(in);
+    check(o.en && o.allow && !o.abort, "mode0 first ADMIT allowed");
+    for (int i = 0; i < 100; i++) { o = b.drive(in); b.edge(); }
+    check(o.allow, "mode0 always allow");
+    check(b.rd(S_CHARGE) == 0, "mode0 never charges");
+    b.apply(In()); b.cur.quiet = true; b.wr(R_COMMAND, 4);
+}
+
+static void t_mode1_charge_and_debt(Bench &b, Ref &r, bool narrow) {
+    b.reset(); r.do_reset(); r.cw = narrow ? 8 : 64;
+    In idle; idle.quiet = true;
+    b.apply(idle);
+    cfg(r, b, R_MODE, 1);
+    cfg(r, b, R_WINDOW, 64);
+    cfg(r, b, R_INITBUD, 4);          // tiny budget -> debt after 2 issues
+    cfg(r, b, R_MINBUD, 1);
+    cfg(r, b, R_MAXBUD, 32768);
+    cfg(r, b, R_STEP, 512);
+    cfg(r, b, R_CAP, 65536);
+    cfg(r, b, R_TARGET, 0);
+    cfg(r, b, R_DEADBAND, 0);
+    cmd(b, r, 1);                     // ARM
+
+    In in; in.quiet = true;
+    // first cycle: balance 4 >= 0 -> allow
+    Obs o = b.drive(in);
+    check(o.en && o.allow, "first admit allowed with positive budget");
+    b.edge();
+
+    // one A issue charges 4096 -> balance deeply negative, allow drops
+    in.a_issue = true;
+    o = b.drive(in);
+    check(o.en && !o.allow, "debt blocks further admission");
+    b.edge();
+    in.a_issue = false;
+
+    for (int i = 0; i < 70; i++) { b.drive(in); b.edge(); }
+    o = b.drive(in);
+    check(!o.allow, "debt not forgiven by window refill");
+    int64_t bal = (int64_t)b.rd(S_BALANCE);
+    check(bal < 0, "negative balance preserved");
+    check(b.rd(S_CHARGE) == 4096, "single 4096 charge");
+    b.apply(In()); b.cur.quiet = true; b.wr(R_COMMAND, 4);
+}
+
+static void t_window_feedback(Bench &b, Ref &r) {
+    b.reset(); r.do_reset();
+    In idle; idle.quiet = true; b.apply(idle);
+    cfg(r, b, R_MODE, 1);
+    cfg(r, b, R_WINDOW, 8);
+    cfg(r, b, R_INITBUD, 8000);
+    cfg(r, b, R_MINBUD, 1);
+    cfg(r, b, R_MAXBUD, 32768);
+    cfg(r, b, R_STEP, 512);
+    cfg(r, b, R_CAP, 65536);
+    cfg(r, b, R_TARGET, 8192);
+    cfg(r, b, R_DEADBAND, 0);
+    cmd(b, r, 1);
+
+    // one fully V-active window with zero V done -> b up, bucket 0
+    In in; in.quiet = true; in.v_active = true;
+    for (int i = 0; i < 8; i++) { b.drive(in); b.edge(); }
+    check(b.rd(S_WIN) == 1, "one complete active window");
+    check(b.rd(S_HIST + 0) == 1, "histogram bucket 0");
+    check(b.rd(S_FBUP) == 1 && b.rd(S_FBDN) == 0, "observed below target -> b up");
+    check(b.rd(S_BFINAL) == 8000 + 512, "b stepped up by 512");
+    check(b.rd(S_SHORTW) == 1 && b.rd(S_SHORTB) == 8192, "shortfall recorded");
+
+    // one fully V-active window with 8 V done (32768 B > target) -> b down
+    In busy = in; busy.v_done = true;
+    for (int i = 0; i < 8; i++) { b.drive(busy); b.edge(); }
+    check(b.rd(S_WIN) == 2, "two complete active windows");
+    check(b.rd(S_HIST + 8) == 1, "histogram bucket 8");
+    check(b.rd(S_FBUP) == 1 && b.rd(S_FBDN) == 1, "b stepped down once");
+    check(b.rd(S_REPLEN) == 8000 + (8000 + 512), "two refills from the pre-window b");
+
+    // partial window (one idle cycle) must not update b
+    uint64_t before = b.rd(S_BFINAL);
+    In gap = in; gap.v_active = false;
+    b.drive(gap); b.edge();
+    for (int i = 1; i < 8; i++) { b.drive(in); b.edge(); }
+    check(b.rd(S_WINPART) == 1, "partial window counted separately");
+    check(b.rd(S_BFINAL) == before, "partial window does not update b");
+    b.apply(In()); b.cur.quiet = true; b.wr(R_COMMAND, 4);
+}
+
+static void t_mode6_gap(Bench &b, Ref &r) {
+    b.reset(); r.do_reset();
+    In idle; idle.quiet = true; b.apply(idle);
+    cfg(r, b, R_MODE, 6);
+    cfg(r, b, R_WINDOW, 64);
+    cfg(r, b, R_INITBUD, 3);
+    cfg(r, b, R_MINBUD, 0);
+    cfg(r, b, R_MAXBUD, 32768);
+    cmd(b, r, 1);
+
+    In in; in.quiet = true;
+    Obs o = b.drive(in);
+    check(o.en && o.allow, "mode6 first admit allowed (countdown 0)");
+    b.edge();
+
+    in.a_done = true;                       // first A done: no gap
+    o = b.drive(in);
+    check(o.allow, "first A done inserts no gap");
+    b.edge();
+
+    o = b.drive(in);                        // second A done: loads gap 3
+    check(o.allow, "countdown still zero before load");
+    b.edge();
+
+    in.a_done = true;
+    o = b.drive(in);
+    check(!o.allow, "decision uses the updated countdown");
+    b.edge();
+    in.a_done = false;
+
+    o = b.drive(in); check(!o.allow, "countdown 3 -> blocked"); b.edge(); b.edge();
+    o = b.drive(in); check(!o.allow, "countdown 1 -> blocked"); b.edge();
+    o = b.drive(in); check(o.allow, "countdown exhausted -> allow");
+    check(b.rd(S_GAPL) == 1, "exactly one gap load");
+    b.apply(In()); b.cur.quiet = true; b.wr(R_COMMAND, 4);
+}
+
+static void t_mode7_stale(Bench &b, Ref &r) {
+    b.reset(); r.do_reset();
+    In idle; idle.quiet = true; b.apply(idle);
+    cfg(r, b, R_MODE, 7);
+    cfg(r, b, R_WINDOW, 8);
+    cmd(b, r, 1);
+
+    In in; in.quiet = true; in.ctl_did = DID_A;
+    for (int i = 0; i < 16; i++) { b.drive(in); b.edge(); }
+    // window 0 charged 0 stale; window 1 charged the 8 A-owner cycles of window 0
+    check(b.rd(S_STALE) == 1, "exactly one stale charge so far");
+    check(b.rd(S_CHARGE) == 8, "first window zero, second window 8");
+    check(b.rd(S_AOWN) == 16, "A-owner cycles counted");
+    b.apply(In()); b.cur.quiet = true; b.wr(R_COMMAND, 4);
+}
+
+static void t_error_abort_and_recovery(Bench &b, Ref &r) {
+    b.reset(); r.do_reset();
+    In in; in.quiet = true; b.apply(in);
+    cmd(b, r, 1);
+    check(b.rd(R_STATUS) & 1, "armed");
+
+    in.response_error = true;
+    Obs o = b.drive(in);
+    check(!o.allow && o.abort, "observation error blocks and aborts");
+    b.edge();
+    in.response_error = false;
+    o = b.drive(in);
+    check(!o.allow && o.abort, "observation error is sticky");
+    check((b.rd(R_ERROR) >> E_OBS) & 1, "E_OBS sticky");
+
+    b.apply(In()); b.cur.quiet = true;
+    b.wr(R_COMMAND, 3);                     // FREEZE requires quiet
+    check(b.rd(R_STATUS) & 2, "frozen");
+    b.wr(R_COMMAND, 4);                     // CLEAR needs !armed -> illegal
+    check((b.rd(R_ERROR) >> E_CLEARILL) & 1, "clear while armed is illegal");
+    check(b.rd(R_ERROR) != 0, "illegal clear cannot clear errors");
+}
+
+static void t_abort_keeps_charging(Bench &b, Ref &r) {
+    b.reset(); r.do_reset();
+    In in; in.quiet = true; b.apply(in);
+    cfg(r, b, R_MODE, 1);
+    cfg(r, b, R_WINDOW, 32);
+    cmd(b, r, 1);
+    cmd(b, r, 2);                            // ABORT
+    Obs o = b.drive(in);
+    check(o.en && !o.allow && o.abort, "abort stops new admission");
+    b.edge();
+    in.a_issue = true;
+    b.drive(in);
+    b.edge();
+    in.a_issue = false;
+    check(b.rd(S_CHARGE) == 4096, "in-flight charging continues after ABORT");
+    b.apply(In()); b.cur.quiet = true; b.wr(R_COMMAND, 3);   // freeze drains
+    check(b.rd(R_STATUS) & 2, "freeze after abort");
+    b.wr(R_COMMAND, 4);
+}
+
+static void t_narrow_overflow(Bench &b) {
+    b.reset();
+    In in; in.quiet = true; b.apply(in);
+    b.wr(R_MODE, 0);
+    b.wr(R_WINDOW, 1);
+    b.wr(R_COMMAND, 1);                      // ARM
+
+    for (int i = 0; i < 300; i++) { b.drive(in); b.edge(); }  // > 256 armed cycles
+    check((b.rd(R_ERROR) >> E_CNTOVF) & 1, "CounterWidth overflow sticky");
+    check(b.rd(S_ARMEDCYC) == (300 & 0xFF), "statistic wraps at CounterWidth");
+    Obs o = b.drive(in);
+    check(!o.allow, "fatal overflow blocks allow even in mode 0");
+    check(o.abort, "fatal overflow raises abort");
+
+    b.apply(In()); b.cur.quiet = true;
+    b.wr(R_COMMAND, 4);                      // legal CLEAR recovers
+    check(b.rd(R_ERROR) == 0, "CLEAR clears counter overflow");
+    check(b.rd(S_ARMEDCYC) == 0, "CLEAR zeroes statistics");
+}
+
+static void t_enabled0(Bench &b) {
+    b.reset();
+    check(b.rd(R_MAGIC) == 0x49444D414D435431ull, "Enabled=0 magic still readable");
+    check(b.rd(R_VERSION) == 1, "Enabled=0 version still readable");
+    In in; in.quiet = true; in.supported = true;
+    b.apply(in);
+    b.wr(R_COMMAND, 1);
+    check((b.rd(R_ERROR) >> E_UNSUP) & 1, "ARM refused as unsupported");
+    check(b.rd(R_STATUS) == 0, "never armed");
+    Obs o = b.drive(in);
+    check(!o.en && !o.allow && !o.abort, "feature absent: outputs inactive");
+}
+
+// ---------------------------------------------------------------------------
+// randomized reference-account test
+// ---------------------------------------------------------------------------
+static void run_reference(const char *tag, uint32_t seed, int cycles,
+                          bool narrow, int mode) {
+    Bench b;
+    Ref   r;
+    r.cw = narrow ? 8 : 64;
+
+    In idle; idle.quiet = true;
+    b.apply(idle);
+    cfg(r, b, R_MODE, (uint32_t)mode);
+    cfg(r, b, R_WINDOW, narrow ? 7 : 23);
+    cfg(r, b, R_TARGET, 12000);
+    cfg(r, b, R_DEADBAND, 4096);
+    cfg(r, b, R_INITBUD, 5000);
+    cfg(r, b, R_MINBUD, narrow ? 1 : (mode == 6 ? 0 : 1));
+    cfg(r, b, R_MAXBUD, 32768);
+    cfg(r, b, R_STEP, narrow ? 3 : 1024);
+    cfg(r, b, R_CAP, 65536);
+    cfg(r, b, R_WHIT, 1);
+    cfg(r, b, R_WMISS, 100);
+    cfg(r, b, R_WPTW, 100);
+    cmd(b, r, 1);
+
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> bite(0, 99);
+    In in;
+    bool quiet_phase = false;
+
+    for (int c = 0; c < cycles; c++) {
+        in = In();
+        in.quiet     = quiet_phase;
+        in.supported = true;
+        in.v_active  = bite(rng) < 80;
+        in.a_issue   = bite(rng) < 15;
+        in.a_done    = bite(rng) < 10;
+        in.v_done    = bite(rng) < 40;
+        in.ctl_did   = (bite(rng) < 70) ? DID_A : (uint32_t)(0x11 + (c % 3));
+        in.ctl_state = (uint32_t)((bite(rng) < 50) ? 1 : (bite(rng) < 60 ? 2 : 3));
+        in.select_fire = bite(rng) < 20;
+        in.select_did  = (bite(rng) < 70) ? DID_A : 0x22;
+        in.lookup      = bite(rng) < 25;
+        in.lookup_hit  = bite(rng) < 50;
+        in.lookup_did  = (bite(rng) < 70) ? DID_A : 0x22;
+        in.ptw_r_fire  = bite(rng) < 12;
+        in.response_error = bite(rng) < 2;
+
+        bool do_wr = false;
+        uint32_t widx = 0;
+        uint64_t wdata = 0;
+        int roll = bite(rng);
+        if (roll < 3) {                 // random config write (usually locked)
+            do_wr = true;
+            widx  = R_STEP;
+            wdata = (uint64_t)(1 + (rng() % 1000));
+        } else if (roll < 4) {          // random bad address
+            do_wr = true;
+            widx  = 0x77;
+            wdata = 0;
+        } else if (roll == 5) {         // legal CLEAR needs quiet && !armed
+            r.err |= 0;                 // nothing to mirror before the write
+            b.apply(in);
+            // CLEAR is only legal when quiet && !armed; in this run the DUT is
+            // armed, so this is the expected "illegal clear" sticky path.
+            b.wr(R_COMMAND, 4);
+            bool fa, fb_, ff, fc, fg;
+            uint64_t ne = r.decode_write(R_COMMAND, 4, in.quiet, fa, fb_, ff, fc, fg);
+            r.err |= ne;
+            b.apply(in);
+            continue;
+        }
+        if (bite(rng) < 2) {            // ABORT
+            b.apply(in);
+            b.wr(R_COMMAND, 2);
+            bool fa, fb_, ff, fc, fg;
+            uint64_t ne = r.decode_write(R_COMMAND, 2, in.quiet, fa, fb_, ff, fc, fg);
+            if (fc) r.clear_now(); else { r.err |= ne; if (fa) r.arm_now();
+                                          if (fb_) r.aborted = true; if (ff) r.frozen = true; }
+            b.apply(in);
+            continue;
+        }
+
+        b.apply(in);
+        b.d.cfg_valid_i = do_wr ? 1 : 0;
+        b.d.cfg_write_i = do_wr ? 1 : 0;
+        b.d.index_i     = (uint16_t)widx;
+        b.d.wdata_i     = wdata;
+        b.d.clk_i = 0; b.d.eval();
+
+        Obs rtl{ (bool)b.d.policy_enable_o, (bool)b.d.policy_allow_o,
+                 (bool)b.d.policy_abort_o };
+        RefObs ref = r.cycle(in, do_wr, widx, wdata);
+
+        if (rtl.en != ref.en || rtl.allow != ref.allow || rtl.abort != ref.abort) {
+            char msg[256];
+            std::snprintf(msg, sizeof(msg),
+                "%s cycle %d en/allow/abort rtl=%d/%d/%d ref=%d/%d/%d",
+                tag, c, rtl.en, rtl.allow, rtl.abort, ref.en, ref.allow, ref.abort);
+            throw std::runtime_error(msg);
+        }
+        checks++;
+
+        b.d.clk_i = 1; b.d.eval(); b.d.clk_i = 0; b.d.eval();
+        b.d.cfg_valid_i = 0; b.d.cfg_write_i = 0; b.d.wdata_i = 0;
+
+        b.apply(in);
+    }
+
+    check(b.rd(R_ERROR) == r.err, "reference error register");
+    check(b.rd(S_CHARGE) == (r.stat[Ref::ST_CHARGE] & r.mask()), "reference total charge");
+    check(b.rd(S_REPLEN) == (r.stat[Ref::ST_REPLEN] & r.mask()), "reference total replenish");
+    check(b.rd(S_WIN) == (r.stat[Ref::ST_WIN] & r.mask()), "reference complete windows");
+    check(b.rd(S_VDONE) == (r.stat[Ref::ST_VDONE] & r.mask()), "reference V done events");
+    check(b.rd(S_FBUP) == (r.stat[Ref::ST_FBUP] & r.mask()), "reference b-up count");
+    check(b.rd(S_FBDN) == (r.stat[Ref::ST_FBDN] & r.mask()), "reference b-down count");
+    check(b.rd(S_BLOCKED) == (r.stat[Ref::ST_BLOCKED] & r.mask()), "reference blocked cycles");
+    check((int64_t)b.rd(S_BALANCE) == r.balance, "reference final balance");
+    check(b.rd(S_BFINAL) == r.b, "reference final b");
+    check(b.rd(S_BMIN) == r.bmin, "reference b min");
+    check(b.rd(S_BMAX) == r.bmax, "reference b max");
+    check(b.rd(S_NODONE) == r.nodone_max, "reference longest no-done run");
+    for (int i = 0; i < 32; i++)
+        check(b.rd(S_HIST + i) == (r.hist[i] & r.mask()), "reference histogram bucket");
+}
+
+// ---------------------------------------------------------------------------
+int main(int argc, char **argv) {
+    Verilated::commandArgs(argc, argv);
+    std::string mode = (argc > 1) ? std::string(argv[1]) : std::string("full");
+
+    try {
+        if (mode == "off") {
+            Bench b;
+            t_enabled0(b);
+        } else if (mode == "small") {
+            Bench b;
+            t_narrow_overflow(b);
+            run_reference("small-ref-m0", 0xC0FFEE01u, 260, true, 0);
+            run_reference("small-ref-m3", 0xC0FFEE02u, 260, true, 3);
+        } else {
+            Bench b;
+            Ref   r;
+            t_reset_defaults(b);
+            t_bad_writes_and_sticky(b, r);
+            t_arm_predicates(b);
+            t_config_lock(b);
+            t_first_allow_and_mode0(b);
+            t_mode1_charge_and_debt(b, r, false);
+            t_window_feedback(b, r);
+            t_mode6_gap(b, r);
+            t_mode7_stale(b, r);
+            t_error_abort_and_recovery(b, r);
+            t_abort_keeps_charging(b, r);
+
+            for (int m = 0; m <= 7; m++) {
+                char nm[32];
+                std::snprintf(nm, sizeof(nm), "ref-mode%d", m);
+                run_reference(nm, 0x12345678u + (uint32_t)m, 400, false, m);
+            }
+        }
+        std::cout << "PASS " << checks
+                  << " dma_research_policy checks (simulation only)" << std::endl;
+        return 0;
+    } catch (const std::exception &e) {
+        std::cerr << "FAIL after " << checks << " checks: " << e.what() << std::endl;
+        return 1;
+    }
+}
+```
+
+---
+
+# Deliverable 3 — `tests/test_research_policy.py` (NEW)
+
+```python
+#!/usr/bin/env python3
+"""Compile and run the dma_research_policy directed/reference-account test.
+
+Three builds are produced from the same sources:
+  rtl        : Enabled=1, CounterWidth=64  (production width)
+  rtl-small  : Enabled=1, CounterWidth=8   (deliberate statistics wrap/overflow)
+  rtl-off    : Enabled=0                   (feature absent, magic still readable)
+
+No claim is made that these commands were executed by the authoring agent.
+"""
+from pathlib import Path
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+RTL = ROOT / "cva6/corev_apu/fpga/src/dma_research_policy.sv"
+TB = ROOT / "tests" / "research_policy_test.cpp"
+
+VARIANTS = (
+    ("rtl", "full", []),
+    ("rtl-small", "small", ["-GCounterWidth=8"]),
+    ("rtl-off", "off", ["-GEnabled=0"]),
+)
+
+if not RTL.is_file():
+    print("missing RTL: %s" % RTL)
+    sys.exit(1)
+if not TB.is_file():
+    print("missing testbench: %s" % TB)
+    sys.exit(1)
+
+for name, mode, extra in VARIANTS:
+    out = ROOT / "out" / "research-policy-20261003" / name
+    out.mkdir(parents=True, exist_ok=True)
+    args = [
+        "verilator", "--cc", "--exe", "--build", "-Wall", "-Wno-fatal",
+        "--top-module", "dma_research_policy", "--Mdir", str(out),
+        str(RTL), str(TB),
+    ] + extra
+    with (out / "build.log").open("w") as log:
+        result = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT)
+    if result.returncode != 0:
+        tail = (out / "build.log").read_text()[-4000:]
+        print("BUILD FAILED (%s) tail:\n%s" % (name, tail))
+        sys.exit(1)
+    run = subprocess.run([str(out / "Vdma_research_policy"), mode],
+                         capture_output=True, text=True)
+    if run.returncode != 0:
+        print("RUN FAILED (%s):\n%s\n%s" % (name, run.stdout, run.stderr))
+        sys.exit(1)
+    print(run.stdout.strip())
+
+print("PASS dma_research_policy builds (simulation only, no board claim)")
+```
+
+---
+
+# JSON output
+
+```json
+{
+  "summary": "NEW standalone SystemVerilog policy module dma_research_policy.sv implementing the contract's 'Method control (bank E00..E5F)' block, plus one directed + reference-account Verilator C++ test and one Python build/run driver. No existing file is modified. cfg_* register access is 64-bit through index_i[12:0] (bank offset in [7:0], bits [12:8] must be zero). ARM comes from register command 1 only; there is no external arm port. Modes 0..7, 64-bit signed balance with 66-bit intermediate and no debt forgiveness, positive-side-only credit_cap clamp, cycle window started at ARM with first/last-cycle-inclusive full-activity detection, mode6 gap countdown loaded by A done (first A done excluded) with decision on the updated countdown, mode7 stale charge of the previous window's A-owner cycles at the next window end with a zero first window, sticky errors with reset/legal-CLEAR recovery only, sticky E_CNTOVF on CounterWidth overflow, and PTW attribution by (ctl_did==DID_A && ptw_r_fire_i) included in mode4 weighted cost and counted separately. Nothing was built or run by the authoring agent.",
+  "files": [
+    {
+      "path": "cva6/corev_apu/fpga/src/dma_research_policy.sv",
+      "content": "<Deliverable 1 above; apply the two fix-up notes (move the bal_r_clamped declaration above its always_comb; use nodone_run_q <= nodone_run_next) before building>"
+    },
+    {
+      "path": "tests/research_policy_test.cpp",
+      "content": "<Deliverable 2 above>"
+    },
+    {
+      "path": "tests/test_research_policy.py",
+      "content": "<Deliverable 3 above>"
+    }
+  ],
+  "register_map": {
+    "bank_base": "E00",
+    "index_width": "index_i[12:0]; index_i[12:8] must be 0, index_i[7:0] selects the register",
+    "data_width": 64,
+    "writable_range": "0x04..0x10 only; every other write address sets sticky E_BADADDR; writes with wdata_i[63:32] != 0 set sticky E_BADADDR",
+    "config": {
+      "0x00": "MAGIC 0x49444d414d435431 (IDMAMCT1), read only",
+      "0x01": "VERSION = 1, read only",
+      "0x02": "ERROR sticky: b0 BADADDR, b1 BADCMD, b2 UNSUP, b3 CFGLOCK, b4 CNTOVF(fatal), b5 BALOVF(fatal), b6 CLEARILL, b7 FRZILL, b8 ARMSTATE, b9 OBS(fatal), b10 BADCFG",
+      "0x03": "STATUS b0 armed, b1 frozen, b2 abort, read only",
+      "0x04": "COMMAND w: 1 ARM, 2 ABORT, 3 FREEZE, 4 CLEAR; reads 0",
+      "0x05": "MODE 0..7, default 0",
+      "0x06": "WINDOW_CYCLES default 16384 (must be >=1 to ARM)",
+      "0x07": "TARGET_BYTES default 51540",
+      "0x08": "DEADBAND_BYTES default 4096",
+      "0x09": "INITIAL_BUDGET default 8000 (clamped into [min,max] at ARM)",
+      "0x0A": "MIN_BUDGET default 1 (must be >0 for modes 1..5,7)",
+      "0x0B": "MAX_BUDGET default 32768",
+      "0x0C": "BUDGET_STEP default 512",
+      "0x0D": "CREDIT_CAP default 65536 (positive-side clamp of the balance)",
+      "0x0E": "HIT_WEIGHT default 1",
+      "0x0F": "MISS_WEIGHT default 100",
+      "0x10": "PTW_WEIGHT default 100"
+    },
+    "statistics_32bit_slots_in_64bit_registers": {
+      "0x20": "complete (fully V-active) billing windows",
+      "0x21": "V done events",
+      "0x22": "V done bytes (4096 per done)",
+      "0x23": "windows with observed bytes < target",
+      "0x24": "total shortfall bytes",
+      "0x25": "cycles with policy_enable_o=1 and policy_allow_o=0",
+      "0x26": "total charge",
+      "0x27": "total replenish",
+      "0x28": "A issue events",
+      "0x29": "A done events",
+      "0x2A": "cycles with non-zero charge",
+      "0x2B": "A-owned lookup hit events",
+      "0x2C": "A-owned lookup miss events",
+      "0x2D": "A-owned PTW return events",
+      "0x2E": "A-owner cycles (ctl_did==DID_A)",
+      "0x2F": "A select fires",
+      "0x30": "A-owned lookup events",
+      "0x31": "A-owned lookup miss events",
+      "0x32": "A REQ_TRANS/AWAIT_RESP cycles",
+      "0x33": "window boundaries closed",
+      "0x34": "window boundaries not fully V-active",
+      "0x35": "feedback steps increasing b",
+      "0x36": "feedback steps decreasing b",
+      "0x37": "mode6 gap loads (A done after the first copy)",
+      "0x38": "mode7 stale charges applied",
+      "0x39": "cycles armed and not frozen",
+      "0x3A": "final signed balance C",
+      "0x3B": "minimum b seen",
+      "0x3C": "maximum b seen",
+      "0x3D": "final b",
+      "0x3E": "longest V-active run without V done",
+      "0x3F": "reserved, reads 0",
+      "0x40..0x5F": "V-done-per-complete-active-window histogram, 32 buckets (0..30 exact, 31 means >=31)"
+    }
+  },
+  "tests": [
+    "t_reset_defaults: magic, version, all default config values, zeroed statistics",
+    "t_bad_writes_and_sticky: unimplemented address, wdata_i[63:32]!=0, unknown command code, illegal CLEAR -> all sticky; legal CLEAR clears them",
+    "t_arm_predicates: ARM refused when quiet_i=0 / supported_i=0, status stays 0",
+    "t_config_lock: every config write while armed sets E_CFGLOCK and leaves the value unchanged; CLEAR unlocks",
+    "t_first_allow_and_mode0: first ADMIT after ARM is allowed; mode 0 always allows and never charges",
+    "t_mode1_charge_and_debt: 4096 per A issue, debt makes allow drop, window refill does not forgive debt (negative final balance)",
+    "t_window_feedback: fully-active window with 0 V done updates b upward and hits histogram bucket 0; 8 V done hits bucket 8 and steps b down; a window missing one V-active cycle is counted as partial and does not update b; refill uses the pre-window b",
+    "t_mode6_gap: first A done inserts no gap, later A done loads the current gap, allow is derived from the updated countdown, exactly one gap load recorded",
+    "t_mode7_stale: first window charges zero, second window charges the previous window's 8 A-owner cycles",
+    "t_error_abort_and_recovery: response_error_i blocks allow and raises abort in the same cycle, is sticky, and CLEAR while armed is illegal and cannot clear",
+    "t_abort_keeps_charging: ABORT forces allow low and abort high while in-flight charging continues to FREEZE",
+    "t_narrow_overflow (CounterWidth=8): 300 armed cycles wrap the statistic to 300&0xFF, set sticky E_CNTOVF, block allow even in mode 0, raise abort, and remain until a legal CLEAR",
+    "t_enabled0: magic/version readable, ARM refused with E_UNSUP, never armed, all three outputs inactive",
+    "run_reference (10 runs): per-cycle comparison of policy_enable_o/policy_allow_o/policy_abort_o against an independent cycle-accurate reference model for modes 0..7 at CounterWidth=64 plus two CounterWidth=8 runs, then final comparison of ERROR, final balance, final/min/max b, total charge, total replenish, complete windows, V done events, b-up/b-down counts, blocked cycles, longest no-done run and all 32 histogram buckets"
+  ],
+  "assumptions": [
+    "Port naming: clk_i/rst_ni (active-low reset) and wdata_i/rdata_o are used; the task text wrote 'clk/rst' and 'wdata64/rdata64' as shorthand.",
+    "index_i[12:0] is interpreted as a bank offset: index_i[12:8] must be zero, index_i[7:0] is the register selector. Writes outside 0x04..0x10 are rejected and sticky.",
+    "The contract's 'E06 E' is implemented as WINDOW_CYCLES (default 16384), matching the 'window配置有界，默认16384周期' sentence and the task's default list.",
+    "Feedback direction is implemented exactly as written: observed ABOVE target -> b increases, observed BELOW target -> b decreases (self-consistent reading of 'target低于观测则提高b，低于目标则降低b'). Mode 6 reverses it (V slow -> gap up). Deadband is the no-change band on both sides.",
+    "'observed' for the feedback is v_done_count * 4096 bytes compared against target_bytes; the shortfall statistics use the raw target without deadband.",
+    "The module needs to know which DID is A; added parameter DID_A with default 24'h000010. ctl_state_i encoding 0 idle / 1 REQ_TRANS / 2 AWAIT_RESP / 3 COMPLETE is parameterised (ST_REQ_TRANS, ST_AWAIT_RESP) because the contract does not fix the numbers.",
+    "The cycle window starts on the cycle after the ARM write registers; win_allact_q is seeded to 1 at ARM so the first cycle is included, and the last cycle's v_active_i is included through act_all_now.",
+    "Mode 0 performs no charge and no refill (refill_en excludes mode 0 and mode 6); mode 6 performs no per-cycle charge and no byte refill.",
+    "Mode 7 rotates prev_main/win_main at every window boundary (complete or partial); the charge at a window end is the previous window's A-owner cycle count, so the first window is zero by construction.",
+    "ABORT/FREEZE/ARM/CLEAR cannot coincide with an active window, because they all require armed_q=0 or automatically imply quiet; FREEZE is only granted when quiet_i is high, which the contract equates with the drain having completed.",
+    "A legal CLEAR resets the sticky error register, the three status flags, the balance, b, the window bookkeeping and all statistics and histogram buckets, and leaves the configuration registers untouched.",
+    "ARM does not clear statistics; only reset and a legal CLEAR do.",
+    "policy_abort_o is driven only while policy_enable_o is high, so that an unimplemented/disabled feature does not stall a legacy pipeline.",
+    "The randomized reference model is an independent re-derivation of the contract semantics written in C++; it mirrors the contract wording rather than the RTL structure."
+  ],
+  "risks": [
+    "The RTL text needs the two documented fix-ups before it will elaborate (declaration order of bal_r_clamped, and nodone_run_q <= nodone_run_next).",
+    "The literal feedback direction (observed above target -> b up) is a positive-feedback controller; if the intended reading was the classic negative-feedback one, a one-line swap of fb_inc/fb_dec in section 7 and in the reference is required. Flagged for Codex review.",
+    "Verilator 4.038 support for `parameter bit` with -GEnabled=0 and for the `64'(x)` style casts was avoided on purpose (zext64/cadd functions are used instead), but the build must still be confirmed by the driver.",
+    "DID_A default 0x10 is an assumption; the contract only fixes DID10 as the V owner for the E2 timing block.",
+    "ctl_state_i numeric encoding is assumed and parameterised; a mismatched integration would silently mis-charge mode 5.",
+    "CounterWidth=8 also wraps the histogram and armed-cycle counters, so the narrow variant can only be used for the overflow test and very short runs; the driver's small variant respects that.",
+    "The mode-7 'previous complete billing window' qualifier is approximated by rotating at every window boundary; partial windows therefore also rotate. Documented, not silently changed.",
+    "No simulation, lint run, synthesis run or board test was performed by the authoring agent; every claim about behaviour is an expectation to be verified by running tests/test_research_policy.py."
+  ]
+}
+```

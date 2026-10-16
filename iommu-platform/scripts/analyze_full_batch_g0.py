@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+"""Offline analyzer for the G0/M0 full-batch traces.
+
+Input directory must contain:
+  baseline-register.json
+  results.json
+  <case_id>.csv for each case in baseline-register.json
+  (or traces/<case_id>.csv)
+
+Outputs in the same directory:
+  trace-statistics.json
+  results-table.csv
+  completion-comparison.svg
+  completion-comparison.png
+
+Run from the platform root with python3 -m scripts.analyze_full_batch_g0
+so scripts/platform.py does not shadow the standard-library platform module.
+
+This script performs offline event matching only.  It does not run or
+re-run any simulation.
+"""
+
+import argparse
+import csv
+import json
+import sys
+from collections import defaultdict, deque
+from pathlib import Path
+
+
+# Tag -> port mapping follows the RTL slave encoding slv = (tag >> 4) & 3.
+# Verified on the A8 root traces: tag 32 (slv2, V payload), tag 36 (slv2,
+# A payload) and tag 48 (slv3, DS).  Tag 36 is NOT a DS tag.
+# Ports are classified by slv; unknown slv/tag pairs keep an explicit label
+# instead of being folded silently into a known port.
+PORT_BY_SLV = {
+    2: "port2_payload",
+    3: "port3_ds",
+}
+
+
+def port_for_tag(tag):
+    slv = (tag >> 4) & 3
+    name = PORT_BY_SLV.get(slv)
+    if name is None:
+        return f"unknown_slv{slv}_tag{tag}"
+    return name
+
+
+def die(message):
+    raise SystemExit(f"ERROR: {message}")
+
+
+def load_json(path):
+    if not path.is_file():
+        die(f"missing required JSON: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def resolve_trace(input_dir, case_id):
+    candidates = [
+        input_dir / f"{case_id}.csv",
+        input_dir / "traces" / f"{case_id}.csv",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    die(f"missing trace CSV for {case_id}; tried {candidates}")
+
+
+def new_lat():
+    return {"count": 0, "sum": 0, "max": 0}
+
+
+def finalize_lat(lat):
+    count = lat["count"]
+    return {
+        "count": count,
+        "sum": lat["sum"],
+        "mean": (lat["sum"] / count) if count else None,
+        "max": lat["max"],
+    }
+
+
+def remove_at(queue, index):
+    """Remove queue[index] while preserving deque order."""
+    if index == 0:
+        queue.popleft()
+    else:
+        queue.rotate(-index)
+        queue.popleft()
+        queue.rotate(index)
+
+
+def analyze_case_trace(trace_path, summary_ptw_active_cycles):
+    buckets = defaultdict(deque)
+    per_port = defaultdict(lambda: {
+        "ar_to_first_r": new_lat(),
+        "ar_to_last_r": new_lat(),
+    })
+    for port in sorted(PORT_BY_SLV.values()):
+        per_port[port]
+
+    ar_by_tag = defaultdict(int)
+    r_by_tag = defaultdict(int)
+
+    total_ar = 0
+    expected_r_beats = 0
+    actual_r_beats = 0
+    completed = 0
+    unmatched_r = 0
+    order_violations = 0
+    beat_mismatch = 0
+
+    ptw_open = defaultdict(deque)
+    ptw_intervals = defaultdict(list)
+    ptw_unmatched_end = 0
+    fullt0_events = 0
+
+    with trace_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"cycle", "event", "tag", "address", "value"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            die(f"{trace_path}: missing columns; need {sorted(required)}")
+
+        for row in reader:
+            event = row["event"].strip()
+            try:
+                cycle = int(row["cycle"])
+            except ValueError:
+                die(f"{trace_path}: bad cycle value {row['cycle']!r}")
+
+            if event == "full_ddr_ar":
+                tag = int(row["tag"])
+                addr = int(row["address"])
+                value = int(row["value"])
+
+                # Sample trace uses value=255 for a 256-beat request.
+                length = value + 1
+
+                ar_by_tag[tag] += 1
+                total_ar += 1
+                expected_r_beats += length
+                buckets[tag].append({
+                    "id": tag,
+                    "addr": addr,
+                    "len": length,
+                    "cycle": cycle,
+                    "next_beat": 0,
+                    "beats": 0,
+                    "first_r": None,
+                    "last_r": None,
+                })
+
+            elif event == "full_ddr_r":
+                tag = int(row["tag"])
+                addr = int(row["address"])
+                beat = int(row["value"])
+
+                actual_r_beats += 1
+                r_by_tag[tag] += 1
+
+                queue = buckets.get(tag)
+                if not queue:
+                    unmatched_r += 1
+                    continue
+
+                index = None
+                for i, ar in enumerate(queue):
+                    if ar["addr"] == addr:
+                        index = i
+                        break
+
+                if index is None:
+                    unmatched_r += 1
+                    continue
+
+                if index != 0:
+                    order_violations += 1
+
+                ar = queue[index]
+                if beat != ar["next_beat"]:
+                    beat_mismatch += 1
+                    continue
+
+                ar["beats"] += 1
+                ar["next_beat"] += 1
+                if ar["first_r"] is None:
+                    ar["first_r"] = cycle
+                ar["last_r"] = cycle
+
+                if ar["beats"] == ar["len"]:
+                    remove_at(queue, index)
+                    completed += 1
+
+                    port = port_for_tag(tag)
+                    lat_first = ar["first_r"] - ar["cycle"]
+                    lat_last = ar["last_r"] - ar["cycle"]
+
+                    d = per_port[port]["ar_to_first_r"]
+                    d["count"] += 1
+                    d["sum"] += lat_first
+                    d["max"] = max(d["max"], lat_first)
+
+                    d = per_port[port]["ar_to_last_r"]
+                    d["count"] += 1
+                    d["sum"] += lat_last
+                    d["max"] = max(d["max"], lat_last)
+
+            elif event == "full_ptw_start":
+                tag = int(row["tag"])
+                ptw_open[tag].append(cycle)
+
+            elif event == "full_ptw_end":
+                tag = int(row["tag"])
+                if ptw_open[tag]:
+                    start = ptw_open[tag].popleft()
+                    ptw_intervals[tag].append(cycle - start)
+                else:
+                    ptw_unmatched_end += 1
+
+            elif event.startswith("fullt0"):
+                fullt0_events += 1
+
+    pending = sum(len(queue) for queue in buckets.values())
+    ptw_unmatched_start = sum(len(queue) for queue in ptw_open.values())
+    matched_ptw_total = sum(sum(intervals) for intervals in ptw_intervals.values())
+
+    tail_ok = (
+        completed == total_ar
+        and pending == 0
+        and beat_mismatch == 0
+    )
+
+    if ptw_unmatched_start or ptw_unmatched_end or fullt0_events:
+        ptw_consistency = "unmatched_activity"
+    elif summary_ptw_active_cycles is None:
+        ptw_consistency = "no_summary"
+    elif matched_ptw_total == summary_ptw_active_cycles:
+        ptw_consistency = "consistent"
+    else:
+        ptw_consistency = "mismatch"
+
+    return {
+        "trace_file": str(trace_path),
+        "ar_requests": total_ar,
+        "r_beats_actual": actual_r_beats,
+        "r_beats_expected": expected_r_beats,
+        "completed_ars": completed,
+        "pending_ars": pending,
+        "unmatched_r_beats": unmatched_r,
+        "same_id_order_violations": order_violations,
+        "beat_index_mismatches": beat_mismatch,
+        "all_requests_tail_complete": tail_ok,
+        "all_r_beats_accounted": (
+            unmatched_r == 0
+            and actual_r_beats == expected_r_beats
+        ),
+        "same_id_order_preserved": order_violations == 0,
+        "ar_by_tag": {str(k): v for k, v in sorted(ar_by_tag.items())},
+        "r_beats_by_tag": {str(k): v for k, v in sorted(r_by_tag.items())},
+        "per_port": {
+            port: {
+                "ar_to_first_r": finalize_lat(per_port[port]["ar_to_first_r"]),
+                "ar_to_last_r": finalize_lat(per_port[port]["ar_to_last_r"]),
+            }
+            for port in sorted(per_port)
+        },
+        "ptw": {
+            "banks": {
+                str(bank): {
+                    "intervals": ptw_intervals[bank],
+                    "count": len(ptw_intervals[bank]),
+                    "sum_cycles": sum(ptw_intervals[bank]),
+                }
+                for bank in sorted(ptw_intervals)
+            },
+            "matched_total_cycles": matched_ptw_total,
+            "unmatched_start": ptw_unmatched_start,
+            "unmatched_end": ptw_unmatched_end,
+            "fullt0_events": fullt0_events,
+            "summary_ptw_active_cycles": summary_ptw_active_cycles,
+            "consistency": ptw_consistency,
+        },
+    }
+
+
+def channel_map(record):
+    return {channel["id"]: channel for channel in record.get("channels", [])}
+
+
+def channel_complete(channel):
+    """True only when the channel reports batch_complete == 1 and is not stopped."""
+    return channel.get("batch_complete") == 1 and channel.get("batch_stopped") == 0
+
+
+def build_table_rows(baseline, records_by_case, trace_stats_by_case):
+    rows = []
+    for case in baseline["cases"]:
+        case_id = case["id"]
+        record = records_by_case[case_id]
+        channels = channel_map(record)
+        v = channels.get("V", {})
+        a = channels.get("A", {})
+        trace_stats = trace_stats_by_case[case_id]
+
+        rows.append({
+            "case_id": case_id,
+            "a_pages": case.get("a_pages", record.get("a_pages")),
+            "mode": case.get("mode", record.get("scenario")),
+            "ds_priority": int(bool(case.get("ds_priority", record.get("ds_priority")))),
+            "t0": record.get("t0"),
+            "T_V": record.get("T_V"),
+            "T_A": record.get("T_A"),
+            "T_data": record.get("T_data"),
+            "T_return": record.get("T_return"),
+            "V_issue": v.get("issue"),
+            "V_done": v.get("done"),
+            "A_issue": a.get("issue"),
+            "A_done": a.get("done"),
+            "V_ar": v.get("ar"),
+            "A_ar": a.get("ar"),
+            "V_r_beats": v.get("r_beats"),
+            "A_r_beats": a.get("r_beats"),
+            "batch_complete": int(channel_complete(v) and channel_complete(a)),
+            "trace_tail_ok": trace_stats["all_requests_tail_complete"],
+            "ptw_active_cycles_summary": record.get("raw", {}).get("ptw_active_cycles"),
+            "ptw_trace_matched_cycles": trace_stats["ptw"]["matched_total_cycles"],
+            "ptw_consistency": trace_stats["ptw"]["consistency"],
+        })
+    return rows
+
+
+def write_results_table(input_dir, rows):
+    if len(rows) != 10:
+        die(f"results-table.csv requires 10 rows, got {len(rows)}")
+    path = input_dir / "results-table.csv"
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def plot_completion(input_dir, baseline, records_by_case):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        die(f"matplotlib Agg backend unavailable: {exc}")
+
+    def cases_for(a_pages):
+        return [c for c in baseline["cases"] if c.get("a_pages") == a_pages]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+
+    for ax, a_pages, title in (
+        (axes[0], 1, "A1 (4 modes)"),
+        (axes[1], 8, "A8 (6 modes)"),
+    ):
+        cases = cases_for(a_pages)
+        labels = []
+        v_values = []
+        a_values = []
+
+        for case in cases:
+            case_id = case["id"]
+            record = records_by_case[case_id]
+            mode = case.get("mode", record.get("scenario"))
+            ds = "+DS" if case.get("ds_priority") else ""
+            labels.append(f"{case_id}\n{mode}{ds}")
+            v_values.append(record["T_V"])
+            a_values.append(record["T_A"])
+
+        x = list(range(len(cases)))
+        width = 0.38
+        ax.bar([i - width / 2 for i in x], v_values, width=width, label="T_V")
+        ax.bar([i + width / 2 for i in x], a_values, width=width, label="T_A")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylabel("completion cycles")
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+        ax.grid(axis="y", alpha=0.25)
+
+    fig.suptitle(
+        "Single deterministic run per case; no statistical sampling / no p99",
+        fontsize=9,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    svg_path = input_dir / "completion-comparison.svg"
+    png_path = input_dir / "completion-comparison.png"
+    fig.savefig(svg_path)
+    fig.savefig(png_path, dpi=160)
+    plt.close(fig)
+    return svg_path, png_path
+
+
+def index_records(results, cases):
+    """Index results.json records by case_id; reject duplicates and set drift."""
+    records = results.get("records")
+    if not isinstance(records, list):
+        die("results.json: records must be a list")
+
+    registry_ids = {case["id"] for case in cases}
+    records_by_case = {}
+    duplicates = []
+    for record in records:
+        case_id = record.get("case_id")
+        if not case_id:
+            die(f"results.json: record without case_id: {record!r}")
+        if case_id in records_by_case:
+            duplicates.append(case_id)
+            continue
+        records_by_case[case_id] = record
+
+    if duplicates:
+        die(f"results.json: duplicate case records: {sorted(set(duplicates))}")
+
+    missing = sorted(registry_ids - set(records_by_case))
+    if missing:
+        die(f"results.json missing case records: {missing}")
+
+    unexpected = sorted(set(records_by_case) - registry_ids)
+    if unexpected:
+        die(f"results.json records not in baseline-register.json: {unexpected}")
+
+    return records_by_case
+
+
+def check_record_metadata(cases, records_by_case):
+    """baseline-register.json metadata must match the results.json record.
+
+    A field absent on one side is not reported here; the record-level checks
+    already fail earlier if a required field is missing there.
+    """
+    problems = []
+    for case in cases:
+        case_id = case["id"]
+        record = records_by_case[case_id]
+
+        base_a_pages = case.get("a_pages")
+        rec_a_pages = record.get("a_pages")
+        if (
+            base_a_pages is not None
+            and rec_a_pages is not None
+            and base_a_pages != rec_a_pages
+        ):
+            problems.append(
+                f"{case_id}: a_pages baseline={base_a_pages!r} results={rec_a_pages!r}"
+            )
+
+        base_scenario = case.get("scenario", case.get("mode"))
+        rec_scenario = record.get("scenario", record.get("mode"))
+        if (
+            base_scenario is not None
+            and rec_scenario is not None
+            and base_scenario != rec_scenario
+        ):
+            problems.append(
+                f"{case_id}: scenario baseline={base_scenario!r} results={rec_scenario!r}"
+            )
+
+        base_ds = case.get("ds_priority")
+        rec_ds = record.get("ds_priority")
+        if base_ds is not None and rec_ds is not None and bool(base_ds) != bool(rec_ds):
+            problems.append(
+                f"{case_id}: ds_priority baseline={base_ds!r} results={rec_ds!r}"
+            )
+
+    if problems:
+        die(
+            "baseline-register.json / results.json metadata mismatch: "
+            + "; ".join(problems)
+        )
+
+
+PTW_CONSISTENT = "consistent"
+
+
+def collect_case_failures(trace_stats_by_case):
+    """Return {case_id: [reason, ...]} for every case breaking the contract."""
+    failures = {}
+    for case_id, case_stats in trace_stats_by_case.items():
+        reasons = []
+
+        if not case_stats["all_requests_tail_complete"]:
+            reasons.append("tail_incomplete")
+
+        unmatched_r = case_stats["unmatched_r_beats"]
+        if unmatched_r:
+            reasons.append(f"unmatched_r_beats={unmatched_r}")
+
+        order_violations = case_stats["same_id_order_violations"]
+        if order_violations:
+            reasons.append(f"same_id_order_violations={order_violations}")
+
+        beat_mismatch = case_stats["beat_index_mismatches"]
+        if beat_mismatch:
+            reasons.append(f"beat_index_mismatches={beat_mismatch}")
+
+        if not case_stats["all_r_beats_accounted"]:
+            reasons.append("r_beats_not_accounted")
+
+        ptw = case_stats["ptw"]
+        ptw_consistency = ptw["consistency"]
+        if ptw_consistency != PTW_CONSISTENT:
+            ptw_matched = ptw["matched_total_cycles"]
+            ptw_summary = ptw["summary_ptw_active_cycles"]
+            ptw_start = ptw["unmatched_start"]
+            ptw_end = ptw["unmatched_end"]
+            ptw_fullt0 = ptw["fullt0_events"]
+            reasons.append(
+                f"ptw_consistency={ptw_consistency} matched={ptw_matched} "
+                f"summary={ptw_summary} unmatched_start={ptw_start} "
+                f"unmatched_end={ptw_end} fullt0_events={ptw_fullt0}"
+            )
+
+        if reasons:
+            failures[case_id] = reasons
+    return failures
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input-dir", required=True, type=Path)
+    args = parser.parse_args()
+
+    input_dir = args.input_dir
+    if not input_dir.is_dir():
+        die(f"input directory does not exist: {input_dir}")
+
+    baseline = load_json(input_dir / "baseline-register.json")
+    results = load_json(input_dir / "results.json")
+
+    cases = baseline.get("cases")
+    if not isinstance(cases, list) or len(cases) != 10:
+        die(
+            "baseline-register.json: expected exactly 10 cases, "
+            f"got {len(cases) if isinstance(cases, list) else 'non-list'}"
+        )
+
+    records_by_case = index_records(results, cases)
+    check_record_metadata(cases, records_by_case)
+
+    trace_stats_by_case = {}
+    for case in cases:
+        case_id = case["id"]
+        trace_path = resolve_trace(input_dir, case_id)
+        summary_ptw = records_by_case[case_id].get("raw", {}).get("ptw_active_cycles")
+        trace_stats_by_case[case_id] = analyze_case_trace(trace_path, summary_ptw)
+        trace_stats_by_case[case_id]["case_id"] = case_id
+
+    stats = {
+        "schema": "trace-statistics-v1",
+        "input_dir": str(input_dir),
+        "note": (
+            "offline event matching only; full_ddr_ar value is treated as last beat "
+            "index (len=value+1); no simulated rerun"
+        ),
+        "cases": [trace_stats_by_case[case["id"]] for case in cases],
+    }
+
+    stats_path = input_dir / "trace-statistics.json"
+    with stats_path.open("w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+
+    rows = build_table_rows(baseline, records_by_case, trace_stats_by_case)
+    table_path = write_results_table(input_dir, rows)
+    svg_path, png_path = plot_completion(input_dir, baseline, records_by_case)
+
+    print(f"wrote {stats_path}")
+    print(f"wrote {table_path}")
+    print(f"wrote {svg_path}")
+    print(f"wrote {png_path}")
+
+    failures = collect_case_failures(trace_stats_by_case)
+    for case_id in trace_stats_by_case:
+        reasons = failures.get(case_id, [])
+        if reasons:
+            detail = "; ".join(reasons)
+            print(f"FAIL {case_id}: {detail}", file=sys.stderr)
+        else:
+            print(f"OK {case_id}")
+
+    if failures:
+        failed_ids = ", ".join(failures)
+        print(
+            f"ERROR: {len(failures)}/{len(trace_stats_by_case)} cases violate the "
+            f"registration contract: {failed_ids}",
+            file=sys.stderr,
+        )
+        print(f"diagnostics kept in {stats_path}", file=sys.stderr)
+        sys.exit(1)
+
+    print("all cases satisfy the registration contract")
+
+
+if __name__ == "__main__":
+    main()

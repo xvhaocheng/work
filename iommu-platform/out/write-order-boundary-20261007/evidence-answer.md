@@ -1,0 +1,414 @@
+# Evidence pack — cross-bank AW/W ordering, bank‑TC serialization, iDMA AR/AW independence, Mode7 admit gate
+
+Scope note: I only inspected the supplied files. I did **not** execute anything and make no claim that any test passed. Items requiring files not supplied are flagged as **MISSING**.
+
+Supplied evidence files (aliases used below):
+
+- `demux` = `cva6/corev_apu/riscv-iommu/vendor/axi/src/axi_demux_simple.sv`
+- `demux_wrap` = `cva6/corev_apu/riscv-iommu/vendor/axi/src/axi_demux.sv`
+- `mux` = `cva6/corev_apu/riscv-iommu/vendor/axi/src/axi_mux.sv`
+- `tc` = `cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv`
+- `bctl` = `tests/nonblock_completion_banked_ctl.sv`
+- `top` = `tests/nonblock_actual_dma_top.sv`
+- `pool_late` = `tests/nonblock_completion_pool_late.sv`
+- `tl` = `cva6/corev_apu/iDMA/src/idma_axi_transport_layer.sv`
+- `be` = `cva6/corev_apu/iDMA/src/idma_backend.sv`
+
+---
+
+## 0. Findings summary (navigable)
+
+1. **Input demux does NOT accept a different port's AW while an unfinished W is in flight.** It only accepts an AW whose select equals the current W owner. Cross-port AW is held (aw_ready low, mst aw_valid low). This is a **global** W-ownership count, not per-port. → §1
+2. **Virtual vs physical W order can diverge** because v-order is decided by the *input* mux and p-order by the *output* mux, two independent RR arbiters at different points; bank translation latency is not equalized. → §2
+3. **Bank TC cannot continue translating an AW while a READ is in COMPLETE waiting for ARready.** The FSM is serial (IDLE→REQ_TRANS→AWAIT_RESP→COMPLETE→IDLE); AW is prioritized *in IDLE only*; in COMPLETE it is blocked until the completion AR handshake. → §3
+4. **iDMA presents AR independently of AW acceptance** at least at the transport layer (RAWCouplingAvail=0 path). Whether the legalizer presents AR before AW handshake depends on `idma_legalizer` (**MISSING**). → §4
+5. **Mode7 admit gate** = pool `armed_q` → `completion_ar_admit_i` → wrapper gates completion AR valid+ready. Read admission at the TC is OFF. `can_stream`/`can_future` both ultimately require the W head at *both* muxes to be the read's own bank → a plausible self-wait loop. → §5
+6. **RTL does not exclude cross-bank physical AW reversal.** The pool *observes/tracks* v and p order but there is **no** assertion/cross-check comparing them; banks are independent FSMs, output mux is RR. → §6
+7. Minimal legal sequences and forbidden false counterexamples → §7
+8. Counter/interface semantics table → §8
+9. Missing files / unresolved → §9
+10. Suggested acceptance checks for Codex → §10
+
+---
+
+## 1. Input AXI demux: can a different port's AW be accepted while W is unfinished?
+
+**No.** The *only* place that muxes AW/W ownership is `axi_demux_simple`'s `w_open` / `w_select_q`.
+
+`demux` lines 164‑193 (AW acceptance condition):
+
+```systemverilog
+164:      end else begin
+...
+168:        if (!aw_id_cnt_full && (w_open != {IdCounterWidth{1'b1}}) &&
+169:            (!(ar_id_cnt_full && slv_req_i.aw.atop[axi_pkg::ATOP_R_RESP]) ||
+170:             !AtopSupport)) begin
+...
+175:          if (slv_req_i.aw_valid &&
+176:                ((w_open == '0) || (w_select == slv_aw_select_i)) &&
+177:                (!aw_select_occupied || (slv_aw_select_i == lookup_aw_select))) begin
+178:            // connect the handshake
+179:            aw_valid     = 1'b1;
+180:            // push arbitration to the W FIFO regardless, do not wait for the AW transaction
+181:            w_cnt_up     = 1'b1;
+```
+
+`demux` lines 236‑253:
+
+```systemverilog
+236:    counter #(
+...
+242:      .clear_i    ( 1'b0                  ),
+243:      .en_i       ( w_cnt_up ^ w_cnt_down ),
+...
+247:      .q_o        ( w_open                ),
+...
+251:    `FFLARN(w_select_q, slv_aw_select_i, w_cnt_up, select_t'(0), clk_i, rst_ni)
+252:    assign w_select       = (|w_open) ? w_select_q : slv_aw_select_i;
+253:    assign w_select_valid = w_cnt_up | (|w_open);
+```
+
+`demux` lines 421‑436 (routing + W-last decrement):
+
+```systemverilog
+424:        mst_reqs_o[i].aw_valid = 1'b0;
+425:        if (aw_valid && (slv_aw_select_i == i)) begin
+426:          mst_reqs_o[i].aw_valid = 1'b1;
+427:        end
+...
+432:        if (w_select_valid && (w_select == i)) begin
+433:          mst_reqs_o[i].w_valid = slv_req_i.w_valid;
+434:          slv_resp_o.w_ready           = mst_resps_i[i].w_ready;
+435:          w_cnt_down            = slv_req_i.w_valid & mst_resps_i[i].w_ready & slv_req_i.w.last;
+436:        end
+```
+
+`demux` line 411: `assign aw_ready = aw_valid & mst_resps_i[slv_aw_select_i].aw_ready;`
+
+Exact semantics:
+
+- `w_open` is a **shared** (both-master-port) count of W bursts whose AW *selection decision* happened (`w_cnt_up`) but whose W-last has not yet been accepted at the selected master port (`w_cnt_down`). Increment is on the AW decision, **not** on the AW handshake (line 181 comment: “push arbitration to the W FIFO regardless, do not wait for the AW transaction”).
+- `w_select_q` is the last AW-decision select; while `w_open != 0`, `w_select == w_select_q`.
+- Therefore while any W burst is outstanding, a new AW is accepted **only** if `slv_aw_select_i == w_select_q` (same port). A different-port AW ⇒ `aw_valid=0` ⇒ `mst aw_valid=0` and `aw_ready=0` (line 411): it is held, not forwarded.
+- W beats are routed by `w_select` (single W slave port), so W bursts of different ports are **not interleaved** by the demux.
+- Per-bank select originates as `aw_sel = tr_axi_req_i.aw.id[BankIdBit]` (`bctl` lines 246‑249) and must be stable while valid (`demux` assumes lines 487‑495).
+
+**Important scope caveat:** this gate lives at the **translation-request** interface (`bctl.i_in_axi_demux`, `bctl` lines 285‑314). The completion-side output mux (`bctl.i_out_axi_mux`) has **no** such gate.
+
+Also note the *input* DMA mux (`axi_mux`, `top` line 590‑615) does **not** have a `w_open`-style block: its AW arbiter (`mux` lines 264‑281) can select another slave port while a previous port's W is still pending, and it pushes the select into its W FIFO (`mux` lines 301‑303). The downstream demux then holds the divergent AW. The pool’s `v` observation point (`top` lines 559‑564: `aw_offer_i = i_dma_iommu_tr_mux.gen_mux.w_fifo_push`, `v_whead_* = ...w_fifo_data[0]`) is thus the *mux decision order*, upstream of the demux cross-port gate.
+
+Do **not** conclude “banks are independent ⇒ cross-port AW reorder at the input.” The demux forbids it at the translation-request interface.
+
+---
+
+## 2. Conditions where virtual (v) vs physical (p) W order may differ
+
+Definitions from `top` (late-pool binding, lines 542‑586):
+
+```systemverilog
+559:            .aw_offer_i(i_dma_iommu_tr_mux.gen_mux.w_fifo_push),
+560:            .aw_bank_i(i_dma_iommu_tr_mux.gen_mux.mst_aw_chan.id[2]), ...
+562:            .v_whead_valid_i(!i_dma_iommu_tr_mux.gen_mux.w_fifo_empty),
+563:            .v_whead_bank_i(i_dma_iommu_tr_mux.gen_mux.w_fifo_data[0]),
+564:            .v_wlast_i(tr_w_valid && tr_w_ready && tr_w_last),
+565:            .p_aw_fire_i(comp_aw_valid && comp_aw_ready), .p_aw_bank_i(comp_aw_id[2]),
+566:            .p_whead_valid_i(!i_sys.gen_banked.i_banked.i_out_axi_mux.gen_mux.w_fifo_empty),
+567:            .p_whead_bank_i(i_sys.gen_banked.i_banked.i_out_axi_mux.gen_mux.w_fifo_data[0]),
+568:            .p_wlast_i(comp_w_valid && comp_w_ready && comp_w_last),
+569:            .p_aw_offer_i(i_sys.gen_banked.i_banked.i_out_axi_mux.gen_mux.w_fifo_push),
+570:            .p_aw_offer_bank_i(i_sys.gen_banked.i_banked.i_out_axi_mux.gen_mux.mst_aw_chan.id[2]),
+```
+
+So:
+
+- **v** = **input** DMA mux `i_dma_iommu_tr_mux.gen_mux` (upstream of the whole banked IOMMU; its W FIFO pushes are `w_fifo_push`, head is `w_fifo_data[0]`).
+- **p** = **output completion** mux `i_sys.gen_banked.i_banked.i_out_axi_mux.gen_mux` (downstream of both banks).
+
+Both are `axi_mux` instances, both use an RR AW arbiter with a per-push W FIFO (`mux` lines 264‑313, 317‑333, 354‑367). The two arbitration points are **independent** and separated by two bank transaction controllers with data-dependent (IOTLB hit / page-walk) latency. Therefore:
+
+- Orderings can differ when two banks/ports have AWs offered close together and one bank’s translation (or its completion-AW admission) is faster than the other.
+- Because the input demux serializes cross-port AW behind the W owner (§1), the *input* order is constrained; the *output* order is not, so the first p AW can be the second v AW.
+- The pool only *detects internal mismatches* (`pool_late` lines 277‑282 check the FIFO head equals the recorded `v_order_q`/`p_order_q`); it does **not** compare v-order to p-order. I found no assertion/compare of v against p.
+
+---
+
+## 3. Can a bank continue translating AW while a READ waits for ARready?
+
+**No — the bank TC is strictly serial per bank.** `tc` FSM (`tc` lines 96‑103, 620‑732):
+
+```systemverilog
+625:            IDLE: begin
+...
+628:                if (aw_valid && !w_cnt_ovf) begin          // AW priority here
+...
+646:                else if (ar_valid && (!ReadAdmissionEnable || read_admit_i ||
+647:                         (fullbuffer_job_i && ar_data.stream_id == FullBufferDID))) begin
+...
+674:            REQ_TRANS: begin
+676:                if (check_valid) begin
+678:                    trans_req_valid_o = 1'b1;
+680:                    if (trans_req_ready_i) begin
+681:                        state_n     = AWAIT_RESP;
+...
+693:            AWAIT_RESP: begin
+695:                trans_resp_ready_o = 1'b1;
+698:                if (trans_resp_valid_i) begin
+699:                    trans_resp_data_n   = trans_resp_data_i;
+700:                    state_n             = (trans_resp_data_i.is_mrif && ...
+716:            COMPLETE: begin
+718:                complete_read = is_read;
+719:                complete_write = is_write;
+721:                if ((axi_comp_resp.ar_ready && is_read) ||
+722:                    (axi_comp_resp.aw_ready && is_write)) begin
+723:                    aw_ready    = is_write;
+724:                    ar_ready    = is_read;
+725:                    state_n     = IDLE;
+```
+
+- In `IDLE`, an AW (line 628) is taken before an AR (line 646). With `ReadAdmissionEnable=0` (Mode7) the AR branch reduces to `ar_valid` — old read admission is bypassed.
+- In `COMPLETE`, the FSM **cannot leave** until `axi_comp_resp.ar_ready` (read) or `axi_comp_resp.aw_ready` (write). The translation-request AR/AW FIFO pops (`ar_ready`, `aw_ready`) are asserted only inside `COMPLETE` (lines 723‑724), i.e. pop == completion handshake.
+- `in_flight_o = (state_q != IDLE)` (`tc` line 105): the whole bank is “busy” for the entire single transaction.
+
+Consequence: a bank stuck in `COMPLETE` on a READ cannot look at its own next queued AW. This is the structural precondition for the “READ blocks own next AW” loop in §5.
+
+Also relevant: W cannot reach completion until the completion AW handshake: `tc` lines 178‑180 (`incr_w_cnt = axi_comp_req.aw_valid & axi_comp_resp.aw_ready`), line 220 (`w_ready = (w_cnt_q != '0) ? axi_comp_resp.w_ready : 0`), lines 226‑240 (W FIFO), lines 359‑360 (`axi_comp_req.w_valid = w_valid & (w_cnt_q != '0)`).
+
+---
+
+## 4. iDMA: can it present AR1 before AW1 is accepted by the IOMMU?
+
+Test config `top` lines 334‑450 (both DMAs):
+
+```systemverilog
+340:        .NumAxInFlight    ( 8               ),
+341:        .MemSysDepth      ( 0               ),
+343:        .BufferDepth      ( DmaBufferDepth  ),   // default 512
+344:        .RAWCouplingAvail ( 1'b0            ),
+...
+415:        .AxID             ( 2'd0            )
+```
+
+With `RAWCouplingAvail=0`, `be` selects the bypass:
+
+```systemverilog
+837:    end else begin : gen_r_aw_bypass
+841:        fall_through_register #(
+843:            .T          ( aw_chan_t )
+...
+849:            .ready_o    ( aw_ready      ),
+851:            .valid_o    ( aw_valid_dp   ),
+```
+
+Transport layer is a pure pass-through for both channels:
+
+```systemverilog
+200:    assign axi_req_o.ar       = ar_req_i;
+201:    assign axi_req_o.ar_valid = ar_valid_i;
+202:    assign ar_ready_o         = axi_rsp_i.ar_ready;
+...
+289:    assign axi_req_o.aw       = aw_req_i;
+290:    assign axi_req_o.aw_valid = aw_valid_i;
+291:    assign aw_ready_o         = axi_rsp_i.aw_ready;
+```
+
+Backend read/write ready are independent:
+
+```systemverilog
+472:    assign r_ready = r_dp_req_in_ready & ar_ready;
+473:    assign w_ready = w_dp_req_in_ready & aw_ready & w_last_ready;
+```
+
+Implications:
+
+- At the transport layer, AR handshaking is completely decoupled from AW; `ar_valid` can be high/acked while `aw_ready` is low. So **yes**, AR1 can handshake with the IOMMU before AW1 is accepted — provided the upstream (legalizer / midend / frontend) is asserting `ar_valid_i` while AW is stalled.
+- The R‑AW coupler (`be` lines 811‑836) is the intended anti-deadlock element; it is **disabled** here. The coupler gates AW against read responses, not AR against AW, so with it enabled AW release is delayed — again consistent with AR being able to precede AW acceptance.
+- **MISSING/Unresolved:** the hardware legalizer (`idma_legalizer`) determines whether `r_valid` and `w_valid` are independent or fork-synchronized. The no-legalizer branch uses `stream_fork` (`be` lines 359‑368), whose `ready_o` is an AND of `{r_ready,w_ready}`: with `HardwareLegalizer=0` AR and AW are effectively coupled. `HardwareLegalizer` is not set in `top` (default from `idma_backend` is `1'b1`, `be` line 40), but I cannot confirm the legalizer’s exact valid generation without that file. Flag for Codex.
+
+---
+
+## 5. Mode7 admit gate and the “READ blocks its own next AW” loop
+
+### 5.1 Where the gate is
+
+`top` line 693: `.CompletionGateEnable(SharedPoolMode >= 4)` ⇒ Mode7 sets it.
+`bctl` line 323: `.ReadAdmissionEnable(!CompletionGateEnable)` ⇒ Mode7 ⇒ `ReadAdmissionEnable=0`.
+Conclusion matches your framing: the **old translation-stage ReadAdmission is off**; the gate has moved to the completion AR.
+
+`bctl` lines 420‑431 (completion AR gate):
+
+```systemverilog
+425:        if (CompletionGateEnable) begin
+426:            for (int b = 0; b < 2; b++) begin
+427:                admitted_comp_req[b].ar_valid = bank_comp_req[b].ar_valid && completion_ar_admit_i[b];
+428:                bank_comp_resp[b].ar_ready = admitted_comp_resp[b].ar_ready && completion_ar_admit_i[b];
+429:            end
+```
+
+`pool_late` line 129: `completion_ar_admit_o = armed_q;` — admit is the registered `armed_q`, set only on `grant` (`pool_late` lines 342‑343):
+
+```systemverilog
+342:                if (grant[b]) begin
+343:                    armed_q[b] <= 1'b1;
+```
+
+`grant` selection, `pool_late` lines 152‑177:
+
+```systemverilog
+155:            if (!armed_q[b] && completion_ar_valid_i[b] && req_seq_q[b] > launch_seq_q[b]) begin
+156:                if (Mode != 5 && (can_stream[b] || can_future[b])) begin
+157:                    grant[b] = 1'b1;
+158:                    grant_stream[b] = 1'b1;
+...
+167:                end else if (Mode != 7 && v_whead_valid_i && v_whead_bank_i != 1'(b)) begin
+```
+
+So in Mode7 the `line 167` fallback is **disabled**; a grant requires `can_stream[b] || can_future[b]`.
+
+### 5.2 Both admit paths ultimately require the W head = the read’s own bank
+
+`pool_late` lines 78‑90 (`can_drain`) and 136‑138 (`can_stream`):
+
+```systemverilog
+78:  function automatic logic can_drain(input integer b, input ar_t ar);
+79:      integer n;
+80:      n = integer'(vw_done_q[b]);
+81:      can_drain = 1'b0;
+82:      if (job_active_q[b] && n < Depth && aw_count_q[b] > vw_done_q[b])
+83:          can_drain = v_whead_valid_i && v_whead_bank_i == 1'(b) &&
+84:              p_whead_valid_i && p_whead_bank_i == 1'(b) &&
+85:              paw_count_q[b] > vw_done_q[b] && pw_done_q[b] == vw_done_q[b] &&
+86:              ar.addr >= src_q[b] && aw_addr_q[b][n] >= dst_q[b] &&
+87:              (ar.addr - src_q[b]) == (aw_addr_q[b][n] - dst_q[b]) && ...
+...
+136:            can_stream[b] = launch_seq_q[b] == tx_seq_q[b] &&
+137:                can_drain(b, metadata[b][li[b]]);
+```
+
+and `pool_late` lines 92‑108 (`future_drain`), which itself calls `can_drain(b, metadata[b][old])`:
+
+```systemverilog
+97:      if ((Mode == 6 || Mode == 7) && n > 0 && n < Depth && launch_seq_q[b] == tx_seq_q[b] + 1 &&
+98:          launch_seq_q[b] == vw_done_q[b] + 1 && pw_done_q[b] == vw_done_q[b] &&
+99:          v_count_q >= 2 && p_count_q >= 2 &&
+100:          v_order_q[3'(v_rd_q + 1)] == 1'(b) && p_order_q[3'(p_rd_q + 1)] == 1'(b) &&
+101:          aw_count_q[b] > launch_seq_q[b] && paw_count_q[b] > launch_seq_q[b] &&
+102:          can_drain(b, metadata[b][old]) && metadata[b][old].id == ar.id && ...
+```
+
+**Key: `can_drain` (and therefore `can_stream`, and `future_drain` too) requires `v_whead_bank_i == b` AND `p_whead_bank_i == b`.** That means a bank’s completion READ is admitted only when the current W head at *both* muxes is that same bank.
+
+### 5.3 The self-wait loop (hypothesis to be tested by Codex)
+
+Combining §3 and §5.2:
+
+- Bank `b` is in `COMPLETE` for a READ, waiting for `axi_comp_resp.ar_ready`, which is gated by `completion_ar_admit_i[b] = armed_q[b]` (`bctl` 428, `pool_late` 129).
+- `armed_q[b]` requires `can_stream[b] || can_future[b]` (Mode7), which requires `v_whead_bank_i == b && p_whead_bank_i == b`.
+- `p_whead_bank_i` moves only when the output mux W-FIFO head changes, which depends on which completion AW was pushed/accepted at the output mux.
+- If bank `b`’s next unit of work is the W whose AW would make `p_whead_bank_i = b` (e.g. the READ was translated before its AW, or the W’s completion AW cannot be issued because the FSM is stuck), then `armed_q[b]` cannot be set, the read cannot complete, the FSM cannot return to `IDLE`, and the AW cannot be translated.
+
+This is exactly the loop you asked about (“未来READ阻塞自己下一AW”). The code does **not** appear to contain a bypass for this; the `Mode != 7` fallback at `pool_late` line 167 is precisely the path that is disabled in Mode7. **Codex should confirm** whether, in practice, the read’s own AW is always already translated/queued-ahead of the read such that `p_whead_bank_i` can become `b` without needing the stuck FSM. That requires tracing the midend/frontend issue order (`idma_midend`, `dma_core_wrap`, `dma_datapath`) — **MISSING files**.
+
+Note also `pool_late` lines 352‑361 / 357 fault checks compare completion AR against stored `physical_ar_*`, so admit/arming must align with the bank’s presented completion AR; this is an additional coupling between pool state and the bank’s COMPLETE stage.
+
+---
+
+## 6. Can the code exclude cross-bank physical AW reversal?
+
+**No.** Evidence:
+
+- The two banks are independent FSMs (`tc` per bank, instantiated in `bctl` `gen_bank` lines 319‑363).
+- The output mux is an RR arbiter over the two banks’ completion AW (`mux` lines 264‑281 via `bctl.i_out_axi_mux`).
+- The pool only records order and checks head-vs-recorded-order internally:
+  - record on push: `pool_late` lines 267‑273 (`v_order_q[...] <= aw_bank_i`, `p_order_q[...] <= p_aw_offer_bank_i`).
+  - check: `pool_late` lines 277‑282 compare each FIFO head against `v_order_q[v_rd_q]`/`p_order_q[p_rd_q]` — this detects an *internal* inconsistency, not a v-vs-p divergence.
+- I found no assertion or compare between `v_order_q` and `p_order_q`, and no admission rule forcing p-order to match v-order.
+- Because the input demux serializes cross-port AW only behind the *W completion of the W owner*, the second bank’s translation can start (AW accepted) before the first bank’s completion AW is issued, so the output mux can legitimately pick the second bank first.
+
+So: **the RTL does not prevent cross-bank physical AW reversal; it tracks both orders and faults only on internal mismatch.**
+
+---
+
+## 7. Minimal legal sequences and forbidden false counterexamples
+
+### 7.1 Minimal legal cross-port AW at the input demux
+
+Assume `aw_sel = id[BankIdBit]`, both AWs valid at the slave:
+
+1. `AW0` select=0 handshake: `aw_valid=1`, `w_cnt_up=1` ⇒ `w_open=1`, `w_select_q=0` (`demux` 179‑181, 251).
+2. `AW1` select=1 offered: `w_open!=0 && w_select(=0)!=1` ⇒ `aw_valid=0`, `aw_ready=0` ⇒ `AW1` held (`demux` 175‑191, 411).
+3. `W0` beats routed to port 0 (`w_select=0`), on `W0.last` ⇒ `w_cnt_down=1`, `w_open=0` (`demux` 432‑436).
+4. `AW1` selectable again: `w_open==0` ⇒ handshake.
+
+Illegal / non-existent variants:
+
+- “AW1 accepted while `w_open!=0` by keeping `w_select==1`”: only if `w_select_q==1`, i.e. the *same* bank was already the W owner; that is not a cross-port accept.
+
+### 7.2 iDMA AR1 before AW1 (transport-layer argument)
+
+`tl` 200‑202 + `be` 472‑473 + `be` 837‑858 justify AR/ AW handshake independence; the actual legality of “AR1 asserted while AW1 stalled” depends on the legalizer (see §4). No claim is made without it.
+
+### 7.3 Forbidden false counterexamples
+
+1. **False:** “Bank0 and bank1 have separate AW/W FIFOs (`bctl` lines 32‑34 header, `tc` 121‑164, 222‑240), therefore AW1 (bank1) can be accepted at the input demux while W0 (bank0) is unfinished.” — The input `axi_demux_simple` `w_open`/`w_select_q` gate forbids it (`demux` 168‑181, 236‑253).
+2. **False:** “The demux allows W beats of the pending and the new port to interleave.” — W is routed by a single `w_select` (`demux` 432‑436); bursts do not interleave.
+3. **False:** “Because the output mux uses an RR arbiter, physical AW order equals input AW order.” — No such constraint exists; v and p are independent (mux 264‑281; `top` 559‑570).
+4. **False:** “A bank can translate its next AW while its current READ is in COMPLETE.” — `tc` COMPLETE (716‑727) blocks the FSM; AR/AW pops only in COMPLETE (723‑724).
+5. **False:** “Mode7 only changes the pool; the TC read-admission path is still active.” — `bctl` 323 + `top` 693 make `ReadAdmissionEnable=0`; the TC AR branch reduces to `ar_valid` (`tc` 646‑647). The new gate is at the completion AR (`bctl` 425‑429, `pool_late` 129).
+6. **False:** “`can_drain` is satisfiable without the current bank owning the W head.” — `pool_late` 82‑85 requires both `v_whead_bank_i==b` and `p_whead_bank_i==b`.
+7. **False (over-statement of the opposite kind):** “Cross-bank physical AW reversal is prohibited by the input demux.” — the demux constrains the *input/translation* interface only; p is downstream of the banks.
+
+---
+
+## 8. Interface / counter semantics table (adjusted to source lines)
+
+| Signal | File:line | Meaning / update |
+|---|---|---|
+| `aw_sel`, `ar_sel` | `bctl` 248‑249 | `tr_axi_req_i.aw.id[BankIdBit]`, `ar.id[BankIdBit]` |
+| demux `w_open` | `demux` 236‑247, 181, 435 | #W bursts selected (`w_cnt_up`) minus W-last accepted at selected master (`w_cnt_down`). Shared over both master ports. |
+| demux `w_select_q` / `w_select` | `demux` 251‑252 | select latched at AW decision; used to route W and to allow same-port AW while `w_open!=0` |
+| demux AW accept | `demux` 168‑191, 411 | requires `!aw_id_cnt_full`, `w_open!=max`, `w_select==select` (once `w_open!=0`), ID-counter occupancy compatible |
+| demux AR accept | `demux` 311‑340 | independent; no W gate (ATOP R-response injection aside) |
+| TC `state_q` | `tc` 96‑105 | IDLE/REQ_TRANS/AWAIT_RESP/MRIF/COMPLETE; `in_flight_o = state != IDLE` |
+| TC AW pop / AR pop | `tc` 723‑724 | asserted only inside COMPLETE on completion AW/AR handshake |
+| TC `w_cnt_q` | `tc` 174‑180, 220, 242‑255 | ++ on completion AW handshake; −− on completion W-last; gates `w_ready` |
+| `w_unfilled_q` | `bctl` 261‑283 | signed; +1 `aw_accept`, −1 `w_last_accept`; min −1 visible-but-unhandshaken AW |
+| `restrict_reads` | `bctl` 264 | `(w_unfilled_q > 0) \|\| tr_axi_req_i.aw_valid` |
+| `read_owner` | `bctl` 265 | `(w_unfilled_q>0) ? w_owner_q : aw_sel` |
+| `bank_read_admit[b]` | `bctl` 270‑273, 347 | gates TC `read_admit_i` — **inactive in Mode7** (`bctl` 323) |
+| `completion_ar_admit_i[b]` | `bctl` 102, 427‑428 | gates completion AR valid+ready when `CompletionGateEnable` |
+| `armed_q` | `pool_late` 129, 342‑343 | admit output; armed on grant |
+| `can_drain` | `pool_late` 78‑90 | requires both v & p W heads = bank, AW counts, addr-match |
+| `can_stream` | `pool_late` 136‑137 | `launch_seq == tx_seq && can_drain(head)` |
+| `can_future` / `future_drain` | `pool_late` 92‑108, 138 | Mode6/7 future-segment path; internally re-uses `can_drain` |
+| `v_order_q` / `p_order_q` | `pool_late` 61‑65, 267‑273, 277‑282 | record input/output mux AW bank order; only self-consistency checks |
+| `v_count_q` / `p_count_q` | `pool_late` 264‑266 | offers − wlast (v); offers − wlast (p) |
+| `aw_count_q` / `vw_done_q` | `pool_late` 311‑323 | v AW offers per bank / v W-last per bank |
+| `paw_count_q` / `pw_done_q` | `pool_late` 322‑323 | p AW fires per bank / p W-last per bank |
+| `inflight_aw/ar/w_q`, `w_partial_q` | `bctl` 564‑604 | translation-request-side in-flight counters; `bank_busy[b] = (state_q != IDLE)` |
+
+---
+
+## 9. Missing files / unresolved dependencies (do not treat as verified)
+
+- `tests/nonblock_banked_top.sv` (produces `late_comp_ar_valid/fire/id/addr/len/size_o` and consumes `late_comp_ar_admit_i`; `top` 816‑819, 983‑988).
+- `cva6/corev_apu/riscv-iommu/vendor/axi/src/axi_id_prepend.sv` (ID-prefix layout; `mux` 211‑259).
+- `idma_legalizer` (`be` 328‑354) — needed to decide AR-before-AW presentation.
+- `idma_channel_coupler` (`be` 820‑836) — though disabled here (`RAWCouplingAvail=0`).
+- `nonblock_completion_pool` (non-late) — for Mode<4 contrast (`top` 506‑539).
+- iDMA midend / frontend (`dma_core_wrap`, `idma_nd_midend`, `dma_datapath`) — needed to know the *issue order* of AW vs AR for a copy, which determines whether §5.3 is reachable.
+- `rv_iommu_tl_wrap` (`top` 180, 983‑986) — bank tag handling / fast-vs-slow response.
+
+Items I state as *fact* come only from the supplied files; all “can happen” statements in §2/§6 are deduced from arbitration/latency independence and require Codex’s simulation to confirm reachability.
+
+---
+
+## 10. Suggested acceptance checks for Codex (experiments, not performed)
+
+1. **Input demux cross-port gate:** drive AW0(bank0)+W0 and AW1(bank1) concurrently; assert `mst_reqs_o[1].aw_valid==0` until `w_open==0`; assert `ar_ready`/`aw_ready` behavior per `demux` 411.
+2. **v/p order divergence:** force a slow page walk on bank0 and fast IOTLB hit on bank1 after both AWs offered; record `v_order_q` vs `p_order_q`; expect possible `p=(bank1,bank0)` with `v=(bank0,bank1)`.
+3. **READ-in-COMPLETE vs next AW:** single bank, issue AR (read) first, then the corresponding AW; observe whether `armed_q` / `completion_ar_admit_o` ever asserts with no AW translated. This is the §5.3 loop probe.
+4. **`can_drain` heads:** instrument `v_whead_bank_i`, `p_whead_bank_i`, `can_stream`, `can_future`, `grant`, `armed_q` per cycle to confirm a read can only be admitted when its own bank owns both W heads.
+5. **iDMA AR before AW:** with `RAWCouplingAvail=0`, stall `aw_ready` at the IOMMU and observe whether `ar_valid` still handshakes (`tl` 200‑202). Confirm with `HardwareLegalizer` = default and = 0 (`be` 326‑369) since the two produce different r/w valid coupling.
+6. **Cross-bank physical AW reversal check:** confirm no assertion compares `v_order_q` to `p_order_q` (grep); then construct a case where bank1’s completion AW is accepted before bank0’s and check pool fault bits 12/13 don’t fire spuriously.
+
+No code was executed; no test result is claimed. These are exact-source proposals for Codex to run and verify, and the architecture judgment (whether §5.3 is an actual deadlock vs a bounded wait, and how to fix it) is left to Codex.

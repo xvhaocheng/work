@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+'''
+Unit tests for validate_helper_diagnostic() in scripts/mac_nonblock_pilot.py.
+
+Pure validator tests plus two tiny optional-flag compatibility tests.  Nothing
+here touches hardware, serial ports, /dev/mem, subprocesses or the filesystem:
+PilotRunner is only constructed (its __init__ performs no I/O) to call
+_reader_command().
+
+Run with:
+    python3 -m unittest discover -s tests -p 'test_nonblock_diag_validator.py'
+    python3 tests/test_nonblock_diag_validator.py
+
+The runner is loaded by file path so scripts/ is never added to sys.path (the
+runner itself avoids that for the same reason).  If the runner patch has not
+been applied, the import-time lookup or the flag tests fail loudly instead of
+silently skipping.
+'''
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import pathlib
+import sys
+import unittest
+from typing import Any, Dict, List, Optional
+
+HERE = pathlib.Path(__file__).resolve().parent
+
+CANDIDATE_RUNNERS = (
+    HERE.parent / 'scripts' / 'mac_nonblock_pilot.py',
+    HERE.parent / 'mac_nonblock_pilot.py',
+    HERE / 'mac_nonblock_pilot.py',
+)
+
+
+def load_runner(path_hint: Optional[str] = None):
+    candidates = ([pathlib.Path(path_hint)] if path_hint else [])
+    candidates += list(CANDIDATE_RUNNERS)
+    for path in candidates:
+        if not path.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location(
+            'nonblock_runner_under_test', path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module, path
+    raise RuntimeError(
+        'mac_nonblock_pilot.py not found; tried: '
+        + ', '.join(str(p) for p in candidates))
+
+
+RUNNER, RUNNER_PATH = load_runner()
+
+FAST_WORDS_MODE1 = (0, 0, 0, 0, 0)
+FAST_WORDS_MODE2 = (0, 1, 1, 0, 0)
+
+
+def make_window(mode: int = 2) -> List[int]:
+    '''A frozen, self-consistent 16-word core window (idma-nonblock-window-v1).'''
+    fast = FAST_WORDS_MODE2 if mode == 2 else FAST_WORDS_MODE1
+    window = [0] * 16
+    window[0] = RUNNER.READER_MAGIC
+    window[1] = RUNNER.READER_VERSION
+    window[2] = mode
+    window[3] = RUNNER.READER_FLAGS_FROZEN
+    window[4] = 7                       # windowseq
+    window[5] = 6                       # cycles
+    for offset, value in enumerate(fast):
+        window[6 + offset] = value
+    window[11], window[12], window[13] = 3, 1, 0
+    window[14] = sum(fast) + 4
+    window[15] = RUNNER.READER_ERRORS_OK
+    return window
+
+
+def make_diag(mode: int = 2) -> List[int]:
+    '''A structurally valid second bank, restricted to what the validator sees.'''
+    fast = FAST_WORDS_MODE2 if mode == 2 else FAST_WORDS_MODE1
+    diag = [0] * 16
+    diag[0] = RUNNER.READER_DIAG_MAGIC
+    diag[1] = RUNNER.READER_DIAG_VERSION
+    diag[2] = mode
+    diag[3] = RUNNER.READER_DIAG_FLAGS_FROZEN
+    diag[4] = 7                         # seq, must equal window[4]
+    diag[5] = 6                         # cycles, must equal window[5]
+    diag[6] = 0xF7FF if mode == 1 else 0xFFFF   # seen mask (bit 11: Mode 2 only)
+    for index in range(7, 15):
+        diag[index] = 1
+    diag[RUNNER.READER_DIAG_FAST_ACCEPT_WORD] = sum(fast)
+    return diag
+
+
+def document(mode: int = 2) -> Dict[str, Any]:
+    return {'words': make_diag(mode)}
+
+
+class ValidateHelperDiagnosticTests(unittest.TestCase):
+
+    def check(self, window: Any, diagnostic: Any,
+              label: str = 'banked-hit') -> List[str]:
+        return RUNNER.validate_helper_diagnostic(window, diagnostic, label)
+
+    # ---- accepted shapes -------------------------------------------------
+
+    def test_mode2_valid(self):
+        self.assertEqual(self.check(make_window(2), document(2)), [])
+
+    def test_mode1_valid(self):
+        self.assertEqual(
+            self.check(make_window(1), document(1), 'banked-serial'), [])
+
+    def test_uint64_max_is_in_range(self):
+        diag = document(2)
+        diag['words'][0] = RUNNER.READER_DIAG_UINT64_MAX   # in range, wrong magic
+        problems = self.check(make_window(2), diag)
+        self.assertTrue(problems)
+        self.assertIn('diagnostic[0] magic', problems[0])
+        for problem in problems:
+            self.assertNotIn('outside uint64', problem)
+
+    # ---- shape rejections ------------------------------------------------
+
+    def test_missing_window(self):
+        expected = ['diagnostic check needs the core 16-word window']
+        self.assertEqual(self.check(None, document(2)), expected)
+        self.assertEqual(self.check([0] * 15, document(2)), expected)
+        self.assertEqual(self.check('x', document(2)), expected)
+
+    def test_diagnostic_not_an_object(self):
+        expected = ['helper diagnostic is not an object']
+        for bad in (None, [], 'x', 3, True):
+            self.assertEqual(self.check(make_window(2), bad), expected)
+
+    def test_words_not_sixteen(self):
+        expected = ['helper diagnostic.words is not 16 words']
+        for bad in ([0] * 15, [0] * 17, [], None, 'x', 16):
+            self.assertEqual(
+                self.check(make_window(2), {'words': bad}), expected)
+
+    def test_bool_word_rejected(self):
+        for index in (0, 3, 15):
+            diag = document(2)
+            diag['words'][index] = True
+            self.assertEqual(
+                self.check(make_window(2), diag),
+                ['helper diagnostic.words contains non-integer words'])
+
+    def test_non_integer_word_rejected(self):
+        for value in (1.0, 1.5, -0.5, '1', None, [1], {'a': 1}):
+            diag = document(2)
+            diag['words'][3] = value
+            self.assertEqual(
+                self.check(make_window(2), diag),
+                ['helper diagnostic.words contains non-integer words'],
+                repr(value))
+
+    def test_negative_word_rejected(self):
+        diag = document(2)
+        diag['words'][5] = -1
+        problems = self.check(make_window(2), diag)
+        self.assertEqual(len(problems), 1)
+        self.assertIn('outside uint64', problems[0])
+        self.assertIn('-1', problems[0])
+
+    def test_above_uint64_rejected(self):
+        diag = document(2)
+        diag['words'][6] = 1 << 64
+        problems = self.check(make_window(2), diag)
+        self.assertEqual(len(problems), 1)
+        self.assertIn('outside uint64', problems[0])
+
+    def test_core_fast_word_not_integer(self):
+        window = make_window(2)
+        window[7] = '1'
+        self.assertEqual(
+            self.check(window, document(2)),
+            ['diagnostic check needs integer core fast words'])
+
+    # ---- field mismatches ------------------------------------------------
+
+    def test_field_mismatches(self):
+        cases = (
+            (0, 0, 'diagnostic[0] magic'),
+            (1, 2, 'diagnostic[1] version'),
+            (3, 0, 'diagnostic[3] flags'),
+            (4, 99, 'diagnostic[4] seq'),
+            (5, 99, 'diagnostic[5] cycles'),
+            (15, 99, 'diagnostic[15] fast_accepts'),
+        )
+        for index, value, needle in cases:
+            diag = document(2)
+            diag['words'][index] = value
+            problems = self.check(make_window(2), diag)
+            self.assertTrue(problems, (index, value))
+            self.assertIn(needle, problems[0], (index, value))
+
+    def test_mode_mismatch_for_label(self):
+        problems = self.check(make_window(2), document(2), 'banked-serial')
+        self.assertTrue(problems)
+        self.assertIn('diagnostic[2] mode', problems[0])
+
+    def test_fast_accept_must_equal_core_fast_sum(self):
+        problems = self.check(make_window(2), document(1))
+        self.assertTrue(
+            any('diagnostic[15] fast_accepts' in p for p in problems),
+            problems)
+
+    def test_core_fast_sum_overflow_is_reported(self):
+        window = make_window(2)
+        window[6] = RUNNER.READER_DIAG_UINT64_MAX
+        window[7] = 1
+        problems = self.check(window, document(2))
+        self.assertTrue(
+            any('core fast sum overflows 64 bits' in p for p in problems),
+            problems)
+
+    # ---- the validator must not touch its inputs -------------------------
+
+    def test_inputs_are_not_mutated(self):
+        window = make_window(2)
+        diag = document(2)
+        window_before = list(window)
+        diag_before = {'words': list(diag['words'])}
+        self.check(window, diag)
+        self.assertEqual(window, window_before)
+        self.assertEqual(diag, diag_before)
+
+
+class DiagnosticsFlagCompatibilityTests(unittest.TestCase):
+    '''The optional flag must default to "not enabled" and must be read with
+    getattr so an args object without the attribute keeps working.'''
+
+    def parse(self, extra: Optional[List[str]] = None):
+        argv = ['--label', 'banked-hit', '--bit', 'b.bit', '--out', 'o',
+                '--reader', 'r.elf'] + list(extra or [])
+        return RUNNER.build_arg_parser().parse_args(argv)
+
+    def test_flag_defaults_to_false(self):
+        args = self.parse()
+        self.assertIn('diagnostics', vars(args))
+        self.assertFalse(getattr(args, 'diagnostics', False))
+
+    def test_flag_sets_true(self):
+        args = self.parse(['--diagnostics'])
+        self.assertTrue(getattr(args, 'diagnostics', False))
+
+    def test_unknown_flag_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.parse(['--diagnostics-typo'])
+
+    def test_reader_command_ignores_a_missing_attribute(self):
+        args = self.parse(['--diagnostics'])
+        del args.diagnostics            # older / partial Namespace
+        pilot = RUNNER.PilotRunner(args, console=None,
+                                   out_dir=pathlib.Path('.'))
+        self.assertNotIn('--diagnostics', pilot._reader_command())
+
+    def test_reader_command_appends_the_flag_when_true(self):
+        args = self.parse(['--diagnostics'])
+        pilot = RUNNER.PilotRunner(args, console=None,
+                                   out_dir=pathlib.Path('.'))
+        self.assertTrue(
+            pilot._reader_command().endswith(' --diagnostics'))
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

@@ -1,0 +1,91 @@
+范围：仅整理给定文档/脚本中的既有证据与接口；未运行命令、未改文件、未重算原始板测。数字均标条件与分母；证据等级：A=有原始记录路径可定位，B=既有汇总/既有复算，C=描述性 n=3/单 boot，D=仅计划/接口，不代表实测。
+
+## 1. 当前 4 KiB/gap 时序、warmup、窗口、发布与 done 的精确定义
+
+- 固定搬运单位：`CHUNK_BYTES = 4096`；平台 50 MHz，周期 20 ns。`composition_plan.py:55-57`
+- gap 参数：V gap 只允许 0/1000/4000 周期；A gap 固定 0；A pages 允许 Solo/A1/A8/A16。`composition-v1-spec-20261004.md:44`，`composition_plan.py:34-35`
+- 计划模式：short=4 mode × Solo/A1/A8/A16，transfers 16、warmup 16、Vgap 0；noise=6 对×2 slot，仅 S，A8，long 4096、warmup 256、Vgap 0；explore=3 block × 3 Vgap × 4 workload × 4 mode，transfers 4096、warmup 256。总 172。`composition-v1-spec-20261004.md:48`，`composition_plan.py:37-45,143-165`
+- 窗口定义：硬件窗口只在 active 时计数；open 边沿不计，close 边沿计；计数区间是 `(open, close]`；ARM 清旧窗口但不改 cache；OPEN 采前状态，CLOSE 采 next。`composition-v1-spec-20261004.md:40`
+- V 窗口完成：校验器要求 `window[13] == transfers` 且 `window[14] == transfers`，同时 `observation[7] == transfers` 且 `observation[8] == transfers`。这里 issued/done 是 V 在窗口内的发起/完成计数，分母是 `transfers`。`composition_plan.py:424-429`
+- A 同窗进度：`window[3]` 是 A 在 `(open, close]` 内完成的 jobs，不是整轮完成量。`composition_plan.py:471-474`
+- V gap：`raw[24]` 是实际占用 gap 周期；注释明确“减去 nominal gap 不是服务延迟”。`composition_plan.py:409-416,473-475`，`composition-v1-spec-20261004.md:48`
+- gap 的语义：当前 gap 是“完成后等待后续提交”的闭环节奏；512 拍缓冲不能直接叫 descriptor 队列深度。`first-paper-options-20261006.md:84`
+- warmup/config：在全局 experiment mutex 内，先 preflight，再原子写 config 并检查 magic/v/live config/generation/status；config 在 `stream_prepare` 和 `warmup` 前；会话复用现有 `prepare/cacheworkaround/warmup/drain/verify/P4M` 计时；结束后先捕获 raw 窗口，排空/禁用 batch 后再 quiet 恢复 S。`composition-v1-spec-20261004.md:45`
+- 任务发布：给定文档只说明驱动 `idma_submit` 逐 chunk 推进偏移，`idma_run_window` 轮询并补交 V/A；当前没有批处理次序或预算控制。`paper-scenarios-mitigation.md:181`
+- 能否表达 DMA→compute→nextDMA：
+  - 能表达的只是串行形态：4 KiB V copy 完成 → 等待 0/1000/4000 周期 → 下一次 4 KiB V copy，同时 A 以 A8/A16 等后台运行。`composition-v1-spec-20261004.md:44,48`
+  - 若 compute 是严格串行、且 compute 时间可被 gap 近似，gap 可作固定等待替代；但给定数据没有 compute 事件。
+  - 不能表达有限双缓冲：没有 buffer 深度、buffer ready/free、consume/release、生产者-消费者依赖、task publish 时间戳、compute 完成事件。计划/validator 只暴露 mode、a_pages、v_gap、transfers、warmup、timeout；`case_argv` 也只有这些。`composition_plan.py:135-137,190-197`
+  - 不能表达“DMA 填下一 buffer 与 compute 消费上一 buffer 重叠”，也不能表达“compute 完成才触发下一次 submit”。窗口 v done 只是 V copy 完成，不是 compute done，也不是 buffer free。`composition_plan.py:424-429,471-474`
+  - 平台范围也没有任意 descriptor scheduler、可配置 in-flight 上限、完整 event trace 或真实多设备应用。`first-paper-options-20261006.md:82`
+  - 后台“大工作集”在现有接口中只到 A pages 1/8/16，A gap 固定 0；不能表达任意大工作集。`composition-v1-spec-20261004.md:44`
+
+结论：当前接口可表达“固定 4 KiB 串行拷贝 + 完成后固定 gap + 后台 A”的闭环节奏，不能表达真正的 compute/DMA 重叠和有限双缓冲工作流。
+
+## 2. 现有同 BIT / 相关 S/N/P/PN 的 V 完成与 A 同窗进度
+
+重要边界：给定文件里没有给出所有 A-pages/gap 的 S/N/P/PN 绝对汇总。172 条计划存在，但文档只给部分 P/PN、PN/N 汇总；完整 S/N 绝对数需要 root 读原始 JSON。`first-paper-options-20261006.md:68`，`composition_plan.py:143-165`
+
+| 条件 | V 完成 / W | A 同窗进度 | 原记录与汇总 | 证据等级 |
+|---|---:|---:|---|---|
+| 当前 isolated BIT，A8，gap0，P/PN，long 4096 级 | P W 7,032,355–7,039,655 cycles；PN W 7,931,144–7,931,945 cycles；PN/P +12.6744%–+12.7922% | A 窗口完成均 4096；A normal lookup 16385–16386；V normal/fast：P 16384/0，PN 12288/4096；V miss 均 0 | `composition-history-isolation-20261007.md:29-32`；原记录例 `.../cases/explore-b1-g0-a8-mp/record.json`、`.../explore-b1-g0-a8-mpn/record.json`，见 `composition-history-isolation-20261007.md:36` | B/C；n=3，描述性；A 完成数相同不等于页、顺序、PTW 代价相同 |
+| 当前同一 BIT 与同一 boot，A8，V gap0/1000/4000，P/PN，V copies 64，warmup256，Agap0 | gap0：P 109,839.3，PN 123,956.7，+12.85%；gap1000：P 171,739.7，PN 178,143.7，+3.73%；gap4000：P 327,404.7，PN 327,658.3，+0.08% | P A speed：29,133.55 / 36,974.57 / 48,207.52；PN：25,815.51 / 35,551.88 / 48,220.97；变化 -11.39% / -3.85% / +0.03%；A 窗口完成 64 / 126–127 / 315–316；A miss 32 / 67 / 162；PN fast 64 / 110–111 / 5–8 | `composition-history-isolation-20261007.md:111-129,135`；原目录 `out/pn-board-path-20261007/mac-records/pn-gap64-20261007-formal01/`，归约 `reduction.json` | C；n=3，同一 BIT/boot，18/18 通过；W 含故意 gap，不能 W−gap 当服务延迟 |
+| 更早单一 boot 三 block，PN 相对 N，A8 g0、A16 g0、A8 g4000 | V 窗口：+16.1%–16.3%；−1.2%；−2.9%–3.2% | A 同窗有效完成率：−13.8%–14.0%；+1.2%–1.3%；−31% | `performance-council-decision-20261005.md:21-27`，源 `out/performance-council-20261005/metrics.csv` | C；单 boot 三 block，不能当三次独立启动；BIT 是否与 2026-10-07 isolated 完全相同需 root 从 metrics.csv/plan 核实 |
+| 当前 isolated BIT，A8 gap0，P/PN 硬件窗口分解，3 条板测记录平均 | V W：P 7,035,178，PN 7,931,659.67，差 +896,481.67；V hardware exec：P 7,031,083，PN 7,927,564.67；V task refill：4095/4095；V software polling：0/0 | V/A 同时 pending：P 7,018,795，PN 7,915,276.67；IOMMU 入口 AW valid 不 ready：P 6,796,732，PN 7,660,220 | `composition-history-isolation-20261007.md:68-79`，`window-decomposition.json` | B；既有三组记录复算，计数互相重叠，不能相加，不能当根因 |
+| A16/g0 补充 | S 与 N 的 A miss 总数同为 7167，N 的 V 窗口约长 3% | 总 miss 数不足以决定时间 | `performance-council-decision-20261005.md:29` | C；单 boot 三 block |
+
+缺失：给定文件没有 S/N/P/PN 全 A-pages/gap 绝对表；没有 S 在 explore 全 gap 的 W/A 同窗汇总。若 root 要下全条件结论，必须读 172 原始 JSON，而不是从上述局部汇总外推。`first-paper-options-20261006.md:68`，`composition_plan.py:143-165`
+
+## 3. 是否存在一个“简单固定策略在所有已有条件最优”
+
+现有证据不支持“存在一个简单固定 S/N/P/PN 策略在所有已有条件均最优”；至少存在真实排序交叉和取舍反转：
+
+- A8 gap0：P 在 V 与 A 上都优于 PN：P W 109,839.3 vs PN 123,956.7；P A speed 29,133.55 vs PN 25,815.51。`composition-history-isolation-20261007.md:121,125`
+- A8 gap0，PN 相对 N：PN 的 V 窗口 +16.1%–16.3%，A 同窗有效完成率 −13.8%–14.0%，PN 更差。`performance-council-decision-20261005.md:25`
+- A16 gap0，PN 相对 N：V 缩短约 1.2%，A 提高约 1.2%–1.3%，PN 不再一致更差。`performance-council-decision-20261005.md:26`
+- A8 gap4000，PN 相对 N：V 缩短约 2.9%–3.2%，但 A 下降约 31%，是明显取舍。`performance-council-decision-20261005.md:27`
+- A8 gap4000，P vs PN：V +0.08%，A +0.03%，在 n=3 描述性下基本持平，方向不一致。`composition-history-isolation-20261007.md:123,125`
+
+因此：排序交叉存在；但“所有条件最优”没有任何现有汇总证明。证据不足，原因包括：多为 n=3 描述性、单 boot/三 block、缺少完整 S/N 绝对表、缺跨 boot、缺真实 compute/双缓冲工作流。不能从这些数据宣称某个固定策略全局最优，也不能宣称“已证明不存在”。
+
+## 4. 固定 gap 与 p1–p6 历史覆盖了此暂选工作流的哪些部分
+
+- 固定 gap 已覆盖：
+  - “4 KiB V copy 完成后等待固定 gap，再发下一项”的串行节奏；Vgap 0/1000/4000；A8/A16 后台；A gap0。`composition-v1-spec-20261004.md:44,48`，`first-paper-options-20261006.md:84`
+  - 同 BIT/boot 的 A8、V64、gap0/1000/4000 P/PN 小段板测，含 A 同窗速度、A miss、A 完成数。`composition-history-isolation-20261007.md:111-129`
+- 固定 gap 未覆盖：
+  - compute 消费、有限双缓冲、buffer release、consumer 触发下一次 submit、DMA 与 compute 重叠。
+  - 任意大工作集；A 只到 1/8/16 pages，A gap 固定 0。`composition-v1-spec-20261004.md:44`
+  - 任意 in-flight/descriptor 队列深度；512 拍缓冲不是 descriptor 队列深度。`first-paper-options-20261006.md:84`
+- p1–p6 / method88 已覆盖：
+  - 固定 A8 / target=170；p1–p4 作为最强匹配简单对照；p5 是实际占用计费；p6；fixedgap 作参照；两个 boot、forward/reverse、各 n=3。`method88-execution-20261004/RESULTS.md:27-53`
+  - 88/88 host_exit0，84 long + 4 short，failed 0。`method88-execution-20261004/RESULTS.md:3,17-22`
+  - p5 对最强匹配简单对照四格全负：boot1 forward p4 −5.68952%；boot1 reverse p4 −8.23689%；boot2 forward p1 −5.15142%；boot2 reverse p2 −4.43680%。`method88-execution-20261004/RESULTS.md:31-34`
+  - p5 vs fixedgap 有正参照，但两格保护未匹配，不能作收益声明；p5 vs p6 反向复现，不是普遍结论。`method88-execution-20261004/RESULTS.md:44-51,55-59`
+  - 该路线已按预定条件结束，p5 转为已测候选/基线。`method88-execution-20261004/RESULTS.md:100`
+- p1–p6 未覆盖：
+  - 此暂选工作流中的 compute/双缓冲；method88 的唯一判定对象是固定 A8 主创新路线是否有稳定额外收益。`method88-execution-20261004/RESULTS.md:96`
+  - 当前 composition S/N/P/PN：method88 在另一 profile 上完成反馈实验，当前 composition BIT 禁用旧准入控制。`first-paper-options-20261006.md:80`
+  - 只测稳定条件：两个 boot 不是两次全新启动；每启动/方向 n=3 只是工程重复，不作统计显著性。`method88-execution-20261004/RESULTS.md:83-85`
+- E2/E3 边界：
+  - E2 已有 64 条有限布局/实现范围的替换证据；E3 是受控阻塞证据；不能推持续吞吐归因。`method88-execution-20261004/RESULTS.md:22,92-95`
+
+结论：固定 gap 覆盖“串行 4KiB + 固定等待 + 后台 A”的外壳；p1–p6 覆盖固定 A8 稳定条件与反馈准入历史。两者都没有覆盖“compute 消费 + 有限双缓冲 + 下一次 DMA 由消费释放触发”的核心工作流。
+
+## 5. root 最少需要亲自读的原始 JSON/脚本边界（不超过 6 项）
+
+1. `scripts/composition_plan.py`：契约与可表达字段。重点 `24-56`（常量）、`135-137`（case 字段）、`143-165`（172 计划）、`190-197`（CLI argv）、`224-327`（validator）、`409-429`（V gap 与 V issued/done）、`454-479`（窗口指标与注释）。
+2. `docs/composition-v1-spec-20261004.md`：窗口/gap/试验边界。重点 `40-48`。
+3. `out/composition-isolated-20261007/mac-records/composition-isolated-20261007-formal01/cases/explore-b1-g0-a8-mp/record.json` 与 `.../explore-b1-g0-a8-mpn/record.json`：当前 isolated A8 gap0 P/PN 原始记录。导航见 `composition-history-isolation-20261007.md:36`。
+4. `out/performance-council-20261005/metrics.csv`：PN vs N 三条件（A8 g0、A16 g0、A8 g4000）的源汇总。导航见 `performance-council-decision-20261005.md:21-27`。
+5. `out/pn-board-path-20261007/reduction.json` 与 `out/pn-board-path-20261007/mac-records/pn-gap64-20261007-formal01/`：同 BIT/boot、A8、V64、gap0/1000/4000 P/PN 原始记录与归约。导航见 `composition-history-isolation-20261007.md:111-135`。
+6. `out/method88-analysis-20261004-01/report.zh.txt` 与 `out/method88-execution-20261004/RESULTS.md`：p1–p6、fixedgap、p5 原始/汇总与终止边界。导航见 `method88-execution-20261004/RESULTS.md:27-59,83-100`。
+
+读 raw 时必须核的最小字段：`request.mode/a_pages/victim_gap_cycles/victim_transfers/warmup_transfers/protected_did`；`raw[24]` 实际 V gap；`window[1]` 窗口 cycles；`window[3]` A 同窗完成；`window[13]/[14]` V issued/done；`observation[7]/[8]` V issued/done；`window[15]` has_a；`raw[12-23]` normal hit/miss 与 fast；`raw[6]/[8]/[9]` flags/cycles/errors。以上索引来自 `composition_plan.py:72-113,224-327,409-429,454-479`。
+
+## 明确不能声称的事项
+
+- 不能称已有真实应用：给定材料明确当前 ping-pong/搬运-计算交替只是结构化合成假设，没有本项目实际应用轨迹支持。`performance-council-decision-20261005.md:15`；当前也仍属合成微基准，若声称应用收益需实际程序或可信轨迹。`first-paper-options-20261006.md:86`
+- 不能把 gap 扣除当作新实测服务延迟：`raw[24]` 是实际 gap，W 含故意等待；`W−gap` 不是独立服务延迟。`composition-history-isolation-20261007.md:117,129`，`composition_plan.py:473-475`
+- 不能把 A 同窗完成数相同写成吞吐相同或速度不变：窗口长度不同，且同 miss 数不代表同页、同顺序、同 PTW 代价。`composition-history-isolation-20261007.md:32`
+- 不能宣称已有一个简单固定策略在所有条件最优；只能报告现有排序交叉与取舍，并注明 n=3、单 boot/三 block、缺完整 S/N 绝对表、证据不足。`performance-council-decision-20261005.md:21-27`，`composition-history-isolation-20261007.md:121-125`，`first-paper-options-20261006.md:68`

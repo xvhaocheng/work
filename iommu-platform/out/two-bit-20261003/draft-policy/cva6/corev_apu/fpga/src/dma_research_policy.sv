@@ -1,0 +1,1 @@
+<Deliverable 1 above; apply the two fix-up notes (move the bal_r_clamped declaration above its always_comb; use nodone_run_q <= nodone_run_next) before building>

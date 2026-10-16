@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
+"""Verilate and run the production FIFO FPGA-RAM storage equivalence test.
+
+Builds tests/nonblock_fifo_ram_test.cpp against the real production RTL:
+
+    cva6/vendor/pulp-platform/common_cells/src/fifo_v3.sv
+    cva6/vendor/pulp-platform/common_cells/src/stream_fifo.sv
+    cva6/vendor/pulp-platform/fpga-support/rtl/AsyncDpRam.sv
+    cva6/corev_apu/iDMA/src/idma_stream_fifo.sv
+    tests/nonblock_fifo_ram_top.sv          (test-only harness + ariane_pkg stub)
+
+Usage:
+    python3 tests/test_nonblock_fifo_ram.py
+    python3 tests/test_nonblock_fifo_ram.py --strict-branch
+    python3 tests/test_nonblock_fifo_ram.py --scenario drain512
+
+The RTL sources are used in place: nothing is copied or duplicated.  The
+test top declares a TEST-ONLY ariane_pkg with FPGA_EN = 1'b0 so the test is
+independent of the whole CVA6 configuration and so the FORCE_FPGA_RAM = 0
+reference really is the non-RAM reference.
+
+This test exercises the production interface:
+    fifo_v3          has `parameter bit FORCE_FPGA_RAM = 1'b0` (appended LAST)
+    stream_fifo      has the same parameter and forwards it
+    idma_stream_fifo opts the depth>2 branch in only for
+        Depth == 512 && $bits(type_t) == 8
+
+Verilator 4.038 is the target version; --timing is deliberately NOT used.
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT  = ROOT / "out" / "nonblock-fifo-ram"
+
+TOP = "nonblock_fifo_ram_top"
+CPP = "tests/nonblock_fifo_ram_test.cpp"
+
+# Order matters: Verilator 4.038 requires a package to be declared before any
+# module that references it, and fifo_v3.sv references ariane_pkg::FPGA_EN.
+# tests/nonblock_fifo_ram_top.sv declares the test-only ariane_pkg (and the
+# top module that instantiates everything), so it is compiled FIRST.  Module
+# instances may reference modules that are defined later, so the production
+# module sources can safely follow.
+REQUIRED_SOURCES = [
+    "tests/nonblock_fifo_ram_top.sv",
+    "cva6/vendor/pulp-platform/common_cells/src/fifo_v3.sv",
+    "cva6/vendor/pulp-platform/common_cells/src/stream_fifo.sv",
+    "cva6/vendor/pulp-platform/fpga-support/rtl/AsyncDpRam.sv",
+    "cva6/corev_apu/iDMA/src/idma_stream_fifo.sv",
+]
+
+# Needed only if the tool happens to elaborate the Depth == 2 spill branch of
+# idma_stream_fifo (it must not for Depth 512, but some Verilator versions
+# still resolve cells in unselected generate branches).
+OPTIONAL_SOURCES = [
+    "cva6/vendor/pulp-platform/common_cells/src/spill_register_flushable.sv",
+    "cva6/vendor/pulp-platform/common_cells/src/spill_register.sv",
+]
+
+INCDIRS = [
+    "cva6/vendor/pulp-platform/common_cells/include",
+    "cva6/corev_apu/iDMA/src/include",
+]
+
+# Verilator flattens hierarchical names with __DOT__ separators.  These
+# patterns are only used to REPORT which storage branch each instance got;
+# they are not part of the pass/fail criteria unless --strict-branch is given.
+BRANCH_PATTERNS = {
+    "dut_ram":    r"i_dut_stream_fifo[A-Za-z0-9_]{0,80}gen_fpga_queue",
+    "dut_asic":   r"i_dut_stream_fifo[A-Za-z0-9_]{0,80}__DOT__mem_q\b",
+    "ab_ram":     r"i_ab_stream_fifo[A-Za-z0-9_]{0,80}gen_fpga_queue",
+    # Verilator 4.038 removes the named always_ff generate block. Its packed
+    # register array remains visible; RAM uses fifo_ram.mem instead.
+    "ref_asic":   r"i_ref_stream_fifo[A-Za-z0-9_]{0,80}__DOT__mem_q\b",
+    "lane3_asic": r"i_lane3_stream_fifo[A-Za-z0-9_]{0,80}__DOT__mem_q\b",
+}
+
+# --strict-branch structural acceptance: the DUT and the FORCE_FPGA_RAM=1 AB
+# anchor must be on the FPGA RAM branch, the FORCE_FPGA_RAM=0 REF and the
+# depth-3 lane must stay on the ASIC branch, and the DUT must NOT appear on the
+# ASIC branch.  Instance names are Verilator-version dependent, so this check is
+# only activated explicitly; the default acceptance criterion is behavioural.
+STRICT_BRANCH_REQUIRED  = ("dut_ram", "ab_ram", "ref_asic", "lane3_asic")
+STRICT_BRANCH_FORBIDDEN = ("dut_asic",)
+
+
+def require(path: Path) -> Path:
+    if not path.exists():
+        sys.exit("required file missing: {}".format(path))
+    return path
+
+
+def tail(path: Path, lines: int = 200) -> str:
+    try:
+        text = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(text[-lines:]) + "\n"
+
+
+def verilator_version() -> str:
+    try:
+        out = subprocess.run(["verilator", "--version"],
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
+    except FileNotFoundError:
+        return ""
+    return out.stdout.decode(errors="replace").strip()
+
+
+def scan_branch_evidence(obj_dir: Path) -> dict:
+    found = {}
+    for p in sorted(obj_dir.rglob("*")):
+        if p.suffix not in (".h", ".hpp", ".cpp"):
+            continue
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        for key, rx in BRANCH_PATTERNS.items():
+            if key in found:
+                continue
+            if re.search(rx, text, re.DOTALL):
+                found[key] = p.name
+    return found
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--scenario", default=None,
+                    help="run only the named scenario "
+                         "(forwarded to the C++ harness as +scenario=)")
+    ap.add_argument("--strict-branch", action="store_true",
+                    help="also FAIL if the generated model does not show the "
+                         "expected storage branches: DUT and AB on "
+                         "gen_fpga_queue, REF and the depth-3 lane on "
+                         "gen_asic_queue, and no DUT on gen_asic_queue.  Off by "
+                         "default: the pass/fail criterion of this test is "
+                         "behavioural equivalence, the structural scan is "
+                         "reported as evidence only because Verilator's "
+                         "flattened naming is version dependent.")
+    opts = ap.parse_args()
+
+    ver = verilator_version()
+    if not ver:
+        sys.stderr.write("verilator not found on PATH\n")
+        return 1
+    print("test_nonblock_fifo_ram: {}".format(ver))
+
+    sources = [require(ROOT / p) for p in REQUIRED_SOURCES]
+    for p in OPTIONAL_SOURCES:
+        cand = ROOT / p
+        if cand.exists():
+            sources.append(cand)
+        else:
+            print("test_nonblock_fifo_ram: note: optional source absent: {}".format(p))
+
+    cpp = require(ROOT / CPP)
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    obj_dir = OUT / "obj"
+    obj_dir.mkdir(parents=True, exist_ok=True)
+
+    args = [
+        "verilator",
+        "--cc",
+        "--exe",
+        "--build",
+        "-Wno-fatal",
+        "+define+ASSERTS_OFF",
+        "--top-module", TOP,
+        "--Mdir", str(obj_dir),
+    ]
+    for inc in INCDIRS:
+        args.append("-I{}".format(ROOT / inc))
+    args += [str(p) for p in sources]
+    args += [str(cpp)]
+
+    print("test_nonblock_fifo_ram: build: {}".format(" ".join(args)))
+
+    build_log = OUT / "build.log"
+    with build_log.open("w") as log:
+        build = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT)
+
+    if build.returncode != 0:
+        sys.stderr.write(tail(build_log))
+        sys.stderr.write("test_nonblock_fifo_ram: build FAILED\n")
+        return 1
+
+    exe = obj_dir / "V{}".format(TOP)
+    if not exe.exists():
+        sys.stderr.write(tail(build_log))
+        sys.stderr.write("test_nonblock_fifo_ram: verilator did not produce {}\n".format(exe))
+        return 1
+
+    evidence = scan_branch_evidence(obj_dir)
+    for key in sorted(BRANCH_PATTERNS):
+        print("test_nonblock_fifo_ram: branch-evidence {:10s} {}".format(
+            key, evidence.get(key, "-")))
+
+    if opts.strict_branch:
+        missing   = [k for k in STRICT_BRANCH_REQUIRED if k not in evidence]
+        forbidden = [k for k in STRICT_BRANCH_FORBIDDEN if k in evidence]
+        if missing or forbidden:
+            sys.stderr.write(
+                "test_nonblock_fifo_ram: --strict-branch: structural acceptance "
+                "not met\n"
+                "  required storage-branch instances not found: {}\n"
+                "  forbidden storage-branch instances present:    {}\n"
+                "  (flattened instance names are Verilator-version dependent; "
+                "this check is only enabled explicitly, the default acceptance "
+                "criterion is behavioural equivalence)\n".format(
+                    ", ".join(missing) if missing else "-",
+                    ", ".join(forbidden) if forbidden else "-"))
+            return 2
+
+    run_args = [str(exe)]
+    if opts.scenario:
+        run_args.append("+scenario={}".format(opts.scenario))
+
+    print("test_nonblock_fifo_ram: run: {}".format(" ".join(run_args)))
+    run = subprocess.run(run_args)
+    if run.returncode != 0:
+        print("test_nonblock_fifo_ram: FAIL (rc={})".format(run.returncode))
+        return run.returncode
+
+    print("test_nonblock_fifo_ram: PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

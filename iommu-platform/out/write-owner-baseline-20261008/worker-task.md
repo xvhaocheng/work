@@ -1,0 +1,6 @@
+承接研究§31自然两DMA同bank等待环，只承担证据整理和普通实验准备脚本草案，创新/关键RTL架构由Codex负责。指定工作区iommu-platform，不执行命令不声称已改文件。
+请按files逐行核证并输出：
+1. 现成SourceReadGateEnable/FrontierEnable/FrontierScanEnable/HeaderParkMode的真实接口、依赖、owner ID bit与physical/virtual W head使用、进入AR通道的位置、与生产banked_ctl及TEST_COMPLETION_GATE宏关系，精确file:line引用。指出它们能/不能保证源R长度在当前具体写段范围内，勿将相同owner判定泛化为字节保证。建议仅为本轮最小同资源强普通对照可复用的编译参数；不创建新创新机制。
+2. 完整Python准备脚本prepare_owner_baseline.py，接受绝对project根，固定只往out/write-owner-baseline-20261008写副本和命令JSON，不构建、不跑DUT、不修改生产或tests。复用out/natural-write-order-20261008/build-write-limit-command.json来源顺序，替换Mdir和system_top.sv/C++到新out，保留上一轮修正容量的TC副本固定源并其hash归档；禁用逆读/强制交错/TEST_COMPLETION_GATE；复制上一轮read-only system_top.sv以及natural_coupled_test.cpp（CONF0）、natural_queue_test.cpp（CONF1）分别作为独立原样驱动副本。脚本只准备最小建议模型命令，不把不适用参数自动开全。默认候选至多两个不同模型（普通准确virtual W head门；若需要现有HeaderPark/旁路再一个），共CONF0/CONF1、V先/A先，先按Codex实际决定运行，不自动扩矩阵。每个模型build-command.json输出绝对argv，驱动可C++重链接后复用RTL archive。控制参数/driver路径必须明确，留供Codex审查。让生成器预检路径和精确替换次数，失败不得修改旧文件。只输出脚本代码块和证据摘要，不输出 unchanged SV/CPP整文件。
+3. 关键验收：完整copy/源/guard bytes，NEXT-ID严格DONE匹配、终止quiet、原AW/WLAST观察、VALI D保持与同ID顺序风险；失败真实退出码和原始队列快照。声明哪些能由现驱动核，哪些需新观测/原源审查。不能从现成强普通门的假设直接主张新工作负结果/创新成立。
+保持thinking/high默认输出预算，无Claude、无shell。完整代码、引用、假设及缺口。

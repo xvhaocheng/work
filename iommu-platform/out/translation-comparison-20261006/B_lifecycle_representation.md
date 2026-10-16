@@ -1,0 +1,131 @@
+## 范围与证据边界
+
+- 本报告只处理**候选2**与**候选4**。给定材料中 ECMDQ 是“降级宽泛想法”，**不是候选4**；见 `iommu-platform/docs/translation-opportunities-20261006.md:65`。
+- 行号均为本轮给定本地抽取文本的行号，不等于 PDF 页码；只引用已给原文，不浏览、不执行。未取得全文的前作只作**未排除覆盖风险**，不当作已不覆盖。
+- 172/172 功能验收不能支持新意；模型一致意见也不能替代前作约束检查。
+- 成本按事件时间线和重叠计，本报告不把翻译、失效、迁移、重填延迟直接相加。
+
+---
+
+# 候选2：按映射生命周期决定翻译共享范围
+
+## 2.1 可证伪的窄问题
+
+在存在真实跨设备共享页、迁移和权限更新事件的负载中，且**现有 IOMMU/设备接口没有公开证明可任意控制局部翻译缓存驻留/准入**的前提下，映射生命周期信息能否在保持相同失效确认语义、相同权限撤销语义和相同维护成本下，改变“哪些设备/哪些位置持有翻译副本”的决策，并改善端到端关键消费者完成时间？
+
+反证条件：若生命周期信号不能预测最优共享范围；或简单“本地/共享阈值”以及 Hydra/IDYLL/ShareMMU 同语义基线已取得同样端到端收益；或收益在失效确认与重填维护成本按时间线重叠后消失，则该窄问题不成立。
+
+## 2.2 最强直接前作与通用基线
+
+| 类型 | 前作/基线 | 本地证据 | 已解决/前提 | 未证明覆盖何处 |
+|---|---|---|---|---|
+| 直接前作 | **Hydra** | `.../papers/hydra2024.txt`；全文 | 已做“lazy and partial replication”选择性、按需页表副本；一致性只涉及 sharer；用 sharer 信息缩减 TLB shootdown。见 `hydra2024.txt:48-54,158-183,377-380,432-448,545-573,628-637` | CPU NUMA 页表页/PTE 副本，不是设备 IOMMU/ATS 缓存；未证明生命周期信息能控制设备翻译副本驻留/准入 |
+| 直接前作 | **IDYLL** | `.../papers/idyll2023.txt`；全文 | 已用 In-PTE directory 和 lazy invalidation 减少/批处理 PTE 失效，IRMB 缓冲失效请求；见 `idyll2023.txt:27-30,115-133,469-483,493-506,563-579,653-657` | 重点是 multi-GPU UVM 失效竞争；未证明“映射生命周期”决定翻译共享范围；未覆盖 IOMMU/ATS 设备缓存驻留控制 |
+| 直接前作 | **ShareMMU** | `.../papers/sharemmu2026.txt`；全文 | 已用 Permission Tracker 支持免重复翻译复用，并以 back-invalidation 保证私有 TLB 包含性；权限更新走 TLB shootdown，等待写回/flush ack；见 `sharemmu2026.txt:27-35,114-126,369-405,423-455,560-565` | 重点是安全复用与修改失效确认；未证明映射生命周期本身能改变共享范围；未提供任意缓存驻留/准入 |
+| 直接前作 | **CLAP** | `.../papers/clap2025.txt`；全文 | 已把页大小选择与选择性迁移结合，考虑 chiplet-locality；见 `clap2025.txt:27-44,111-115,1441-1464` | 不是翻译副本生命周期；未证明跨设备翻译副本共享范围受生命周期指导 |
+| 补充直接对照 | **Trans-FW** | `.../papers/transfw2023.txt`；全文 | 已有远端转发、page sharing、read-replication 及写失效；见 `transfw2023.txt:27-31,149-161,504-509,1540-1581` | 仍是 multi-GPU 仿真与现有失效模型；未证明设备缓存生命周期控制 |
+| 通用基线 | **TinyLFU** | `.../papers/tinylfu2015.txt`；全文 | 已把“准入”与“逐出”分离：逐出策略选 victim，准入策略决定是否替换；见 `tinylfu2015.txt:96-121,255-258,417-430` | 面向数据缓存，不是翻译撤权；数据一致性语义不能替代翻译失效语义 |
+| 通用基线 | **VIO** | `.../gap-audit-03/papers/vio2025.txt`；全文 | 已用 IOPA-Snoop 在 VirtIO 数据面提前处理缺页，shadow available ring 切换 snooping/passthrough；见 `vio2025.txt:292-331,426-443,467-483,484-497` | 是软件供给/提交前准备映射路径，未证明 IOMMU 翻译副本准入/驻留控制 |
+| 通用基线 | **Leases/TinyLFU/MIND** | `.../shared-translation-gaps-20261006.md:32,35`；Leases/MIND 本轮仅目录/说明 | 已覆盖有效期、准入、共享内存管理等一般思想 | 不能直接等同翻译撤权；缺全文处只作风险，不作已覆盖结论 |
+
+**关键判断：** CLAP 已结合迁移，Hydra 已有选择性/惰性副本，IDYLL 已有 PTE 失效，ShareMMU 已有修改失效确认。不能只因“前作没讲 lifetime”就称新。真正要证明的是：**设备/IOMMU 翻译副本层是否缺少现有接口能廉价获得的生命周期信息和驻留控制**。
+
+## 2.3 来自文献的具体应用入口（最多2个）
+
+1. **VIO 的云上 VirtIO/DPU I/O 直通路径**  
+   证据强度：强部署证据，OSDI 2025 论文称部署 300K VMs；但非翻译副本共享机制。路径：guest VirtIO frontend 填 available ring → kick → host IOPA-Snoop 查 EPT/页可达性 → shadow available ring → IOMMU IOPT remap → device DMA。见 `vio2025.txt:292-331,411-443,467-483`。  
+   待验证事实：真实设备与 IOMMU 是否暴露局部翻译缓存驻留/准入控制；VIO 的软件 snooping 不能证明 ATS 可免费支持任意缓存控制。  
+   注意：VIO 也说明 PRI 不普及、Linux v6.12 仅部分 SVA 场景支持 PRI，ATS/PRI 延迟可能达约 3×–80× CPU 缺页。见 `vio2025.txt:94-106,107-128`。
+
+2. **Multi-GPU UVM 页迁移/远端映射负载**  
+   证据强度：Trans-FW/IDYLL/CLAP 多为模拟；IDYLL 有 2-GPU A100 剖析，但评估仍主要模拟。路径：VA→per-GPU 页表→本地/远端 PTE；页迁移后失效旧 PTE；read-replication 写时失效其他副本。见 `transfw2023.txt:149-161,1540-1581`；`idyll2023.txt:243-256`。  
+   待验证事实：真实 IOMMU/ATS 缓存、注册缓存、设备本地 TLB 是否参与；不能把 GMMU 页表副本等同 IOMMU 翻译副本。
+
+## 2.4 尚未解决约束
+
+- **假设：** 真实负载中“高翻译复用”与“高更新/迁移/权限变化”同时出现，且生命周期信息有预测力。给定材料未提供实际轨迹证明。
+- **原文限制：** PRI/ATS 不普及；PRI 在 Linux 支持受限；ATS/PRI 缺页在关键 I/O 路径产生延迟；GPUDirect RDMA 文档要求相关路径 1:1 映射/直通。见 `vio2025.txt:94-106,107-128`；`gap-audit-03/README.md:20-22`。
+- **接口约束：** 给定材料未证明现有 ATS/IOMMU 接口提供任意“局部翻译缓存驻留/准入”控制；ShareMMU 仍需 Permission Tracker 包含私有 TLB，并在 eviction 时 back-invalidate。见 `sharemmu2026.txt:369-405,423-455`。
+- **语义约束：** 不能以过期翻译或放宽权限撤销换性能。ShareMMU 在修改时等待 accelerator 写回/flush ack；IDYLL 也明确 TLB 立即失效。见 `sharemmu2026.txt:560-565`；`idyll2023.txt:653-657`。
+- **缺证据：** ShadowUpdate、SPMC、Clover 全文未在本 worker 输入中给出，不能当已不覆盖。`shared-translation-gaps-20261006.md:13,41`；`catalog.csv:15,90`。
+
+## 2.5 最小验证草案
+
+- **输入事件：** 真实或可核轨迹中的 per-device 翻译请求/缺失、页迁移、权限变更、失效请求与 ack、PTE/PWC/IRMB/TLB 命中、DMA 完成、关键消费者解除。
+- **对照策略：** FIFO/本地优先；全共享/全复制；Hydra 式惰性部分复制；IDYLL 式 In-PTE+lazy invalidation；ShareMMU 式 permission tracker+back-invalidation；生命周期感知策略；理想生命周期 oracle。
+- **固定资源/语义：** 相同页大小、缓存容量、失效确认语义、权限撤销语义、无 stale translation、无额外数据复制；允许等待与计算重叠，但不把延迟直接相加。
+- **观测：** 端到端完成时间；关键消费者解除时间；失效/确认/重填次数与时间线；迁移等待；维护更新次数；设备翻译缓存驻留量。
+- **主要终点：** 端到端完成时间或关键消费者解除时间，而非单独命中率。
+- **反证条件：** 高复用与高更新不共存；简单阈值或 Hydra/IDYLL/ShareMMU 同语义基线已达上限；生命周期 oracle 无额外端到端收益；维护成本在重叠时间线上抵消收益。
+- **必要新信息/维护成本：** OS 分配/迁移阶段信息能否传到 IOMMU/设备；设备是否可查询/控制翻译缓存准入；维护需新增元数据、失效确认、同步与重填。
+
+## 2.6 缺文献（最多2项）
+
+1. **ShadowUpdate 全文**：仅机构摘要，含失效时传播新映射、在途迁移 tracker、拷贝完成后放行；见 `catalog.csv:90`。不能当已不覆盖。
+2. **SPMC 全文**：仅 MICRO 2026 官方题录；见 `shared-translation-gaps-20261006.md:13`。不能推断共享范围/协议。Clover 全文也在候选2相关风险内，但本处以该项为未排除风险，不作独立缺口。
+
+## 2.7 给 Codex 的建议取舍
+
+**候选2建议暂缓为独立新方向。** Hydra 已覆盖选择性/惰性页表副本和 sharer-based shootdown，IDYLL 已覆盖 PTE 失效与批处理，ShareMMU 已覆盖修改失效确认，CLAP 已结合迁移。除非能证明：现有 IOMMU/ATS 接口确实缺少可查询/可控制的局部翻译缓存驻留与准入，且生命周期信息在同失效确认/权限语义下改变端到端关键消费者完成时间，而 Hydra+IDYLL+ShareMMU 同语义基线不能达到，否则不应以“前作没讲 lifetime”立题。
+
+---
+
+# 候选4：同一底层对象，允许不同设备使用不同翻译表示
+
+## 4.1 可证伪的窄问题
+
+对同一共享物理对象，保留对象身份与权限语义，是否存在至少两类设备访问/更新模式，使得单一翻译表示无法同时满足，而必须允许每设备局部翻译表示；且该冲突不能由 EMT 式 OS 级多翻译方案共存、PFM 式 PA→硬件地址重映射、Utopia/RMM 式混合映射/范围映射加普通拆分/分组/复制解决？  
+反证条件：冲突只来自数据布局而非 IOMMU 翻译表示；PFM/EMT/Utopia/RMM 已可覆盖；或每设备表示的更新/失效/重填成本在时间线上抵消收益。
+
+## 4.2 最强直接前作与通用基线
+
+| 类型 | 前作/基线 | 本地证据 | 已解决/前提 | 未证明覆盖何处 |
+|---|---|---|---|---|
+| 直接前作 | **PFM / Dual-View Memory** | `.../gap-audit-02/papers/pfm2026.txt`；全文 | 同一物理数据面向 NPU/PIM 暴露不同逻辑视图；离线 profiling；MapID/MDT；ARU 把 PA 映射到硬件地址；FAS 调度；relayout buffer。见 `pfm2026.txt:98-107,111-117,438-460,540-543,730-743,1277-1291` | 原文保留 VA→PA；PFM 做的是 PA→hardware address，层级不同。不能直接证明新，也不能完全否定具体 IOMMU 页表表示问题 |
+| 直接前作 | **EMT** | `.../papers/emt2025.txt`；全文 | OS 级架构中立接口，支持 radix/ECPT/FPT 等翻译方案共存；MMU driver、translation object/database/service；ECPT 可用多个共存页表。见 `emt2025.txt:40-52,103-116,369-375,404-408` | 当前明确“does not target IOMMU translation for DMA requests”；见 `emt2025.txt:483-490`。未证明 IOMMU/设备表示共存与失效同步 |
+| 直接前作 | **Utopia** | `.../papers/utopia2023.txt`；全文 | RestSeg/FlexSeg 让受限哈希映射与灵活映射共存；TAR/SF、RSW/FSW、迁移与 TAR/SF cache 失效。见 `utopia2023.txt:27-42,103-116,651-658,963-987,1043-1057` | CPU 地址翻译，不是每设备 IOMMU 表示；未证明同一对象在设备间表示不同且低更新成本 |
+| 直接前作 | **RMM** | `.../gap-audit-02/papers/rmm2015.txt`；全文 | 范围翻译与标准分页并行；range TLB 与 L2 TLB 并行；OS 更新 range table；COW/访问位等约束。见 `rmm2015.txt:19-27,108-127,232-239,419-421,519-532` | 不是多设备表示共存；未覆盖 IOMMU 页表表示与失效 |
+| 补充邻近 | **CLAP** | `.../papers/clap2025.txt`；全文 | MCM GPU 统一地址空间、单一 GPU 页表；页大小/locality；见 `clap2025.txt:183-184,27-44` | 单一页表共享不等于允许不同设备不同翻译表示 |
+| 通用基线 | **Direct Segments / 大页 / 标准分页** | RMM 对照表与 related work；`rmm2015.txt:69-73,105-118,180-218` | 已覆盖单范围、大页、分页作为通用基线；说明对齐/覆盖限制 | 通用基线不等于 IOMMU 页表表示共存 |
+| 通用基线 | **VBI/DIPTA/DeACT/Barre Chord** | `catalog.csv:118,27,25,5`；本轮输入未给全文 | 目录状态显示已有全文/评审，但本 worker 未获全文 | 未排除覆盖风险；不能当已覆盖，也不能当领域空白 |
+
+**关键判断：** PFM 的地址层级是 PA→hardware address，保留 VA→PA；EMT 是 OS 级翻译表示共存强前作；Utopia/RMM 已覆盖混合映射/范围表示。宽泛“双视图”主张应撤回。只有精确到 **IOMMU 页表表示共存、对象身份/权限语义、更新同步成本** 的具体问题才可能保留。
+
+## 4.3 来自文献的具体应用入口（最多2个）
+
+1. **PFM 的 NPU-PIM LLM 推理入口**  
+   证据强度：模拟+HBM-PIM 模型，非真实 IOMMU；文献报告最高 2.32× 吞吐提升。路径：VA→PA 保留；PFMMalloc 绑定 MapID；MDT 存映射模板；ARU 做 PA→硬件地址；FAS 调度 NPU/PIM 请求；relayout buffer 重组数据。见 `pfm2026.txt:438-460,540-543,730-743,1277-1291`。  
+   待验证事实：同一底层对象的跨设备身份/权限如何维护；MapID 与 IOMMU 页表/ATS 缓存的关系；relayout buffer 是否掩盖更新成本；离线 MDT 是否覆盖动态表示切换。
+
+2. **EMT 的 Linux ECPT/FPT 翻译表示共存入口**  
+   证据强度：EMT 在 Linux v5.15 上实现，QEMU 仿真 MMU，LTP 1,208 项通过；但非 IOMMU/DMA。路径：architecture-independent memory management 调 EMT API；MMU driver 实现 translation object/database/service；可管理多个共存页表。见 `emt2025.txt:118-138,369-375,404-408,516-518,764-788`。  
+   待验证事实：EMT 扩展到 IOMMU 后，是否支持每设备 PTE/表示不同且保持权限/失效语义；EMT 当前限制是否只是“未做”，而非接口不可扩展。
+
+## 4.4 尚未解决约束
+
+- **假设：** 同一对象在不同设备上存在真实翻译表示冲突，且不能由 PFM 的 PA→HA 重映射或数据布局优化吸收。
+- **原文限制：** PFM 依赖离线 profiling、有限 MDT、relayout buffer，保留基本 VA→PA；见 `pfm2026.txt:98-107,540-543,1242-1247,1277-1291`。EMT 当前不管 IOMMU DMA；见 `emt2025.txt:483-490`。
+- **强前作约束：** EMT 已是 OS 级表示共存强前作；Utopia 已是混合映射共存；RMM 已是范围/分页冗余并行；PFM 已是同一数据双视图。不能只提“加一层中间地址”或“支持大页”。
+- **缺证据：** VBI、DIPTA、DeACT、Barre Chord 等目录显示有全文，但本 worker 输入未给全文；不能当已不覆盖。见 `catalog.csv:118,27,25,5`。
+- **语义约束：** 必须保留对象身份与权限语义；页级地址转换不能免费完成任意张量转置；页内布局改变需要地址生成或实际数据重排，成本要计入。
+- **地址层级：** PFM 的 PA→HA 与候选4 的具体 IOMMU 表示问题不在同一层，既不能直接证明新，也不能完全否定。
+
+## 4.5 最小验证草案
+
+- **输入事件：** 同一对象上的 per-device 翻译请求、页大小/覆盖、权限更新、对象更新、失效/ack、重填、设备访问完成。
+- **对照策略：** 单一共享页表；EMT 式多翻译方案共存；PFM 式物理布局+PA→HA；Utopia/RestSeg+FlexSeg；RMM 式范围映射；理想每设备表示 oracle（相同对象身份/权限，无额外复制）。
+- **固定资源/语义：** 相同物理数据、相同页大小候选、相同 TLB/缓存容量、相同权限撤销语义、无 stale translation、无额外数据复制；允许等待与访问重叠。
+- **观测：** 翻译延迟、更新/失效/重填成本、设备进度、端到端完成时间、元数据开销。
+- **主要终点：** 端到端工作负载或关键设备完成时间，而非仅 TLB 命中率。
+- **反证条件：** 单一表示已足够；PFM/EMT/Utopia/RMM 已覆盖；冲突来自数据布局而非 IOMMU 表示；更新维护成本在时间线上抵消收益。
+- **必要新信息/维护成本：** 实际 IOMMU/设备是否支持每设备表示；对象身份/权限如何跨表示同步；失效确认路径；每设备表示元数据与重填成本。
+
+## 4.6 缺文献（最多2项）
+
+1. **VBI 全文**：`catalog.csv:118` 显示 fulltext true，但本 worker 输入未给；不能当已不覆盖。
+2. **DIPTA 全文**：`catalog.csv:27` 显示 fulltext true，但本 worker 输入未给；不能当已不覆盖。  
+   DeACT/Barre Chord 同属未给全文风险，见 `catalog.csv:25,5`，本处不列为独立缺文献项。
+
+## 4.7 给 Codex 的建议取舍
+
+**候选4应撤回宽泛“双视图/不同表示”主张，仅保留精确 IOMMU 表示问题。** PFM 已做到同一物理数据不同逻辑视图，但层级是 PA→hardware address，保留 VA→PA；EMT 已是 OS 级多翻译表示共存强前作；Utopia/RMM 已覆盖混合/范围表示共存。若不能证明同一对象在 IOMMU 页表表示层存在 PFM+EMT+Utopia/RMM 加普通拆分/分组/复制仍不能解决的冲突，且更新/失效/权限同步成本足够低，建议暂缓，不把 ECMDQ 或“多队列”误作候选4替代。

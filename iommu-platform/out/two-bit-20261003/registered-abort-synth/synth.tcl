@@ -1,0 +1,9 @@
+set_param general.maxThreads 8
+create_project -in_memory -part xc7k325tffg900-2
+set_property include_dirs {/home/xvhaocheng/work/iommu-platform/cva6/vendor/pulp-platform/common_cells/include /home/xvhaocheng/work/iommu-platform/cva6/corev_apu/iDMA/src/include} [current_fileset]
+read_verilog -sv {/home/xvhaocheng/work/iommu-platform/cva6/vendor/pulp-platform/common_cells/include/common_cells/registers.svh /home/xvhaocheng/work/iommu-platform/cva6/vendor/pulp-platform/axi/src/axi_pkg.sv /home/xvhaocheng/work/iommu-platform/cva6/corev_apu/iDMA/src/idma_pkg.sv /home/xvhaocheng/work/iommu-platform/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend_reg_pkg.sv /home/xvhaocheng/work/iommu-platform/cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src/prim_subreg_arb.sv /home/xvhaocheng/work/iommu-platform/cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src/prim_subreg.sv /home/xvhaocheng/work/iommu-platform/cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src/prim_subreg_ext.sv /home/xvhaocheng/work/iommu-platform/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend_reg_top.sv /home/xvhaocheng/work/iommu-platform/cva6/corev_apu/iDMA/src/frontends/idma_transfer_id_gen.sv /home/xvhaocheng/work/iommu-platform/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv /home/xvhaocheng/work/iommu-platform/cva6/corev_apu/fpga/src/dma_research_policy.sv /home/xvhaocheng/work/iommu-platform/tests/idma_research_policy_top.sv}
+set_property -dict {file_type {Verilog Header} is_global_include 1} [get_files *registers.svh]
+synth_design -top idma_research_policy_top -part xc7k325tffg900-2 -mode out_of_context -retiming
+check_timing -verbose -override_defaults {loops} -file {/home/xvhaocheng/work/iommu-platform/out/two-bit-20261003/registered-abort-synth/loops.rpt}
+write_checkpoint -force {/home/xvhaocheng/work/iommu-platform/out/two-bit-20261003/registered-abort-synth/synth.dcp}
+exit

@@ -1,0 +1,244 @@
+# Revision summary (script only)
+
+Changes are confined to `out/translation-progress-frontier-20261008/frontier_model.py`; no interface, model edge, saved-primitive or budget changes, and no forced full-graph traversal.
+
+1. **Statistics fix (early-exit mislabeling).** `dijkstra_fast` / `dijkstra_path` now return `(min_work, settled_nodes, search_exhausted)` / `(min_work, path, settled_nodes, search_exhausted)`. A both‑done early pop returns `search_exhausted=False` with a *partial* settled prefix; heap exhaustion returns `search_exhausted=True` with all reachable nodes settled. A shared helper `node_count_fields` emits `settled_nodes`, `search_exhausted`, `unsettled_nodes = 512 - settled_nodes` and `unreachable_nodes = 512 - settled_nodes` **only** when `search_exhausted` is true, otherwise `null`. Applied to `all_results`, `representative_paths`, `specific_cases` and the `all_configs` field list/rows. No successful configuration is forced to explore the full graph.
+2. **Notes**: `q` described as an upper bound with voluntary early yield; `reachable=true` stated as existence of one completing strategy (monotone checkpoint strategy completes) and not as progress under all legal/service‑fair strategies.
+3. **Notes**: the 30‑work baseline is restated under the contract (each PTE read advances only the current request, no PTE shared across the two requests, no coalescing, fixed 15+15 steps, no PWC); the misleading “total unique PTE work” wording is removed.
+4. **Notes/metadata**: added `configurations_per_family` = 1290 and the note that `all_configs` holds 1290 rows per family (15 q × 86 B) and 6450 across five families; existing counts were already correct, so only wording was added.
+
+Assumptions / flags for Codex:
+- `unsettled_nodes` is emitted for every record (nodes this bounded search did not settle), while `unreachable_nodes` is the conditional alias — this is my reading of “改用 settled_nodes、unsettled_nodes 以及 search_exhausted … 额外记录 unreachable_nodes”. If you prefer a single field, delete the `unreachable_nodes` entry from the helper (the task allows omitting it).
+- `unreachable_nodes` is `null` in JSON for every successful config; any external consumer still reading `reachable_nodes`/`unreachable_nodes` must be updated.
+- The 512 figure is documented in notes as nominal `(pA, pV, turn)` encodings including illegal/unreachable encodings, not distinct physical addresses.
+- `codex-model-contract.md` line 45 already states the count as the 6450 total, so it is consistent and left unedited.
+
+# Patch
+
+```diff
+*** Begin Patch
+*** Update File: out/translation-progress-frontier-20261008/frontier_model.py
+@@
+ def dijkstra_fast(family, q, B):
++    """Shortest both-done work, settled-node count, and exhaustion flag.
++
++    Returns (min_work, settled_nodes, search_exhausted).  A successful run pops
++    the first both-done node and returns early, so settled_nodes is only the
++    settled prefix and search_exhausted is False.  If the heap empties instead,
++    min_work is None, search_exhausted is True, and settled_nodes counts every
++    reachable node of the finite graph.
++    """
+     start = state_to_idx((0, 0, 0))
+     INF = 10**9
+     dist = [INF] * TOTAL_NODES
+     dist[start] = 0
+     heap = [(0, start)]
+     visited = [False] * TOTAL_NODES
+-    reachable_count = 0
++    settled_count = 0
+     while heap:
+         d, idx = heapq.heappop(heap)
+         if visited[idx]:
+             continue
+         visited[idx] = True
+-        reachable_count += 1
++        settled_count += 1
+         pA, pV, _ = idx_to_state(idx)
+         if pA == 15 and pV == 15:
+-            return d, reachable_count
++            # Early return at the first both-done pop: the search is NOT
++            # exhausted, so no node outside the settled prefix may be called
++            # unreachable.
++            return d, settled_count, False
+         for nxt, w in neighbors_idx(idx, family, q, B):
+             nd = d + w
+             if nd < dist[nxt]:
+                 dist[nxt] = nd
+                 heapq.heappush(heap, (nd, nxt))
+-    return None, reachable_count
++    # Heap exhausted: every reachable node has been settled.
++    return None, settled_count, True
+@@
+ def dijkstra_path(family, q, B):
++    """Same search as dijkstra_fast, keeping predecessor info for the path.
++
++    Returns (min_work, path, settled_nodes, search_exhausted) with the same
++    semantics as dijkstra_fast: settled_nodes is the settled prefix on the
++    both-done early return, and all reachable nodes on heap exhaustion.
++    """
+     start = (0, 0, 0)
+     dist = {start: 0}
+     prev = {}
+     heap = [(0, start)]
+     visited = set()
+     while heap:
+         d, state = heapq.heappop(heap)
+         if state in visited:
+             continue
+         visited.add(state)
+         if state[0] == 15 and state[1] == 15:
+             path = []
+             cur = state
+             while cur in prev:
+                 pstate, info = prev[cur]
+                 path.append((pstate, cur, info))
+                 cur = pstate
+             path.reverse()
+-            return d, path, len(visited)
++            return d, path, len(visited), False
+         for nxt, w, info in neighbors(state, family, q, B):
+             nd = d + w
+             if nxt not in dist or nd < dist[nxt]:
+                 dist[nxt] = nd
+                 prev[nxt] = (state, info)
+                 heapq.heappush(heap, (nd, nxt))
+-    return None, None, len(visited)
++    return None, None, len(visited), True
++
++def node_count_fields(settled_nodes, search_exhausted):
++    """Node bookkeeping fields shared by all report sections.
++
++    settled_nodes: nodes this search popped with final distance.  A successful
++    run stops at the first both-done pop, so this counts only the settled
++    prefix, not all reachable nodes.
++    search_exhausted: True only when the search emptied the heap without
++    reaching both-done; successful early returns report False.
++    unsettled_nodes: TOTAL_NODES - settled_nodes, i.e. the nominal encoding
++    nodes this search did not settle.  TOTAL_NODES = 512 is 16*16*2 nominal
++    (pA, pV, turn) encodings and includes illegal/unreachable encodings, so it
++    is not a count of distinct physical addresses.
++    unreachable_nodes: recorded only when search_exhausted is True, where
++    unsettled == unreachable == TOTAL_NODES - settled_nodes; otherwise None,
++    because the unexplored remainder is not claimed unreachable.
++    """
++    unsettled = TOTAL_NODES - settled_nodes
++    return {
++        "settled_nodes": settled_nodes,
++        "search_exhausted": search_exhausted,
++        "unsettled_nodes": unsettled,
++        "unreachable_nodes": unsettled if search_exhausted else None
++    }
+@@
+     all_results = {fam: {} for fam in FAMILIES}
+     mismatches = []
+     for fam in FAMILIES:
+         for B in B_VALUES:
+             all_results[fam][B] = {}
+             for q in Q_VALUES:
+-                min_work, reach_nodes = dijkstra_fast(fam, q, B)
++                min_work, settled_nodes, search_exhausted = dijkstra_fast(fam, q, B)
+                 reachable = min_work is not None
+                 all_results[fam][B][q] = {
+                     "q": q,
+                     "B": B,
+                     "reachable": reachable,
+                     "min_work": min_work,
+-                    "reachable_nodes": reach_nodes,
+-                    "unreachable_nodes": TOTAL_NODES - reach_nodes
++                    **node_count_fields(settled_nodes, search_exhausted)
+                 }
+@@
+     rep_paths = {}
+     for fam in FAMILIES:
+         for q in rep_q:
+             for B in rep_B:
+                 key = f"{fam}_q{q}_B{B}"
+-                min_work, path, reach_nodes = dijkstra_path(fam, q, B)
++                min_work, path, settled_nodes, search_exhausted = dijkstra_path(fam, q, B)
+                 if min_work is not None:
+                     rep_paths[key] = {
+                         "family": fam, "q": q, "B": B,
+                         "reachable": True,
+                         "min_work": min_work,
+                         "recomputed_work": min_work - 30,
+-                        "reachable_nodes": reach_nodes,
++                        **node_count_fields(settled_nodes, search_exhausted),
+                         "path": format_path(path)
+                     }
+                 else:
+                     cycle = find_cycle(fam, q, B)
+                     rep_paths[key] = {
+                         "family": fam, "q": q, "B": B,
+                         "reachable": False,
+                         "min_work": None,
+                         "recomputed_work": None,
+-                        "reachable_nodes": reach_nodes,
+-                        "unreachable_nodes": TOTAL_NODES - reach_nodes,
++                        **node_count_fields(settled_nodes, search_exhausted),
+                         "cycle": format_cycle(cycle) if cycle else None
+                     }
+@@
+     # Specific required cases
+     specific = {}
+     def add_specific(name, fam, q, B):
+-        min_work, path, reach_nodes = dijkstra_path(fam, q, B)
++        min_work, path, settled_nodes, search_exhausted = dijkstra_path(fam, q, B)
+         entry = {
+             "family": fam, "q": q, "B": B,
+             "reachable": min_work is not None,
+             "min_work": min_work,
+             "recomputed_work": (min_work - 30) if min_work is not None else None,
+-            "reachable_nodes": reach_nodes,
+-            "unreachable_nodes": TOTAL_NODES - reach_nodes
++            **node_count_fields(settled_nodes, search_exhausted)
+         }
+@@
+     # Compact all-config table
+     all_configs = {
+-        "fields": ["q", "B", "reachable", "min_work", "reachable_nodes", "unreachable_nodes"]
++        "fields": ["q", "B", "reachable", "min_work", "settled_nodes",
++                   "search_exhausted", "unsettled_nodes", "unreachable_nodes"]
+     }
+     for fam in FAMILIES:
+         fam_list = []
+         for B in B_VALUES:
+             for q in Q_VALUES:
+                 r = all_results[fam][B][q]
+                 fam_list.append([
+                     r["q"], r["B"], r["reachable"], r["min_work"],
+-                    r["reachable_nodes"], r["unreachable_nodes"]
++                    r["settled_nodes"], r["search_exhausted"],
++                    r["unsettled_nodes"], r["unreachable_nodes"]
+                 ])
+         all_configs[fam] = fam_list
+@@
+             "families": FAMILIES,
+             "q_values": Q_VALUES,
+             "B_values": B_VALUES,
++            "configurations_per_family": len(Q_VALUES) * len(B_VALUES),
+             "total_configurations": len(FAMILIES) * len(Q_VALUES) * len(B_VALUES),
+@@
+             "chain": "G1,G2,G3,S1,G1,G2,G3,S2,G1,G2,G3,S3,G1,G2,G3",
+             "all_configs_fields": all_configs["fields"],
+             "notes": [
+                 "Finite mathematical model only; not DUT, not memory-cycle, not whole-architecture minimal state.",
+                 "0 and 15 need no extra frame; C/identity/active/terminal shared costs are excluded from B.",
+                 "No area output.",
+-                "Allows voluntary early yield and restart; does not force filling q.",
++                "q is an upper bound on consecutive PTE services; a request may voluntarily yield earlier, so the model does not force filling q.",
++                "reachable=true proves only that one completing strategy exists (the monotone checkpoint strategy completes both requests); it does not mean that every legal strategy, every service order, or every fair scheduler progresses.",
+                 "PWC/denser tags/cache optimizations are not used here to establish any global lower bound.",
+-                "Unreachability is determined by full finite-graph Dijkstra; a reported cycle is only a non-progress trace, not a proof that all strategies fail.",
++                "reachability is decided by full finite-graph Dijkstra. On an unsolvable configuration the heap is exhausted (search_exhausted=true); a reported cycle is only a non-progress trace, not a proof on its own.",
+                 "min_work is null when the finite graph cannot reach both-done state.",
+-                "recomputed_work = min_work - 30; 30 is the total unique PTE work for two requests (15+15)."
++                "settled_nodes counts only nodes settled (popped with final distance) by the run producing the record. Successful configurations return at the first both-done pop, so their settled_nodes is a partial settled prefix, not the number of reachable nodes.",
++                "search_exhausted is false for every reachable configuration and true only when the search emptied the heap without reaching both-done.",
++                "unsettled_nodes = TOTAL_NODES - settled_nodes = 512 - settled_nodes. The 512 nominal (pA, pV, turn) encoding nodes include illegal/unreachable encodings; this is a bound-graph encoding count, not a count of distinct physical addresses.",
++                "unreachable_nodes is recorded (equal to 512 - settled_nodes) only when search_exhausted is true; otherwise it is null and the unexplored remainder is not claimed unreachable.",
++                "all_configs has 1290 rows per family (15 q values x 86 B values); 6450 rows across the five families. 6450 is a mathematical configuration count, not a DUT/FPGA experiment count.",
++                "min_work = 30 is the fixed-chain baseline for two requests (15+15 PTE work) only under this model's contract: each PTE read advances only the current request, no PTE is shared between the two requests, no coalescing, and each request reads its 15 fixed steps with no PWC. It is not a claim that the two requests must touch 15 distinct physical addresses.",
++                "recomputed_work = min_work - 30 measured against that 30-work baseline."
+             ]
+*** End Patch
+```
+
+# Acceptance checks (for Codex to run)
+
+1. `python3 out/translation-progress-frontier-20261008/frontier_model.py` exits 0 (mismatch logic untouched) and writes the JSON.
+2. `grep -n "reachable_nodes" frontier_model.py` returns nothing.
+3. Failing case `specific_cases["whole_q14_B0_unreachable"]`: `search_exhausted == true`, `unsettled_nodes == unreachable_nodes == 512 - settled_nodes`, `min_work is null`.
+4. Successful case `specific_cases["semantic_chunks_q3_B77_no_reread_path"]` and `whole_q15_B0_success`: `search_exhausted == false`, `unreachable_nodes is null`, `settled_nodes` small (partial prefix), `min_work == 30` and path present.
+5. `len(all_configs[fam]) == 1290` for each of the five families; each row length equals `len(all_configs["fields"]) == 8`; JSON `null` appears for `unreachable_nodes` in every reachable row.
+6. `representative_paths`, `specific_cases` and `all_results` rows all carry the same four counter fields; `bands` unchanged.
+7. Metadata: `configurations_per_family == 1290`, `total_configurations == 6450`, notes contain the q-upper-bound statement, the 30-work contract, and the 1290/6450 wording; no note contains the phrase "total unique PTE work".

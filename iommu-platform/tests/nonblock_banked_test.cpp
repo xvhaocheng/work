@@ -1,0 +1,1069 @@
+// SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
+#include "Vnonblock_banked_top.h"
+#include "verilated.h"
+
+double sc_time_stamp() { return 0; }
+
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <deque>
+#include <map>
+#include <vector>
+
+#define FAIL_AT(msg)                                                            \
+    do {                                                                        \
+        std::fprintf(stderr, "nonblock_banked_test: FAIL: %s (%s:%d)\n",        \
+                     (msg), __FILE__, __LINE__);                                \
+        std::abort();                                                           \
+    } while (0)
+
+#define CHECK_AT(cond, msg)                                                     \
+    do {                                                                        \
+        if (!(cond)) FAIL_AT(msg);                                              \
+    } while (0)
+
+struct Beat {
+    uint64_t data = 0;
+    uint8_t  strb = 0;
+    bool     last = false;
+    uint32_t id = 0;
+};
+
+static const uint32_t V_ID      = 0;
+static const uint32_t A_ID      = 4;
+static const uint32_t V_DID     = 10;
+static const uint32_t A_DID     = 11;
+static const uint64_t VSRC_IOVA = 0x10000000ULL;
+static const uint64_t VDST_IOVA = 0x10001000ULL;
+static const uint64_t VRO_IOVA  = 0x10002000ULL;
+static const uint64_t A_IOVA    = 0x20000000ULL;
+static const uint64_t VSRC_PA   = 0x80000000ULL;
+static const uint64_t VDST_PA   = 0x80001000ULL;
+static const uint64_t A_PA      = 0x90000000ULL;
+
+static uint64_t make_test_word(uint64_t word_index) {
+    // Odd 64-bit multiplier + xor constant: a full-width permutation, so every
+    // word index in 0..511 is unique and the old low-byte repeat is avoided.
+    return (word_index * 0x9E3779B97F4A7C15ULL) ^ 0xA5C3E10D2B4F9678ULL;
+}
+
+class Tb {
+public:
+    Vnonblock_banked_top* top;
+    std::map<uint64_t, uint8_t> mem;
+
+    struct AxiReadState {
+        bool     pending = false;
+        uint64_t addr    = 0;
+        uint8_t  len     = 0;
+        uint8_t  size    = 0;
+        uint8_t  id      = 0;
+        int      beat    = 0;
+    };
+    AxiReadState ddtw_rd, ptw_rd;
+    bool hold_ptw_r       = false;
+    bool a_ptw_hold_armed = false;
+
+    struct Up {
+        bool     aw_valid = false;
+        uint32_t aw_id = 0; uint64_t aw_addr = 0;
+        uint32_t aw_len = 0, aw_size = 3, aw_burst = 1, aw_prot = 0, aw_user = 0;
+        uint32_t aw_did = 0; bool aw_ssid = false; uint32_t aw_subid = 0;
+        bool     aw_atst = false, aw_mvalid = false;
+
+        bool     ar_valid = false;
+        uint32_t ar_id = 0; uint64_t ar_addr = 0;
+        uint32_t ar_len = 0, ar_size = 3, ar_burst = 1, ar_prot = 0, ar_user = 0;
+        uint32_t ar_did = 0; bool ar_ssid = false; uint32_t ar_subid = 0;
+        bool     ar_atst = false, ar_mvalid = false;
+
+        std::deque<Beat> wq;
+        std::deque<std::pair<uint32_t,int> > w_attrib;
+        bool b_ready = true, r_ready = true;
+    } up;
+
+    struct CawEnt {
+        uint32_t id = 0;
+        uint64_t addr = 0;
+        uint32_t len = 0;
+        std::vector<Beat> exp;
+        bool     have_exp = false;
+        int      got = 0;
+    };
+    std::deque<CawEnt> caw_q;
+    std::deque<std::pair<uint32_t,uint32_t> > b_q;
+    std::deque<Beat> r_q;
+    std::deque<Beat> comp_w_q;
+
+    bool comp_aw_ready = true, comp_ar_ready = true, comp_w_ready = true;
+    bool comp_b_valid = false; uint32_t comp_b_id = 0, comp_b_resp = 0;
+    bool comp_r_valid = false; uint32_t comp_r_id = 0;
+    uint64_t comp_r_data = 0; uint32_t comp_r_resp = 0; bool comp_r_last = false;
+
+    bool nonblock_enable = true;
+    long g_cycle = 0;
+
+    struct UpAwRec { long cyc; uint32_t id; uint64_t addr; uint32_t len; };
+    struct UpArRec { long cyc; uint32_t id; uint64_t addr; uint32_t len; };
+    struct UpWRec  { long cyc; uint32_t id; uint64_t data; uint8_t strb; bool last; };
+    struct UpBRec  { long cyc; uint32_t id; uint32_t resp; };
+    struct UpRRec  { long cyc; uint32_t id; uint64_t data; bool last; uint32_t resp; };
+    struct CmpAwRec { long cyc; uint32_t id; uint64_t addr; uint32_t len; };
+    struct CmpArRec { long cyc; uint32_t id; uint64_t addr; uint32_t len; };
+    struct CmpWRec  { long cyc; uint64_t data; uint8_t strb; bool last; };
+
+    std::vector<UpAwRec>  L_up_aw;
+    std::vector<UpArRec>  L_up_ar;
+    std::vector<UpWRec>   L_up_w;
+    std::vector<UpBRec>   L_up_b;
+    std::vector<UpRRec>   L_up_r;
+    std::vector<CmpAwRec> L_cmp_aw;
+    std::vector<CmpArRec> L_cmp_ar;
+    std::vector<CmpWRec>  L_cmp_w;
+    std::vector<long>     L_nonblock_fire_cycles;
+
+    struct PendingWrite {
+        uint64_t paddr;
+        uint32_t len;
+        std::vector<Beat> beats;
+    };
+    std::deque<PendingWrite> g_pending_writes;
+
+    Tb() : top(new Vnonblock_banked_top) {}
+    ~Tb() { top->final(); delete top; }
+
+    void write64(uint64_t addr, uint64_t data) {
+        for (int i = 0; i < 8; ++i)
+            mem[addr + i] = (uint8_t)((data >> (8 * i)) & 0xFF);
+    }
+
+    uint64_t read64(uint64_t addr) {
+        uint64_t data = 0;
+        for (int i = 0; i < 8; ++i) {
+            auto it = mem.find(addr + i);
+            if (it == mem.end()) {
+                std::fprintf(stderr,
+                             "nonblock_banked_test: unmapped read @0x%016lx\n",
+                             (unsigned long)(addr + i));
+                std::abort();
+            }
+            data |= (uint64_t)it->second << (8 * i);
+        }
+        return data;
+    }
+
+    void write_beat(uint64_t addr, uint64_t data, uint8_t strb) {
+        for (int i = 0; i < 8; ++i)
+            if (strb & (1 << i))
+                mem[addr + i] = (uint8_t)((data >> (8 * i)) & 0xFF);
+    }
+
+    void setup_memory() {
+        // Extended DDT, 1-level, base 0x10000, stride 64.
+        // DID10 -> 0x10280, DID11 -> 0x102C0.
+        // Word order ascending: tc, iohgatp, ta, fsc, msiptp, mask, pattern, reserved.
+        write64(0x10280, 0x0000000000000001ULL);
+        write64(0x10288, 0x0000000000000000ULL);
+        write64(0x10290, 0x000000000000A000ULL); // pscid=10
+        write64(0x10298, 0x8000000000000020ULL); // Sv39, root 0x20
+        write64(0x102A0, 0x0ULL);
+        write64(0x102A8, 0x0ULL);
+        write64(0x102B0, 0x0ULL);
+        write64(0x102B8, 0x0ULL);
+
+        write64(0x102C0, 0x0000000000000001ULL);
+        write64(0x102C8, 0x0000000000000000ULL);
+        write64(0x102D0, 0x000000000000B000ULL); // pscid=11
+        write64(0x102D8, 0x8000000000000030ULL); // Sv39, root 0x30
+        write64(0x102E0, 0x0ULL);
+        write64(0x102E8, 0x0ULL);
+        write64(0x102F0, 0x0ULL);
+        write64(0x102F8, 0x0ULL);
+
+        // V page tables: root 0x20000, L1V 0x40000, L0V 0x50000.
+        write64(0x20000, 0x0000000000010001ULL);
+        write64(0x40400, 0x0000000000014001ULL);
+        write64(0x50000, 0x00000000200000DFULL); // Vsrc -> 0x80000000
+        write64(0x50008, 0x00000000200004DFULL); // Vdst -> 0x80001000
+        write64(0x50010, 0x00000000200000D3ULL); // Vro  -> 0x80000000, w=0
+        write64(0x50018, 0x00000000200008DFULL); // Vcold -> 0x80002000
+
+        // A page tables: root 0x30000, L1A 0x60000, L0A 0x70000.
+        write64(0x30000, 0x0000000000018001ULL);
+        write64(0x60800, 0x000000000001C001ULL);
+        write64(0x70000, 0x00000000240000DFULL); // Asrc -> 0x90000000
+        write64(0x70008, 0x00000000240004DFULL); // Adst -> 0x90001000
+
+        // Default completion memory.
+        for (int i = 0; i < 512; ++i)
+            write64(0x80000000 + (uint64_t)i * 8,
+                    0x1000000000000000ULL + (uint64_t)i);
+        for (int i = 0; i < 512; ++i)
+            write64(0x80001000 + (uint64_t)i * 8,
+                    0x2000000000000000ULL + (uint64_t)i);
+        for (int i = 0; i < 512; ++i)
+            write64(0x90000000 + (uint64_t)i * 8,
+                    0x3000000000000000ULL + (uint64_t)i);
+    }
+
+    void drive_upstream() {
+        top->fullbuffer_jobs_i = 0;
+        top->tr_aw_valid = up.aw_valid ? 1 : 0;
+        top->tr_aw_id    = up.aw_id;
+        top->tr_aw_addr  = up.aw_addr;
+        top->tr_aw_len   = up.aw_len;
+        top->tr_aw_size  = up.aw_size;
+        top->tr_aw_burst = up.aw_burst;
+        top->tr_aw_prot  = up.aw_prot;
+        top->tr_aw_user  = up.aw_user;
+        top->tr_aw_did   = up.aw_did;
+        top->tr_aw_ssid_valid = up.aw_ssid ? 1 : 0;
+        top->tr_aw_subid = up.aw_subid;
+        top->tr_aw_mmu_atst  = up.aw_atst ? 1 : 0;
+        top->tr_aw_mmu_valid = up.aw_mvalid ? 1 : 0;
+
+        top->tr_ar_valid = up.ar_valid ? 1 : 0;
+        top->tr_ar_id    = up.ar_id;
+        top->tr_ar_addr  = up.ar_addr;
+        top->tr_ar_len   = up.ar_len;
+        top->tr_ar_size  = up.ar_size;
+        top->tr_ar_burst = up.ar_burst;
+        top->tr_ar_prot  = up.ar_prot;
+        top->tr_ar_user  = up.ar_user;
+        top->tr_ar_did   = up.ar_did;
+        top->tr_ar_ssid_valid = up.ar_ssid ? 1 : 0;
+        top->tr_ar_subid = up.ar_subid;
+        top->tr_ar_mmu_atst  = up.ar_atst ? 1 : 0;
+        top->tr_ar_mmu_valid = up.ar_mvalid ? 1 : 0;
+
+        if (!up.wq.empty()) {
+            top->tr_w_valid = 1;
+            top->tr_w_data  = up.wq.front().data;
+            top->tr_w_strb  = up.wq.front().strb;
+            top->tr_w_last  = up.wq.front().last ? 1 : 0;
+        } else {
+            top->tr_w_valid = 0;
+            top->tr_w_data  = 0;
+            top->tr_w_strb  = 0;
+            top->tr_w_last  = 0;
+        }
+        top->tr_w_user = 0;
+
+        top->tr_b_ready = up.b_ready ? 1 : 0;
+        top->tr_r_ready = up.r_ready ? 1 : 0;
+    }
+
+    void drive_comp() {
+        top->comp_aw_ready = comp_aw_ready ? 1 : 0;
+        top->comp_ar_ready = comp_ar_ready ? 1 : 0;
+        top->comp_w_ready  = comp_w_ready  ? 1 : 0;
+        top->comp_b_valid  = comp_b_valid  ? 1 : 0;
+        top->comp_b_id     = comp_b_id;
+        top->comp_b_resp   = comp_b_resp;
+        top->comp_r_valid  = comp_r_valid  ? 1 : 0;
+        top->comp_r_id     = comp_r_id;
+        top->comp_r_data   = comp_r_data;
+        top->comp_r_resp   = comp_r_resp;
+        top->comp_r_last   = comp_r_last ? 1 : 0;
+    }
+
+    void drive_ddtw_r() {
+        if (ddtw_rd.pending) {
+            top->ddtw_r_valid = 1;
+            top->ddtw_r_data  =
+                read64(ddtw_rd.addr + (uint64_t)ddtw_rd.beat *
+                                           (1ULL << ddtw_rd.size));
+            top->ddtw_r_id    = ddtw_rd.id;
+            top->ddtw_r_resp  = 0;
+            top->ddtw_r_last  = (ddtw_rd.beat == ddtw_rd.len) ? 1 : 0;
+        } else {
+            top->ddtw_r_valid = 0;
+            top->ddtw_r_data  = 0;
+            top->ddtw_r_id    = 0;
+            top->ddtw_r_resp  = 0;
+            top->ddtw_r_last  = 0;
+        }
+    }
+
+    void drive_ptw_r() {
+        if (ptw_rd.pending && !hold_ptw_r) {
+            top->ptw_r_valid = 1;
+            top->ptw_r_data  =
+                read64(ptw_rd.addr + (uint64_t)ptw_rd.beat *
+                                          (1ULL << ptw_rd.size));
+            top->ptw_r_id    = ptw_rd.id;
+            top->ptw_r_resp  = 0;
+            top->ptw_r_last  = (ptw_rd.beat == ptw_rd.len) ? 1 : 0;
+        } else {
+            top->ptw_r_valid = 0;
+            top->ptw_r_data  = 0;
+            top->ptw_r_id    = 0;
+            top->ptw_r_resp  = 0;
+            top->ptw_r_last  = 0;
+        }
+    }
+
+    void try_drain_comp_w() {
+        while (!comp_w_q.empty() && !caw_q.empty()) {
+            CawEnt& c = caw_q.front();
+            CHECK_AT(c.have_exp,
+                     "comp W matched AW without expected beats");
+            CHECK_AT(c.got < (int)c.exp.size(),
+                     "too many comp W beats for AW");
+            const Beat& w = comp_w_q.front();
+            const Beat& e = c.exp[c.got];
+            CHECK_AT(e.data == w.data, "comp W data mismatch");
+            CHECK_AT(e.strb == w.strb, "comp W strb mismatch");
+            CHECK_AT(e.last == w.last, "comp W last mismatch");
+            write_beat(c.addr + (uint64_t)c.got * 8, w.data, w.strb);
+            ++c.got;
+            if (w.last) {
+                CHECK_AT(c.got == (int)c.len + 1,
+                         "comp W burst length != len+1");
+                b_q.push_back(std::make_pair(c.id, 0u));
+                caw_q.pop_front();
+            }
+            comp_w_q.pop_front();
+        }
+    }
+
+    void tick() {
+        top->nonblock_enable_i = nonblock_enable ? 1 : 0;
+        drive_upstream();
+        drive_comp();
+        top->ddtw_ar_ready = ddtw_rd.pending ? 0 : 1;
+        top->ptw_ar_ready  = ptw_rd.pending  ? 0 : 1;
+        drive_ddtw_r();
+        drive_ptw_r();
+
+        top->eval();
+
+        bool d_ar_fire = top->ddtw_ar_valid && top->ddtw_ar_ready;
+        uint64_t d_ar_addr = top->ddtw_ar_addr;
+        uint8_t d_ar_len   = top->ddtw_ar_len;
+        uint8_t d_ar_size  = top->ddtw_ar_size;
+        uint8_t d_ar_id    = top->ddtw_ar_id;
+        bool d_r_fire = ddtw_rd.pending && top->ddtw_r_valid && top->ddtw_r_ready;
+
+        bool p_ar_fire = top->ptw_ar_valid && top->ptw_ar_ready;
+        uint64_t p_ar_addr = top->ptw_ar_addr;
+        uint8_t p_ar_len   = top->ptw_ar_len;
+        uint8_t p_ar_size  = top->ptw_ar_size;
+        uint8_t p_ar_id    = top->ptw_ar_id;
+        bool p_r_fire = ptw_rd.pending && top->ptw_r_valid && top->ptw_r_ready;
+
+        bool up_aw_fire = up.aw_valid && top->tr_aw_ready;
+        bool up_ar_fire = up.ar_valid && top->tr_ar_ready;
+        bool up_w_fire  = !up.wq.empty() && top->tr_w_ready;
+        bool up_b_fire  = top->tr_b_valid && up.b_ready;
+        bool up_r_fire  = top->tr_r_valid && up.r_ready;
+
+        bool cmp_aw_fire = top->comp_aw_valid && top->comp_aw_ready;
+        bool cmp_ar_fire = top->comp_ar_valid && top->comp_ar_ready;
+        bool cmp_w_fire  = top->comp_w_valid && top->comp_w_ready;
+        bool cmp_b_fire  = comp_b_valid && top->comp_b_ready;
+        bool cmp_r_fire  = comp_r_valid && top->comp_r_ready;
+
+        if (top->nonblock_fire_o)
+            L_nonblock_fire_cycles.push_back(g_cycle);
+
+        if (up_aw_fire) {
+            L_up_aw.push_back({g_cycle, up.aw_id, up.aw_addr, up.aw_len});
+            up.w_attrib.push_back(std::make_pair(up.aw_id, (int)up.aw_len + 1));
+            up.aw_valid = false;
+        }
+        if (up_ar_fire) {
+            L_up_ar.push_back({g_cycle, up.ar_id, up.ar_addr, up.ar_len});
+            up.ar_valid = false;
+        }
+        if (up_w_fire) {
+            uint32_t wid = up.w_attrib.empty() ? 0u : up.w_attrib.front().first;
+            L_up_w.push_back({g_cycle, wid, up.wq.front().data,
+                              up.wq.front().strb, up.wq.front().last});
+            if (!up.w_attrib.empty()) {
+                if (--up.w_attrib.front().second <= 0)
+                    up.w_attrib.pop_front();
+            }
+            up.wq.pop_front();
+        }
+        if (up_b_fire)
+            L_up_b.push_back({g_cycle, top->tr_b_id, (uint32_t)top->tr_b_resp});
+        if (up_r_fire)
+            L_up_r.push_back({g_cycle, top->tr_r_id, top->tr_r_data,
+                              (bool)top->tr_r_last, (uint32_t)top->tr_r_resp});
+
+        if (cmp_aw_fire) {
+            L_cmp_aw.push_back({g_cycle, top->comp_aw_id,
+                                top->comp_aw_addr, top->comp_aw_len});
+            CHECK_AT(!g_pending_writes.empty(),
+                     "comp AW with no expected write");
+            PendingWrite& pw = g_pending_writes.front();
+            CHECK_AT(pw.paddr == top->comp_aw_addr &&
+                     pw.len == top->comp_aw_len,
+                     "comp AW unexpected addr/len");
+            CawEnt c;
+            c.id       = top->comp_aw_id;
+            c.addr     = top->comp_aw_addr;
+            c.len      = top->comp_aw_len;
+            c.exp      = pw.beats;
+            c.have_exp = true;
+            c.got      = 0;
+            caw_q.push_back(c);
+            g_pending_writes.pop_front();
+            try_drain_comp_w();
+        }
+
+        if (cmp_ar_fire) {
+            L_cmp_ar.push_back({g_cycle, top->comp_ar_id,
+                                top->comp_ar_addr, top->comp_ar_len});
+            for (uint32_t i = 0; i <= (uint32_t)top->comp_ar_len; ++i) {
+                Beat rb;
+                rb.data = read64(top->comp_ar_addr + (uint64_t)i * 8);
+                rb.strb = 0xFF;
+                rb.last = (i == (uint32_t)top->comp_ar_len);
+                rb.id = top->comp_ar_id;
+                r_q.push_back(rb);
+            }
+        }
+
+        if (cmp_w_fire) {
+            L_cmp_w.push_back({g_cycle, top->comp_w_data,
+                               (uint8_t)top->comp_w_strb,
+                               (bool)top->comp_w_last});
+            Beat wb;
+            wb.data = top->comp_w_data;
+            wb.strb = (uint8_t)top->comp_w_strb;
+            wb.last = (bool)top->comp_w_last;
+            wb.id   = 0;
+            comp_w_q.push_back(wb);
+            try_drain_comp_w();
+        }
+
+        if (cmp_b_fire) { b_q.pop_front(); comp_b_valid = false; }
+        if (cmp_r_fire) { r_q.pop_front(); comp_r_valid = false; }
+
+        top->clk_i = 1;
+        top->eval();
+
+        if (d_ar_fire) {
+            if (ddtw_rd.pending) FAIL_AT("DDTW AR while pending");
+            ddtw_rd.pending = true;
+            ddtw_rd.addr    = d_ar_addr;
+            ddtw_rd.len     = d_ar_len;
+            ddtw_rd.size    = d_ar_size;
+            ddtw_rd.id      = d_ar_id;
+            ddtw_rd.beat    = 0;
+        }
+        if (d_r_fire) {
+            if (ddtw_rd.beat == ddtw_rd.len) ddtw_rd.pending = false;
+            else                             ddtw_rd.beat++;
+        }
+
+        if (p_ar_fire) {
+            if (ptw_rd.pending) FAIL_AT("PTW AR while pending");
+            ptw_rd.pending = true;
+            ptw_rd.addr    = p_ar_addr;
+            ptw_rd.len     = p_ar_len;
+            ptw_rd.size    = p_ar_size;
+            ptw_rd.id      = p_ar_id;
+            ptw_rd.beat    = 0;
+            if (a_ptw_hold_armed && p_ar_addr >= 0x30000ULL &&
+                p_ar_addr < 0x80000ULL) {
+                hold_ptw_r       = true;
+                a_ptw_hold_armed = false;
+            }
+        }
+        if (p_r_fire) {
+            if (ptw_rd.beat == ptw_rd.len) ptw_rd.pending = false;
+            else                           ptw_rd.beat++;
+        }
+
+        if (!comp_b_valid && !b_q.empty()) {
+            comp_b_valid = true;
+            comp_b_id    = b_q.front().first;
+            comp_b_resp  = b_q.front().second;
+        }
+        if (!comp_r_valid && !r_q.empty()) {
+            comp_r_valid = true;
+            comp_r_id    = r_q.front().id;
+            comp_r_data  = r_q.front().data;
+            comp_r_resp  = 0;
+            comp_r_last  = r_q.front().last;
+        }
+
+        top->clk_i = 0;
+        top->eval();
+        ++g_cycle;
+    }
+
+    void reset(bool enable) {
+        nonblock_enable = enable;
+        top->clk_i  = 0;
+        top->rst_ni = 0;
+        top->fullbuffer_jobs_i = 0;
+
+        up = Up();
+        caw_q.clear(); b_q.clear(); r_q.clear(); comp_w_q.clear();
+        ddtw_rd = AxiReadState();
+        ptw_rd  = AxiReadState();
+        hold_ptw_r = false;
+        a_ptw_hold_armed = false;
+        comp_aw_ready = true; comp_ar_ready = true; comp_w_ready = true;
+        comp_b_valid = false; comp_r_valid = false;
+        L_up_aw.clear(); L_up_ar.clear(); L_up_w.clear();
+        L_up_b.clear(); L_up_r.clear();
+        L_cmp_aw.clear(); L_cmp_ar.clear(); L_cmp_w.clear();
+        L_nonblock_fire_cycles.clear();
+        g_pending_writes.clear();
+
+        for (int i = 0; i < 8; ++i) tick();
+        top->rst_ni = 1;
+        for (int i = 0; i < 2; ++i) tick();
+    }
+
+    bool wait_for_up_ar(size_t prev, int maxc = 50000) {
+        for (int i = 0; i < maxc; ++i) {
+            tick();
+            if (L_up_ar.size() > prev) return true;
+        }
+        return false;
+    }
+
+    bool wait_for_up_r(size_t prev, int maxc = 50000) {
+        for (int i = 0; i < maxc; ++i) {
+            tick();
+            if (L_up_r.size() > prev) return true;
+        }
+        return false;
+    }
+
+    bool wait_for_up_r_count(size_t prev, size_t count, int maxc = 50000) {
+        for (int i = 0; i < maxc; ++i) {
+            tick();
+            if (L_up_r.size() >= prev + count) return true;
+        }
+        return false;
+    }
+
+    size_t count_up_r_last(size_t start) {
+        size_t n = 0;
+        for (size_t i = start; i < L_up_r.size(); ++i)
+            if (L_up_r[i].last) ++n;
+        return n;
+    }
+
+    bool wait_for_comp_ar_valid(int maxc = 50000) {
+        for (int i = 0; i < maxc; ++i) {
+            tick();
+            if (top->comp_ar_valid) return true;
+        }
+        return false;
+    }
+
+    bool wait_for_up_b(size_t prev, int maxc = 50000) {
+        for (int i = 0; i < maxc; ++i) {
+            tick();
+            if (L_up_b.size() > prev) return true;
+        }
+        return false;
+    }
+
+    bool wait_for_ptw_hold(int maxc = 50000) {
+        for (int i = 0; i < maxc; ++i) {
+            tick();
+            if (hold_ptw_r) return true;
+        }
+        return false;
+    }
+
+    void start_read(uint32_t id, uint64_t iova, uint32_t len, uint32_t did) {
+        CHECK_AT(!up.ar_valid, "start_read: previous AR still valid");
+        up.ar_valid = true;
+        up.ar_id    = id;
+        up.ar_addr  = iova;
+        up.ar_len   = len;
+        up.ar_size  = 3;
+        up.ar_burst = 1;
+        up.ar_prot  = 0;
+        up.ar_did   = did;
+    }
+
+    void start_write(uint32_t id, uint64_t iova, uint32_t len, uint32_t did,
+                     const std::vector<Beat>& beats) {
+        CHECK_AT(!up.aw_valid, "start_write: previous AW still valid");
+        CHECK_AT(up.wq.empty(), "start_write: previous W queue not empty");
+        up.aw_valid = true;
+        up.aw_id    = id;
+        up.aw_addr  = iova;
+        up.aw_len   = len;
+        up.aw_size  = 3;
+        up.aw_burst = 1;
+        up.aw_prot  = 0;
+        up.aw_did   = did;
+        up.wq.clear();
+        for (size_t i = 0; i < beats.size(); ++i)
+            up.wq.push_back(beats[i]);
+    }
+
+    void check_quiet() {
+        for (int i = 0; i < 20; ++i) tick();
+        CHECK_AT(!top->in_flight_o, "in_flight_o not low after quiet drain");
+        CHECK_AT(!top->nonblock_busy_o, "nonblock_busy_o not low after quiet drain");
+        CHECK_AT(!up.aw_valid && !up.ar_valid, "upstream header still valid");
+        CHECK_AT(up.wq.empty() && up.w_attrib.empty(), "upstream W queue not empty");
+        CHECK_AT(r_q.empty() && b_q.empty() && caw_q.empty(),
+                 "pending response/AW queues not empty");
+        CHECK_AT(comp_w_q.empty(), "pending completion W queue not empty");
+        CHECK_AT(g_pending_writes.empty(), "expected write queue not empty");
+        size_t r_sz = L_up_r.size();
+        size_t b_sz = L_up_b.size();
+        size_t cmp_aw_sz = L_cmp_aw.size();
+        size_t cmp_ar_sz = L_cmp_ar.size();
+        size_t cmp_w_sz = L_cmp_w.size();
+        for (int i = 0; i < 20; ++i) tick();
+        CHECK_AT(L_up_r.size() == r_sz && L_up_b.size() == b_sz,
+                 "R/B activity after quiet drain");
+        CHECK_AT(L_cmp_aw.size() == cmp_aw_sz &&
+                 L_cmp_ar.size() == cmp_ar_sz &&
+                 L_cmp_w.size() == cmp_w_sz,
+                 "completion activity after quiet drain");
+        CHECK_AT(!top->in_flight_o && !top->nonblock_busy_o,
+                 "DUT busy after extended quiet drain");
+    }
+
+    void warm_leaf(uint64_t iova, uint64_t exp_pa, uint32_t did, uint32_t id) {
+        size_t prev_r = L_up_r.size();
+        size_t prev_ar = L_cmp_ar.size();
+        start_read(id, iova, 0, did);
+        if (!wait_for_up_r_count(prev_r, 1))
+            FAIL_AT("warm_leaf: no upstream R");
+        CHECK_AT(L_up_r.size() == prev_r + 1,
+                 "warm_leaf: unexpected R beat count");
+        CHECK_AT(L_cmp_ar.size() == prev_ar + 1,
+                 "warm_leaf: missing completion AR");
+        const CmpArRec& car = L_cmp_ar.back();
+        CHECK_AT(car.addr == exp_pa, "warm_leaf: comp AR addr mismatch");
+        CHECK_AT(car.id == id, "warm_leaf: comp AR id mismatch");
+        UpRRec r = L_up_r.back();
+        CHECK_AT(r.id == id, "warm_leaf: R id mismatch");
+        CHECK_AT(r.resp == 0, "warm_leaf: R resp not OKAY");
+        CHECK_AT(r.last, "warm_leaf: R last not set");
+        CHECK_AT(r.data == read64(exp_pa), "warm_leaf: R data mismatch");
+    }
+
+    void warm_v() {
+        warm_leaf(VSRC_IOVA, VSRC_PA, V_DID, V_ID);
+        warm_leaf(VDST_IOVA, VDST_PA, V_DID, V_ID);
+        warm_leaf(VRO_IOVA,  VSRC_PA, V_DID, V_ID);
+    }
+
+    void case_fast_hit_during_held_a() {
+        std::printf("== fast V hit while A held ==\n");
+        mem.clear(); setup_memory();
+        reset(true);
+        warm_v();
+
+        a_ptw_hold_armed = true;
+        hold_ptw_r       = false;
+        size_t prev_a_ar = L_up_ar.size();
+        start_read(A_ID, A_IOVA, 0, A_DID);
+        if (!wait_for_up_ar(prev_a_ar)) FAIL_AT("A AR not accepted");
+        if (!wait_for_ptw_hold()) FAIL_AT("A PTW not held");
+        CHECK_AT(top->in_flight_o, "in_flight_o low while A held");
+
+        size_t prev_v_r = L_up_r.size();
+        size_t prev_fire = L_nonblock_fire_cycles.size();
+        start_read(V_ID, VSRC_IOVA, 0, V_DID);
+        if (!wait_for_up_r(prev_v_r))
+            FAIL_AT("V cached read did not complete while A held");
+        CHECK_AT(L_up_r.size() == prev_v_r + 1,
+                 "A completed while held");
+        CHECK_AT(top->in_flight_o, "in_flight_o low while A still held");
+        CHECK_AT(L_nonblock_fire_cycles.size() > prev_fire,
+                 "V cached read did not trigger nonblock_fire");
+        UpRRec vr = L_up_r.back();
+        CHECK_AT(vr.id == V_ID, "V R id mismatch");
+        CHECK_AT(vr.resp == 0, "V R resp not OKAY");
+        CHECK_AT(vr.last, "V R last not set");
+        CHECK_AT(vr.data == read64(VSRC_PA), "V R data mismatch");
+
+        hold_ptw_r = false;
+        size_t prev_a_r = L_up_r.size();
+        if (!wait_for_up_r(prev_a_r)) FAIL_AT("A did not complete after release");
+        CHECK_AT(L_up_r.size() == prev_a_r + 1, "extra R after A release");
+        UpRRec ar = L_up_r.back();
+        CHECK_AT(ar.id == A_ID, "A R id mismatch");
+        CHECK_AT(ar.resp == 0, "A R resp not OKAY");
+        CHECK_AT(ar.last, "A R last not set");
+        CHECK_AT(ar.data == read64(A_PA), "A R data mismatch");
+        check_quiet();
+    }
+
+    void case_nonblock_disabled_blocks() {
+        std::printf("== nonblock disabled blocks V until A released ==\n");
+        mem.clear(); setup_memory();
+        reset(false);
+        warm_v();
+
+        a_ptw_hold_armed = true; hold_ptw_r = false;
+        size_t prev_a_ar = L_up_ar.size();
+        start_read(A_ID, A_IOVA, 0, A_DID);
+        if (!wait_for_up_ar(prev_a_ar)) FAIL_AT("A AR not accepted");
+        if (!wait_for_ptw_hold()) FAIL_AT("A PTW not held");
+
+        size_t prev_v_r  = L_up_r.size();
+        size_t prev_fire = L_nonblock_fire_cycles.size();
+        start_read(V_ID, VSRC_IOVA, 0, V_DID);
+        for (int i = 0; i < 200; ++i) tick();
+        CHECK_AT(L_up_r.size() == prev_v_r,
+                 "V completed while nonblock disabled and A held");
+        CHECK_AT(L_nonblock_fire_cycles.size() == prev_fire,
+                 "nonblock_fire occurred while disabled");
+
+        hold_ptw_r = false;
+        size_t prev_a_r = L_up_r.size();
+        if (!wait_for_up_r_count(prev_a_r, 2))
+            FAIL_AT("A/V did not complete after release");
+        CHECK_AT(L_up_r.size() == prev_a_r + 2,
+                 "unexpected R beat count after release");
+        UpRRec ar = L_up_r[prev_a_r];
+        CHECK_AT(ar.id == A_ID, "A R id mismatch");
+        CHECK_AT(ar.resp == 0, "A R resp not OKAY");
+        CHECK_AT(ar.last, "A R last not set");
+        CHECK_AT(ar.data == read64(A_PA), "A R data mismatch");
+        UpRRec vr = L_up_r[prev_a_r + 1];
+        CHECK_AT(vr.id == V_ID, "V R id mismatch");
+        CHECK_AT(vr.resp == 0, "V R resp not OKAY");
+        CHECK_AT(vr.last, "V R last not set");
+        CHECK_AT(vr.data == read64(VSRC_PA), "V R data mismatch");
+        CHECK_AT(L_nonblock_fire_cycles.size() == prev_fire,
+                 "nonblock_fire occurred after release with disabled");
+        check_quiet();
+    }
+
+    void case_write_128beats() {
+        std::printf("== ordinary legal V write, 128 beats ==\n");
+        mem.clear(); setup_memory();
+        reset(true);
+        warm_v();
+
+        uint32_t len = 127;
+        std::vector<Beat> beats;
+        for (uint32_t i = 0; i <= len; ++i) {
+            Beat b;
+            b.data = ((uint64_t)0x1111 << 48) | ((uint64_t)i << 8) | (i & 0xFF);
+            b.strb = (uint8_t)(0xA5 ^ (i & 0xFF));
+            b.last = (i == len);
+            beats.push_back(b);
+        }
+        g_pending_writes.push_back({VDST_PA, len, beats});
+        size_t prev_b = L_up_b.size();
+        size_t prev_aw = L_cmp_aw.size();
+        size_t prev_w = L_cmp_w.size();
+        start_write(V_ID, VDST_IOVA, len, V_DID, beats);
+        if (!wait_for_up_b(prev_b)) FAIL_AT("V write did not complete");
+        CHECK_AT(L_up_b.size() == prev_b + 1, "unexpected B count");
+        CHECK_AT(L_cmp_aw.size() == prev_aw + 1, "unexpected comp AW count");
+        CHECK_AT(L_cmp_w.size() == prev_w + (size_t)(len + 1),
+                 "unexpected comp W count");
+        CHECK_AT(L_up_b.back().id == V_ID, "V write B id mismatch");
+        CHECK_AT(L_up_b.back().resp == 0, "V write B resp not OKAY");
+        CHECK_AT(L_cmp_aw.back().id == V_ID, "comp AW id mismatch");
+        CHECK_AT(L_cmp_aw.back().addr == VDST_PA, "comp AW addr mismatch");
+        CHECK_AT(L_cmp_aw.back().len == len, "comp AW len mismatch");
+        for (uint32_t i = 0; i <= len; ++i) {
+            uint64_t got = read64(VDST_PA + (uint64_t)i * 8);
+            uint64_t orig = 0x2000000000000000ULL + (uint64_t)i;
+            for (int byte = 0; byte < 8; ++byte) {
+                uint8_t exp_byte;
+                if (beats[i].strb & (1 << byte)) {
+                    exp_byte = (beats[i].data >> (8 * byte)) & 0xFF;
+                } else {
+                    exp_byte = (orig >> (8 * byte)) & 0xFF;
+                }
+                uint8_t got_byte = (got >> (8 * byte)) & 0xFF;
+                CHECK_AT(exp_byte == got_byte,
+                         "memory byte mismatch after partial write");
+            }
+        }
+        check_quiet();
+    }
+
+    void case_4kib_read_split() {
+        std::printf("== 4KiB read split into 2x256 beats ==\n");
+        mem.clear(); setup_memory();
+        reset(true);
+        warm_v();
+
+        for (uint32_t i = 0; i < 512; ++i) {
+            write64(VSRC_PA + (uint64_t)i * 8,
+                    ((uint64_t)0xABCD << 48) | i);
+        }
+
+        size_t prev_r = L_up_r.size();
+        size_t prev_ar = L_cmp_ar.size();
+        size_t prev_up_ar = L_up_ar.size();
+
+        start_read(V_ID, VSRC_IOVA, 255, V_DID);
+        if (!wait_for_up_ar(prev_up_ar))
+            FAIL_AT("first 4KiB read header not accepted");
+        prev_up_ar = L_up_ar.size();
+        start_read(V_ID, VSRC_IOVA + 0x800, 255, V_DID);
+        if (!wait_for_up_ar(prev_up_ar))
+            FAIL_AT("second 4KiB read header not accepted");
+
+        if (!wait_for_up_r_count(prev_r, 512))
+            FAIL_AT("4KiB read did not return 512 beats");
+        CHECK_AT(L_up_r.size() == prev_r + 512,
+                 "unexpected 4KiB read beat count");
+        CHECK_AT(count_up_r_last(prev_r) == 2,
+                 "expected two 4KiB read last beats");
+        CHECK_AT(L_cmp_ar.size() == prev_ar + 2,
+                 "expected two 4KiB completion ARs");
+        CHECK_AT(L_cmp_ar[L_cmp_ar.size() - 2].addr == VSRC_PA,
+                 "first 4KiB AR addr mismatch");
+        CHECK_AT(L_cmp_ar[L_cmp_ar.size() - 1].addr == VSRC_PA + 0x800,
+                 "second 4KiB AR addr mismatch");
+
+        for (uint32_t i = 0; i < 512; ++i) {
+            uint64_t exp = ((uint64_t)0xABCD << 48) | i;
+            CHECK_AT(L_up_r[prev_r + i].data == exp,
+                     "4KiB read data mismatch");
+            bool exp_last = (i == 255 || i == 511);
+            CHECK_AT(L_up_r[prev_r + i].last == exp_last,
+                     "4KiB read last mismatch");
+            CHECK_AT(L_up_r[prev_r + i].id == V_ID,
+                     "4KiB read id mismatch");
+        }
+        check_quiet();
+    }
+
+    void case_4kib_write_split() {
+        std::printf("== 4KiB write split into 2x256 full-strobe beats ==\n");
+        mem.clear(); setup_memory();
+        reset(true);
+        warm_v();
+
+        uint32_t len = 255;
+        std::vector<Beat> beats1, beats2;
+        for (uint32_t i = 0; i <= len; ++i) {
+            Beat b;
+            b.data = make_test_word(i);
+            b.strb = 0xFF;
+            b.last = (i == len);
+            beats1.push_back(b);
+        }
+        for (uint32_t i = 0; i <= len; ++i) {
+            Beat b;
+            b.data = make_test_word(256 + i);
+            b.strb = 0xFF;
+            b.last = (i == len);
+            beats2.push_back(b);
+        }
+        g_pending_writes.push_back({VDST_PA, len, beats1});
+        g_pending_writes.push_back({VDST_PA + 0x800, len, beats2});
+
+        size_t start_b = L_up_b.size();
+        size_t prev_aw = L_cmp_aw.size();
+        size_t prev_w = L_cmp_w.size();
+        start_write(V_ID, VDST_IOVA, len, V_DID, beats1);
+        if (!wait_for_up_b(start_b))
+            FAIL_AT("first 4KiB write half did not complete");
+        CHECK_AT(L_up_b.size() == start_b + 1,
+                 "expected first 4KiB B");
+        size_t mid_b = L_up_b.size();
+        start_write(V_ID, VDST_IOVA + 0x800, len, V_DID, beats2);
+        if (!wait_for_up_b(mid_b))
+            FAIL_AT("second 4KiB write half did not complete");
+        CHECK_AT(L_up_b.size() == start_b + 2,
+                 "expected exactly two B for 4KiB write");
+        CHECK_AT(L_up_b[start_b].id == V_ID &&
+                 L_up_b[start_b].resp == 0,
+                 "first 4KiB B mismatch");
+        CHECK_AT(L_up_b[start_b + 1].id == V_ID &&
+                 L_up_b[start_b + 1].resp == 0,
+                 "second 4KiB B mismatch");
+        CHECK_AT(L_cmp_aw.size() == prev_aw + 2,
+                 "expected exactly two comp AW for 4KiB write");
+        CHECK_AT(L_cmp_w.size() == prev_w + 512,
+                 "expected exactly 512 comp W for 4KiB write");
+        CHECK_AT(L_cmp_aw[L_cmp_aw.size() - 2].addr == VDST_PA,
+                 "first 4KiB comp AW addr mismatch");
+        CHECK_AT(L_cmp_aw[L_cmp_aw.size() - 2].len == len,
+                 "first 4KiB comp AW len mismatch");
+        CHECK_AT(L_cmp_aw[L_cmp_aw.size() - 2].id == V_ID,
+                 "first 4KiB comp AW id mismatch");
+        CHECK_AT(L_cmp_aw[L_cmp_aw.size() - 1].addr == VDST_PA + 0x800,
+                 "second 4KiB comp AW addr mismatch");
+        CHECK_AT(L_cmp_aw[L_cmp_aw.size() - 1].len == len,
+                 "second 4KiB comp AW len mismatch");
+        CHECK_AT(L_cmp_aw[L_cmp_aw.size() - 1].id == V_ID,
+                 "second 4KiB comp AW id mismatch");
+        for (uint32_t i = 0; i < 512; ++i) {
+            uint64_t exp = make_test_word(i);
+            uint64_t got = read64(VDST_PA + (uint64_t)i * 8);
+            CHECK_AT(got == exp, "4KiB full-strobe memory mismatch");
+        }
+        check_quiet();
+    }
+
+    void case_readonly_write_fault() {
+        std::printf("== read-only V write fault ==\n");
+        mem.clear(); setup_memory();
+        reset(true);
+        warm_v();
+
+        size_t prev_b  = L_up_b.size();
+        size_t prev_aw = L_cmp_aw.size();
+        size_t prev_w  = L_cmp_w.size();
+        std::vector<Beat> beats;
+        Beat b; b.data = 0xDEADBEEF; b.strb = 0xFF; b.last = true;
+        beats.push_back(b);
+        start_write(V_ID, VRO_IOVA, 0, V_DID, beats);
+        if (!wait_for_up_b(prev_b))
+            FAIL_AT("readonly write did not return B");
+        CHECK_AT(L_up_b.back().id == V_ID, "readonly fault B id mismatch");
+        CHECK_AT(L_up_b.back().resp == 2,
+                 "readonly fault B resp != SLVERR");
+        CHECK_AT(L_cmp_aw.size() == prev_aw,
+                 "readonly write reached completion AW");
+        CHECK_AT(L_cmp_w.size() == prev_w,
+                 "readonly write reached completion W");
+        check_quiet();
+    }
+
+    void case_completion_backpressure() {
+        std::printf("== completion AW backpressure ==\n");
+        mem.clear(); setup_memory();
+        reset(true);
+        warm_v();
+
+        comp_aw_ready = false;
+        std::vector<Beat> beats;
+        Beat b; b.data = 0x1234; b.strb = 0xFF; b.last = true;
+        beats.push_back(b);
+        g_pending_writes.push_back({VDST_PA, 0, beats});
+        start_write(V_ID, VDST_IOVA, 0, V_DID, beats);
+        int seen = 0;
+        uint64_t addr0 = 0;
+        for (int i = 0; i < 50; ++i) {
+            tick();
+            if (top->comp_aw_valid) {
+                if (seen == 0) addr0 = top->comp_aw_addr;
+                else CHECK_AT(top->comp_aw_addr == addr0,
+                              "comp AW addr changed while stalled");
+                ++seen;
+            }
+        }
+        CHECK_AT(seen > 0, "comp AW never asserted while stalled");
+        comp_aw_ready = true;
+        size_t prev_b = L_up_b.size();
+        if (!wait_for_up_b(prev_b))
+            FAIL_AT("write did not complete after backpressure release");
+        CHECK_AT(L_up_b.back().id == V_ID, "backpressure B id mismatch");
+        check_quiet();
+    }
+
+    void case_a_held_v_write() {
+        std::printf("== A held, V write while A stalled ==\n");
+        mem.clear(); setup_memory();
+        reset(true);
+        warm_v();
+
+        a_ptw_hold_armed = true; hold_ptw_r = false;
+        size_t prev_a_ar = L_up_ar.size();
+        start_read(A_ID, A_IOVA, 0, A_DID);
+        if (!wait_for_up_ar(prev_a_ar)) FAIL_AT("A AR not accepted");
+        if (!wait_for_ptw_hold()) FAIL_AT("A PTW not held");
+
+        size_t prev_fire = L_nonblock_fire_cycles.size();
+        size_t prev_v_b  = L_up_b.size();
+        std::vector<Beat> beats;
+        Beat b; b.data = 0x5555; b.strb = 0xFF; b.last = true;
+        beats.push_back(b);
+        g_pending_writes.push_back({VDST_PA, 0, beats});
+        start_write(V_ID, VDST_IOVA, 0, V_DID, beats);
+        for (int i = 0; i < 100; ++i) tick();
+        CHECK_AT(L_nonblock_fire_cycles.size() > prev_fire,
+                 "V write did not trigger nonblock_fire while A held");
+
+        hold_ptw_r = false;
+        size_t prev_a_r = L_up_r.size();
+        if (!wait_for_up_r(prev_a_r))
+            FAIL_AT("A did not complete after release");
+
+        for (int i = 0; i < 50000 && L_up_b.size() == prev_v_b; ++i)
+            tick();
+        CHECK_AT(L_up_b.size() > prev_v_b,
+                 "V write did not complete eventually");
+        CHECK_AT(L_up_b.back().id == V_ID, "V write B id mismatch");
+        check_quiet();
+    }
+
+    void case_same_bank_ordering() {
+        std::printf("== same-bank concurrent ordering ==\n");
+        mem.clear(); setup_memory();
+        reset(true);
+        warm_v();
+
+        comp_ar_ready = false;
+        size_t prev_ar = L_up_ar.size();
+        start_read(V_ID, VSRC_IOVA, 0, V_DID);
+        if (!wait_for_up_ar(prev_ar))
+            FAIL_AT("first same-bank AR not accepted");
+        if (!wait_for_comp_ar_valid())
+            FAIL_AT("first same-bank comp AR not asserted");
+        CHECK_AT(top->comp_ar_addr == VSRC_PA,
+                 "first comp AR addr mismatch");
+        CHECK_AT(top->comp_ar_id == V_ID,
+                 "first comp AR id mismatch");
+
+        prev_ar = L_up_ar.size();
+        start_read(V_ID, VDST_IOVA, 0, V_DID);
+        if (!wait_for_up_ar(prev_ar))
+            FAIL_AT("second same-bank AR not accepted while first held");
+
+        comp_ar_ready = true;
+        size_t prev_r = L_up_r.size();
+        if (!wait_for_up_r_count(prev_r, 2))
+            FAIL_AT("same-bank reads did not complete");
+        CHECK_AT(L_up_r.size() == prev_r + 2,
+                 "unexpected same-bank R count");
+        CHECK_AT(count_up_r_last(prev_r) == 2,
+                 "expected two same-bank R last beats");
+        CHECK_AT(L_cmp_ar.size() >= 2,
+                 "not enough completion AR");
+        CHECK_AT(L_cmp_ar[L_cmp_ar.size() - 2].addr == VSRC_PA,
+                 "first AR addr mismatch");
+        CHECK_AT(L_cmp_ar[L_cmp_ar.size() - 1].addr == VDST_PA,
+                 "second AR addr mismatch");
+        CHECK_AT(L_up_r[prev_r].id == V_ID, "first R id mismatch");
+        CHECK_AT(L_up_r[prev_r].data == read64(VSRC_PA),
+                 "first R data mismatch");
+        CHECK_AT(L_up_r[prev_r].last, "first R last not set");
+        CHECK_AT(L_up_r[prev_r + 1].id == V_ID, "second R id mismatch");
+        CHECK_AT(L_up_r[prev_r + 1].data == read64(VDST_PA),
+                 "second R data mismatch");
+        CHECK_AT(L_up_r[prev_r + 1].last, "second R last not set");
+        check_quiet();
+    }
+};
+
+int main(int argc, char** argv) {
+    Verilated::commandArgs(argc, argv);
+
+    Tb tb;
+    tb.case_fast_hit_during_held_a();
+    tb.case_nonblock_disabled_blocks();
+    tb.case_write_128beats();
+    tb.case_4kib_read_split();
+    tb.case_4kib_write_split();
+    tb.case_readonly_write_fault();
+    tb.case_completion_backpressure();
+    tb.case_a_held_v_write();
+    tb.case_same_bank_ordering();
+
+    std::printf("nonblock_banked_test: PASS\n");
+    return 0;
+}

@@ -1,0 +1,430 @@
+--- configure_key.py
++++ configure_key.py
+@@ -73,9 +73,14 @@
+ MCP_TOOL_TIMEOUT_SEC = 660
+ MCP_STARTUP_TIMEOUT_SEC = 20
+ 
++# The Codex CLI writes the nested MCP table, so both spellings below denote
++# exactly mcp_servers.claude-advisor (a bare TOML key may contain "-", and a
++# quoted key segment is the other legal spelling). A header such as
++# ["mcp_servers.claude-advisor"] is deliberately NOT accepted: that is a
++# different, literal top-level table whose single key merely contains a dot.
+ MCP_TABLE_HEADERS = (
+     '[mcp_servers.' + MCP_SERVER_NAME + ']',
+-    '["mcp_servers.' + MCP_SERVER_NAME + '"]',
++    '[mcp_servers."' + MCP_SERVER_NAME + '"]',
+ )
+ MCP_NOT_FOUND_MARKER = 'no mcp server named'
+ 
+@@ -655,15 +660,61 @@
+     return match.group(1) if match else None
+ 
+ 
++# TOML multi-line basic ("""...""") and multi-line literal ('''...''')
++# strings may contain anything, a table-header lookalike included. Spotting
++# them reliably would need a full TOML parser, which this key-free installer
++# deliberately does not embed, so such a file is refused instead and the
++# caller reports the timeouts as pending. Documented supported safe subset:
++# single-line key/value pairs, comments and nested tables.
++TRIPLE_QUOTES = ('"""', "'''")
++
++
++def _has_multiline_string(text: str) -> bool:
++    return any(marker in text for marker in TRIPLE_QUOTES)
++
++
++def _line_ending(line: str) -> Optional[str]:
++    '''The exact terminator of one splitlines(keepends=True) element.'''
++    if line.endswith('\r\n'):
++        return '\r\n'
++    if line.endswith('\n'):
++        return '\n'
++    if line.endswith('\r'):
++        return '\r'
++    return None
++
++
++def _detect_newline(lines: List[str], header: int) -> str:
++    '''The header line's own terminator, else the first one in the file.'''
++    ending = _line_ending(lines[header])
++    if ending is not None:
++        return ending
++    for line in lines:
++        ending = _line_ending(line)
++        if ending is not None:
++            return ending
++    return '\n'
++
++
+ def render_server_timeouts(text: str, tool_timeout: int, startup_timeout: int) -> Optional[str]:
+     '''Return text with the two MCP timeouts set, or None when unsafe.
+ 
+-    Only the exact, unique table header written by the Codex CLI
+-    ([mcp_servers.claude-advisor], quoted or not) is accepted; every other
+-    byte of the file, including all other tables and comments, is preserved.
+-    A missing or ambiguous header returns None so the caller reports pending
+-    instead of guessing at a string that merely looks like a table.
++    Only the exact, unique nested header denoting mcp_servers.claude-advisor
++    ([mcp_servers.claude-advisor], or the equivalent
++    [mcp_servers."claude-advisor"]) is accepted. The prefix before the header,
++    every other table (nested sub-tables included), every comment and every
++    other byte of UTF-8 text are preserved verbatim; the only differences are
++    the two timeout keys inside that one table, written with the file's own
++    line terminator.
++
++    Safe subset, documented on purpose: with no TOML parser, a file containing
++    any multi-line (triple-quoted) string is refused (None), because a
++    multi-line prompt could otherwise hide a table-header lookalike. A
++    missing, whole-quoted or ambiguous header also returns None so the caller
++    reports pending instead of guessing.
+     '''
++    if _has_multiline_string(text):
++        return None
+     lines = text.splitlines(keepends=True)
+     headers = [index for index, line in enumerate(lines) if line.strip() in MCP_TABLE_HEADERS]
+     if len(headers) != 1:
+@@ -674,16 +725,17 @@
+         if _is_table_header(lines[index]):
+             end = index
+             break
++    newline = _detect_newline(lines, header)
+     head = lines[header]
+-    if not head.endswith('\n'):
+-        head = head + '\n'
++    if not head.endswith('\n') and not head.endswith('\r'):
++        head = head + newline
+     wanted = [('tool_timeout_sec', tool_timeout), ('startup_timeout_sec', startup_timeout)]
+-    body = [key + ' = ' + str(value) + '\n' for key, value in wanted]
++    body = [key + ' = ' + str(value) + newline for key, value in wanted]
+     for line in lines[header + 1:end]:
+         if _timeout_key(line) is not None:
+             continue
+         body.append(line)
+-    return ''.join([head] + body + lines[end:])
++    return ''.join(lines[:header] + [head] + body + lines[end:])
+ 
+ 
+ def write_server_timeouts(config_path: Path) -> None:
+@@ -701,10 +753,16 @@
+     uid = current_uid()
+     if uid is not None and info.st_uid != uid:
+         raise InstallerError('mcp_config_error', 'Codex 配置文件不属于当前用户，已拒绝写入。')
+-    try:
+-        text = config_path.read_text(encoding='utf-8')
+-    except (OSError, UnicodeDecodeError):
++    # Raw bytes plus an explicit UTF-8 decode: read_text() applies universal
++    # newline translation and would silently rewrite a CRLF file.
++    try:
++        raw = config_path.read_bytes()
++    except OSError:
+         raise InstallerError('mcp_config_error', '无法读取 Codex 配置文件。')
++    try:
++        text = raw.decode('utf-8')
++    except UnicodeDecodeError:
++        raise InstallerError('mcp_config_error', 'Codex 配置文件不是 UTF-8 文本，已拒绝写入。')
+     rendered = render_server_timeouts(text, MCP_TOOL_TIMEOUT_SEC, MCP_STARTUP_TIMEOUT_SEC)
+     if rendered is None:
+         raise InstallerError('mcp_config_error', '未能唯一定位 claude-advisor 配置表，未做任何猜测写入。')
+--- test_configure_key.py
++++ test_configure_key.py
+@@ -827,7 +827,7 @@
+         self.assertIsNone(configure_key.render_server_timeouts(doubled, 660, 20))
+ 
+     def test_quoted_header_is_supported_and_other_text_is_kept(self):
+-        text = '''["mcp_servers.claude-advisor"]
++        text = '''[mcp_servers."claude-advisor"]
+ command = "x"
+ 
+ [other]
+@@ -835,11 +835,291 @@
+ '''
+         rendered = configure_key.render_server_timeouts(text, 660, 20)
+         self.assertIsNotNone(rendered)
++        self.assertTrue(rendered.startswith('[mcp_servers."claude-advisor"]\n'))
+         self.assertIn('tool_timeout_sec = 660', rendered)
+         self.assertIn('startup_timeout_sec = 20', rendered)
+         self.assertIn('command = "x"', rendered)
+         self.assertIn('[other]', rendered)
+         self.assertIn('keep = 1', rendered)
++
++    def test_supported_headers_are_the_nested_table_only(self):
++        self.assertEqual(
++            configure_key.MCP_TABLE_HEADERS,
++            ('[mcp_servers.claude-advisor]', '[mcp_servers."claude-advisor"]'),
++        )
++
++    def test_whole_header_quoted_as_a_single_key_is_refused(self):
++        text = '["mcp_servers.claude-advisor"]\ncommand = "x"\n'
++        self.assertIsNone(configure_key.render_server_timeouts(text, 660, 20))
++
++    def test_prefix_before_the_table_is_kept_byte_for_byte(self):
++        prefix = (
++            'model = "keep-this"\n'
++            '\n'
++            '[mcp_servers.deepseek]\n'
++            'command = "keep-worker"\n'
++            '\n'
++        )
++        claude = (
++            '[mcp_servers.claude-advisor]\n'
++            'command = "/usr/bin/python3"\n'
++            'args = ["/tmp/bridge.py"]\n'
++            'tool_timeout_sec = 60.0\n'
++        )
++        suffix = (
++            '\n'
++            '[mcp_servers.other]\n'
++            'command = "keep-other"\n'
++            '\n'
++            '[settings]\n'
++            'note = "中文 note # not a comment"\n'
++        )
++        rendered = configure_key.render_server_timeouts(prefix + claude + suffix, 660, 20)
++        self.assertIsNotNone(rendered)
++        self.assertTrue(rendered.startswith(prefix), rendered)
++        self.assertTrue(rendered.endswith(suffix), rendered)
++        self.assertEqual(rendered.count('tool_timeout_sec ='), 1)
++        self.assertEqual(rendered.count('startup_timeout_sec ='), 1)
++        self.assertIn('tool_timeout_sec = 660\n', rendered)
++        self.assertIn('startup_timeout_sec = 20\n', rendered)
++        self.assertNotIn('= 60.0', rendered)
++        for kept in (
++            'model = "keep-this"',
++            '[mcp_servers.deepseek]',
++            'command = "keep-worker"',
++            'command = "/usr/bin/python3"',
++            'args = ["/tmp/bridge.py"]',
++            '[mcp_servers.other]',
++            'command = "keep-other"',
++            '[settings]',
++            'note = "中文 note # not a comment"',
++        ):
++            self.assertIn(kept, rendered)
++
++    def test_table_at_the_end_of_file_keeps_its_prefix(self):
++        text = (
++            '[settings]\n'
++            'model = "keep-this"\n'
++            '\n'
++            '[mcp_servers."claude-advisor"]\n'
++            'command = "keep-worker"'
++        )
++        self.assertEqual(
++            configure_key.render_server_timeouts(text, 660, 20),
++            '[settings]\n'
++            'model = "keep-this"\n'
++            '\n'
++            '[mcp_servers."claude-advisor"]\n'
++            'tool_timeout_sec = 660\n'
++            'startup_timeout_sec = 20\n'
++            'command = "keep-worker"',
++        )
++
++    def test_header_on_the_last_line_without_newline_is_terminated(self):
++        text = '[settings]\nmodel = "keep-this"\n\n[mcp_servers.claude-advisor]'
++        self.assertEqual(
++            configure_key.render_server_timeouts(text, 660, 20),
++            '[settings]\n'
++            'model = "keep-this"\n'
++            '\n'
++            '[mcp_servers.claude-advisor]\n'
++            'tool_timeout_sec = 660\n'
++            'startup_timeout_sec = 20\n',
++        )
++
++    def test_comment_and_nested_subtable_after_the_table_are_kept(self):
++        text = (
++            '# top\n'
++            '[mcp_servers.claude-advisor]\n'
++            'startup_timeout_sec = 1\n'
++            'command = "/usr/bin/python3"\n'
++            '# keep me\n'
++            'tool_timeout_sec = 2\n'
++            '\n'
++            '[mcp_servers.claude-advisor.env]\n'
++            'FOO = "bar"\n'
++        )
++        rendered = configure_key.render_server_timeouts(text, 660, 20)
++        self.assertTrue(rendered.startswith('# top\n'))
++        self.assertIn('# keep me\n', rendered)
++        self.assertIn('command = "/usr/bin/python3"\n', rendered)
++        self.assertIn('[mcp_servers.claude-advisor.env]\nFOO = "bar"\n', rendered)
++        self.assertEqual(rendered.count('tool_timeout_sec ='), 1)
++        self.assertEqual(rendered.count('startup_timeout_sec ='), 1)
++        self.assertIn('tool_timeout_sec = 660\n', rendered)
++        self.assertIn('startup_timeout_sec = 20\n', rendered)
++
++    def test_crlf_file_keeps_crlf_and_gets_crlf_timeouts(self):
++        text = (
++            '[settings]\r\n'
++            'model = "keep-this"\r\n'
++            '\r\n'
++            '[mcp_servers.claude-advisor]\r\n'
++            'tool_timeout_sec = 60.0\r\n'
++            'command = "keep-this-too"\r\n'
++        )
++        rendered = configure_key.render_server_timeouts(text, 660, 20)
++        self.assertEqual(
++            rendered,
++            '[settings]\r\n'
++            'model = "keep-this"\r\n'
++            '\r\n'
++            '[mcp_servers.claude-advisor]\r\n'
++            'tool_timeout_sec = 660\r\n'
++            'startup_timeout_sec = 20\r\n'
++            'command = "keep-this-too"\r\n',
++        )
++        self.assertNotIn('\n', rendered.replace('\r\n', ''))
++
++    def test_multiline_prompt_hiding_a_header_lookalike_is_refused(self):
++        text = (
++            'model = "keep-this"\n'
++            '\n'
++            '[mcp_servers.deepseek]\n'
++            'prompt = """\n'
++            '[mcp_servers.claude-advisor]\n'
++            '"""\n'
++            '\n'
++            '[mcp_servers.claude-advisor]\n'
++            'command = "/usr/bin/python3"\n'
++        )
++        self.assertIsNone(configure_key.render_server_timeouts(text, 660, 20))
++
++    def test_literal_multiline_value_is_refused(self):
++        text = (
++            '[mcp_servers.claude-advisor]\n'
++            'command = "/usr/bin/python3"\n'
++            "note = '''\n"
++            '[mcp_servers.other]\n'
++            "'''\n"
++        )
++        self.assertIsNone(configure_key.render_server_timeouts(text, 660, 20))
++
++
++class WriteServerTimeoutsTests(unittest.TestCase):
++    '''write_server_timeouts against real temporary files: no network, no CLI.'''
++
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.dir = Path(self._tmp.name)
++        self.path = self.dir / 'config.toml'
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def write(self, data, mode=0o600):
++        self.path.write_bytes(data)
++        os.chmod(self.path, mode)
++        return self.path
++
++    def test_prefix_suffix_and_file_mode_are_preserved(self):
++        prefix = (
++            '# codex config\n'
++            'model = "keep-this"\n'
++            '\n'
++            '[mcp_servers.deepseek]\n'
++            'command = "keep-worker"\n'
++            'args = ["--serve"]\n'
++            '\n'
++        ).encode('utf-8')
++        claude = (
++            '[mcp_servers.claude-advisor]\n'
++            'command = "/usr/bin/python3"\n'
++            'tool_timeout_sec = 60.0\n'
++            'startup_timeout_sec = 5\n'
++        ).encode('utf-8')
++        suffix = (
++            '\n'
++            '[mcp_servers.claude-advisor.env]\n'
++            'FOO = "bar"\n'
++            '\n'
++            '[settings]\n'
++            'note = "中文 # 注释"\n'
++        ).encode('utf-8')
++        self.write(prefix + claude + suffix, mode=0o644)
++
++        configure_key.write_server_timeouts(self.path)
++
++        after = self.path.read_bytes()
++        self.assertTrue(after.startswith(prefix), after)
++        self.assertTrue(after.endswith(suffix), after)
++        self.assertEqual(after.count(b'tool_timeout_sec ='), 1)
++        self.assertEqual(after.count(b'startup_timeout_sec ='), 1)
++        self.assertIn(b'tool_timeout_sec = 660\n', after)
++        self.assertIn(b'startup_timeout_sec = 20\n', after)
++        self.assertNotIn(b'= 60.0', after)
++        self.assertNotIn(b'startup_timeout_sec = 5\n', after)
++        self.assertIn(b'command = "/usr/bin/python3"\n', after)
++        self.assertIn('中文 # 注释'.encode('utf-8'), after)
++        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o644)
++
++    def test_crlf_file_stays_crlf_after_the_write(self):
++        original = (
++            '[settings]\r\n'
++            'model = "keep-this"\r\n'
++            '\r\n'
++            '[mcp_servers.claude-advisor]\r\n'
++            'tool_timeout_sec = 60.0\r\n'
++        ).encode('utf-8')
++        self.write(original)
++
++        configure_key.write_server_timeouts(self.path)
++
++        after = self.path.read_bytes()
++        self.assertTrue(after.startswith(b'[settings]\r\nmodel = "keep-this"\r\n\r\n'))
++        self.assertIn(b'tool_timeout_sec = 660\r\n', after)
++        self.assertIn(b'startup_timeout_sec = 20\r\n', after)
++        self.assertNotIn(b'\n', after.replace(b'\r\n', b''))
++
++    def test_already_correct_timeouts_leave_the_file_untouched(self):
++        original = (
++            '[mcp_servers.claude-advisor]\n'
++            'tool_timeout_sec = 660\n'
++            'startup_timeout_sec = 20\n'
++        ).encode('utf-8')
++        self.write(original)
++
++        configure_key.write_server_timeouts(self.path)
++
++        self.assertEqual(self.path.read_bytes(), original)
++        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ['config.toml'])
++
++    def test_multiline_lookalike_is_refused_and_the_file_is_untouched(self):
++        original = (
++            '[settings]\n'
++            'prompt = """\n'
++            '[mcp_servers.claude-advisor]\n'
++            '"""\n'
++            '\n'
++            '[mcp_servers.claude-advisor]\n'
++            'command = "/usr/bin/python3"\n'
++        ).encode('utf-8')
++        self.write(original)
++
++        with self.assertRaises(configure_key.InstallerError) as ctx:
++            configure_key.write_server_timeouts(self.path)
++
++        self.assertEqual(ctx.exception.category, 'mcp_config_error')
++        self.assertEqual(self.path.read_bytes(), original)
++
++    def test_whole_quoted_header_is_refused_and_the_file_is_untouched(self):
++        original = b'["mcp_servers.claude-advisor"]\ncommand = "x"\n'
++        self.write(original)
++
++        with self.assertRaises(configure_key.InstallerError):
++            configure_key.write_server_timeouts(self.path)
++
++        self.assertEqual(self.path.read_bytes(), original)
++
++    def test_non_utf8_file_is_refused(self):
++        original = b'[mcp_servers.claude-advisor]\nnote = "\xff\xfe"\n'
++        self.write(original)
++
++        with self.assertRaises(configure_key.InstallerError) as ctx:
++            configure_key.write_server_timeouts(self.path)
++
++        self.assertEqual(ctx.exception.category, 'mcp_config_error')
++        self.assertEqual(self.path.read_bytes(), original)
+ 
+ 
+ class BridgeEffortTests(unittest.TestCase):

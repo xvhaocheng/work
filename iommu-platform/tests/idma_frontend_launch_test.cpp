@@ -1,0 +1,437 @@
+#include "Vidma_frontend_launch_top.h"
+#include "verilated.h"
+#include <cstdint>
+#include <iostream>
+#include <stdexcept>
+
+static void ck(bool b, const char* s) { if (!b) throw std::runtime_error(s); }
+
+struct Bench {
+    Vidma_frontend_launch_top d;
+    uint64_t cycle = 0;
+
+    // eval() never touches ready_i: tests drive it directly, so ready_i == 0 is
+    // genuinely exercised.
+    void eval() {
+        d.clk_i = 0;
+        d.eval();
+    }
+    void tick() {
+        eval();
+        d.clk_i = 1;
+        d.eval();
+        cycle++;
+        eval();
+    }
+
+    Bench() {
+        d.rst_ni = 0;
+        d.valid_i = 0;
+        d.write_i = 0;
+        d.addr_i  = 0;
+        d.wdata_i = 0;
+        d.ready_i = 1;
+        d.complete_i = 0;
+        d.idle_i = 1;
+        d.hold_i = 0;
+        d.go_i = 0;
+        d.cancel_i = 0;
+        d.obs_cfg_rdata_i = 0;
+        tick();
+        d.rst_ni = 1;
+        tick();
+    }
+
+    struct Rsp {
+        uint64_t rdata;
+        bool error, ready;
+        bool launch_error, launch_cancelled, launch_held, launch_active;
+        bool issue, done, cfg_valid, cfg_write;
+        uint64_t issue_id, done_id, cfg_wdata;
+        uint8_t cfg_addr;
+    };
+
+    // Copy every combinational output while the request is still asserted, so
+    // single-cycle pulses (launch_error, cfg_valid, issue, done) are captured.
+    Rsp sample() {
+        Rsp r;
+        r.rdata            = d.rdata_o;
+        r.error            = d.error_o;
+        r.ready            = d.ready_o;
+        r.launch_error     = d.launch_error_o;
+        r.launch_cancelled = d.launch_cancelled_o;
+        r.launch_held      = d.launch_held_o;
+        r.launch_active    = d.launch_active_o;
+        r.issue            = d.issue_o;
+        r.done             = d.done_o;
+        r.issue_id         = d.issue_id_o;
+        r.done_id          = d.done_id_o;
+        r.cfg_valid        = d.cfg_valid_o;
+        r.cfg_write        = d.cfg_write_o;
+        r.cfg_addr         = (uint8_t)d.cfg_addr_o;
+        r.cfg_wdata        = d.cfg_wdata_o;
+        return r;
+    }
+
+    Rsp access2(unsigned addr, bool wr = false, uint64_t val = 0) {
+        d.addr_i  = addr;
+        d.write_i = wr;
+        d.wdata_i = val;
+        d.valid_i = 1;
+        eval();
+        Rsp r = sample();
+        tick();
+        d.valid_i = 0;
+        d.write_i = 0;
+        eval();
+        return r;
+    }
+
+    uint64_t access(unsigned addr, bool wr = false, uint64_t val = 0) {
+        return access2(addr, wr, val).rdata;
+    }
+
+    // CONF is at 0x18 (STATUS is 0x20 and must not be used as CONF). N_TRANS at
+    // 0x48 is not needed for a single DEFAULT 64-byte transfer.
+    void configure_controlled(uint64_t src = 0x10000, uint64_t dst = 0x100000,
+                              uint64_t bytes = 64, uint64_t conf = 0) {
+        access(0x00, true, src);
+        access(0x08, true, dst);
+        access(0x10, true, bytes);
+        access(0x18, true, conf);
+    }
+};
+
+// Deterministic ID a fresh instance reserves for the first controlled job.
+static uint64_t fresh_first_id() {
+    Bench b;
+    b.configure_controlled();
+    b.d.idle_i = 1;
+    b.d.hold_i = 1;
+    auto r = b.access2(0x28);
+    b.d.cancel_i = 1; b.tick(); b.d.cancel_i = 0; b.d.hold_i = 0; b.eval();
+    return r.rdata;
+}
+
+int main(int argc, char** argv) {
+    Verilated::commandArgs(argc, argv);
+    try {
+        // 1) Reserve with backend ready=0: one ID, no issue, HOLD stable under stall.
+        {
+            Bench b;
+            b.configure_controlled(0x10000, 0x100000);
+            b.d.idle_i = 1;
+            b.d.ready_i = 0;      // backend not ready, must not block reservation
+            b.d.hold_i = 1;
+            auto r = b.access2(0x28);
+            ck(r.ready && !r.error, "reserve ready/ok");
+            uint64_t reserved = r.rdata;
+            ck(!r.issue, "no issue at reservation");
+            ck(!r.done, "no done at reservation");
+            ck(!r.launch_error, "no launch error at reservation");
+            ck(b.d.launch_held_o && b.d.launch_active_o, "held+active after reserve");
+
+            for (int i = 0; i < 100; i++) {
+                b.eval();
+                ck(!b.d.request_o, "no VALID in HOLD");
+                b.tick();
+            }
+            ck(!b.d.issue_o && !b.d.done_o, "no issue/done in HOLD");
+
+            // locked base write while held
+            auto w = b.access2(0x00, true, 0xDEAD0000);
+            ck(w.ready && w.error, "base write error while held");
+            ck(w.launch_error, "launch_error pulse on locked base write");
+            ck(b.d.src_o == 0x10000, "src unchanged by locked write");
+
+            // repeated NEXT_ID while held
+            auto r2 = b.access2(0x28);
+            ck(r2.ready && r2.error, "second NEXT_ID error");
+            ck(r2.launch_error, "launch_error pulse on repeated NEXT_ID");
+            ck(!r2.issue, "no issue on repeated NEXT_ID");
+
+            // batch write rejected while held, not poisoning batch_error_q
+            auto bw = b.access2(0x88, true, 1);
+            ck(bw.ready && bw.error, "batch write rejected while held");
+            ck(bw.launch_error, "launch_error on batch write while held");
+            auto bs = b.access2(0x88, false);
+            ck(((bs.rdata >> 32) & 1) == 0, "batch_error_q not poisoned");
+
+            // go -> COUNT
+            b.d.hold_i = 0;
+            b.d.go_i = 1;
+            b.tick();
+            b.d.go_i = 0;
+            b.eval();
+            ck(b.d.request_o, "VALID after go");
+            ck(b.d.src_o == 0x10000 && b.d.dst_o == 0x100000, "addresses stable");
+            ck(b.d.launch_active_o, "active in COUNT");
+            ck(!b.d.issue_o, "no actual issue while backend not ready");
+
+            for (int i = 0; i < 10; i++) {
+                b.eval();
+                ck(b.d.request_o, "VALID stable under backend stall");
+                ck(b.d.src_o == 0x10000, "addr stable under stall");
+                b.tick();
+            }
+            ck(!b.d.issue_o, "no actual issue under stall");
+
+            // cancel in COUNT must not withdraw VALID
+            b.d.cancel_i = 1;
+            b.eval();
+            ck(b.d.request_o, "cancel in COUNT does not withdraw VALID");
+            ck(!b.d.launch_cancelled_o, "no cancelled pulse outside HOLD");
+            b.tick();
+            b.d.cancel_i = 0;
+            b.eval();
+            ck(b.d.request_o, "VALID still asserted after COUNT cancel attempt");
+
+            // actual issue when backend ready
+            b.d.ready_i = 1;
+            b.eval();
+            ck(b.d.issue_o && b.d.issue_id_o == reserved, "actual issue with reserved ID");
+            b.tick();
+            b.d.ready_i = 0;
+            b.eval();
+            ck(!b.d.request_o, "no VALID in WAIT");
+
+            // completion uses reserved ID
+            b.d.complete_i = 1;
+            b.eval();
+            ck(b.d.done_o && b.d.done_id_o == reserved, "done with reserved ID");
+            b.tick();
+            b.d.complete_i = 0;
+            b.eval();
+            ck(!b.d.done_o, "done once");
+            ck(!b.d.launch_active_o, "inactive after completion");
+        }
+
+        // 2) cancel in HOLD retires ID with no issue/done; next job increments &
+        //    completion still reports the newly reserved ID.
+        {
+            Bench b;
+            b.configure_controlled(0x20000, 0x200000);
+            b.d.idle_i = 1;
+            b.d.ready_i = 0;
+            b.d.hold_i = 1;
+            auto r3 = b.access2(0x28);
+            ck(r3.ready && !r3.error, "reserve ready");
+            uint64_t id3 = r3.rdata;
+            ck(!r3.issue, "no issue at reserve");
+            ck(b.d.launch_held_o, "held");
+            ck(!b.d.launch_cancelled_o, "no cancel before");
+
+            b.d.cancel_i = 1;
+            b.eval();
+            ck(b.d.launch_cancelled_o, "cancel pulse in HOLD");
+            ck(!b.d.issue_o && !b.d.done_o, "no issue/done on cancel");
+            b.tick();
+            b.d.cancel_i = 0;
+            b.d.hold_i = 0;
+            b.eval();
+            ck(!b.d.launch_held_o && !b.d.launch_active_o, "idle after cancel");
+            ck(!b.d.launch_cancelled_o, "cancel pulse ended");
+
+            // reserved ID retired: next reservation increments
+            b.d.hold_i = 1;
+            auto r4 = b.access2(0x28);
+            ck(r4.ready && !r4.error, "reserve ready after cancel");
+            uint64_t id4 = r4.rdata;
+            ck(id4 == id3 + 1, "ID increments after cancel retirement");
+
+            // complete that second job; DONE must use the reserved ID
+            b.d.hold_i = 0;
+            b.d.ready_i = 0;
+            b.d.go_i = 1;
+            b.tick();
+            b.d.go_i = 0;
+            b.eval();
+            ck(b.d.request_o, "VALID after go");
+            b.d.ready_i = 1;
+            b.eval();
+            ck(b.d.issue_o && b.d.issue_id_o == id4, "issue reserved ID");
+            b.tick();
+            b.d.ready_i = 0;
+            b.eval();
+            b.d.complete_i = 1;
+            b.eval();
+            ck(b.d.done_o && b.d.done_id_o == id4, "DONE reserved ID after cancel retirement");
+            b.tick();
+            b.d.complete_i = 0;
+            b.eval();
+            ck(!b.d.launch_active_o, "idle after completion");
+        }
+
+        // 3) simultaneous prepare+cancel rejects without consuming an ID.
+        {
+            Bench b;
+            b.configure_controlled(0x30000, 0x300000);
+            b.d.idle_i = 1;
+            b.d.ready_i = 0;
+            b.d.hold_i = 1;
+            b.d.cancel_i = 1;
+            b.d.valid_i = 1; b.d.write_i = 0; b.d.addr_i = 0x28;
+            b.eval();
+            ck(b.d.ready_o && b.d.error_o, "simultaneous cancel rejects");
+            ck(b.d.launch_error_o, "launch_error pulse");
+            ck(!b.d.issue_o, "no issue");
+            b.tick();
+            b.d.valid_i = 0; b.d.cancel_i = 0;
+            b.eval();
+
+            uint64_t ref = fresh_first_id();
+            b.d.hold_i = 1;
+            auto r5 = b.access2(0x28);
+            ck(r5.ready && !r5.error, "reserve after rejected prep");
+            ck(r5.rdata == ref, "rejected prep did not consume an ID");
+            b.d.cancel_i = 1; b.tick(); b.d.cancel_i = 0; b.d.hold_i = 0; b.eval();
+        }
+
+        // 4) invalid preparations reject and consume no ID.
+        {
+            Bench b;
+            b.configure_controlled(0x40000, 0x400000);
+            b.d.idle_i = 1;
+            b.d.ready_i = 0;
+            uint64_t ref = fresh_first_id();
+
+            auto expect_reject = [&](const char* msg) {
+                b.d.hold_i = 1;
+                b.d.valid_i = 1; b.d.write_i = 0; b.d.addr_i = 0x28;
+                b.eval();
+                ck(b.d.ready_o && b.d.error_o, msg);
+                ck(b.d.launch_error_o, "launch_error on invalid prep");
+                ck(!b.d.issue_o, "no issue on invalid prep");
+                b.tick();
+                b.d.valid_i = 0; b.d.hold_i = 0;
+                b.eval();
+            };
+
+            b.access(0x10, true, 128);
+            expect_reject("invalid num_bytes reject");
+            b.access(0x10, true, 64);
+
+            // real writable CONF field (cache[0]); 0x18 is CONF, not STATUS
+            b.access(0x18, true, 1);
+            expect_reject("invalid CONF reject");
+            b.access(0x18, true, 0);
+
+            b.access(0x00, true, 0x40001);
+            expect_reject("invalid src alignment reject");
+            b.access(0x00, true, 0x40000);
+
+            b.access(0x08, true, 0x400001);
+            expect_reject("invalid dst alignment reject");
+            b.access(0x08, true, 0x400000);
+
+            b.d.idle_i = 0;
+            expect_reject("backend busy reject");
+            b.d.idle_i = 1;
+
+            b.access(0x88, true, 1);
+            expect_reject("batch enabled reject");
+            b.access(0x88, true, 0);
+
+            b.d.hold_i = 1;
+            auto r6 = b.access2(0x28);
+            ck(r6.ready && !r6.error, "valid reserve after rejects");
+            ck(r6.rdata == ref, "invalid preps consumed no ID");
+            b.d.cancel_i = 1; b.tick(); b.d.cancel_i = 0; b.d.hold_i = 0; b.eval();
+        }
+
+        // 5) launcher window exact 8-bit decode, no aliasing, forwarding observable.
+        {
+            Bench b;
+            b.configure_controlled(0x50000, 0x500000);
+            b.d.idle_i = 1;
+            b.d.ready_i = 0;
+            b.d.obs_cfg_rdata_i = 0xDEADBEEFCAFEBABEULL;
+
+            auto lr = b.access2(0xc0, false);
+            ck(lr.ready && !lr.error, "launcher read ready");
+            ck(lr.rdata == 0xDEADBEEFCAFEBABEULL, "launcher read forwarded");
+            ck(lr.cfg_valid, "launcher read cfg_valid sampled while valid");
+            ck(!lr.cfg_write, "launcher read not write");
+            ck(lr.cfg_addr == 0xc0, "launcher read addr exact");
+
+            auto lw = b.access2(0xc0, true, 0x1234);
+            ck(lw.ready && !lw.error, "launcher write accepted");
+            ck(lw.cfg_valid && lw.cfg_write, "launcher write forwarded (cfg_valid/cfg_write)");
+            ck(lw.cfg_addr == 0xc0, "launcher write addr");
+            ck(lw.cfg_wdata == 0x1234, "launcher write data");
+
+            auto lw2 = b.access2(0xc8, true, 0x55);
+            ck(lw2.cfg_valid && lw2.cfg_addr == 0xc8, "0xc8 distinct from 0x58");
+
+            auto o1 = b.access2(0x58, false);
+            ck(o1.cfg_valid && o1.cfg_addr == 0x58, "0x58 legacy observer");
+
+            auto ar = b.access2(0x50, false);
+            ck(!ar.cfg_valid, "0x50 active-cycles not launcher");
+            auto br = b.access2(0x80, false);
+            ck(br.rdata == 0x49444d4142544301ULL, "batch magic intact");
+            ck(!br.cfg_valid, "batch not launcher");
+            auto sr = b.access2(0x00, false);
+            ck(sr.rdata == 0x50000, "base SRC read intact");
+            ck(!sr.cfg_valid, "base not launcher");
+        }
+
+        // 6) stale go/cancel in IDLE are harmless.
+        {
+            Bench b;
+            b.configure_controlled(0x70000, 0x700000);
+            b.d.idle_i = 1;
+            b.d.ready_i = 0;
+            b.d.go_i = 1; b.d.cancel_i = 1;
+            b.eval();
+            ck(!b.d.launch_cancelled_o, "no cancelled pulse in IDLE");
+            ck(!b.d.launch_held_o, "not held in IDLE");
+            ck(!b.d.launch_active_o, "not active in IDLE");
+            b.tick();
+            b.d.go_i = 0; b.d.cancel_i = 0;
+            b.eval();
+            ck(!b.d.request_o, "no VALID from stale go");
+
+            uint64_t ref = fresh_first_id();
+            b.d.hold_i = 1;
+            auto r7 = b.access2(0x28);
+            ck(r7.ready && !r7.error && r7.rdata == ref, "stale go/cancel did not affect reservation");
+            b.d.cancel_i = 1; b.tick(); b.d.cancel_i = 0; b.d.hold_i = 0; b.eval();
+        }
+
+        // 7) normal 64B transfer (hold=0) is unchanged.
+        {
+            Bench b;
+            b.configure_controlled(0x60000, 0x600000);
+            b.d.idle_i = 1;
+            b.d.ready_i = 1;
+            b.d.hold_i = 0;
+            b.d.valid_i = 1; b.d.write_i = 0; b.d.addr_i = 0x28;
+            b.eval();
+            ck(b.d.ready_o, "normal NEXT_ID ready");
+            ck(b.d.issue_o, "normal obs issue at NEXT_ID");
+            ck(!b.d.error_o, "normal no error");
+            b.tick();
+            b.d.valid_i = 0;
+            b.eval();
+            ck(b.d.request_o, "normal VALID after NEXT_ID");
+            ck(b.d.src_o == 0x60000, "normal src stable");
+            b.tick();
+            b.d.ready_i = 0;
+            b.eval();
+            ck(!b.d.request_o, "normal no VALID in WAIT");
+            b.d.complete_i = 1;
+            b.eval();
+            ck(b.d.done_o, "normal done");
+            b.tick();
+            b.d.complete_i = 0;
+            b.eval();
+        }
+
+        std::cout << "PASS launch frontend scenarios\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL " << e.what() << "\n";
+        return 1;
+    }
+}

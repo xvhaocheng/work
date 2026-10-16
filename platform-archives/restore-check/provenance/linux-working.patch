@@ -1,0 +1,461 @@
+diff --git a/drivers/misc/idma.c b/drivers/misc/idma.c
+index 5e2aa4ef4882..f4aeeb25d913 100644
+--- a/drivers/misc/idma.c
++++ b/drivers/misc/idma.c
+@@ -66,6 +66,7 @@ struct idma_device {
+ 	int id;
+ 	void __iomem *reg;
+ 	void __iomem *iommu_reg;
++	bool quarantined;
+ };
+ 
+ struct idma_bench_ctx {
+@@ -92,6 +93,7 @@ struct idma_bench_ctx {
+ 	bool mapped_src;
+ 	bool mapped_dst;
+ 	bool random_order;
++	bool cleanup_safe;
+ 	void *src;
+ 	void *dst;
+ 	const char *mode;
+@@ -106,6 +108,19 @@ struct idma_transfer {
+ 	bool valid;
+ };
+ 
++struct idma_independent_stream {
++	struct idma_bench_ctx *ctx;
++	struct idma_transfer xfer;
++	ktime_t deadline;
++	u64 bytes;
++	u32 iteration;
++	u32 slot;
++	u32 slots;
++	u32 done_iters;
++	bool in_flight;
++	bool finished;
++};
++
+ static DEFINE_MUTEX(idma_devices_lock);
+ static struct idma_device *idma_devices[IDMA_MAX_DEVS];
+ static DEFINE_MUTEX(idma_iova_lock);
+@@ -267,6 +282,9 @@ static struct page *idma_virt_to_page(void *addr)
+ static int idma_submit_transfer(struct idma_device *idma_dev, dma_addr_t src,
+ 				dma_addr_t dst, u64 size, u64 *transfer_id)
+ {
++	if (unlikely(READ_ONCE(idma_dev->quarantined)))
++		return -EIO;
++
+ 	writeq(src, idma_dev->reg + IDMA_SRC_ADDR_REG_OFFSET);
+ 	writeq(dst, idma_dev->reg + IDMA_DST_ADDR_REG_OFFSET);
+ 	writeq(size, idma_dev->reg + IDMA_NUM_BYTES_REG_OFFSET);
+@@ -550,6 +568,7 @@ static int idma_bench_prepare(struct idma_bench_ctx *ctx,
+ 	ctx->domain = iommu_get_domain_for_dev(ctx->dev);
+ 	ctx->args = *args;
+ 	ctx->attrs = DMA_ATTR_FORCE_CONTIGUOUS;
++	ctx->cleanup_safe = true;
+ 	idma_bench_clear_results(&ctx->args);
+ 
+ 	if (!ctx->domain)
+@@ -737,9 +756,9 @@ static int idma_bench_run(struct idma_bench_ctx *ctx, const char *label)
+ 
+ 	idma_bench_log_start(ctx, label);
+ 
+-	idma_hpm_read(ctx->idma_dev, &before);
+ 	mutex_lock(&ctx->idma_dev->lock);
+ 	active_before = idma_active_cycles_read(ctx->idma_dev);
++	idma_hpm_read(ctx->idma_dev, &before);
+ 	for (i = 0; i < ctx->args.iterations; i++) {
+ 		if (ctx->random_order)
+ 			ret = idma_start_transfer_random_chunks(ctx, &bytes);
+@@ -749,9 +768,9 @@ static int idma_bench_run(struct idma_bench_ctx *ctx, const char *label)
+ 			break;
+ 		done_iters++;
+ 	}
++	idma_hpm_read(ctx->idma_dev, &after);
+ 	active_after = idma_active_cycles_read(ctx->idma_dev);
+ 	mutex_unlock(&ctx->idma_dev->lock);
+-	idma_hpm_read(ctx->idma_dev, &after);
+ 
+ 	idma_hpm_delta(&before, &after, &delta);
+ 	ctx->args.iterations = done_iters;
+@@ -818,8 +837,9 @@ static void idma_unlock_multi(struct idma_bench_ctx *ctxs, u32 nr_devs)
+ 	}
+ }
+ 
+-static int idma_bench_run_pair_concurrent(struct idma_bench_ctx *victim_ctx,
+-					  struct idma_bench_ctx *aggressor_ctx)
++static int
++idma_bench_run_pair_lockstep(struct idma_bench_ctx *victim_ctx,
++			     struct idma_bench_ctx *aggressor_ctx)
+ {
+ 	struct idma_hpm_sample before;
+ 	struct idma_hpm_sample after;
+@@ -841,14 +861,14 @@ static int idma_bench_run_pair_concurrent(struct idma_bench_ctx *victim_ctx,
+ 	u32 i;
+ 	int ret = 0;
+ 
+-	idma_bench_log_start(victim_ctx, "pair victim");
+-	idma_bench_log_start(aggressor_ctx, "pair aggressor");
++	idma_bench_log_start(victim_ctx, "pair lockstep victim");
++	idma_bench_log_start(aggressor_ctx, "pair lockstep aggressor");
+ 
+ 	idma_lock_pair(victim_ctx->idma_dev, aggressor_ctx->idma_dev);
+-	idma_hpm_read(victim_ctx->idma_dev, &before);
+ 	victim_active_before = idma_active_cycles_read(victim_ctx->idma_dev);
+ 	aggressor_active_before =
+ 		idma_active_cycles_read(aggressor_ctx->idma_dev);
++	idma_hpm_read(victim_ctx->idma_dev, &before);
+ 
+ 	for (i = 0; i < pair_iters; i++) {
+ 		bool victim_enabled = i < victim_iters;
+@@ -920,10 +940,10 @@ static int idma_bench_run_pair_concurrent(struct idma_bench_ctx *victim_ctx,
+ 	}
+ 
+ out_measure:
++	idma_hpm_read(victim_ctx->idma_dev, &after);
+ 	victim_active_after = idma_active_cycles_read(victim_ctx->idma_dev);
+ 	aggressor_active_after =
+ 		idma_active_cycles_read(aggressor_ctx->idma_dev);
+-	idma_hpm_read(victim_ctx->idma_dev, &after);
+ 	idma_unlock_pair(victim_ctx->idma_dev, aggressor_ctx->idma_dev);
+ 
+ 	idma_hpm_delta(&before, &after, &delta);
+@@ -951,8 +971,229 @@ static int idma_bench_run_pair_concurrent(struct idma_bench_ctx *victim_ctx,
+ 		idma_bench_verify_result(aggressor_ctx);
+ 	}
+ 
+-	idma_bench_log_result(victim_ctx, "pair victim", ret);
+-	idma_bench_log_result(aggressor_ctx, "pair aggressor", ret);
++	idma_bench_log_result(victim_ctx, "pair lockstep victim", ret);
++	idma_bench_log_result(aggressor_ctx, "pair lockstep aggressor", ret);
++
++	return ret;
++}
++
++static void
++idma_independent_stream_init(struct idma_independent_stream *stream,
++			     struct idma_bench_ctx *ctx)
++{
++	memset(stream, 0, sizeof(*stream));
++	stream->ctx = ctx;
++	stream->slots = idma_bench_transfer_slots(ctx);
++}
++
++static int
++idma_independent_stream_submit_next(struct idma_independent_stream *stream)
++{
++	struct idma_bench_ctx *ctx = stream->ctx;
++	int ret;
++
++	while (stream->iteration < ctx->args.iterations) {
++		if (stream->slot >= stream->slots) {
++			stream->done_iters++;
++			stream->iteration++;
++			stream->slot = 0;
++			continue;
++		}
++
++		if (!idma_bench_transfer_at(ctx, stream->slot++,
++					    &stream->xfer))
++			continue;
++
++		ret = idma_submit_transfer(ctx->idma_dev, stream->xfer.src,
++					   stream->xfer.dst,
++					   stream->xfer.size,
++					   &stream->xfer.id);
++		if (ret)
++			return ret;
++
++		stream->deadline =
++			ktime_add_us(ktime_get(), IDMA_XFER_TIMEOUT_US);
++		stream->in_flight = true;
++		return 0;
++	}
++
++	stream->finished = true;
++	return 0;
++}
++
++static int
++idma_independent_stream_poll(struct idma_independent_stream *stream,
++			     ktime_t now)
++{
++	struct idma_bench_ctx *ctx = stream->ctx;
++	u64 done;
++
++	if (!stream->in_flight)
++		return 0;
++
++	done = readq(ctx->idma_dev->reg + IDMA_DONE_REG_OFFSET);
++	if (done == stream->xfer.id) {
++		stream->bytes += stream->xfer.size;
++		stream->in_flight = false;
++		return idma_independent_stream_submit_next(stream);
++	}
++
++	if (ktime_compare(now, stream->deadline) <= 0)
++		return 0;
++
++	dev_err(ctx->dev,
++		"timeout: src=%pad dst=%pad size=%llu id=%llu done=%llu status=%llx\n",
++		&stream->xfer.src, &stream->xfer.dst,
++		(unsigned long long)stream->xfer.size,
++		(unsigned long long)stream->xfer.id,
++		(unsigned long long)done,
++		(unsigned long long)readq(ctx->idma_dev->reg +
++					  IDMA_STATUS_REG_OFFSET));
++
++	return -ETIMEDOUT;
++}
++
++static bool
++idma_independent_stream_drain(struct idma_independent_stream *stream)
++{
++	int ret;
++
++	if (!stream->in_flight)
++		return true;
++
++	ret = idma_wait_transfer(stream->ctx->idma_dev, stream->xfer.src,
++				 stream->xfer.dst, stream->xfer.size,
++				 stream->xfer.id);
++	if (ret) {
++		/*
++		 * With no hardware cancel/reset, retaining the mappings and
++		 * buffers is safer than freeing memory that a wedged DMA may
++		 * still access.  Keep the device quarantined until reboot.
++		 */
++		stream->ctx->cleanup_safe = false;
++		WRITE_ONCE(stream->ctx->idma_dev->quarantined, true);
++		dev_crit(stream->ctx->dev,
++			 "DMA did not drain; device quarantined and benchmark buffers retained\n");
++		return false;
++	}
++
++	stream->bytes += stream->xfer.size;
++	stream->in_flight = false;
++	return true;
++}
++
++static int
++idma_bench_run_pair_independent(struct idma_bench_ctx *victim_ctx,
++				struct idma_bench_ctx *aggressor_ctx)
++{
++	struct idma_independent_stream victim;
++	struct idma_independent_stream aggressor;
++	struct idma_independent_stream *streams[2] = {
++		&victim,
++		&aggressor,
++	};
++	struct idma_hpm_sample before;
++	struct idma_hpm_sample after;
++	struct idma_hpm_sample delta;
++	u64 victim_active_before;
++	u64 victim_active_after;
++	u64 aggressor_active_before;
++	u64 aggressor_active_after;
++	u32 first = 0;
++	int ret;
++
++	idma_independent_stream_init(&victim, victim_ctx);
++	idma_independent_stream_init(&aggressor, aggressor_ctx);
++
++	idma_bench_log_start(victim_ctx, "pair independent victim");
++	idma_bench_log_start(aggressor_ctx, "pair independent aggressor");
++
++	idma_lock_pair(victim_ctx->idma_dev, aggressor_ctx->idma_dev);
++	victim_active_before = idma_active_cycles_read(victim_ctx->idma_dev);
++	aggressor_active_before =
++		idma_active_cycles_read(aggressor_ctx->idma_dev);
++	idma_hpm_read(victim_ctx->idma_dev, &before);
++
++	if (READ_ONCE(victim_ctx->idma_dev->quarantined) ||
++	    READ_ONCE(aggressor_ctx->idma_dev->quarantined)) {
++		ret = -EIO;
++		goto out_measure;
++	}
++
++	/*
++	 * Start the aggressor first, as in the lockstep benchmark.  From this
++	 * point on each engine is refilled independently as soon as its current
++	 * transfer completes.
++	 */
++	ret = idma_independent_stream_submit_next(&aggressor);
++	if (!ret)
++		ret = idma_independent_stream_submit_next(&victim);
++
++	while (!ret && (!victim.finished || !aggressor.finished)) {
++		ktime_t now = ktime_get();
++		u32 scanned;
++
++		for (scanned = 0; scanned < ARRAY_SIZE(streams); scanned++) {
++			u32 index = (first + scanned) % ARRAY_SIZE(streams);
++
++			ret = idma_independent_stream_poll(streams[index], now);
++			if (ret)
++				break;
++		}
++		first ^= 1;
++		cpu_relax();
++	}
++
++	if (ret) {
++		bool aggressor_drained;
++		bool victim_drained;
++
++		/*
++		 * Do not unmap/free a buffer while a successfully submitted DMA
++		 * may still be using it.  A stream that cannot be drained marks
++		 * its context unsafe for cleanup and quarantines that engine.
++		 */
++		victim_drained = idma_independent_stream_drain(&victim);
++		aggressor_drained = idma_independent_stream_drain(&aggressor);
++		if (!victim_drained || !aggressor_drained)
++			ret = -ETIMEDOUT;
++	}
++
++out_measure:
++	idma_hpm_read(victim_ctx->idma_dev, &after);
++	victim_active_after = idma_active_cycles_read(victim_ctx->idma_dev);
++	aggressor_active_after =
++		idma_active_cycles_read(aggressor_ctx->idma_dev);
++	idma_unlock_pair(victim_ctx->idma_dev, aggressor_ctx->idma_dev);
++
++	idma_hpm_delta(&before, &after, &delta);
++
++	victim_ctx->args.iterations = victim.done_iters;
++	victim_ctx->args.bytes = victim.bytes;
++	victim_ctx->args.cycles = delta.cycles;
++	victim_ctx->args.iotlb_miss = delta.iotlb_miss;
++	victim_ctx->args.s1_ptw = delta.s1_ptw;
++	victim_ctx->args.s2_ptw = delta.s2_ptw;
++	victim_ctx->args.dma_active_cycles =
++		victim_active_after - victim_active_before;
++
++	aggressor_ctx->args.iterations = aggressor.done_iters;
++	aggressor_ctx->args.bytes = aggressor.bytes;
++	aggressor_ctx->args.cycles = delta.cycles;
++	aggressor_ctx->args.iotlb_miss = delta.iotlb_miss;
++	aggressor_ctx->args.s1_ptw = delta.s1_ptw;
++	aggressor_ctx->args.s2_ptw = delta.s2_ptw;
++	aggressor_ctx->args.dma_active_cycles =
++		aggressor_active_after - aggressor_active_before;
++
++	if (!ret) {
++		idma_bench_verify_result(victim_ctx);
++		idma_bench_verify_result(aggressor_ctx);
++	}
++
++	idma_bench_log_result(victim_ctx, "pair independent victim", ret);
++	idma_bench_log_result(aggressor_ctx, "pair independent aggressor",
++			      ret);
+ 
+ 	return ret;
+ }
+@@ -985,9 +1226,9 @@ static int idma_bench_run_multi_concurrent(struct idma_bench_ctx *ctxs,
+ 	}
+ 
+ 	idma_lock_multi(ctxs, nr_devs);
+-	idma_hpm_read(ctxs[0].idma_dev, &before);
+ 	for (i = 0; i < nr_devs; i++)
+ 		active_before[i] = idma_active_cycles_read(ctxs[i].idma_dev);
++	idma_hpm_read(ctxs[0].idma_dev, &before);
+ 
+ 	for (iter = 0; iter < iters; iter++) {
+ 		u32 slot;
+@@ -1053,9 +1294,9 @@ static int idma_bench_run_multi_concurrent(struct idma_bench_ctx *ctxs,
+ 	}
+ 
+ out_measure:
++	idma_hpm_read(ctxs[0].idma_dev, &after);
+ 	for (i = 0; i < nr_devs; i++)
+ 		active_after[i] = idma_active_cycles_read(ctxs[i].idma_dev);
+-	idma_hpm_read(ctxs[0].idma_dev, &after);
+ 	idma_unlock_multi(ctxs, nr_devs);
+ 
+ 	idma_hpm_delta(&before, &after, &delta);
+@@ -1089,6 +1330,12 @@ static int idma_bench_run_multi_concurrent(struct idma_bench_ctx *ctxs,
+ 
+ static void idma_bench_cleanup(struct idma_bench_ctx *ctx)
+ {
++	if (!ctx->cleanup_safe) {
++		dev_crit(ctx->dev,
++			 "retaining benchmark mappings and buffers for quarantined DMA\n");
++		return;
++	}
++
+ 	kvfree(ctx->transfer_order);
+ 
+ 	if (ctx->mapped_src || ctx->mapped_dst) {
+@@ -1164,13 +1411,13 @@ static long idma_run_once_ioctl(struct idma_device *idma_dev,
+ 	dev_info(dev, "once start: size=%zu src=%pad dst=%pad\n",
+ 		 size, &src_dma, &dst_dma);
+ 
+-	idma_hpm_read(idma_dev, &before);
+ 	mutex_lock(&idma_dev->lock);
+ 	active_before = idma_active_cycles_read(idma_dev);
++	idma_hpm_read(idma_dev, &before);
+ 	ret = idma_start_transfer(idma_dev, src_dma, dst_dma, size);
++	idma_hpm_read(idma_dev, &after);
+ 	active_after = idma_active_cycles_read(idma_dev);
+ 	mutex_unlock(&idma_dev->lock);
+-	idma_hpm_read(idma_dev, &after);
+ 
+ 	idma_hpm_delta(&before, &after, &delta);
+ 	args.cycles = delta.cycles;
+@@ -1207,7 +1454,8 @@ static long idma_run_once_ioctl(struct idma_device *idma_dev,
+ }
+ 
+ static long idma_run_pair_bench_ioctl(struct idma_device *victim_dev,
+-				      struct idma_pair_bench_args __user *uarg)
++				      struct idma_pair_bench_args __user *uarg,
++				      bool independent)
+ {
+ 	struct idma_pair_bench_args args;
+ 	struct idma_bench_ctx victim_ctx;
+@@ -1259,7 +1507,12 @@ static long idma_run_pair_bench_ioctl(struct idma_device *victim_dev,
+ 		goto out_cleanup;
+ 	aggressor_prepared = true;
+ 
+-	ret = idma_bench_run_pair_concurrent(&victim_ctx, &aggressor_ctx);
++	if (independent)
++		ret = idma_bench_run_pair_independent(&victim_ctx,
++						      &aggressor_ctx);
++	else
++		ret = idma_bench_run_pair_lockstep(&victim_ctx,
++						   &aggressor_ctx);
+ 	args.victim = victim_ctx.args;
+ 	args.aggressor = aggressor_ctx.args;
+ 
+@@ -1366,13 +1619,18 @@ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ 	switch (cmd) {
+ 	case IDMA_IOC_RUN_PAIR_BENCH:
+ 		return idma_run_pair_bench_ioctl(idma_dev,
+-						 (struct idma_pair_bench_args __user *)arg);
++						 (struct idma_pair_bench_args __user *)arg,
++						 false);
+ 	case IDMA_IOC_RUN_ONCE:
+ 		return idma_run_once_ioctl(idma_dev,
+ 					   (struct idma_once_args __user *)arg);
+ 	case IDMA_IOC_RUN_MULTI_BENCH:
+ 		return idma_run_multi_bench_ioctl(
+ 			(struct idma_multi_bench_args __user *)arg);
++	case IDMA_IOC_RUN_PAIR_BENCH_INDEPENDENT:
++		return idma_run_pair_bench_ioctl(idma_dev,
++						 (struct idma_pair_bench_args __user *)arg,
++						 true);
+ 	default:
+ 		return -ENOTTY;
+ 	}
+diff --git a/include/uapi/linux/idma.h b/include/uapi/linux/idma.h
+index 52a2e7c7733a..9737cd0b0473 100644
+--- a/include/uapi/linux/idma.h
++++ b/include/uapi/linux/idma.h
+@@ -63,5 +63,7 @@ struct idma_multi_bench_args {
+ #define IDMA_IOC_RUN_PAIR_BENCH	_IOWR(IDMA_IOC_MAGIC, 0x02, struct idma_pair_bench_args)
+ #define IDMA_IOC_RUN_ONCE	_IOWR(IDMA_IOC_MAGIC, 0x03, struct idma_once_args)
+ #define IDMA_IOC_RUN_MULTI_BENCH	_IOWR(IDMA_IOC_MAGIC, 0x04, struct idma_multi_bench_args)
++#define IDMA_IOC_RUN_PAIR_BENCH_INDEPENDENT \
++	_IOWR(IDMA_IOC_MAGIC, 0x05, struct idma_pair_bench_args)
+ 
+ #endif /* _UAPI_LINUX_IDMA_H */
