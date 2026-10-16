@@ -1,0 +1,197 @@
+# 接手准备：composition-v1 上板 + 172 + Ethernet 更新链路
+
+声明：以下全部为对给定文件的静态阅读结论，我未执行、未改文件、未连板。任何“可用/兼容”均为**静态证据**，不是实测；运行时是否成立必须由原 runner / 原工具内置检查决定。未知项在 §6 明确列出。
+
+---
+
+## 0. 先判版本冲突（已核实的事实）
+
+| 事实 | 证据 |
+|---|---|
+| 旧 handoff 文字说本轮内核是 **cpn1** | `iommu-platform/docs/composition-handoff-20261005.md:10`（`6.5.0-rc2-cpn1-00093-gc0f5e13ea81f-dirty`）、`:13`（“本次SD/实验配套的是cpn1”） |
+| 但**最新一次真实写 SD** 使用的是 **cpn2-net1** | `iommu-platform/out/sd-install-20261005/receipt.json:7`（`kernel: 6.5.0-rc2-cpn2-net1-00093-gc0f5e13ea81f-dirty`）、`:5`（payload 路径 `.../software-update-20261004/delivery/fw_payload.bin`）、`:8`（`script: scripts/write_research_sd.py`）、`:16-17`（`ejected=true, synced=true`） |
+| cpn2 交付内核、payload 体积、sha | `iommu-platform/out/software-update-20261004/delivery/build-state.json:171`（kernel_release cpn2-net1）、`:191-192`（fw_payload 29363656 / `c457dceb…`）；`:209-212`（`mac_update_reboot.py` 已在交付 sha `772291890…`） |
+| 交付文档同值 | `iommu-platform/docs/software-update-20261004.md:124-126` |
+
+**结论**：本次实际 SD 内容为 **cpn2-net1**，因此 `--expected-kernel` 应使用 `6.5.0-rc2-cpn2-net1-00093-gc0f5e13ea81f-dirty`。旧 handoff 里的 cpn1 命令模板（`composition-handoff-20261005.md:28`）**必须替换**。若上板后实测 `uname -r` 仍是 cpn1，则：① `mac_composition.py` 在 attach 阶段即停止（内核不等，见 §1b）；② cpn1 内核**没有** lowrisc 以太网驱动，Ethernet/更新阶段无所需驱动，**不得静默假装可用**（证据 §3e）。
+
+---
+
+## 1. cpn2 支持现有 172 runner 的构建/源码证据，及仍须 runner 运行时核对的界限
+
+### 1a. 构建/源码证据（静态支持）
+- 172 runner 使用的板端 CLI 是 `/usr/bin/idma_composition`：`iommu-platform/scripts/mac_composition.py:34`（`DEFAULT_BOARD_CLI='/usr/bin/idma_composition'`）。
+- cpn2 根文件系统**保留该可执行文件**：`iommu-platform/scripts/rootfs.py:18`（`'idma_composition': 'out/bench/idma_composition'`），`:65`+`:74-76` 把它以 `0o755` 打包进 `usr/bin/`（`:75`），`:93-98` 有“存在/权限/唯一”校验。
+- cpn2 同时新增本期需要的板端工具：`iommu-platform/scripts/rootfs.py:20-22`（`platform-sd-update`、`platform-net-up`、`platform-fetch-update`）；对应二进制/脚本在 `build-state.json:194-198`（`platform-sd-update`）、`:139-146`（两个 board-*.sh）。
+- cpn2 内核保留 idma 驱动源码在构建输入内：`build-state.json:57`（`linux/drivers/misc/idma.c`）、`:61`（`idma_research.h`）、`:65`（`linux/include/uapi/linux/idma.h`）。Ethernet 驱动来源：`:69-71`（`lowrisc_ethernet.c`）。
+- cpn2 内核 SD/PHY/ETH 配置全 `y`：`iommu-platform/out/software-update-20261004/embedded-artifact-acceptance.json:27-38`（`CONFIG_SPI_XILINX/MMC/MMC_SPI/LOWRISC_ETH/PHYLIB/MDIO_BITBANG/REALTEK_PHY=y`），`:5`（`executable_manifest_entries: 14`）。
+
+> 这只能说明“二进制被打进 rootfs、驱动源码在构建输入里”。**不等于**板端运行时 `/dev/idma0` 存在、`--abi` 正常、用例通过。
+
+### 1b. 仍应由原 runner 运行时核对（静态不可替代的界限）
+`mac_composition.py` 在任一用例前会自行强制核对，应原样保留、不得绕过：
+- 内核相等：`mac_composition.py:201-203`（`uname_r != expected_kernel` 即 `CompositionError`）。
+- boot_id 格式：`:209-211`；taint 必须为 0：`:217-219`。
+- 板端 ABI JSON：`:221-238`（要求 `schema=='idma-composition-tool-v1'`、`record_schema=='idma-composition-v1'`、`composition_abi==1`，`:233-238`）。
+- 每用例：taint before/after、`boot_after` 不变、framed exit 与 `exit.txt` 一致、`validate_case`/`case_metrics`（`:335-345`、`:348-365`）。任一技术问题即 `_stop` 写 `STOPPED.txt` 并抛错（`:411-412`、`:495-499`），**不自动重跑**。
+- `/dev/idma0` 是否存在、idma 驱动是否加载**没有独立预检**；只在第一个用例执行时由 CLI 失败暴露（`:266-267`、`:272-275`）。这是本批次最可能的第一失败点，须以 runner 真实输出为准。
+
+### 1c. 不可误用的 runner（防串台）
+- `mac_research2.py` 只可**取其 `SerialConsole` 类**；`mac_composition.py` 仅按名加载 `SerialConsole` 并校验其具备 `start/close/run_shell/drain_input/disable_echo`（`mac_composition.py:90-98`）。
+- `mac_research2.py` 自带的是**另一个实验的、固定 bootid 语义**的 runner：板端 CLI 是 `/usr/bin/idma_research`（`:56`，不是 idma_composition）；它要求**两次烧写两个 BIT 且 boot_id 必须变化**（`:849-857`、`:1172-1177`）。**与 172 语义相反**——172 全程同一 BIT、同一 boot，`boot_id` 必须**不变**（`mac_composition.py:339-340`）。**不得用 `mac_research2.Research2Runner` 跑 172，也不得用 `--stage e2/method` 之类入口。**
+
+---
+
+## 2. 当前 172 入口 exact 命令模板（cpn2 值）
+
+前置（两步，不写进同一自动函数；见 `composition-v1-mac-20261004.md:59-69`）：
+1) 串口先采集启动输出→关闭临时采集（避免与 runner 抢占 UART，`mac_composition.py:111-124, 174-193`）；
+2) 烧一次 BIT：
+
+```sh
+/opt/homebrew/bin/openFPGALoader -b genesys2 --freq 1000000 \
+  'tools/composition-v1-20261004/ariane_xilinx.bit'
+```
+
+3) 等 root shell 后**一次**跑完全部 172（不先 short）：
+
+```sh
+cd '/Users/jojo/Desktop/在mac链接pfga(codex)'
+tools/method88-venv/bin/python tools/composition-v1-20261004/mac_composition.py \
+  --run \
+  --through-phase explore \
+  --out results/composition-v1-20261004-01 \
+  --expected-kernel '6.5.0-rc2-cpn2-net1-00093-gc0f5e13ea81f-dirty'
+```
+
+要点（均有源码/文档依据）：
+- `--through-phase` 默认 `short`，必须显式 `explore` 才含 16+12+144（`mac_composition.py:44, 477-487, 515`；`composition-v1-mac-20261004.md:83`）。
+- `--run` 会先生成完整 `plan.json` 再执行，**不要**为看计划单独跑 `--plan`（`mac_composition.py:446-452`；`composition-v1-mac-20261004.md:82`）。
+- `--out` 必须**不存在**，已存在直接拒绝、覆盖/resume/重跑都没有（`mac_composition.py:552-561`）。
+- `--expected-kernel` 是必填（`:507`），且必须等于实测 `uname -r`（`:201-203`）。**建议先用 §4 的内联方式读一次 `uname -r` 再定值**；若实测为 cpn1，任务在 attach 即停，且后续 Ethernet 阶段无驱动可用。
+
+---
+
+## 3. 最简 Ethernet 测试操作（含关键依赖 / BusyBox 关注点）
+
+### 3a. Mac 侧：只在真实以太网口设 IP（不改默认路由）
+en4/en5/en6 当前 inactive、对应关系未知，**必须按实际链路选**，不碰 WiFi/en0：
+```sh
+# 1) 找出以太网硬件端口及其 Device
+networksetup -listallhardwareports        # 看 "Ethernet" 段的 Device: enX
+# 2) 只对物理连着板子的那个口确认 link up（status: active）
+ifconfig enX | grep -E 'status|inet '
+# 3) 设静态地址（ifconfig 不添加默认路由）
+sudo ifconfig enX inet 192.168.77.1 netmask 255.255.255.0 up
+# 4) 确认默认路由未被改动
+netstat -rn -f inet | grep '^default'
+```
+注：`ifconfig` 直接加址最不触碰路由；若改用 `networksetup -setmanual` 须确保不给 router，设后仍复查默认路由。**哪个 enX 是真实口，须看实际 link；不要凭编号猜。**
+
+### 3b. Mac HTTP（仅 delivery 目录服务，勿暴露其它目录）
+delivery 目录（来自实际写卡 payload 路径 `receipt.json:5`）：
+```sh
+cd '/Users/jojo/Desktop/在mac链接pfga(codex)/artifacts/software/software-update-20261004/delivery'
+python3 -m http.server 8000 --bind 192.168.77.1
+```
+（与 `software-update-20261004.md:60-65` 一致。）
+
+### 3c. 板端：配网 + 一次下载并直接真写
+```sh
+# 板端配静态地址（默认 dry-run，--apply 才改；只动 eth0）
+platform-net-up eth0 --addr 192.168.77.2/24 --apply
+
+# 一次下载 + 真实写 /dev/mmcblk0p1（--write 跳过手动 hash，且不再 dry-run 重跑）
+platform-fetch-update http://192.168.77.1:8000/fw_payload.bin --write
+```
+依据：`tests/board-net-up.sh:8, 101-115, 118-123`；`tests/board-fetch-update.sh:71-79, 92-119, 121-127`。`--write` 路径**不做** hash 对比、直接调用 `platform-sd-update --device /dev/mmcblk0p1 --image …`（`:127`），并按 doc 要求“不额外 hash/回读/dry-run 重跑”。`platform-sd-update` 内部 `fsync`（`software-update-20261004.md:18`），同步已覆盖。
+“board 侧接口名是否为 `eth0`、是否 link up、PHY 是否 1G full”属§6未知，须实测确认（驱动仅支持 1G full：`software-update-20261004.md:23`）。
+
+### 3d. 同 BIT JTAG 重启并保存 uname/bootUUID
+先把 helper 放到 Mac delivery（构建记录显示该文件本已是交付件 `build-state.json:209-212`；若 Mac 上缺失，从 `scripts/mac_update_reboot.py` 复制过去）：
+```sh
+cd '/Users/jojo/Desktop/在mac链接pfga(codex)/artifacts/software/software-update-20261004/delivery'
+tools/method88-venv/bin/python mac_update_reboot.py --run \
+  --bit '/Users/jojo/Desktop/在mac链接pfga(codex)/tools/composition-v1-20261004/ariane_xilinx.bit' \
+  --port /dev/cu.usbserial-AV0KRCHT \
+  --expected-kernel "$(cat kernel-release)" \
+  --boot-timeout 300 \
+  --out <新且不存在的目录，如 results/reboot-cpn2-01>
+```
+行为与依据：默认 dry-run，`--run` 强制 `--port/--bit/--expected-kernel/--out`（`scripts/mac_update_reboot.py:333-381`）；用 `openFPGALoader` 重载同一 BIT 到 SRAM（`:199-207`）；重启前读 `uname -r`/`boot_id`（`:237-270, 295-297`）；重启后要求 `uname -r==expected_kernel` 且 `boot_id` 已变化（`:304-313`）；失败即停不重试，落 `result.json`+`uart.log`（`:316-327`）。用同一已知 payload（cpn2-net1）验证升级链路，不改版本、不重建 Linux。
+
+### 3e. 关键依赖与可能的真实 BusyBox 语法兼容点（**先别改脚本**）
+- `board-net-up.sh:99,118` 依赖 `ip -o addr show`，`software-update-20261004.md:48` 已明确警示 BusyBox `ip -o` 兼容性；`:112` 用 `ip addr replace`，BusyBox `ip` 对 `-o`/`replace` 支持不一，**上板后真实报错点最可能在此**。
+- `board-fetch-update.sh` 依赖 `wget -O`（`:99`）、`wc -c`+`tr -d ' '`（`:111`）、`dirname`（`:92`）、`mv`（`:118`），并要求 `wget`、`platform-sd-update` 在 PATH（`:88-90`）。
+- 板端脚本是 `/bin/sh`（`:1`）；`platform-sd-update` 为 C 工具（`build-state.json:149-152`）。
+- Ethernet 驱动只支持 1G full（`software-update-20261004.md:23`），MDIO addr 1、软件 FCS（`:23`），PHY 侧 `REALTEK_PHY=y`（`embedded-artifact-acceptance.json:37`）。
+> 以上为**预判**，不预先改脚本；以真实运行报错为准。
+
+---
+
+## 4. 现有 `SerialConsole` 的 `run_shell`/保存 raw/`close`/登录方式，及内联模板
+
+### 4a. 精确 API（`scripts/mac_research2.py`）
+- 构造：`SerialConsole(port, raw_log_path, events_log_path, serial_factory=None, baudrate=115200)`（`:345-357`）。
+- `start(timeout=10.0)`：建串口 + 启动读线程（`:359-365`；注意 `timeout` 参数当前未被使用）。
+- **保存 raw**：读线程以 `'ab'` 追加写 `raw_log_path` 的**每一个字节**（`:374-390`，`:376,385`）；事件另写 `events_log_path`（`:367-372`）。
+- `run_shell(command, timeout, cwd=None, exit_var=None)` → `ShellResult(stdout: bytes, exit_code: int)`（`:478-519`）；拒绝含换行的命令（`:482-483`）；用 begin/end 动态 marker 框定（`:488-519`）。
+- `drain_input()`（`:421-425`）、`disable_echo()`（发 `stty -echo`，`:407-419`）、`read_until`（`:427-442`）、`read_line`（去尾部 CR，`:444-459`）。
+- `close()`：置停 → join(2s) → 关串口（`:392-400`）。
+
+### 4b. “shell 登录”方式（重要区别）
+- `SerialConsole` **本身不做登录**；它假定板子已到 root shell，只发 `stty -echo` 并由调用者探测（`mac_composition.py:174-193` 只用 `run_shell('true')` 轮询；`mac_research2.py:784-804` 同）。
+- 只有 `mac_update_reboot.py` 处理登录提示：遇 `login:` 发 `root`、遇 `Password:` 发空行（`scripts/mac_update_reboot.py:209-235`），并用 `sync && echo <token>` 确认 shell 存活（`:180-191`）。172 runner 的登录应由“板子自动到 root shell”保证（见 `composition-v1-mac-20261004.md:67`），无需额外登录动作。
+
+### 4c. 只读身份内联模板（只用现成类；**不保存为脚本、不新建持久包装器**）
+用于跑 172 前确认 `uname -r`/ABI，以及在 Ethernet 阶段前确认 PHY/SD 身份。等价的 inflight 操作（`python3 - <<'PY' … PY` 一次性执行即可，别落盘成验收脚本）：
+
+```python
+import importlib.util, pathlib
+d = pathlib.Path('tools/composition-v1-20261004')
+s = importlib.util.spec_from_file_location('mr2', d/'mac_research2.py')
+mr2 = importlib.util.module_from_spec(s); s.loader.exec_module(mr2)
+out = pathlib.Path('results/board-identity-01'); out.mkdir(parents=True, exist_ok=True)
+c = mr2.SerialConsole('/dev/cu.usbserial-AV0KRCHT', out/'console.raw.log', out/'console.events.log')
+c.start(); c.disable_echo()
+for cmd in (
+    'uname -r',
+    '/usr/bin/idma_composition --abi',
+    'ip link show eth0',
+    'cat /sys/class/net/eth0/carrier',
+    'cat /sys/class/block/mmcblk0p1/partition',
+    'cat /sys/class/block/mmcblk0p1/start',
+    'cat /sys/class/block/mmcblk0p1/size',
+):
+    r = c.run_shell(cmd, timeout=30)
+    print(cmd, '=> exit', r.exit_code, repr(bytes(r.stdout)[:400]))
+c.close()
+```
+仅只读身份检查（uname/ABI/PHY 存在性/SD 分区身份），不引入独立验收。SD 期望 `partition=1,start=2048,size=65536`（`software-update-20261004.md:49-58`）。
+
+---
+
+## 5. 回传目录（Mac → Dell）
+
+- 172 结果（含失败/启动/用例 raw）由 runner 自己写到 `results/composition-v1-20261004-01/`，回传 Dell：`out/mac-composition-v1-20261004-01/`（目的地见 `composition-v1-mac-20261004.md:92-96`）。
+- 172 目录内容（均由现成 runner 产出，无需新增工具）：
+  `plan.json`/`manifest.json`/`boot.json`（`mac_composition.py:451/453/473`）、`summary.json`（`:415-437`）、`run.log`（`:146-153`）、`console.raw.log`+`console.events.log`（`:562-563`）、按用例 `cases/<id>/{record.raw.json,record.json,stderr.txt,meta.json,metrics.json}`（`:311/326/314/393/362`）、`dmesg.*.txt`（`:476/485/492/497`）、失败时 `STOPPED.txt`（`:163-169`）。
+- Ethernet download/write：产物即板端 `platform-fetch-update`/`platform-sd-update` 的 stdout（经串口，落进对应 SerialConsole 的 raw 日志），**只保存这些原始输出/原退出码**，不新增独立验收。
+- reboot：`mac_update_reboot.py --out` 已自带 `result.json`（含 before/after uname+boot_id、status、error）、`uart.log`、`fpga-load.stdout/stderr`（`mac_update_reboot.py:172,202-203,327`），原样回传即可。
+- 建议按既有命名各建一个独立目录（如 `results/composition-v1-20261004-01`、`results/eth-update-…`、`results/reboot-…`），只存操作 raw/原退出码与 summary；**不新增单独的“验收脚本/哈希/回读”产物**。
+
+---
+
+## 6. 待实际确认的未知（必须实测，不得假定）
+
+1. 编译/时序：`out/paper-route-review-20261004/recovery-v1/recovery-state.json` 完成态、`recovery-tcl-result.json`、`reports/timing_summary_routed.rpt`/`route_status.rpt`/`check_timing_routed.rpt`、非空 BIT/MCS——本次未提供，属 Codex 的最终验收，未确认。
+2. 板端 `uname -r` 究竟 cpn1 还是 cpn2-net1：本次拒绝把静态当实测；若 cpn1 则 172 attach 即停且 Ethernet 无驱动。
+3. 板端以太网接口名是否 `eth0`、PHY 是否 1G full、link/carrier 是否 up。
+4. Mac 上 en4/en5/en6 哪个是真实连板以太网口（须看实际 link）。
+5. BusyBox `ip -o`/`ip addr replace`/`wget -O` 是否可用（§3e 预判点）。
+6. `composition_plan.py` 内部 API（`build_plan/cases_through_phase/case_argv/validate_case/case_metrics` 返回结构）未在给定材料内，须由原 runner 运行时校验；不重复造 plan。
+
+## 建议的接受检查（由 runner/工具内置完成，不新增）
+- 172：`summary.json` 的 `planned/attempted/completed/failed` 与 `plan.json.count` 一致；无 `STOPPED.txt` 即技术通过（科学阴性不算失败）。
+- Ethernet：`platform-net-up … --apply` 打印 `PASS`（`board-net-up.sh:123`）；`platform-fetch-update … --write` 打印 `update applied`（`board-fetch-update.sh:128`）。
+- 重启：`result.json.status=='complete'` 且 `after.uname_r==expected`、`after.boot_id!=before.boot_id`（`mac_update_reboot.py:304-314`）。

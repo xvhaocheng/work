@@ -1,0 +1,235 @@
+--- a/tests/nonblock_actual_dma_test.cpp
++++ b/tests/nonblock_actual_dma_test.cpp
+@@ -123,4 +123,31 @@
+ static uint64_t page_old(uint32_t page, uint32_t i) {
+     return 0xD000000000000000ULL ^ ((uint64_t)(page + 1) << 40) ^ (uint64_t)i;
+ }
++
++#ifdef ACTUAL_DMA_SYSTEM
++// ---------------------------------------------------------------------------
++// Synthetic-CPU write / AMO scoreboard constants.  These MUST match the
++// test-only RTL constants in tests/nonblock_actual_dma_system_top.sv
++// (CPU_WR_ADDR / CPU_AMO_ADDR / CPU_AMO_ADD / CPU_WR_DAT0 / CPU_WR_DAT1 /
++//  CPU_WR_STR0 / CPU_WR_STR1 / CPU_WR_INIT1 / CPU_AMO_INIT).
++// Both sides are test code.
++// ---------------------------------------------------------------------------
++static const uint64_t CPU_WR_ADDR  = 0x81000000ULL;
++static const uint64_t CPU_AMO_ADDR = 0x81001000ULL;
++static const uint64_t CPU_AMO_ADD  = 0x0000000012345678ULL;
++static const uint64_t CPU_WR_DAT0  = 0x1122334455667788ULL;
++static const uint64_t CPU_WR_DAT1  = 0xAABBCCDDEEFF0011ULL;
++static const uint8_t  CPU_WR_STR0  = 0xFF;
++static const uint8_t  CPU_WR_STR1  = 0x0F;
++static const uint64_t CPU_WR_INIT1 = 0xE000000000000001ULL;
++static const uint64_t CPU_AMO_INIT = 0xD000000000000000ULL;
++
++static uint64_t cpu_apply_strb(uint64_t cur, uint64_t data, uint8_t strb) {
++    uint64_t mask = 0;
++    for (int i = 0; i < 8; ++i)
++        if (strb & (uint8_t)(1u << i)) mask |= (0xFFULL << (8 * i));
++    return (cur & ~mask) | (data & mask);
++}
++#endif
+ 
+ struct TestFailure : std::runtime_error {
+@@ -215,3 +242,18 @@
+     uint32_t last_cpu_issued     = 0;
+     uint32_t last_cpu_completed  = 0;
++    // Synthetic-CPU write/AMO scoreboard.  `cpu_writes` mirrors the run-time
++    // +cpu-writes flag; the counters below are refreshed ONLY by the new
++    // write/AMO lifecycle taps, so a stalled write path cannot hide behind
++    // read progress (and vice versa).
++    bool     cpu_writes             = false;
++    long     cpu_wr_progress_cycle  = 0;
++    long     cpu_wr_watchdog_cycles = 200000L;
++    uint32_t last_cpu_wr_issued     = 0;
++    uint32_t last_cpu_wr_completed  = 0;
++    uint32_t last_cpu_amo_issued    = 0;
++    uint32_t last_cpu_amo_completed = 0;
++    // AMO old-value accumulation scoreboard (bounded: engine runs until
++    // cpu_run drops; the C++ counter is 64-bit and unbounded by design).
++    uint64_t cpu_amo_expected  = 0;
++    uint64_t n_cpu_amo_obs     = 0;
+ #endif
+@@ -324,3 +366,12 @@ @@
+             }
+         }
++
++#ifdef ACTUAL_DMA_SYSTEM
++        // Synthetic-CPU write / AMO scratch: distinct from V (0x8000_0000),
++        // A (0x9000_0000+), the DDT (0x1_0000) and every page table.
++        write64(CPU_WR_ADDR + 0, 0xE000000000000000ULL);
++        write64(CPU_WR_ADDR + 8, CPU_WR_INIT1);
++        for (uint32_t i = 0; i < 8; ++i)
++            write64(CPU_AMO_ADDR + (uint64_t)i * 8, CPU_AMO_INIT + (uint64_t)i);
++#endif
+     }
+@@ -556,3 +607,23 @@
+             last_cpu_completed = top->dbg_cpu_completed;
+         }
++        // Synthetic-CPU write / AMO independent progress.  Refreshed ONLY by
++        // the new write/AMO lifecycle taps, so a stalled write path cannot be
++        // hidden by read progress.
++        if (top->dbg_cpu_wr_issued != last_cpu_wr_issued ||
++            top->dbg_cpu_wr_completed != last_cpu_wr_completed ||
++            top->dbg_cpu_amo_issued != last_cpu_amo_issued ||
++            top->dbg_cpu_amo_completed != last_cpu_amo_completed) {
++            cpu_wr_progress_cycle  = g_cycle;
++            last_cpu_wr_issued     = top->dbg_cpu_wr_issued;
++            last_cpu_wr_completed  = top->dbg_cpu_wr_completed;
++            last_cpu_amo_issued    = top->dbg_cpu_amo_issued;
++            last_cpu_amo_completed = top->dbg_cpu_amo_completed;
++        }
++        // AMO old-value accumulation continuity scoreboard.
++        if (top->dbg_cpu_amo_r_fire) {
++            CHECK(top->dbg_cpu_amo_r_data == cpu_amo_expected,
++                  "AMO returned old value broke accumulation continuity");
++            cpu_amo_expected += CPU_AMO_ADD;
++            ++n_cpu_amo_obs;
++        }
+ #endif
+@@ -776,3 +847,10 @@
+         last_cpu_issued    = 0;
+         last_cpu_completed = 0;
++        cpu_wr_progress_cycle  = g_cycle;
++        last_cpu_wr_issued     = 0;
++        last_cpu_wr_completed  = 0;
++        last_cpu_amo_issued    = 0;
++        last_cpu_amo_completed = 0;
++        cpu_amo_expected       = CPU_AMO_INIT;
++        n_cpu_amo_obs          = 0;
+ #endif
+@@ -795,5 +873,5 @@
+ #ifdef ACTUAL_DMA_SYSTEM
+-            const bool cpu_q = top->dbg_cpu_quiet;
++            const bool cpu_q = top->dbg_cpu_quiet && top->dbg_cpu_wr_quiet;
+ #else
+             const bool cpu_q = true;
+ #endif
+@@ -804,5 +882,12 @@
+             if (g_cycle - last_progress_cycle > WATCHDOG_CYCLES) {
+                 dump_stall(std::string("quiet ") + tag);
+                 throw TestFailure("watchdog during drain-to-quiet");
+             }
++#ifdef ACTUAL_DMA_SYSTEM
++            if (cpu_writes && !top->dbg_cpu_wr_quiet &&
++                (g_cycle - cpu_wr_progress_cycle > cpu_wr_watchdog_cycles)) {
++                dump_stall(std::string("quiet cpu-wr ") + tag);
++                throw TestFailure("watchdog: synthetic CPU write/AMO made no progress");
++            }
++#endif
+         }
+@@ -885,3 +970,13 @@
+         std::fprintf(stderr,
+             "  SYS cpu issued=%u completed=%u quiet=%d active=%d\n",
+             (unsigned)top->dbg_cpu_issued, (unsigned)top->dbg_cpu_completed,
+             (int)top->dbg_cpu_quiet, (int)top->dbg_cpu_active);
++        std::fprintf(stderr,
++            "  SYS cpu-wr issued=%u completed=%u amo_issued=%u amo_completed=%u "
++            "quiet=%d amo_r_fire=%d amo_r_data=0x%016llx rd_err=%u wr_err=%u amo_err=%u\n",
++            (unsigned)top->dbg_cpu_wr_issued, (unsigned)top->dbg_cpu_wr_completed,
++            (unsigned)top->dbg_cpu_amo_issued, (unsigned)top->dbg_cpu_amo_completed,
++            (int)top->dbg_cpu_wr_quiet, (int)top->dbg_cpu_amo_r_fire,
++            (unsigned long long)top->dbg_cpu_amo_r_data,
++            (unsigned)top->dbg_cpu_rd_err, (unsigned)top->dbg_cpu_wr_err,
++            (unsigned)top->dbg_cpu_amo_err);
+@@ -1261,4 +1356,9 @@
+                 if ((top->dbg_dma_batch_active & 1) &&
+                     (g_cycle - cpu_progress_cycle > cpu_watchdog_cycles)) {
+                     dump_stall("scenario CPU progress");
+                     throw TestFailure("watchdog: synthetic CPU made no progress");
+                 }
++                if (cpu_writes && !top->dbg_cpu_wr_quiet &&
++                    (g_cycle - cpu_wr_progress_cycle > cpu_wr_watchdog_cycles)) {
++                    dump_stall("scenario CPU write progress");
++                    throw TestFailure("watchdog: synthetic CPU write/AMO made no progress");
++                }
+ #endif
+@@ -1327,10 +1427,56 @@
+         // Synthetic CPU must actually run and drain (no false PASS by skipping
+         // the new branch).
+         CHECK(top->dbg_cpu_completed > 0, "synthetic CPU completed no reads");
++        CHECK(top->dbg_cpu_issued == top->dbg_cpu_completed,
++              "synthetic CPU issued/completed read mismatch at terminal");
+         CHECK(top->dbg_cpu_quiet, "synthetic CPU not quiet at terminal");
+         // The idle debug port must never produce shared-DDR traffic.
+         CHECK(n_slv_ar[1] == 0, "idle debug port produced shared-DDR reads");
+         if (!enable) {
+             CHECK(n_fast == 0 && n_fast_bank[0] == 0 && n_fast_bank[1] == 0,
+                   "nonblocking fast path fired while nonblocking is disabled");
+         }
++        // ---- optional synthetic CPU write / AMO evidence -------------------
++        if (cpu_writes) {
++            CHECK(top->dbg_cpu_wr_completed  > 0,
++                  "synthetic CPU completed no plain writes");
++            CHECK(top->dbg_cpu_amo_completed > 0,
++                  "synthetic CPU completed no AMOs");
++            // issued == completed: every offered AW/W/B/R really retired.
++            CHECK(top->dbg_cpu_wr_issued  == top->dbg_cpu_wr_completed,
++                  "synthetic CPU issued/completed write mismatch at terminal");
++            CHECK(top->dbg_cpu_amo_issued == top->dbg_cpu_amo_completed,
++                  "synthetic CPU issued/completed AMO mismatch at terminal");
++            CHECK(top->dbg_cpu_rd_err  == 0,
++                  "synthetic CPU read received a non-OKAY response");
++            CHECK(top->dbg_cpu_wr_err  == 0,
++                  "synthetic CPU write received a non-OKAY response");
++            CHECK(top->dbg_cpu_amo_err == 0,
++                  "synthetic CPU AMO received a non-OKAY response");
++            CHECK(n_cpu_amo_obs == (uint64_t)top->dbg_cpu_amo_completed,
++                  "AMO R observations do not match completed AMOs");
++            // Plain write data / strobe actually landed in DDR.
++            CHECK(read64(CPU_WR_ADDR) == CPU_WR_DAT0,
++                  "synthetic CPU plain write beat 0 data was not stored");
++            CHECK(read64(CPU_WR_ADDR + 8) ==
++                      cpu_apply_strb(CPU_WR_INIT1, CPU_WR_DAT1, CPU_WR_STR1),
++                  "synthetic CPU plain write beat 1 data/strb was not honoured");
++            // AMO accumulation reached the expected final DDR value.
++            CHECK(read64(CPU_AMO_ADDR) ==
++                      CPU_AMO_INIT +
++                      (uint64_t)top->dbg_cpu_amo_completed * CPU_AMO_ADD,
++                  "synthetic CPU AMO final DDR value does not match the addend sum");
++            std::printf("SYSTEM cpu-wr wr_issued=%u wr_completed=%u amo_issued=%u "
++                        "amo_completed=%u amo_obs=%llu rd_err=%u wr_err=%u amo_err=%u "
++                        "wr_mem=0x%016llx amo_mem=0x%016llx\n",
++                        (unsigned)top->dbg_cpu_wr_issued,
++                        (unsigned)top->dbg_cpu_wr_completed,
++                        (unsigned)top->dbg_cpu_amo_issued,
++                        (unsigned)top->dbg_cpu_amo_completed,
++                        (unsigned long long)n_cpu_amo_obs,
++                        (unsigned)top->dbg_cpu_rd_err,
++                        (unsigned)top->dbg_cpu_wr_err,
++                        (unsigned)top->dbg_cpu_amo_err,
++                        (unsigned long long)read64(CPU_WR_ADDR),
++                        (unsigned long long)read64(CPU_AMO_ADDR));
++        }
+         std::printf("SYSTEM walk ddtw=%lu ptw=%lu ddr_ar=%lu ddr_aw=%lu ddr_r=%lu "
+@@ -1385,3 +1531,6 @@
+     uint64_t    a_target = 1048576ULL;
++#ifdef ACTUAL_DMA_SYSTEM
++    bool        cpu_writes = false;
++#endif
+ 
+     for (int i = 1; i < argc; ++i) {
+@@ -1399,3 +1549,6 @@
+         if (const char* v = val("ptw-latency")) ptw_lat = (uint32_t)std::strtoul(v, nullptr, 0);
+         if (const char* v = val("a-target"))  a_target = std::strtoull(v, nullptr, 0);
++#ifdef ACTUAL_DMA_SYSTEM
++        if (const char* v = val("cpu-writes")) cpu_writes = (std::strtoul(v, nullptr, 0) != 0);
++#endif
+     }
+@@ -1432,3 +1585,6 @@
+                 a_pages, v_gap, transfers, warmup, ptw_lat,
+                 (unsigned long long)a_target);
+     std::printf("NOTE: ptw latency is a plain model delay (DDL/DDR), NOT MIG-matched.\n");
++#ifdef ACTUAL_DMA_SYSTEM
++    std::printf("nonblock_actual_dma_test: cpu_writes=%d\n", (int)cpu_writes);
++#endif
+ 
+     int rc = 0;
+@@ -1442,3 +1598,6 @@
+         tb.ptw_latency     = ptw_lat;
+         tb.a_target        = a_target;
++#ifdef ACTUAL_DMA_SYSTEM
++        tb.cpu_writes      = cpu_writes;
++#endif
+         tb.policy_partition= false;

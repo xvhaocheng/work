@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: Solderpad-0.51
+//
+// dma_nonblock_observer
+//
+// Passive, non-blocking (open, close] window observer. The module only samples
+// the DMA monitor bus; no output feeds back into the DMA or AXI data paths, and
+// the register bank is read-only from software.
+//
+// 16-word read-only bank, selected by the 8-bit index port:
+//   0  magic  0x49444D414E424C01
+//   1  version 1
+//   2  Mode
+//   3  flags  {.., frozen, active, armed}
+//   4  seq    monotonic, incremented once per ARM
+//   5  cycles active cycles counted inside (open, close]
+//   6  fast DID10 read
+//   7  fast DID10 write
+//   8  fast DID11 read
+//   9  fast DID11 write
+//  10  fast other
+//  11  normal DID10
+//  12  normal DID11
+//  13  normal other
+//  14  all accepted (== sum of words 6..13)
+//  15  sticky error bits
+//
+// Indices 16..31 expose a separate passive diagnostic bank; the original
+// words 0..15 are unchanged. Other indices read zero. rst is synchronous
+// and active high.
+//
+module dma_nonblock_observer #(
+    parameter int unsigned Mode = 2
+) (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        arm,
+    input  logic        open,
+    input  logic        close,
+    input  logic [7:0]  index,
+    output logic [63:0] rdata,
+    input  logic        accept,
+    input  logic        fast,
+    input  logic [23:0] did,
+    input  logic [5:0]  ttype,
+    input  logic [15:0] diag_events = 16'd0
+);
+    localparam logic [63:0] NB_MAGIC   = 64'h49444D414E424C01;
+    localparam logic [63:0] NB_VERSION = 64'd1;
+    localparam logic [63:0] DIAG_MAGIC = 64'h49444D414E444701;
+
+    // DID / transaction-type encodings used by the IOMMU.
+    localparam logic [23:0] DID_V = 24'd10;
+    localparam logic [23:0] DID_A = 24'd11;
+    localparam logic [5:0]  TT_R  = 6'b000010; // UNTRANSLATED_R
+    localparam logic [5:0]  TT_W  = 6'b000011; // UNTRANSLATED_W
+
+    // Error bit positions inside word 15.
+    localparam int E_OPEN_NO_ARM  = 0;
+    localparam int E_CLOSE_NO_ACT = 1;
+    localparam int E_OVERLAP      = 2;
+    localparam int E_OVERFLOW     = 3;
+    localparam int E_FAST_NO_ACPT = 4;
+    localparam int E_FAST_MODE1   = 5;
+    localparam int E_FAST_BAD_TT  = 6;
+
+    typedef enum logic [1:0] {S_OFF, S_ARMED, S_ACTIVE, S_FROZEN} state_e;
+
+    state_e      state_q, state_d;
+    logic [63:0] seq_q,   seq_d;
+    logic [63:0] cnt_q [16];
+    logic [63:0] cnt_d [16];
+    logic [63:0] err_q,   err_d;
+    logic [15:0] diag_seen_q, diag_seen_d;
+    logic [63:0] diag_cnt_q [9], diag_cnt_d [9];
+    logic diag_overflow_q, diag_overflow_d;
+
+    // Event classification selects (module scope so always_comb stays simple).
+    logic        ff_r10, ff_w10, ff_r11, ff_w11, ff_other;
+    logic        nn_10, nn_11, nn_other;
+    logic [3:0]  cat;
+    logic        arm_overlap;
+
+    always_comb begin
+        ff_r10   = fast && (did == DID_V) && (ttype == TT_R);
+        ff_w10   = fast && (did == DID_V) && (ttype == TT_W);
+        ff_r11   = fast && (did == DID_A) && (ttype == TT_R);
+        ff_w11   = fast && (did == DID_A) && (ttype == TT_W);
+        ff_other = fast && !(ff_r10 || ff_w10 || ff_r11 || ff_w11);
+        nn_10    = !fast && (did == DID_V);
+        nn_11    = !fast && (did == DID_A);
+        nn_other = !fast && (did != DID_V) && (did != DID_A);
+
+        cat = 4'd0;
+        if (accept) begin
+            if (ff_r10)        cat = 4'd6;
+            else if (ff_w10)   cat = 4'd7;
+            else if (ff_r11)   cat = 4'd8;
+            else if (ff_w11)   cat = 4'd9;
+            else if (fast)     cat = 4'd10;
+            else if (nn_10)    cat = 4'd11;
+            else if (nn_11)    cat = 4'd12;
+            else               cat = 4'd13;
+        end
+
+        arm_overlap = arm && (open || close);
+
+        state_d = state_q;
+        seq_d   = seq_q;
+        err_d   = err_q;
+        diag_seen_d = diag_seen_q;
+        diag_overflow_d = diag_overflow_q;
+        for (int i = 0; i < 9; i++) diag_cnt_d[i] = diag_cnt_q[i];
+        for (int i = 0; i < 16; i++) cnt_d[i] = cnt_q[i];
+
+        // ---- commands ----
+        // ARM clears the window and arms. Invalid while active or when asserted
+        // together with OPEN/CLOSE: set overlap error and preserve the window.
+        if (arm) begin
+            if (arm_overlap) begin
+                err_d[E_OVERLAP] = 1'b1;
+            end else if (state_q == S_ACTIVE) begin
+                err_d[E_OVERLAP] = 1'b1;
+            end else begin
+                state_d = S_ARMED;
+                err_d   = '0;
+                diag_seen_d = '0;
+                diag_overflow_d = 1'b0;
+                for (int i = 0; i < 9; i++) diag_cnt_d[i] = '0;
+                for (int i = 0; i < 16; i++) cnt_d[i] = '0;
+                if (seq_q == {64{1'b1}}) err_d[E_OVERFLOW] = 1'b1;
+                else                     seq_d = seq_q + 64'd1;
+            end
+        end
+
+        // OPEN is only legal from registered ARMED, with no same-cycle ARM.
+        // No open-edge event is counted.
+        if (open) begin
+            if (arm) begin
+                err_d[E_OVERLAP] = 1'b1; // ARM/OPEN overlap is invalid
+            end else if (state_q == S_ARMED) begin
+                state_d = S_ACTIVE;
+            end else if (state_q == S_ACTIVE) begin
+                err_d[E_OVERLAP] = 1'b1; // open while active
+            end else begin
+                err_d[E_OPEN_NO_ARM] = 1'b1; // open without arm
+            end
+        end
+
+        // CLOSE is only legal while registered ACTIVE, with no same-cycle ARM.
+        // Freezes the window.
+        if (close) begin
+            if (arm) begin
+                err_d[E_OVERLAP] = 1'b1; // ARM/CLOSE overlap is invalid
+            end else if (state_q == S_ACTIVE) begin
+                state_d = S_FROZEN;
+            end else begin
+                err_d[E_CLOSE_NO_ACT] = 1'b1;
+            end
+        end
+
+        // ---- window accumulation (open, close] ----
+        // Counting keys off the registered state, so the open-edge cycle is
+        // excluded and the close-edge cycle (state still S_ACTIVE) is included.
+        if (state_q == S_ACTIVE) begin
+            diag_seen_d = diag_seen_d | diag_events;
+            // Counts map to events 3..11. Probe phases can cross the window
+            // boundary; their counts need not form a complete lifecycle here.
+            for (int i = 0; i < 9; i++) begin
+                if (diag_events[i+3]) begin
+                    if (diag_cnt_d[i] == {64{1'b1}}) diag_overflow_d = 1'b1;
+                    else diag_cnt_d[i] = diag_cnt_d[i] + 64'd1;
+                end
+            end
+            if (cnt_d[5] == {64{1'b1}}) err_d[E_OVERFLOW] = 1'b1;
+            else                        cnt_d[5] = cnt_d[5] + 64'd1;
+
+            if (accept) begin
+                if (cnt_d[14] == {64{1'b1}}) err_d[E_OVERFLOW] = 1'b1;
+                else                         cnt_d[14] = cnt_d[14] + 64'd1;
+
+                if (cnt_d[cat] == {64{1'b1}}) err_d[E_OVERFLOW] = 1'b1;
+                else                          cnt_d[cat] = cnt_d[cat] + 64'd1;
+            end
+        end
+
+        // ---- fast protocol errors (sticky), only while a window is open/armed ----
+        if (state_q == S_ARMED || state_q == S_ACTIVE) begin
+            if (fast && !accept)                               err_d[E_FAST_NO_ACPT] = 1'b1;
+            if ((Mode == 1) && fast)                           err_d[E_FAST_MODE1]   = 1'b1;
+            if (fast && !((ttype == TT_R) || (ttype == TT_W))) err_d[E_FAST_BAD_TT]  = 1'b1;
+        end
+    end
+
+    always_comb begin
+        rdata = 64'd0;
+        case (index)
+            8'd0:  rdata = NB_MAGIC;
+            8'd1:  rdata = NB_VERSION;
+            8'd2:  rdata = 64'(Mode);
+            8'd3:  rdata = {61'd0, (state_q == S_FROZEN),
+                                     (state_q == S_ACTIVE),
+                                     (state_q == S_ARMED)};
+            8'd4:  rdata = seq_q;
+            8'd5:  rdata = cnt_q[5];
+            8'd6:  rdata = cnt_q[6];
+            8'd7:  rdata = cnt_q[7];
+            8'd8:  rdata = cnt_q[8];
+            8'd9:  rdata = cnt_q[9];
+            8'd10: rdata = cnt_q[10];
+            8'd11: rdata = cnt_q[11];
+            8'd12: rdata = cnt_q[12];
+            8'd13: rdata = cnt_q[13];
+            8'd14: rdata = cnt_q[14];
+            8'd15: rdata = err_q;
+            // Separate diagnostic bank: original words 0..15 stay unchanged.
+            8'd16: rdata = DIAG_MAGIC;
+            8'd17: rdata = 64'd1;
+            8'd18: rdata = 64'(Mode);
+            8'd19: rdata = {diag_overflow_q, 60'd0, (state_q == S_FROZEN),
+                                     (state_q == S_ACTIVE), (state_q == S_ARMED)};
+            8'd20: rdata = seq_q;
+            8'd21: rdata = cnt_q[5];
+            8'd22: rdata = {48'd0, diag_seen_q};
+            8'd23: rdata = diag_cnt_q[0];
+            8'd24: rdata = diag_cnt_q[1];
+            8'd25: rdata = diag_cnt_q[2];
+            8'd26: rdata = diag_cnt_q[3];
+            8'd27: rdata = diag_cnt_q[4];
+            8'd28: rdata = diag_cnt_q[5];
+            8'd29: rdata = diag_cnt_q[6];
+            8'd30: rdata = diag_cnt_q[7];
+            8'd31: rdata = diag_cnt_q[8];
+            default: rdata = 64'd0;
+        endcase
+    end
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            state_q <= S_OFF;
+            seq_q   <= 64'd0;
+            err_q   <= 64'd0;
+            diag_seen_q <= '0;
+            diag_overflow_q <= 1'b0;
+            for (int i = 0; i < 9; i++) diag_cnt_q[i] <= 64'd0;
+            for (int i = 0; i < 16; i++) cnt_q[i] <= 64'd0;
+        end else begin
+            state_q <= state_d;
+            seq_q   <= seq_d;
+            err_q   <= err_d;
+            diag_seen_q <= diag_seen_d;
+            diag_overflow_q <= diag_overflow_d;
+            for (int i = 0; i < 9; i++) diag_cnt_q[i] <= diag_cnt_d[i];
+            for (int i = 0; i < 16; i++) cnt_q[i] <= cnt_d[i];
+        end
+    end
+endmodule

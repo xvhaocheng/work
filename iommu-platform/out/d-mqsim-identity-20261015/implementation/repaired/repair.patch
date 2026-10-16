@@ -1,0 +1,111 @@
+--- a/src/identity_log.h
++++ b/src/identity_log.h
+@@ -115,6 +115,19 @@
+   state().disabled=true;error(t,"observer_arena_exhausted_identity_disabled",nullptr);
+  }
+ }
++template<class T> inline void user_allocate(uint64_t t,T* p,uint64_t old_ppa,bool locked) {
++ if(state().disabled)return;
++ auto i=state().children.find(p);if(i==state().children.end()) {error(t,"allocation_missing_child",p);return;}
++ std::cerr<<"{\"event\":\"identity_user_allocate\",\"time_ns\":"<<t<<",\"child_uid\":"<<i->second.uid
++  <<",\"owner_uid\":"<<i->second.owner<<",\"user_uid\":"<<i->second.owner<<",\"stream\":"<<p->Stream_id<<",\"lpa\":"<<p->LPA
++  <<",\"old_ppa\":"<<old_ppa<<",\"new_ppa\":"<<p->PPA<<",\"locked\":"<<(locked?"true":"false")<<"}\n";
++}
++template<class A> inline void gc_candidate(uint64_t t,const A& a,uint64_t stream,uint64_t count) {
++ if(state().disabled)return;
++ std::cerr<<"{\"event\":\"identity_gc_candidate\",\"time_ns\":"<<t<<",\"stream\":"<<stream
++  <<",\"channel\":"<<a.ChannelID<<",\"chip\":"<<a.ChipID<<",\"die\":"<<a.DieID<<",\"plane\":"<<a.PlaneID
++  <<",\"block\":"<<a.BlockID<<",\"ongoing_user_program_count\":"<<count<<"}\n";
++}
+ template<class T> inline void child_created(uint64_t t,T* p) {
+  if(state().disabled)return;
+  try {
+--- a/src/ssd/Address_Mapping_Unit_Page_Level.cpp
++++ b/src/ssd/Address_Mapping_Unit_Page_Level.cpp
+@@ -1198,6 +1198,8 @@
+ 		transaction->PPA = Convert_address_to_ppa(transaction->Address);
+ 		domain->Update_mapping_info(ideal_mapping_table, transaction->Stream_id, transaction->LPA, transaction->PPA,
+ 			((NVM_Transaction_Flash_WR*)transaction)->write_sectors_bitmap | domain->Get_page_status(ideal_mapping_table, transaction->Stream_id, transaction->LPA));
++		if (!is_for_gc) Identity::user_allocate(Simulator->Time(), transaction, old_ppa,
++			domain->Locked_LPAs.find(transaction->LPA) != domain->Locked_LPAs.end());
+ 	}
+ 
+ 	void Address_Mapping_Unit_Page_Level::allocate_plane_for_translation_write(NVM_Transaction_Flash* transaction)
+@@ -1809,30 +1811,25 @@
+ 		if (itr == domains[stream_id]->Locked_LPAs.end()) {
+ 			PRINT_ERROR("Illegal operation: Unlocking an LPA that has not been locked!");
+ 		}
++
++		// Borrow original children; owner lists retain their completion references.
++		// Detach both fixed batches before any potentially reentrant translation.
++		std::list<NVM_Transaction*> resumed;
++		auto reads = domains[stream_id]->Read_transactions_behind_LPA_barrier.equal_range(lpa);
++		for (auto it = reads.first; it != reads.second; ++it) resumed.push_back(it->second);
++		domains[stream_id]->Read_transactions_behind_LPA_barrier.erase(reads.first, reads.second);
++		auto writes = domains[stream_id]->Write_transactions_behind_LPA_barrier.equal_range(lpa);
++		for (auto it = writes.first; it != writes.second; ++it) resumed.push_back(it->second);
++		domains[stream_id]->Write_transactions_behind_LPA_barrier.erase(writes.first, writes.second);
++
+ 		domains[stream_id]->Locked_LPAs.erase(itr);
+ 		Identity::lpa_event("identity_lpa_unlock", Simulator->Time(), stream_id, lpa);
+-
+-		//If there are read requests waiting behind the barrier, then MQSim assumes they can be serviced with the actual page data that is accessed during GC execution
+-		auto read_tr = domains[stream_id]->Read_transactions_behind_LPA_barrier.find(lpa);
+-		while (read_tr != domains[stream_id]->Read_transactions_behind_LPA_barrier.end()) {
+-			Identity::child_live_event("identity_barrier_read_release", Simulator->Time(), (*read_tr).second);
+-			handle_transaction_serviced_signal_from_PHY((*read_tr).second);
+-			Identity::child_retire("identity_barrier_read_delete", Simulator->Time(), (*read_tr).second);
+-			delete (*read_tr).second;
+-			domains[stream_id]->Read_transactions_behind_LPA_barrier.erase(read_tr);
+-			read_tr = domains[stream_id]->Read_transactions_behind_LPA_barrier.find(lpa);
+-		}
+-
+-		//If there are write requests waiting behind the barrier, then MQSim assumes they can be serviced with the actual page data that is accessed during GC execution. This may not be 100% true for all write requests, but, to avoid more complexity in the simulation, we accept this assumption.
+-		auto write_tr = domains[stream_id]->Write_transactions_behind_LPA_barrier.find(lpa);
+-		while (write_tr != domains[stream_id]->Write_transactions_behind_LPA_barrier.end()) {
+-			Identity::child_live_event("identity_barrier_write_release", Simulator->Time(), (*write_tr).second);
+-			handle_transaction_serviced_signal_from_PHY((*write_tr).second);
+-			Identity::child_retire("identity_barrier_write_delete", Simulator->Time(), (*write_tr).second);
+-			delete (*write_tr).second;
+-			domains[stream_id]->Write_transactions_behind_LPA_barrier.erase(write_tr);
+-			write_tr = domains[stream_id]->Write_transactions_behind_LPA_barrier.find(lpa);
+-		}
++		for (auto transaction : resumed) {
++			Identity::child_live_event(transaction->Type == Transaction_Type::READ ?
++				"identity_barrier_read_resume" : "identity_barrier_write_resume",
++				Simulator->Time(), static_cast<NVM_Transaction_Flash*>(transaction));
++		}
++		if (!resumed.empty()) Translate_lpa_to_ppa_and_dispatch(resumed);
+ 	}
+ 
+ 	inline void Address_Mapping_Unit_Page_Level::Remove_barrier_for_accessing_mvpn(stream_id_type stream_id, MVPN_type mvpn)
+--- a/src/ssd/GC_and_WL_Unit_Page_Level.cpp
++++ b/src/ssd/GC_and_WL_Unit_Page_Level.cpp
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #include "../d_boundary_probe.h"
+ #include <math.h>
+ #include <vector>
+@@ -145,6 +146,7 @@
+ 				return;
+ 			}
+ 			
++			Identity::gc_candidate(Simulator->Time(), gc_candidate_address, block->Stream_id, block->Ongoing_user_program_count);
+ 			//Run the state machine to protect against race condition
+ 			block_manager->GC_WL_started(gc_candidate_address);
+ 			pbke->Ongoing_erase_operations.insert(gc_candidate_block_id);
+--- a/src/ssd/NVM_PHY_ONFI_NVDDR2.cpp
++++ b/src/ssd/NVM_PHY_ONFI_NVDDR2.cpp
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #include <stdexcept>
+ #include "../sim/Engine.h"
+ #include "NVM_PHY_ONFI_NVDDR2.h"
+@@ -130,6 +131,7 @@
+ 	
+ 	void NVM_PHY_ONFI_NVDDR2::Send_command_to_chip(std::list<NVM_Transaction_Flash*>& transaction_list)
+ 	{
++		for (auto transaction : transaction_list) Identity::child_live_event("identity_phy_issue", Simulator->Time(), transaction);
+ 		ONFI_Channel_NVDDR2* target_channel = channels[transaction_list.front()->Address.ChannelID];
+ 
+ 		NVM::FlashMemory::Flash_Chip* targetChip = target_channel->Chips[transaction_list.front()->Address.ChipID];

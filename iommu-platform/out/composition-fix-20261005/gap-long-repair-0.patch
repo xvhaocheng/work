@@ -1,0 +1,262 @@
+diff --git a/tests/nonblock_coupled_test.cpp b/tests/nonblock_coupled_test.cpp
+--- a/tests/nonblock_coupled_test.cpp
++++ b/tests/nonblock_coupled_test.cpp
+@@ -63,6 +63,21 @@
+ // coupling-FIFO overflow CHECK (the f_up_r update), so a run can never
+ // back-pressure at one depth and check another.
+ //
++// Scenario selection (opt-in rows)
++// --------------------------------
++// The default plan is the historical 12 rows at 64 jobs each.  Four opt-in rows
++// carry the 16-page aggressor (mode1-a16-l1, mode1-a16-l31, mode2-a16-l1,
++// mode2-a16-l31); they run ONLY when named with +scenario=<name> (Python
++// --scenario).  With no +scenario they are skipped and the default run is
++// unchanged.
++//
++// Job count (opt-in, +job-count=64|4096)
++// --------------------------------------
++// 64 is the historical default and keeps every existing log valid; 4096 is the
++// bounded long continuous-work run.  Both are validated exactly.  Warm-up is
++// deliberately NOT scaled with the job count: the board warm256 is 256
++// transfers, not 256 pages, and this harness makes no board-warm256 claim.
++//
+ // This is a test harness model.  It is NOT DDR and NOT the real iDMA backend:
+ // it has no XBAR, no rv_iommu_ds_if arbitration, no board axi_delayer and no
+ // ID remap.  It only reproduces the ordering/back-pressure shape of the board.
+@@ -104,18 +104,38 @@
+ static const uint32_t PAGE_BEATS   = 512;   // 4 KiB / 8 B
+ static const uint32_t BURST_BEATS  = 256;   // 2 KiB / 8 B
+ static const uint32_t BURST_LEN    = 255;   // -> 256 beats
+ // The per-DMA read->write coupling-FIFO depth is no longer a file constant:
+ // it is Tb::couple_depth (default 3), set from +couple-depth=3|512 in main().
+-static const uint32_t WARM_ROUNDS  = 16;
+-static const uint32_t JOB_COUNT    = 64;
+-
+-// Last-progress watchdog: 4096 consecutive cycles with no upstream / completion
+-// handshake is treated as a real stall (a known stall no longer hides inside a
+-// 4-million-cycle budget).
+-static const long WATCHDOG_CYCLES = 4096L;
+-// Ultimate backstop only; the watchdog normally fires long before this.
+-static const long SCENARIO_BUDGET = 4000000L;
+-static const long WARM_BUDGET     = 200000L;
++static const uint32_t WARM_ROUNDS  = 16;   // not scaled with the job count
++
++// Job count per DMA.  64 is the historical default (every existing log); 4096
++// is the bounded long continuous-work run.  Set from +job-count=64|4096.
++static const uint32_t JOB_COUNT_DEFAULT = 64;
++
++// Last-progress watchdog: 4096 consecutive cycles with no upstream / completion
++// handshake is treated as a real stall.
++static const long WATCHDOG_CYCLES = 4096L;
++// Largest accepted +v-gap-cycles, strictly inside the watchdog window so a
++// planned V inter-job gap is never mistaken for a stall.
++static const uint32_t V_GAP_MAX = 4000;
++static_assert(V_GAP_MAX < (uint32_t)WATCHDOG_CYCLES,
++              "planned V gap must stay inside the watchdog window");
++
++// Ultimate backstop only; the watchdog normally fires long before this.  Now
++// DERIVED from the job count and the V gap: keep the historical per-job
++// allowance (4_000_000 / 64 == 62_500 cycles per job), add the total planned V
++// gap, and add a fixed warm-up + drain margin.  Finite for both job counts.
++static const long SCENARIO_BUDGET_PER_JOB = 62500L;
++static const long SCENARIO_BUDGET_WARM    = 400000L;
++static const long WARM_BUDGET             = 200000L;
++
++// Per-scenario backstop derived from the two run knobs (upper bound only; the
++// per-job watchdog is what detects a real stall).
++static long scenario_budget(uint32_t job_count, uint32_t v_gap_cycles) {
++    return SCENARIO_BUDGET_PER_JOB * (long)job_count
++         + (long)v_gap_cycles * (long)job_count
++         + SCENARIO_BUDGET_WARM;
++}
+ 
+ // ---------------------------------------------------------------------------
+ // identifiers / addresses / sizes
+@@ -239,7 +239,11 @@
+     long scenario_start  = 0;
+     uint32_t ptw_latency = 1;
+     uint32_t a_pages_    = 0;
++    // Job count per DMA (V and A each issue this many 4 KiB jobs).  64 keeps the
++    // historical 12-row run; 4096 is the bounded long run.  Set from
++    // +job-count=64|4096 in main(); every V/A job loop uses this value.
++    uint32_t job_count = JOB_COUNT_DEFAULT;
+ 
+     // Upstream request-priority order for the two DMA clients (see +order= in
+     // main()): 0 = V (dma[0]) first, 1 = A (dma[1]) first.
+     // Defaults select the matching-source order (both V-first).
+@@ -1127,9 +1127,10 @@
+     void run_scenario(const char* name, bool enable, uint32_t a_pages,
+                       uint32_t ptw_lat) {
+         std::printf("== coupled scenario %s (runtime enable=%d, a_pages=%u, "
+-                    "ptw_latency=%u, v_gap_cycles=%u, policy_partition=%d) ==\n",
+-                    name, (int)enable, a_pages, ptw_lat, v_gap_cycles,
+-                    (int)policy_partition);
++                    "ptw_latency=%u, jobs=%u, v_gap_cycles=%u, "
++                    "policy_partition=%d) ==\n",
++                    name, (int)enable, a_pages, ptw_lat, job_count,
++                    v_gap_cycles, (int)policy_partition);
+         setup_memory(a_pages);
+         reset(enable);
+         ptw_latency    = ptw_lat;
+@@ -1145,3 +1145,6 @@
+         for (uint32_t r = 0; r < WARM_ROUNDS; ++r) warm_round(a_pages);
+ 
++        // Bounded per-scenario budget; scales with the job count and V gap.
++        const long budget = scenario_budget(job_count, v_gap_cycles);
++
+         uint32_t v_next = 0, a_next = 0;
+@@ -1155,12 +1155,17 @@
+         if (a_pages) start_job(1, a_next++);
+ 
+-        while (v_next < JOB_COUNT || (a_pages && a_next < JOB_COUNT)) {
++        while (v_next < job_count || (a_pages && a_next < job_count)) {
+             tick();
+-            if (g_cycle - last_progress_cycle > WATCHDOG_CYCLES) {
++            // A pending planned V gap is a deliberate idle: widen the progress
++            // window by that bounded gap so a planned gap is never reported as
++            // a stall, while a real stall is still caught.
++            long idle_limit = WATCHDOG_CYCLES;
++            if (v_ready_at >= 0) idle_limit += (long)v_gap_cycles;
++            if (g_cycle - last_progress_cycle > idle_limit) {
+                 dump_stall(std::string("scenario ") + name);
+                 throw TestFailure("watchdog: no handshake progress");
+             }
+-            if (dma[0].job_done && v_next < JOB_COUNT) {
++            if (dma[0].job_done && v_next < job_count) {
+                 if (v_gap_cycles == 0) {
+                     start_job(0, v_next++);
+                     v_ready_at = -1;
+@@ -1173,6 +1173,6 @@
+             }
+-            if (a_pages && dma[1].job_done && a_next < JOB_COUNT) start_job(1, a_next++);
+-            if (g_cycle - scenario_start > SCENARIO_BUDGET) {
++            if (a_pages && dma[1].job_done && a_next < job_count) start_job(1, a_next++);
++            if (g_cycle - scenario_start > budget) {
+                 dump_stall(std::string("scenario ") + name);
+                 throw TestFailure("scenario budget exceeded");
+             }
+@@ -1184,6 +1184,6 @@
+                 throw TestFailure("watchdog: no handshake progress during drain");
+             }
+-            if (g_cycle - scenario_start > SCENARIO_BUDGET) {
++            if (g_cycle - scenario_start > budget) {
+                 dump_stall(std::string("scenario-drain ") + name);
+                 throw TestFailure("scenario drain budget exceeded");
+             }
+@@ -1229,9 +1229,9 @@
+         }
+-        std::printf("COUPLED-SUMMARY %s couple_depth=%u cycles=%ld comp_ar=%lu "
++        std::printf("COUPLED-SUMMARY %s couple_depth=%u jobs=%u cycles=%ld comp_ar=%lu "
+                     "ddtw_ar=%lu ptw_ar=%lu tl_accept=%lu tl_resp=%lu "
+                     "iotlb_look=%lu iotlb_hit=%lu ptw_active=%lu r_beats=%lu b_up=%lu "
+                     "nonblock_fire=%lu nonblock_busy=%lu "
+                     "v_gap=%u policy=%d\n",
+-                    name, couple_depth, g_cycle - scenario_start,
++                    name, couple_depth, job_count, g_cycle - scenario_start,
+                     (unsigned long)n_comp_ar, (unsigned long)n_ddtw_ar,
+                     (unsigned long)n_ptw_ar, (unsigned long)n_tl_accept,
+@@ -1250,18 +1250,24 @@
+ 
+     // (runtime enable, aggressor pages, ptw latency)
+     const struct { const char* name; bool en; uint32_t a; uint32_t lat; } plan[] = {
+-        { "mode1-solo-l1",  false, 0,  1 },
+-        { "mode1-solo-l31", false, 0,  31 },
+-        { "mode1-a1-l1",    false, 1,  1 },
+-        { "mode1-a1-l31",   false, 1,  31 },
+-        { "mode1-a8-l1",    false, 8,  1 },
+-        { "mode1-a8-l31",   false, 8,  31 },
+-        { "mode2-solo-l1",  true,  0,  1 },
+-        { "mode2-solo-l31", true,  0,  31 },
+-        { "mode2-a1-l1",    true,  1,  1 },
+-        { "mode2-a1-l31",   true,  1,  31 },
+-        { "mode2-a8-l1",    true,  8,  1 },
+-        { "mode2-a8-l31",   true,  8,  31 },
+-    };
++    // (runtime enable, aggressor pages, ptw latency, opt-in)
++    // The first 12 rows are the historical default plan; the four a16 rows run
++    // only when named with +scenario=<name>.
++    const struct { const char* name; bool en; uint32_t a; uint32_t lat; bool opt_in; } plan[] = {
++        { "mode1-solo-l1",  false, 0,  1,  false },
++        { "mode1-solo-l31", false, 0,  31, false },
++        { "mode1-a1-l1",    false, 1,  1,  false },
++        { "mode1-a1-l31",   false, 1,  31, false },
++        { "mode1-a8-l1",    false, 8,  1,  false },
++        { "mode1-a8-l31",   false, 8,  31, false },
++        { "mode1-a16-l1",   false, 16, 1,  true  },
++        { "mode1-a16-l31",  false, 16, 31, true  },
++        { "mode2-solo-l1",  true,  0,  1,  false },
++        { "mode2-solo-l31", true,  0,  31, false },
++        { "mode2-a1-l1",    true,  1,  1,  false },
++        { "mode2-a1-l31",   true,  1,  31, false },
++        { "mode2-a8-l1",    true,  8,  1,  false },
++        { "mode2-a8-l31",   true,  8,  31, false },
++        { "mode2-a16-l1",   true,  16, 1,  true  },
++        { "mode2-a16-l31",  true,  16, 31, true  },
++    };
+ 
+     // optional single-scenario selection: +scenario=<name>
+@@ -1291,6 +1291,7 @@
+     std::string couple_depth_str = "3";
+     std::string v_gap_str = "0";
+     std::string policy_str = "0";
++    std::string job_count_str = "64";
+     bool overlap = false;
+     bool fullbuffer_permit = false;
+     for (int i = 1; i < argc; ++i) {
+@@ -1306,5 +1306,7 @@
+         const std::string pkey = "+policy=";
+         if (a.rfind(pkey, 0) == 0) policy_str = a.substr(pkey.size());
++        const std::string jkey = "+job-count=";
++        if (a.rfind(jkey, 0) == 0) job_count_str = a.substr(jkey.size());
+         if (a == "--overlap") overlap = true;
+         if (a == "--fullbuffer-permit") fullbuffer_permit = true;
+     }
+@@ -1344,6 +1344,17 @@
+                              policy_str.c_str());
+         return 2;
+     }
++    // Strict job-count validation: exactly the two known values (same style as
++    // the depth/gap/policy knobs).
++    uint32_t job_count = 0;
++    if (job_count_str == "64")        job_count = 64;
++    else if (job_count_str == "4096") job_count = 4096;
++    else {
++        std::fprintf(stderr, "nonblock_coupled_test: invalid +job-count='%s' "
++                             "(expected exactly 64 or 4096)\n",
++                             job_count_str.c_str());
++        return 2;
++    }
+     int order_ar = 0, order_aw = 0;   // 0 = V first, 1 = A first
+     bool order_rr = false;
+     if (order == "aa")      { order_ar = 1; order_aw = 1; }
+@@ -1366,6 +1366,7 @@
+     std::printf("nonblock_coupled_test: fullbuffer_permit=%d\n",
+                 (int)fullbuffer_permit);
+     std::printf("nonblock_coupled_test: v_gap_cycles=%u\n", v_gap_cycles);
++    std::printf("nonblock_coupled_test: job_count=%u\n", job_count);
+     std::printf("nonblock_coupled_test: policy_partition=%d "
+                 "(wrapper PolicyEnable is an elaboration flag; see --policy)\n",
+                 (int)policy_partition);
+@@ -1374,13 +1374,20 @@
+     for (const auto& s : plan) {
+-        if (!only.empty() && only != s.name) continue;
++        if (!only.empty()) {
++            // Explicit +scenario selects exactly that row (a16 rows included).
++            if (only != s.name) continue;
++        } else if (s.opt_in) {
++            // No +scenario: the historical 12 rows run; the a16 rows are opt-in.
++            continue;
++        }
+         ++ran;
+         try {
+             Tb tb;
+             tb.order_ar_prefer = order_ar;
+             tb.order_aw_prefer = order_aw;
+             tb.rr_order        = order_rr;
+             tb.overlap_mode    = overlap;
+             tb.couple_depth    = couple_depth;
+             tb.fullbuffer_permit = fullbuffer_permit;
+             tb.v_gap_cycles      = v_gap_cycles;
+             tb.policy_partition  = policy_partition;
++            tb.job_count         = job_count;
+             tb.run_scenario(s.name, s.en, s.a, s.lat);

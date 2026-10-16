@@ -1,0 +1,517 @@
+--- tests/nonblock_actual_dma_test.cpp
++++ tests/nonblock_actual_dma_test.cpp
+@@ -31,7 +31,13 @@
+ //
+ // Exit: 0 on PASS, non-zero on FAIL / bounded STALL / WAIT.
+ 
++#ifdef ACTUAL_DMA_SYSTEM
++#include "Vnonblock_actual_dma_system_top.h"
++using TopT = Vnonblock_actual_dma_system_top;
++#else
+ #include "Vnonblock_actual_dma_top.h"
++using TopT = Vnonblock_actual_dma_top;
++#endif
+ #include "verilated.h"
+ 
+ double sc_time_stamp() { return 0; }
+@@ -113,12 +119,12 @@
+ // ---------------------------------------------------------------------------
+ class Tb {
+ public:
+-    Vnonblock_actual_dma_top* top;
++    TopT* top;
+ 
+     // ---------------- shared memory -------------------------------------
+     std::map<uint64_t, uint8_t> mem;
+ 
+-    enum Port { P_COMP = 0, P_DDTW = 1, P_PTW = 2 };
++    enum Port { P_COMP = 0, P_DDTW = 1, P_PTW = 2, P_DDR = 3 };
+     struct MemRead {
+         Port     port    = P_COMP;
+         uint64_t addr    = 0;
+@@ -153,6 +159,14 @@
+     long scenario_budget = 0;
+     // Per-V-progress watchdog (gap-scaled), set in reset().
+     long v_watchdog_cycles = 200000L;
++#ifdef ACTUAL_DMA_SYSTEM
++    // Synthetic-CPU independent progress baseline (refreshed only by the CPU
++    // lifecycle counters, never by DMA handshakes).
++    long     cpu_progress_cycle  = 0;
++    long     cpu_watchdog_cycles = 200000L;
++    uint32_t last_cpu_issued     = 0;
++    uint32_t last_cpu_completed  = 0;
++#endif
+ 
+     // ---------------- config driver state -------------------------------
+     bool     cfg_valid  = false;
+@@ -167,6 +181,11 @@
+     uint64_t n_r_beats = 0, n_b_up = 0;
+     uint64_t n_tl_accept = 0, n_tl_resp = 0;
+     uint64_t n_ptw_active = 0, n_iotlb_lookup = 0, n_iotlb_hit = 0;
++#ifdef ACTUAL_DMA_SYSTEM
++    uint64_t n_ddr_ar = 0, n_ddr_aw = 0, n_ddr_b = 0, n_ddr_r = 0;
++    uint64_t n_slv_ar[4] = {0, 0, 0, 0};   // by top 2 bits of the 6-bit DDR ID
++    uint64_t n_walk_ddtw = 0, n_walk_ptw = 0;
++#endif
+     uint64_t n_req_bank[2] = {0, 0};
+     uint64_t n_resp_bank[2] = {0, 0};
+     uint64_t n_fast = 0;                 // fast (nonblocking hit) responses
+@@ -179,7 +198,7 @@
+     static const long WATCHDOG_CYCLES = 200000L;   // ~10x a 4 KiB copy + walk
+     static const long CFG_TIMEOUT     = 100000L;
+ 
+-    Tb() : top(new Vnonblock_actual_dma_top) {}
++    Tb() : top(new TopT) {}
+     ~Tb() { top->final(); delete top; }
+ 
+     // ---------------------------------------------------------------------
+@@ -261,6 +280,7 @@
+     // ---------------------------------------------------------------------
+     // memory R-return drive (ordered, head-of-line) -- no Rready hardwire
+     // ---------------------------------------------------------------------
++#ifndef ACTUAL_DMA_SYSTEM
+     void drive_comp() {
+         top->comp_aw_ready = 1;
+         top->comp_ar_ready = (mem_q.size() < 16) ? 1 : 0;
+@@ -307,12 +327,40 @@
+             top->ptw_r_resp  = 0;
+             top->ptw_r_last  = (h.beat == h.len) ? 1 : 0;
+             break;
+-        }
+-    }
+-
+-    // ---------------------------------------------------------------------
+-    // one cycle
+-    // ---------------------------------------------------------------------
++        default: break;
++        }
++    }
++#else
++    // ---- SYSTEM mode: ONE shared DDR port (comp + DS merged by the xbar) ----
++    // The plain DDR model latency applies uniformly to every accepted DDR read;
++    // the real 50/50 DS delayer adds latency on the DS path in RTL only.
++    void drive_ddr() {
++        top->ddr_aw_ready = 1;
++        top->ddr_w_ready  = 1;
++        top->ddr_ar_ready = (mem_q.size() < 16) ? 1 : 0;
++        if (!cb_q.empty()) {
++            top->ddr_b_valid = 1;
++            top->ddr_b_id    = (uint8_t)cb_q.front();
++            top->ddr_b_resp  = 0;
++        } else {
++            top->ddr_b_valid = 0;
++            top->ddr_b_id    = 0;
++            top->ddr_b_resp  = 0;
++        }
++
++        top->ddr_r_valid = 0;
++        if (mem_q.empty()) return;
++        MemRead& h = mem_q.front();
++        if (h.latency > 0) { h.latency--; return; }
++
++        top->ddr_r_valid = 1;
++        top->ddr_r_data  = read64(h.addr + (uint64_t)h.beat * 8);
++        top->ddr_r_id    = (uint8_t)h.id;   // 6-bit shared-DDR ID echoed verbatim
++        top->ddr_r_resp  = 0;
++        top->ddr_r_last  = (h.beat == h.len) ? 1 : 0;
++    }
++#endif
++
+     void tick() {
+         top->nonblock_enable_i  = nonblock_enable  ? 1 : 0;
+         top->policy_partition_i = policy_partition ? 1 : 0;
+@@ -325,13 +373,36 @@
+         top->cfg_wstrb = cfg_wstrb;
+ 
+         top->clk_i = 0;
++#ifdef ACTUAL_DMA_SYSTEM
++        drive_ddr();
++#else
+         drive_comp();
+         drive_mem_r();
+         top->ddtw_ar_ready = 1;
+         top->ptw_ar_ready  = 1;
++#endif
+         top->eval();
+ 
+-        // ---- snapshot handshakes BEFORE the rising edge -----------------
++        // ================= pre-edge snapshot ==============================
++        bool any_fire = false;
++
++#ifdef ACTUAL_DMA_SYSTEM
++        const bool     f_ddr_ar   = top->ddr_ar_valid && top->ddr_ar_ready;
++        const bool     f_ddr_aw   = top->ddr_aw_valid && top->ddr_aw_ready;
++        const bool     f_ddr_w    = top->ddr_w_valid  && top->ddr_w_ready;
++        const bool     f_ddr_b    = top->ddr_b_valid  && top->ddr_b_ready;
++        const bool     f_ddr_r    = top->ddr_r_valid  && top->ddr_r_ready;
++        const uint64_t s_ddr_ar_a = top->ddr_ar_addr;
++        const uint32_t s_ddr_ar_l = (uint32_t)top->ddr_ar_len;
++        const uint32_t s_ddr_ar_i = (uint32_t)top->ddr_ar_id;
++        const uint64_t s_ddr_aw_a = top->ddr_aw_addr;
++        const uint32_t s_ddr_aw_l = (uint32_t)top->ddr_aw_len;
++        const uint32_t s_ddr_aw_i = (uint32_t)top->ddr_aw_id;
++        const uint64_t s_ddr_w_d  = top->ddr_w_data;
++        const uint8_t  s_ddr_w_s  = (uint8_t)top->ddr_w_strb;
++        const bool     s_ddr_w_l  = top->ddr_w_last;
++        any_fire = f_ddr_ar || f_ddr_aw || f_ddr_w || f_ddr_b || f_ddr_r;
++#else
+         const bool     s_comp_ar_v = top->comp_ar_valid;
+         const bool     s_comp_ar_r = top->comp_ar_ready;
+         const uint32_t s_comp_ar_i = top->comp_ar_id;
+@@ -382,24 +453,19 @@
+         const bool f_ddtw_r  = s_ddtw_r_v  && s_ddtw_r_r;
+         const bool f_ptw_r   = s_ptw_r_v   && s_ptw_r_r;
+ 
+-        if (f_comp_ar || f_ddtw_ar || f_ptw_ar || f_comp_aw || f_comp_w ||
+-            f_comp_b || f_comp_r || f_ddtw_r || f_ptw_r) {
+-            last_progress_cycle = g_cycle;
+-        }
+-
+-        // V (DMA0 = bank0) independent completion progress: obs_done_o pulses
+-        // once per completed transfer.  Independent of any A handshake, so A
+-        // activity can never mask a stalled V.
++        any_fire = f_comp_ar || f_ddtw_ar || f_ptw_ar || f_comp_aw || f_comp_w ||
++                   f_comp_b  || f_comp_r  || f_ddtw_r  || f_ptw_r;
++#endif
++
++        if (any_fire) last_progress_cycle = g_cycle;
++
++        // V (DMA0 = bank0) independent completion progress.
+         if (top->dbg_dma_done & 1) v_progress_cycle = g_cycle;
+ 
+-        // Fast (nonblocking hit) response accounting, split by bank.  With
+-        // nonblocking disabled this must remain 0.
+         if (top->dbg_fast_resp_valid && top->dbg_fast_resp_ready) {
+             ++n_fast;
+             ++n_fast_bank[top->dbg_fast_resp_bank & 1];
+         }
+-
+-        // ---- TL observation counters + per-bank counts ------------------
+         if (top->dbg_tl_req_valid && top->dbg_tl_req_ready) {
+             ++n_tl_accept;
+             ++n_req_bank[top->dbg_tl_req_bank & 1];
+@@ -414,11 +480,64 @@
+             if (top->dbg_tl_iotlb_hit) ++n_iotlb_hit;
+         }
+ 
+-        // ---- rising edge -------------------------------------------------
++#ifdef ACTUAL_DMA_SYSTEM
++        // Underlying walker counters: the real ds_if merge hides the external
++        // dd/ptw ports, so walk evidence comes from the harness taps.
++        if (top->dbg_ddtw_ar_fire) ++n_walk_ddtw;
++        if (top->dbg_ptw_ar_fire)  ++n_walk_ptw;
++        // Synthetic-CPU independent progress.
++        if (top->dbg_cpu_issued != last_cpu_issued ||
++            top->dbg_cpu_completed != last_cpu_completed) {
++            cpu_progress_cycle = g_cycle;
++            last_cpu_issued    = top->dbg_cpu_issued;
++            last_cpu_completed = top->dbg_cpu_completed;
++        }
++#endif
++
++        // ================= rising edge ====================================
+         top->clk_i = 1;
+         top->eval();
+ 
+-        // ---- queue / state updates from snapshots ------------------------
++#ifdef ACTUAL_DMA_SYSTEM
++        if (f_ddr_ar) {
++            ++n_ddr_ar;
++            ++n_slv_ar[(s_ddr_ar_i >> 4) & 3];
++            MemRead r; r.port = P_DDR; r.addr = s_ddr_ar_a;
++            r.len = (uint8_t)s_ddr_ar_l; r.id = (uint8_t)s_ddr_ar_i;
++            r.beat = 0; r.latency = (int)ptw_latency;
++            mem_q.push_back(r);
++        }
++        if (f_ddr_aw) {
++            ++n_ddr_aw;
++            CawEnt c; c.id = s_ddr_aw_i; c.addr = s_ddr_aw_a;
++            c.len = (uint8_t)s_ddr_aw_l; c.got = 0;
++            caw_q.push_back(c);
++        }
++        if (f_ddr_w) {
++            CHECK(!caw_q.empty(), "completion W without a pending completion AW");
++            CawEnt& c = caw_q.front();
++            CHECK(c.got < (uint32_t)c.len + 1, "too many completion W beats");
++            write_beat(c.addr + (uint64_t)c.got * 8, s_ddr_w_d, s_ddr_w_s);
++            c.got++;
++            if (s_ddr_w_l) {
++                CHECK(c.got == (uint32_t)c.len + 1, "completion W burst length mismatch");
++                cb_q.push_back(c.id);
++                caw_q.pop_front();
++            }
++        }
++        if (f_ddr_b) {
++            ++n_ddr_b;
++            CHECK(!cb_q.empty(), "completion B handshake with empty cb_q");
++            cb_q.pop_front();
++        }
++        if (f_ddr_r) {
++            ++n_ddr_r;
++            MemRead& h = mem_q.front();
++            CHECK(h.port == P_DDR, "R handshake on an unexpected port");
++            if (h.beat == h.len) mem_q.pop_front();
++            else                 h.beat++;
++        }
++#else
+         if (f_comp_ar) {
+             ++n_comp_ar;
+             MemRead r; r.port = P_COMP; r.addr = s_comp_ar_a;
+@@ -468,6 +587,7 @@
+             if (h.beat == h.len) mem_q.pop_front();
+             else                 h.beat++;
+         }
++#endif
+ 
+         top->clk_i = 0;
+         top->eval();
+@@ -567,6 +687,14 @@
+         for (int i = 0; i < 4; ++i) tick();
+         last_progress_cycle = g_cycle;
+         v_progress_cycle    = g_cycle;
++#ifdef ACTUAL_DMA_SYSTEM
++        n_ddr_ar = n_ddr_aw = n_ddr_b = n_ddr_r = 0;
++        n_slv_ar[0] = n_slv_ar[1] = n_slv_ar[2] = n_slv_ar[3] = 0;
++        n_walk_ddtw = n_walk_ptw = 0;
++        cpu_progress_cycle = g_cycle;
++        last_cpu_issued    = 0;
++        last_cpu_completed = 0;
++#endif
+         scenario_budget     = total_budget();
+         v_watchdog_cycles   = WATCHDOG_CYCLES + 4L * (long)v_gap_cycles;
+ 
+@@ -583,7 +711,12 @@
+         bool quiet = false;
+         for (long i = 0; i < QUIET_TIMEOUT; ++i) {
+             tick();
+-            if (top->dbg_in_flight == 0 && top->dbg_dma_job_quiet == 3) {
++#ifdef ACTUAL_DMA_SYSTEM
++            const bool cpu_q = top->dbg_cpu_quiet;
++#else
++            const bool cpu_q = true;
++#endif
++            if (top->dbg_in_flight == 0 && top->dbg_dma_job_quiet == 3 && cpu_q) {
+                 quiet = true;
+                 break;
+             }
+@@ -666,6 +799,37 @@
+             (int)((top->dbg_dma_job_quiet >> 1) & 1), (int)((top->dbg_dma_fullbuffer >> 1) & 1),
+             (int)((top->dbg_dma_launch_active >> 1) & 1), (int)((top->dbg_dma_launch_held >> 1) & 1),
+             (int)((top->dbg_dma_launch_error >> 1) & 1));
++#ifdef ACTUAL_DMA_SYSTEM
++        std::fprintf(stderr,
++            "  SYS cpu issued=%u completed=%u quiet=%d active=%d\n",
++            (unsigned)top->dbg_cpu_issued, (unsigned)top->dbg_cpu_completed,
++            (int)top->dbg_cpu_quiet, (int)top->dbg_cpu_active);
++        std::fprintf(stderr,
++            "  SYS ddr ar_v=%d ar_r=%d r_v=%d r_r=%d aw_v=%d aw_r=%d b_v=%d b_r=%d "
++            "ds ar_v=%d ar_r=%d r_v=%d r_r=%d comp ar_f=%d aw_f=%d w_f=%d "
++            "ddtw_f=%d ptw_f=%d\n",
++            (int)top->dbg_ddr_ar_valid, (int)top->dbg_ddr_ar_ready,
++            (int)top->dbg_ddr_r_valid,  (int)top->dbg_ddr_r_ready,
++            (int)top->dbg_ddr_aw_valid, (int)top->dbg_ddr_aw_ready,
++            (int)top->dbg_ddr_b_valid,  (int)top->dbg_ddr_b_ready,
++            (int)top->dbg_ds_ar_valid,  (int)top->dbg_ds_ar_ready,
++            (int)top->dbg_ds_r_valid,   (int)top->dbg_ds_r_ready,
++            (int)top->dbg_comp_ar_fire, (int)top->dbg_comp_aw_fire,
++            (int)top->dbg_comp_w_fire,  (int)top->dbg_ddtw_ar_fire,
++            (int)top->dbg_ptw_ar_fire);
++        std::fprintf(stderr,
++            "  SYS ddr_ar=%lu ddr_aw=%lu ddr_r=%lu  slv_ar cpu=%lu dbg=%lu ds=%lu comp=%lu\n",
++            (unsigned long)n_ddr_ar, (unsigned long)n_ddr_aw, (unsigned long)n_ddr_r,
++            (unsigned long)n_slv_ar[0], (unsigned long)n_slv_ar[1],
++            (unsigned long)n_slv_ar[3], (unsigned long)n_slv_ar[2]);
++        if (!mem_q.empty()) {
++            const MemRead& h = mem_q.front();
++            std::fprintf(stderr,
++                "  SYS ddrR.head slv=%u id=0x%02x addr=0x%016lx len=%u beat=%u lat=%d\n",
++                (unsigned)((h.id >> 4) & 3), (unsigned)h.id,
++                (unsigned long)h.addr, (unsigned)h.len, h.beat, h.latency);
++        }
++#endif
+         std::fprintf(stderr,
+             "  v_done_last(debug)=%llu a_done_last(debug)=%llu\n",
+             (unsigned long long)v_done_last, (unsigned long long)a_done_last);
+@@ -816,6 +980,13 @@
+                     dump_stall("scenario V progress");
+                     throw TestFailure("watchdog: V made no completion progress");
+                 }
++#ifdef ACTUAL_DMA_SYSTEM
++                if ((top->dbg_dma_batch_active & 1) &&
++                    (g_cycle - cpu_progress_cycle > cpu_watchdog_cycles)) {
++                    dump_stall("scenario CPU progress");
++                    throw TestFailure("watchdog: synthetic CPU made no progress");
++                }
++#endif
+                 read_batch_ctl(SEL_V, err, complete, stopped, active, enable_b);
+                 if (complete) break;
+                 if (g_cycle - scenario_start > scenario_budget) {
+@@ -870,15 +1041,41 @@
+         }
+ 
+         // ---- 7. mechanism guards ---------------------------------------
++#ifdef ACTUAL_DMA_SYSTEM
++        CHECK(n_ddr_ar > 0, "no shared-DDR reads observed");
++        CHECK(n_ddr_aw > 0, "no shared-DDR writes observed");
++        CHECK(n_ddr_r  > 0, "no shared-DDR R beats observed");
++        CHECK(n_tl_accept > 0, "no translation accepted by the TL");
++        // Walker evidence comes from the underlying harness taps, not from the
++        // (merged-away) external dd/ptw ports.
++        CHECK((n_walk_ddtw + n_walk_ptw) > 0, "no walker reads observed");
++        // Synthetic CPU must actually run and drain (no false PASS by skipping
++        // the new branch).
++        CHECK(top->dbg_cpu_completed > 0, "synthetic CPU completed no reads");
++        CHECK(top->dbg_cpu_quiet, "synthetic CPU not quiet at terminal");
++        // The idle debug port must never produce shared-DDR traffic.
++        CHECK(n_slv_ar[1] == 0, "idle debug port produced shared-DDR reads");
++        if (!enable) {
++            CHECK(n_fast == 0 && n_fast_bank[0] == 0 && n_fast_bank[1] == 0,
++                  "nonblocking fast path fired while nonblocking is disabled");
++        }
++        std::printf("SYSTEM walk ddtw=%lu ptw=%lu ddr_ar=%lu ddr_aw=%lu ddr_r=%lu "
++                    "slv_ar cpu=%lu ds=%lu comp=%lu cpu_issued=%u cpu_completed=%u\n",
++                    (unsigned long)n_walk_ddtw, (unsigned long)n_walk_ptw,
++                    (unsigned long)n_ddr_ar, (unsigned long)n_ddr_aw,
++                    (unsigned long)n_ddr_r, (unsigned long)n_slv_ar[0],
++                    (unsigned long)n_slv_ar[3], (unsigned long)n_slv_ar[2],
++                    (unsigned)top->dbg_cpu_issued, (unsigned)top->dbg_cpu_completed);
++#else
+         CHECK(n_comp_ar > 0, "no completion reads observed");
+         CHECK(n_r_beats + n_comp_ar > 0, "no R traffic observed");
+         CHECK(n_tl_accept > 0, "no translation accepted by the TL");
+         CHECK(n_ddtw_ar + n_ptw_ar > 0, "no walker reads observed");
+-        // With nonblocking disabled the fast path must never fire.
+         if (!enable) {
+             CHECK(n_fast == 0 && n_fast_bank[0] == 0 && n_fast_bank[1] == 0,
+                   "nonblocking fast path fired while nonblocking is disabled");
+         }
++#endif
+ 
+         std::printf("ACTUAL-DMA-SUMMARY %s enable=%d a_pages=%u transfers=%u "
+                     "cycles=%ld comp_ar=%lu ddtw_ar=%lu ptw_ar=%lu "
+--- tests/test_nonblock_actual_dma.py
++++ tests/test_nonblock_actual_dma.py
+@@ -166,6 +166,28 @@
+     ]
+ 
+ 
++def system_sources():
++    """Extra production sources required by the SYSTEM-mode top:
++    rv_iommu_ds_if + axi_delayer/stream_delay + axi_xbar family
++    (axi_xbar -> axi_xbar_unmuxed -> axi_multicut -> axi_cut, addr_decode)
++    and the stream_mux used by rv_iommu_ds_if.  axi_atop_filter /
++    onehot_to_bin are already appended by idma_sources()."""
++    axi = CVA6 / "vendor" / "pulp-platform" / "axi" / "src"
++    cc  = CVA6 / "vendor" / "pulp-platform" / "common_cells" / "src"
++    return [
++        cc  / "stream_delay.sv",
++        cc  / "addr_decode.sv",
++        cc  / "stream_mux.sv",
++        axi / "axi_cut.sv",
++        axi / "axi_multicut.sv",
++        axi / "axi_delayer.sv",
++        axi / "axi_xbar_unmuxed.sv",
++        axi / "axi_xbar.sv",
++        IOMMU / "rtl" / "ext_interfaces" / "rv_iommu_ds_if.sv",
++        ROOT / "tests" / "nonblock_actual_dma_system_top.sv",
++    ]
++
++
+ def idma_incdirs():
+     # IOMMU/include carries axi-iommu/*.svh; the register_interface include
+     # roots carry register_interface/*.svh.  The single vendored axi/ and
+@@ -197,27 +219,38 @@
+                     help="model PTW read latency (DDL/DDR model only; NOT MIG)")
+     ap.add_argument("--a-target", type=lambda s: int(s, 0), default=1048576,
+                     help="A autonomous batch target (default 1048576)")
++    ap.add_argument("--system", action="store_true",
++                    help="build the shared-DDR system-integration top "
++                         "(tests/nonblock_actual_dma_system_top.sv) with the "
++                         "production rv_iommu_ds_if / axi_delayer(50/50) / "
++                         "axi_xbar; compiles with -DACTUAL_DMA_SYSTEM and uses "
++                         "the separate object directory out/nonblock-actual-dma/obj-system")
+     opts = ap.parse_args()
+ 
+     sibling = load_sibling()
+     tb = ROOT / "tests" / "nonblock_actual_dma_test.cpp"
+ 
+-    # common_cells/axi come from the sibling's tree ONLY (no duplicate vendor),
+-    # except the FIFO family, which is taken from the production tree so that
+-    # idma_stream_fifo's FORCE_FPGA_RAM pin resolves and AsyncDpRam is real.
+-    # The TEST-ONLY ariane_pkg is compiled FIRST: fifo_v3.sv reads
+-    # ariane_pkg::FPGA_EN and Verilator 4.038 needs the package declared first.
++    if opts.system:
++        top_name = "nonblock_actual_dma_system_top"
++        obj_dir  = OUT / "obj-system"
++        defines  = ["-CFLAGS", "-DACTUAL_DMA_SYSTEM"]
++        extra    = [require(ROOT / "tests" / "nonblock_actual_dma_top.sv")] + [require(p) for p in system_sources()]
++    else:
++        top_name = TOP
++        obj_dir  = OUT / "obj"
++        defines  = []
++        extra    = [require(ROOT / "tests" / "nonblock_actual_dma_top.sv")]
++
+     sources = dedup(
+         [require(ARIANE_PKG_SRC)]
+         + [require(p) for p in sibling.SOURCES
+            if p not in REPLACED_BY_PRODUCTION]
+         + [require(p) for p in idma_sources()]
+         + [require(p) for p in production_fifo_sources()]
+-        + [require(ROOT / "tests" / "nonblock_actual_dma_top.sv")]
++        + extra
+     )
+     incdirs = dedup(list(sibling.INCDIRS) + idma_incdirs())
+ 
+-    obj_dir = OUT / "obj"
+     obj_dir.mkdir(parents=True, exist_ok=True)
+ 
+     args = [
+@@ -227,22 +260,24 @@
+         "--build",
+         "-Wno-fatal",
+         "+define+ASSERTS_OFF",
+-        "--top-module", TOP,
++    ] + defines + [
++        "--top-module", top_name,
+         "--Mdir", str(obj_dir),
+     ]
++
+     for inc in incdirs:
+         args += ["-I{}".format(inc)]
+     args += [str(p) for p in sources]
+     args += [str(tb)]
+ 
+-    build_log = OUT / "build.log"
++    build_log = OUT / ("build-system.log" if opts.system else "build.log")
+     with build_log.open("w") as log:
+         build = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT)
+     if build.returncode != 0:
+         sys.stderr.write(tail(build_log))
+         return 1
+ 
+-    exe = obj_dir / "V{}".format(TOP)
++    exe = obj_dir / "V{}".format(top_name)
+     if not exe.exists():
+         sys.stderr.write(tail(build_log))
+         sys.stderr.write("verilator did not produce {}\n".format(exe))
+@@ -258,13 +293,16 @@
+         "+ptw-latency={}".format(opts.ptw_latency),
+         "+a-target={}".format(opts.a_target),
+     ]
+-    print("test_nonblock_actual_dma: mode={} a_pages={} v_gap={} transfers={} "
+-          "warmup={} ptw_latency={} a_target={}".format(
+-              opts.mode, opts.a_pages, opts.v_gap, opts.transfers,
+-              opts.warmup, opts.ptw_latency, opts.a_target))
++    if opts.system:
++        run_args += ["+system=1"]
++    print("test_nonblock_actual_dma: system={} top={} mode={} a_pages={} v_gap={} "
++          "transfers={} warmup={} ptw_latency={} a_target={}".format(
++              int(opts.system), top_name, opts.mode, opts.a_pages, opts.v_gap,
++              opts.transfers, opts.warmup, opts.ptw_latency, opts.a_target))
+     run = subprocess.run(run_args)
+     return run.returncode
+ 
+ 
++
+ if __name__ == "__main__":
+     sys.exit(main())

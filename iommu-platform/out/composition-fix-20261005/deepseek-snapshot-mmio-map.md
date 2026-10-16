@@ -1,0 +1,194 @@
+# Read-only evidence map — idma.c pair window + FPGA MMIO/AR mapping
+
+Scope reminder honored: this is an address/call-chain evidence map only. No root-cause claim. I explicitly do **not** conclude "CPU stuck inside the pair function" from a missing `pair-return` (see §5).
+
+---
+
+## Navigation summary (fastest path)
+
+- The strings `pair-enter`/`pair-return` exist in exactly one place: `linux/drivers/misc/idma.c:534` and `:586`, both inside `idma_batch_start()`.
+- They are emitted only when `v->composition_trace` is true; that flag is set at `idma.c:2446` from `comp_trace = composition != NULL && READ_ONCE(idma_composition_trace)` (`:2373`). `composition != NULL` only on the `IDMA_IOC_RUN_COMPOSITION` path (`idma_run_composition` `:2775` → `idma_run_session2(..., p)` `:2803`). So the observed trace = composition run with `composition_trace=1`.
+- The protected "pair" region (`:535`–`:585`) contains **exactly two MMIO accesses**: `readq(reg+0x28)` on A at `:554`, then `readq(reg+0x28)` on V at `:578`. Everything else in the region is `ktime_get_ns()`/`signal_pending()`.
+- `0x28` is `IDMA_NEXT_ID_REG_OFFSET` (`idma.c:38`) and is a **read-trigger with a launch side effect** in HW (`idma_reg64_frontend.sv:490`).
+
+---
+
+## (1) FPGA MMIO windows, DMA0..3 bases, composition/observer/launcher control addresses
+
+### SoC windows — `cva6/corev_apu/tb/ariane_soc_pkg.sv`
+- `DMALength = 64'h4000` (`:62`), `IOMMULength = 64'h1000` (`:63`).
+- `DMABase = 64'h5000_0000` (`:79`), `IOMMUBase = 64'h5001_0000` (`:80`), `DRAMBase = 64'h8000_0000` (`:81`) with `DRAMLength = 64'h40000000` (`:64`).
+- Slave ordering (`axi_slaves_t`, `:35-48`): `DRAM, IOMMU_CFG, DMA_CFG, GPIO, Ethernet, SPI, Timer, UART, PLIC, CLINT, ROM, Debug` — `DMA_CFG = 2`, `IOMMU_CFG = 1`, `DRAM = 0` (`:36-38`). "must be in order from highest address to lowest" (`:34`).
+
+So:
+- DMA_CFG window = `0x5000_0000 .. 0x5000_3FFF` (16 KiB).
+- IOMMU programming window = `0x5001_0000 .. 0x5001_0FFF`.
+
+### DMA0..3 split — `ariane_peripherals_xilinx.sv`
+- `NumDMADevices = 4` (`:873`).
+- Config demux selects port by `addr[13:12]`: `.slv_aw_select_i(dma_cfg.aw_addr[13:12])`, `.slv_ar_select_i(dma_cfg.ar_addr[13:12])`, `NO_MST_PORTS(NumDMADevices)` (`:1203-1218`).
+- So each DMA has a 4 KiB window:
+
+| Instance | Base | DID (`DEVICE_ID` `:1288`) | OBSERVER_PORT (`:1284`) | LAUNCH_PORT (`:1285`) | RESEARCH_PORT (`:1286`) |
+|---|---|---|---|---|---|
+| DMA0 | `0x5000_0000` | 10 | 1 | 1 | 0 |
+| DMA1 | `0x5000_1000` | 11 | 0 | 1 | (role-dependent) |
+| DMA2 | `0x5000_2000` | 12 | 0 | 0 | 0 |
+| DMA3 | `0x5000_3000` | 13 | 0 | 0 | 0 |
+
+Confirms driver's victim did=10 / aggressor did=11 (`idma.c:2117`, `idma_p4m_validate` `:1314`).
+
+### "Outer" observer / launcher / composition control — which DMA and which selection
+From `idma_reg64_frontend.sv` (the DMA internal frontend):
+- Legacy observer window is selected on exact 8-bit addresses: `observer_access` → `full_addr == 0x58 | 0x60 | 0x68 | 0x70 | 0x78` (`:220-222`). These are forwarded outward: `obs_cfg_valid_o = observer_access || launcher_access` (`:233`), `obs_cfg_write_o = dma_ctrl_req_i.write` (`:234`), addr/wdata/wstrb at `:235-237`.
+- Launcher window: `launcher_access = LaunchPort && ObserverPort && valid && full_addr >= 0xb0 && !gap_access` (`:142-143`). Base constant `LauncherBase = 8'hb0` (`:67`).
+- Batch high bank: `batch_access = BatchPort && valid && full_addr[7] && !launcher_access` (`:144`); gap slots carved out first: `GapCyclesOffset = 0xd0`, `GapCapOffset = 0xd8` (`:70-71`), `gap_access` (`:138-139`).
+- In the top, the observer block gets `cfg_valid_i(obs_cfg_valid[0] && !obs_cfg_addr[0][7])` (`ariane_peripherals_xilinx.sv:984`), the launcher gets `cfg_valid_i(obs_cfg_valid[0] && obs_cfg_addr[0][7])` (`:1145`). Both are wired **only to DMA0** (`obs_cfg_rdata = obs_cfg_addr[0][7] ? launch_cfg_rdata : legacy_cfg_rdata` `:1012`).
+
+Consequently the "outer" control blocks are addressed through **DMA0 (`0x5000_0000`)**:
+- Observer bank (legacy): `0x5000_0058 / 0x60 / 0x68 / 0x70 / 0x78`.
+- Launcher bank: `0x5000_00b0 .. 0x00c8` (any `addr[7]`=1 is steered to the launcher block: `:1145`).
+- Composition is reached through the observer index/data words (`0x70`/`0x78`) — see below and §4 for the unresolved index base.
+
+### Composition register bank — `dma_composition_control.sv`
+- Module header/description: 128-word relative bank, `index_i == 0` maps to `D20`, only word 2 writable, others ignored (`:10-11`).
+- HW decode in top: `composition_access = IOMMUNonblockMode == 3 && research_index >= 13'hD20 && research_index <= 13'hD9F` (`ariane_peripherals_xilinx.sv:1015-1017`); `composition_index = research_index - 13'hD20` (`:1017`); `composition_data` selected when `composition_access` (`:1018`). Instantiated only in `gen_composition` when `IOMMUNonblockMode == 3` (`:1036-1059`).
+- Word map (`dma_composition_control.sv:465-518`):
+
+| rel word | content |
+|---|---|
+| 0 | `COMP_MAGIC = 64'h49444D4143504E01` (`:70`, `:468`) |
+| 1 | `COMP_ABI = 1` (`:71`, `:469`) |
+| 2 | `{32'd0, protected_did, 6'd0, mode}` — only writable word (`:470`) |
+| 3 | generation (`:471`) |
+| 4 | `{61'd0, last_status_q}` (`:472`) |
+| 5 | `{63'd0, quiet_obs}` (`:473`) |
+| 6 | `{frozen, active, armed}` (`:474`) |
+| 7 / 8 / 9 | seq / cycles / err (`:475-477`) |
+| 10 / 11 | win_cfg / win_gen (`:478-479`) |
+| 12–33 | counters (`:480-501`) |
+| 34 | `PROT_MASK = 3` (`:502`) |
+| 35 | 0 (`:503`) |
+| 36–39 | plru_open/close, pscid_v/a (`:504-507`) |
+| 64–95 | entries_open (2 words/entry) (`:509-511`) |
+| 96–127 | entries_close (`:512-514`) |
+
+Composition write is gated by `clear_o = rst_ni && cfg_write_i && (index_i == 7'd2) && !cfg_busy && supported_i && cfg_data_legal && (generation != all-ones)` (`:182-186`); `cfg_data_legal` requires `wdata[63:32]==0`, `wdata[7:2]==0`, and `wdata[31:8] ∈ {DID_V=10, DID_A=11}` (`:160-164`).
+
+---
+
+## (2) idma.c call chain pair‑enter → pair‑return, MMIO offsets, widths, IRQ masking, read side-effects
+
+### Call chain (composition batch pair)
+```
+IDMA_IOC_RUN_COMPOSITION  (ioctl, idma.c:2899)
+└─ idma_run_composition                 :2775
+   └─ idma_run_session2                 :2803 (composition = p)
+      ├─ … stream_prepare v/a           :2443 / :2448
+      ├─ idma_batch_configure(v)        :2539   (writes/reads 0x80,0x88,0x90,0x98)
+      ├─ idma_batch_configure(a)        :2541
+      ├─ idma_gap_program_readback(v)   :2548   (0xd8, 0xd0, 0x88)
+      ├─ idma_gap_program_readback(a)   :2550
+      ├─ idma_observation_arm           :2574   (0x68, 0x60)
+      ├─ idma_snapshot                  :2581   (0x50 v/a)
+      ├─ "prewindow"                    :2585
+      └─ idma_batch_window              :2586
+         └─ idma_batch_start            :888      (→ :504)
+            ├─ idma_submit_config(a)    :528   (writes 0x00,0x08,0x10,0x18  ← BEFORE pair-enter)
+            ├─ idma_submit_config(v)    :531   (writes 0x00,0x08,0x10,0x18  ← BEFORE pair-enter)
+            ├─ "pair-enter"             :534
+            ├─ preempt_disable          :535
+            ├─ local_irq_save           :536
+            │   ├─ ktime_get_ns         :543
+            │   ├─ signal_pending       :547
+            │   ├─ a_begin=ktime        :553
+            │   ├─ a_id = readq(0x28)   :554   ★ A trigger (DMA1, 0x5000_1028)
+            │   ├─ a_end=ktime          :555
+            │   ├─ v_begin=ktime        :577
+            │   ├─ v_id = readq(0x28)   :578   ★ V trigger (DMA0, 0x5000_0028)
+            │   └─ v_end=ktime          :579
+            ├─ local_irq_restore        :584
+            ├─ preempt_enable           :585
+            └─ "pair-return"            :586
+```
+Early-exit variants inside the same function: `a_id==0` path restores IRQ/preempt at `:564-565`; `out_untriggered` restores at `:622-623`.
+
+### MMIO inside the protected window [536, 584] — all 8-byte (`readq` = 64-bit)
+| Line | R/W | Offset | Absolute (DMA0 / DMA1) | Meaning |
+|---|---|---|---|---|
+| `:554` | R 8B | `0x28` | `0x5000_1028` (a) | `IDMA_NEXT_ID_REG_OFFSET` — **A trigger** |
+| `:578` | R 8B | `0x28` | `0x5000_0028` (v) | `IDMA_NEXT_ID_REG_OFFSET` — **V trigger** |
+
+No other MMIO in the window. `idma_submit_config` writes (`:415-418`, offsets `0x00/0x08/0x10/0x18`) occur at `:528/:531`, i.e. **before** `pair-enter`.
+
+### IRQ / loop masking ranges
+- Hard IRQ-off: `local_irq_save` `:536` → `local_irq_restore` `:584` (whole window). Preempt off: `:535` → `:585`.
+- Pre-window polls (`idma_run_window` `:689`, `idma_batch_window` `:881`) run **without** IRQ masking, with `cond_resched()` every 1024 spins: `:741-742` and `:908-909`. `cpu_relax()` `:743` / `:910`.
+- `idma_drain` uses `readq_poll_timeout(... IDMA_XFER_TIMEOUT_US)` with sleep=0 (`:757-758`); timeout `IDMA_XFER_TIMEOUT_US = 2000000` (`:66`).
+
+### Read side effects — does a read launch a JOBREG?
+From `idma_reg64_frontend.sv`:
+- `NextIdOffset = 8'h28` (`:65`). In `IDLE`: `else if (dma_reg2hw.next_id.re)` → `issue = 1'b1; … state_n = COUNT` (when `num_bytes != 0`) (`:490-509`). So **reading `0x28` is the job-launch trigger** (this is what `idma_submit` `:452` and the pair triggers `:554/:578` rely on).
+- Under `LaunchPort` **and** `launch_hold_i` asserted, the same `0x28` read instead enters controlled prep / reserves an ID and goes to `HOLD` (`:472-489`). `launch_next_id_read` is explicitly `!write && full_addr == 0x28` (`:241`).
+- `0x30` (`DONE`) read: does **not** launch a job, but it does set `obs_poll_o` (`:298-300`). It also sets `dma_reg2hw.done`/returns `done_id` (`:449`).
+- `0x50` (`active_cycles`) read: `active_cycles_read` returns the counter, no launch (`:384-393`).
+- `0x80/0x88/0x90/0x98/0xa0/0xa8/0xd0/0xd8` reads: batch bank, return/`error` only (`:424-446`); no job launch.
+- `0x58/0x60/0x68/0x70/0x78` and `0xb0…0xc8` reads: forwarded out of the frontend (`observer_access`/`launcher_access`, `:395-405`, `:233`). Their read side effects are **not defined in the supplied files** (see §4).
+
+So: the only read in the pair window that can launch work via the JOBREG is `readq(0x28)`; both `:554` and `:578` are such triggers.
+
+### Full set of MMIO offsets touched by this driver (for cross-reference)
+`0x00,0x08,0x10,0x18` (`idma_submit_config` `:415-418`); `0x28` (`:452,:554,:578`); `0x30` (`:673,:757`); `0x50` (`:921-922,:1607,:1616`); `0x58` (`:995,:1545-1547`); `0x60` (`:1018,:1021,:1052,:1067,:1070,:1551`); `0x68` write (`:1049`); `0x70`/`0x78` (`:1073-1074,:1096-1097,:1124-1125,:1170-1171,:1197-1198,:1294-1295,:2274-2275,:2291-2292`); `0x80` (`:825,:2421`); `0x88` (`:827,:829,:832,:835,:841,:852,:878,:1382,:1559-1573,:2426-2427,:2684-2685`); `0x90` (`:830`); `0x98` (`:831`); `0xa0` (`:859`); `0xa8` (`:858`); `0xb0` (`:1280,:1549`); `0xb8` (`:1553,:1758,:1761,:1865-1873,:1894,:1918-1920,:1950`); `0xc0` (`:1283`); `0xc8` (`:1284`); `0xd0` (`:1377-1378`); `0xd8` (`:1362,:1365,:1375`).
+
+---
+
+## (3) Phase distinction + AR-address lookup table (assuming DMA0 base `0x5000_0000`)
+
+Important framing: the CPU issues a **load** → AXI **AR**; a **store** → AXI **AW**. So `cpu_last_ar = addr` means the last accepted CPU read address. All driver reads are 8-byte.
+
+| AR address (DMA0 / DMA1) | Offset | Code site(s) | Phase |
+|---|---|---|---|
+| `0x5000_0028` / `0x5000_1028` | `0x28` | `:452` (`idma_submit`), `:554`/`:578` (`idma_batch_start`) | warmup submit, or **pair trigger** |
+| `0x5000_0030` / `0x5000_1030` | `0x30` | `:673` (`idma_poll`), `:757` (`idma_drain`) | warmup/window poll or drain |
+| `0x5000_0050` / `0x5000_1050` | `0x50` | `:921-922` (`idma_snapshot`) | pre/post-window snapshot |
+| `0x5000_0058` | `0x58` | `:995` (`observation_prepare`) | pre-run arm/clear |
+| `0x5000_0060` | `0x60` | `:1018,:1021` (prepare), `:1052` (arm), `:1067,:1070` (finish) | arm / obs-finish |
+| `0x5000_0070` / `0x5000_0078` | `0x70`/`0x78` | `:1073-1074`, `:1096-1097`, `:1124-1125`, `:1170-1171`, `:1197-1198`, `:1294-1295`, `:2274-2275` | obs-finish / e3-finish / composition capture |
+| `0x5000_0080` | `0x80` | `:825,:2421` | batch magic check (pre-run) |
+| `0x5000_0088` | `0x88` | `:827,:835,:852` (reads) | batch control (pre-run / collect) |
+| `0x5000_00a0` / `0x5000_00a8` | `0xa0`/`0xa8` | `:859`/`:858` | batch collect (post-window) |
+| `0x5000_00d0` / `0x5000_00d8` | `0xd0`/`0xd8` | `:1378`/`:1362,:1365,:1375` | gap preflight/program (pre-run) |
+| `0x5000_00b0` / `0xb8` / `0xc8` | `0xb0`/`0xb8`/`0xc8` | `:1280,:1549` / `:1553,1758,1761,1865…` / `:1284` | controlled launcher (not used in plain batch pair) |
+
+Phase sequence for the composition batch pair (from `idma_run_session2`):
+1. **warmup** — `idma_run_window` `:2502` (submit `:706`→`idma_submit` `:447`; poll `idma_poll` `:667`). No IRQ masking.
+2. **batch-config** — `idma_batch_configure` `:2539/:2541`.
+3. **gap-program** — `idma_gap_program_readback` `:2548/:2550`.
+4. **arm** — `idma_observation_arm` `:2574`.
+5. **pre-window snapshot** — `idma_snapshot` `:2581`, trace "prewindow" `:2585`.
+6. **window** — `idma_batch_window` `:2586` → `idma_batch_start` (pair-enter `:534` … pair-return `:586`) then poll loop `:892-911`.
+7. **post-window** — "window-return" `:2590`, snapshot `:2600`, batch_stop `:2595-2598`.
+8. **drain** — `:2608+` (`idma_drain` `:2617`, `idma_batch_collect` `:2627`).
+9. **obs-finish / composition capture+restore / e3-finish** — `:2651`, `:2688/:2692`, `:2700`.
+
+---
+
+## (4) Missing definitions → precise next files (no values guessed)
+
+- **Observer bank read semantics and the research/composition index mapping** (`research_index_o` / `obs_cfg_rdata_i` / read side effects at `0x58..0x78`): next file → `cva6/corev_apu/fpga/src/dma_observer.sv` (`dma_observer`, instantiated `ariane_peripherals_xilinx.sv:978-1010`).
+  - Open item: driver uses `IDMA_COMPOSITION_BASE (512U + 0xd20U)` (`idma.c:2270`) while HW decodes `research_index ∈ [0xD20, 0xD9F]` (`ariane_peripherals_xilinx.sv:1015-1017`). The +512 offset cannot be resolved from the supplied files — verify the exact index written to `OBS_INDEX (0x70)` against `dma_observer.sv` before assuming the composition bank is reached.
+- **Launcher register semantics** `0xb0/0xb8/0xc0/0xc8` (`launch_hold/launch_go`, read side effects): `cva6/corev_apu/fpga/src/dma_controlled_launcher.sv` (`ariane_peripherals_xilinx.sv:1143-1165`).
+- **Batch / composition / P4M / E3 ABI constants**: `uapi/linux/idma.h` — for `IDMA_EXPERIMENT_MAX_TRANSFERS` (`idma.c:869,948`), `IDMA_BATCH_MAX_TRANSFERS` (`:1329,2381`), `IDMA_E3_CONTROLLED_WORDS` (`:1644,1744`), `IDMA_P4M_WORDS`, `IDMA_P4M_OBS_WORDS` (`:1400-1403`), `IDMA_COMPOSITION_WORDS`, and `IDMA_COMPOSITION_MAGIC/ABI` (compare `dma_composition_control.sv:70-71`).
+- **research2 path**: `linux/drivers/misc/idma_research.h` (`#include` at `idma.c:2870`).
+- **The dump registers themselves** ("CPU last accepted AR low32", CPU/COMP/DS/DDR/DMA_CFG/IOMMU_CFG AR64/AWlow32/validready): none of the supplied files define them. The "cpu_last_ar" is a CPU/DM-observable AR, not in these files; the IOMMU/COMP/DS accepted-AR/AW counters would be in the rv_iommu sources (`cva6/corev_apu/.../rv_iommu_*` incl. the counters feeding `research_o`, `ariane_peripherals_xilinx.sv:1474`). Point of care: do not read any `last_accepted_*` register as "current blocked" (§5).
+
+---
+
+## (5) Uncertainty / explicit non-claims
+
+- **`pair-return` missing ≠ CPU stopped inside the pair.** `pair-enter` (`:534`) is printed before `local_irq_save` (`:536`); the next trace is `pair-return` (`:586`) **after** `local_irq_restore` (`:584`) and `preempt_enable` (`:585`). A missing `pair-return` is consistent with (a) executing anywhere in `[535,585]`, **or** (b) being blocked inside the `dev_info` at `:586` itself (console/printk path can sleep), **or** (c) any block after `:586` (`:588+` `idma_quarantine`/`dev_crit` `:407`; commit at `:600-602`; or return to `idma_batch_window` and the `:892-911` poll loop). All must remain candidates until the CPU state is read.
+- Inside `[536,584]` the only MMIO is the two `readq(0x28)` (`:554,:578`); a CPU halted there could be waiting on the AXI **R** for that read (IRQs are off, so nothing else runs to mask it). This is consistent with, but does not prove, a stall on the `0x28` read.
+- `cpu_last_ar` is a *load* address; the trigger reads at `:554`/`:578` are loads, so `cpu_last_ar == 0x5000_1028` or `0x5000_0028` is consistent with the pair window — but `last_accepted` only means the last AR that completed *acceptance*, not what is currently outstanding. A later AR (e.g. `0x30` from the poll loop) may be the blocked one; and an AR may be accepted while its R never returns.
+- ktime/`signal_pending` calls are not MMIO and were excluded from the AR table.
+- I have not verified HW behavior of the observer/launcher read paths (files absent, §4) and make no claim about their read side effects.
+- No tests were run; nothing here is a pass/fail result.

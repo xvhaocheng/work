@@ -1,0 +1,1011 @@
+diff --git a/bench/idma_sva_task.c b/bench/idma_sva_task.c
+new file mode 100644
+--- /dev/null
++++ b/bench/idma_sva_task.c
+@@ -0,0 +1,520 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define _GNU_SOURCE
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <linux/idma_sva.h>
++#include <signal.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/uio.h>
++#include <unistd.h>
++
++/* These are the materialized A2 input offsets, not stage117 physical VAs. */
++static const unsigned int lengths[] = { 60, 568, 1011 };
++static const unsigned int record_offsets[] = { 0, 72, 652 };
++static const unsigned int src_offsets[] = { 32, 4128, 8224, 12320 };
++static const unsigned int dst_offsets[] = { 16396, 20492, 20557, 24588 };
++static const unsigned int span_lengths[] = { 60, 65, 503, 1011 };
++static const unsigned int input_offsets[] = { 12, 84, 149, 664 };
++
++#define MODE_CPU_COPY 4U
++#define MODE_SOURCE_WRITEV 5U
++#define MAX_REPEATS 1024U
++
++struct options {
++	const char *input, *device;
++	const char *outputs[MAX_REPEATS];
++	unsigned int mode, peer, timeout, repeat, output_count;
++	int host_model;
++};
++
++static void usage(FILE *stream)
++{
++	fputs("Usage: idma_sva_task --input FILE --output FILE [--output FILE ...]\n"
++	      "  --address-mode iova|sameva-shadow|pinned-mm|cpu-copy|source-writev\n"
++	      "  --device PATH       DMA device (default /dev/idma0)\n"
++	      "  --peer N            Peer device index (default 1)\n"
++	      "  --timeout-ms N      Normal-DONE deadline; not a cancellation (default 1000)\n"
++	      "  --repeat N          Requires N distinct --output paths (default 1)\n"
++	      "  --backend native|host-model  Explicit logical host model: NO DMA/SVA evidence\n"
++	      "Input is exactly three le64-cookie/le32-length frames (1/60,2/568,3/1011).\n"
++	      "No timings are measured. DMA errors never fall back to a CPU adapter.\n", stream);
++}
++
++static int parse_uint(const char *text, unsigned int *value)
++{
++	uint64_t n = 0;
++	const unsigned char *p = (const unsigned char *)text;
++
++	if (!*p)
++		return -1;
++	for (; *p; p++) {
++		if (*p < '0' || *p > '9' || n > (UINT32_MAX - (*p - '0')) / 10)
++			return -1;
++		n = n * 10 + *p - '0';
++	}
++	*value = (unsigned int)n;
++	return 0;
++}
++
++static const char *mode_name(unsigned int mode)
++{
++	switch (mode) {
++	case IDMA_SVA_MODE_IOVA: return "iova";
++	case IDMA_SVA_MODE_SHADOW: return "sameva-shadow";
++	case IDMA_SVA_MODE_BORROWED_MM: return "pinned-mm";
++	case MODE_CPU_COPY: return "cpu-copy";
++	case MODE_SOURCE_WRITEV: return "source-writev";
++	default: return "invalid";
++	}
++}
++
++static int parse_options(int argc, char **argv, struct options *o)
++{
++	unsigned int seen = 0;
++	int i;
++
++	memset(o, 0, sizeof(*o));
++	o->device = "/dev/idma0";
++	o->peer = 1;
++	o->timeout = 1000;
++	o->repeat = 1;
++	for (i = 1; i < argc; i++) {
++		unsigned int bit;
++		const char *arg = argv[i], *value;
++
++		if (!strcmp(arg, "--help")) {
++			usage(stdout);
++			exit(0);
++		}
++		if (!strcmp(arg, "--input")) bit = 1U;
++		else if (!strcmp(arg, "--device")) bit = 2U;
++		else if (!strcmp(arg, "--peer")) bit = 4U;
++		else if (!strcmp(arg, "--timeout-ms")) bit = 8U;
++		else if (!strcmp(arg, "--repeat")) bit = 16U;
++		else if (!strcmp(arg, "--address-mode")) bit = 32U;
++		else if (!strcmp(arg, "--backend")) bit = 64U;
++		else if (!strcmp(arg, "--output")) bit = 0;
++		else return -1;
++		if ((seen & bit) || i + 1 == argc)
++			return -1;
++		seen |= bit;
++		value = argv[++i];
++		if (!*value)
++			return -1;
++		if (!strcmp(arg, "--input")) o->input = value;
++		else if (!strcmp(arg, "--device")) o->device = value;
++		else if (!strcmp(arg, "--output")) {
++			if (o->output_count == MAX_REPEATS)
++				return -1;
++			o->outputs[o->output_count++] = value;
++		} else if (!strcmp(arg, "--backend")) {
++			if (!strcmp(value, "host-model")) o->host_model = 1;
++			else if (strcmp(value, "native")) return -1;
++		} else if (!strcmp(arg, "--address-mode")) {
++			for (o->mode = 1; o->mode <= MODE_SOURCE_WRITEV; o->mode++)
++				if (!strcmp(value, mode_name(o->mode)))
++					break;
++			if (o->mode > MODE_SOURCE_WRITEV)
++				return -1;
++		} else {
++			unsigned int n;
++			if (parse_uint(value, &n))
++				return -1;
++			if (!strcmp(arg, "--peer")) o->peer = n;
++			else if (!strcmp(arg, "--repeat")) o->repeat = n;
++			else o->timeout = n;
++		}
++	}
++	return !o->input || !o->mode || !o->repeat || o->repeat > MAX_REPEATS ||
++		o->repeat != o->output_count || !o->timeout ||
++		(o->host_model && o->mode >= MODE_CPU_COPY) ? -1 : 0;
++}
++
++static int read_input(const char *path, unsigned char *input)
++{
++	unsigned char bytes[IDMA_SVA_RECORD_BYTES + 1];
++	size_t have = 0;
++	int fd = open(path, O_RDONLY | O_CLOEXEC), error = 0;
++	unsigned int p;
++
++	if (fd < 0)
++		return -1;
++	while (have < sizeof(bytes)) {
++		ssize_t count = read(fd, bytes + have, sizeof(bytes) - have);
++		if (count < 0 && errno == EINTR)
++			continue;
++		if (count < 0) { error = errno; break; }
++		if (!count) break;
++		have += (size_t)count;
++	}
++	if (close(fd) && !error)
++		error = errno;
++	if (error) { errno = error; return -1; }
++	if (have != IDMA_SVA_RECORD_BYTES) { errno = EINVAL; return -1; }
++	for (p = 0; p < IDMA_SVA_PACKETS; p++) {
++		const unsigned char *header = bytes + record_offsets[p];
++		uint64_t cookie = 0;
++		uint32_t length = 0;
++		unsigned int i;
++		for (i = 0; i < 8; i++) cookie |= (uint64_t)header[i] << (8 * i);
++		for (i = 0; i < 4; i++) length |= (uint32_t)header[8 + i] << (8 * i);
++		if (cookie != p + 1 || length != lengths[p]) { errno = EINVAL; return -1; }
++	}
++	memcpy(input, bytes, IDMA_SVA_RECORD_BYTES);
++	return 0;
++}
++
++/* Reject accidental input truncation and repeated outputs, including existing
++ * hardlinks. fstat() after open repeats the input check before ftruncate(). */
++static int check_paths(const struct options *o)
++{
++	struct stat source, outputs[MAX_REPEATS];
++	unsigned char exists[MAX_REPEATS] = { 0 };
++	unsigned int i, j;
++
++	if (stat(o->input, &source))
++		return -1;
++	for (i = 0; i < o->output_count; i++) {
++		if (!stat(o->outputs[i], &outputs[i])) {
++			exists[i] = 1;
++			if (source.st_dev == outputs[i].st_dev && source.st_ino == outputs[i].st_ino)
++				goto invalid;
++		} else if (errno != ENOENT) return -1;
++		for (j = 0; j < i; j++) {
++			if (!strcmp(o->outputs[i], o->outputs[j]) ||
++			    (exists[i] && exists[j] && outputs[i].st_dev == outputs[j].st_dev &&
++			     outputs[i].st_ino == outputs[j].st_ino))
++				goto invalid;
++		}
++	}
++	return 0;
++invalid:
++	errno = EINVAL;
++	return -1;
++}
++
++static void initialize_arena(unsigned char *arena, const unsigned char *input)
++{
++	unsigned int i;
++
++	memset(arena, 0xa5, IDMA_SVA_ARENA_BYTES);
++	for (i = 0; i < IDMA_SVA_DESCRIPTORS; i++) {
++		memset(arena + src_offsets[i] - 16, 0x3c, 16);
++		memcpy(arena + src_offsets[i], input + input_offsets[i], span_lengths[i]);
++		memset(arena + src_offsets[i] + span_lengths[i], 0xc3, 16);
++	}
++	for (i = 0; i < IDMA_SVA_PACKETS; i++) {
++		unsigned char *record = arena + (i + 4) * IDMA_SVA_PAGE_BYTES;
++		memcpy(record, input + record_offsets[i], IDMA_SVA_HEADER_BYTES);
++		memset(record + IDMA_SVA_HEADER_BYTES + lengths[i], 0x5a, 16);
++	}
++}
++
++/* Compare all 32768 bytes without allocating an extra expected arena. The
++ * expected packets come from the input file, not from returned DMA addresses.
++ */
++static int verify_arena(const unsigned char *arena, const unsigned char *input)
++{
++	unsigned int page, offset;
++
++	for (page = 0; page < IDMA_SVA_ARENA_PAGES; page++) {
++		for (offset = 0; offset < IDMA_SVA_PAGE_BYTES; offset++) {
++			unsigned char expected = 0xa5;
++			if (page < 4) {
++				if (offset >= 16 && offset < 32) expected = 0x3c;
++				else if (offset >= 32 && offset < 32 + span_lengths[page])
++					expected = input[input_offsets[page] + offset - 32];
++				else if (offset >= 32 + span_lengths[page] && offset < 48 + span_lengths[page])
++					expected = 0xc3;
++			} else if (page < 7) {
++				unsigned int p = page - 4, end = IDMA_SVA_HEADER_BYTES + lengths[p];
++				if (offset < end) expected = input[record_offsets[p] + offset];
++				else if (offset < end + 16) expected = 0x5a;
++			}
++			if (arena[page * IDMA_SVA_PAGE_BYTES + offset] != expected) {
++				fprintf(stderr, "arena mismatch: page=%u offset=%u expected=%02x actual=%02x\n",
++					page, offset, expected, arena[page * IDMA_SVA_PAGE_BYTES + offset]);
++				errno = EILSEQ;
++				return -1;
++			}
++		}
++	}
++	return 0;
++}
++
++/* This is a logical protocol model, not a bus/cache/IOMMU simulator. The
++ * event order describes model obligations only. memcpy implements its data
++ * operation; no event below establishes that real hardware executed it.
++ */
++static const char *const model_job_events[] = {
++	"SOURCE_READY", "NEXT_ID", "COUNT_ACCEPT", "R", "W", "B", "DONE",
++};
++
++static void host_model_copy(unsigned char *arena)
++{
++	unsigned int descriptor, state;
++
++	for (descriptor = 0; descriptor < IDMA_SVA_DESCRIPTORS; descriptor++) {
++		for (state = 0; state < sizeof(model_job_events) / sizeof(model_job_events[0]); state++) {
++			/* The serial model can only reach DONE after its R/W/B stages.
++			 * It has no software pending queue or simultaneous live jobs.
++			 */
++			if (state == 4)
++				memcpy(arena + dst_offsets[descriptor], arena + src_offsets[descriptor],
++				       span_lengths[descriptor]);
++		}
++	}
++}
++
++static void print_model_trace(void)
++{
++	unsigned int descriptor, state;
++	for (descriptor = 0; descriptor < IDMA_SVA_DESCRIPTORS; descriptor++)
++		for (state = 0; state < sizeof(model_job_events) / sizeof(model_job_events[0]); state++)
++			printf("%s\"d%u:%s\"", descriptor || state ? "," : "", descriptor, model_job_events[state]);
++	fputs(",\"CACHE_ACQUIRE\",\"CONTEXT_RESTORED\",\"UNPIN\",\"INDEPENDENT_VERIFY\",\"FILE_CONSUMER\"", stdout);
++}
++
++static int check_caps(int fd, const struct options *o, struct idma_sva_caps *caps)
++{
++	const unsigned int required = IDMA_SVA_CAP_SYNCHRONOUS | IDMA_SVA_CAP_FIXED_TASK |
++		IDMA_SVA_CAP_SINGLE_HART_FENCE_I | IDMA_SVA_CAP_QUIESCENT_CONTEXT;
++
++	memset(caps, 0, sizeof(*caps));
++	caps->abi_version = IDMA_SVA_ABI;
++	caps->struct_size = sizeof(*caps);
++	caps->peer_index = o->peer;
++	/* Do not retry RUN after EINTR: submission/ownership may already exist. */
++	if (ioctl(fd, IDMA_IOC_SVA_CAPS, caps))
++		return -1;
++	if (caps->abi_version != IDMA_SVA_ABI || caps->struct_size != sizeof(*caps) ||
++	    (caps->capabilities & required) != required ||
++	    !(caps->address_modes & IDMA_SVA_MODE_BIT(o->mode)) ||
++	    caps->primary_did != 10 || caps->peer_did != 11 || caps->peer_index != o->peer ||
++	    caps->page_bytes != IDMA_SVA_PAGE_BYTES || caps->arena_pages != IDMA_SVA_ARENA_PAGES ||
++	    caps->data_pages != IDMA_SVA_DATA_PAGES || caps->descriptors != IDMA_SVA_DESCRIPTORS ||
++	    caps->packets != IDMA_SVA_PACKETS || o->timeout > caps->max_timeout_ms) {
++		errno = EOPNOTSUPP;
++		return -1;
++	}
++	return 0;
++}
++
++static int run_dma(int fd, const struct options *o, unsigned char *arena,
++		   struct idma_sva_run *run)
++{
++	unsigned int i;
++	uint64_t base;
++
++	memset(run, 0, sizeof(*run));
++	run->abi_version = IDMA_SVA_ABI;
++	run->struct_size = sizeof(*run);
++	run->address_mode = o->mode;
++	run->peer_index = o->peer;
++	run->timeout_ms = o->timeout;
++	run->arena_user = (uintptr_t)arena;
++	run->arena_bytes = IDMA_SVA_ARENA_BYTES;
++	if (ioctl(fd, IDMA_IOC_SVA_RUN, run)) {
++		fprintf(stderr, "RUN failed: status=%d restore_status=%d flags=%u submitted=%u completed=%u\n",
++			run->status, run->restore_status, run->result_flags, run->submitted, run->completed);
++		return -1;
++	}
++	if (run->status || run->restore_status ||
++	    (run->result_flags & IDMA_SVA_RESULT_SAFE) != IDMA_SVA_RESULT_SAFE ||
++	    run->submitted != IDMA_SVA_DESCRIPTORS || run->completed != IDMA_SVA_DESCRIPTORS ||
++	    run->primary_did != 10 || run->peer_did != 11 || run->pinned_pages != IDMA_SVA_ARENA_PAGES ||
++	    run->mapped_pages != (o->mode == IDMA_SVA_MODE_BORROWED_MM ? 0U : IDMA_SVA_DATA_PAGES)) {
++		errno = EPROTO;
++		return -1;
++	}
++	if (run->device_src[0] < src_offsets[0]) { errno = EPROTO; return -1; }
++	base = run->device_src[0] - src_offsets[0];
++	if (base > UINT64_MAX - IDMA_SVA_ARENA_BYTES || base % IDMA_SVA_PAGE_BYTES ||
++	    (o->mode != IDMA_SVA_MODE_IOVA && base != (uintptr_t)arena)) {
++		errno = EPROTO;
++		return -1;
++	}
++	for (i = 0; i < IDMA_SVA_DESCRIPTORS; i++) {
++		if (!run->transfer_id[i] || run->device_src[i] != base + src_offsets[i] ||
++		    run->device_dst[i] != base + dst_offsets[i]) { errno = EPROTO; return -1; }
++	}
++	return 0;
++}
++
++/* Advance exactly the bytes accepted by writev(), including partial vectors. */
++static int write_vectors(int fd, struct iovec *iov, int count)
++{
++	while (count) {
++		ssize_t written = writev(fd, iov, count);
++		if (written < 0 && errno == EINTR)
++			continue;
++		if (written < 0)
++			return -1;
++		if (!written) { errno = EIO; return -1; }
++		while (count && (size_t)written >= iov->iov_len) {
++			written -= (ssize_t)iov->iov_len;
++			iov++;
++			count--;
++		}
++		if (count) {
++			iov->iov_base = (unsigned char *)iov->iov_base + written;
++			iov->iov_len -= (size_t)written;
++		}
++	}
++	return 0;
++}
++
++static int consume_file(const struct options *o, unsigned int iteration,
++			const unsigned char *arena, const unsigned char *input)
++{
++	struct stat source, target;
++	const char *path = o->outputs[iteration];
++	int fd, error = 0;
++	unsigned int p;
++
++	if (stat(o->input, &source))
++		return -1;
++	fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
++	if (fd < 0)
++		return -1;
++	if (fstat(fd, &target)) error = errno;
++	else if (source.st_dev == target.st_dev && source.st_ino == target.st_ino) error = EINVAL;
++	/* Files created in previous iterations now have an inode, including aliases
++	 * such as new-file and ./new-file that did not exist during preflight.
++	 */
++	for (p = 0; p < iteration && !error; p++) {
++		struct stat previous;
++		if (stat(o->outputs[p], &previous)) error = errno;
++		else if (previous.st_dev == target.st_dev && previous.st_ino == target.st_ino) error = EINVAL;
++	}
++	if (!error && S_ISREG(target.st_mode) && ftruncate(fd, 0)) error = errno;
++	for (p = 0; p < IDMA_SVA_PACKETS && !error; p++) {
++		const unsigned char *record = o->mode == MODE_SOURCE_WRITEV ?
++			input + record_offsets[p] : arena + (p + 4) * IDMA_SVA_PAGE_BYTES;
++		struct iovec iov[3] = {
++			{ .iov_base = (void *)record, .iov_len = IDMA_SVA_HEADER_BYTES },
++			{ .iov_base = (void *)(record + IDMA_SVA_HEADER_BYTES), .iov_len = lengths[p] },
++		};
++		int count = 2;
++		if (o->mode == MODE_SOURCE_WRITEV && p == 1) {
++			iov[1].iov_len = 65;
++			iov[2].iov_base = (void *)(record + IDMA_SVA_HEADER_BYTES + 65);
++			iov[2].iov_len = 503;
++			count = 3;
++		}
++		if (write_vectors(fd, iov, count)) error = errno;
++	}
++	if (close(fd) && !error) error = errno;
++	if (error) { errno = error; return -1; }
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	struct options options;
++	struct idma_sva_caps caps;
++	unsigned char input[IDMA_SVA_RECORD_BYTES];
++	int fd = -1, result = EXIT_FAILURE;
++	unsigned int iteration;
++
++	if (parse_options(argc, argv, &options)) { usage(stderr); return EXIT_FAILURE; }
++	if (check_paths(&options)) { perror("input/output paths"); return EXIT_FAILURE; }
++	/* A failed pipe consumer must be reported as an error, not silent SIGPIPE. */
++	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) { perror("SIGPIPE"); return EXIT_FAILURE; }
++	if (options.mode < MODE_CPU_COPY && !options.host_model) {
++		fd = open(options.device, O_RDWR | O_CLOEXEC);
++		if (fd < 0) { perror("open DMA device"); goto done; }
++		if (check_caps(fd, &options, &caps)) { perror("CAPS"); goto done; }
++	}
++	for (iteration = 0; iteration < options.repeat; iteration++) {
++		unsigned char *arena = MAP_FAILED;
++		struct idma_sva_run run = { 0 };
++		int arena_locked = 0;
++		unsigned int i;
++		if (read_input(options.input, input)) { perror("input frames"); goto done; }
++		if (options.mode != MODE_SOURCE_WRITEV) {
++			if (sysconf(_SC_PAGESIZE) != IDMA_SVA_PAGE_BYTES) {
++				fprintf(stderr, "This fixed task requires 4096-byte OS pages\n");
++				goto done;
++			}
++			arena = mmap(NULL, IDMA_SVA_ARENA_BYTES, PROT_READ | PROT_WRITE,
++				     MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
++			if (arena == MAP_FAILED) { perror("arena mmap"); goto done; }
++			/* Only borrowed native CPU page tables need the VM_LOCKED profile.
++			 * Establish it before writing every page's source/poison/guards so
++			 * the subsequent A/D check runs inside the locked-page window.
++			 * The host model performs no real pin/cache/mm lifetime operation.
++			 */
++			if (!options.host_model && options.mode == IDMA_SVA_MODE_BORROWED_MM) {
++				if (mlock(arena, IDMA_SVA_ARENA_BYTES)) {
++					perror("arena mlock");
++					munmap(arena, IDMA_SVA_ARENA_BYTES);
++					goto done;
++				}
++				arena_locked = 1;
++			}
++			initialize_arena(arena, input);
++			if (options.host_model) {
++				host_model_copy(arena);
++			} else if (options.mode == MODE_CPU_COPY) {
++				for (i = 0; i < IDMA_SVA_DESCRIPTORS; i++)
++					memcpy(arena + dst_offsets[i], arena + src_offsets[i], span_lengths[i]);
++			} else {
++				int run_failed = run_dma(fd, &options, arena, &run);
++
++				if (run_failed) perror("DMA RUN");
++				/* The synchronous ABI guarantees no hardware references on
++				 * every return, including a safely drained failed RUN.
++				 */
++				if (arena_locked && munlock(arena, IDMA_SVA_ARENA_BYTES)) {
++					perror("arena munlock");
++					munmap(arena, IDMA_SVA_ARENA_BYTES);
++					goto done;
++				}
++				arena_locked = 0;
++				if (run_failed) {
++					munmap(arena, IDMA_SVA_ARENA_BYTES);
++					goto done;
++				}
++			}
++			if (verify_arena(arena, input)) {
++				perror("independent bytes/guards");
++				munmap(arena, IDMA_SVA_ARENA_BYTES);
++				goto done;
++			}
++		}
++		if (consume_file(&options, iteration, arena, input)) {
++			perror("file consumer");
++			if (arena != MAP_FAILED) munmap(arena, IDMA_SVA_ARENA_BYTES);
++			goto done;
++		}
++		if (arena != MAP_FAILED && munmap(arena, IDMA_SVA_ARENA_BYTES)) { perror("arena munmap"); goto done; }
++		printf("{\"result\":\"PASS\",\"backend\":\"%s\",\"address_mode\":\"%s\","
++		       "\"iteration\":%u,\"arena_pages\":%u,\"semantic_descriptors\":%u,"
++		       "\"dma_submitted\":%u,\"dma_completed\":%u,\"pinned_pages\":%u,\"locked_pages_peak\":%u,"
++		       "\"mapped_pages\":%u,\"domain_pt_pages\":%u,\"consumer_bytes\":%u,"
++		       "\"timing\":\"UNKNOWN\",\"model_trace\":[",
++		       options.host_model ? "host-model-NO-DMA" : options.mode >= MODE_CPU_COPY ? "CPU" : "native-DMA",
++		       mode_name(options.mode), iteration + 1,
++		       options.mode == MODE_SOURCE_WRITEV ? 0U : IDMA_SVA_ARENA_PAGES,
++		       options.mode == MODE_SOURCE_WRITEV ? 0U : IDMA_SVA_DESCRIPTORS,
++		       run.submitted, run.completed, run.pinned_pages,
++		       !options.host_model && options.mode == IDMA_SVA_MODE_BORROWED_MM ? IDMA_SVA_ARENA_PAGES : 0U,
++		       run.mapped_pages,
++		       run.domain_pt_pages, IDMA_SVA_RECORD_BYTES);
++		if (options.host_model) print_model_trace();
++		puts("]}");
++		if (fflush(stdout)) { perror("result output"); goto done; }
++	}
++	result = EXIT_SUCCESS;
++done:
++	if (fd >= 0 && close(fd)) { perror("close DMA device"); result = EXIT_FAILURE; }
++	return result;
++}
+diff --git a/scripts/platform.py b/scripts/platform.py
+--- a/scripts/platform.py
++++ b/scripts/platform.py
+@@ -153,6 +153,7 @@
+     uapi = ROOT / 'out/bench-uapi'
+     (uapi/'linux').mkdir(parents=True, exist_ok=True)
+     shutil.copy2(ROOT/'linux/include/uapi/linux/idma.h', uapi/'linux/idma.h')
++    shutil.copy2(ROOT/'linux/include/uapi/linux/idma_sva.h', uapi/'linux/idma_sva.h')
+     src = ROOT / 'bench/idma_experiment.c'
+     run([CC+'gcc', '-O2', '-static', '-Wall', '-Wextra',
+          '-I', uapi, src, '-o', dest/'idma_experiment'])
+@@ -164,6 +165,8 @@
+          '-I', uapi, ROOT/'bench/idma_e3_pair.c', '-o', dest/'idma_e3_pair'])
+     run([CC+'gcc', '-O2', '-static', '-Wall', '-Wextra',
+          '-I', uapi, ROOT/'bench/idma_e3_controlled.c', '-o', dest/'idma_e3_controlled'])
++    run([CC+'gcc', '-O2', '-static', '-Wall', '-Wextra', '-Werror',
++         '-I', uapi, ROOT/'bench/idma_sva_task.c', '-o', dest/'idma_sva_task'])
+     run([CC+'gcc', '-O2', '-static', '-Wall', '-Wextra',
+          ROOT/'bench/platform_timeout.c', '-o', dest/'platform-timeout'])
+     run([CC+'gcc', '-O2', '-static', '-Wall', '-Wextra',
+diff --git a/scripts/rootfs.py b/scripts/rootfs.py
+--- a/scripts/rootfs.py
++++ b/scripts/rootfs.py
+@@ -16,6 +16,7 @@
+     'platform-timeout': 'out/bench/platform-timeout',
+     'idma_research': 'out/bench/idma_research',
+     'idma_composition': 'out/bench/idma_composition',
++    'idma_sva_task': 'out/bench/idma_sva_task',
+     'platform-research': 'tests/board-research.sh',
+     'platform-sd-update': 'out/bench/platform-sd-update',
+     'platform-net-up': 'tests/board-net-up.sh',
+@@ -23,6 +24,7 @@
+ }
+ 
+ DATA={
++    'etc/idma-sva-three-frames.bin': 'tests/fixtures/idma-sva-three-frames.bin',
+     'etc/platform-research-plan.tsv': 'tests/research-plan.tsv',
+     'etc/network/interfaces': 'configs/board-network.interfaces',
+     'etc/dhcpcd.conf': 'configs/board-dhcpcd.conf',
+diff --git a/tests/test_idma_sva_task.py b/tests/test_idma_sva_task.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_idma_sva_task.py
+@@ -0,0 +1,426 @@
++#!/usr/bin/env python3
++"""Independent file/lifecycle tests. Host adapter and mock ioctls are NOT DMA evidence."""
++import hashlib
++import json
++import os
++from pathlib import Path
++import shutil
++import struct
++import subprocess
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++LENGTHS = (60, 568, 1011)
++
++# Test-only syscall interposition exercises hard-to-trigger userspace API errors.
++# It is never linked to the production executable and is enabled only by this suite.
++SHIM = r'''
++#define _GNU_SOURCE
++#include <dlfcn.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/idma_sva.h>
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/syscall.h>
++#include <sys/uio.h>
++#include <unistd.h>
++static int scenario(const char *value) {
++ const char *s = getenv("IDMA_SVA_TEST_SCENARIO"); return s && !strcmp(s, value);
++}
++static const void *locked_arena, *last_arena;
++static void lifecycle_event(const char *text) {
++ const char *path = getenv("IDMA_SVA_TEST_LIFECYCLE_LOG");
++ if (!path) return;
++ int fd = syscall(SYS_openat, AT_FDCWD, path, O_WRONLY | O_CREAT | O_APPEND, 0600);
++ if (fd < 0) abort();
++ if (syscall(SYS_write, fd, text, strlen(text)) != (ssize_t)strlen(text)) abort();
++ syscall(SYS_close, fd);
++}
++int mlock(const void *addr, size_t bytes) {
++ if (!getenv("IDMA_SVA_TEST_IOCTL")) {
++  int (*real_mlock)(const void *, size_t) = dlsym(RTLD_NEXT, "mlock");
++  return real_mlock(addr, bytes);
++ }
++ if (bytes != 32768 || (uintptr_t)addr % 4096 || locked_arena) abort();
++ lifecycle_event("MLOCK\n"); last_arena = addr;
++ if (scenario("mlock-error")) { errno = ENOMEM; return -1; }
++ locked_arena = addr; return 0;
++}
++int munlock(const void *addr, size_t bytes) {
++ if (!getenv("IDMA_SVA_TEST_IOCTL")) {
++  int (*real_munlock)(const void *, size_t) = dlsym(RTLD_NEXT, "munlock");
++  return real_munlock(addr, bytes);
++ }
++ if (bytes != 32768 || locked_arena != addr) abort();
++ lifecycle_event("MUNLOCK\n");
++ if (scenario("munlock-error")) { errno = EIO; return -1; }
++ locked_arena = NULL; return 0;
++}
++int munmap(void *addr, size_t bytes) {
++ int (*real_munmap)(void *, size_t) = dlsym(RTLD_NEXT, "munmap");
++ if (getenv("IDMA_SVA_TEST_IOCTL") && addr == last_arena) {
++  if (bytes != 32768 || (locked_arena && !scenario("munlock-error"))) abort();
++  lifecycle_event("MUNMAP\n"); locked_arena = NULL; last_arena = NULL;
++ }
++ return real_munmap(addr, bytes);
++}
++int ioctl(int fd, unsigned long op, ...) {
++ va_list ap; void *arg;
++ va_start(ap, op); arg = va_arg(ap, void *); va_end(ap);
++ if (!getenv("IDMA_SVA_TEST_IOCTL")) {
++  int (*real_ioctl)(int, unsigned long, ...) = dlsym(RTLD_NEXT, "ioctl");
++  return real_ioctl(fd, op, arg);
++ }
++ if (op == IDMA_IOC_SVA_CAPS) {
++  struct idma_sva_caps *c = arg;
++  if (scenario("caps-errno")) { errno = ENOTTY; return -1; }
++  c->capabilities = 15; c->address_modes = 7; c->primary_did = 10; c->peer_did = 11;
++  c->page_bytes = 4096; c->arena_pages = 8; c->data_pages = 7;
++  c->descriptors = 4; c->packets = 3; c->max_timeout_ms = 10000;
++  if (scenario("caps-mode")) c->address_modes = 0;
++  if (scenario("caps-did")) c->peer_did = 12;
++  if (scenario("caps-abi")) c->abi_version++;
++  if (scenario("caps-profile")) c->capabilities &= ~IDMA_SVA_CAP_SINGLE_HART_FENCE_I;
++  return 0;
++ }
++ if (op == IDMA_IOC_SVA_RUN) {
++  static unsigned int runs;
++  struct idma_sva_run *r = arg;
++  unsigned char *a = (void *)(uintptr_t)r->arena_user;
++  if ((r->address_mode == 3 && locked_arena != a) ||
++      (r->address_mode != 3 && locked_arena)) abort();
++  lifecycle_event("RUN\n");
++  const unsigned int src[] = {32, 4128, 8224, 12320};
++  const unsigned int dst[] = {16396, 20492, 20557, 24588};
++  const unsigned int len[] = {60, 65, 503, 1011};
++  unsigned int i, j;
++  uint64_t base = r->address_mode == 1 ? 0x100000 : r->arena_user;
++  if (r->abi_version != 1 || r->struct_size != sizeof(*r) || r->arena_bytes != 32768 ||
++      r->flags || r->peer_index != 1 || r->arena_user % 4096) { errno = EINVAL; return -1; }
++  /* Each repetition must begin with freshly poisoned destination/source guards. */
++  for (i = 0; i < 4; i++) for (j = 0; j < len[i]; j++)
++   if (a[dst[i] + j] != 0xa5) { errno = EUCLEAN; return -1; }
++  runs++;
++  r->status = 0; r->restore_status = 0; r->result_flags = IDMA_SVA_RESULT_SAFE;
++  r->primary_did = 10; r->peer_did = 11; r->submitted = 4; r->completed = 4;
++  r->pinned_pages = 8; r->mapped_pages = r->address_mode == 3 ? 0 : 7;
++  r->domain_pt_pages = r->address_mode == 3 ? 0 : 3;
++  if (scenario("run-errno")) { r->status = -ETIMEDOUT; errno = ETIMEDOUT; return -1; }
++  for (i = 0; i < 4; i++) {
++   memcpy(a + dst[i], a + src[i], len[i]);
++   r->transfer_id[i] = runs * 10 + i + 1;
++   r->device_src[i] = base + src[i]; r->device_dst[i] = base + dst[i];
++  }
++  if (scenario("run-status")) r->status = -EIO;
++  if (scenario("restore-status")) r->restore_status = -EIO;
++  if (scenario("ownership")) r->result_flags &= ~IDMA_SVA_RESULT_CPU_OWNED;
++  if (scenario("pins")) r->result_flags &= ~IDMA_SVA_RESULT_PINS_RELEASED;
++  if (scenario("partial-done")) r->completed = 3;
++  if (scenario("resources")) r->pinned_pages = 7;
++  if (scenario("address")) r->device_dst[2]++;
++  if (scenario("receipt")) r->transfer_id[1] = 0;
++  if (scenario("payload")) a[20492 + 65] ^= 1;
++  if (scenario("header")) a[16384] ^= 1;
++  if (scenario("source")) a[32] ^= 1;
++  if (scenario("source-guard")) a[16] ^= 1;
++  if (scenario("destination-guard")) a[16396 + 60] ^= 1;
++  if (scenario("page-tail")) a[24576 + 4095] ^= 1;
++  if (scenario("metadata")) a[28672 + 9] ^= 1;
++  return 0;
++ }
++ errno = ENOTTY; return -1;
++}
++ssize_t writev(int fd, const struct iovec *iov, int count) {
++ static unsigned int calls;
++ ssize_t (*real_writev)(int, const struct iovec *, int) = dlsym(RTLD_NEXT, "writev");
++ const char *io = getenv("IDMA_SVA_TEST_IO");
++ if (locked_arena) abort();
++ lifecycle_event("CONSUMER\n");
++ calls++;
++ if (io && !strcmp(io, "partial")) {
++  struct iovec limited[3]; int n = 0; size_t left = 7;
++  if (calls % 4 == 1) { errno = EINTR; return -1; }
++  while (n < count && left) {
++   limited[n] = iov[n]; if (limited[n].iov_len > left) limited[n].iov_len = left;
++   left -= limited[n].iov_len; n++;
++  }
++  return real_writev(fd, limited, n);
++ }
++ if (io && !strcmp(io, "zero")) return 0;
++ if (io && (!strcmp(io, "error") || (!strcmp(io, "partial-error") && calls > 1))) {
++  errno = ENOSPC; return -1;
++ }
++ return real_writev(fd, iov, count);
++}
++ssize_t read(int fd, void *buffer, size_t count) {
++ static unsigned int calls;
++ ssize_t (*real_read)(int, void *, size_t) = dlsym(RTLD_NEXT, "read");
++ const char *io = getenv("IDMA_SVA_TEST_IO");
++ if (io && !strcmp(io, "read-partial")) {
++  if (++calls % 4 == 1) { errno = EINTR; return -1; }
++  if (count > 7) count = 7;
++ }
++ return real_read(fd, buffer, count);
++}
++int close(int fd) {
++ int (*real_close)(int) = dlsym(RTLD_NEXT, "close");
++ const char *io = getenv("IDMA_SVA_TEST_IO");
++ int flags = fcntl(fd, F_GETFL);
++ int result = real_close(fd);
++ if (io && !strcmp(io, "close-error") && flags >= 0 && (flags & O_ACCMODE) == O_WRONLY) {
++  errno = EIO; return -1;
++ }
++ return result;
++}
++'''
++
++
++class TaskTest(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.build = tempfile.TemporaryDirectory(prefix="idma-sva-task-build-")
++        cls.builddir = Path(cls.build.name)
++        include = cls.builddir / "include/linux"
++        include.mkdir(parents=True)
++        shutil.copy(ROOT / "linux/include/uapi/linux/idma_sva.h", include)
++        cls.binary = cls.builddir / "idma_sva_task"
++        common = ["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-I", str(include.parent)]
++        subprocess.run(common + [str(ROOT / "bench/idma_sva_task.c"), "-o", str(cls.binary)], check=True)
++        source = cls.builddir / "shim.c"
++        source.write_text(SHIM)
++        cls.shim = cls.builddir / "shim.so"
++        subprocess.run(common + ["-shared", "-fPIC", str(source), "-ldl", "-o", str(cls.shim)], check=True)
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.build.cleanup()
++
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory(prefix="idma-sva-task-test-")
++        self.addCleanup(self.temp.cleanup)
++        self.work = Path(self.temp.name)
++        self.source = self.work / "input.bin"
++        # Deliberately differs from the materialized fixture, including byte 0xa5.
++        self.data = b"".join(struct.pack("<QI", p + 1, n) +
++                            bytes(((j * 73 + p * 51 + 165) ^ (j >> 3)) & 255 for j in range(n))
++                            for p, n in enumerate(LENGTHS))
++        self.source.write_bytes(self.data)
++
++    def run_task(self, mode="pinned-mm", *, host=True, scenario=None, io=None,
++                 outputs=None, repeat=1, extra=(), source=None, lifecycle_log=None):
++        outputs = outputs or [self.work / "output.bin"]
++        args = [str(self.binary), "--input", str(source or self.source), "--address-mode", mode,
++                "--repeat", str(repeat), "--device", "/dev/null"]
++        for output in outputs:
++            args += ["--output", str(output)]
++        if host:
++            args += ["--backend", "host-model"]
++        args += list(extra)
++        env = os.environ.copy()
++        if scenario is not None or io:
++            env["LD_PRELOAD"] = str(self.shim)
++        if scenario is not None:
++            env["IDMA_SVA_TEST_IOCTL"] = "1"
++            env["IDMA_SVA_TEST_SCENARIO"] = scenario
++        if io:
++            env["IDMA_SVA_TEST_IO"] = io
++        if lifecycle_log:
++            env["IDMA_SVA_TEST_LIFECYCLE_LOG"] = str(lifecycle_log)
++        result = subprocess.run(args, env=env, text=True, capture_output=True)
++        artifact_root = os.environ.get("IDMA_SVA_TEST_ARTIFACT_DIR")
++        if artifact_root:
++            self._artifact_calls = getattr(self, "_artifact_calls", 0) + 1
++            artifact = Path(artifact_root) / self._testMethodName / str(self._artifact_calls)
++            artifact.mkdir(parents=True, exist_ok=True)
++            (artifact / "stdout.jsonl").write_text(result.stdout)
++            (artifact / "stderr.log").write_text(result.stderr)
++            (artifact / "invocation.json").write_text(json.dumps({"argv": args, "returncode": result.returncode,
++                "test_only_ioctl_mock": scenario is not None, "hardware_evidence": False}, indent=2) + "\n")
++            if lifecycle_log and Path(lifecycle_log).exists():
++                shutil.copyfile(lifecycle_log, artifact / "lifecycle.log")
++            for index, output in enumerate(outputs):
++                if Path(output).is_file():
++                    shutil.copyfile(output, artifact / f"consumer-{index}.bin")
++        return result, outputs
++
++    def test_materialized_real_file_all_explicit_host_modes(self):
++        source = ROOT / "out/a2-native-sva-binding-20261015/design/three-frames.bin"
++        expected = source.read_bytes()
++        self.assertEqual(hashlib.sha256(expected).hexdigest(),
++                         "914ec5d1fe933aca831497dcdd4a8599ede1e22053303cf9453832b5c3f0f12f")
++        for mode in ("iova", "sameva-shadow", "pinned-mm"):
++            with self.subTest(mode=mode):
++                completed, outputs = self.run_task(mode, source=source)
++                self.assertEqual(completed.returncode, 0, completed.stderr)
++                self.assertEqual(outputs[0].read_bytes(), expected)
++                record = json.loads(completed.stdout)
++                self.assertEqual(record["backend"], "host-model-NO-DMA")
++                self.assertEqual(record["dma_completed"], 0)
++                self.assertEqual(record["timing"], "UNKNOWN")
++                trace = record["model_trace"]
++                self.assertEqual(len(trace), 33)
++                self.assertEqual(trace[:7], ["d0:" + e for e in
++                                 ("SOURCE_READY", "NEXT_ID", "COUNT_ACCEPT", "R", "W", "B", "DONE")])
++                self.assertEqual(trace[-5:], ["CACHE_ACQUIRE", "CONTEXT_RESTORED", "UNPIN",
++                                             "INDEPENDENT_VERIFY", "FILE_CONSUMER"])
++
++    def test_arbitrary_payload_and_cpu_controls(self):
++        for mode in ("pinned-mm", "cpu-copy", "source-writev"):
++            with self.subTest(mode=mode):
++                completed, outputs = self.run_task(mode, host=mode == "pinned-mm")
++                self.assertEqual(completed.returncode, 0, completed.stderr)
++                self.assertEqual(outputs[0].read_bytes(), self.data)
++                record = json.loads(completed.stdout)
++                self.assertEqual(record["dma_submitted"], 0)
++                self.assertEqual(record["pinned_pages"], 0)
++                if mode == "source-writev":
++                    self.assertEqual(record["arena_pages"], 0)
++
++    def test_production_never_silently_falls_back(self):
++        completed, outputs = self.run_task(host=False)
++        self.assertNotEqual(completed.returncode, 0)
++        self.assertIn("CAPS", completed.stderr)
++        self.assertFalse(outputs[0].exists())
++        self.assertNotIn("PASS", completed.stdout)
++
++    def test_fixed_frames_reject_bad_length_cookie_truncation_and_trailing_data(self):
++        variants = (self.data[:-1], self.data + b"x", self.data[:72],
++                    b"\x02" + self.data[1:], self.data[:8] + struct.pack("<I", 61) + self.data[12:])
++        for data in variants:
++            with self.subTest(length=len(data)):
++                self.source.write_bytes(data)
++                completed, outputs = self.run_task()
++                self.assertNotEqual(completed.returncode, 0)
++                self.assertFalse(outputs[0].exists())
++
++    def test_repeat_reinitializes_and_delivers_independent_files(self):
++        outputs = [self.work / f"run-{i}.bin" for i in range(3)]
++        # A mock RUN also checks every destination payload is reset before publication.
++        completed, _ = self.run_task(host=False, scenario="success", outputs=outputs, repeat=3)
++        self.assertEqual(completed.returncode, 0, completed.stderr)
++        records = [json.loads(line) for line in completed.stdout.splitlines()]
++        self.assertEqual([r["iteration"] for r in records], [1, 2, 3])
++        for output in outputs:
++            self.assertEqual(output.read_bytes(), self.data)
++
++    def test_partial_and_interrupted_input_and_consumer_io(self):
++        for io in ("partial", "read-partial"):
++            for mode in ("pinned-mm", "source-writev"):
++                with self.subTest(io=io, mode=mode):
++                    completed, outputs = self.run_task(mode, host=mode == "pinned-mm", io=io)
++                    self.assertEqual(completed.returncode, 0, completed.stderr)
++                    self.assertEqual(outputs[0].read_bytes(), self.data)
++
++    def test_existing_output_truncated_to_exact_consumer_bytes(self):
++        output = self.work / "output.bin"
++        output.write_bytes(b"old" * 4000)
++        completed, _ = self.run_task(outputs=[output])
++        self.assertEqual(completed.returncode, 0, completed.stderr)
++        self.assertEqual(output.read_bytes(), self.data)
++
++    def test_early_or_partial_consumer_failures_never_report_success(self):
++        for io in ("error", "zero", "partial-error", "close-error"):
++            with self.subTest(io=io):
++                completed, outputs = self.run_task(io=io)
++                self.assertNotEqual(completed.returncode, 0)
++                self.assertIn("file consumer", completed.stderr)
++                self.assertNotIn("PASS", completed.stdout)
++                if io == "partial-error":
++                    self.assertEqual(outputs[0].read_bytes(), self.data[:72])
++
++    def test_caps_run_restore_owner_resource_and_receipt_failures(self):
++        for scenario in ("caps-errno", "caps-mode", "caps-did", "caps-abi", "caps-profile",
++                         "run-errno", "run-status", "restore-status", "ownership", "pins",
++                         "partial-done", "resources", "address", "receipt"):
++            with self.subTest(scenario=scenario):
++                completed, outputs = self.run_task(host=False, scenario=scenario)
++                self.assertNotEqual(completed.returncode, 0)
++                self.assertFalse(outputs[0].exists())
++                self.assertNotIn("PASS", completed.stdout)
++
++    def test_independent_payload_header_source_guard_tail_and_metadata_detection(self):
++        for scenario in ("payload", "header", "source", "source-guard", "destination-guard",
++                         "page-tail", "metadata"):
++            with self.subTest(scenario=scenario):
++                completed, outputs = self.run_task(host=False, scenario=scenario)
++                self.assertNotEqual(completed.returncode, 0)
++                self.assertIn("arena mismatch", completed.stderr)
++                self.assertFalse(outputs[0].exists())
++
++    def test_input_output_alias_and_repeat_path_alias_rejected_without_truncation(self):
++        alias = self.work / "hardlink.bin"
++        os.link(self.source, alias)
++        for outputs, repeat in (([self.source], 1), ([alias], 1),
++                                ([self.work / "same", self.work / "same"], 2)):
++            with self.subTest(outputs=outputs):
++                completed, _ = self.run_task(outputs=outputs, repeat=repeat)
++                self.assertNotEqual(completed.returncode, 0)
++                self.assertEqual(self.source.read_bytes(), self.data)
++
++    def test_new_output_alias_cannot_truncate_prior_delivery(self):
++        output = self.work / "new-output.bin"
++        alias = str(self.work) + "/./new-output.bin"
++        completed, _ = self.run_task(outputs=[output, alias], repeat=2)
++        self.assertNotEqual(completed.returncode, 0)
++        self.assertEqual(output.read_bytes(), self.data)
++        self.assertEqual(len(completed.stdout.splitlines()), 1)
++
++    def test_native_borrowed_locks_each_same_arena_and_unlocks_before_consumer(self):
++        log = self.work / "lifecycle.log"
++        outputs = [self.work / f"locked-{i}.bin" for i in range(2)]
++        completed, _ = self.run_task(host=False, scenario="success", outputs=outputs,
++                                     repeat=2, lifecycle_log=log)
++        self.assertEqual(completed.returncode, 0, completed.stderr)
++        self.assertEqual(log.read_text().splitlines(),
++                         ["MLOCK", "RUN", "MUNLOCK", "CONSUMER", "CONSUMER", "CONSUMER", "MUNMAP"] * 2)
++        for output in outputs:
++            self.assertEqual(output.read_bytes(), self.data)
++        for record in completed.stdout.splitlines():
++            self.assertEqual(json.loads(record)["locked_pages_peak"], 8)
++
++    def test_lock_unlock_and_safely_returned_run_failures_never_consume(self):
++        for scenario in ("mlock-error", "munlock-error", "run-errno"):
++            with self.subTest(scenario=scenario):
++                log = self.work / (scenario + ".log")
++                completed, outputs = self.run_task(host=False, scenario=scenario, lifecycle_log=log)
++                self.assertNotEqual(completed.returncode, 0)
++                self.assertFalse(outputs[0].exists())
++                self.assertNotIn("PASS", completed.stdout)
++                events = log.read_text().splitlines()
++                self.assertNotIn("CONSUMER", events)
++                if scenario == "mlock-error":
++                    self.assertEqual(events, ["MLOCK", "MUNMAP"])
++                    self.assertIn("arena mlock", completed.stderr)
++                else:
++                    self.assertEqual(events, ["MLOCK", "RUN", "MUNLOCK", "MUNMAP"])
++                    self.assertIn("arena munlock" if scenario == "munlock-error" else "DMA RUN", completed.stderr)
++
++    def test_ordinary_cpu_and_host_paths_do_not_pay_borrowed_lock_cost(self):
++        for mode, host in (("iova", False), ("sameva-shadow", False), ("pinned-mm", True),
++                           ("cpu-copy", False), ("source-writev", False)):
++            with self.subTest(mode=mode, host=host):
++                log = self.work / (mode + ".log")
++                completed, outputs = self.run_task(mode, host=host, scenario="mlock-error", lifecycle_log=log)
++                self.assertEqual(completed.returncode, 0, completed.stderr)
++                self.assertEqual(outputs[0].read_bytes(), self.data)
++                self.assertNotIn("MLOCK", log.read_text())
++                self.assertNotIn("MUNLOCK", log.read_text())
++                self.assertEqual(json.loads(completed.stdout)["locked_pages_peak"], 0)
++
++    def test_all_native_address_mode_contracts_with_test_only_mock(self):
++        for mode in ("iova", "sameva-shadow", "pinned-mm"):
++            with self.subTest(mode=mode):
++                completed, outputs = self.run_task(mode, host=False, scenario="success")
++                self.assertEqual(completed.returncode, 0, completed.stderr)
++                self.assertEqual(outputs[0].read_bytes(), self.data)
++                self.assertEqual(json.loads(completed.stdout)["dma_completed"], 4)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/fixtures/idma-sva-three-frames.bin b/tests/fixtures/idma-sva-three-frames.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..b45aa605bab4365fad1b0063792ea962cfc94a12
+GIT binary patch
+literal 1675
+zcmZQ%fB+j1#mL0W!pg?Z!O6wV!^_7nASfg(A}S^>At@y-BP%Dbps1v*qN=8@p{b><
+zqpPQHU}$7)Vrph?VQFQ}1U1J3$RI(Rjjf%%gQJtPi>sTvho_gfkFTG9KwwaCNN8Ai
+zL}XNSOl(|yLSj;KN@`kqMrKxaPHtX)L19sGNoiSmMP*fWO>JF$Lt|5OOKV$uM`u@e
+zPj6rUgo%?TPnkMx`iz;gX3v>BZ~lUXixw|gx@`H1m8({-S-WoihK-vxZ`rzS`;MKv
+zcJJA{Z~uXVhYlY(dhGa#lc!FfIeYH>g^QOiU%7hi`i+~nZr{0k@BV{_j~+jH`t13O
+zm#<#GdHe4DhmW5=fBE|D`;VW$e*gLV?>{BMHtK(*_-BTuq0c}D?vyqfWJp0anq@|d
+JjNwvb0su?J4d(y=
+
+literal 0
+HcmV?d00001
+

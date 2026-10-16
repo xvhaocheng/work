@@ -1,0 +1,534 @@
+下面是两个**新增**工具文件的完整代码提案。二者都在 `scripts/` 目录、以「同目录动态加载」方式复用现有 `mac_composition.py` 与 `composition_plan.py`，不改这两个文件、不自造 SSH/串口/验证器、不输出凭据、不续跑。
+
+## (1) `scripts/mac_composition_history.py`
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""mac_composition_history.py - history-isolation diagnostic runner (22 cases).
+
+A thin wrapper around scripts/mac_composition.py.  It imports the real
+runner from this directory and replaces ONLY the module returned by that
+runner's load_plan_module() hook with a frozen 22-case diagnostic plan.
+Everything else - main(), the UART/SSH transports, the safety gates, the
+fail-stop, the plan/manifest/summary/record/metrics saving - stays the
+original code path.
+
+The 22 cases are a deterministic filter of the original 172-case plan:
+
+  short  : mode P / PN with a_pages in {0, 8}                 ->  4
+  explore: v_gap_cycles == 0 and
+             (a_pages == 8, any of the 4 modes) or
+             (a_pages == 1, mode P / PN)                      -> 18
+                                                              total 22
+
+Original execution order, ids and per-case parameters are preserved.  There is
+no condition/selection CLI parameter: --plan always freezes the full 22-case
+list.  A technical failure stops the run; there is no resume and no rerun.
+This wrapper never reads, prints or logs a credential.
+"""
+from __future__ import annotations
+
+import importlib.util
+import pathlib
+import sys
+import types
+
+HISTORY_PLAN_SCHEMA = 'idma-composition-plan-history-v1'
+HISTORY_PLAN_GENERATION = 'history-isolation-diagnostic22'
+HISTORY_PLAN_GENERATION_NOTE = 'history-isolation diagnostic22'
+
+SOURCE_PLAN_SCHEMA = 'idma-composition-plan-v1'
+SOURCE_PLAN_COUNT = 172
+
+MODE_P = 2
+MODE_PN = 3
+HISTORY_SHORT_MODES = frozenset((MODE_P, MODE_PN))
+HISTORY_SHORT_A_PAGES = frozenset((0, 8))
+HISTORY_EXPLORE_ALL_MODE_A_PAGES = frozenset((8,))
+HISTORY_EXPLORE_P_ONLY_A_PAGES = frozenset((1,))
+
+EXPECTED_COUNT = 22
+EXPECTED_PHASES = {'short': 4, 'noise': 0, 'explore': 18}
+
+
+def _load_sibling(name):
+    """Load a .py file that sits next to this wrapper, no package needed."""
+    here = pathlib.Path(__file__).resolve().parent
+    path = here / (name + '.py')
+    if not path.is_file():
+        raise SystemExit('cannot find ' + name + '.py next to this wrapper')
+    spec = importlib.util.spec_from_file_location('history_wrapper_' + name, path)
+    if spec is None or spec.loader is None:
+        raise SystemExit('cannot load ' + str(path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules['history_wrapper_' + name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def select_source_cases(cases):
+    """Deterministic filter of the original plan; original order is kept.
+
+    short  : mode P / PN and a_pages in {0, 8}
+    explore: v_gap_cycles == 0 and
+             (a_pages == 8 any mode) or (a_pages == 1 mode P / PN)
+    """
+    selected = []
+    for case in cases:
+        phase = case['phase']
+        mode = int(case['mode'])
+        a_pages = int(case['a_pages'])
+        gap = int(case['v_gap_cycles'])
+        if phase == 'short':
+            if mode in HISTORY_SHORT_MODES and a_pages in HISTORY_SHORT_A_PAGES:
+                selected.append(case)
+        elif phase == 'explore':
+            if gap != 0:
+                continue
+            if a_pages in HISTORY_EXPLORE_ALL_MODE_A_PAGES:
+                selected.append(case)
+            elif a_pages in HISTORY_EXPLORE_P_ONLY_A_PAGES and mode in HISTORY_SHORT_MODES:
+                selected.append(case)
+    return selected
+
+
+def build_history_plan(source_plan):
+    cases = select_source_cases(source_plan.get('cases') or [])
+    phases = {}
+    for name in ('short', 'noise', 'explore'):
+        phases[name] = sum(1 for case in cases if case['phase'] == name)
+    return {
+        'schema': HISTORY_PLAN_SCHEMA,
+        'plan_generation': HISTORY_PLAN_GENERATION,
+        'plan_generation_note': HISTORY_PLAN_GENERATION_NOTE,
+        'source_plan_schema': source_plan.get('schema'),
+        'source_plan_generation': source_plan.get('plan_generation'),
+        'source_case_count': source_plan.get('count'),
+        'auto_rerun': False,
+        'resume': False,
+        'calibration': source_plan.get('calibration', 'unverified'),
+        'selection': (
+            'short: mode P/PN a_pages in {0,8}; '
+            'explore: v_gap 0 and (a_pages 8 any mode, a_pages 1 mode P/PN)'),
+        'count': len(cases),
+        'phases': phases,
+        'cases': cases,
+    }
+
+
+def make_history_plan_module(real_plan):
+    """Build a plan-module facade: same API, but build_plan() is the frozen 22."""
+    source_plan = real_plan.build_plan()
+    if (source_plan.get('schema') != SOURCE_PLAN_SCHEMA
+            or source_plan.get('count') != SOURCE_PLAN_COUNT):
+        raise SystemExit(
+            'source plan is not the expected %s/%d: schema=%r count=%r'
+            % (SOURCE_PLAN_SCHEMA, SOURCE_PLAN_COUNT,
+               source_plan.get('schema'), source_plan.get('count')))
+    history_plan = build_history_plan(source_plan)
+    if history_plan['count'] != EXPECTED_COUNT or history_plan['phases'] != EXPECTED_PHASES:
+        raise SystemExit(
+            'history selection drifted from the frozen 22: count=%r phases=%r'
+            % (history_plan['count'], history_plan['phases']))
+    module = types.ModuleType('composition_plan_history')
+    for name in dir(real_plan):
+        if name.startswith('_'):
+            continue
+        setattr(module, name, getattr(real_plan, name))
+    # Only this is replaced; case_argv/validate_case/case_metrics/
+    # cases_through_phase and all constants stay the original ones.
+    module.build_plan = lambda: history_plan
+    return module
+
+
+def main(argv=None):
+    mac_module = _load_sibling('mac_composition')
+    real_plan = _load_sibling('composition_plan')
+    history_plan_module = make_history_plan_module(real_plan)
+    # mac_composition.main() looks up load_plan_module() at call time, so this
+    # single rebind is enough; no other runner code is touched.
+    mac_module.load_plan_module = lambda: history_plan_module
+    return mac_module.main(sys.argv[1:] if argv is None else argv)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+```
+
+## (2) `scripts/analyze_composition_history.py`
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""analyze_composition_history.py - read-only analysis of history-isolation runs.
+
+Reads one or more original-runner RUN_DIRs (each holding plan.json and
+cases/<id>/{record.json,meta.json,metrics.json}) and summarises the 18
+'explore' cases of the history diagnostic selection:
+
+  v_gap_cycles == 0 and (a_pages == 8 any mode, or a_pages == 1 mode P/PN)
+
+For each selected case it reports W (p4m.window[1]), same-window A completed
+(p4m.window[3]), V normal miss / V fast, and A normal lookup / miss / fill,
+then per block+condition the P -> PN W percent change and the A-miss
+difference.  Several inputs are compared case by case.
+
+Read-only: no port, no case, no rerun.  Contract problems come ONLY from the
+original composition_plan validate function (its real name is validate_case,
+with meta optional; called here without meta).  A performance negative
+(fast == 0, miss == 0, no P/PN W change) is never a technical failure.  No
+significance test and no cross-BIT / cross-boot causal claim is produced.
+
+Note: the original module exposes validate_case(case, record, meta=None) and
+case_metrics(case, record); there is no function named validate_record.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import importlib.util
+import json
+import pathlib
+import sys
+
+ANALYSIS_SCHEMA = 'composition-history-analysis-v1'
+NEWLINE = '\n'
+
+SELECTION_NOTE = ('explore, v_gap_cycles == 0 and '
+                  '(a_pages == 8 any mode, or a_pages == 1 mode P/PN)')
+
+# Historical reference only, from the older ptwfix work; never used here as a
+# baseline, a threshold or evidence for a new run.
+HISTORICAL_PTWFIX_PERCENT = (11.58, 12.22)
+
+NOTES = [
+    'read-only analysis: no port is opened, no case is run, nothing is rerun',
+    'contract problems come only from the original composition_plan.validate_case',
+    'a performance negative (fast == 0, miss == 0, no P/PN W change) is never '
+    'a technical failure',
+    'no significance test is performed; the numbers are descriptive only',
+    'a new run is one boot; cross-boot or cross-BIT comparisons are not '
+    'same-boot causal evidence',
+    'W is p4m.window[1] window cycles; A completed is p4m.window[3] in the '
+    'same (open,close] window',
+    'w_pct_change = (W_pn - W_p) / W_p * 100; a_miss_diff = A_miss_pn - A_miss_p',
+]
+
+CSV_FIELDS = (
+    'kind', 'input', 'id', 'block', 'a_pages', 'mode', 'mode_name',
+    'v_gap_cycles', 'W', 'a_completed_window', 'v_lookup', 'v_hit', 'v_miss',
+    'v_fast', 'a_lookup', 'a_hit', 'a_miss', 'a_fill', 'w_pct_change',
+    'a_miss_diff', 'validate_problems', 'problems')
+
+
+def _load_sibling(name):
+    here = pathlib.Path(__file__).resolve().parent
+    path = here / (name + '.py')
+    if not path.is_file():
+        raise SystemExit('cannot find ' + name + '.py next to this tool')
+    spec = importlib.util.spec_from_file_location('history_analysis_' + name, path)
+    if spec is None or spec.loader is None:
+        raise SystemExit('cannot load ' + str(path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules['history_analysis_' + name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def read_json(path):
+    with open(path, 'r', encoding='utf-8') as handle:
+        return json.load(handle)
+
+
+def _raw_at(raw, index):
+    if isinstance(raw, list) and len(raw) > index:
+        value = raw[index]
+        if isinstance(value, bool):
+            return None
+        return value
+    return None
+
+
+def _csv_value(value):
+    return '' if value is None else value
+
+
+def select_explore_cases(history_module, cases):
+    """Same single source of truth as the runner's frozen selection."""
+    return [case for case in history_module.select_source_cases(cases)
+            if case['phase'] == 'explore']
+
+
+def collect_case(real_plan, case, cdir):
+    entry = {
+        'id': case['id'],
+        'block': case.get('block'),
+        'a_pages': int(case['a_pages']),
+        'mode': int(case['mode']),
+        'mode_name': case.get('mode_name'),
+        'v_gap_cycles': int(case['v_gap_cycles']),
+        'record_present': False,
+        'meta_present': False,
+        'metrics_file_present': False,
+        'validate_problems': None,
+        'problems': [],
+        'W': None,
+        'a_completed_window': None,
+        'v_lookup': None,
+        'v_hit': None,
+        'v_miss': None,
+        'v_fast': None,
+        'a_lookup': None,
+        'a_hit': None,
+        'a_miss': None,
+        'a_fill': None,
+        'boot_id': None,
+        'framed_exit': None,
+    }
+    record_path = cdir / 'record.json'
+    meta_path = cdir / 'meta.json'
+    metrics_path = cdir / 'metrics.json'
+
+    record = None
+    if record_path.is_file():
+        try:
+            record = read_json(record_path)
+            entry['record_present'] = True
+        except Exception as exc:
+            entry['problems'].append('record.json unreadable: ' + repr(exc))
+    else:
+        entry['problems'].append('record.json missing')
+
+    if meta_path.is_file():
+        try:
+            meta = read_json(meta_path)
+            entry['meta_present'] = True
+            entry['boot_id'] = meta.get('boot_id')
+            entry['framed_exit'] = meta.get('framed_exit')
+        except Exception as exc:
+            entry['problems'].append('meta.json unreadable: ' + repr(exc))
+    else:
+        entry['problems'].append('meta.json missing')
+
+    if metrics_path.is_file():
+        entry['metrics_file_present'] = True
+
+    if not isinstance(record, dict):
+        entry['validate_problems'] = ['record is not a JSON object']
+        return entry
+
+    try:
+        entry['validate_problems'] = list(real_plan.validate_case(case, record))
+    except Exception as exc:
+        entry['validate_problems'] = ['validate_case raised: ' + repr(exc)]
+
+    try:
+        metrics = real_plan.case_metrics(case, record)
+    except Exception as exc:
+        metrics = None
+        entry['problems'].append('case_metrics raised: ' + repr(exc))
+
+    result = record.get('result')
+    raw = result.get('raw') if isinstance(result, dict) else None
+    if metrics is not None:
+        entry['W'] = metrics.get('v_window_cycles')
+        entry['a_completed_window'] = metrics.get('a_completed_jobs_window')
+    entry['v_lookup'] = _raw_at(raw, real_plan.RAW_V_LOOKUP)
+    entry['v_hit'] = _raw_at(raw, real_plan.RAW_V_HIT)
+    entry['v_miss'] = _raw_at(raw, real_plan.RAW_V_MISS)
+    entry['v_fast'] = _raw_at(raw, real_plan.RAW_V_FAST)
+    entry['a_lookup'] = _raw_at(raw, real_plan.RAW_A_LOOKUP)
+    entry['a_hit'] = _raw_at(raw, real_plan.RAW_A_HIT)
+    entry['a_miss'] = _raw_at(raw, real_plan.RAW_A_MISS)
+    entry['a_fill'] = _raw_at(raw, real_plan.RAW_A_FILL)
+    return entry
+
+
+def p_to_pn_rows(entries):
+    groups = {}
+    for entry in entries:
+        key = (entry['block'], entry['a_pages'])
+        groups.setdefault(key, {})[entry['mode']] = entry
+    rows = []
+    for block, a_pages in sorted(groups, key=lambda k: (k[0] is None, k[0], k[1])):
+        pair = groups[(block, a_pages)]
+        p = pair.get(2)
+        pn = pair.get(3)
+        row = {
+            'block': block,
+            'a_pages': a_pages,
+            'w_p': p['W'] if p else None,
+            'w_pn': pn['W'] if pn else None,
+            'w_pct_change': None,
+            'a_miss_p': p['a_miss'] if p else None,
+            'a_miss_pn': pn['a_miss'] if pn else None,
+            'a_miss_diff': None,
+            'a_lookup_p': p['a_lookup'] if p else None,
+            'a_lookup_pn': pn['a_lookup'] if pn else None,
+            'a_fill_p': p['a_fill'] if p else None,
+            'a_fill_pn': pn['a_fill'] if pn else None,
+            'v_fast_p': p['v_fast'] if p else None,
+            'v_fast_pn': pn['v_fast'] if pn else None,
+            'v_miss_p': p['v_miss'] if p else None,
+            'v_miss_pn': pn['v_miss'] if pn else None,
+        }
+        if p and pn and p['W'] not in (None, 0) and pn['W'] is not None:
+            row['w_pct_change'] = (pn['W'] - p['W']) / float(p['W']) * 100.0
+        if p and pn and p['a_miss'] is not None and pn['a_miss'] is not None:
+            row['a_miss_diff'] = pn['a_miss'] - p['a_miss']
+        rows.append(row)
+    return rows
+
+
+def summarize_run(history_module, real_plan, run_dir):
+    run_dir = pathlib.Path(run_dir)
+    plan = None
+    plan_path = run_dir / 'plan.json'
+    if plan_path.is_file():
+        try:
+            plan = read_json(plan_path)
+        except Exception:
+            plan = None
+    if not isinstance(plan, dict):
+        plan = real_plan.build_plan()
+    cases = select_explore_cases(history_module, plan.get('cases') or [])
+    entries = [collect_case(real_plan, case, run_dir / 'cases' / case['id'])
+               for case in cases]
+    boot_ids = sorted({entry['boot_id'] for entry in entries if entry['boot_id']})
+    return {
+        'run_dir': str(run_dir),
+        'plan_schema': plan.get('schema'),
+        'plan_count': plan.get('count'),
+        'explore_case_count': len(entries),
+        'boot_ids': boot_ids,
+        'cases': entries,
+        'p_to_pn': p_to_pn_rows(entries),
+    }
+
+
+def cross_input_cases(runs):
+    by_id = {}
+    for run in runs:
+        for entry in run['cases']:
+            by_id.setdefault(entry['id'], {})[run['run_dir']] = {
+                'W': entry['W'],
+                'a_completed_window': entry['a_completed_window'],
+                'v_miss': entry['v_miss'],
+                'v_fast': entry['v_fast'],
+                'a_lookup': entry['a_lookup'],
+                'a_miss': entry['a_miss'],
+                'a_fill': entry['a_fill'],
+                'boot_id': entry['boot_id'],
+            }
+    return by_id
+
+
+def cross_input_pairs(runs):
+    by_pair = {}
+    for run in runs:
+        for row in run['p_to_pn']:
+            key = 'block%s/a%s' % (row['block'], row['a_pages'])
+            by_pair.setdefault(key, {})[run['run_dir']] = {
+                'w_pct_change': row['w_pct_change'],
+                'a_miss_diff': row['a_miss_diff'],
+            }
+    return by_pair
+
+
+def write_csv(path, runs):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', encoding='utf-8', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(CSV_FIELDS),
+                                restval='', extrasaction='ignore')
+        writer.writeheader()
+        for run in runs:
+            for entry in run['cases']:
+                row = {key: _csv_value(entry.get(key)) for key in CSV_FIELDS}
+                row['kind'] = 'case'
+                row['input'] = run['run_dir']
+                row['validate_problems'] = '; '.join(entry.get('validate_problems') or [])
+                row['problems'] = '; '.join(entry.get('problems') or [])
+                writer.writerow(row)
+            for pair in run['p_to_pn']:
+                writer.writerow({
+                    'kind': 'p_to_pn',
+                    'input': run['run_dir'],
+                    'block': _csv_value(pair['block']),
+                    'a_pages': _csv_value(pair['a_pages']),
+                    'W': _csv_value(pair['w_p']),
+                    'a_miss': _csv_value(pair['a_miss_p']),
+                    'w_pct_change': _csv_value(pair['w_pct_change']),
+                    'a_miss_diff': _csv_value(pair['a_miss_diff']),
+                })
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description='History-isolation read-only analysis of original RUN_DIRs')
+    parser.add_argument('run_dirs', nargs='+',
+                        help='one or more original runner RUN_DIRs')
+    parser.add_argument('--json', dest='json_path', default=None,
+                        help='write the JSON report here; default is stdout')
+    parser.add_argument('--csv', dest='csv_path', default=None,
+                        help='also write a flat CSV of the case table')
+    return parser
+
+
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+    history_module = _load_sibling('mac_composition_history')
+    real_plan = _load_sibling('composition_plan')
+    runs = [summarize_run(history_module, real_plan, d) for d in args.run_dirs]
+    all_boots = sorted({boot for run in runs for boot in run['boot_ids']})
+    report = {
+        'schema': ANALYSIS_SCHEMA,
+        'selection': SELECTION_NOTE,
+        'notes': NOTES,
+        'historical_ptwfix_reference_percent': list(HISTORICAL_PTWFIX_PERCENT),
+        'cross_boot_inputs': len(all_boots) > 1,
+        'boot_ids': all_boots,
+        'inputs': runs,
+        'cross_input_cases': cross_input_cases(runs),
+        'cross_input_p_to_pn': cross_input_pairs(runs),
+    }
+    text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
+    if args.json_path:
+        path = pathlib.Path(args.json_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + NEWLINE, encoding='utf-8')
+    else:
+        sys.stdout.write(text + NEWLINE)
+    if args.csv_path:
+        write_csv(pathlib.Path(args.csv_path), runs)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+```
+
+## 接口与最小验收方法
+
+`scripts/mac_composition_history.py`
+- 接口：与 `mac_composition.py` 完全相同（`--serial/--transport/--board-host/--credential-script/--ssh-helper/--out/--expected-kernel/--board-cli/--device/--plan/--run/--through-phase/...`），**没有**新增选择条件参数；`--plan` 只写 `plan.json`+`manifest.json` 并退出，`--run` 才开端口。
+- 最小验收：
+  1. `python3 scripts/mac_composition_history.py --out /tmp/h22 --expected-kernel <K> --plan` → `plan.json` 的 `count==22`，`phases=={"short":4,"noise":0,"explore":18}`，`schema=='idma-composition-plan-history-v1'`，`plan_generation=='history-isolation-diagnostic22'`，并含 `source_plan_schema/source_case_count==172`。
+  2. 对照原 `plan.json`：所选 22 个 `id` 是原 172 的子集，且顺序、每 case 的 `mode/a_pages/v_gap_cycles/transfers/warmup/timeout_ms` 完全一致。
+  3. `--plan` 重复对已存在 `--out` 应拒绝（沿用 runner 行为），不产生续跑；无凭据输出（该包装器不读凭据）。
+  4. 若需要跑满 22，用 `--through-phase explore`；默认 `--through-phase short` 只跑 4 个 short。
+
+`scripts/analyze_composition_history.py`
+- 接口：`analyze_composition_history.py RUN_DIR [RUN_DIR ...] [--json PATH] [--csv PATH]`（只读，缺省 JSON 到 stdout）。
+- 最小验收：
+  1. 传入给出的样例两 run 目录之一/多个 → 每个输入的 `explore_case_count==18`，`cross_input_cases` 含 `explore-b1-g0-a8-mpn` 等。
+  2. `--json /tmp/a.json --csv /tmp/a.csv` 均生成；JSON 含 `inputs/cross_input_cases/cross_input_p_to_pn`；CSV 有 `kind=case` 与 `kind=p_to_pn` 行。
+  3. `p_to_pn` 行里 `block1/a8`：`W_p=8994909`（mp）、`W_pn=10004139`（mpn），`w_pct_change≈+11.22%`；`a_miss` 直接取自 `raw[17]`。
+  4. `validate_problems` 为空表示合约通过；空不等于性能结论，性能负值不产生技术失败。
+
+## 假设与未决点
+- 实际函数名是 `composition_plan.validate_case(case, record, meta=None)`，不是 `validate_record`；分析器按真实签名调用且**不传 meta**（因此不做 exit/taint 全验收），仅在 `problems` 里记录缺失的 `meta.json`。
+- 分析器直接读 `RUN_DIR/plan.json` 的 `cases` 再按同一 `select_source_cases` 过滤；若 run 目录缺 `plan.json` 则回退到 `composition_plan.build_plan()` 的规范 172。
+- `W`/`a_completed_window` 用 `case_metrics` 重算（对应 `p4m.window[1]`/`[3]`），`metrics.json` 仅记录存在性。
+- 历史 `ptwfix +11.58~12.22%` 仅作参考常量写入报告，不作为基线/阈值/新运行证据；跨 boot/BIT 比较仅在报告中标注，不作因果结论。
+- 未运行任何命令；以上均为未执行的提案，需 Codex 实际上板/本地验证。

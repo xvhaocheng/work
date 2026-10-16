@@ -1,0 +1,182 @@
+--- a/tests/nonblock_coupled_test.cpp
++++ b/tests/nonblock_coupled_test.cpp
+@@ -256,11 +256,23 @@
+     // Overlap mode: honor both halves of one 4 KiB job concurrently.
+     bool overlap_mode = false;
+ 
+     // v5 opt-in proxy: drive fullbuffer_jobs_i = 3u for the bounded 4 KiB
+     // candidate.  Default false -> 0u (legacy guard).  With +couple-depth=512
+     // the harness runs all 12 existing scenarios; each scenario has one 4 KiB
+     // job per DMA, and the A-enabled scenarios therefore carry two jobs on the
+     // two separate 512-deep coupling FIFOs.
+     bool fullbuffer_permit = false;
+ 
++    // +v-gap-cycles=0|1000|4000: number of complete ticks the V victim waits
++    // after finishing one 4 KiB job before the next V job is started.  0 is the
++    // historical back-to-back issue.  A is never gated by this value: A's own
++    // start condition is unchanged and tick() keeps running during the wait.
++    // The wait is purely temporal; no IOVA/PA or page distance is changed.
++    uint32_t v_gap_cycles = 0;
++
++    // +policy=0|1: forwarded verbatim to the wrapper input policy_partition_i.
++    // Only observable in a build elaborated with PolicyEnable=1 (the Python
++    // --policy build); the default build forces the full replacement mask.
++    bool policy_partition = false;
++
+     // Per-DMA selectors for the half whose AR / AW is currently on the wire,
+     // and per-DMA pointers to the half of the next returning R / B / W beat.
+     // They are all no-ops in serial mode (they stay 0 or 1).
+@@ -573,7 +585,8 @@
+     void tick() {
+         top->nonblock_enable_i = nonblock_enable ? 1 : 0;
+         top->fullbuffer_jobs_i = fullbuffer_permit ? 3u : 0u;
++        top->policy_partition_i = policy_partition ? 1 : 0;
+ 
+         for (int d = 0; d < 2; ++d) dma_progress(d);
+ 
+         // ---- drive all combinational inputs at clk low -----------------
+@@ -1114,9 +1127,11 @@
+     void run_scenario(const char* name, bool enable, uint32_t a_pages,
+                       uint32_t ptw_lat) {
+         std::printf("== coupled scenario %s (runtime enable=%d, a_pages=%u, "
+-                    "ptw_latency=%u) ==\n", name, (int)enable, a_pages, ptw_lat);
++                    "ptw_latency=%u, v_gap_cycles=%u, policy_partition=%d) ==\n",
++                    name, (int)enable, a_pages, ptw_lat, v_gap_cycles,
++                    (int)policy_partition);
+         setup_memory(a_pages);
+         reset(enable);
+         ptw_latency    = ptw_lat;
+@@ -1132,17 +1147,33 @@
+         uint32_t v_next = 0, a_next = 0;
++        // Optional V-only inter-job gap.  After a V 4 KiB job completes, the
++        // next V job is only started once v_gap_cycles complete ticks have
++        // elapsed.  A is never gated here: the A start below is unchanged and
++        // tick() keeps running, so A keeps progressing while V is idle.  The
++        // gap is purely temporal and never touches any IOVA/PA or page stride.
++        long v_ready_at = -1;
+         start_job(0, v_next++);
+         if (a_pages) start_job(1, a_next++);
+ 
+         while (v_next < JOB_COUNT || (a_pages && a_next < JOB_COUNT)) {
+             tick();
+             if (g_cycle - last_progress_cycle > WATCHDOG_CYCLES) {
+                 dump_stall(std::string("scenario ") + name);
+                 throw TestFailure("watchdog: no handshake progress");
+             }
+-            if (dma[0].job_done && v_next < JOB_COUNT) start_job(0, v_next++);
++            if (dma[0].job_done && v_next < JOB_COUNT) {
++                if (v_gap_cycles == 0) {
++                    start_job(0, v_next++);
++                    v_ready_at = -1;
++                } else if (v_ready_at < 0) {
++                    v_ready_at = g_cycle + (long)v_gap_cycles;
++                } else if (g_cycle >= v_ready_at) {
++                    start_job(0, v_next++);
++                    v_ready_at = -1;
++                }
++            }
+             if (a_pages && dma[1].job_done && a_next < JOB_COUNT) start_job(1, a_next++);
+             if (g_cycle - scenario_start > SCENARIO_BUDGET) {
+                 dump_stall(std::string("scenario ") + name);
+                 throw TestFailure("scenario budget exceeded");
+             }
+         }
+@@ -1199,12 +1230,14 @@
+         std::printf("COUPLED-SUMMARY %s couple_depth=%u cycles=%ld comp_ar=%lu "
+                     "ddtw_ar=%lu ptw_ar=%lu tl_accept=%lu tl_resp=%lu "
+                     "iotlb_look=%lu iotlb_hit=%lu ptw_active=%lu r_beats=%lu b_up=%lu "
+-                    "nonblock_fire=%lu nonblock_busy=%lu\n",
++                    "nonblock_fire=%lu nonblock_busy=%lu "
++                    "v_gap=%u policy=%d\n",
+                     name, couple_depth, g_cycle - scenario_start,
+                     (unsigned long)n_comp_ar, (unsigned long)n_ddtw_ar,
+                     (unsigned long)n_ptw_ar, (unsigned long)n_tl_accept,
+                     (unsigned long)n_tl_resp, (unsigned long)n_iotlb_lookup,
+                     (unsigned long)n_iotlb_hit, (unsigned long)n_ptw_active,
+                     (unsigned long)n_r_beats, (unsigned long)n_b_up,
+                     (unsigned long)d_nonblock_fire,
+-                    (unsigned long)d_nonblock_busy);
++                    (unsigned long)d_nonblock_busy,
++                    v_gap_cycles, (int)policy_partition);
+@@ -1244,19 +1277,34 @@
+     //        (owner 2) never changes either RR cursor.  This interleaves the
+     //        two halves of both 4 KiB jobs on the shared upstream port as a
+     //        legal AXI stream, e.g. V.h0 -> A.h0 -> V.h1 -> A.h1.
++    // optional V inter-job gap:           +v-gap-cycles=0|1000|4000 (default 0)
++    //   The V victim waits this many complete ticks between finishing one
++    //   4 KiB job and starting the next one.  The wait is counted by tick(),
++    //   so A keeps progressing; A is never gated by this value and no IOVA/PA
++    //   or page distance is changed.
++    // optional IOTLB partition policy:    +policy=0|1 (default 0)
++    //   Forwarded to the wrapper input policy_partition_i.  It is only
++    //   observable in a wrapper elaborated with -GPolicyEnable=1 (python
++    //   --policy), which is also the only reason the obj directory is split.
+     std::string only;
+     std::string order = "vv";
+     std::string couple_depth_str = "3";
++    std::string v_gap_str = "0";
++    std::string policy_str = "0";
+     bool overlap = false;
+     bool fullbuffer_permit = false;
+     for (int i = 1; i < argc; ++i) {
+         std::string a = argv[i];
+         const std::string skey = "+scenario=";
+         if (a.rfind(skey, 0) == 0) only = a.substr(skey.size());
+         const std::string okey = "+order=";
+         if (a.rfind(okey, 0) == 0) order = a.substr(okey.size());
+         const std::string ckey = "+couple-depth=";
+         if (a.rfind(ckey, 0) == 0) couple_depth_str = a.substr(ckey.size());
++        const std::string gkey = "+v-gap-cycles=";
++        if (a.rfind(gkey, 0) == 0) v_gap_str = a.substr(gkey.size());
++        const std::string pkey = "+policy=";
++        if (a.rfind(pkey, 0) == 0) policy_str = a.substr(pkey.size());
+         if (a == "--overlap") overlap = true;
+         if (a == "--fullbuffer-permit") fullbuffer_permit = true;
+     }
+@@ -1274,6 +1322,25 @@
+     else {
+         std::fprintf(stderr, "nonblock_coupled_test: invalid +couple-depth='%s' "
+                              "(expected exactly 3 or 512)\n", couple_depth_str.c_str());
+         return 2;
+     }
++    // Strict gap/knob validation, same style as the depth check: exactly the
++    // known values, never a free-form integer.
++    uint32_t v_gap_cycles = 0;
++    if (v_gap_str == "0")         v_gap_cycles = 0;
++    else if (v_gap_str == "1000") v_gap_cycles = 1000;
++    else if (v_gap_str == "4000") v_gap_cycles = 4000;
++    else {
++        std::fprintf(stderr, "nonblock_coupled_test: invalid +v-gap-cycles='%s' "
++                             "(expected exactly 0, 1000 or 4000)\n", v_gap_str.c_str());
++        return 2;
++    }
++    bool policy_partition = false;
++    if (policy_str == "0")      policy_partition = false;
++    else if (policy_str == "1") policy_partition = true;
++    else {
++        std::fprintf(stderr, "nonblock_coupled_test: invalid +policy='%s' "
++                             "(expected exactly 0 or 1)\n", policy_str.c_str());
++        return 2;
++    }
+     int order_ar = 0, order_aw = 0;   // 0 = V first, 1 = A first
+@@ -1299,6 +1366,10 @@
+     std::printf("nonblock_coupled_test: fullbuffer_permit=%d\n",
+                 (int)fullbuffer_permit);
++    std::printf("nonblock_coupled_test: v_gap_cycles=%u\n", v_gap_cycles);
++    std::printf("nonblock_coupled_test: policy_partition=%d "
++                "(wrapper PolicyEnable is an elaboration flag; see --policy)\n",
++                (int)policy_partition);
+ 
+     int ran = 0, failed = 0;
+@@ -1306,9 +1377,11 @@
+         try {
+             Tb tb;
+             tb.order_ar_prefer = order_ar;
+             tb.order_aw_prefer = order_aw;
+             tb.rr_order        = order_rr;
+             tb.overlap_mode    = overlap;
+             tb.couple_depth    = couple_depth;
+             tb.fullbuffer_permit = fullbuffer_permit;
++            tb.v_gap_cycles      = v_gap_cycles;
++            tb.policy_partition  = policy_partition;
+             tb.run_scenario(s.name, s.en, s.a, s.lat);

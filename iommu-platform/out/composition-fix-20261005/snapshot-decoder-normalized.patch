@@ -1,0 +1,182 @@
+--- out/composition-fix-20261005/snapshot-decoder-proposal.py
++++ scripts/decode_hang_snapshot.py
+@@ -12,9 +12,15 @@
+   * every decoded bus value is re-derived from the raw 136-byte frame
+     ("rawframehex"), never from the reader's own convenience fields
+     ("header", "payload_words", "payload_hex");
+-  * exit status is 0 only while every sample is trusted: raw frame length/hex
+-    OK, magic/version/valid/marker OK, reqtoggle == acksync, header and
+-    payload_words agree with rawframehex, and the reader reported no errors.
++  * exit status is 0 only while every sample is trusted and the JTAG source is
++    verified: raw frame length/hex OK, magic/version/valid OK, ready (bit 41,
++    1 only while ack == request) OK, reqtoggle == acksync, header and
++    payload_words agree with rawframehex, the reader reported no errors, and
++    idcode[27:0] == 0x03651093 with 'idcode_masked_match' strictly true;
++  * a document with no samples, or with a non-empty top-level 'errors', or
++    whose JTAG source cannot be re-verified, yields no trusted sample: every
++    sample is marked untrusted, cross-sample deltas are suppressed and the
++    exit status is non-zero.
+ 
+ Bit-layout authority (RTL, not the reader's fields):
+   * cva6/corev_apu/fpga/src/hang_snapshot.sv:53-62
+@@ -47,6 +53,11 @@
+ CYCLE_MOD = 1 << 32
+ COUNTER_MOD = 1 << 16
+ 
++# JTAG source identity, re-derived from the raw 'idcode' value; the reader's
++# 'idcode_masked_match' field alone is not accepted as proof of the source.
++IDCODE_LOW28_MASK = 0x0FFFFFFF
++IDCODE_LOW28_EXPECTED = 0x03651093
++
+ AXI_RESP_NAMES = {0: "OKAY", 1: "EXOKAY", 2: "SLVERR", 3: "DECERR"}
+ 
+ HEADER_FIELDS = ("raw", "magic", "version", "valid", "ready",
+@@ -62,7 +73,7 @@
+ # rv_iommu_nonblock_hit.diag_o (rv_iommu_tl_wrap.sv:307-308,
+ # rv_iommu_nonblock_hit.sv:114-132).
+ NONBLOCK_DIAG_BITS = [
+-    "tl_wrap: state==PT && e3_ptw_active && en_1S_q && !en_2S_q (TL wrapper override; subset of n_window)",
++    "tl_wrap: state==PT && e3_ptw_active && en_1S_q && !en_2S_q (TL wrapper override; has fewer conditions than the n_window term)",
+     "nonblock_hit: window_i",
+     "nonblock_hit: window_i && candidate_valid_i",
+     "nonblock_hit: start",
+@@ -204,9 +215,10 @@
+         "sequence": _bits(header_int, 44, 20),
+         "layout_note": (
+             "bits[31:0]=magic, [39:32]=8'd1 (version), [40]=valid_q, "
+-            "[41]=constant 1'b1 (the reader labels it 'ready'), [42]=request_q, "
++            "[41]=1 only while acknowledge_sync_q == request_q at capture, "
++            "else 0 (the reader labels it 'ready'), [42]=request_q, "
+             "[43]=acknowledge_sync_q, [63:44]=sequence "
+-            "(hang_snapshot.sv:58-59)"
++            "(hang_snapshot.sv:56-62)"
+         ),
+     }
+ 
+@@ -243,9 +255,9 @@
+             "diag bit 0 is produced by the TL wrapper (rv_iommu_tl_wrap.sv:307-308), "
+             "bits 1..15 come from rv_iommu_nonblock_hit.diag_o "
+             "(rv_iommu_nonblock_hit.sv:114-132)",
+-            "diag bit 0 is a subset of the TL-wrapper n_window term: it omits the "
+-            "bank/implicit-translation/debug/invalidate exclusions of "
+-            "rv_iommu_tl_wrap.sv:303-306",
++            "diag bit 0 has fewer conditions than the TL-wrapper n_window term "
++            "(rv_iommu_tl_wrap.sv:303-308): n_window applies additional "
++            "conditions that bit 0 does not",
+         ],
+     }
+ 
+@@ -416,12 +428,12 @@
+ # ---------------------------------------------------------------------------
+ # Sample-level decode
+ # ---------------------------------------------------------------------------
+-
+-def decode_sample(raw_sample, fallback_index):
++def decode_sample(raw_sample, fallback_index, source_errors=()):
+     out = {
+         "index": fallback_index,
+         "input_timestamp": None,
+         "input_timestamp_iso": None,
++        "source_errors": [str(x) for x in source_errors],
+         "trusted": False,
+         "decoder_frame_checks_ok": False,
+         "errors": [],
+@@ -506,7 +518,9 @@
+     if not header["valid"]:
+         out["errors"].append("valid bit is 0: the frame holds no acknowledged sample")
+     if not header["ready"]:
+-        out["errors"].append("marker bit (bit 41, labelled 'ready' by the reader) is 0")
++        out["errors"].append(
++            "ready bit (bit 41) is 0: bit 41 is 1 only while ack == request at "
++            "capture (hang_snapshot.sv:57-62), so no acknowledged frame was captured")
+     if header["reqtoggle"] != header["acksync"]:
+         out["errors"].append("reqtoggle %d != acksync %d"
+                              % (header["reqtoggle"], header["acksync"]))
+@@ -523,8 +537,32 @@
+     out["blocked_flags"] = collect_blocked_flags(out["axi_records"])
+ 
+     out["decoder_frame_checks_ok"] = not out["errors"]
+-    out["trusted"] = out["decoder_frame_checks_ok"] and not out["input_validation_errors"]
++    out["trusted"] = (out["decoder_frame_checks_ok"]
++                      and not out["input_validation_errors"]
++                      and not out["source_errors"])
+     return out
++
++
++def input_source_errors(doc, input_errors):
++    """Reasons that make every sample in this document unusable as evidence.
++
++    The reader's own 'errors' are carried over verbatim. The JTAG source is
++    re-derived from the raw 'idcode' value, and the reader's
++    'idcode_masked_match' field must additionally be strictly True.
++    """
++    reasons = [str(e) for e in input_errors]
++    idcode = _int_like(doc.get("idcode"))
++    if idcode is None:
++        reasons.append("input 'idcode' is missing or not integer-like: %r"
++                       % (doc.get("idcode"),))
++    elif (idcode & IDCODE_LOW28_MASK) != IDCODE_LOW28_EXPECTED:
++        reasons.append(
++            "input 'idcode' low 28 bits are 0x%07X, expected 0x%07X"
++            % (idcode & IDCODE_LOW28_MASK, IDCODE_LOW28_EXPECTED))
++    if doc.get("idcode_masked_match") is not True:
++        reasons.append("input 'idcode_masked_match' is not strictly true: %r"
++                       % (doc.get("idcode_masked_match"),))
++    return reasons
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -604,7 +642,8 @@
+     json.dump(result, sys.stdout, indent=2)
+     sys.stdout.write("\n")
+     if code != 0:
+-        lines = list(result.get("input_errors", [])) + list(result.get("decoder_errors", []))
++        lines = (list(result.get("decoder_errors", []))
++                 + list(result.get("source_errors", [])))
+         for s in result.get("samples", []):
+             if not s.get("trusted"):
+                 lines.extend("sample %s: %s" % (s.get("index"), e) for e in s.get("errors", []))
+@@ -630,6 +669,7 @@
+         "schema": "hang_snapshot_decode/v1",
+         "input_file": args.input_json,
+         "input_errors": [],
++        "source_errors": [],
+         "input_metadata": {},
+         "decoder_errors": [],
+         "samples_decoded": 0,
+@@ -677,6 +717,7 @@
+         ("host", "port", "idcode_only", "advertised_bytes", "max_bits",
+          "actual_period_ns", "idcode", "idcode_masked_match")
+     }
++    result["source_errors"] = input_source_errors(doc, result["input_errors"])
+ 
+     samples_in = doc.get("samples")
+     if samples_in is None:
+@@ -686,19 +727,24 @@
+         result["decoder_errors"].append("'samples' is not a list")
+         samples_in = []
+ 
+-    result["samples"] = [decode_sample(raw, i) for i, raw in enumerate(samples_in)]
++    result["samples"] = [decode_sample(raw, i, result["source_errors"])
++                         for i, raw in enumerate(samples_in)]
+     result["samples_decoded"] = len(result["samples"])
+     if not result["samples"]:
+-        result["warnings"].append(
++        no_bus_evidence = (
+             "input contains no samples (e.g. the reader ran with --idcode-only): "
+             "there is no bus evidence to decode")
++        result["warnings"].append(no_bus_evidence)
++        result["decoder_errors"].append(no_bus_evidence)
+ 
+     result["cross_sample"] = build_cross_sample(result["samples"])
+ 
+     untrusted = [s["index"] for s in result["samples"] if not s.get("trusted")]
+     result["untrusted_sample_indices"] = untrusted
+-    result["all_samples_trusted"] = (not untrusted
++    result["all_samples_trusted"] = (bool(result["samples"])
++                                     and not untrusted
+                                      and not result["input_errors"]
++                                     and not result["source_errors"]
+                                      and not result["decoder_errors"])
+     code = 0 if result["all_samples_trusted"] else 1
+     result["exit_status"] = code

@@ -1,0 +1,1828 @@
+// SPDX-License-Identifier: Solderpad-0.51
+//
+// Passive research observer for the 2026-10-02 experiment contract.
+// Read-only taps only: no output of this module drives DMA, the IOTLB, the
+// translation logic, the command queue or any interrupt.
+//
+// MODE (cfg 0x0004): 0 none, 1 E2 entry-lifecycle, 2 COST natural cost.
+//   MODE_E2 and MODE_COST are mutually exclusive and are accepted only while
+//   the observer is drained (E2 phase IDLE and no COST session active).
+// E2 PHASE (cfg 0x0006): 0 IDLE, 1 ARM_WARM, 2 ARM_A, 3 PROBE, 4 FREEZE,
+//   5 ABORT, 6 READY.  ARM_A -> READY is autonomous at exactly T_CYCLES
+//   after the ARM_A acceptance edge; software then issues PROBE explicitly.
+// COST sessions run from p4m_arm to p4m_close; the (open, close] window
+//   excludes the opening edge and includes the closing edge.
+// COST_ERR[7] = response_error_i while active; COST_ERR[8] = aborted by ABORT;
+// COST_ERR[9] = supported_i low while active.
+//
+// Raw IOTLB entry (raw128, both words): gscid at bits [79:64], vpn[28:0] at 0,
+// pscid at [48:29], en1 at 49, en2 at 50, valid at 51, S1 is1G/is2M at 52/53,
+// S2 is1G/is2M at 54/55, S1 global at 56, bits [63:57] and [127:80] zero.
+module dma_research_observer #(
+    parameter int unsigned ResearchRole = 0,
+    parameter int unsigned CounterWidth = 64,
+    parameter int unsigned NumEntries   = 16,
+    parameter int unsigned EventDepth   = 256,
+    parameter int unsigned SampleDepth  = 256,
+    parameter int unsigned T_CYCLES     = 5000000
+) (
+    input  logic          clk_i,
+    input  logic          rst_ni,
+
+    input  logic          cfg_valid_i,
+    input  logic          cfg_write_i,
+    input  logic [12:0]   index_i,
+    input  logic [63:0]   wdata_i,
+    output logic [63:0]   rdata_o,
+
+    input  logic          quiet_i,
+    input  logic          supported_i,
+
+    input  logic [127:0]  entries_i      [NumEntries],
+    input  logic [127:0]  entries_next_i [NumEntries],
+    input  logic [31:0]   plru_i,
+    input  logic          update_i,
+    input  logic          invalidate_i,
+    input  logic [15:0]   replace_mask_i,
+    input  logic [23:0]   update_did_i,
+
+    input  logic          lookup_i,
+    input  logic          lookup_hit_i,
+    input  logic [23:0]   lookup_did_i,
+    input  logic [63:0]   lookup_iova_i,
+    input  logic [19:0]   lookup_pscid_i,
+    input  logic [15:0]   lookup_gscid_i,
+    input  logic          lookup_stage1_i,
+    input  logic          lookup_stage2_i,
+
+    input  logic [2:0]    ctl_state_i,
+    input  logic [23:0]   ctl_did_i,
+    input  logic          select_fire_i,
+    input  logic [23:0]   select_did_i,
+    input  logic          response_error_i,
+
+    input  logic [1:0]    issue_i,
+    input  logic [1:0]    done_i,
+    input  logic [63:0]   issue_id_i [2],
+    input  logic [63:0]   done_id_i  [2],
+
+    input  logic          p4m_arm_i,
+    input  logic          p4m_open_i,
+    input  logic          p4m_close_i,
+    output logic          reverse_order_o
+);
+
+    // ------------------------------------------------------------------ consts
+    localparam logic [2:0] ST_IDLE       = 3'd0;
+    localparam logic [2:0] ST_REQ_TRANS  = 3'd1;
+    localparam logic [2:0] ST_AWAIT_RESP = 3'd2;
+    localparam logic [2:0] ST_MRIF       = 3'd3;
+    localparam logic [2:0] ST_COMPLETE   = 3'd4;
+
+    localparam logic [2:0] E2_IDLE     = 3'd0;
+    localparam logic [2:0] E2_ARM_WARM = 3'd1;
+    localparam logic [2:0] E2_ARM_A    = 3'd2;
+    localparam logic [2:0] E2_PROBE    = 3'd3;
+    localparam logic [2:0] E2_FREEZE   = 3'd4;
+    localparam logic [2:0] E2_ABORT    = 3'd5;
+    localparam logic [2:0] E2_READY    = 3'd6;
+
+    localparam logic [1:0] MODE_NONE = 2'd0;
+    localparam logic [1:0] MODE_E2   = 2'd1;
+    localparam logic [1:0] MODE_COST = 2'd2;
+
+    localparam logic [23:0] DID_V = 24'd10;
+    localparam logic [23:0] DID_A = 24'd11;
+
+    localparam logic [63:0] RESEARCH_MAGIC0 = 64'h49444d4152455331;
+    localparam logic [63:0] RESEARCH_MAGIC1 = 64'h49444d414f425308;
+    localparam logic [63:0] COST_MAGIC      = 64'h49444d4152454331;
+    localparam logic [63:0] AGG_MAGIC       = 64'h49444d4141474731;
+
+    // ---------------------------------------------------------------- helpers
+    // Context of the current normal first lookup, in raw128 layout.
+    function automatic logic [127:0] ctx_key_128;
+        logic [127:0] k;
+        k        = '0;
+        k[28:0]  = lookup_iova_i[40:12];
+        k[48:29] = lookup_pscid_i;
+        k[49]    = lookup_stage1_i;
+        k[50]    = lookup_stage2_i;
+        k[51]    = 1'b1;
+        k[79:64] = lookup_gscid_i;
+        return k;
+    endfunction
+
+    // Identity match: vpn, pscid, gscid, stage enables only.
+    function automatic logic id_match(input logic [127:0] e, input logic [127:0] k);
+        return (e[79:64] == k[79:64]) &&
+               (e[48:29] == k[48:29]) &&
+               (e[28:0]  == k[28:0 ]) &&
+               (e[49]    == k[49]   ) &&
+               (e[50]    == k[50]   );
+    endfunction
+
+    // Ordinary target entry: valid, S1 only, 4K, not global.
+    function automatic logic ordinary4k(input logic [127:0] e);
+        return e[51] && e[49] && !e[50] &&
+               !e[52] && !e[53] && !e[54] && !e[55] && !e[56];
+    endfunction
+
+    function automatic logic page_match(input logic [63:0] a, input logic [63:0] b);
+        return a[63:12] == b[63:12];
+    endfunction
+
+    // lane index of a DID: 0 = V/DID10, 1 = A/DID11, 2 = unknown.
+    function automatic logic [1:0] lane_of(input logic [23:0] did);
+        return (did == DID_A) ? 2'd1 : (did == DID_V) ? 2'd0 : 2'd2;
+    endfunction
+
+    // ------------------------------------------------------------- registers
+    // shared configuration
+    logic [1:0]  mode_q;
+    logic [3:0]  cmd_q;
+
+    // E2
+    logic [2:0]  e2_phase_q;
+    logic reverse_order_q;
+    logic [63:0] epoch_q, a_elapsed_q, astart_q, deadline_q, probestart_q, freeze_ts_q;
+    logic [15:0] event_count_q;
+    logic [31:0] inval_count_q, update_count_q, quiet_timeout_q;
+    logic        e2_ovf_q;
+    logic [15:0] e2_err_q;
+    logic [127:0] target_key_q [2];
+    logic [1:0]  target_valid_q;
+    logic [127:0] target_ctx_q [2];
+    logic [1:0]  target_ctx_valid_q;
+    logic [63:0] fp_time_q [2];
+    logic        fp_hit_q [2];
+    logic [15:0] fp_live_self_q [2];
+    logic [15:0] fp_live_oth_q [2];
+    logic [127:0] fp_key_q [2];
+    logic [1:0]  fp_done_q;
+    logic [2:0]  snapshot_valid_q;
+    logic [31:0] plru_snap_q [3];
+    // All snapshot words latch simultaneously: registers, not multiport RAM.
+    logic [31:0][63:0] snap_warm_q;
+    logic [31:0][63:0] snap_deadline_q;
+    logic [31:0][63:0] snap_freeze_q;
+    // One complete record per write port; the external word ABI is unchanged.
+    (* ram_style = "distributed" *) logic [383:0] event_ram_q [EventDepth];
+    logic [31:0] e2a_issue_cnt_q, e2a_done_cnt_q;
+    logic [63:0] e2a_first_q, e2a_last_q;
+    logic        e2a_first_seen_q;
+    logic [63:0] src_iova_q, dst_iova_q;
+    logic        src_set_q, dst_set_q;
+
+    // lanes (shared between modes; modes are mutually exclusive)
+    logic [1:0]  lane_active_q;
+    logic [63:0] lane_id_q [2];
+    logic [1:0]  lane_in_window_q;
+
+    // COST
+    logic        cost_active_q;
+    logic [15:0] cost_err_q;
+    logic [CounterWidth-1:0] cost_cycles_q;
+    logic [CounterWidth-1:0] cost_main_q   [2];
+    logic [CounterWidth-1:0] cost_comp_q   [2];
+    logic [CounterWidth-1:0] cost_sel_q    [2];
+    logic [CounterWidth-1:0] cost_hit_q    [2];
+    logic [CounterWidth-1:0] cost_miss_q   [2];
+    logic [CounterWidth-1:0] cost_issue_q  [2];
+    logic [CounterWidth-1:0] cost_done_q   [2];
+    logic [CounterWidth-1:0] cost_owner_err_q;
+    logic [CounterWidth-1:0] cost_a_done_all_q;
+    logic        window_open_q, window_closed_q;
+    logic [CounterWidth-1:0] win_cycles_q;
+    logic [CounterWidth-1:0] win_main_q [2];
+    logic [CounterWidth-1:0] win_comp_q [2];
+    logic [CounterWidth-1:0] win_sel_q  [2];
+    logic [CounterWidth-1:0] win_hit_q  [2];
+    logic [CounterWidth-1:0] win_miss_q [2];
+    logic        carry_in_q, carry_out_q;
+    logic [CounterWidth-1:0] eligible_q;
+    logic [15:0] sample_count_q;
+    logic        sample_ovf_q;
+    logic [31:0] cur_a_main_q, cur_a_req_q, cur_a_miss_q, cur_a_comp_q, cur_a_dur_q, cur_a_flags_q;
+    logic [31:0] cur_v_main_q, cur_v_comp_q;
+    (* ram_style = "distributed" *) logic [255:0] sample_ram_q [SampleDepth];
+
+    // next-state (declared once; do not declare *_RAM_n because RAMs are FF-only)
+    logic [1:0]  mode_n;
+    logic [3:0]  cmd_n;
+    logic [2:0]  e2_phase_n;
+    logic [63:0] epoch_n, a_elapsed_n, astart_n, deadline_n, probestart_n, freeze_ts_n;
+    logic [15:0] event_count_n;
+    logic [31:0] inval_count_n, update_count_n, quiet_timeout_n;
+    logic        e2_ovf_n;
+    logic [15:0] e2_err_n;
+    logic [127:0] target_key_n [2];
+    logic [1:0]  target_valid_n;
+    logic [127:0] target_ctx_n [2];
+    logic [1:0]  target_ctx_valid_n;
+    logic [63:0] fp_time_n [2];
+    logic        fp_hit_n [2];
+    logic [15:0] fp_live_self_n [2];
+    logic [15:0] fp_live_oth_n [2];
+    logic [127:0] fp_key_n [2];
+    logic [1:0]  fp_done_n;
+    logic [2:0]  snapshot_valid_n;
+    logic [31:0] plru_snap_n [3];
+    logic [31:0] e2a_issue_cnt_n, e2a_done_cnt_n;
+    logic [63:0] e2a_first_n, e2a_last_n;
+    logic        e2a_first_seen_n;
+    logic [63:0] src_iova_n, dst_iova_n;
+    logic        src_set_n, dst_set_n;
+    logic [1:0]  lane_active_n;
+    logic [63:0] lane_id_n [2];
+    logic [1:0]  lane_in_window_n;
+    logic        cost_active_n;
+    logic [15:0] cost_err_n;
+    logic [CounterWidth-1:0] cost_cycles_n;
+    logic [CounterWidth-1:0] cost_main_n [2];
+    logic [CounterWidth-1:0] cost_comp_n [2];
+    logic [CounterWidth-1:0] cost_sel_n [2];
+    logic [CounterWidth-1:0] cost_hit_n [2];
+    logic [CounterWidth-1:0] cost_miss_n [2];
+    logic [CounterWidth-1:0] cost_issue_n [2];
+    logic [CounterWidth-1:0] cost_done_n [2];
+    logic [CounterWidth-1:0] cost_owner_err_n;
+    logic [CounterWidth-1:0] cost_a_done_all_n;
+    logic        window_open_n, window_closed_n;
+    logic [CounterWidth-1:0] win_cycles_n;
+    logic [CounterWidth-1:0] win_main_n [2];
+    logic [CounterWidth-1:0] win_comp_n [2];
+    logic [CounterWidth-1:0] win_sel_n [2];
+    logic [CounterWidth-1:0] win_hit_n [2];
+    logic [CounterWidth-1:0] win_miss_n [2];
+    logic        carry_in_n, carry_out_n;
+    logic [CounterWidth-1:0] eligible_n;
+    logic [15:0] sample_count_n;
+    logic        sample_ovf_n;
+    logic [31:0] cur_a_main_n, cur_a_req_n, cur_a_miss_n, cur_a_comp_n, cur_a_dur_n, cur_a_flags_n;
+    logic [31:0] cur_v_main_n, cur_v_comp_n;
+
+    function automatic logic ctx_match(input logic [127:0] a, input logic [127:0] b);
+        return (a[48:29] == b[48:29]) && (a[79:64] == b[79:64]) &&
+               (a[49] == b[49]) && (a[50] == b[50]);
+    endfunction
+
+    logic ctx_ok_both;
+    assign ctx_ok_both = (target_ctx_valid_q == 2'b11) &&
+                         ctx_match(target_ctx_q[0], target_ctx_q[1]);
+
+    // ------------------------------------------------------ derived comb wires
+    logic [2:0] ph;
+    assign ph = e2_phase_q;
+    // The frontend latches order at batch creation. Frozen/legacy sessions
+    // must not leak a previous E2 reverse setting into an unrelated batch.
+    assign reverse_order_o = (ResearchRole != 0) && reverse_order_q &&
+        (((mode_q == MODE_E2) && (ph == E2_ARM_A)) ||
+         ((mode_q == MODE_COST) && cost_active_q));
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) reverse_order_q <= 1'b0;
+        else if (acc_clear) reverse_order_q <= 1'b0;
+        else if (cfg_valid_i && cfg_write_i && index_i == 13'h0F10 &&
+                 ResearchRole != 0 && quiet_i && ph == E2_IDLE &&
+                 !cost_active_q && wdata_i[63:1] == 0)
+            reverse_order_q <= wdata_i[0];
+    end
+
+    logic e2_active_phase;
+    assign e2_active_phase = (ph == E2_ARM_WARM) || (ph == E2_ARM_A) ||
+                             (ph == E2_READY) || (ph == E2_PROBE);
+
+    logic iova_cfg_valid;
+    assign iova_cfg_valid = src_set_q && dst_set_q;
+
+    logic cmd_wr, cmd_rsvd;
+    assign cmd_wr   = cfg_valid_i && cfg_write_i && (index_i == 13'h0005);
+    assign cmd_rsvd = (wdata_i[63:4] != 60'd0);
+
+    logic acc_warm, acc_a, acc_probe, acc_freeze, acc_abort, acc_clear;
+    assign acc_warm  = cmd_wr && !cmd_rsvd && (mode_q == MODE_E2) && (wdata_i[3:0] == 4'd1) &&
+                       (ph == E2_IDLE) && quiet_i && supported_i && iova_cfg_valid &&
+                       !update_i && !invalidate_i;
+    assign acc_a     = cmd_wr && !cmd_rsvd && (mode_q == MODE_E2) && (wdata_i[3:0] == 4'd2) &&
+                       (ph == E2_ARM_WARM) && quiet_i && supported_i &&
+                       (target_valid_q == 2'b11) && tgt_present0 && tgt_present1 &&
+                       !update_i && !invalidate_i && ctx_ok_both;
+    assign acc_probe = cmd_wr && !cmd_rsvd && (mode_q == MODE_E2) && (wdata_i[3:0] == 4'd3) &&
+                       (ph == E2_READY) && quiet_i && supported_i;
+    assign acc_freeze= cmd_wr && !cmd_rsvd && (mode_q == MODE_E2) && (wdata_i[3:0] == 4'd4) &&
+                       (ph == E2_PROBE) && quiet_i && supported_i &&
+                       (fp_done_q == 2'b11) && !update_i && !invalidate_i;
+    logic abort_cmd;
+    assign abort_cmd = cmd_wr && !cmd_rsvd && (wdata_i[3:0] == 4'd5);
+    assign acc_clear = cmd_wr && !cmd_rsvd && (wdata_i[3:0] == 4'd6) && quiet_i && !cost_active_q &&
+                       ( (mode_q == MODE_NONE) ||
+                         (mode_q == MODE_COST) ||
+                         ((mode_q == MODE_E2) && ((ph == E2_IDLE) || (ph == E2_FREEZE) || (ph == E2_ABORT))) );
+
+    logic lanes_en;
+    assign lanes_en = (mode_q == MODE_E2) ? e2_active_phase :
+                      ((mode_q == MODE_COST) && cost_active_q);
+
+    logic a_issue_ok, a_done_ok;
+    assign a_issue_ok = lanes_en && issue_i[1] && !lane_active_q[1];
+    assign a_done_ok  = lanes_en && done_i[1] && lane_active_q[1] && (done_id_i[1] == lane_id_q[1]);
+
+    logic lane_proto_err;
+    assign lane_proto_err = lanes_en &&
+        ( (issue_i[1] &&  lane_active_q[1]) ||
+          (done_i[1]  && !lane_active_q[1]) ||
+          (done_i[1]  &&  lane_active_q[1] && (done_id_i[1] != lane_id_q[1])) ||
+          (issue_i[0] &&  lane_active_q[0]) ||
+          (done_i[0]  && !lane_active_q[0]) ||
+          (done_i[0]  &&  lane_active_q[0] && (done_id_i[0] != lane_id_q[0])) );
+
+    logic win_act, main_cyc, comp_cyc;
+    assign win_act  = cost_active_q && window_open_q && !window_closed_q;
+    logic win_act_issue;
+    assign win_act_issue = cost_active_q && (window_open_q || p4m_open_i) &&
+                           !window_closed_q && !p4m_close_i;
+
+    // ------------------------------------------------- fullstats aggregator
+    // Read-only aggregation of complete A copies in the (open, close] window.
+    // No output of this helper drives control, ready, DMA or interrupts.
+    logic [63:0] agg_count_o [6];
+    logic [63:0] agg_sum_main_o [6];
+    logic [63:0] agg_sum_comp_o [6];
+    logic [63:0] agg_sum_dur_o [6];
+    logic [63:0] agg_sum_req_o [6];
+    logic [63:0] agg_sum_miss_o [6];
+    logic [31:0] agg_min_main_o [6];
+    logic [31:0] agg_max_main_o [6];
+    logic [31:0] agg_min_comp_o [6];
+    logic [31:0] agg_max_comp_o [6];
+    logic [31:0] agg_min_dur_o [6];
+    logic [31:0] agg_max_dur_o [6];
+    logic [63:0] agg_total_o;
+    logic [15:0] agg_err_o;
+    logic        agg_clear;
+
+    assign agg_clear = acc_clear ||
+                       (p4m_arm_i && (mode_q == MODE_COST) && quiet_i &&
+                        !cost_active_q && (e2_phase_q == E2_IDLE));
+
+    dma_research_cost_groups u_dma_research_cost_groups (
+        .clk_i      (clk_i),
+        .rst_ni     (rst_ni),
+        .clear_i    (agg_clear),
+        .commit_i   (win_act && a_done_ok && lane_in_window_q[1]),
+        .main_i     (cur_a_main_n),
+        .comp_i     (cur_a_comp_n),
+        .dur_i      (cur_a_dur_n),
+        .req_i      (cur_a_req_n),
+        .miss_i     (cur_a_miss_n),
+        .count_o    (agg_count_o),
+        .sum_main_o (agg_sum_main_o),
+        .sum_comp_o (agg_sum_comp_o),
+        .sum_dur_o  (agg_sum_dur_o),
+        .sum_req_o  (agg_sum_req_o),
+        .sum_miss_o (agg_sum_miss_o),
+        .min_main_o (agg_min_main_o),
+        .max_main_o (agg_max_main_o),
+        .min_comp_o (agg_min_comp_o),
+        .max_comp_o (agg_max_comp_o),
+        .min_dur_o  (agg_min_dur_o),
+        .max_dur_o  (agg_max_dur_o),
+        .total_o    (agg_total_o),
+        .err_o      (agg_err_o)
+    );
+    // ------------------------------------------------- E2 probe timing block
+    // Passive only: all outputs feed the read mux.  Legal PROBE/CLEAR pulses
+    // come from the observer acceptance decode above; V lane is DID10.
+    logic [15:0] e2t_error;
+    logic [63:0] e2t_flags, e2t_issue_epoch, e2t_first_select_epoch, e2t_done_epoch;
+    logic [63:0] e2t_done_issue_cycles, e2t_first_select_issue_cycles;
+    logic [63:0] e2t_v_main, e2t_v_comp, e2t_v_select, e2t_v_hit, e2t_v_miss;
+
+    dma_research_e2_timing u_dma_research_e2_timing (
+        .clk_i                     (clk_i),
+        .rst_ni                    (rst_ni),
+        .clear_i                   (acc_clear),
+        .probe_accept_i            (acc_probe),
+        .phase_i                   (ph),
+        .epoch_i                   (epoch_q),
+        .issue_v_i                 (issue_i[0]),
+        .done_v_i                  (done_i[0]),
+        .select_v_i                (select_fire_i && (select_did_i == DID_V)),
+        .ctl_v_i                   (ctl_did_i == DID_V),
+        .ctl_state_i               (ctl_state_i),
+        .lookup_v_i                (lookup_i && (lookup_did_i == DID_V)),
+        .lookup_hit_i              (lookup_hit_i),
+        .response_error_i          (response_error_i),
+        .unsupported_i             (!supported_i),
+        .error_o                   (e2t_error),
+        .flags_o                   (e2t_flags),
+        .issue_epoch_o             (e2t_issue_epoch),
+        .first_select_epoch_o      (e2t_first_select_epoch),
+        .done_epoch_o              (e2t_done_epoch),
+        .done_issue_cycles_o       (e2t_done_issue_cycles),
+        .first_select_issue_cycles_o(e2t_first_select_issue_cycles),
+        .v_main_cycles_o           (e2t_v_main),
+        .v_comp_cycles_o           (e2t_v_comp),
+        .v_select_count_o          (e2t_v_select),
+        .v_hit_count_o             (e2t_v_hit),
+        .v_miss_count_o            (e2t_v_miss)
+    );
+
+    assign main_cyc = (ctl_state_i == ST_REQ_TRANS) || (ctl_state_i == ST_AWAIT_RESP);
+    assign comp_cyc = (ctl_state_i == ST_COMPLETE);
+
+    logic [1:0] main_lane, sel_lane, lu_lane;
+    logic       main_known, sel_known, lu_known;
+    assign main_lane = (ctl_did_i == DID_A) ? 2'd1 : 2'd0;
+    assign main_known= (ctl_did_i == DID_V) || (ctl_did_i == DID_A);
+    assign sel_lane  = (select_did_i == DID_A) ? 2'd1 : 2'd0;
+    assign sel_known = (select_did_i == DID_V) || (select_did_i == DID_A);
+    assign lu_lane   = (lookup_did_i == DID_A) ? 2'd1 : 2'd0;
+    assign lu_known  = (lookup_did_i == DID_V) || (lookup_did_i == DID_A);
+
+    // --------------------------------------------------------- search results
+    logic [15:0]  changed_mask;
+    logic [4:0]   changed_count;
+    logic [3:0]   changed_index;
+    logic         slot_oh_valid;
+    logic [3:0]   slot_idx;
+    logic [15:0]  tgt_live0, tgt_live1;
+    logic         tgt_present0, tgt_present1;
+    logic         cap_found, cap_bad_geom;
+    logic [127:0] cap_key;
+
+    always_comb begin
+        changed_mask  = 16'd0;
+        for (int unsigned i = 0; i < NumEntries; i++) begin
+            if (entries_i[i] != entries_next_i[i]) changed_mask[i] = 1'b1;
+        end
+        changed_count = 5'd0;
+        changed_index = 4'd0;
+        for (int unsigned i = 0; i < NumEntries; i++) begin
+            if (changed_mask[i]) begin
+                changed_count = changed_count + 5'd1;
+                changed_index = i[3:0];
+            end
+        end
+
+        slot_oh_valid = (replace_mask_i != 16'd0) &&
+                        ((replace_mask_i & (replace_mask_i - 16'd1)) == 16'd0);
+        slot_idx = 4'd0;
+        for (int unsigned i = 0; i < NumEntries; i++) begin
+            if (replace_mask_i[i]) slot_idx = i[3:0];
+        end
+
+        tgt_live0    = 16'd0;
+        tgt_live1    = 16'd0;
+        tgt_present0 = 1'b0;
+        tgt_present1 = 1'b0;
+        for (int unsigned i = 0; i < NumEntries; i++) begin
+            if (target_valid_q[0] && id_match(entries_i[i], target_key_q[0])) begin
+                tgt_live0[i] = entries_i[i][51];
+                if (ordinary4k(entries_i[i])) tgt_present0 = 1'b1;
+            end
+            if (target_valid_q[1] && id_match(entries_i[i], target_key_q[1])) begin
+                tgt_live1[i] = entries_i[i][51];
+                if (ordinary4k(entries_i[i])) tgt_present1 = 1'b1;
+            end
+        end
+
+        cap_found    = 1'b0;
+        cap_bad_geom = 1'b0;
+        cap_key      = '0;
+        if (lookup_i) begin
+            for (int unsigned i = 0; i < NumEntries; i++) begin
+                if (entries_i[i][51] && id_match(entries_i[i], ctx_key_128())) begin
+                    if (ordinary4k(entries_i[i])) begin
+                        if (!cap_found) begin
+                            cap_found = 1'b1;
+                            cap_key   = entries_i[i];
+                        end
+                    end else begin
+                        cap_bad_geom = 1'b1;
+                    end
+                end
+            end
+        end
+    end
+
+    // event meta (exact layout, see register map)
+    logic [63:0] evt_meta;
+    always_comb begin
+        evt_meta        = 64'd0;
+        evt_meta[15:0]  = replace_mask_i;
+        evt_meta[20:16] = {1'b0, changed_index};
+        evt_meta[23:21] = e2_phase_q;
+        evt_meta[47:24] = update_did_i;
+        evt_meta[48]    = 1'b1;
+        evt_meta[49]    = (changed_count == 5'd0);
+        evt_meta[50]    = (changed_count > 5'd1);
+        evt_meta[51]    = (changed_count == 5'd1) && (changed_mask != replace_mask_i);
+        evt_meta[52]    = target_valid_q[0] && entries_i[slot_idx][51] &&
+                          id_match(entries_i[slot_idx], target_key_q[0]) &&
+                          ( !entries_next_i[slot_idx][51] ||
+                            !id_match(entries_next_i[slot_idx], target_key_q[0]) );
+        evt_meta[53]    = target_valid_q[1] && entries_i[slot_idx][51] &&
+                          id_match(entries_i[slot_idx], target_key_q[1]) &&
+                          ( !entries_next_i[slot_idx][51] ||
+                            !id_match(entries_next_i[slot_idx], target_key_q[1]) );
+        evt_meta[54]    = !slot_oh_valid;
+    end
+
+    logic evt_push, sample_push;
+    assign evt_push = ((ph == E2_ARM_WARM) || (ph == E2_ARM_A) || (ph == E2_PROBE)) &&
+                      update_i && slot_oh_valid && (event_count_q < EventDepth);
+    assign sample_push = win_act && a_done_ok && lane_in_window_q[1] &&
+                         (eligible_q[3:0] == 4'hF) && (sample_count_q < SampleDepth);
+
+    logic [15:0] evt_base, smp_base;
+    assign evt_base = event_count_q  * 16'd6;
+    assign smp_base = sample_count_q * 16'd4;
+
+    // --------------------------------------------------------- next state
+    always_comb begin
+        // defaults
+        e2_phase_n       = e2_phase_q;
+        epoch_n          = epoch_q;
+        a_elapsed_n      = a_elapsed_q;
+        astart_n         = astart_q;
+        deadline_n       = deadline_q;
+        probestart_n     = probestart_q;
+        freeze_ts_n      = freeze_ts_q;
+        event_count_n    = event_count_q;
+        inval_count_n    = inval_count_q;
+        update_count_n   = update_count_q;
+        quiet_timeout_n  = quiet_timeout_q;
+        e2_ovf_n         = e2_ovf_q;
+        e2_err_n         = e2_err_q;
+        target_valid_n   = target_valid_q;
+        target_ctx_valid_n = target_ctx_valid_q;
+        fp_done_n        = fp_done_q;
+        snapshot_valid_n = snapshot_valid_q;
+        e2a_issue_cnt_n  = e2a_issue_cnt_q;
+        e2a_done_cnt_n   = e2a_done_cnt_q;
+        e2a_first_n      = e2a_first_q;
+        e2a_last_n       = e2a_last_q;
+        e2a_first_seen_n = e2a_first_seen_q;
+        src_iova_n       = src_iova_q;
+        dst_iova_n       = dst_iova_q;
+        src_set_n        = src_set_q;
+        dst_set_n        = dst_set_q;
+        for (int i = 0; i < 2; i++) begin
+            target_key_n[i]   = target_key_q[i];
+            target_ctx_n[i]   = target_ctx_q[i];
+            fp_time_n[i]      = fp_time_q[i];
+            fp_hit_n[i]       = fp_hit_q[i];
+            fp_live_self_n[i] = fp_live_self_q[i];
+            fp_live_oth_n[i]  = fp_live_oth_q[i];
+            fp_key_n[i]       = fp_key_q[i];
+        end
+        for (int i = 0; i < 3; i++) plru_snap_n[i] = plru_snap_q[i];
+
+        mode_n            = mode_q;
+        cmd_n             = cmd_q;
+        cost_active_n     = cost_active_q;
+        cost_err_n        = cost_err_q;
+        cost_cycles_n     = cost_cycles_q;
+        cost_owner_err_n  = cost_owner_err_q;
+        cost_a_done_all_n = cost_a_done_all_q;
+        window_open_n     = window_open_q;
+        window_closed_n   = window_closed_q;
+        win_cycles_n      = win_cycles_q;
+        carry_in_n        = carry_in_q;
+        carry_out_n       = carry_out_q;
+        eligible_n        = eligible_q;
+        sample_count_n    = sample_count_q;
+        sample_ovf_n      = sample_ovf_q;
+        cur_a_main_n      = cur_a_main_q;
+        cur_a_req_n       = cur_a_req_q;
+        cur_a_miss_n      = cur_a_miss_q;
+        cur_a_comp_n      = cur_a_comp_q;
+        cur_a_dur_n       = cur_a_dur_q;
+        cur_a_flags_n     = cur_a_flags_q;
+        cur_v_main_n      = cur_v_main_q;
+        cur_v_comp_n      = cur_v_comp_q;
+        for (int i = 0; i < 2; i++) begin
+            lane_active_n[i]    = lane_active_q[i];
+            lane_id_n[i]        = lane_id_q[i];
+            lane_in_window_n[i] = lane_in_window_q[i];
+            cost_main_n[i]      = cost_main_q[i];
+            cost_comp_n[i]      = cost_comp_q[i];
+            cost_sel_n[i]       = cost_sel_q[i];
+            cost_hit_n[i]       = cost_hit_q[i];
+            cost_miss_n[i]      = cost_miss_q[i];
+            cost_issue_n[i]     = cost_issue_q[i];
+            cost_done_n[i]      = cost_done_q[i];
+            win_main_n[i]       = win_main_q[i];
+            win_comp_n[i]       = win_comp_q[i];
+            win_sel_n[i]        = win_sel_q[i];
+            win_hit_n[i]        = win_hit_q[i];
+            win_miss_n[i]       = win_miss_q[i];
+        end
+
+        // ------------------------------------------------- E2 epoch / deadline
+        if ((ph == E2_ARM_WARM) || (ph == E2_ARM_A) || (ph == E2_READY) || (ph == E2_PROBE))
+            epoch_n = epoch_q + 64'd1;
+        // E2 supported_i low is sticky in any active E2 phase.
+        if (e2_active_phase && !supported_i) e2_err_n[9] = 1'b1;
+        if (ph == E2_ARM_A) a_elapsed_n = a_elapsed_q + 64'd1;
+
+        if ((ph == E2_ARM_A) && ((a_elapsed_q + 64'd1) >= T_CYCLES)) begin
+            e2_phase_n   = E2_READY;
+            a_elapsed_n  = T_CYCLES;
+            deadline_n   = epoch_q;
+            if (!quiet_i) begin
+                quiet_timeout_n = quiet_timeout_q + 32'd1;
+                e2_err_n[4]     = 1'b1;
+            end
+            if (update_i || invalidate_i) e2_err_n[7] = 1'b1;
+            if (!supported_i)             e2_err_n[9] = 1'b1;
+        end
+
+        // -------------------------------------------------------- E2 guards
+        if (ph == E2_READY) begin
+            if (lookup_i || update_i || invalidate_i || (issue_i != 2'b00) ||
+                (done_i != 2'b00) || select_fire_i || response_error_i)
+                e2_err_n[5] = 1'b1;
+            if (invalidate_i) inval_count_n = inval_count_q + 32'd1;
+        end else if ((ph == E2_ARM_WARM) || (ph == E2_ARM_A) || (ph == E2_PROBE)) begin
+            if (lookup_i) begin
+                if (!lookup_stage1_i || lookup_stage2_i) e2_err_n[5] = 1'b1;
+                if (ph == E2_ARM_A) begin
+                    if (lookup_did_i != DID_A) e2_err_n[12] = 1'b1;
+                end else begin
+                    if (lookup_did_i != DID_V) e2_err_n[12] = 1'b1;
+                    if (ph == E2_ARM_WARM &&
+                        !(page_match(lookup_iova_i, src_iova_q) ||
+                          page_match(lookup_iova_i, dst_iova_q)))
+                        e2_err_n[12] = 1'b1;
+                    if ((ph == E2_PROBE) &&
+                        !(page_match(lookup_iova_i, src_iova_q) ||
+                          page_match(lookup_iova_i, dst_iova_q)))
+                        e2_err_n[5] = 1'b1;
+                end
+            end
+            if (update_i) begin
+                if (ph == E2_ARM_A) begin
+                    if (update_did_i != DID_A) e2_err_n[12] = 1'b1;
+                end else begin
+                    if (update_did_i != DID_V) e2_err_n[12] = 1'b1;
+                end
+            end
+            if (invalidate_i) begin
+                inval_count_n = inval_count_q + 32'd1;
+                e2_err_n[2]   = 1'b1;
+            end
+            if (issue_i[1] && (ph != E2_ARM_A)) e2_err_n[5] = 1'b1;
+            if (issue_i[0] && (ph == E2_ARM_A)) e2_err_n[5] = 1'b1;
+            if (done_i[1]  && (ph != E2_ARM_A)) e2_err_n[5] = 1'b1;
+            if (done_i[0]  && (ph == E2_ARM_A)) e2_err_n[5] = 1'b1;
+            if (select_fire_i) begin
+                if (ph == E2_ARM_A) begin
+                    if (select_did_i != DID_A) e2_err_n[12] = 1'b1;
+                end else begin
+                    if (select_did_i != DID_V) e2_err_n[12] = 1'b1;
+                end
+            end
+            if (response_error_i) e2_err_n[13] = 1'b1;
+        end
+
+        // ------------------------------------------------- E2 target capture
+        if ((ph == E2_ARM_WARM) && lookup_i && lookup_stage1_i && !lookup_stage2_i &&
+            (lookup_did_i == DID_V)) begin
+            if (page_match(lookup_iova_i, src_iova_q)) begin
+                if (!target_ctx_valid_q[0]) begin
+                    target_ctx_n[0]       = ctx_key_128();
+                    target_ctx_valid_n[0] = 1'b1;
+                end else if (!ctx_match(ctx_key_128(), target_ctx_q[0])) begin
+                    e2_err_n[12] = 1'b1;
+                end
+                if (!target_valid_q[0]) begin
+                    if (cap_found) begin
+                        target_key_n[0]   = cap_key;
+                        target_valid_n[0] = 1'b1;
+                    end else if (cap_bad_geom) begin
+                        e2_err_n[9] = 1'b1;
+                    end
+                end
+            end else if (page_match(lookup_iova_i, dst_iova_q)) begin
+                if (!target_ctx_valid_q[1]) begin
+                    target_ctx_n[1]       = ctx_key_128();
+                    target_ctx_valid_n[1] = 1'b1;
+                end else if (!ctx_match(ctx_key_128(), target_ctx_q[1])) begin
+                    e2_err_n[12] = 1'b1;
+                end
+                if (!target_valid_q[1]) begin
+                    if (cap_found) begin
+                        target_key_n[1]   = cap_key;
+                        target_valid_n[1] = 1'b1;
+                    end else if (cap_bad_geom) begin
+                        e2_err_n[9] = 1'b1;
+                    end
+                end
+            end else begin
+                e2_err_n[12] = 1'b1;
+            end
+        end
+
+        // -------------------------------------------------- E2 event accounting
+        if ((ph == E2_ARM_WARM) || (ph == E2_ARM_A) || (ph == E2_PROBE)) begin
+            if (update_i) begin
+                update_count_n = update_count_q + 32'd1;
+                if (invalidate_i)                                   e2_err_n[8] = 1'b1;
+                if (!slot_oh_valid)                                 e2_err_n[8] = 1'b1;
+                if (changed_count > 5'd1)                           e2_err_n[1] = 1'b1;
+                if ((changed_count == 5'd1) && (changed_mask != replace_mask_i))
+                                                                    e2_err_n[8] = 1'b1;
+                if (slot_oh_valid) begin
+                    if (event_count_q < EventDepth) begin
+                        event_count_n = event_count_q + 16'd1;
+                    end else begin
+                        e2_ovf_n    = 1'b1;
+                        e2_err_n[3] = 1'b1;
+                    end
+                end
+            end
+        end
+
+        // ------------------------------------------------------ config writes
+        if (cfg_valid_i && cfg_write_i) begin
+            unique case (index_i)
+                13'h0004: begin
+                    if ((wdata_i[63:2] != 62'd0) || (wdata_i[1:0] == 2'd3) ||
+                        (ph != E2_IDLE) || cost_active_q) begin
+                        e2_err_n[0] = 1'b1;
+                        if (wdata_i[1:0] == 2'd3) cost_err_n[6] = 1'b1;
+                    end else begin
+                        mode_n = wdata_i[1:0];
+                    end
+                end
+                13'h0005: begin
+                    cmd_n = wdata_i[3:0];
+                    if (cmd_rsvd || (wdata_i[3:0] == 4'd0) || (wdata_i[3:0] > 4'd6)) begin
+                        e2_err_n[0] = 1'b1;
+                    end else begin
+                        unique case (wdata_i[3:0])
+                            4'd1: begin
+                                if (!acc_warm) begin
+                                    e2_err_n[0] = 1'b1;
+                                    if (update_i || invalidate_i) e2_err_n[7] = 1'b1;
+                                end
+                            end
+                            4'd2: begin
+                                if (!acc_a) begin
+                                    e2_err_n[0] = 1'b1;
+                                    if (!((target_valid_q == 2'b11) && tgt_present0 && tgt_present1))
+                                        e2_err_n[6] = 1'b1;
+                                    else if (update_i || invalidate_i)
+                                        e2_err_n[7] = 1'b1;
+                                    else if (!ctx_ok_both)
+                                        e2_err_n[12] = 1'b1;
+                                end
+                            end
+                            4'd3: begin
+                                if (!acc_probe) e2_err_n[0] = 1'b1;
+                            end
+                            4'd4: begin
+                                if (!acc_freeze) begin
+                                    e2_err_n[0] = 1'b1;
+                                    if (fp_done_q != 2'b11) e2_err_n[0] = 1'b1;
+                                    else if (update_i || invalidate_i) e2_err_n[7] = 1'b1;
+                                end
+                            end
+                            4'd5: begin
+                                // ABORT is a cleanup request; effect below decides no-op.
+                            end
+                            4'd6: begin
+                                if (!acc_clear) e2_err_n[0] = 1'b1;
+                            end
+                        endcase
+                    end
+                    if (!supported_i) e2_err_n[9] = 1'b1;
+                end
+                13'h0030: begin
+                    if ((ph != E2_IDLE) || cost_active_q || (wdata_i[11:0] != 12'd0) ||
+                        (dst_set_q && (wdata_i[63:12] == dst_iova_q[63:12]))) begin
+                        e2_err_n[11] = 1'b1;
+                    end else begin
+                        src_iova_n = wdata_i;
+                        src_set_n  = 1'b1;
+                    end
+                end
+                13'h0031: begin
+                    if ((ph != E2_IDLE) || cost_active_q || (wdata_i[11:0] != 12'd0) ||
+                        (src_set_q && (wdata_i[63:12] == src_iova_q[63:12]))) begin
+                        e2_err_n[11] = 1'b1;
+                    end else begin
+                        dst_iova_n = wdata_i;
+                        dst_set_n  = 1'b1;
+                    end
+                end
+                13'h0F10: begin
+                    if (ResearchRole == 0 || !quiet_i || ph != E2_IDLE ||
+                        cost_active_q || wdata_i[63:1] != 0)
+                        e2_err_n[0] = 1'b1;
+                end
+                default: e2_err_n[0] = 1'b1;
+            endcase
+        end
+
+        // ---------------------------------------------------- command effects
+        if (acc_warm) begin
+            e2_phase_n       = E2_ARM_WARM;
+            epoch_n          = 64'd0;
+            a_elapsed_n      = 64'd0;
+            astart_n         = 64'd0;
+            deadline_n       = 64'd0;
+            probestart_n     = 64'd0;
+            freeze_ts_n      = 64'd0;
+            event_count_n    = 16'd0;
+            inval_count_n    = 32'd0;
+            update_count_n   = 32'd0;
+            quiet_timeout_n  = 32'd0;
+            e2_ovf_n         = 1'b0;
+            target_valid_n   = 2'b00;
+            target_ctx_valid_n = 2'b00;
+            fp_done_n        = 2'b00;
+            snapshot_valid_n = 3'b000;
+            e2a_issue_cnt_n  = 32'd0;
+            e2a_done_cnt_n   = 32'd0;
+            e2a_first_n      = 64'd0;
+            e2a_last_n       = 64'd0;
+            e2a_first_seen_n = 1'b0;
+            lane_active_n    = 2'b00;
+            lane_in_window_n = 2'b00;
+        end
+        if (acc_a) begin
+            e2_phase_n  = E2_ARM_A;
+            a_elapsed_n = 64'd0;
+            astart_n    = epoch_q;
+            deadline_n  = epoch_q + T_CYCLES;
+        end
+        if (acc_probe) begin
+            e2_phase_n   = E2_PROBE;
+            probestart_n = epoch_q;
+        end
+        if (acc_freeze) begin
+            e2_phase_n  = E2_FREEZE;
+            freeze_ts_n = epoch_q;
+        end
+        if (abort_cmd) begin
+            if ((mode_q == MODE_E2) && e2_active_phase) begin
+                e2_phase_n = E2_ABORT;
+            end else if ((mode_q == MODE_COST) && cost_active_q) begin
+                cost_active_n = 1'b0;
+                cost_err_n[8] = 1'b1;
+            end
+        end
+        if (acc_clear) begin
+            e2_phase_n      = E2_IDLE;
+            e2_err_n        = 16'd0;
+            cost_err_n      = 16'd0;
+            e2_ovf_n        = 1'b0;
+            quiet_timeout_n = 32'd0;
+            src_set_n       = 1'b0;
+            dst_set_n       = 1'b0;
+        end
+
+        // ------------------------------------------- E2 first-probe records
+        if ((ph == E2_PROBE) && lookup_i && lookup_stage1_i && !lookup_stage2_i &&
+            (lookup_did_i == DID_V)) begin
+            if (page_match(lookup_iova_i, src_iova_q)) begin
+                if (!target_ctx_valid_q[0] || !ctx_match(ctx_key_128(), target_ctx_q[0]))
+                    e2_err_n[12] = 1'b1;
+                if (lookup_hit_i != cap_found) e2_err_n[5] = 1'b1;
+                if (cap_bad_geom) e2_err_n[9] = 1'b1;
+                if (target_ctx_valid_q[0] && !fp_done_q[0]) begin
+                    fp_time_n[0]      = epoch_q;
+                    fp_hit_n[0]       = lookup_hit_i;
+                    fp_live_self_n[0] = tgt_live0;
+                    fp_live_oth_n[0]  = tgt_live1;
+                    fp_key_n[0]       = cap_found ? cap_key : ctx_key_128();
+                    fp_done_n[0]      = 1'b1;
+                end
+            end else if (page_match(lookup_iova_i, dst_iova_q)) begin
+                if (!target_ctx_valid_q[1] || !ctx_match(ctx_key_128(), target_ctx_q[1]))
+                    e2_err_n[12] = 1'b1;
+                if (lookup_hit_i != cap_found) e2_err_n[5] = 1'b1;
+                if (cap_bad_geom) e2_err_n[9] = 1'b1;
+                if (target_ctx_valid_q[1] && !fp_done_q[1]) begin
+                    fp_time_n[1]      = epoch_q;
+                    fp_hit_n[1]       = lookup_hit_i;
+                    fp_live_self_n[1] = tgt_live1;
+                    fp_live_oth_n[1]  = tgt_live0;
+                    fp_key_n[1]       = cap_found ? cap_key : ctx_key_128();
+                    fp_done_n[1]      = 1'b1;
+                end
+            end else begin
+                e2_err_n[5] = 1'b1;
+            end
+        end
+
+        // --------------------------------------------------------- E2 A lane
+        if ((mode_q == MODE_E2) && e2_active_phase) begin
+            if (a_issue_ok) begin
+                if (&e2a_issue_cnt_q) e2_err_n[10] = 1'b1;
+                e2a_issue_cnt_n = e2a_issue_cnt_q + 32'd1;
+                if (!e2a_first_seen_q) begin
+                    e2a_first_n      = epoch_q;
+                    e2a_first_seen_n = 1'b1;
+                end
+            end
+            if (a_done_ok) begin
+                if (&e2a_done_cnt_q) e2_err_n[10] = 1'b1;
+                e2a_done_cnt_n = e2a_done_cnt_q + 32'd1;
+                e2a_last_n     = epoch_q;
+            end
+        end
+
+        // ------------------------------------------------------ shared lanes
+        if (lanes_en) begin
+            if (issue_i[1] && !lane_active_q[1]) begin
+                lane_active_n[1] = 1'b1;
+                lane_id_n[1]     = issue_id_i[1];
+            end
+            if (done_i[1] && lane_active_q[1] && (done_id_i[1] == lane_id_q[1]))
+                lane_active_n[1] = 1'b0;
+            if (issue_i[0] && !lane_active_q[0]) begin
+                lane_active_n[0] = 1'b1;
+                lane_id_n[0]     = issue_id_i[0];
+            end
+            if (done_i[0] && lane_active_q[0] && (done_id_i[0] == lane_id_q[0]))
+                lane_active_n[0] = 1'b0;
+        end
+        if (lane_proto_err) begin
+            if (mode_q == MODE_COST) cost_err_n[0] = 1'b1;
+            else                     e2_err_n[10]  = 1'b1;
+        end
+
+        // =====================================================================
+        // COST: counters run only while a session is active (arm .. close).
+        // Ownership is taken from ctl_did_i / select_did_i / lookup_did_i only.
+        // =====================================================================
+        if (cost_active_q) begin
+            if (!supported_i)   cost_err_n[9] = 1'b1;
+            if (response_error_i) cost_err_n[7] = 1'b1;
+            if (&cost_cycles_q) cost_err_n[2] = 1'b1;
+            cost_cycles_n = cost_cycles_q + 1'b1;
+            if (win_act) begin
+                if (&win_cycles_q) cost_err_n[2] = 1'b1;
+                win_cycles_n = win_cycles_q + 1'b1;
+            end
+
+            if (main_cyc) begin
+                if (main_known) begin
+                    if (&cost_main_q[main_lane]) cost_err_n[2] = 1'b1;
+                    cost_main_n[main_lane] = cost_main_q[main_lane] + 1'b1;
+                    if (win_act) begin
+                        if (&win_main_q[main_lane]) cost_err_n[2] = 1'b1;
+                        win_main_n[main_lane] = win_main_q[main_lane] + 1'b1;
+                    end
+                end else begin
+                    cost_err_n[1] = 1'b1;
+                    if (&cost_owner_err_q) cost_err_n[2] = 1'b1;
+                    cost_owner_err_n = cost_owner_err_q + 1'b1;
+                end
+            end
+            if (comp_cyc) begin
+                if (main_known) begin
+                    if (&cost_comp_q[main_lane]) cost_err_n[2] = 1'b1;
+                    cost_comp_n[main_lane] = cost_comp_q[main_lane] + 1'b1;
+                    if (win_act) begin
+                        if (&win_comp_q[main_lane]) cost_err_n[2] = 1'b1;
+                        win_comp_n[main_lane] = win_comp_q[main_lane] + 1'b1;
+                    end
+                end else begin
+                    cost_err_n[1] = 1'b1;
+                    if (&cost_owner_err_q) cost_err_n[2] = 1'b1;
+                    cost_owner_err_n = cost_owner_err_q + 1'b1;
+                end
+            end
+            if (select_fire_i) begin
+                if (sel_known) begin
+                    if (&cost_sel_q[sel_lane]) cost_err_n[2] = 1'b1;
+                    cost_sel_n[sel_lane] = cost_sel_q[sel_lane] + 1'b1;
+                    if (win_act) begin
+                        if (&win_sel_q[sel_lane]) cost_err_n[2] = 1'b1;
+                        win_sel_n[sel_lane] = win_sel_q[sel_lane] + 1'b1;
+                    end
+                end else begin
+                    cost_err_n[1] = 1'b1;
+                    if (&cost_owner_err_q) cost_err_n[2] = 1'b1;
+                    cost_owner_err_n = cost_owner_err_q + 1'b1;
+                end
+            end
+            if (lookup_i) begin
+                if (lu_known) begin
+                    if (lookup_hit_i) begin
+                        if (&cost_hit_q[lu_lane]) cost_err_n[2] = 1'b1;
+                        cost_hit_n[lu_lane] = cost_hit_q[lu_lane] + 1'b1;
+                        if (win_act) begin
+                            if (&win_hit_q[lu_lane]) cost_err_n[2] = 1'b1;
+                            win_hit_n[lu_lane] = win_hit_q[lu_lane] + 1'b1;
+                        end
+                    end else begin
+                        if (&cost_miss_q[lu_lane]) cost_err_n[2] = 1'b1;
+                        cost_miss_n[lu_lane] = cost_miss_q[lu_lane] + 1'b1;
+                        if (win_act) begin
+                            if (&win_miss_q[lu_lane]) cost_err_n[2] = 1'b1;
+                            win_miss_n[lu_lane] = win_miss_q[lu_lane] + 1'b1;
+                        end
+                    end
+                end else begin
+                    cost_err_n[1] = 1'b1;
+                    if (&cost_owner_err_q) cost_err_n[2] = 1'b1;
+                    cost_owner_err_n = cost_owner_err_q + 1'b1;
+                end
+            end
+
+            // per-copy A/V counters (kept from accepted issue until done)
+            if (lane_active_q[1]) begin
+                if (&cur_a_dur_q) cost_err_n[2] = 1'b1;
+                cur_a_dur_n = cur_a_dur_q + 32'd1;
+                if (main_cyc && (ctl_did_i == DID_A)) begin
+                    if (&cur_a_main_q) cost_err_n[2] = 1'b1;
+                    cur_a_main_n = cur_a_main_q + 32'd1;
+                end
+                if (select_fire_i && (select_did_i == DID_A)) begin
+                    if (&cur_a_req_q) cost_err_n[2] = 1'b1;
+                    cur_a_req_n  = cur_a_req_q  + 32'd1;
+                end
+                if (lookup_i && (lookup_did_i == DID_A) && !lookup_hit_i) begin
+                    if (&cur_a_miss_q) cost_err_n[2] = 1'b1;
+                    cur_a_miss_n = cur_a_miss_q + 32'd1;
+                end
+                if (comp_cyc && (ctl_did_i == DID_A)) begin
+                    if (&cur_a_comp_q) cost_err_n[2] = 1'b1;
+                    cur_a_comp_n = cur_a_comp_q + 32'd1;
+                end
+            end
+            if (lane_active_q[0]) begin
+                if (main_cyc && (ctl_did_i == DID_V)) begin
+                    if (&cur_v_main_q) cost_err_n[2] = 1'b1;
+                    cur_v_main_n = cur_v_main_q + 32'd1;
+                end
+                if (comp_cyc && (ctl_did_i == DID_V)) begin
+                    if (&cur_v_comp_q) cost_err_n[2] = 1'b1;
+                    cur_v_comp_n = cur_v_comp_q + 32'd1;
+                end
+            end
+
+            if (cost_active_q && a_issue_ok) begin
+                if (&cost_issue_q[1]) cost_err_n[2] = 1'b1;
+                cost_issue_n[1] = cost_issue_q[1] + 1'b1;
+                cur_a_main_n  = 32'd0;
+                cur_a_req_n   = 32'd0;
+                cur_a_miss_n  = 32'd0;
+                cur_a_comp_n  = 32'd0;
+                cur_a_dur_n   = 32'd0;
+                cur_a_flags_n = 32'd0;
+                cur_a_flags_n[0] = !(window_open_q || p4m_open_i);
+                cur_a_flags_n[1] = window_closed_q;
+                cur_a_flags_n[2] = win_act_issue;
+                lane_in_window_n[1] = win_act_issue;
+            end
+            if (cost_active_q && issue_i[0] && !lane_active_q[0]) begin
+                if (&cost_issue_q[0]) cost_err_n[2] = 1'b1;
+                cost_issue_n[0] = cost_issue_q[0] + 1'b1;
+            end
+            if (cost_active_q && a_done_ok) begin
+                if (&cost_done_q[1])     cost_err_n[2] = 1'b1;
+                if (&cost_a_done_all_q)  cost_err_n[2] = 1'b1;
+                cost_done_n[1]    = cost_done_q[1] + 1'b1;
+                cost_a_done_all_n = cost_a_done_all_q + 1'b1;
+                cur_a_flags_n[3]  = p4m_close_i;
+                if (lane_in_window_q[1] && win_act) begin
+                    if (&eligible_q) cost_err_n[2] = 1'b1;
+                    eligible_n = eligible_q + 1'b1;
+                    if (eligible_q[3:0] == 4'hF) begin
+                        if (sample_count_q < SampleDepth) begin
+                            sample_count_n = sample_count_q + 16'd1;
+                        end else begin
+                            sample_ovf_n = 1'b1;
+                            cost_err_n[3] = 1'b1;
+                        end
+                    end
+                end
+                lane_in_window_n[1] = 1'b0;
+            end
+            if (cost_active_q && done_i[0] && lane_active_q[0] && (done_id_i[0] == lane_id_q[0])) begin
+                if (&cost_done_q[0]) cost_err_n[2] = 1'b1;
+                cost_done_n[0] = cost_done_q[0] + 1'b1;
+            end
+
+            // window edges: (open, close] convention
+            if (p4m_open_i) begin
+                if (window_open_q) begin
+                    cost_err_n[4] = 1'b1;
+                end else begin
+                    window_open_n = 1'b1;
+                    window_closed_n = 1'b0;
+                    carry_in_n = lane_active_q[1];
+                end
+            end
+            if (p4m_close_i) begin
+                if (!window_open_q || window_closed_q) begin
+                    cost_err_n[4] = 1'b1;
+                end else begin
+                    window_closed_n = 1'b1;
+                    carry_out_n = lane_active_n[1];
+                    cost_active_n = 1'b0;
+                end
+            end
+        end
+
+        // p4m_arm dominates: reset and start (requires quiet and MODE_COST)
+        if (p4m_arm_i) begin
+            if (mode_q == MODE_COST && !quiet_i) begin
+                cost_err_n[5] = 1'b1;
+            end else if (mode_q == MODE_COST && (cost_active_q || (e2_phase_q != E2_IDLE))) begin
+                cost_err_n[6] = 1'b1;
+            end else if (mode_q == MODE_COST) begin
+                cost_active_n        = 1'b1;
+                cost_err_n           = 16'd0;
+                cost_cycles_n        = '0;
+                cost_owner_err_n     = '0;
+                cost_a_done_all_n    = '0;
+                window_open_n        = 1'b0;
+                window_closed_n      = 1'b0;
+                win_cycles_n         = '0;
+                carry_in_n           = 1'b0;
+                carry_out_n          = 1'b0;
+                eligible_n           = '0;
+                sample_count_n       = 16'd0;
+                sample_ovf_n         = 1'b0;
+                cur_a_main_n         = 32'd0;
+                cur_a_req_n          = 32'd0;
+                cur_a_miss_n         = 32'd0;
+                cur_a_comp_n         = 32'd0;
+                cur_a_dur_n          = 32'd0;
+                cur_a_flags_n        = 32'd0;
+                cur_v_main_n         = 32'd0;
+                cur_v_comp_n         = 32'd0;
+                lane_active_n        = 2'b00;
+                lane_in_window_n     = 2'b00;
+                for (int i = 0; i < 2; i++) begin
+                    cost_main_n[i] = '0;
+                    cost_comp_n[i] = '0;
+                    cost_sel_n[i]  = '0;
+                    cost_hit_n[i]  = '0;
+                    cost_miss_n[i] = '0;
+                    cost_issue_n[i]= '0;
+                    cost_done_n[i] = '0;
+                    win_main_n[i]  = '0;
+                    win_comp_n[i]  = '0;
+                    win_sel_n[i]   = '0;
+                    win_hit_n[i]   = '0;
+                    win_miss_n[i]  = '0;
+                end
+            end
+        end
+    end
+
+    // ------------------------------------------------------------ sequential
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            mode_q           <= 2'd0;
+            cmd_q            <= 4'd0;
+            e2_phase_q       <= E2_IDLE;
+            epoch_q          <= 64'd0;
+            a_elapsed_q      <= 64'd0;
+            astart_q         <= 64'd0;
+            deadline_q       <= 64'd0;
+            probestart_q     <= 64'd0;
+            freeze_ts_q      <= 64'd0;
+            event_count_q    <= 16'd0;
+            inval_count_q    <= 32'd0;
+            update_count_q   <= 32'd0;
+            quiet_timeout_q  <= 32'd0;
+            e2_ovf_q         <= 1'b0;
+            e2_err_q         <= 16'd0;
+            target_valid_q   <= 2'b00;
+            target_ctx_valid_q <= 2'b00;
+            fp_done_q        <= 2'b00;
+            snapshot_valid_q <= 3'b000;
+            e2a_issue_cnt_q  <= 32'd0;
+            e2a_done_cnt_q   <= 32'd0;
+            e2a_first_q      <= 64'd0;
+            e2a_last_q       <= 64'd0;
+            e2a_first_seen_q <= 1'b0;
+            src_iova_q       <= 64'd0;
+            dst_iova_q       <= 64'd0;
+            src_set_q        <= 1'b0;
+            dst_set_q        <= 1'b0;
+            cost_active_q    <= 1'b0;
+            cost_err_q       <= 16'd0;
+            cost_cycles_q    <= '0;
+            cost_owner_err_q <= '0;
+            cost_a_done_all_q<= '0;
+            window_open_q    <= 1'b0;
+            window_closed_q  <= 1'b0;
+            win_cycles_q     <= '0;
+            carry_in_q       <= 1'b0;
+            carry_out_q      <= 1'b0;
+            eligible_q       <= '0;
+            sample_count_q   <= 16'd0;
+            sample_ovf_q     <= 1'b0;
+            cur_a_main_q     <= 32'd0;
+            cur_a_req_q      <= 32'd0;
+            cur_a_miss_q     <= 32'd0;
+            cur_a_comp_q     <= 32'd0;
+            cur_a_dur_q      <= 32'd0;
+            cur_a_flags_q    <= 32'd0;
+            cur_v_main_q     <= 32'd0;
+            cur_v_comp_q     <= 32'd0;
+            lane_active_q    <= 2'b00;
+            lane_in_window_q <= 2'b00;
+            for (int i = 0; i < 2; i++) begin
+                target_key_q[i]   <= '0;
+                target_ctx_q[i]   <= '0;
+                fp_time_q[i]      <= 64'd0;
+                fp_hit_q[i]       <= 1'b0;
+                fp_live_self_q[i] <= 16'd0;
+                fp_live_oth_q[i]  <= 16'd0;
+                fp_key_q[i]       <= '0;
+                lane_id_q[i]      <= 64'd0;
+                cost_main_q[i]    <= '0;
+                cost_comp_q[i]    <= '0;
+                cost_sel_q[i]     <= '0;
+                cost_hit_q[i]     <= '0;
+                cost_miss_q[i]    <= '0;
+                cost_issue_q[i]   <= '0;
+                cost_done_q[i]    <= '0;
+                win_main_q[i]     <= '0;
+                win_comp_q[i]     <= '0;
+                win_sel_q[i]      <= '0;
+                win_hit_q[i]      <= '0;
+                win_miss_q[i]     <= '0;
+            end
+            for (int i = 0; i < 3; i++) plru_snap_q[i] <= 32'd0;
+        end else begin
+            mode_q           <= mode_n;
+            cmd_q            <= cmd_n;
+            e2_phase_q       <= e2_phase_n;
+            epoch_q          <= epoch_n;
+            a_elapsed_q      <= a_elapsed_n;
+            astart_q         <= astart_n;
+            deadline_q       <= deadline_n;
+            probestart_q     <= probestart_n;
+            freeze_ts_q      <= freeze_ts_n;
+            event_count_q    <= event_count_n;
+            inval_count_q    <= inval_count_n;
+            update_count_q   <= update_count_n;
+            quiet_timeout_q  <= quiet_timeout_n;
+            e2_ovf_q         <= e2_ovf_n;
+            e2_err_q         <= e2_err_n;
+            target_valid_q   <= target_valid_n;
+            target_ctx_valid_q <= target_ctx_valid_n;
+            fp_done_q        <= fp_done_n;
+            snapshot_valid_q <= snapshot_valid_n;
+            e2a_issue_cnt_q  <= e2a_issue_cnt_n;
+            e2a_done_cnt_q   <= e2a_done_cnt_n;
+            e2a_first_q      <= e2a_first_n;
+            e2a_last_q       <= e2a_last_n;
+            e2a_first_seen_q <= e2a_first_seen_n;
+            src_iova_q       <= src_iova_n;
+            dst_iova_q       <= dst_iova_n;
+            src_set_q        <= src_set_n;
+            dst_set_q        <= dst_set_n;
+            cost_active_q    <= cost_active_n;
+            cost_err_q       <= cost_err_n;
+            cost_cycles_q    <= cost_cycles_n;
+            cost_owner_err_q <= cost_owner_err_n;
+            cost_a_done_all_q<= cost_a_done_all_n;
+            window_open_q    <= window_open_n;
+            window_closed_q  <= window_closed_n;
+            win_cycles_q     <= win_cycles_n;
+            carry_in_q       <= carry_in_n;
+            carry_out_q      <= carry_out_n;
+            eligible_q       <= eligible_n;
+            sample_count_q   <= sample_count_n;
+            sample_ovf_q     <= sample_ovf_n;
+            cur_a_main_q     <= cur_a_main_n;
+            cur_a_req_q      <= cur_a_req_n;
+            cur_a_miss_q     <= cur_a_miss_n;
+            cur_a_comp_q     <= cur_a_comp_n;
+            cur_a_dur_q      <= cur_a_dur_n;
+            cur_a_flags_q    <= cur_a_flags_n;
+            cur_v_main_q     <= cur_v_main_n;
+            cur_v_comp_q     <= cur_v_comp_n;
+            lane_active_q    <= lane_active_n;
+            lane_in_window_q <= lane_in_window_n;
+            for (int i = 0; i < 2; i++) begin
+                target_key_q[i]   <= target_key_n[i];
+                target_ctx_q[i]   <= target_ctx_n[i];
+                fp_time_q[i]      <= fp_time_n[i];
+                fp_hit_q[i]       <= fp_hit_n[i];
+                fp_live_self_q[i] <= fp_live_self_n[i];
+                fp_live_oth_q[i]  <= fp_live_oth_n[i];
+                fp_key_q[i]       <= fp_key_n[i];
+                lane_id_q[i]      <= lane_id_n[i];
+                cost_main_q[i]    <= cost_main_n[i];
+                cost_comp_q[i]    <= cost_comp_n[i];
+                cost_sel_q[i]     <= cost_sel_n[i];
+                cost_hit_q[i]     <= cost_hit_n[i];
+                cost_miss_q[i]    <= cost_miss_n[i];
+                cost_issue_q[i]   <= cost_issue_n[i];
+                cost_done_q[i]    <= cost_done_n[i];
+                win_main_q[i]     <= win_main_n[i];
+                win_comp_q[i]     <= win_comp_n[i];
+                win_sel_q[i]      <= win_sel_n[i];
+                win_hit_q[i]      <= win_hit_n[i];
+                win_miss_q[i]     <= win_miss_n[i];
+            end
+            for (int i = 0; i < 3; i++) plru_snap_q[i] <= plru_snap_n[i];
+
+            // ---- warm snapshot at the ARM_A acceptance edge (pre-edge tags)
+            if (acc_a) begin
+                for (int unsigned i = 0; i < NumEntries; i++) begin
+                    snap_warm_q[i*2]   <= entries_i[i][63:0];
+                    snap_warm_q[i*2+1] <= entries_i[i][127:64];
+                end
+                plru_snap_q[0]      <= plru_i;
+                snapshot_valid_q[0] <= 1'b1;
+            end
+
+            // ---- deadline snapshot at exactly T (pre-edge tags)
+            if ((e2_phase_q == E2_ARM_A) && ((a_elapsed_q + 64'd1) >= T_CYCLES) &&
+                quiet_i && supported_i && !update_i && !invalidate_i) begin
+                for (int unsigned i = 0; i < NumEntries; i++) begin
+                    snap_deadline_q[i*2]   <= entries_i[i][63:0];
+                    snap_deadline_q[i*2+1] <= entries_i[i][127:64];
+                end
+                plru_snap_q[1]      <= plru_i;
+                snapshot_valid_q[1] <= 1'b1;
+            end
+
+            // ---- freeze snapshot at the FREEZE acceptance edge
+            if (acc_freeze) begin
+                for (int unsigned i = 0; i < NumEntries; i++) begin
+                    snap_freeze_q[i*2]   <= entries_i[i][63:0];
+                    snap_freeze_q[i*2+1] <= entries_i[i][127:64];
+                end
+                plru_snap_q[2]      <= plru_i;
+                snapshot_valid_q[2] <= 1'b1;
+            end
+
+        end
+    end
+
+    // No RAM reset: reset/CLEAR invalidates counts; unread records return zero.
+    // A synchronous single-record write permits LUT RAM inference in Vivado.
+    always_ff @(posedge clk_i) begin
+        if (rst_ni && evt_push)
+            event_ram_q[event_count_q] <= {entries_next_i[slot_idx],
+                                          entries_i[slot_idx], evt_meta, epoch_q};
+        if (rst_ni && sample_push)
+            sample_ram_q[sample_count_q] <= {cur_a_dur_n, cur_a_flags_n,
+                                            cur_a_req_n, cur_a_miss_n,
+                                            cur_a_main_n, cur_a_comp_n, done_id_i[1]};
+    end
+
+    // -------------------------------------------------------------- status
+    logic [63:0] status_q, error_combined;
+    always_comb begin
+        status_q            = 64'd0;
+        status_q[0]         = (e2_phase_q == E2_IDLE);
+        status_q[1]         = (e2_phase_q == E2_ARM_WARM);
+        status_q[2]         = (e2_phase_q == E2_ARM_A);
+        status_q[3]         = (e2_phase_q == E2_PROBE);
+        status_q[4]         = (e2_phase_q == E2_FREEZE);
+        status_q[5]         = (e2_phase_q == E2_ABORT);
+        status_q[6]         = (e2_phase_q == E2_READY);
+        status_q[10:8]      = e2_phase_q;
+        status_q[11]        = (mode_q == MODE_E2);
+        status_q[12]        = (mode_q == MODE_COST);
+        status_q[13]        = cost_active_q;
+        status_q[14]        = window_open_q;
+        status_q[15]        = window_closed_q;
+        status_q[16]        = target_valid_q[0];
+        status_q[17]        = target_valid_q[1];
+        status_q[18]        = snapshot_valid_q[0];
+        status_q[19]        = snapshot_valid_q[1];
+        status_q[20]        = snapshot_valid_q[2];
+        status_q[21]        = quiet_i;
+        status_q[22]        = supported_i;
+        status_q[23]        = (e2_err_q   != 16'd0);
+        status_q[24]        = (cost_err_q != 16'd0);
+        status_q[25]        = (fp_done_q == 2'b11);
+        status_q[26]        = sample_ovf_q;
+        status_q[27]        = e2_ovf_q;
+        status_q[28]        = (e2_err_q != 16'd0) || (cost_err_q != 16'd0);
+        status_q[31:29]     = 3'd0;
+        status_q[34:32]     = ctl_state_i;
+        status_q[35]        = (ctl_did_i == DID_V);
+        status_q[36]        = (ctl_did_i == DID_A);
+    end
+    assign error_combined = {32'd0, cost_err_q, e2_err_q};
+
+    // ------------------------------------------------------------- read mux
+    always_comb begin
+        rdata_o = 64'd0;
+        if (index_i < 13'h0100) begin
+            unique case (index_i)
+                13'h0000: rdata_o = RESEARCH_MAGIC0;
+                13'h0001: rdata_o = RESEARCH_MAGIC1;
+                13'h0002: rdata_o = status_q;
+                13'h0003: rdata_o = error_combined;
+                13'h0004: rdata_o = {62'd0, mode_q};
+                13'h0005: rdata_o = {60'd0, cmd_q};
+                13'h0006: rdata_o = {61'd0, e2_phase_q};
+                13'h0007: rdata_o = astart_q;
+                13'h0008: rdata_o = a_elapsed_q;
+                13'h0009: rdata_o = epoch_q;
+                13'h000A: rdata_o = {48'd0, event_count_q};
+                13'h000B: rdata_o = {32'd0, inval_count_q};
+                13'h000C: rdata_o = {63'd0, e2_ovf_q};
+                13'h000D: rdata_o = {48'd0, e2_err_q};
+                13'h000E: rdata_o = {32'd0, update_count_q};
+                13'h000F: rdata_o = {32'd0, quiet_timeout_q};
+                13'h0010: rdata_o = target_key_q[0][63:0];
+                13'h0011: rdata_o = target_key_q[0][127:64];
+                13'h0012: rdata_o = target_key_q[1][63:0];
+                13'h0013: rdata_o = target_key_q[1][127:64];
+                13'h0014: rdata_o = fp_time_q[0];
+                13'h0015: rdata_o = {31'd0, fp_hit_q[0], fp_live_oth_q[0], fp_live_self_q[0]};
+                13'h0016: rdata_o = fp_key_q[0][63:0];
+                13'h0017: rdata_o = fp_key_q[0][127:64];
+                13'h0018: rdata_o = fp_time_q[1];
+                13'h0019: rdata_o = {31'd0, fp_hit_q[1], fp_live_oth_q[1], fp_live_self_q[1]};
+                13'h001A: rdata_o = fp_key_q[1][63:0];
+                13'h001B: rdata_o = fp_key_q[1][127:64];
+                13'h001C: rdata_o = {62'd0, target_valid_q};
+                13'h001D: rdata_o = {62'd0, fp_done_q};
+                13'h001E: rdata_o = deadline_q;
+                13'h001F: rdata_o = probestart_q;
+                13'h0020: rdata_o = freeze_ts_q;
+                13'h0021: rdata_o = {61'd0, snapshot_valid_q};
+                13'h0022: rdata_o = {32'd0, plru_snap_q[0]};
+                13'h0023: rdata_o = {32'd0, plru_snap_q[1]};
+                13'h0024: rdata_o = {32'd0, plru_snap_q[2]};
+                13'h0025: rdata_o = {32'd0, e2a_issue_cnt_q};
+                13'h0026: rdata_o = {32'd0, e2a_done_cnt_q};
+                13'h0027: rdata_o = e2a_first_q;
+                13'h0028: rdata_o = e2a_last_q;
+                13'h0030: rdata_o = src_iova_q;
+                13'h0031: rdata_o = dst_iova_q;
+                13'h0032: rdata_o = {62'd0, dst_set_q, src_set_q};
+                default: rdata_o = 64'd0;
+            endcase
+        end else if (index_i < 13'h0160) begin
+            if (index_i < 13'h0120)
+                rdata_o = snapshot_valid_q[0] ? snap_warm_q[index_i - 13'h0100] : 64'd0;
+            else if (index_i < 13'h0140)
+                rdata_o = snapshot_valid_q[1] ? snap_deadline_q[index_i - 13'h0120] : 64'd0;
+            else
+                rdata_o = snapshot_valid_q[2] ? snap_freeze_q[index_i - 13'h0140] : 64'd0;
+        end else if (index_i >= 13'h0200 && index_i < 13'h0800) begin
+            if ((index_i - 13'h0200) < (event_count_q * 16'd6))
+                rdata_o = event_ram_q[(index_i - 13'h0200) / 6]
+                                    [((index_i - 13'h0200) % 6) * 64 +: 64];
+            else
+                rdata_o = 64'd0;
+        end else if (index_i >= 13'h0800 && index_i < 13'h0C00) begin
+            if ((index_i - 13'h0800) < (sample_count_q * 16'd4))
+                rdata_o = sample_ram_q[(index_i - 13'h0800) / 4]
+                                     [((index_i - 13'h0800) % 4) * 64 +: 64];
+            else
+                rdata_o = 64'd0;
+        end else if (index_i >= 13'h0C00 && index_i < 13'h0C40) begin
+            unique case (index_i)
+                13'h0C00: rdata_o = COST_MAGIC;
+                13'h0C01: rdata_o = {61'd0, window_closed_q, window_open_q, cost_active_q};
+                13'h0C02: rdata_o = {48'd0, cost_err_q};
+                13'h0C03: rdata_o = 64'(cost_cycles_q);
+                13'h0C04: rdata_o = 64'(cost_main_q[0]);
+                13'h0C05: rdata_o = 64'(cost_main_q[1]);
+                13'h0C06: rdata_o = 64'(cost_comp_q[0]);
+                13'h0C07: rdata_o = 64'(cost_comp_q[1]);
+                13'h0C08: rdata_o = 64'(cost_sel_q[0]);
+                13'h0C09: rdata_o = 64'(cost_sel_q[1]);
+                13'h0C0A: rdata_o = 64'(cost_hit_q[0]);
+                13'h0C0B: rdata_o = 64'(cost_miss_q[0]);
+                13'h0C0C: rdata_o = 64'(cost_hit_q[1]);
+                13'h0C0D: rdata_o = 64'(cost_miss_q[1]);
+                13'h0C0E: rdata_o = 64'(cost_owner_err_q);
+                13'h0C0F: rdata_o = 64'(cost_issue_q[1]);
+                13'h0C10: rdata_o = 64'(cost_done_q[1]);
+                13'h0C11: rdata_o = 64'(cost_issue_q[0]);
+                13'h0C12: rdata_o = 64'(cost_done_q[0]);
+                13'h0C13: rdata_o = 64'(cost_a_done_all_q);
+                13'h0C14: rdata_o = 64'(eligible_q);
+                13'h0C15: rdata_o = {48'd0, sample_count_q};
+                13'h0C16: rdata_o = {63'd0, sample_ovf_q};
+                13'h0C17: rdata_o = {63'd0, carry_in_q};
+                13'h0C18: rdata_o = {63'd0, carry_out_q};
+                13'h0C19: rdata_o = 64'(win_cycles_q);
+                13'h0C1A: rdata_o = 64'(win_main_q[0]);
+                13'h0C1B: rdata_o = 64'(win_main_q[1]);
+                13'h0C1C: rdata_o = 64'(win_comp_q[0]);
+                13'h0C1D: rdata_o = 64'(win_comp_q[1]);
+                13'h0C1E: rdata_o = 64'(win_sel_q[0]);
+                13'h0C1F: rdata_o = 64'(win_sel_q[1]);
+                13'h0C20: rdata_o = 64'(win_hit_q[0]);
+                13'h0C21: rdata_o = 64'(win_miss_q[0]);
+                13'h0C22: rdata_o = 64'(win_hit_q[1]);
+                13'h0C23: rdata_o = 64'(win_miss_q[1]);
+                13'h0C24: rdata_o = {32'd0, cur_a_main_q};
+                13'h0C25: rdata_o = {32'd0, cur_a_req_q};
+                13'h0C26: rdata_o = {32'd0, cur_a_miss_q};
+                13'h0C27: rdata_o = {32'd0, cur_a_comp_q};
+                13'h0C28: rdata_o = {32'd0, cur_a_dur_q};
+                13'h0C29: rdata_o = {32'd0, cur_a_flags_q};
+                13'h0C2A: rdata_o = {32'd0, cur_v_main_q};
+                13'h0C2B: rdata_o = {32'd0, cur_v_comp_q};
+                13'h0C2C: rdata_o = {62'd0, lane_active_q};
+                13'h0C2D: rdata_o = {16'd0, DID_A, DID_V};
+                default: rdata_o = 64'd0;
+            endcase
+        end else if (index_i >= 13'h0D00 && index_i < 13'h0D70) begin
+            if (index_i < 13'h0D10) begin
+                unique case (index_i)
+                    13'h0D00: rdata_o = AGG_MAGIC;
+                    13'h0D01: rdata_o = 64'd1;
+                    13'h0D02: rdata_o = 64'd6;
+                    13'h0D03: rdata_o = 64'd16;
+                    13'h0D04: rdata_o = {48'd0, agg_err_o};
+                    13'h0D05: rdata_o = agg_total_o;
+                    default: rdata_o = 64'd0;
+                endcase
+            end else if ((index_i[7:4] >= 4'd1) && (index_i[7:4] <= 4'd6)) begin
+                unique case (index_i[3:0])
+                    4'd0: rdata_o = agg_count_o[index_i[7:4] - 4'd1];
+                    4'd1: rdata_o = agg_sum_main_o[index_i[7:4] - 4'd1];
+                    4'd2: rdata_o = agg_sum_comp_o[index_i[7:4] - 4'd1];
+                    4'd3: rdata_o = agg_sum_dur_o[index_i[7:4] - 4'd1];
+                    4'd4: rdata_o = agg_sum_req_o[index_i[7:4] - 4'd1];
+                    4'd5: rdata_o = agg_sum_miss_o[index_i[7:4] - 4'd1];
+                    4'd6: rdata_o = {agg_max_main_o[index_i[7:4] - 4'd1],
+                                     agg_min_main_o[index_i[7:4] - 4'd1]};
+                    4'd7: rdata_o = {agg_max_comp_o[index_i[7:4] - 4'd1],
+                                     agg_min_comp_o[index_i[7:4] - 4'd1]};
+                    4'd8: rdata_o = {agg_max_dur_o[index_i[7:4] - 4'd1],
+                                     agg_min_dur_o[index_i[7:4] - 4'd1]};
+                    default: rdata_o = 64'd0;
+                endcase
+            end else begin
+                rdata_o = 64'd0;
+            end
+        end else if (index_i >= 13'h0F00 && index_i <= 13'h0F10) begin
+            if (ResearchRole != 0) begin
+                case (index_i)
+                    13'h0F00: rdata_o = 64'h49444d4132434150;
+                    13'h0F01: rdata_o = 64'd1;
+                    13'h0F02: rdata_o = 64'(ResearchRole);
+                    13'h0F03: rdata_o = ResearchRole == 2 ? 64'd15 : 64'd7;
+                    13'h0F10: rdata_o = {63'd0, reverse_order_q};
+                    default: rdata_o = 64'd0;
+                endcase
+            end
+        end else if (index_i >= 13'h0D80 && index_i < 13'h0D90) begin
+            unique case (index_i)
+                13'h0D80: rdata_o = 64'h49444d4145325431;
+                13'h0D81: rdata_o = 64'd1;
+                13'h0D82: rdata_o = {48'd0, e2t_error};
+                13'h0D83: rdata_o = e2t_flags;
+                13'h0D84: rdata_o = e2t_issue_epoch;
+                13'h0D85: rdata_o = e2t_first_select_epoch;
+                13'h0D86: rdata_o = e2t_done_epoch;
+                13'h0D87: rdata_o = e2t_done_issue_cycles;
+                13'h0D88: rdata_o = e2t_first_select_issue_cycles;
+                13'h0D89: rdata_o = e2t_v_main;
+                13'h0D8A: rdata_o = e2t_v_comp;
+                13'h0D8B: rdata_o = e2t_v_select;
+                13'h0D8C: rdata_o = e2t_v_hit;
+                13'h0D8D: rdata_o = e2t_v_miss;
+                13'h0D8E, 13'h0D8F: rdata_o = 64'd0;
+                default: rdata_o = 64'd0;
+            endcase
+        end
+    end
+
+endmodule
+
+module dma_research_cost_groups #(
+    parameter int unsigned StatWidth = 64
+) (
+    input  logic                 clk_i,
+    input  logic                 rst_ni,
+    input  logic                 clear_i,
+    input  logic                 commit_i,
+    input  logic [31:0]          main_i,
+    input  logic [31:0]          comp_i,
+    input  logic [31:0]          dur_i,
+    input  logic [31:0]          req_i,
+    input  logic [31:0]          miss_i,
+
+    output logic [StatWidth-1:0] count_o    [6],
+    output logic [StatWidth-1:0] sum_main_o [6],
+    output logic [StatWidth-1:0] sum_comp_o [6],
+    output logic [StatWidth-1:0] sum_dur_o  [6],
+    output logic [StatWidth-1:0] sum_req_o  [6],
+    output logic [StatWidth-1:0] sum_miss_o [6],
+    output logic [31:0]          min_main_o [6],
+    output logic [31:0]          max_main_o [6],
+    output logic [31:0]          min_comp_o [6],
+    output logic [31:0]          max_comp_o [6],
+    output logic [31:0]          min_dur_o  [6],
+    output logic [31:0]          max_dur_o  [6],
+    output logic [StatWidth-1:0] total_o,
+    output logic [15:0]          err_o
+);
+    localparam int unsigned NumGroups = 6;
+    localparam int unsigned ExtWidth  = 65;
+
+    logic [StatWidth-1:0] count_q    [NumGroups];
+    logic [StatWidth-1:0] sum_main_q [NumGroups];
+    logic [StatWidth-1:0] sum_comp_q [NumGroups];
+    logic [StatWidth-1:0] sum_dur_q  [NumGroups];
+    logic [StatWidth-1:0] sum_req_q  [NumGroups];
+    logic [StatWidth-1:0] sum_miss_q [NumGroups];
+    logic [31:0]          min_main_q [NumGroups];
+    logic [31:0]          max_main_q [NumGroups];
+    logic [31:0]          min_comp_q [NumGroups];
+    logic [31:0]          max_comp_q [NumGroups];
+    logic [31:0]          min_dur_q  [NumGroups];
+    logic [31:0]          max_dur_q  [NumGroups];
+    logic [NumGroups-1:0] seen_q;
+    logic [StatWidth-1:0] total_q;
+    logic [15:0]          err_q;
+
+    logic [StatWidth-1:0] count_n    [NumGroups];
+    logic [StatWidth-1:0] sum_main_n [NumGroups];
+    logic [StatWidth-1:0] sum_comp_n [NumGroups];
+    logic [StatWidth-1:0] sum_dur_n  [NumGroups];
+    logic [StatWidth-1:0] sum_req_n  [NumGroups];
+    logic [StatWidth-1:0] sum_miss_n [NumGroups];
+    logic [31:0]          min_main_n [NumGroups];
+    logic [31:0]          max_main_n [NumGroups];
+    logic [31:0]          min_comp_n [NumGroups];
+    logic [31:0]          max_comp_n [NumGroups];
+    logic [31:0]          min_dur_n  [NumGroups];
+    logic [31:0]          max_dur_n  [NumGroups];
+    logic [NumGroups-1:0] seen_n;
+    logic [StatWidth-1:0] total_n;
+    logic [15:0]          err_n;
+
+    logic [2:0]  grp;
+    logic [64:0] ext;
+    logic [32:0] main_plus_comp;
+
+    always_comb begin
+        for (int i = 0; i < NumGroups; i++) begin
+            count_n[i]    = count_q[i];
+            sum_main_n[i] = sum_main_q[i];
+            sum_comp_n[i] = sum_comp_q[i];
+            sum_dur_n[i]  = sum_dur_q[i];
+            sum_req_n[i]  = sum_req_q[i];
+            sum_miss_n[i] = sum_miss_q[i];
+            min_main_n[i] = min_main_q[i];
+            max_main_n[i] = max_main_q[i];
+            min_comp_n[i] = min_comp_q[i];
+            max_comp_n[i] = max_comp_q[i];
+            min_dur_n[i]  = min_dur_q[i];
+            max_dur_n[i]  = max_dur_q[i];
+        end
+        seen_n  = seen_q;
+        total_n = total_q;
+        err_n   = err_q;
+        grp = 3'd5;
+        ext = 65'd0;
+        main_plus_comp = 33'd0;
+
+        if ((req_i == 32'd4) && (miss_i <= 32'd4)) grp = miss_i[2:0];
+
+        if (clear_i) begin
+            for (int i = 0; i < NumGroups; i++) begin
+                count_n[i]    = '0;
+                sum_main_n[i] = '0;
+                sum_comp_n[i] = '0;
+                sum_dur_n[i]  = '0;
+                sum_req_n[i]  = '0;
+                sum_miss_n[i] = '0;
+                min_main_n[i] = 32'd0;
+                max_main_n[i] = 32'd0;
+                min_comp_n[i] = 32'd0;
+                max_comp_n[i] = 32'd0;
+                min_dur_n[i]  = 32'd0;
+                max_dur_n[i]  = 32'd0;
+            end
+            seen_n  = '0;
+            total_n = '0;
+            err_n   = 16'd0;
+        end else if (commit_i) begin
+            if (miss_i > req_i) err_n[2] = 1'b1;
+            main_plus_comp = {1'b0, main_i} + {1'b0, comp_i};
+            if (main_plus_comp > {1'b0, dur_i}) err_n[3] = 1'b1;
+
+            if (&total_q) err_n[0] = 1'b1;
+            total_n = total_q + 1'b1;
+
+            if (&count_q[grp]) err_n[0] = 1'b1;
+            count_n[grp] = count_q[grp] + 1'b1;
+
+            ext = { { (ExtWidth-StatWidth) {1'b0} }, sum_main_q[grp] } +
+                  { { (ExtWidth-32) {1'b0} }, main_i };
+            if (|ext[ExtWidth-1:StatWidth]) err_n[1] = 1'b1;
+            sum_main_n[grp] = ext[StatWidth-1:0];
+
+            ext = { { (ExtWidth-StatWidth) {1'b0} }, sum_comp_q[grp] } +
+                  { { (ExtWidth-32) {1'b0} }, comp_i };
+            if (|ext[ExtWidth-1:StatWidth]) err_n[1] = 1'b1;
+            sum_comp_n[grp] = ext[StatWidth-1:0];
+
+            ext = { { (ExtWidth-StatWidth) {1'b0} }, sum_dur_q[grp] } +
+                  { { (ExtWidth-32) {1'b0} }, dur_i };
+            if (|ext[ExtWidth-1:StatWidth]) err_n[1] = 1'b1;
+            sum_dur_n[grp] = ext[StatWidth-1:0];
+
+            ext = { { (ExtWidth-StatWidth) {1'b0} }, sum_req_q[grp] } +
+                  { { (ExtWidth-32) {1'b0} }, req_i };
+            if (|ext[ExtWidth-1:StatWidth]) err_n[1] = 1'b1;
+            sum_req_n[grp] = ext[StatWidth-1:0];
+
+            ext = { { (ExtWidth-StatWidth) {1'b0} }, sum_miss_q[grp] } +
+                  { { (ExtWidth-32) {1'b0} }, miss_i };
+            if (|ext[ExtWidth-1:StatWidth]) err_n[1] = 1'b1;
+            sum_miss_n[grp] = ext[StatWidth-1:0];
+
+            if (!seen_q[grp]) begin
+                min_main_n[grp] = main_i;
+                max_main_n[grp] = main_i;
+                min_comp_n[grp] = comp_i;
+                max_comp_n[grp] = comp_i;
+                min_dur_n[grp]  = dur_i;
+                max_dur_n[grp]  = dur_i;
+            end else begin
+                if (main_i < min_main_q[grp]) min_main_n[grp] = main_i;
+                if (main_i > max_main_q[grp]) max_main_n[grp] = main_i;
+                if (comp_i < min_comp_q[grp]) min_comp_n[grp] = comp_i;
+                if (comp_i > max_comp_q[grp]) max_comp_n[grp] = comp_i;
+                if (dur_i  < min_dur_q[grp])  min_dur_n[grp]  = dur_i;
+                if (dur_i  > max_dur_q[grp])  max_dur_n[grp]  = dur_i;
+            end
+            seen_n[grp] = 1'b1;
+        end
+    end
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            for (int i = 0; i < NumGroups; i++) begin
+                count_q[i]    <= '0;
+                sum_main_q[i] <= '0;
+                sum_comp_q[i] <= '0;
+                sum_dur_q[i]  <= '0;
+                sum_req_q[i]  <= '0;
+                sum_miss_q[i] <= '0;
+                min_main_q[i] <= 32'd0;
+                max_main_q[i] <= 32'd0;
+                min_comp_q[i] <= 32'd0;
+                max_comp_q[i] <= 32'd0;
+                min_dur_q[i]  <= 32'd0;
+                max_dur_q[i]  <= 32'd0;
+            end
+            seen_q  <= '0;
+            total_q <= '0;
+            err_q   <= 16'd0;
+        end else begin
+            for (int i = 0; i < NumGroups; i++) begin
+                count_q[i]    <= count_n[i];
+                sum_main_q[i] <= sum_main_n[i];
+                sum_comp_q[i] <= sum_comp_n[i];
+                sum_dur_q[i]  <= sum_dur_n[i];
+                sum_req_q[i]  <= sum_req_n[i];
+                sum_miss_q[i] <= sum_miss_n[i];
+                min_main_q[i] <= min_main_n[i];
+                max_main_q[i] <= max_main_n[i];
+                min_comp_q[i] <= min_comp_n[i];
+                max_comp_q[i] <= max_comp_n[i];
+                min_dur_q[i]  <= min_dur_n[i];
+                max_dur_q[i]  <= max_dur_n[i];
+            end
+            seen_q  <= seen_n;
+            total_q <= total_n;
+            err_q   <= err_n;
+        end
+    end
+
+    always_comb begin
+        for (int i = 0; i < NumGroups; i++) begin
+            count_o[i]    = count_q[i];
+            sum_main_o[i] = sum_main_q[i];
+            sum_comp_o[i] = sum_comp_q[i];
+            sum_dur_o[i]  = sum_dur_q[i];
+            sum_req_o[i]  = sum_req_q[i];
+            sum_miss_o[i] = sum_miss_q[i];
+            min_main_o[i] = min_main_q[i];
+            max_main_o[i] = max_main_q[i];
+            min_comp_o[i] = min_comp_q[i];
+            max_comp_o[i] = max_comp_q[i];
+            min_dur_o[i]  = min_dur_q[i];
+            max_dur_o[i]  = max_dur_q[i];
+        end
+        total_o = total_q;
+        err_o   = err_q;
+    end
+
+endmodule

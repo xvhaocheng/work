@@ -1,0 +1,414 @@
+--- a/tests/nonblock_actual_dma_test.cpp
++++ b/tests/nonblock_actual_dma_test.cpp
+@@ -18,15 +18,32 @@
+ // Software timeline (all phase prints are software-timing diagnostics and are
+ // NOT a board measurement):
+ //   1. setup_memory()/reset() per case (counters never carried across cases);
+-//   2. warm: --warmup iterations; each iteration runs ONE V transfer
+-//      (batch OFF, NEXT_ID/DONE polling) then ONE A transfer over --a-pages
+-//      pages, SERIALLY.  WARM IS NOT A CONTINUOUS-A OVERLAP: the continuous
+-//      autonomous-A overlap is exercised by the batch phase below, not here;
++//   2. warm: --warmup V transfers CONCURRENT with a continuously refilled A
++//      ring over --a-pages pages, batch OFF on both.  This models the Linux
++//      warm driver ORDER (linux/drivers/misc/idma.c:2497-2528 plus
++//      idma_run_window() at idma.c:689-748): A launched first, V second;
++//      each loop iteration polls and refills V before A; V stops at exactly
++//      --warmup completions; the A transfer left open by that stop is
++//      drained.  It does NOT model absolute board timing.  The continuous
++//      autonomous-A overlap during the measurement window is still
++//      exercised by the batch phase below, not here;
+ //   3. configure A autonomous batch (target --a-target) and V batch
+ //      (target --transfers, pages=1, gap --v-gap), both configurations
+ //      completed before any trigger;
+ //   4. A NEXT_ID trigger, then V NEXT_ID trigger;
+ //   5. wait V batch complete, STOP A, drain to quiet;
+ //   6. verify every touched page byte-for-byte; check quiet.
+ //
++// Warm-phase model limitations (no board-equivalence claim):
++//   * the model exercises the driver ORDER (A first, V second; V-first poll,
++//     A-second poll; exactly --warmup V completions; one A ring page per
++//     submit; final A drain).  It does NOT model absolute CPU instruction,
++//     cache or interrupt timing: every register access here is a full
++//     multi-cycle cfg AXI transaction issued by a single-threaded software
++//     loop, so cycle counts are model numbers, not board numbers;
++//   * both DMAs are polled by that one loop: no concurrent CPU, no IRQ
++//     latency and no multi-core contention is modelled;
++//   * the warm A refill count depends on model timing, so it is reported
++//     by the WARM-SUMMARY line and asserted only to be > 0, never to a
++//     board value.
++//
+ // Exit: 0 on PASS, non-zero on FAIL / bounded STALL / WAIT.
+@@ -158,5 +175,35 @@
+     long scenario_budget = 0;
+     // Per-V-progress watchdog (gap-scaled), set in reset().
+     long v_watchdog_cycles = 200000L;
++    // ---------------- warm-phase model state / counters -------------------
++    // Software bookkeeping only: what THIS model scheduled and observed; not
++    // a hardware measurement and not a board target.
++    uint32_t warm_a_page         = 0;   // next A ring page (first page is 0)
++    uint64_t warm_v_submitted    = 0;   // V transfers submitted during warm
++    uint64_t warm_v_completed    = 0;   // V DONE matches observed
++    uint64_t warm_a_submitted    = 0;   // A transfers submitted during warm
++    uint64_t warm_a_completed    = 0;   // A DONE matches observed
++    uint64_t warm_overlap_ticks  = 0;   // HW cycles with V and A both unfinished
++    bool     warm_a_drained      = false;
++    long     warm_a_drain_cycles = 0;
++    long     warm_start_cycle    = 0;
++    long     warm_end_cycle      = 0;
++    // Refreshed ONLY by a warm V completion, never by any A handshake, so a
++    // stalled V cannot be hidden by A traffic.
++    long     warm_v_progress_cycle = 0;
++    // One 4 KiB V job plus its walk is ~1e3-1e4 model cycles here; 200k is a
++    // generous but finite bound for both the V stall watchdog and the A drain.
++    static const long WARM_V_WATCHDOG_CYCLES = 200000L;
++    static const long WARM_A_DRAIN_CYCLES    = 200000L;
++    // Hardware-observed warm overlap scoreboard, driven ONLY by
++    // dbg_dma_issue/dbg_dma_done (nonblock_actual_dma_top.sv:814-815).
++    // Bit0 = DMA0 = V, bit1 = DMA1 = A.
++    bool     warm_hw_track      = false;  // enabled only during warm + drain
++    bool     warm_hw_v_busy     = false;  // hardware-observed V job unfinished
++    bool     warm_hw_a_busy     = false;  // hardware-observed A job unfinished
++    uint64_t warm_hw_v_issue    = 0;
++    uint64_t warm_hw_v_done     = 0;
++    uint64_t warm_hw_a_issue    = 0;
++    uint64_t warm_hw_a_done     = 0;
+ #ifdef ACTUAL_DMA_SYSTEM
+@@ -461,5 +508,20 @@
+ 
+         // V (DMA0 = bank0) independent completion progress.
+         if (top->dbg_dma_done & 1) v_progress_cycle = g_cycle;
++        // Warm-phase hardware overlap scoreboard.  Only active during warm
++        // (and its drain); uses the real per-channel issue/done observer
++        // pulses, so the overlap counter is a cycle count of genuinely
++        // unfinished jobs, NOT a software-inflight approximation.
++        if (warm_hw_track) {
++            const uint32_t iss = (uint32_t)top->dbg_dma_issue & 3u;
++            const uint32_t dnn = (uint32_t)top->dbg_dma_done  & 3u;
++            // Process done before issue so a back-to-back
++            // done-then-issue cycle keeps the channel busy.
++            if (dnn & 1u) { ++warm_hw_v_done; warm_hw_v_busy = false; }
++            if (iss & 1u) { ++warm_hw_v_issue; warm_hw_v_busy = true; }
++            if (dnn & 2u) { ++warm_hw_a_done; warm_hw_a_busy = false; }
++            if (iss & 2u) { ++warm_hw_a_issue; warm_hw_a_busy = true; }
++            if (warm_hw_v_busy && warm_hw_a_busy) ++warm_overlap_ticks;
++        }
+ 
+         if (top->dbg_fast_resp_valid && top->dbg_fast_resp_ready) {
+@@ -681,10 +743,28 @@
+         n_fast = 0;
+         n_fast_bank[0] = n_fast_bank[1] = 0;
+         v_done_last = a_done_last = 0;
++        warm_a_page         = 0;
++        warm_v_submitted    = 0;
++        warm_v_completed    = 0;
++        warm_a_submitted    = 0;
++        warm_a_completed    = 0;
++        warm_overlap_ticks  = 0;
++        warm_a_drained      = false;
++        warm_a_drain_cycles = 0;
++        warm_start_cycle    = 0;
++        warm_end_cycle      = 0;
++        warm_hw_track       = false;
++        warm_hw_v_busy      = false;
++        warm_hw_a_busy      = false;
++        warm_hw_v_issue     = 0;
++        warm_hw_v_done      = 0;
++        warm_hw_a_issue     = 0;
++        warm_hw_a_done      = 0;
+ 
+         for (int i = 0; i < 8; ++i) tick();
+         top->rst_ni = 1;
+         for (int i = 0; i < 4; ++i) tick();
+         last_progress_cycle = g_cycle;
+         v_progress_cycle    = g_cycle;
++        warm_v_progress_cycle = g_cycle;
+ #ifdef ACTUAL_DMA_SYSTEM
+@@ -833,6 +913,20 @@
+         std::fprintf(stderr,
+             "  v_done_last(debug)=%llu a_done_last(debug)=%llu\n",
+             (unsigned long long)v_done_last, (unsigned long long)a_done_last);
++        std::fprintf(stderr,
++            "  warm v_sub=%llu v_done=%llu a_sub=%llu a_done=%llu "
++            "hw_overlap_ticks=%llu hw_v_issue=%llu hw_v_done=%llu "
++            "hw_a_issue=%llu hw_a_done=%llu a_page=%u\n",
++            (unsigned long long)warm_v_submitted,
++            (unsigned long long)warm_v_completed,
++            (unsigned long long)warm_a_submitted,
++            (unsigned long long)warm_a_completed,
++            (unsigned long long)warm_overlap_ticks,
++            (unsigned long long)warm_hw_v_issue,
++            (unsigned long long)warm_hw_v_done,
++            (unsigned long long)warm_hw_a_issue,
++            (unsigned long long)warm_hw_a_done,
++            (unsigned)warm_a_page);
+         std::fprintf(stderr,
+             "  mem_q=%zu caw_q=%zu cb_q=%zu\n",
+             mem_q.size(), caw_q.size(), cb_q.size());
+@@ -887,7 +981,10 @@
+     long total_budget() const {
+         long per_job = per_job_cycles();
++        // The warm phase is concurrent, but it still moves up to `warmup` V
++        // jobs plus a comparable number of A refills, so the original
++        // two-jobs-per-warmup bound is kept.
+         long warm    = (long)warmup * 2L * per_job;
+         long victim  = (long)v_transfers * (per_job + (long)v_gap_cycles);
+         long aggr    = (long)a_pages * 16L * per_job;
+@@ -895,37 +992,197 @@
+-    // ---------------------------------------------------------------------
+-    // warm phase: --warmup iterations, V then A, SERIAL
+-    // ---------------------------------------------------------------------
+-    void warm_phase() {
+-        for (uint32_t i = 0; i < warmup; ++i) {
+-            // V : one 4 KiB copy, batch OFF.  The expected ID is the value the
+-            // NEXT_ID read returned, so a wrong/stale DONE is never accepted.
+-            program_single(SEL_V, V_SRC_IOVA, V_DST_IOVA);
+-            uint64_t v_exp = trigger(SEL_V);
+-            wait_done(SEL_V, v_exp, "warm V");
+-
+-            // A : ring over a_pages, batch OFF
+-            uint32_t p = i % a_pages;
+-            program_single(SEL_A,
+-                           A_IOVA_BASE + (uint64_t)p * 0x1000,
+-                           A_IOVA_BASE + (uint64_t)(a_pages + p) * 0x1000);
+-            uint64_t a_exp = trigger(SEL_A);
+-            wait_done(SEL_A, a_exp, "warm A");
+-
+-            if (g_cycle - last_progress_cycle > WATCHDOG_CYCLES) {
+-                dump_stall("warm");
+-                throw TestFailure("watchdog during warm-up");
+-            }
+-            if (g_cycle - scenario_start > scenario_budget) {
+-                dump_stall("warm budget");
+-                throw TestFailure("scenario budget exceeded during warm-up");
+-            }
+-        }
+-    }
+-
+-    void drain_a() {
+-        // batch is OFF during warm: nothing is outstanding by construction,
+-        // but keep the check so a future change cannot silently paper over it.
+-        bool err, complete, stopped, active, enable;
+-        read_batch_ctl(SEL_A, err, complete, stopped, active, enable);
+-        CHECK(!active, "A still active after warm drain");
+-    }
++    // ---------------------------------------------------------------------
++    // warm phase: one V transfer in flight, concurrently with a continuously
++    // refilled A ring, batch OFF on both channels.  This models the Linux
++    // warm schedule:
++    //   idma_run_session2()  linux/drivers/misc/idma.c:2497-2528
++    //   idma_submit()        linux/drivers/misc/idma.c:447-467
++    //   idma_run_window()    linux/drivers/misc/idma.c:689-748
++    //   idma_drain()         linux/drivers/misc/idma.c:750-769
++    // The ORDER is modelled; the absolute timing is not (see the model
++    // limitations note at the top of this file).
++    // ---------------------------------------------------------------------
++
++    // One 4 KiB V copy, batch OFF.  Returns the reserved NEXT_ID so DONE can
++    // be matched exactly; a stale DONE is never accepted.
++    uint64_t warm_submit_v() {
++        program_single(SEL_V, V_SRC_IOVA, V_DST_IOVA);
++        ++warm_v_submitted;
++        return trigger(SEL_V);
++    }
++
++    // One A ring step, batch OFF.  The ring index starts at page 0 and
++    // advances one page per submit with wrap, like the driver's
++    // "next_offset += chunk; if (next_offset == size) next_offset = 0"
++    // (idma.c:440-442) over an a_pages-page ring.  Source page p is
++    // A_IOVA_BASE + p*4K and destination page p is
++    // A_IOVA_BASE + (a_pages + p)*4K, as setup_memory() maps them.
++    uint64_t warm_submit_a() {
++        const uint32_t p = warm_a_page;
++
++        CHECK(p < a_pages, "warm A ring page index out of range");
++        program_single(SEL_A,
++                       A_IOVA_BASE + (uint64_t)p * 0x1000,
++                       A_IOVA_BASE + (uint64_t)(a_pages + p) * 0x1000);
++        warm_a_page = (p + 1 == a_pages) ? 0 : (p + 1);
++        ++warm_a_submitted;
++        return trigger(SEL_A);
++    }
++
++    void warm_phase() {
++        // Software mirror of struct idma_stream::in_flight: at most one
++        // transfer outstanding per channel.
++        bool     v_in_flight = false, a_in_flight = false;
++        uint64_t v_id = 0, a_id = 0;
++        long     drain_start;
++        long     a_deadline;
++
++        warm_start_cycle      = g_cycle;
++        warm_v_progress_cycle = g_cycle;
++        warm_a_page           = 0;
++        warm_v_submitted      = 0;
++        warm_v_completed      = 0;
++        warm_a_submitted      = 0;
++        warm_a_completed      = 0;
++        warm_overlap_ticks    = 0;
++        warm_a_drained        = false;
++        warm_a_drain_cycles   = 0;
++        warm_hw_track         = false;   // enabled below only if warmup > 0
++        warm_hw_v_busy        = false;
++        warm_hw_a_busy        = false;
++        warm_hw_v_issue       = 0;
++        warm_hw_v_done        = 0;
++        warm_hw_a_issue       = 0;
++        warm_hw_a_done        = 0;
++
++        if (warmup == 0) {
++            // idma.c:2497-2502: with warmup_transfers == 0 the driver
++            // neither launches A nor enters the V window.
++            warm_a_drained = true;
++            warm_end_cycle = g_cycle;
++            return;
++        }
++
++        // Enable the hardware overlap scoreboard before the first cfg write
++        // so the initial A issue pulse is captured.
++        warm_hw_track = true;
++
++        // ---- A-first initial launch (idma.c:2497-2501) -------------------
++        a_id = warm_submit_a();
++        a_in_flight = true;
++
++        // ---- V first submit, before the poll loop (idma.c:706) ----------
++        v_id = warm_submit_v();
++        v_in_flight = true;
++
++        for (;;) {
++            // Bounded watchdog refreshed ONLY by a V (DMA0) completion, so A
++            // handshakes can never mask a stalled V.
++            if (g_cycle - warm_v_progress_cycle > WARM_V_WATCHDOG_CYCLES) {
++                dump_stall("warm V progress");
++                throw TestFailure("watchdog: warm V made no completion progress");
++            }
++            if (g_cycle - scenario_start > scenario_budget) {
++                dump_stall("warm budget");
++                throw TestFailure("scenario budget exceeded during warm-up");
++            }
++
++            // ---- V first: poll (idma.c:718), then refill (idma.c:727) -----
++            if (v_in_flight && cfg_rd(SEL_V, REG_DONE) == v_id) {
++                v_in_flight = false;
++                ++warm_v_completed;
++                warm_v_progress_cycle = g_cycle;
++                // idma.c:722-726: stop at exactly `count` completions, before
++                // A is polled or refilled again.
++                if (warm_v_completed == warmup)
++                    break;
++                v_id = warm_submit_v();
++                v_in_flight = true;
++            }
++
++            // ---- A second: poll (idma.c:731), refill (idma.c:736) --------
++            if (a_in_flight && cfg_rd(SEL_A, REG_DONE) == a_id) {
++                a_in_flight = false;
++                ++warm_a_completed;
++                a_id = warm_submit_a();
++                a_in_flight = true;
++            }
++
++            tick();
++        }
++
++        CHECK(!v_in_flight, "warm V still in flight after the target count");
++        CHECK(warm_v_completed == warmup,
++              "warm V completion count does not match --warmup");
++        CHECK(warm_v_submitted == warmup,
++              "warm issued more V transfers than the target count");
++
++        // ---- drain the still-open A transfer (idma.c:2524-2528) ---------
++        // A fixed cycle cap keeps this bound independent of any progress
++        // heuristic, like idma_drain()'s fixed timeout.
++        drain_start = g_cycle;
++        if (a_in_flight) {
++            a_deadline = g_cycle + WARM_A_DRAIN_CYCLES;
++            for (;;) {
++                if (cfg_rd(SEL_A, REG_DONE) == a_id) {
++                    a_in_flight = false;
++                    ++warm_a_completed;   // count the drained job
++                    break;
++                }
++                if (g_cycle >= a_deadline) {
++                    dump_stall("warm A drain");
++                    throw TestFailure("watchdog: warm A drain never completed");
++                }
++                tick();
++            }
++        }
++        warm_a_drain_cycles = g_cycle - drain_start;
++        warm_a_drained      = true;
++        warm_end_cycle      = g_cycle;
++
++        // Disable the hardware scoreboard now that warm is done.
++        warm_hw_track = false;
++
++        // ---- post-warm consistency and data checks ----------------------
++        CHECK(warm_a_completed == warm_a_submitted,
++              "warm A completion count does not match submissions after drain");
++        CHECK(warm_a_completed > 0, "warm A completed no transfer");
++        CHECK(warm_hw_v_issue == warm_hw_v_done,
++              "warm hardware V issue/done pulses disagree");
++        CHECK(warm_hw_a_issue == warm_hw_a_done,
++              "warm hardware A issue/done pulses disagree");
++        CHECK(!warm_hw_v_busy && !warm_hw_a_busy,
++              "warm hardware job still pending after drain");
++
++        // ---- bounded A-ring data evidence -------------------------------
++        // One A transfer is outstanding at a time and jobs retire in order,
++        // so `warm_a_completed` completions cover exactly the first
++        // min(warm_a_completed, a_pages) ring pages, starting at page 0.
++        // This proves warm A really moved data, not only that DONE matched.
++        // V's single page is covered by the scenario-wide check below.
++        {
++            const uint32_t pages_done =
++                (warm_a_completed < (uint64_t)a_pages) ?
++                (uint32_t)warm_a_completed : a_pages;
++
++            for (uint32_t p = 0; p < pages_done; ++p) {
++                for (uint32_t i = 0; i < PAGE_BEATS; ++i) {
++                    CHECK(read64(A_SRC_PA_BASE + (uint64_t)p * 0x1000 +
++                                 (uint64_t)i * 8) == page_word(1 + p, i),
++                          "warm A source page was modified");
++                    CHECK(read64(A_DST_PA_BASE + (uint64_t)p * 0x1000 +
++                                 (uint64_t)i * 8) == page_word(1 + p, i),
++                          "warm A destination page was not copied");
++                }
++            }
++        }
++    }
++
++    void drain_a() {
++        // batch is OFF during warm and the Linux warm path leaves at most
++        // ONE A transfer open, which warm_phase() drains in-line under a
++        // fixed cycle cap.  Keep the checks so a future change cannot
++        // silently paper over an outstanding A.
++        bool err, complete, stopped, active, enable;
++        read_batch_ctl(SEL_A, err, complete, stopped, active, enable);
++        CHECK(!active, "A still active after warm drain");
++        CHECK(warm_a_drained, "warm A drain did not complete");
++    }
+@@ -950,7 +1207,24 @@
+         // ---- 1. warm + drain -------------------------------------------
+         warm_phase();
+         drain_a();
++        std::printf("WARM-SUMMARY model v_target=%u v_submitted=%llu "
++                    "v_completed=%llu a_submitted=%llu a_completed=%llu "
++                    "hw_overlap_ticks=%llu hw_v_issue=%llu hw_v_done=%llu "
++                    "hw_a_issue=%llu hw_a_done=%llu a_drain_cycles=%ld "
++                    "warm_cycles=%ld (software-model counters, NOT a board measurement)\n",
++                    (unsigned)warmup,
++                    (unsigned long long)warm_v_submitted,
++                    (unsigned long long)warm_v_completed,
++                    (unsigned long long)warm_a_submitted,
++                    (unsigned long long)warm_a_completed,
++                    (unsigned long long)warm_overlap_ticks,
++                    (unsigned long long)warm_hw_v_issue,
++                    (unsigned long long)warm_hw_v_done,
++                    (unsigned long long)warm_hw_a_issue,
++                    (unsigned long long)warm_hw_a_done,
++                    warm_a_drain_cycles,
++                    warm_end_cycle - warm_start_cycle);
+ 
+         // ---- 2. configure BOTH batches before any trigger --------------
+         // A autonomous: ring over a_pages, no gap.

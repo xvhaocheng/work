@@ -1,0 +1,481 @@
+--- a/src/host/IO_Flow_Base.cpp
++++ b/src/host/IO_Flow_Base.cpp
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #include "../d_boundary_probe.h"
+ #include "IO_Flow_Base.h"
+ #include "../ssd/Host_Interface_Defs.h"
+@@ -254,6 +255,7 @@
+ 	{
+ 		//Find the request and update statistics
+ 		Host_IO_Request* request = nvme_software_request_queue[cqe->Command_Identifier];
++		Identity::host_completed(Simulator->Time(), request, cqe);
+ 		nvme_software_request_queue.erase(cqe->Command_Identifier);
+ 		available_command_ids.insert(cqe->Command_Identifier);
+ 		sim_time_type device_response_time = Simulator->Time() - request->Enqueue_time;
+@@ -405,6 +407,7 @@
+ 			sqe->PRP_entry_2 = (DATA_MEMORY_REGION + 0x1000);//Dummy addresses
+ 		}
+ 
++		Identity::sqe_bind(Simulator->Time(), sqe, request);
+ 		return sqe;
+ 	}
+ 
+--- a/src/host/IO_Flow_Trace_Based.cpp
++++ b/src/host/IO_Flow_Trace_Based.cpp
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #include "../d_boundary_probe.h"
+ #include "IO_Flow_Trace_Based.h"
+ #include "../utils/StringTools.h"
+@@ -59,6 +60,7 @@
+ 
+ 	request->Arrival_time = time_offset + Simulator->Time();
+ 	STAT_generated_request_count++;
++	Identity::host_generated(Simulator->Time(), request, flow_id);
+ 
+ 	return request;
+ }
+--- /dev/null
++++ b/src/identity_log.h
+@@ -0,0 +1,149 @@
++#ifndef MQ_IDENTITY_LOG_H
++#define MQ_IDENTITY_LOG_H
++#include <cstdint>
++#include <map>
++#include <iostream>
++#include <cstddef>
++#include <new>
++#include <utility>
++// Passive process-local bookkeeping only. No model fields, events, or decisions.
++namespace Identity {
++// Dedicated BSS arena: observer map nodes never consume the model malloc heap.
++// No reclamation is needed for this single fresh-process frozen workload.
++struct Arena {
++ alignas(std::max_align_t) unsigned char bytes[32u*1024u*1024u];
++ size_t used=0;
++};
++inline Arena& arena() { static Arena a; return a; }
++template<class T> struct Allocator {
++ typedef T value_type;
++ template<class U> struct rebind { typedef Allocator<U> other; };
++ Allocator() noexcept {}
++ template<class U> Allocator(const Allocator<U>&) noexcept {}
++ T* allocate(size_t n) {
++  Arena& a=arena();const size_t alignment=alignof(T);
++  const size_t start=(a.used+alignment-1)&~(alignment-1);
++  if(start>sizeof(a.bytes) || n>(sizeof(a.bytes)-start)/sizeof(T)) throw std::bad_alloc();
++  a.used=start+n*sizeof(T);return reinterpret_cast<T*>(a.bytes+start);
++ }
++ void deallocate(T*,size_t) noexcept {}
++};
++template<class T,class U> inline bool operator==(const Allocator<T>&,const Allocator<U>&) {return true;}
++template<class T,class U> inline bool operator!=(const Allocator<T>&,const Allocator<U>&) {return false;}
++template<class V> using Map=std::map<const void*,V,std::less<const void*>,Allocator<std::pair<const void* const,V>>>;
++
++struct Child { uint64_t uid, owner, source, type, stream, lpa, ppa; };
++struct State {
++ uint64_t host_next=0, child_next=0;
++ bool disabled=false;
++ Map<uint64_t> hosts, sqes, users, cqes;
++ Map<Child> children;
++};
++inline State& state() { static State s; return s; }
++inline void error(uint64_t t,const char* reason,const void* p) {
++ std::cerr << "{\"event\":\"identity_error\",\"time_ns\":"<<t<<",\"reason\":\""<<reason<<"\",\"pointer\":\""<<p<<"\"}\n";
++}
++inline uint64_t lookup(const Map<uint64_t>& m,const void* p,uint64_t t,const char* reason) {
++ auto i=m.find(p); if(i==m.end()) {error(t,reason,p);return 0;} return i->second;
++}
++inline void lpa_event(const char* event,uint64_t t,uint64_t stream,uint64_t lpa) {
++ if(state().disabled)return;
++ std::cerr<<"{\"event\":\""<<event<<"\",\"time_ns\":"<<t<<",\"stream\":"<<stream<<",\"lpa\":"<<lpa<<"}\n";
++}
++template<class H> inline void host_generated(uint64_t t,H* p,uint64_t flow) {
++ if(state().disabled)return;
++ try {
++ uint64_t uid=++state().host_next; state().hosts[p]=uid;
++ std::cerr<<"{\"event\":\"identity_host_generated\",\"time_ns\":"<<t<<",\"host_uid\":"<<uid<<",\"host_ptr\":\""<<p<<"\",\"flow\":"<<flow<<",\"arrival_ns\":"<<p->Arrival_time<<",\"lba\":"<<p->Start_LBA<<",\"sectors\":"<<p->LBA_count<<",\"type\":"<<static_cast<unsigned>(p->Type)<<"}\n";
++ } catch(const std::bad_alloc&) {
++  state().disabled=true;error(t,"observer_arena_exhausted_identity_disabled",nullptr);
++ }
++}
++template<class S,class H> inline void sqe_bind(uint64_t t,S* sqe,H* h) {
++ if(state().disabled)return;
++ try {
++ auto uid=lookup(state().hosts,h,t,"sqe_missing_host"); state().sqes[sqe]=uid;
++ std::cerr<<"{\"event\":\"identity_sqe_bind\",\"time_ns\":"<<t<<",\"host_uid\":"<<uid<<",\"host_ptr\":\""<<h<<"\",\"sqe_ptr\":\""<<sqe<<"\",\"cid\":"<<sqe->Command_Identifier<<"}\n";
++ } catch(const std::bad_alloc&) {
++  state().disabled=true;error(t,"observer_arena_exhausted_identity_disabled",nullptr);
++ }
++}
++template<class U,class S> inline void user_bind(uint64_t t,U* u,S* sqe) {
++ if(state().disabled)return;
++ try {
++ auto uid=lookup(state().sqes,sqe,t,"user_missing_sqe"); state().users[u]=uid;
++ std::cerr<<"{\"event\":\"identity_user_bind\",\"time_ns\":"<<t<<",\"host_uid\":"<<uid<<",\"user_uid\":"<<uid<<",\"native_id\":"<<u->ID<<",\"user_ptr\":\""<<u<<"\",\"sqe_ptr\":\""<<sqe<<"\",\"cid\":"<<sqe->Command_Identifier<<",\"stream\":"<<u->Stream_id<<",\"lba\":"<<u->Start_LBA<<",\"sectors\":"<<u->SizeInSectors<<"}\n";
++ } catch(const std::bad_alloc&) {
++  state().disabled=true;error(t,"observer_arena_exhausted_identity_disabled",nullptr);
++ }
++}
++template<class U> inline void user_event(const char* event,uint64_t t,U* u) {
++ if(state().disabled)return;
++ try {
++ auto uid=lookup(state().users,u,t,"event_missing_user");
++ std::cerr<<"{\"event\":\""<<event<<"\",\"time_ns\":"<<t<<",\"user_uid\":"<<uid<<",\"user_ptr\":\""<<u<<"\"}\n";
++ } catch(const std::bad_alloc&) {
++  state().disabled=true;error(t,"observer_arena_exhausted_identity_disabled",nullptr);
++ }
++}
++inline void child_event(const char* event,uint64_t t,const void* p) {
++ if(state().disabled)return;
++ try {
++ auto i=state().children.find(p); if(i==state().children.end()) {error(t,"event_missing_child",p);return;}
++ const Child& c=i->second;
++ std::cerr<<"{\"event\":\""<<event<<"\",\"time_ns\":"<<t<<",\"child_uid\":"<<c.uid<<",\"user_uid\":"<<c.owner<<",\"child_ptr\":\""<<p<<"\",\"source\":"<<c.source<<",\"type\":"<<c.type<<",\"stream\":"<<c.stream<<",\"creation_lpa\":"<<c.lpa<<",\"creation_ppa\":"<<c.ppa<<"}\n";
++ } catch(const std::bad_alloc&) {
++  state().disabled=true;error(t,"observer_arena_exhausted_identity_disabled",nullptr);
++ }
++}
++inline void child_retire(const char* event,uint64_t t,const void* p) {
++ if(state().disabled)return;
++ try {
++ child_event(event,t,p);state().children.erase(p);
++ } catch(const std::bad_alloc&) {
++  state().disabled=true;error(t,"observer_arena_exhausted_identity_disabled",nullptr);
++ }
++}
++template<class T> inline void child_live_event(const char* event,uint64_t t,T* p) {
++ if(state().disabled)return;
++ try {
++ // Scalar fields initialized by both base constructors; never dereference owner.
++ child_event(event,t,p);
++ auto i=state().children.find(p);if(i==state().children.end())return;
++ std::cerr<<"{\"event\":\"identity_child_position\",\"time_ns\":"<<t<<",\"child_uid\":"<<i->second.uid<<",\"lpa\":"<<p->LPA<<",\"ppa\":"<<p->PPA<<"}\n";
++ } catch(const std::bad_alloc&) {
++  state().disabled=true;error(t,"observer_arena_exhausted_identity_disabled",nullptr);
++ }
++}
++template<class T> inline void child_created(uint64_t t,T* p) {
++ if(state().disabled)return;
++ try {
++ uint64_t owner=p->UserIORequest?lookup(state().users,p->UserIORequest,t,"child_missing_user"):0;
++ Child c={++state().child_next,owner,static_cast<uint64_t>(p->Source),static_cast<uint64_t>(p->Type),p->Stream_id,p->LPA,p->PPA};
++ state().children[p]=c; child_event("identity_child_created",t,p);
++ } catch(const std::bad_alloc&) {
++  state().disabled=true;error(t,"observer_arena_exhausted_identity_disabled",nullptr);
++ }
++}
++template<class U,class C> inline void cqe_send(uint64_t t,U* u,C* c) {
++ if(state().disabled)return;
++ try {
++ auto uid=lookup(state().users,u,t,"cqe_missing_user"); state().cqes[c]=uid;
++ std::cerr<<"{\"event\":\"identity_cqe_send\",\"time_ns\":"<<t<<",\"user_uid\":"<<uid<<",\"user_ptr\":\""<<u<<"\",\"cqe_ptr\":\""<<c<<"\",\"cid\":"<<c->Command_Identifier<<"}\n";
++ } catch(const std::bad_alloc&) {
++  state().disabled=true;error(t,"observer_arena_exhausted_identity_disabled",nullptr);
++ }
++}
++template<class H,class C> inline void host_completed(uint64_t t,H* h,C* c) {
++ if(state().disabled)return;
++ try {
++ auto uid=lookup(state().hosts,h,t,"complete_missing_host"), sent=lookup(state().cqes,c,t,"complete_missing_cqe");
++ if(uid!=sent) error(t,"host_cqe_uid_mismatch",c);
++ std::cerr<<"{\"event\":\"identity_host_complete\",\"time_ns\":"<<t<<",\"host_uid\":"<<uid<<",\"cqe_user_uid\":"<<sent<<",\"host_ptr\":\""<<h<<"\",\"cqe_ptr\":\""<<c<<"\",\"cid\":"<<c->Command_Identifier<<"}\n";
++ state().hosts.erase(h);state().cqes.erase(c);
++ } catch(const std::bad_alloc&) {
++  state().disabled=true;error(t,"observer_arena_exhausted_identity_disabled",nullptr);
++ }
++}
++}
++#endif
+--- a/src/ssd/Address_Mapping_Unit_Page_Level.cpp
++++ b/src/ssd/Address_Mapping_Unit_Page_Level.cpp
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #include <cmath>
+ #include <assert.h>
+ #include <stdexcept>
+@@ -229,12 +230,14 @@
+ 
+ 		auto read_entry = Waiting_unmapped_read_transactions.begin();
+ 		while (read_entry != Waiting_unmapped_read_transactions.end()) {
++			Identity::child_retire("identity_mapping_cleanup_delete", Simulator->Time(), read_entry->second);
+ 			delete read_entry->second;
+ 			Waiting_unmapped_read_transactions.erase(read_entry++);
+ 		}
+ 
+ 		auto entry_write = Waiting_unmapped_program_transactions.begin();
+ 		while (entry_write != Waiting_unmapped_program_transactions.end()) {
++			Identity::child_retire("identity_mapping_cleanup_delete", Simulator->Time(), entry_write->second);
+ 			delete entry_write->second;
+ 			Waiting_unmapped_program_transactions.erase(entry_write++);
+ 		}
+@@ -564,12 +567,14 @@
+ 					Stats::total_readTR_CMT_queries_per_stream[stream_id]++;
+ 					Stats::readTR_CMT_miss++;
+ 					Stats::readTR_CMT_miss_per_stream[stream_id]++;
++					Identity::child_live_event("identity_mapping_wait_enter", Simulator->Time(), transaction);
+ 					domains[stream_id]->Waiting_unmapped_read_transactions.insert(std::pair<LPA_type, NVM_Transaction_Flash*>(transaction->LPA, transaction));
+ 				} else {//This is a write transaction
+ 					Stats::total_writeTR_CMT_queries++;
+ 					Stats::total_writeTR_CMT_queries_per_stream[stream_id]++;
+ 					Stats::writeTR_CMT_miss++;
+ 					Stats::writeTR_CMT_miss_per_stream[stream_id]++;
++					Identity::child_live_event("identity_mapping_wait_enter", Simulator->Time(), transaction);
+ 					domains[stream_id]->Waiting_unmapped_program_transactions.insert(std::pair<LPA_type, NVM_Transaction_Flash*>(transaction->LPA, transaction));
+ 				}
+ 			}
+@@ -1664,6 +1669,7 @@
+ 
+ 	inline void Address_Mapping_Unit_Page_Level::handle_transaction_serviced_signal_from_PHY(NVM_Transaction_Flash* transaction)
+ 	{
++		Identity::child_live_event("identity_amu_callback", Simulator->Time(), transaction);
+ 		//First check if the transaction source is Mapping Module
+ 		if (transaction->Source != Transaction_Source_Type::MAPPING) {
+ 			return;
+@@ -1708,6 +1714,7 @@
+ 									_my_instance->mange_unsuccessful_translation(it2->second);
+ 								}
+ 							}
++							Identity::child_live_event("identity_mapping_wait_exit", Simulator->Time(), it2->second);
+ 							_my_instance->domains[transaction->Stream_id]->Waiting_unmapped_read_transactions.erase(it2++);
+ 						}
+ 						it2 = _my_instance->domains[transaction->Stream_id]->Waiting_unmapped_program_transactions.find(lpa);
+@@ -1725,6 +1732,7 @@
+ 									_my_instance->mange_unsuccessful_translation(it2->second);
+ 								}
+ 							}
++							Identity::child_live_event("identity_mapping_wait_exit", Simulator->Time(), it2->second);
+ 							_my_instance->domains[transaction->Stream_id]->Waiting_unmapped_program_transactions.erase(it2++);
+ 						}
+ 					}
+@@ -1754,6 +1762,7 @@
+ 			PRINT_ERROR("Illegal operation: Locking an LPA that has already been locked!");
+ 		}
+ 		domains[stream_id]->Locked_LPAs.insert(lpa);
++		if (itr == domains[stream_id]->Locked_LPAs.end()) Identity::lpa_event("identity_lpa_lock", Simulator->Time(), stream_id, lpa);
+ 	}
+ 
+ 	inline void Address_Mapping_Unit_Page_Level::Set_barrier_for_accessing_mvpn(stream_id_type stream_id, MVPN_type mvpn)
+@@ -1801,11 +1810,14 @@
+ 			PRINT_ERROR("Illegal operation: Unlocking an LPA that has not been locked!");
+ 		}
+ 		domains[stream_id]->Locked_LPAs.erase(itr);
++		Identity::lpa_event("identity_lpa_unlock", Simulator->Time(), stream_id, lpa);
+ 
+ 		//If there are read requests waiting behind the barrier, then MQSim assumes they can be serviced with the actual page data that is accessed during GC execution
+ 		auto read_tr = domains[stream_id]->Read_transactions_behind_LPA_barrier.find(lpa);
+ 		while (read_tr != domains[stream_id]->Read_transactions_behind_LPA_barrier.end()) {
++			Identity::child_live_event("identity_barrier_read_release", Simulator->Time(), (*read_tr).second);
+ 			handle_transaction_serviced_signal_from_PHY((*read_tr).second);
++			Identity::child_retire("identity_barrier_read_delete", Simulator->Time(), (*read_tr).second);
+ 			delete (*read_tr).second;
+ 			domains[stream_id]->Read_transactions_behind_LPA_barrier.erase(read_tr);
+ 			read_tr = domains[stream_id]->Read_transactions_behind_LPA_barrier.find(lpa);
+@@ -1814,7 +1826,9 @@
+ 		//If there are write requests waiting behind the barrier, then MQSim assumes they can be serviced with the actual page data that is accessed during GC execution. This may not be 100% true for all write requests, but, to avoid more complexity in the simulation, we accept this assumption.
+ 		auto write_tr = domains[stream_id]->Write_transactions_behind_LPA_barrier.find(lpa);
+ 		while (write_tr != domains[stream_id]->Write_transactions_behind_LPA_barrier.end()) {
++			Identity::child_live_event("identity_barrier_write_release", Simulator->Time(), (*write_tr).second);
+ 			handle_transaction_serviced_signal_from_PHY((*write_tr).second);
++			Identity::child_retire("identity_barrier_write_delete", Simulator->Time(), (*write_tr).second);
+ 			delete (*write_tr).second;
+ 			domains[stream_id]->Write_transactions_behind_LPA_barrier.erase(write_tr);
+ 			write_tr = domains[stream_id]->Write_transactions_behind_LPA_barrier.find(lpa);
+@@ -1846,6 +1860,7 @@
+ 
+ 			handle_transaction_serviced_signal_from_PHY(readTR);
+ 			
++			Identity::child_retire("identity_mvpn_read_delete", Simulator->Time(), readTR);
+ 			delete readTR;
+ 		}
+ 
+@@ -1883,12 +1898,14 @@
+ 
+ 			handle_transaction_serviced_signal_from_PHY(writeTR);
+ 
++			Identity::child_retire("identity_mvpn_write_delete", Simulator->Time(), writeTR);
+ 			delete writeTR;
+ 		}
+ 	}
+ 
+ 	inline void Address_Mapping_Unit_Page_Level::manage_user_transaction_facing_barrier(NVM_Transaction_Flash* transaction)
+ 	{
++		Identity::child_live_event("identity_barrier_enter", Simulator->Time(), transaction);
+ 		std::pair<LPA_type, NVM_Transaction_Flash*> entry(transaction->LPA, transaction);
+ 		if (transaction->Type == Transaction_Type::READ) {
+ 			domains[transaction->Stream_id]->Read_transactions_behind_LPA_barrier.insert(entry);
+@@ -1909,6 +1926,7 @@
+ 	void Address_Mapping_Unit_Page_Level::mange_unsuccessful_translation(NVM_Transaction_Flash* transaction)
+ 	{
+ 		//Currently, the only unsuccessfull translation would be for program translations that are accessing a plane that is running out of free pages
++		Identity::child_live_event("identity_overfull_wait_enter", Simulator->Time(), transaction);
+ 		Write_transactions_for_overfull_planes[transaction->Address.ChannelID][transaction->Address.ChipID][transaction->Address.DieID][transaction->Address.PlaneID].insert((NVM_Transaction_Flash_WR*)transaction);
+ 	}
+ 
+@@ -1924,6 +1942,7 @@
+ 				if ((*program)->RelatedRead != NULL) {
+ 					ftl->TSU->Submit_transaction((*program)->RelatedRead);
+ 				}
++				Identity::child_live_event("identity_overfull_wait_exit", Simulator->Time(), *program);
+ 				waiting_write_list.erase(program++);
+ 			}
+ 			else {
+--- a/src/ssd/Data_Cache_Manager_Base.cpp
++++ b/src/ssd/Data_Cache_Manager_Base.cpp
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #include "Data_Cache_Manager_Base.h"
+ #include "FTL.h"
+ 
+@@ -40,6 +41,7 @@
+ 	
+ 	void Data_Cache_Manager_Base::broadcast_user_request_serviced_signal(User_Request* nvm_transaction)
+ 	{
++		Identity::user_event("identity_cache_owner_complete", Simulator->Time(), nvm_transaction);
+ 		for (std::vector<UserRequestServicedSignalHanderType>::iterator it = connected_user_request_serviced_signal_handlers.begin();
+ 			it != connected_user_request_serviced_signal_handlers.end(); it++) {
+ 			(*it)(nvm_transaction);
+--- a/src/ssd/Data_Cache_Manager_Flash_Advanced.cpp
++++ b/src/ssd/Data_Cache_Manager_Flash_Advanced.cpp
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #include <stdexcept>
+ #include "../nvm_chip/NVM_Types.h"
+ #include "Data_Cache_Manager_Flash_Advanced.h"
+@@ -207,7 +208,8 @@
+ 							page_status_type available_sectors_bitmap = per_stream_cache[tr->Stream_id]->Get_slot(tr->Stream_id, tr->LPA).State_bitmap_of_existing_sectors & tr->read_sectors_bitmap;
+ 							if (available_sectors_bitmap == tr->read_sectors_bitmap) {
+ 								user_request->Sectors_serviced_from_cache += count_sector_no_from_status_bitmap(tr->read_sectors_bitmap);
+-								user_request->Transaction_list.erase(it++);//the ++ operation should happen here, otherwise the iterator will be part of the list after erasing it from the list
++								Identity::child_event("identity_cache_detach", Simulator->Time(), *it);
++			user_request->Transaction_list.erase(it++);//the ++ operation should happen here, otherwise the iterator will be part of the list after erasing it from the list
+ 							} else if (available_sectors_bitmap != 0) {
+ 								user_request->Sectors_serviced_from_cache += count_sector_no_from_status_bitmap(available_sectors_bitmap);
+ 								tr->read_sectors_bitmap = (tr->read_sectors_bitmap & ~available_sectors_bitmap);
+@@ -314,6 +316,7 @@
+ 				bloom_filter[user_request->Stream_id].insert(tr->LPA);
+ 				writeback_transactions.push_back(tr);
+ 			}
++			Identity::child_event("identity_cache_detach", Simulator->Time(), *it);
+ 			user_request->Transaction_list.erase(it++);
+ 		}
+ 		
+@@ -377,6 +380,7 @@
+ 			{
+ 				case Caching_Mode::TURNED_OFF:
+ 				case Caching_Mode::WRITE_CACHE:
++					Identity::child_live_event("identity_cache_child_serviced", Simulator->Time(), transaction);
+ 					transaction->UserIORequest->Transaction_list.remove(transaction);
+ 					if (_my_instance->is_user_request_finished(transaction->UserIORequest)) {
+ 						_my_instance->broadcast_user_request_serviced_signal(transaction->UserIORequest);
+@@ -430,6 +434,7 @@
+ 						((Data_Cache_Manager_Flash_Advanced*)_my_instance)->service_dram_access_request(transfer_info);
+ 					}
+ 
++					Identity::child_live_event("identity_cache_child_serviced", Simulator->Time(), transaction);
+ 					transaction->UserIORequest->Transaction_list.remove(transaction);
+ 					if (_my_instance->is_user_request_finished(transaction->UserIORequest)) {
+ 						_my_instance->broadcast_user_request_serviced_signal(transaction->UserIORequest);
+@@ -442,6 +447,7 @@
+ 			{
+ 				case Caching_Mode::TURNED_OFF:
+ 				case Caching_Mode::READ_CACHE:
++					Identity::child_live_event("identity_cache_child_serviced", Simulator->Time(), transaction);
+ 					transaction->UserIORequest->Transaction_list.remove(transaction);
+ 					if (_my_instance->is_user_request_finished(transaction->UserIORequest)) {
+ 						_my_instance->broadcast_user_request_serviced_signal(transaction->UserIORequest);
+--- a/src/ssd/Host_Interface_NVMe.cpp
++++ b/src/ssd/Host_Interface_NVMe.cpp
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #include <stdexcept>
+ #include "../sim/Engine.h"
+ #include "Host_Interface_NVMe.h"
+@@ -308,6 +309,7 @@
+ 		default:
+ 			throw std::invalid_argument("NVMe command is not supported!");
+ 		}
++		Identity::user_bind(Simulator->Time(), new_request, sqe);
+ 		((Input_Stream_Manager_NVMe *)(hi->input_stream_manager))->Handle_new_arrived_request(new_request);
+ 		break;
+ 	}
+@@ -352,6 +354,7 @@
+ 	cqe->SQ_ID = FLOW_ID_TO_Q_ID(request->Stream_id);
+ 	cqe->SF_P = 0x0001 & current_phase;
+ 	cqe->Command_Identifier = ((Submission_Queue_Entry *)request->IO_command_info)->Command_Identifier;
++	Identity::cqe_send(Simulator->Time(), request, cqe);
+ 	Input_Stream_NVMe *im = ((Input_Stream_NVMe *)hi->input_stream_manager->input_streams[request->Stream_id]);
+ 	host_interface->Send_write_message_to_host(im->Completion_queue_base_address + im->Completion_tail * sizeof(Completion_Queue_Entry), cqe, sizeof(Completion_Queue_Entry));
+ 	number_of_sent_cqe++;
+--- a/src/ssd/NVM_PHY_ONFI.cpp
++++ b/src/ssd/NVM_PHY_ONFI.cpp
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #include "NVM_PHY_ONFI.h"
+ 
+ namespace SSD_Components {
+@@ -15,10 +16,12 @@
+ 	*/
+ 	void NVM_PHY_ONFI::broadcastTransactionServicedSignal(NVM_Transaction_Flash* transaction)
+ 	{
++		Identity::child_live_event("identity_phy_broadcast", Simulator->Time(), transaction);
+ 		for (std::vector<TransactionServicedHandlerType>::iterator it = connectedTransactionServicedHandlers.begin();
+ 			it != connectedTransactionServicedHandlers.end(); it++) {
+ 			(*it)(transaction);
+ 		}
++		Identity::child_retire("identity_phy_delete", Simulator->Time(), transaction);
+ 		delete transaction;//This transaction has been consumed and no more needed
+ 	}
+ 
+--- a/src/ssd/NVM_Transaction_Flash.cpp
++++ b/src/ssd/NVM_Transaction_Flash.cpp
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #include "NVM_Transaction_Flash.h"
+ 
+ 
+@@ -8,11 +9,13 @@
+ 		NVM_Transaction(stream_id, source, type, user_request, priority_class),
+ 		Data_and_metadata_size_in_byte(data_size_in_byte), LPA(lpa), PPA(ppa), Physical_address_determined(false), FLIN_Barrier(false)
+ 	{
++		Identity::child_created(Simulator->Time(), this);
+ 	}
+ 	
+ 	NVM_Transaction_Flash::NVM_Transaction_Flash(Transaction_Source_Type source, Transaction_Type type, stream_id_type stream_id,
+ 		unsigned int data_size_in_byte, LPA_type lpa, PPA_type ppa, const NVM::FlashMemory::Physical_Page_Address& address, User_Request* user_request, IO_Flow_Priority_Class::Priority priority_class) :
+ 		NVM_Transaction(stream_id, source, type, user_request, priority_class), Data_and_metadata_size_in_byte(data_size_in_byte), LPA(lpa), PPA(ppa), Address(address), Physical_address_determined(false)
+ 	{
++		Identity::child_created(Simulator->Time(), this);
+ 	}
+ }
+--- a/src/ssd/TSU_Base.h
++++ b/src/ssd/TSU_Base.h
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #ifndef TSU_H
+ #define TSU_H
+ 
+@@ -56,6 +57,7 @@
+ 
+ 	void Submit_transaction(NVM_Transaction_Flash *transaction)
+ 	{
++		Identity::child_live_event("identity_tsu_submit", Simulator->Time(), transaction);
+ 		transaction_receive_slots.push_back(transaction);
+ 	}
+ 
+--- a/src/ssd/TSU_FLIN.cpp
++++ b/src/ssd/TSU_FLIN.cpp
+@@ -1,3 +1,4 @@
++#include "../identity_log.h"
+ #include "TSU_FLIN.h"
+ /*#include "NVM_PHY_ONFI_NVDDR2.h"
+ #include <stack>
+@@ -184,6 +185,7 @@
+ 
+ 	inline void TSU_FLIN::Submit_transaction(NVM_Transaction_Flash* transaction)
+ 	{
++		Identity::child_live_event("identity_tsu_submit", Simulator->Time(), transaction);
+ 		transaction_receive_slots.push_back(transaction);
+ 	}
+ 

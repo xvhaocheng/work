@@ -1,0 +1,279 @@
+--- canonical/nonblock_actual_dma_test.cpp
++++ private/preparation-harness.cpp
+@@ -57,6 +57,7 @@
+ using TopT = Vnonblock_actual_dma_top;
+ #endif
+ #include "verilated.h"
++#include "ramulator-bridge.h"
+ 
+ double sc_time_stamp() { return 0; }
+ 
+@@ -194,14 +195,17 @@
+         uint32_t beat    = 0;
+         int      latency = 1;
+         long     accepted_cycle = 0;
++        uint64_t bridge_uid = 0;
+     };
+     std::deque<MemRead> mem_q;                 // SINGLE ordered R-return queue
+ 
+     struct CawEnt {
+         uint32_t id = 0; uint64_t addr = 0; uint8_t len = 0; uint32_t got = 0;
+         bool tail_hold_seen = false; long tail_release_cycle = 0;
++        uint64_t bridge_uid = 0;
+     };
+     std::deque<CawEnt>   caw_q;                // completion AWs being written
++    std::deque<uint64_t> bridge_b_uids;
+     std::deque<uint32_t> cb_q;                 // completion B ids ready
+ 
+     // ---------------- run-time knobs ------------------------------------
+@@ -647,80 +651,31 @@
+     // ---- SYSTEM mode: ONE shared DDR port (comp + DS merged by the xbar) ----
+     // The plain DDR model latency applies uniformly to every accepted DDR read;
+     // the real 50/50 DS delayer adds latency on the DS path in RTL only.
++    void projection_phase(const std::string& label) {
++        projection_bridge->log("functional_queues",0,0,0,mem_q.size(),"label="+label+";mem_q="+std::to_string(mem_q.size())+";caw_q="+std::to_string(caw_q.size())+";cb_q="+std::to_string(cb_q.size())+";bridge_b_uids="+std::to_string(bridge_b_uids.size())+";held_R="+std::to_string(ddr_r_held)+";next_rtl_tick="+std::to_string(g_cycle)+";dbg_in_flight="+std::to_string(top->dbg_in_flight)+";dbg_dma_job_quiet="+std::to_string(top->dbg_dma_job_quiet)+";dbg_cpu_quiet="+std::to_string(top->dbg_cpu_quiet)+";dbg_cpu_wr_quiet="+std::to_string(top->dbg_cpu_wr_quiet)+";rst_ni="+std::to_string(top->rst_ni));
++        projection_bridge->phase(label);
++    }
+     void drive_ddr() {
+-        ddr_setup_wait = false;
+-        ddr_model_empty = mem_q.empty();
+-        top->ddr_aw_ready = 1;
+-        top->ddr_w_ready  = 1;
+-        if (write_tail_pause != 0 && !caw_q.empty()) {
+-            CawEnt& c = caw_q.front();
+-            if (((c.id >> 4) & 3u) == 2u && c.len == 255 && c.got == 248 && !c.tail_hold_seen) {
+-                c.tail_hold_seen = true;
+-                c.tail_release_cycle = g_cycle + write_tail_pause;
+-                ++write_tail_holds;
+-                trace_event("ddr_w_tail_hold", c.id, c.addr, write_tail_pause);
+-            }
+-            if (c.tail_hold_seen && g_cycle < c.tail_release_cycle) {
+-                top->ddr_w_ready = 0;
+-                ++write_tail_hold_cycles;
+-            }
+-        }
+-        top->ddr_ar_ready = (mem_q.size() < 16) ? 1 : 0;
+-        if (!cb_q.empty()) {
+-            top->ddr_b_valid = 1;
+-            top->ddr_b_id    = (uint8_t)cb_q.front();
+-            top->ddr_b_resp  = 0;
+-        } else {
+-            top->ddr_b_valid = 0;
+-            top->ddr_b_id    = 0;
+-            top->ddr_b_resp  = 0;
+-        }
+-
+-        top->ddr_r_valid = 0;
+-        if (mem_q.empty()) return;
+-        // AXI allows R interleaving across different IDs. Promote only the
+-        // oldest DS request, retaining order within every ID and preserving
+-        // a VALID payload held from the prior tick. No DUT arbitration changes.
+-        // Each request retains its original latency/beat state after rotation.
+-        // The priority WINDOW is the legacy first-V-issue window in the legacy
+-        // path and the full-era V-completion count in full-batch mode
+-        // (v_transfers == 64 in the approved full configuration).  The held-R
+-        // guard applies to BOTH: a beat currently held MUST NOT be displaced.
+-        const bool ds_window = full_batch
+-            ? (full_era && full_done_n[0] < (uint32_t)v_transfers)
+-            : win_open;
+-        if (ds_priority && !ddr_r_held && ds_window &&
+-            ((mem_q.front().id >> 4) & 3) != 3) {
+-            auto ds = std::find_if(mem_q.begin(), mem_q.end(), [](const MemRead& r) {
+-                return ((r.id >> 4) & 3) == 3;
+-            });
+-            if (ds != mem_q.end()) std::rotate(mem_q.begin(), ds, ds + 1);
+-        }
+-        MemRead& h = mem_q.front();
+-        ddr_setup_port = (h.id >> 4) & 3u;
+-        if (read_latency_overlap && measurement_phase) {
+-            // Same isolated-request delay as the old model: AR accepted at
+-            // t first returns at t + latency + 1. Queued requests age from
+-            // acceptance, allowing their preparation delays to overlap.
+-            if (g_cycle <= h.accepted_cycle + (long)ptw_latency) {
+-                ddr_setup_wait = true;
+-                return;
+-            }
+-        } else if (h.latency > 0) {
+-            --h.latency;
+-            ddr_setup_wait = true;
+-            return;
+-        }
+-
+-        top->ddr_r_valid = 1;
+-        top->ddr_r_data  = read64(h.addr + (uint64_t)h.beat * 8);
+-        top->ddr_r_id    = (uint8_t)h.id;   // 6-bit shared-DDR ID echoed verbatim
+-        top->ddr_r_resp  = 0;
+-        top->ddr_r_last  = (h.beat == h.len) ? 1 : 0;
+-    }
++        auto& b=*projection_bridge;
++        ddr_setup_wait=false;ddr_model_empty=mem_q.empty();
++        top->ddr_aw_ready=b.can_aw();
++        top->ddr_w_ready=!caw_q.empty();
++        // Reserve both simultaneous handshakes; READY itself does not allocate.
++        top->ddr_ar_ready=b.ar_live<16 && b.credits + 33 + (top->ddr_aw_ready?32:0)<=1024;
++        top->ddr_b_valid=!cb_q.empty() && !bridge_b_uids.empty() && b.b_ready(bridge_b_uids.front());
++        top->ddr_b_id=cb_q.empty()?0:cb_q.front();top->ddr_b_resp=0;
++        top->ddr_r_valid=0;
++        if(mem_q.empty())return;
++        MemRead& h=mem_q.front();ddr_setup_port=(h.id>>4)&3u;
++        if(!b.read_ready(h.bridge_uid,h.beat)){ddr_setup_wait=true;return;}
++        top->ddr_r_valid=1;top->ddr_r_data=read64(h.addr+uint64_t(h.beat)*8);
++        top->ddr_r_id=h.id;top->ddr_r_resp=0;top->ddr_r_last=h.beat==h.len;
++    }
++
+ #endif
+ 
+     void tick() {
++        projection_bridge->rtl=g_cycle;
+         top->nonblock_enable_i  = nonblock_enable  ? 1 : 0;
+         top->policy_partition_i = policy_partition ? 1 : 0;
+         // Present on BOTH tops: suppress fullbuffer_jobs_i admission
+@@ -824,6 +779,8 @@
+         bool any_fire = false;
+ 
+ #ifdef ACTUAL_DMA_SYSTEM
++        const unsigned s_ar_size=top->ddr_ar_size,s_ar_burst=top->ddr_ar_burst;
++        const unsigned s_aw_size=top->ddr_aw_size,s_aw_burst=top->ddr_aw_burst;
+         const bool     f_ddr_ar   = top->ddr_ar_valid && top->ddr_ar_ready;
+         const bool     f_ddr_aw   = top->ddr_aw_valid && top->ddr_aw_ready;
+         const bool     f_ddr_w    = top->ddr_w_valid  && top->ddr_w_ready;
+@@ -897,6 +854,8 @@
+ 
+         if (any_fire) last_progress_cycle = g_cycle;
+ 
++        if(top->dbg_dma_issue)projection_bridge->log("hardware_issue",0,0,0,top->dbg_dma_issue);
++        if(top->dbg_dma_done)projection_bridge->log("hardware_done",0,0,0,top->dbg_dma_done);
+         // V (DMA0 = bank0) independent completion progress.
+         if (top->dbg_dma_done & 1) v_progress_cycle = g_cycle;
+         // Warm-phase hardware overlap scoreboard.  Only active during warm
+@@ -1302,6 +1261,7 @@
+             r.len = (uint8_t)s_ddr_ar_l; r.id = (uint8_t)s_ddr_ar_i;
+             r.beat = 0; r.latency = (int)ptw_latency;
+             r.accepted_cycle = g_cycle;
++            r.bridge_uid=projection_bridge->accept(false,s_ddr_ar_a,s_ddr_ar_l,s_ddr_ar_i,s_ar_size,s_ar_burst);
+             mem_q.push_back(r);
+         }
+         if (f_ddr_aw) {
+@@ -1330,6 +1290,7 @@
+             }
+             CawEnt c; c.id = s_ddr_aw_i; c.addr = s_ddr_aw_a;
+             c.len = (uint8_t)s_ddr_aw_l; c.got = 0;
++            c.bridge_uid=projection_bridge->accept(true,s_ddr_aw_a,s_ddr_aw_l,s_ddr_aw_i,s_aw_size,s_aw_burst);
+             caw_q.push_back(c);
+         }
+         if (f_ddr_w) {
+@@ -1345,11 +1306,13 @@
+                     if (s_ddr_w_s & (uint8_t)(1u << i)) ++bits;
+                 full_wr_bytes[ch] += bits;
+             }
++            projection_bridge->beat(c.bridge_uid,s_ddr_w_d,s_ddr_w_s,s_ddr_w_l);
+             write_beat(c.addr + (uint64_t)c.got * 8, s_ddr_w_d, s_ddr_w_s);
+             c.got++;
+             if (s_ddr_w_l) {
+                 CHECK(c.got == (uint32_t)c.len + 1, "completion W burst length mismatch");
+                 cb_q.push_back(c.id);
++                bridge_b_uids.push_back(c.bridge_uid);
+                 caw_q.pop_front();
+             }
+         }
+@@ -1366,6 +1329,8 @@
+                 ++full_b_n[chn];
+                 if (top->ddr_b_resp != 0) ++full_err[chn];
+             }
++            projection_bridge->b_consumed(bridge_b_uids.front());
++            bridge_b_uids.pop_front();
+             cb_q.pop_front();
+         }
+         if (f_ddr_r) {
+@@ -1395,6 +1360,8 @@
+                 full_r_return_bytes[chn] += 8ULL;   // one 64-bit R beat
+                 if (top->ddr_r_resp != 0) ++full_err[chn];
+             }
++            projection_bridge->log("actual_R_data",h.bridge_uid,0,h.addr+uint64_t(h.beat)*8,top->ddr_r_data,"id="+std::to_string(h.id)+";last="+std::to_string(top->ddr_r_last));
++            projection_bridge->r_consumed(h.bridge_uid,h.beat);
+             if (h.beat == h.len) mem_q.pop_front();
+             else                 h.beat++;
+         }
+@@ -1452,7 +1419,9 @@
+ 
+         top->clk_i = 0;
+         top->eval();
++        projection_bridge->tick(g_cycle);
+         ++g_cycle;
++        CHECK(g_cycle <= 7900480L,"frozen total cycle limit");
+     }
+ 
+     // ---------------------------------------------------------------------
+@@ -1474,6 +1443,7 @@
+         }
+         uint64_t rd = top->cfg_rdata;
+         bool     er = top->cfg_error;
++        projection_bridge->log(write?"cfg_write":"cfg_read",sel,0,addr,write?wdata:rd,"error="+std::to_string(er)+";strb="+std::to_string(wstrb));
+         cfg_valid = false;
+         tick();                      // let the SV FSM return to IDLE
+         if (er) fail("configuration transaction returned an error", __FILE__, __LINE__);
+@@ -2227,6 +2197,7 @@
+ 
+         // Disable the hardware scoreboard now that warm is done.
+         warm_hw_track = false;
++        projection_phase("original_warm_finish_before_byte_checks");
+ 
+         // ---- post-warm consistency and data checks ----------------------
+         CHECK(warm_a_completed == warm_a_submitted,
+@@ -2299,6 +2270,7 @@
+         // ---- 1. warm + drain -------------------------------------------
+         warm_phase();
+         drain_a();
++        projection_phase("original_warm_and_A_drain");
+         std::printf("WARM-SUMMARY model v_target=%u v_submitted=%llu "
+                     "v_completed=%llu a_submitted=%llu a_completed=%llu "
+                     "hw_overlap_ticks=%llu hw_v_issue=%llu hw_v_done=%llu "
+@@ -2338,6 +2310,24 @@
+         // above.  Its common t0 is captured inside run_full_batch() after
+         // BOTH batches are configured and before the first NEXT_ID.
+         if (full_batch) {
++            projection_phase("pre_t0_after_configs");
++            const long added_start=g_cycle;
++            while(!projection_bridge->drained() || !mem_q.empty() || !caw_q.empty() || !cb_q.empty() || !bridge_b_uids.empty() || top->dbg_in_flight!=0 || top->dbg_dma_job_quiet!=3 || !top->dbg_cpu_quiet || !top->dbg_cpu_wr_quiet || !top->rst_ni){
++                CHECK(g_cycle-added_start<=200000,"added strict drain watchdog");tick();
++            }
++            CHECK(top->dbg_in_flight==0 && top->dbg_dma_job_quiet==3 && top->dbg_cpu_quiet && top->dbg_cpu_wr_quiet && top->rst_ni,"strong terminal hardware quiet");
++            projection_bridge->log("added_terminal_wait",0,0,0,g_cycle-added_start);
++            projection_phase("strong_final_drain");
++            // Original warm A source/destination checks already ran; V check
++            // copied verbatim from the source scenario-wide full-byte check.
++            for(uint32_t i=0;i<PAGE_BEATS;++i){
++                CHECK(read64(V_SRC_PA+uint64_t(i)*8)==page_word(0,i),"V source page was modified");
++                const uint64_t expected=(warmup>0)?page_word(0,i):page_old(0,i);
++                CHECK(read64(V_DST_PA+uint64_t(i)*8)==expected,"V warm destination page does not match its expected state");
++            }
++            projection_bridge->log("full_warm_byte_checks_pass",0,0,0,warm_a_completed,"data_verified=true;full_task_executed=false;V512words;Aall_completed_ring_pages;source_and_destination");
++            std::printf("PREPARATION-ONLY PASS extra_drain=%ld; no t0 or measurement launch executed\n",g_cycle-added_start);
++            return;
+             run_full_batch(name, enable);
+         } else {
+             win_armed = true;
+@@ -3384,7 +3374,7 @@
+                 "ptw_latency=%u a_target=%llu\n",
+                 a_pages, v_gap, transfers, warmup, ptw_lat,
+                 (unsigned long long)a_target);
+-    std::printf("NOTE: ptw latency is a plain model delay (DDL/DDR), NOT MIG-matched.\n");
++    std::printf("NOTE: private projection replaces DDR latency with Ramulator, 1:1 model ticks; NOT MIG-matched.\n");
+     std::printf("nonblock_actual_dma_test: owner_only=%d\n", (int)owner_only);
+ #ifdef ACTUAL_DMA_SYSTEM
+     std::printf("nonblock_actual_dma_test: cpu_writes=%d\n", (int)cpu_writes);
+@@ -3398,6 +3388,14 @@
+ 
+     int rc = 0;
+     try {
++        CHECK(mode=="p" || mode=="pn","projection permits only P/PN");
++        CHECK(full_batch && transfers==64 && a_target==64 && a_pages==8 && warmup==256 && v_gap==0 && !cpu_enable && !cpu_writes && !ds_priority && !owner_only && !read_latency_overlap && write_tail_pause==0 && read_admit_val==0 && !read_admit_measure_only && !v_cold_dst && start_delay==0 && v_start_delay==0 && a_start_delay==0 && full_watchdog==200000,"frozen projection knobs");
++        const char* bridge_config=std::getenv("PROJECTION_CONFIG");
++        const char* bridge_output=std::getenv("PROJECTION_OUTPUT");
++        const char* bridge_history=std::getenv("PROJECTION_HISTORY");
++        CHECK(bridge_config && bridge_output && bridge_history,"missing projection environment");
++        CHECK(std::string(bridge_history)=="row0" || std::string(bridge_history)=="row1","bad history");
++        projection_bridge=std::make_unique<RamBridge>(bridge_config,bridge_output,std::string(bridge_history)=="row1");
+         Tb tb;
+         tb.a_pages         = a_pages;
+         tb.v_gap_cycles    = v_gap;

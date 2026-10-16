@@ -1,0 +1,1 @@
+Earlier successful build receipts and hashes, superseded after the ordinary-mode CPU A/D fairness correction. current-build-inputs.json includes the pre-Image vmlinux. Final authoritative inputs/outputs are in the parent build-lock.json and final-output-manifest.json. These archived hashes are not claimed to describe current outputs.

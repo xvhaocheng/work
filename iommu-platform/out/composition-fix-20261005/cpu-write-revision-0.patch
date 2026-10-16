@@ -1,0 +1,490 @@
+--- a/tests/nonblock_actual_dma_system_top.sv
++++ b/tests/nonblock_actual_dma_system_top.sv
+@@ -36,6 +36,9 @@
+ // The synthetic CPU master is NOT a real RISC-V core and NOT a cache model. 
+-// It only injects one bounded read stream to reproduce CPU<->DMA<->walker
+-// contention through the real crossbar.  It starts when DMA0's batch becomes
+-// active and stops offering NEW reads when the batch (active|gap) ends, then
+-// drains any outstanding beat.  Its AR is never withdrawn while stalled and its
+-// RREADY is a fixed 16-cycle-ready / 4-cycle-stall pattern.
++// It injects one bounded read stream (ID0) plus, only with
++// --system-atomics --cpu-writes, a plain-write stream (ID2) and an AMO stream
++// (ATOMICLOAD+ADD, ID1), to reproduce CPU<->DMA<->walker contention through the
++// real crossbar.  It starts when DMA0's batch becomes active and stops offering
++// NEW read/write/AMO offers when the batch (active|gap) ends, then drains any
++// outstanding beat/transaction.  AR/AW/W valids are never withdrawn while
++// stalled; RREADY keeps the original fixed 16-cycle-ready / 4-cycle-stall
++// pattern for the read lane.
+@@ -46,3 +49,5 @@
+ //     ROM/UART/SPI/GPIO/Ethernet/timer are NOT instantiated;
+-//   * optional real DDR atomics enabled by --system-atomics; no real CPU atomics yet;
++//   * optional real DDR atomics enabled by --system-atomics; the optional
++//     --cpu-writes AMO traffic is synthetic test stimulus, not a real CPU and
++//     does not reproduce any board measurement;
+ //   * no MIG / DDR controller / clock converter / 512-to-64 width converter:
+@@ -65,3 +70,6 @@
+     parameter bit          NonblockEnable       = 1,
+     parameter bit          DdrAtomics           = 0,
++    // Test-only: add the synthetic CPU plain-write / AMO stimulus.  Only
++    // effective together with DdrAtomics (--system-atomics --cpu-writes).
++    parameter bit          CpuWrites            = 0,
+     parameter int unsigned NumOutstandingTrans = 8,
+@@ -179,6 +187,18 @@
+     // ---------------- synthetic CPU lifecycle (read-only) -------------------
+     output logic [31:0] dbg_cpu_issued,
+     output logic [31:0] dbg_cpu_completed,
+     output logic        dbg_cpu_quiet,
+-    output logic        dbg_cpu_active
++    output logic        dbg_cpu_active,
++
++    // ---------------- synthetic CPU write / AMO lifecycle (optional) --------
++    output logic [31:0] dbg_cpu_wr_issued,
++    output logic [31:0] dbg_cpu_wr_completed,
++    output logic [31:0] dbg_cpu_amo_issued,
++    output logic [31:0] dbg_cpu_amo_completed,
++    output logic [31:0] dbg_cpu_rd_err,
++    output logic [31:0] dbg_cpu_wr_err,
++    output logic [31:0] dbg_cpu_amo_err,
++    output logic        dbg_cpu_wr_quiet,
++    output logic        dbg_cpu_amo_r_fire,
++    output logic [63:0] dbg_cpu_amo_r_data
+ );
+@@ -394,80 +414,340 @@
+-    // ========================================================================
+-    // Slave port 0 : synthetic read-only CPU master (TEST-ONLY)
+-    // ========================================================================
+-    logic        cpu_run;
+-    assign cpu_run = dbg_dma_batch_active[0] | dbg_dma_batch_gap[0];
+-
+-    localparam logic [5:0] CPU_INTERVAL = 6'(CpuIssueInterval);
+-
+-    logic        cpu_ar_valid_q;
+-    logic [3:0]  cpu_ar_id_q;
+-    logic [63:0] cpu_ar_addr_q;
+-    logic [7:0]  cpu_ar_len_q;
+-    logic [2:0]  cpu_ar_size_q;
+-    logic [1:0]  cpu_ar_burst_q;
+-    logic        cpu_outstanding_q;
+-    logic [31:0] cpu_issued_q;
+-    logic [31:0] cpu_completed_q;
+-    logic [5:0]  cpu_wait_q;
+-    logic [4:0]  cpu_rphase_q;
+-
+-    slv_req_t    cpu_req;
+-
+-    always_ff @(posedge clk_i or negedge rst_ni) begin : cpu_fsm
+-        if (!rst_ni) begin
+-            cpu_ar_valid_q    <= 1'b0;
+-            cpu_ar_id_q       <= '0;
+-            cpu_ar_addr_q     <= '0;
+-            cpu_ar_len_q      <= '0;
+-            cpu_ar_size_q     <= '0;
+-            cpu_ar_burst_q    <= '0;
+-            cpu_outstanding_q <= 1'b0;
+-            cpu_issued_q      <= '0;
+-            cpu_completed_q   <= '0;
+-            cpu_wait_q        <= CPU_INTERVAL;
+-            cpu_rphase_q      <= '0;
+-        end else begin
+-            // ---- AR offer: held stable until accepted, never withdrawn -----
+-            if (cpu_ar_valid_q) begin
+-                if (slv_resps[0].ar_ready) begin
+-                    cpu_ar_valid_q    <= 1'b0;
+-                    cpu_outstanding_q <= 1'b1;
+-                    cpu_issued_q      <= cpu_issued_q + 32'd1;
+-                end
+-            end else if (!cpu_outstanding_q && cpu_run && (cpu_wait_q == '0)) begin
+-                cpu_ar_valid_q <= 1'b1;
+-                cpu_ar_id_q    <= 4'd0;
+-                cpu_ar_addr_q  <= 64'h0000_0000_8000_0000; // V_SRC_PA
+-                cpu_ar_len_q   <= 8'd7;                    // 8 x 8 B = 64 B
+-                cpu_ar_size_q  <= 3'd3;
+-                cpu_ar_burst_q <= axi_pkg::BURST_INCR;
+-            end
+-
+-            // ---- bounded inter-read interval -------------------------------
+-            if (cpu_ar_valid_q || cpu_outstanding_q) cpu_wait_q <= CPU_INTERVAL;
+-            else if (cpu_wait_q != '0)               cpu_wait_q <= cpu_wait_q - 6'd1;
+-
+-            // ---- single outstanding read drain -----------------------------
+-            if (slv_resps[0].r_valid && cpu_req.r_ready && slv_resps[0].r.last) begin
+-                cpu_outstanding_q <= 1'b0;
+-                cpu_completed_q   <= cpu_completed_q + 32'd1;
+-            end
+-
+-            // ---- RREADY shape: 16 cycles ready, 4 cycles stalled -----------
+-            if (cpu_rphase_q == 5'd19) cpu_rphase_q <= '0;
+-            else                       cpu_rphase_q <= cpu_rphase_q + 5'd1;
+-        end
+-    end
+-
+-    always_comb begin : cpu_req_drive
+-        cpu_req = '0;
+-        cpu_req.ar_valid = cpu_ar_valid_q;
+-        cpu_req.ar.id    = cpu_ar_id_q;
+-        cpu_req.ar.addr  = cpu_ar_addr_q;
+-        cpu_req.ar.len   = cpu_ar_len_q;
+-        cpu_req.ar.size  = cpu_ar_size_q;
+-        cpu_req.ar.burst = cpu_ar_burst_q;
+-        cpu_req.ar.prot  = 3'b010;
+-        cpu_req.r_ready  = (cpu_rphase_q < 5'd16);
+-    end
+-    assign slv_reqs[0] = cpu_req;
++    // ========================================================================
++    // Slave port 0 : synthetic CPU master (TEST-ONLY)
++    //   ID0 : plain read stream (original behaviour, unchanged)
++    //   ID1 : ATOMICLOAD + ADD 64-bit (optional; CpuWrites & DdrAtomics)
++    //   ID2 : plain 2-beat write burst (optional; CpuWrites & DdrAtomics)
++    //
++    // Synthetic AXI stimulus only: NOT a real CPU, NOT a cache model, and no
++    // board-equivalence claim.  At most ONE write transaction (AW+W+B, plus the
++    // R of an AMO) is outstanding at a time.
++    //
++    // AW and W offers are controlled independently by a free-running, saturating
++    // per-transaction age counter that depends on NO ready: when a transaction
++    // starts, each channel's offer is delayed by a fixed number of cycles and
++    // then held stable until its own handshake.  The (AW,W) skew rotates
++    // (2,0) / (0,0) / (0,2) cycles.  AWVALID never depends on WREADY or the W
++    // handshake and WVALID never depends on AWREADY or the AW handshake, so the
++    // two channels can never deadlock each other.  Only the next beat of a W
++    // burst waits for the previous W beat's handshake (legal AXI ordering).
++    //
++    // Responses are never dropped: this engine asserts its BREADY / AMO RREADY
++    // only in states that capture the response (an early B/R stays asserted by
++    // the slave and is captured later), and capture is strictly by response ID.
++    // The shared RREADY is the OR of the read lane's periodic ready and the AMO
++    // lane's accept, with the read lane latching ID0 and the AMO lane ID1.
++    //
++    // New transactions start while cpu_run is asserted and continue until it
++    // drops; the transaction in flight is then drained.  CPU_WR_MAX is only a
++    // large safety bound and is not expected to be reached in a normal N4096 run.
++    // ========================================================================
++    localparam bit CpuWrEn = CpuWrites && DdrAtomics;
++
++    localparam logic [3:0]  CPU_ID_RD    = 4'd0;
++    localparam logic [3:0]  CPU_ID_AMO   = 4'd1;
++    localparam logic [3:0]  CPU_ID_WR    = 4'd2;
++
++    localparam logic [7:0]  CPU_WR_LEN   = 8'd1;            // 2 x 8 B burst
++    localparam logic [63:0] CPU_WR_ADDR  = 64'h0000_0000_8100_0000;
++    localparam logic [63:0] CPU_AMO_ADDR = 64'h0000_0000_8100_1000;
++    localparam logic [63:0] CPU_AMO_ADD  = 64'h0000_0000_1234_5678;
++    localparam logic [63:0] CPU_WR_DAT0  = 64'h1122_3344_5566_7788;
++    localparam logic [63:0] CPU_WR_DAT1  = 64'hAABB_CCDD_EEFF_0011;
++    localparam logic [7:0]  CPU_WR_STR0  = 8'hFF;
++    localparam logic [7:0]  CPU_WR_STR1  = 8'h0F;
++    // ATOMICLOAD (ATOP[5:4]=2'b10), little endian (ATOP[3]=0), ADD (ATOP[2:0]).
++    localparam logic [5:0]  CPU_AMO_ATOP =
++        {axi_pkg::ATOP_ATOMICLOAD, axi_pkg::ATOP_LITTLE_END, axi_pkg::ATOP_ADD};
++    // Large safety bound only; the effective bound is cpu_run plus the C++
++    // scenario budget and independent watchdog.
++    localparam logic [31:0] CPU_WR_MAX   = 32'd1048576;
++
++    logic        cpu_run;
++    assign cpu_run = dbg_dma_batch_active[0] | dbg_dma_batch_gap[0];
++
++    localparam logic [5:0] CPU_INTERVAL = 6'(CpuIssueInterval);
++
++    slv_req_t    cpu_req;
++
++    // ---- plain read lane (ID0) -------------------------------------------
++    logic        cpu_ar_valid_q;
++    logic [3:0]  cpu_ar_id_q;
++    logic [63:0] cpu_ar_addr_q;
++    logic [7:0]  cpu_ar_len_q;
++    logic [2:0]  cpu_ar_size_q;
++    logic [1:0]  cpu_ar_burst_q;
++    logic        cpu_outstanding_q;
++    logic [31:0] cpu_issued_q;
++    logic [31:0] cpu_completed_q;
++    logic [31:0] cpu_rd_err_q;
++    logic [5:0]  cpu_wait_q;
++    logic [4:0]  cpu_rphase_q;
++    logic        cpu_r_ready;
++
++    // ---- write / AMO engine ----------------------------------------------
++    typedef enum logic [1:0] {CW_IDLE, CW_ISSUE, CW_RESP} cw_state_e;
++
++    cw_state_e   cw_state_q;
++    logic        cw_amo_q;
++    logic [1:0]  cw_skew_q;
++    logic [3:0]  cw_age_q;
++    logic        cw_aw_done_q;
++    logic [7:0]  cw_wcnt_q;
++    logic        cw_b_done_q;
++    logic        cw_r_done_q;
++    logic [1:0]  cw_next_q;
++    logic [1:0]  cw_rot_q;
++    logic [31:0] cw_txn_q;
++    logic [31:0] cpu_wr_issued_q;
++    logic [31:0] cpu_wr_completed_q;
++    logic [31:0] cpu_amo_issued_q;
++    logic [31:0] cpu_amo_completed_q;
++    logic [31:0] cpu_wr_err_q;
++    logic [31:0] cpu_amo_err_q;
++    logic [63:0] cpu_amo_r_data_q;
++    logic        cpu_amo_r_fire_q;
++
++    logic        cw_aw_valid;
++    logic [3:0]  cw_aw_id;
++    logic [63:0] cw_aw_addr;
++    logic [7:0]  cw_aw_len;
++    logic [5:0]  cw_aw_atop;
++    logic        cw_w_valid;
++    logic [63:0] cw_w_data;
++    logic [7:0]  cw_w_strb;
++    logic        cw_w_last;
++    logic [3:0]  cw_aw_delay;
++    logic [3:0]  cw_w_delay;
++    logic        cw_aw_fire;
++    logic        cw_w_fire;
++    logic        cw_aw_ok;
++    logic [8:0]  cw_wdone_next;
++    logic        cw_w_ok;
++    logic        cw_b_accept;
++    logic        cw_r_accept;
++    logic        cw_b_fire;
++    logic        cw_r_fire;
++    logic [1:0]  cw_err_add;
++
++    // ---- plain read lane FSM (ID0, original behaviour preserved) ----------
++    always_ff @(posedge clk_i or negedge rst_ni) begin : cpu_read_fsm
++        if (!rst_ni) begin
++            cpu_ar_valid_q    <= 1'b0;
++            cpu_ar_id_q       <= '0;
++            cpu_ar_addr_q     <= '0;
++            cpu_ar_len_q      <= '0;
++            cpu_ar_size_q     <= '0;
++            cpu_ar_burst_q    <= '0;
++            cpu_outstanding_q <= 1'b0;
++            cpu_issued_q      <= '0;
++            cpu_completed_q   <= '0;
++            cpu_rd_err_q      <= '0;
++            cpu_wait_q        <= CPU_INTERVAL;
++            cpu_rphase_q      <= '0;
++        end else begin
++            // ---- AR offer: held stable until accepted, never withdrawn ----
++            if (cpu_ar_valid_q) begin
++                if (slv_resps[0].ar_ready) begin
++                    cpu_ar_valid_q    <= 1'b0;
++                    cpu_outstanding_q <= 1'b1;
++                    cpu_issued_q      <= cpu_issued_q + 32'd1;
++                end
++            end else if (!cpu_outstanding_q && cpu_run && (cpu_wait_q == '0)) begin
++                cpu_ar_valid_q <= 1'b1;
++                cpu_ar_id_q    <= CPU_ID_RD;
++                cpu_ar_addr_q  <= 64'h0000_0000_8000_0000; // V_SRC_PA
++                cpu_ar_len_q   <= 8'd7;                    // 8 x 8 B = 64 B
++                cpu_ar_size_q  <= 3'd3;
++                cpu_ar_burst_q <= axi_pkg::BURST_INCR;
++            end
++
++            // ---- bounded inter-read interval ------------------------------
++            if (cpu_ar_valid_q || cpu_outstanding_q) cpu_wait_q <= CPU_INTERVAL;
++            else if (cpu_wait_q != '0)               cpu_wait_q <= cpu_wait_q - 6'd1;
++
++            // ---- read-lane R capture: ID0 only, every beat caught ----------
++            if (slv_resps[0].r_valid && cpu_r_ready &&
++                (slv_resps[0].r.id == CPU_ID_RD)) begin
++                if (slv_resps[0].r.resp != axi_pkg::RESP_OKAY)
++                    cpu_rd_err_q <= cpu_rd_err_q + 32'd1;
++                if (slv_resps[0].r.last) begin
++                    cpu_outstanding_q <= 1'b0;
++                    cpu_completed_q   <= cpu_completed_q + 32'd1;
++                end
++            end
++
++            // ---- RREADY phase: 16 cycles ready, 4 cycles stalled -----------
++            if (cpu_rphase_q == 5'd19) cpu_rphase_q <= '0;
++            else                       cpu_rphase_q <= cpu_rphase_q + 5'd1;
++        end
++    end
++
++    // ---- write / AMO transaction descriptor ------------------------------
++    assign cw_aw_len  = cw_amo_q ? 8'd0 : CPU_WR_LEN;
++    assign cw_aw_id   = cw_amo_q ? CPU_ID_AMO : CPU_ID_WR;
++    assign cw_aw_addr = cw_amo_q ? CPU_AMO_ADDR : CPU_WR_ADDR;
++    assign cw_aw_atop = cw_amo_q ? CPU_AMO_ATOP : 6'b000000;
++
++    // Fixed offer delays after the transaction starts.  (AW,W)=(2,0)/(0,0)/(0,2)
++    assign cw_aw_delay = (cw_skew_q == 2'd0) ? 4'd2 : 4'd0;
++    assign cw_w_delay  = (cw_skew_q == 2'd2) ? 4'd2 : 4'd0;
++
++    // Valid offers.  AW never waits for W and W never waits for AW, so neither
++    // channel can hold the other's valid hostage.
++    assign cw_aw_valid = (cw_state_q == CW_ISSUE) && !cw_aw_done_q &&
++                         (cw_age_q >= cw_aw_delay);
++    assign cw_w_valid  = (cw_state_q == CW_ISSUE) && (cw_wcnt_q <= cw_aw_len) &&
++                         (cw_age_q >= cw_w_delay);
++    assign cw_w_last   = (cw_wcnt_q == cw_aw_len);
++
++    assign cw_aw_fire  = cw_aw_valid && slv_resps[0].aw_ready;
++    assign cw_w_fire   = cw_w_valid  && slv_resps[0].w_ready;
++
++    assign cw_aw_ok      = cw_aw_done_q || cw_aw_fire;
++    assign cw_wdone_next = {1'b0, cw_wcnt_q} + (cw_w_fire ? 9'd1 : 9'd0);
++    assign cw_w_ok       = cw_wdone_next > {1'b0, cw_aw_len};
++
++    always_comb begin : cw_w_payload
++        if (cw_amo_q) begin
++            cw_w_data = CPU_AMO_ADD;
++            cw_w_strb = 8'hFF;
++        end else if (cw_wcnt_q == 8'd0) begin
++            cw_w_data = CPU_WR_DAT0;
++            cw_w_strb = CPU_WR_STR0;
++        end else begin
++            cw_w_data = CPU_WR_DAT1;
++            cw_w_strb = CPU_WR_STR1;
++        end
++    end
++
++    // Response accept: the engine only asserts its own BREADY / AMO RREADY when
++    // it can capture, and both lanes latch strictly by response ID, so no
++    // already-handshaked B/R is ever lost.
++    assign cw_b_accept = (cw_state_q == CW_RESP) && !cw_b_done_q;
++    assign cw_r_accept = (cw_state_q == CW_RESP) && cw_amo_q && !cw_r_done_q;
++    assign cpu_r_ready = (cpu_rphase_q < 5'd16) | cw_r_accept;
++
++    assign cw_b_fire   = slv_resps[0].b_valid && cw_b_accept &&
++                         (slv_resps[0].b.id == cw_aw_id);
++    assign cw_r_fire   = slv_resps[0].r_valid && cpu_r_ready &&
++                         (cw_state_q != CW_IDLE) &&
++                         (slv_resps[0].r.id == CPU_ID_AMO);
++
++    always_comb begin : cw_err_cnt
++        cw_err_add = 2'd0;
++        if (cw_b_fire && (slv_resps[0].b.resp != axi_pkg::RESP_OKAY))
++            cw_err_add = cw_err_add + 2'd1;
++        if (cw_r_fire && (slv_resps[0].r.resp != axi_pkg::RESP_OKAY))
++            cw_err_add = cw_err_add + 2'd1;
++    end
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin : cpu_write_fsm
++        if (!rst_ni) begin
++            cw_state_q          <= CW_IDLE;
++            cw_amo_q            <= 1'b0;
++            cw_skew_q           <= 2'd0;
++            cw_age_q            <= 4'd0;
++            cw_aw_done_q        <= 1'b0;
++            cw_wcnt_q           <= '0;
++            cw_b_done_q         <= 1'b0;
++            cw_r_done_q         <= 1'b0;
++            cw_next_q           <= 2'd0;
++            cw_rot_q            <= 2'd0;
++            cw_txn_q            <= '0;
++            cpu_wr_issued_q     <= '0;
++            cpu_wr_completed_q  <= '0;
++            cpu_amo_issued_q    <= '0;
++            cpu_amo_completed_q <= '0;
++            cpu_wr_err_q        <= '0;
++            cpu_amo_err_q       <= '0;
++            cpu_amo_r_data_q    <= '0;
++            cpu_amo_r_fire_q    <= 1'b0;
++        end else begin
++            cpu_amo_r_fire_q <= 1'b0;
++
++            // ---- free-running age: increments every cycle in ISSUE,
++            //      saturates, and depends on NO ready -------------------------
++            if (cw_state_q != CW_ISSUE) cw_age_q <= 4'd0;
++            else if (cw_age_q != 4'hF)  cw_age_q <= cw_age_q + 4'd1;
++
++            // ---- response capture: never state-gated, by ID only -----------
++            if (cw_b_fire) cw_b_done_q <= 1'b1;
++            if (cw_r_fire) begin
++                cw_r_done_q      <= 1'b1;
++                cpu_amo_r_data_q <= slv_resps[0].r.data;
++                cpu_amo_r_fire_q <= 1'b1;
++            end
++
++            // ---- per-response error counting -------------------------------
++            if (cw_err_add != 2'd0) begin
++                if (cw_amo_q) cpu_amo_err_q <= cpu_amo_err_q + {30'b0, cw_err_add};
++                else          cpu_wr_err_q  <= cpu_wr_err_q  + {30'b0, cw_err_add};
++            end
++
++            case (cw_state_q)
++              CW_IDLE: begin
++                // New transactions start only while the model runs, up to a
++                // large safety bound that a normal N4096 run never reaches.
++                if (CpuWrEn && cpu_run && (cw_txn_q < CPU_WR_MAX)) begin
++                    cw_state_q   <= CW_ISSUE;
++                    cw_amo_q     <= cw_next_q[0];
++                    cw_skew_q    <= cw_rot_q;
++                    cw_aw_done_q <= 1'b0;
++                    cw_wcnt_q    <= '0;
++                    cw_b_done_q  <= 1'b0;
++                    cw_r_done_q  <= 1'b0;
++                    cw_txn_q     <= cw_txn_q + 32'd1;
++                    if (cw_next_q[0]) cpu_amo_issued_q <= cpu_amo_issued_q + 32'd1;
++                    else              cpu_wr_issued_q  <= cpu_wr_issued_q  + 32'd1;
++                    cw_next_q <= {1'b0, ~cw_next_q[0]};
++                    cw_rot_q  <= (cw_rot_q == 2'd2) ? 2'd0 : (cw_rot_q + 2'd1);
++                end
++              end
++
++              CW_ISSUE: begin
++                if (cw_aw_fire) cw_aw_done_q <= 1'b1;
++                if (cw_w_fire)  cw_wcnt_q    <= cw_wcnt_q + 8'd1;
++                if (cw_aw_ok && cw_w_ok) cw_state_q <= CW_RESP;
++              end
++
++              CW_RESP: begin
++                if ((cw_b_done_q || cw_b_fire) &&
++                    (cw_amo_q ? (cw_r_done_q || cw_r_fire) : 1'b1)) begin
++                    if (cw_amo_q) cpu_amo_completed_q <= cpu_amo_completed_q + 32'd1;
++                    else          cpu_wr_completed_q  <= cpu_wr_completed_q  + 32'd1;
++                    cw_state_q <= CW_IDLE;
++                end
++              end
++
++              default: cw_state_q <= CW_IDLE;
++            endcase
++        end
++    end
++
++    always_comb begin : cpu_req_drive
++        cpu_req = '0;
++        // ---- plain read (ID0) --------------------------------------------
++        cpu_req.ar_valid = cpu_ar_valid_q;
++        cpu_req.ar.id    = cpu_ar_id_q;
++        cpu_req.ar.addr  = cpu_ar_addr_q;
++        cpu_req.ar.len   = cpu_ar_len_q;
++        cpu_req.ar.size  = cpu_ar_size_q;
++        cpu_req.ar.burst = cpu_ar_burst_q;
++        cpu_req.ar.prot  = 3'b010;
++        // ---- plain write (ID2) / AMO (ID1) -------------------------------
++        cpu_req.aw_valid = cw_aw_valid;
++        cpu_req.aw.id    = cw_aw_id;
++        cpu_req.aw.addr  = cw_aw_addr;
++        cpu_req.aw.len   = cw_aw_len;
++        cpu_req.aw.size  = 3'd3;
++        cpu_req.aw.burst = axi_pkg::BURST_INCR;
++        cpu_req.aw.atop  = cw_aw_atop;
++        cpu_req.aw.prot  = 3'b010;
++        cpu_req.w_valid  = cw_w_valid;
++        cpu_req.w.data   = cw_w_data;
++        cpu_req.w.strb   = cw_w_strb;
++        cpu_req.w.last   = cw_w_last;
++        // ---- capture-only response ready ---------------------------------
++        cpu_req.b_ready  = cw_b_accept;
++        cpu_req.r_ready  = cpu_r_ready;
++    end
++    assign slv_reqs[0] = cpu_req;
+@@ -844,4 +1124,16 @@
+     assign dbg_cpu_issued    = cpu_issued_q;
+     assign dbg_cpu_completed = cpu_completed_q;
+     assign dbg_cpu_active    = cpu_run;
+-    assign dbg_cpu_quiet     = ~cpu_ar_valid_q & ~cpu_outstanding_q & ~cpu_run;
++    assign dbg_cpu_quiet     = ~cpu_ar_valid_q & ~cpu_outstanding_q & ~cpu_run &
++                               (cw_state_q == CW_IDLE);
++
++    assign dbg_cpu_wr_issued     = cpu_wr_issued_q;
++    assign dbg_cpu_wr_completed  = cpu_wr_completed_q;
++    assign dbg_cpu_amo_issued    = cpu_amo_issued_q;
++    assign dbg_cpu_amo_completed = cpu_amo_completed_q;
++    assign dbg_cpu_rd_err        = cpu_rd_err_q;
++    assign dbg_cpu_wr_err        = cpu_wr_err_q;
++    assign dbg_cpu_amo_err       = cpu_amo_err_q;
++    assign dbg_cpu_wr_quiet      = (cw_state_q == CW_IDLE);
++    assign dbg_cpu_amo_r_fire    = cpu_amo_r_fire_q;
++    assign dbg_cpu_amo_r_data    = cpu_amo_r_data_q;

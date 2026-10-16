@@ -1,0 +1,134 @@
+# 层级、真实/模型边界与三条能力的判定（B1 下一判别：A8/gap0 P vs PN 首次替换分歧）
+
+**执行状态声明**：本轮无 shell，未运行、未编译、未修改文件。下面所有运行命令均为**从现有 runner 的 argparse 推断**的拟用命令，不是执行结果。`docs/novelty-gate-20261006.md:144` 要求"复用现有仿真入口…先尝试取得…短事件序列"，本轮只做入口盘点与探针提案。
+
+---
+
+## 1. 现有入口的层级与边界
+
+| 层 | runner | top 模块 | 实例化的真实 RTL | 纯模型（C++/SV 侧） | 启动（拟用） |
+|---|---|---|---|---|---|
+| L1 IOTLB 单元 | `tests/test_composition_iotlb.py` | `composition_iotlb_top` | `rv_iommu_iotlb` ×3：PolicyEnable=1（actual）、PolicyEnable=0（base）、SHA `137f5e5…` 抽取的 reference | C++ 逐拍驱动 `lookup_i/update_i/inval_i`，随机 tag（`composition_iotlb_test.cpp:208-265`）；无 DMA、无 TL、无 PTW | `python3 tests/test_composition_iotlb.py` |
+| L2 TL 组合 | `tests/test_composition_tl.py` | `composition_tl_top` | `rv_iommu_tl_wrap`（PolicyEnable=1, NonblockEnable=1, E3Enable=0），含 DDTW/PTW/IOTLB/nonblock_hit/e3_delay（`test_composition_tl.py:64-70`） | DDTW/PTW 的 AXI R 由 C++ `mem` map 逐拍返回（`composition_tl_test.cpp:94-128`）；请求调度由 C++ 单线程循环；无 DMA、无共享 fabric | `python3 tests/test_composition_tl.py` |
+| L3 actual-DMA（plain） | `tests/test_nonblock_actual_dma.py`（无 `--system`） | `nonblock_actual_dma_top`（文件未提供） | 两个真实 `dma_core_wrap` + 真实 `axi_mux` + banked CTL↔TL harness（`test_nonblock_actual_dma.py:5-13`） | completion/DDTW/PTW 内存 + 页表 + 单条有序 R 返回队列（`nonblock_actual_dma_test.cpp:180,382-430`）；DDR 读出延迟 = `ptw_latency` | `python3 tests/test_nonblock_actual_dma.py --mode n --a-pages 16 --v-gap 0 --transfers 64 --warmup 256 --ptw-latency 31 --a-target 1048576` |
+| L3 actual-DMA + system | `tests/test_nonblock_actual_dma.py --system [--system-atomics]` | `nonblock_actual_dma_system_top` | 真实 `rv_iommu_ds_if`（`nonblock_actual_dma_system_top.sv:329-351`）、真实 `axi_delayer` 50/50（`:354-373`）、真实 `axi_xbar`（board 形状，`:785-814`）、可选真实 `axi_riscv_atomics`（`:823-919`）、内层未改的 `nonblock_actual_dma_top`（`:985-1099`） | DDR = C++ `mem_q`（统一 `ptw_latency`，`:435-459`）；合成 CPU master（`:415-753`）；**无 MIG / DDR 控制器 / 时钟转换 / 位宽转换**（文件自述 `:46-57`） | 追加 `--system` |
+
+依赖路径（关键、非穷尽）：
+- L1：`packages/rv_iommu_{reg,cfg}_pkg.sv`、`packages/rv_iommu_pkg.sv`、`rtl/translation_logic/rv_iommu_iotlb.sv` + git 历史 `137f5e5…`（`test_composition_iotlb.py:35,88-97`）。
+- L2：`vendor/common_cells/src/{cf_math_pkg,lzc,rr_arb_tree,stream_arbiter*,spill_register*}.sv`、`vendor/axi/src/axi_pkg.sv`、上述 packages、`rtl/translation_logic/{ddtc,ddtw,iotlb,ptw,e3_delay,nonblock_hit,tl_wrap}.sv`；`+define+ASSERTS_OFF`（`test_composition_tl.py:53-73,95`）。
+- L3：`test_nonblock_actual_dma.py:241,267-275` 复用 sibling `tests/test_nonblock_banked.py`（**该文件未提供，属未核依赖**）的 `SOURCES/INCDIRS`，追加 iDMA 源（`:96-138`）、production FIFO 替换（`:154-166`）、system 源（`:169-188`）、atomics 源（`:261-265`）；另需 `tests/nonblock_actual_dma_pkg.sv`。
+
+---
+
+## 2. 三问逐层判定
+
+### Q1 —— 能否产生 V/A 页真实的"正常/fast"lookup 顺序？
+
+- **L1：不能。** `touch_i` 硬接 `1'b0`（`composition_iotlb_top.sv:153`，且 `TouchEnable=1'b0` 于 `:143`），只走正常 lookup 路径；激励是随机 tag（`composition_iotlb_test.cpp:208-216`），无 V/A 页身份。**无法区分 fast/normal**，因此不能单独用来验证"命中仍更新共享 PLRU"的路径（novelty-gate `:131` 假说的关键就在 touch 侧）。
+- **L2：能产生 normal 与 fast 两种 lookup。** `warm_leaf`（`:395-406`）经真实 DDTW/PTW 路径给 V 页（`0x10000000`/`0x10001000`）建表；`fast_prove_under_cold_a`（`:442-462`）先占住一个 **bank-different cold A walk**（`hold_ptw_r`，`:321-334`），证明 V 探针被 fast 路径接走（`req_fire_fast = req_fire && nonblock_fire_o`，`:156`）。**限制**：当前只驱动 V 页 0/1、A 页 0–14（`:501,529-557`），没有 V2/A16 的现成刺激；但页基址是参数化的常数，可平移。另外 per-lookup 只能拿到 **命中/未命中**，拿不到"命中在哪一路"——`composition_tl_top.sv` 只导出 valid 位与 DID+mask（`:114-118,465-476`）。
+- **L3 plain / L3 system：有真实 fast 事件，但只有聚合计数。** `n_fast`/`n_fast_bank` 由 `dbg_fast_resp_valid/ready/bank` 统计（`nonblock_actual_dma_test.cpp:578-581`）；`n_iotlb_lookup/hit` 由 `dbg_tl_iotlb_lookup/hit` 统计（`:591-594`）。这些**不带 VPN/way**，所以只能回答"fast 是否发生"，不能回答"哪个 V 页在哪个 way 被 fast 命中"。V 只有 2 页（`V_SRC_IOVA/V_DST_IOVA`，`:79-80`）；`--a-pages 16` 时 A 页 0–15 存在（`:346-351`），而 IOTLB 16 路中 2 路被保护 → **A16 正好是第 15 个非保护 A 页，是第一次必须驱逐既有 A 页的填充**。这是本层唯一能真实产生"首次 A 替换"的地方，但当前没有逐填充观测把它导出来。
+
+### Q2 —— 每 lane 单 copy 的闭环供给？
+
+- **L1：没有。** C++ 一次驱动一个 lookup/update，无 lane、无 job。
+- **L2：没有。** 单一 request 端口（`composition_tl_top.sv:31-32`），一次一笔。
+- **L3 plain：有。** warm 阶段用 `v_in_flight/a_in_flight` 显式镜像"每通道至多一笔在飞"（`nonblock_actual_dma_test.cpp:1127-1204`，注释自称镜像 `struct idma_stream::in_flight`）；测量阶段用真实批量引擎自主跑（`configure_batch`+`start_batch`，`:1322-1370`），A 连续环、V 单页带 `--v-gap`，触发/停止/排空全部走真实寄存器。
+- **L3 system：同样有**，并强制经过真实 `rv_iommu_ds_if` / `axi_delayer` / `axi_xbar`。合成 CPU 读/写/AMO master 也是真 AXI 时序驱动（`:415-753`），但它**不是**真 CPU/缓存（`:36-44`）。
+
+### Q3 —— DDR / backpressure？
+
+- **L1：不存在。**
+- **L2：没有 DDR，也没有响应背压模型。** 只有 DDTW/PTW 两条 AXI 通道，R 由 `read64` 顺序返回（`composition_tl_test.cpp:94-128`），背压靠手工 `hold_ptw_r`。**不是 DDR 模型。**
+- **L3 plain：有行为 DDR 模型 + 单头阻塞背压。** `mem_q` 单一有序 R 返回队列（`nonblock_actual_dma_test.cpp:180`），`comp_ar_ready = (mem_q.size() < 16)`（`:384`），完成写走 `caw_q`/`cb_q`；PTW 读延迟 = `ptw_latency`（`:692`），其余 = 1。**无 DDR 控制器、无 MIG。**
+- **L3 system：同样模型 DDR + 单队列背压**（`:435-459`），但 AR ready 由 xbar/MUX 决定；RTL 侧是真实 `axi_delayer(50/50)` 与真实 `axi_xbar`。文件自述"no MIG / DDR controller / clock converter / 512-to-64 width converter"（`:53-54`）。所以**背压路径是真的，DDR 延迟不是。**
+
+---
+
+## 3. 推荐的最小现有入口
+
+**推荐 `tests/test_composition_tl.py`（L2）作为定位"首次替换分歧"的最小入口。**
+
+理由：
+1. 它是现有入口中**唯一在 P/PN 组合层**（PolicyEnable/NonblockEnable 且 E3Enable=0）跑真实 `rv_iommu_tl_wrap`、且同时走**正常 lookup 与 fast 命中**的最小实例。
+2. 它已经有**逐填充事件桩**：`research_update_o` 上升时把 `{research_did_o, research_replace_mask_o}` 压进 `fills`（`composition_tl_test.cpp:161-164`）——即已经能拿到"DID×way"粒度的填充序列；`check_all_fills` 只需再扩两三个字段。
+3. 它的激励小、确定、可复现（每 case 数百至数千拍），"首次分歧"最容易肉眼定位。
+4. 它**不需要**碰 `test_nonblock_actual_dma_top.sv` 这类未提供的大件；观测扩展局限在 `composition_tl_top.sv` + `composition_tl_test.cpp`。
+
+**必须写明的边界**：L2 是**局部探针**。它没有 Q2 的每 lane 自主供给，也没有 Q3 的 DDR/背压。因此：
+
+> 在 L2 观察到的 P/PN 首次替换分歧，是板测 A8/gap0 差异的**必要不充分**条件；L2 结果**不能**宣称"复现板测"。要把 L2 的分歧升级为对板测现象的解释，需要在 L3 system 上做同样的观测，或者独立证据（板测）——这属于 Codex 的架构判断（novelty-gate `:146`）。
+
+L2 的现成观测缺口（需**仅观测**扩展，不改功能）：`composition_tl_top.sv` 只导出 `research_update/did/replace_mask/valid_q/valid_n`（`:114-118,465-476`），**缺 `plru`、缺 fill way 的 VPN/stage、缺 hit way**。`rv_iommu_iotlb` 自带的 `research_o` 已经含 `plru` 与 `entries[16][128]`（L1 top 正是靠它取到 `a_plru`、`a_q_lo/hi`，`composition_iotlb_top.sv:247-252`），所以只要把同一 research 端口从 `rv_iommu_tl_wrap` 透传到 `composition_tl_top.sv`，就是**观测-only**的改动（是否允许透传由 Codex 判定）。
+
+**次选/交叉复核**：`test_nonblock_actual_dma.py --system --mode n --a-pages 16 --v-gap 0 --transfers 64 --warmup 256 --ptw-latency 31`。它有 Q2、Q3 的真实闭环，`--a-pages 16` 会真实触发第一次 A 替换；但当前它**完全不导出逐填充 IOTLB 事件**（只有 `dbg_tl_iotlb_lookup/hit` 聚合计数，且内层 `nonblock_actual_dma_top.sv` 未提供，是否已有 research 端口未知）。要在此层定位首次替换，需要一次**有界的观测-only tap 透传**——这已属于 Codex 领导的架构决策，本轮不做。
+
+---
+
+## 4. 观测接口 / 事件字段提案
+
+建议在 L2（或后续 L3）用一个**只读、被动、逐事件**的记录器导出，不在 RTL 里做任何状态机。字段如下（`width` 括号内为建议位宽）：
+
+```
+struct iotlb_ev_t {
+  uint64      cycle;              // C++ eval 计数器
+  uint8        lane;              // 0=V(DMA0/bank0) 1=A(DMA1/bank1) 2=DDTW 3=PTW 4=other
+  uint8        pscid;             // lu_pscid_i / req 的 pscid (20)
+  uint32       vpn;               // lu_vpn_i / 被翻译的 VPN (29)
+  uint8        sel;               // 0=none 1=1S 2=2S 3=1S|2S
+  uint8        kind;              // 枚举见下
+  uint8        hit_way;           // 命中路；未命中=0xF
+  uint8        fill_way;          // one-hot replace_mask 折 bit index；无则=0xF
+  uint16       replace_mask;      // 原样
+  uint32       plru_before;       // 该事件前 PLRU 树
+  uint32       plru_after;        // 该事件后 PLRU 树
+  uint8        job_id;            // 关联的 DMA job id（L3）
+  uint8        job_ev;            // 0=issue 1=done
+  uint8        nonblock_fire;     // 本拍 nonblock_fire_o
+  uint8        nonblock_busy;     // 本拍 nonblock_busy_o
+  uint8        fast_resp_bank;    // 若本拍 fast_resp_valid&ready
+};
+kind ∈ { LOOKUP_REQ, HIT_NORMAL, MISS_NORMAL, HIT_FAST, MISS_FAST,
+         FILL_COMMIT, REPLACE_SELECT, INVAL_VMA, INVAL_GVMA, CLEAR }
+```
+
+来源映射（现有信号 → 字段）：
+- `cycle`：L2 用 C++ eval 计数；L3 用 `g_cycle`（`nonblock_actual_dma_test.cpp:196,727`）。
+- `lane`：L2 用 `req_did`（10→V，11→A）；L3 用 `dbg_dma_issue/done` 位序（`:567-574`）。
+- `vpn/pscid/sel`：L2 直接取 `composition_tl_top.sv` 的 `lu_vpn_i/lu_pscid_i/en_1S_i/en_2S_i`（`:60-64`）；L3 无法从当前端口取，需要透传。
+- `replace_mask`：L2 已有 `research_replace_mask_o`（`:116,476`）；L1 已有 `a_replace_mask`（`composition_iotlb_top.sv:247`）。
+- `plru_before/after`：L1 已有 `a_plru`（`:248`）；L2/L3 需透传 `research_o.plru`。
+- `hit_way`：目前**只有 L1** 能从 `entries[tap_idx]`+`replace_mask` 推断；L2 需把 `research_o` 的 hit 侧信息透传。
+- `fill_way`：由 `replace_mask` 折 one-hot→bin，L1/L2 目前都可推导。
+- `job_id/job_ev`：只在 L3 有意义，取 `dbg_dma_issue/dbg_dma_done`（`:138-139`）。
+- `nonblock_fire/busy`：L2 有 `nonblock_fire_o/nonblock_busy_o`（`composition_tl_top.sv:103-104`），L3 有 `dbg_nonblock_fire/busy`（`:147-149`）。
+- `fast_resp_bank`：仅 L3 有（`dbg_fast_resp_bank`，`:153`）。
+
+写入方式建议：C++ 侧每拍 bump `cycle`，对每个 kind 各维护一个"上一拍是否触发"的沿检测；RTL 侧只做**零副作用组合导出**（不引入新的 always_ff 状态）。
+
+---
+
+## 5. 允许的诊断反事实
+
+**允许且只允许改变一处：PLRU 更新是否跨分区共享。**
+
+- 原树（baseline）：现网 `rv_iommu_iotlb` 单棵共享 PLRU，命中仍更新对应叶路径（novelty-gate `:131` 已核到 `rv_iommu_iotlb.sv:336-387`）。
+- 隔离历史（counterfactual）：**同一 RTL**，只让 P 保护分区（mask `0x0003`）与其余分区各自拥有独立 PLRU 状态，其余**逐位不变**——同 mask、同边界、同复位值、同 clear 语义、同 touch 更新位置。
+- 若隔离历史下 L2 的首次填充分歧消失 → 共享 PLRU（经 fast/normal touch 更新）就是**普通解释**的充分候选，"P/PN 退化"落到工程收尾（novelty-gate `:146`）。
+- 若分歧仍在 → 共享 PLRU **不足以解释**，剩下的候选是 L3 侧的服务顺序/背压/供给反馈；此时**先**在 L3 system 上做同一类观测，再看是否需要第二个反事实（例如隔离 fast 响应路径），不要直接跳到"新机制"。
+
+**不偷改其他行为的硬性条件**：
+1. 同 mask（`0x0003` vs `0xfffc`），不重算、不移动保护位（`composition_tl_top.sv:108-111`；`test_composition_tl.py:95` 已核到 wrap `:657-675` 的两类分配）。
+2. 同 touch 时机：`nonblock_fire_o` 的触发条件（state_q==PT && e3_ptw_active && bank 不同，`composition_tl_test.cpp:503-507`）必须逐拍一致；touch 的更新点必须与真实路径同拍。
+3. 同请求调度：同 seed、同 request 顺序、同 DID、同 response-ready 模式（L2 手工 `trans_resp_ready_i`；L3 同 `+mode/+v-gap/+warmup`）。
+4. 同 DDTW/PTW 内存与同 `ptw_latency`（L2 `setup_memory`，`:342-372`；L3 `mem` 与 `ptw_latency`）。
+5. 同 eval：两个实例（原树/隔离）必须在同一 `top->eval()` 中同步评估，不引入时序相位差。
+6. 只对**逐事件序列**做 diff（首次 `kind/way/vpn` 分歧拍），不做事后聚合（novelty-gate `:144` 明确"现有累计计数及首尾快照无法补出"）。
+
+---
+
+## 6. 未决问题 / 需要 Codex 判定
+
+1. `rv_iommu_tl_wrap.sv` 是否已把 `research_o`（含 `plru` 与 `entries[16][128]`）透传到顶层端口？若否，观测探针必须扩到 wrap 层；这是**观测-only**但仍属接口改动，应由 Codex 判定。
+2. `tests/nonblock_actual_dma_top.sv` 与 `tests/test_nonblock_banked.py` 未提供，无法确认 L3 是否已有可复用的 IOTLB research 出口——**这是"能否在 L3 定位首次替换"的关键未知**。
+3. 「V2 页 / A16 页」的具体页码语义：现有 L2 只有 V 页 0/1，L3 只有 V 页 src/dst + 最多 `--a-pages` 个 A 页；A16 在 IOTLB 16 路 / 2 路保护下正好是第一次必然驱逐，可作为"首次替换"的目标刺激，但若指其它含义需澄清。
+4. `--system` 下合成 CPU master 的读流（`nonblock_actual_dma_system_top.sv:531-582`）会与 DMA/walker 争用同一 DDR 模型，做 P/PN 对照时必须保证两种配置下 CPU 激励逐拍一致，否则反事实会引入第三个变量。这是否可接受由 Codex 决定。
