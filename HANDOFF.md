@@ -1,3 +1,11 @@
+# 2026年10月16日 工作区入口、规则与文献库整理
+
+根与平台AGENTS仅保留稳定工作规则，整理前工作树原文已[归档](docs/history/agent-rules-20261016/README.md)。[根README](README.md)与[研究导航](研究导航.md)提供新agent阅读路径；[仓库地图](docs/repository-layout.md)定位代码与证据，[成果索引](docs/research-results.md)串联历史结果及具体停止范围。
+
+[根文献库](references/README.md)集中已引用论文与技术资料、对应总结、本地原件入口和阅读状态；复用已核记录，未核题录不冒充精读。原论文/数据/历史正文保留，不移动生产源码，不重跑研究模型、构建或板测。各分支与MIG暂停保持，当前研究仍见CURRENT_STATUS与唯一总计划。
+
+整理范围、覆盖边界和检查结果见[验收记录](docs/organization/verification-20261016.json)。写入前重读共享文件，以下旧交接正文原样保留。
+
 # 2026年10月16日 FIRST-PTE-ORDER-CONSTRUCTION-1：首PTE票据条件构造与接口成本边界
 
 当前探索转为M0首PTE顺序票据的**接口实现成本**：从M0普通DS-return优先依赖可调整已接受读顺序这一条件X出发，在实际PTW启动至payload首次AR承诺之间，用付费早意图保护一次首PTE顺序；保留原burst与返回路径。未选论文主线，未实现生产RTL，未证原生收益或独立新调度。

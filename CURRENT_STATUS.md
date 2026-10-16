@@ -2,6 +2,8 @@
 
 2026年10月16日（JST）。当前探索转为M0首PTE顺序票据的**接口实现成本**：从M0普通DS-return优先依赖可调整已接受读顺序这一条件X出发，在实际PTW启动至payload首次AR承诺之间，用付费早意图保护一次首PTE顺序；保留原burst与返回路径。未选论文主线，未实现生产RTL，未证原生收益或独立新调度。 [研究计划](研究计划.md)为唯一总计划，[研究导航](研究导航.md)定位资产。
 
+资料入口已统一：[上手导航](研究导航.md) → [仓库地图](docs/repository-layout.md)／[成果索引](docs/research-results.md)／[根文献库](references/README.md)。稳定规则见[AGENTS](AGENTS.md)和[执行细则](docs/agent-policy.md)；本次仅整理资料，不改变下列研究结论、分支边界或暂停状态。
+
 ## 全局安排与下一判别
 
 - 一次冻结模型70模拟／82检查通过；保留两路各4096B COPY、cold三笔PTE、四个B及最终drain。完整起点quiet：cold2066→2060，hot2050不变，short2059→2060，long2070→2061，lateintent无效。同付费接口普通if/else逐事件相同，不能认领独占新调度。普通read2×128在零暴露费用下cold2058、hot2050，仅多1个AR；固定G2在cold追平、hot慢2。

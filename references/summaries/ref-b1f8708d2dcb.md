@@ -1,0 +1,50 @@
+# 官方/作者发布页〔正式题名待整理〕
+
+稳定ID：`ref-b1f8708d2dcb` · 类型：`rfc_patch` · 主题：`mapping-lifecycle`
+
+作者：unknown；年份：unknown；出处：unknown。
+
+阅读等级：**仅题录/摘要/提及或核读范围待整理**。本轮是资料归档，不新增人读标记或复现实验结论。
+
+问题：项目记录中用于何种问题，见逐条来源上下文。
+
+机制／已存认识：本轮未独立抽取方法；仅保留项目记录已明确写出的内容，不由题名补结论。
+
+支持边界：项目已有引用/局部核查记录；不能据此视为全文精读或完成新颖性比较。
+
+限制：作者/年份/完整题名未归一时显式unknown；正文范围和作者结果未在本轮重新核验。
+
+与研究关系：本条用于对应主题的前作/语义边界；是否当前采用须回到总计划。
+
+相邻资料：mapping-lifecycle资料；是否当前采用须回到总计划和本轮接受记录。
+
+原始来源：
+
+- [来源1](https://lists.infradead.org/pipermail/linux-arm-kernel/2026-July/1146543.html)
+
+项目核查／引用入口（精确行保存在catalog；链接打开原文件）：
+
+- [iommu-platform/docs/independent-research-directions-20261015.md:70](../../iommu-platform/docs/independent-research-directions-20261015.md)
+- [iommu-platform/out/independent-directions-20261015/lifecycle/assessment.md:23](../../iommu-platform/out/independent-directions-20261015/lifecycle/assessment.md)
+- [iommu-platform/out/research-plan-implementation-20261015/i/source-evidence.md:241](../../iommu-platform/out/research-plan-implementation-20261015/i/source-evidence.md)
+- [iommu-platform/out/research-plan-implementation-20261015/i/source-evidence.md:250](../../iommu-platform/out/research-plan-implementation-20261015/i/source-evidence.md)
+
+既有项目记录的上下文（历史判断，不能覆盖最新合同）：
+
+[iommu-platform/docs/independent-research-directions-20261015.md:70](../../iommu-platform/docs/independent-research-directions-20261015.md)：
+
+这个方向有新补到的真实需求：2026年7月SMMUv3 RIL补丁讨论，作者倾向每gather一个范围命令以减少提交时延，reviewer担心扩大失效范围影响摄像/显示的live DMA。作者同时指出等时设备应容忍偶发full walk，且RIL相对原full失效更温和。**这是待量化的实际权衡，不是已证明deadline失守，也未核该补丁最终合入状态。** [原讨论](https://lists.infradead.org/pipermail/linux-arm-kernel/2026-July/1146330.html)、[回应](https://lists.infradead.org/pipermail/linux-arm-kernel/2026-July/1146543.html)。
+
+[iommu-platform/out/independent-directions-20261015/lifecycle/assessment.md:23](../../iommu-platform/out/independent-directions-20261015/lifecycle/assessment.md)：
+
+2026年7月SMMUv3 RIL补丁讨论有比假设“系统突然remap”更扎实的入口：作者提出每个gather尽量用一个range命令，减少失效提交时延；reviewer担心扩大范围会影响live DMA的摄像头/显示；作者回应等时流量应已容忍偶发完整walk，新的RIL扩张通常轻于旧的full invalidation，并把formal isochronous支持及替代RIL算法留作有条件后继。**两方都必须保留：这是现实权衡，不是已经证明的deadline问题。** [原讨论](https://lists.infradead.org/pipermail/linux-arm-kernel/2026-July/1146330.html)、[作者回应](https://lists.infradead.org/pipermail/linux-arm-kernel/2026-July/1146543.html)；本地`lifecycle/sources/smmu-range-concern.txt:16–66,70–79`、`smmu-range-response.txt:16–40`。
+
+[iommu-platform/out/research-plan-implementation-20261015/i/source-evidence.md:241](../../iommu-platform/out/research-plan-implementation-20261015/i/source-evidence.md)：
+
+- 原始来源：[官方/作者发布页](https://lists.infradead.org/pipermail/linux-arm-kernel/2026-July/1146543.html)
+
+[iommu-platform/out/research-plan-implementation-20261015/i/source-evidence.md:250](../../iommu-platform/out/research-plan-implementation-20261015/i/source-evidence.md)：
+
+- 原始来源：[官方/作者发布页](https://lists.infradead.org/pipermail/linux-arm-kernel/2026-July/1146543.html)
+
+[返回总目录](../README.md)

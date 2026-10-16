@@ -2,13 +2,13 @@
 
 这是从旧实验工程整理的独立、固定版本、仅构建 Linux 路径的平台。当前平台为 CVA6 + 四 iDMA + RISC-V IOMMU + Linux；迁移基线和历史修复保留在各组件内，不依赖旧目录。研究安排按[唯一总计划](../研究计划.md)执行；FPGA保留为实验平台，仿真按需辅助。
 
-硬件最小身份：Genesys 2、CVA6 50 MHz、timer 25 MHz、4 DMA、IOTLB 16。DS50/50 与整批轮询保持。
+参考配置为Genesys 2、CVA6 50 MHz、timer 25 MHz、4 DMA、IOTLB 16；DS50/50与整批轮询属于相应历史实验合同。实际构建/加载身份、有效时钟与暂停状态见[当前状态](../CURRENT_STATUS.md)及对应验收，不由本配置说明推定。
 
-2026-10-15入口同步：E3 v5及v6后续板测已完成，受控v6只支持局部A-miss→V-hit等待传播，见[受控E3结果](docs/e3-controlled-results-review.md)；旧“v5未上板”是2026-09-18早期快照。历史Mac上板不能推出当前Dell接板；构建通过不等于板卡功能、时序或机制证据，新FPGA性能主张须验对应时钟/时序。历史验证见 [docs/validation.md](docs/validation.md)。
+源码职责见[仓库结构](../docs/repository-layout.md)，历史结果见[研究成果索引](../docs/research-results.md)，论文与技术资料见[根文献库](../references/README.md)。板测、仿真和构建结论按各自原始报告使用。
 
 ## 当前入口
 
-- 当前安排：[唯一总计划](../研究计划.md)、[研究导航](../研究导航.md)、[当前状态](../CURRENT_STATUS.md)；阶段背景见[HANDOFF](../HANDOFF.md)。D为当前主线、I轻量预筛，A5保留候选与局部工作；MIG1792023314继续暂停，入口同步不授权新实验。
+- 当前安排：[唯一总计划](../研究计划.md)、[研究导航](../研究导航.md)、[当前状态](../CURRENT_STATUS.md)；阶段背景见[HANDOFF](../HANDOFF.md)。研究方向与暂停状态仅由这些入口维护，本说明不另设主线或授权新实验。
 - 平台使用、构建、交付：本文件、[构建说明](docs/build.md)。
 - 历史 E3 v5 协议与有限矩阵：[E3_QUEUE_PAIR.md](E3_QUEUE_PAIR.md)。
 - E3 原协议/字段：[E3_SERVICE.md](E3_SERVICE.md)；D0/D0 软件诊断字段：[E3_DIAGNOSTIC.md](E3_DIAGNOSTIC.md)。
@@ -52,7 +52,7 @@ scripts/              构建、归档、离线恢复
 sources.lock.json     完整组件版本及来源
 provenance/           迁移前的本地修改副本，用于审查，不要再次应用
 assets/rootfs-base.cpio  固定旧 rootfs 基础镜像
-out/                  构建、测试和回传产物，不进普通 Git
+out/                  研究证据、测试回传与可再生构建物；顶层按类型筛选同步
 ```
 
 主要软件输出：
@@ -74,7 +74,7 @@ FPGA 输出示例（历史 v5配置）：
 - 顶层仓库管理脚本、配置、测试以及组件提交指针；CVA6、IOMMU、Linux、OpenSBI 保留各自来源历史。
 - 修改 IOMMU 后，按 IOMMU → CVA6 子模块指针 → 顶层 CVA6 指针的顺序提交，并更新 `sources.lock.json`；`make check` 会检查工作树、各级指针和 lock 是否一致，并会写 `out/manifests`。
 - 具体当前工作树和提交以 `git status`、`git rev-parse HEAD` 及 `sources.lock.json` 为准，不在文档中硬编码 HEAD。
-- 这里没有个人远端；`upstream` 只表示来源，个人提交直接 `clone --recursive` 不保证能取到。
+- 组件远端以其实际配置为准；`upstream`只表示来源。顶层公开工作区同步与组件自身上游提交分开，不由一次`clone --recursive`保证取回所有本地提交。
 - 现有 bundle/恢复副本来自迁移阶段，不能假定包含最新实验修改；迁移新版前重新运行 `make bundle`。
 
 ## 验证范围与边界

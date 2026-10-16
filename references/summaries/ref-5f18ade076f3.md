@@ -1,0 +1,40 @@
+# Model selection〔正式题名待整理〕
+
+稳定ID：`ref-5f18ade076f3` · 类型：`technical_document` · 主题：`workflow-tools`
+
+作者：unknown；年份：unknown；出处：unknown。
+
+阅读等级：**仅题录/摘要/提及或核读范围待整理**。本轮是资料归档，不新增人读标记或复现实验结论。
+
+问题：项目记录中用于何种问题，见逐条来源上下文。
+
+机制／已存认识：本轮未独立抽取方法；仅保留项目记录已明确写出的内容，不由题名补结论。
+
+支持边界：项目已有引用/局部核查记录；不能据此视为全文精读或完成新颖性比较。
+
+限制：作者/年份/完整题名未归一时显式unknown；正文范围和作者结果未在本轮重新核验。
+
+与研究关系：本条用于对应主题的前作/语义边界；是否当前采用须回到总计划。
+
+相邻资料：standards-software资料；是否当前采用须回到总计划和本轮接受记录。
+
+原始来源：
+
+- [来源1](https://developers.openai.com/api/docs/guides/model-selection)
+
+项目核查／引用入口（精确行保存在catalog；链接打开原文件）：
+
+- [docs/agent-policy.md:7](../../docs/agent-policy.md)
+- [docs/history/agent-rules-20261016/workspace-instructions-before.md:15](../../docs/history/agent-rules-20261016/workspace-instructions-before.md)
+
+既有项目记录的上下文（历史判断，不能覆盖最新合同）：
+
+[docs/history/agent-rules-20261016/workspace-instructions-before.md:15](../../docs/history/agent-rules-20261016/workspace-instructions-before.md)：
+
+官方依据（2026-10-15已核对）：[Model selection](https://developers.openai.com/api/docs/guides/model-selection)强调按任务、质量、时延与成本选择模型，并以代表性结果检验；[API deployment checklist](https://developers.openai.com/api/docs/guides/deployment-checklist)说明推理强度的取舍及实际评估。下表是据此制定的**项目建议**，执行前仍须核对工具支持与实际运行记录。
+
+[docs/agent-policy.md:7](../../docs/agent-policy.md)：
+
+根AGENTS的配置表是项目建议，不是OpenAI针对本项目验证的最优配置。依据为已核对的[模型选择](https://developers.openai.com/api/docs/guides/model-selection)与[部署检查](https://developers.openai.com/api/docs/guides/deployment-checklist)；配置随任务、正确性、返工、耗时和可取得的用量数据调整，不为比较模型重跑已完成工作。
+
+[返回总目录](../README.md)
