@@ -1,0 +1,1155 @@
+--- a/apps/omp/basic/axpy/Makefile
++++ b/apps/omp/basic/axpy/Makefile
+@@ -4,14 +4,17 @@
+ #
+ # Cyril Koenig <cykoenig@iis.ee.ethz.ch>
+ 
++# The shared offload recipes use Bash parameter substitution.
++SHELL := /bin/bash
+ HERO_DEVICE ?= carfield_snitch_cluster
+ 
+ SRCDIR          = $(realpath $(HERO_ROOT)/apps/omp)
+ 
+-CSRCS_HOST      = basic/axpy/axpy_main.c common/iommu.c common/llc.c
++CSRCS_HOST      = basic/axpy/axpy_main.c
+ CSRCS           = common/utils.c basic/axpy/axpy_snitch.c
+ 
+ CFLAGS   += -O3 -g
++LDFLAGS  += -lm -fno-openmp-implicit-rpath
+ # CFLAGS   += -v -debug -save-temps=obj
+ 
+ -include ../../common/default.mk
+--- a/apps/omp/basic/axpy/axpy_main.c
++++ b/apps/omp/basic/axpy/axpy_main.c
+@@ -5,171 +5,139 @@
+ // Cyril Koenig   <cykoenig@iis.ee.ethz.ch>
+ // Enrico Zelioli <ezelioli@iis.ee.ethz.ch>
+ 
+-#include <ctype.h>
+-#include <fcntl.h>
++#include <errno.h>
++#include <limits.h>
+ #include <math.h>
+-#include <omp.h>
++#include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <sys/mman.h>
+-#include <time.h>
+-#include <unistd.h>
+-
+ #include "utils.h"
+-#include "iommu.h"
+-
+ #include <libhero/hero_api.h>
+ 
+-#define ALIGN_UP(size, align) ((size%align==0) ? size : size + align - (size%align))
+-#define MIN(A, B) (((A)<(B))?(A):(B))
++#define TILE_FLOATS 512U
++#define PAGE_BYTES 4096U
++#define BYPASS_OFFSET UINT64_C(0x200000000)
+ 
+-int axpy(uint64_t x_phys, uint64_t y_phys, float alpha, uint32_t n);
++int axpy(uint64_t x_iova, uint64_t y_iova, float alpha, uint32_t n);
+ 
+-int main(int argc, char *argv[])
++/* Actual buffers never alias either reference. Read every result element before
++ * a restore, and compare both cold and hot outputs against one immutable oracle. */
++static int consume(const float *actual_x, const float *actual_y,
++                   const float *reference_x, const float *expected, unsigned n,
++                   const char *label)
+ {
+-    // Input data
+-    float *x = NULL, *y = NULL;
+-    // Physical addresses
+-    uintptr_t x_dev_io, y_dev_io;
+-    // Virtual addresses
+-    float *x_dev_virt = NULL, *y_dev_virt = NULL;
+-    // Verification matrices / vectors
+-    float *x_host = NULL, *y_host = NULL;
+-    // Device virtual addresses
+-    float *x_iommu = NULL, *y_iommu = NULL;
+-    // Do / Don't map IOMMU flag
+-    int do_map = 0;
+-    // Return
+-    int ret;
+-    // sprintf buffer
+-    char toprint[128];
+-
+-    int n       = 16;
+-    float alpha = 1.0f;
+-    int noise   = 0;
+-
+-    if (argc > 1)
+-        n = strtol(argv[1], NULL, 10);
+-    if (argc > 2)
+-        alpha = atof(argv[2]);
+-    if (argc > 3)
+-        do_map = strtol(argv[3], NULL, 10);
+-    if (argc > 4)
+-        noise = strtol(argv[4], NULL, 10);
+-
+-    // IOMMU Management
+-    uint64_t iommu_ptr = iommu_devmap();
+-    if(do_map)
+-        iommu_enable(iommu_ptr);
+-    else
+-        iommu_disable(iommu_ptr);
+-    // LLC Management
+-    uint64_t llc_ptr = llc_devmap();
+-
+-    // Verification matrices
+-    x        = aligned_alloc(0x1000, ALIGN_UP(n * sizeof(float), 0x1000));
+-    y        = aligned_alloc(0x1000, ALIGN_UP(n * sizeof(float), 0x1000));
+-    x_host   = aligned_alloc(0x1000, ALIGN_UP(n * sizeof(float), 0x1000));
+-    y_host   = aligned_alloc(0x1000, ALIGN_UP(n * sizeof(float), 0x1000));
+-
+-    // Init Hero OpenMP runtime
+-    hero_add_timestamp("enter_init_omp", __func__, 0);
+-    init_omp_target();
+-
+-    // Prepare data in Linux's virtual memory region
+-    hero_add_timestamp("enter_prepare_data", __func__, 0);
+-
+-    for (int i = 0; i < n; ++i) {
+-        x[i] = (float) (fast_rand()%30 / 4);
+-        y[i] = (float) (fast_rand()%30 / 4);
+-        x_host[i] = x[i];
+-        y_host[i] = y[i];
+-    }
+-
+-    // Allocate data in upper physical memory region
+-    if(!do_map) {
+-        hero_add_timestamp("enter_alloc_data", __func__, 0);
+-        x_dev_virt   = hero_dev_l3_malloc(NULL, n * sizeof(float),   &x_dev_io);
+-        y_dev_virt   = hero_dev_l3_malloc(NULL, n * sizeof(float),   &y_dev_io);
+-    } else {
+-        x_dev_virt = x_host;
+-        y_dev_virt = y_host;
+-    }
+-
+-    // Copy data to physical memory region
+-    if(!do_map) {
+-        hero_add_timestamp("enter_copy_data", __func__, 0);
+-        memcpy(x_dev_virt, x_host, n  * sizeof(float));
+-        memcpy(y_dev_virt, y_host, n  * sizeof(float));
+-    } else {
+-    // Map allocated data into device IOMMU
+-        hero_add_timestamp("enter_map_data", __func__, 0);
+-        x_dev_io = (float *)(hero_iommu_map_virt(NULL, n * sizeof(float), x_host));
+-        y_dev_io = (float *)(hero_iommu_map_virt(NULL, n * sizeof(float), y_host));
+-    }
+-
+-    // Bypass LLC
+-    x_dev_io += 0x200000000;
+-    y_dev_io += 0x200000000;
+-
+-    asm volatile("fence");
+-    llc_flush(llc_ptr);
+-
+-    // Offload 1 (pre-heat instruction caches)
+-    snprintf(toprint, 128, "enter_cold_omp_axpy-%u", n);
+-    hero_add_timestamp(toprint, __func__, 0);
+-    ret = axpy((uint64_t)x_dev_io, (uint64_t)y_dev_io, alpha, (uint32_t)n);
+-
+-    // Re-copy input as AXPY is in place
+-    hero_add_timestamp("clean_input", __func__, 0);
+-    memcpy(x_dev_virt, x_host, n  * sizeof(float));
+-    memcpy(y_dev_virt, y_host, n  * sizeof(float));
+-
+-    asm volatile("fence");
+-    llc_flush(llc_ptr);
+-
+-    // Offload 2
+-    snprintf(toprint, 128, "enter_hot_omp_axpy-%u", n);
+-    hero_add_timestamp(toprint, __func__, 0);
+-    ret = axpy((uint64_t)x_dev_io, (uint64_t)y_dev_io, alpha, (uint32_t)n);
+-
+-    // Execution on host
+-    hero_add_timestamp("enter_verif", __func__, 0);
+-    for (long i=0; i < n; i+=4) {
+-       y_host[i]   = alpha * x_host[i]   + y_host[i]   ;
+-       y_host[i+1] = alpha * x_host[i+1] + y_host[i+1] ;
+-       y_host[i+2] = alpha * x_host[i+2] + y_host[i+2] ;
+-       y_host[i+3] = alpha * x_host[i+3] + y_host[i+3] ;
+-    }
+-    hero_add_timestamp("end_verif", __func__, 0);
+-
+-    asm volatile("fence");
+-
+-    // Verify result
+-    for (int i = 0; i < n; i++) {
+-        if (y_host[i] != y_dev_virt[i]) {
+-            printf("nope %i (%f != %f)\n", i, y_host[i], y_dev_virt[i]);
+-            break;
++    for (unsigned i = 0; i < n; i++) {
++        if (actual_x[i] != reference_x[i] ||
++            memcmp(&actual_y[i], &expected[i], sizeof(float))) {
++            fprintf(stderr, "%s mismatch at %u: got %a expected %a\n",
++                    label, i, actual_y[i], expected[i]);
++            return -1;
+         }
+     }
+-
+-    // Print all the recorded timestamps
+-    hero_print_timestamp();
+-
+-    // Print the device cycles per region
+-    // for (int i = 0; i < hero_num_device_cycles; i++)
+-    //     printf("%u - ", hero_device_cycles[i]);
+-    // printf("\n");
+-
+-    if (!do_map) {
+-        hero_dev_l3_free(NULL,   x_dev_virt,   x_dev_io);
+-        hero_dev_l3_free(NULL,   y_dev_virt,   y_dev_io);
+-    }
+-    free(  x_host);
+-    free(  y_host);
+-    free(  x);
+-    free(  y);
+-
++    printf("%s consumer verified %u FP32 elements\n", label, n);
+     return 0;
+ }
++
++int main(int argc, char **argv)
++{
++    unsigned n = 32768U;
++    float alpha = 1.0f;
++    char *end;
++    long parsed;
++    int status = EXIT_FAILURE, x_mapped = 0, y_mapped = 0;
++    int x_attempted = 0, y_attempted = 0;
++    float *x_ref = NULL, *y_ref = NULL, *expected = NULL;
++    float *x_dma = NULL, *y_dma = NULL;
++    uintptr_t x_iova = 0, y_iova = 0;
++    unsigned bytes = 0;
++
++    if (argc > 1) {
++        errno = 0; parsed = strtol(argv[1], &end, 10);
++        if (errno || *end || parsed <= 0 || (unsigned long)parsed > UINT_MAX / sizeof(float))
++            goto usage;
++        n = (unsigned)parsed;
++    }
++    if (argc > 2) {
++        errno = 0; alpha = strtof(argv[2], &end);
++        if (errno || *end || !isfinite(alpha)) goto usage;
++    }
++    /* This repair deliberately binds the enabled-IOVA workload. The legacy
++     * physical allocator/cache contract needs its own accepted control. */
++    if (n % TILE_FLOATS || (argc > 3 && strcmp(argv[3], "1")) ||
++        (argc > 4 && strcmp(argv[4], "0")) || argc > 5)
++        goto usage;
++    bytes = n * sizeof(float);
++    if (bytes > UINT_MAX - PAGE_BYTES + 1U) goto usage;
++    bytes = (bytes + PAGE_BYTES - 1U) & ~(PAGE_BYTES - 1U);
++    x_ref = aligned_alloc(PAGE_BYTES, bytes);
++    y_ref = aligned_alloc(PAGE_BYTES, bytes);
++    expected = aligned_alloc(PAGE_BYTES, bytes);
++    x_dma = aligned_alloc(PAGE_BYTES, bytes);
++    y_dma = aligned_alloc(PAGE_BYTES, bytes);
++    if (!x_ref || !y_ref || !expected || !x_dma || !y_dma) goto cleanup;
++    /* Fully initialize the pinned extent, including any trailing page bytes. */
++    memset(x_dma, 0, bytes); memset(y_dma, 0, bytes);
++    for (unsigned i = 0; i < n; i++) {
++        x_ref[i] = (float)((i * 17U + 3U) % 113U) * 0.25f;
++        y_ref[i] = (float)((i * 11U + 7U) % 127U) * 0.25f;
++        expected[i] = fmaf(alpha, x_ref[i], y_ref[i]);
++        if (!isfinite(expected[i])) goto cleanup;
++    }
++    init_omp_target();
++    /* Domain mode is owned by the kernel; never rewrite global DDTP from
++     * /dev/mem while other mappings or requesters may be active. */
++    x_attempted = 1;
++    x_iova = hero_iommu_map_virt(NULL, bytes, x_dma);
++    if (!x_iova) { perror("map x (requires accepted platform barriers)"); goto cleanup; }
++    x_mapped = 1;
++    y_attempted = 1;
++    y_iova = hero_iommu_map_virt(NULL, bytes, y_dma);
++    if (!y_iova) { perror("map y"); goto cleanup; }
++    y_mapped = 1;
++
++    for (unsigned run = 0; run < 2; run++) {
++        const char *label = run ? "hot" : "cold";
++        /* Cold and hot begin with identical, independently preserved inputs. */
++        memcpy(x_dma, x_ref, n * sizeof(float));
++        memcpy(y_dma, y_ref, n * sizeof(float));
++        if (hero_iommu_sync_for_device(NULL, bytes, x_dma, x_iova) ||
++            hero_iommu_sync_for_device(NULL, bytes, y_dma, y_iova)) {
++            perror("cache handoff to device"); goto cleanup;
++        }
++        /* Synchronous target return now includes final output DMA wait before
++         * the target dispatcher is allowed to publish DEVICE_DONE. */
++        if (axpy(x_iova + BYPASS_OFFSET, y_iova + BYPASS_OFFSET, alpha, n))
++            goto cleanup;
++        if (hero_iommu_sync_for_cpu(NULL, bytes, x_dma, x_iova) ||
++            hero_iommu_sync_for_cpu(NULL, bytes, y_dma, y_iova)) {
++            perror("cache handoff to CPU"); goto cleanup;
++        }
++        if (consume(x_dma, y_dma, x_ref, expected, n, label)) goto cleanup;
++    }
++    status = EXIT_SUCCESS;
++cleanup:
++    if (y_mapped) {
++        if (hero_iommu_unmap_virt(NULL, bytes, y_dma, y_iova)) {
++            perror("unmap y: kernel retains pins until safe revocation");
++            status = EXIT_FAILURE;
++        } else y_mapped = 0;
++    }
++    if (x_mapped) {
++        if (hero_iommu_unmap_virt(NULL, bytes, x_dma, x_iova)) {
++            perror("unmap x: kernel retains pins until safe revocation");
++            status = EXIT_FAILURE;
++        } else x_mapped = 0;
++    }
++    /* free() is permitted only after successful unmap/invalidation/unpin.
++     * On failure the process may exit, but physical pages remain pinned. */
++    /* A failed ioctl may have quarantined a partially installed map. Without
++     * a returned handle, retain that allocation until process exit as well. */
++    if (!x_attempted || (x_iova && !x_mapped)) free(x_dma);
++    if (!y_attempted || (y_iova && !y_mapped)) free(y_dma);
++    free(x_ref); free(y_ref); free(expected);
++    return status;
++usage:
++    fprintf(stderr, "usage: %s [n divisible by 512] [finite alpha] [1] [0]\n", argv[0]);
++    return EXIT_FAILURE;
++}
+--- a/apps/omp/basic/axpy/axpy_snitch.c
++++ b/apps/omp/basic/axpy/axpy_snitch.c
+@@ -9,12 +9,13 @@
+ // Host wrapper             //
+ //////////////////////////////
+ 
+-#include <inttypes.h>
++#include <stdint.h>
+ 
+ void dev_axpy(uint64_t x_phys, uint64_t y_phys, float alpha, uint32_t n);
+ 
+ 
+ int axpy(uint64_t x_phys, uint64_t y_phys, float alpha, uint32_t n) {
++    if (!x_phys || !y_phys || !n || n % 512U) return -1;
+     #pragma omp target device(1) map(to:x_phys, y_phys, alpha, n)
+     {
+         (volatile uint64_t) x_phys;
+@@ -25,7 +26,7 @@
+         dev_axpy(x_phys, y_phys, alpha, n);
+ #endif
+     }
+-
++    return 0;
+ }
+ 
+ //////////////////////////////
+@@ -36,7 +37,6 @@
+ 
+ #include "encoding.h"
+ #include "runtime.h"
+-#include "printf.h"
+ #include "printf.h"
+ #include "hero_64.h"
+ 
+@@ -76,8 +76,8 @@
+ 
+     if(core_idx == 8) {
+         issue_timer = pulp_get_timer();
+-        __dma_start_1d_wideptr_base((uint64_t) l1_buf_x[0], (uint64_t) x_phys, 8*BUF_SIZE*sizeof(float), 0);
+-        __dma_start_1d_wideptr_base((uint64_t) l1_buf_y[0], (uint64_t) y_phys, 8*BUF_SIZE*sizeof(float), 0);
++        __dma_start_1d_wideptr_base((uint64_t)(uintptr_t) l1_buf_x[0], (uint64_t) x_phys, 8*BUF_SIZE*sizeof(float), 0);
++        __dma_start_1d_wideptr_base((uint64_t)(uintptr_t) l1_buf_y[0], (uint64_t) y_phys, 8*BUF_SIZE*sizeof(float), 0);
+         issue_time += pulp_get_timer() - issue_timer;
+     }
+ 
+@@ -94,8 +94,8 @@
+             
+             issue_timer = pulp_get_timer();
+             if(rest > 0) {
+-                __dma_start_1d_wideptr_base((uint64_t) l1_buf_x[(itr+1)%2], x_phys + (i+8*BUF_SIZE)*sizeof(float), 8*BUF_SIZE*sizeof(float), 0);
+-                __dma_start_1d_wideptr_base((uint64_t) l1_buf_y[(itr+1)%2], y_phys + (i+8*BUF_SIZE)*sizeof(float), 8*BUF_SIZE*sizeof(float), 0);
++                __dma_start_1d_wideptr_base((uint64_t)(uintptr_t) l1_buf_x[(itr+1)%2], x_phys + (i+8*BUF_SIZE)*sizeof(float), 8*BUF_SIZE*sizeof(float), 0);
++                __dma_start_1d_wideptr_base((uint64_t)(uintptr_t) l1_buf_y[(itr+1)%2], y_phys + (i+8*BUF_SIZE)*sizeof(float), 8*BUF_SIZE*sizeof(float), 0);
+             }
+             issue_diff = pulp_get_timer() - issue_timer;
+         } else {
+@@ -104,20 +104,24 @@
+ 
+             if(core_idx == 0) compute_timer = pulp_get_timer();
+ 
+-            // Don't accumulate in first iteration
+-            asm volatile("mv t0, zero\n"
+-                 // Don't accumulate in first iteration
+-                 "addi t0, t0, 1\n\r"
+-                 "flw ft1, 0(%[a]) \n"
+-                 "add %[a], %[a], 4 \n"
+-                 "flw ft2, 0(%[b]) \n"
+-                 "fmadd.s ft2, %[alpha], ft1, ft2 \n"
+-                 "fsw ft2, 0(%[b]) \n"
+-                 "add %[b], %[b], 4 \n"
+-                 "blt   t0, %[n], -28 \n"
+-                 :
+-                 : [n] "r"(BUF_SIZE), [a] "r"(&l1_buf_x[itr%2][core_idx]), [b] "r"(&l1_buf_y[itr%2][core_idx]), [alpha] "f"(alpha)
+-                 : "ft1", "ft2", "t0");
++            /* Preserve one hardware FP32 FMA per element. These pointers are
++             * modified inside the asm: read/write EARLY-CLOBBER operands keep
++             * them separate from the loop bound, and memory describes stores. */
++            __device float *px = &l1_buf_x[itr % 2][core_idx][0];
++            __device float *py = &l1_buf_y[itr % 2][core_idx][0];
++            asm volatile (
++                "li t0, 0\n"
++                "1: flw ft1, 0(%[a])\n"
++                "flw ft2, 0(%[b])\n"
++                "fmadd.s ft2, %[alpha], ft1, ft2\n"
++                "fsw ft2, 0(%[b])\n"
++                "addi %[a], %[a], 4\n"
++                "addi %[b], %[b], 4\n"
++                "addi t0, t0, 1\n"
++                "blt t0, %[n], 1b\n"
++                : [a] "+&r"(px), [b] "+&r"(py)
++                : [n] "r"(BUF_SIZE), [alpha] "f"(alpha)
++                : "ft1", "ft2", "t0", "memory");
+         }
+ 
+         pulp_barrier();
+@@ -128,17 +132,25 @@
+             uint32_t compute_diff = (pulp_get_timer() - compute_timer);
+              // Copy out data
+             issue_timer = pulp_get_timer();
+-            __dma_start_1d_wideptr_base(y_phys + i*sizeof(float), (uint64_t) &l1_buf_y[itr%2], 8*BUF_SIZE*sizeof(float), 0);
++            __dma_start_1d_wideptr_base(y_phys + i*sizeof(float), (uint64_t)(uintptr_t) &l1_buf_y[itr%2], 8*BUF_SIZE*sizeof(float), 0);
+             issue_time += pulp_get_timer() - issue_timer + (issue_diff - compute_diff) * (issue_diff > compute_diff);
+         }
+         itr++;
+     }
+-    
++
++    /* The last output descriptor is asynchronous too. Drain it on the sole
++     * publisher before ANY core returns to the dispatcher and DEVICE_DONE. */
++    if (core_idx == 8) {
++        dma_timer = pulp_get_timer();
++        dma_wait_all();
++        dma_time += pulp_get_timer() - dma_timer;
++        asm volatile("fence rw, rw" ::: "memory");
++    }
+     pulp_barrier();
+ 
+     if(core_idx == 8) {
+         all_time = pulp_get_timer() - all_timer;
+-        printf("%x Tot : %u Dma : %u Issue : %u Compute : %u\n", all_time, dma_time, issue_time, compute_time);
++        printf("Tot : %u Dma : %u Issue : %u Compute : %u\n", all_time, dma_time, issue_time, compute_time);
+     }
+ 
+     pulp_barrier();
+--- a/apps/omp/common/default.mk
++++ b/apps/omp/common/default.mk
+@@ -49,7 +49,8 @@
+ CFLAGS   += -MT $@ -MMD -MP -MF $(DEPDIR)/$*.d
+ 
+ # Link flags
+-LDFLAGS  += --ld-path=$(RISCV)/bin/riscv64-buildroot-linux-gnu-ld 
++HOST_LD ?= $(RISCV)/bin/riscv64-buildroot-linux-gnu-ld
++LDFLAGS  += --ld-path=$(HOST_LD) 
+ # Path to the OpenMP target RTL
+ LDFLAGS  += -L$(HERO_ROOT)/sw/libomp/lib
+ 
+--- a/hero.mk
++++ b/hero.mk
+@@ -32,12 +32,13 @@
+ # Outputs of cva6-sdk/buildroot
+ HERO_BR_OUTPUT_DIR := $(realpath $(HERO_CVA6_SDK_DIR)/buildroot/output/)
+ HERO_LINUX_CROSS_COMPILE := $(HERO_BR_OUTPUT_DIR)/host/bin/riscv64-buildroot-linux-gnu-
+-HERO_KERNEL_DIR    := $(HERO_BR_OUTPUT_DIR)/build/linux-6.1.22
++# A2 uses an immutable 6.9 author snapshot, never the old 6.1.22 default.
++HERO_KERNEL_DIR    := $(HERO_BR_OUTPUT_DIR)/build/linux-e4b0725a5089f6cc0fc5afec06f3091d98dffa68
+ 
+ HERO_ARTIFACTS_ROOT_tc-gcc := $(HERO_ARTIFACTS_ROOT)/tc_gcc
+ HERO_ARTIFACTS_DATA_tc-gcc := $(HERO_BR_OUTPUT_DIR)/host
+ HERO_ARTIFACTS_VARS_tc-gcc := $(CC) $(CXX)
+-HERO_ARTIFACTS_FILES_tc-gcc := $(HERO_CVA6_SDK_DIR)/configs/buildroot64_defconfig
++HERO_ARTIFACTS_FILES_tc-gcc := $(HERO_CVA6_SDK_DIR)/configs/buildroot64_defconfig_iommu
+ 
+ # Cross compiler *Linux* gcc toolchain
+ $(HERO_LINUX_CROSS_COMPILE)gcc:
+--- a/scripts/setenv.sh
++++ b/scripts/setenv.sh
+@@ -11,11 +11,8 @@
+ export RV64_SYSROOT=$RISCV/riscv64-buildroot-linux-gnu/sysroot
+ export CROSS_COMPILE=$RISCV/bin/riscv64-buildroot-linux-gnu-
+ 
+-# Parse the device Linux path from buildroot
+-if [ -d $CVA6_SDK/buildroot/output/build ]; then
+-export BR_LINUX_DIR=$CVA6_SDK/buildroot/output/$(make -C cva6-sdk/buildroot linux-show-info \
+-                    | python3 -c "import sys, json; print(json.loads(sys.stdin.readlines()[1])['linux']['build_dir'])")
+-fi
++# A2 fixed author 6.9 tree; no mutable Buildroot query or 6.1 fallback.
++export BR_LINUX_DIR=$CVA6_SDK/buildroot/output/build/linux-e4b0725a5089f6cc0fc5afec06f3091d98dffa68
+ 
+ # For Occamy bootrom
+ export UBOOT_SPL_BIN=$CVA6_SDK/install64/u-boot-spl.bin
+--- a/sw/hero-driver/carfield/Makefile
++++ b/sw/hero-driver/carfield/Makefile
+@@ -4,21 +4,17 @@
+ 
+ HERO_ROOT = $(realpath ../../..)
+ 
+-# Platform BUILDROOT : cross compile driver for the FPGA
+-#          NATIVE    : compile driver for this machine
+-PLATFORM ?= BUILDROOT
+-
+-KERNEL_DIR_NATIVE := /lib/modules/$(shell uname -r)/build
+-KERNEL_DIR_BUILDROOT := $(BR_LINUX_DIR)
+-
+-BR_OUTPUT_DIR ?= $(HERO_ROOT)/cva6-sdk/buildroot/output/
+-CROSS_COMPILE_NATIVE ?=
+-CROSS_COMPILE_BUILDROOT ?= $(BR_OUTPUT_DIR)/host/bin/riscv64-buildroot-linux-gnu-
++# A2 fixed enabled-IOVA profile. scripts/setenv.sh points at this exact author
++# snapshot; there is no native or 6.1 kernel fallback in this profile.
++PLATFORM := BUILDROOT
++KERNEL_DIR := $(HERO_ROOT)/cva6-sdk/buildroot/output/build/linux-e4b0725a5089f6cc0fc5afec06f3091d98dffa68
++BR_OUTPUT_DIR := $(HERO_ROOT)/cva6-sdk/buildroot/output/
++CROSS_COMPILE := $(BR_OUTPUT_DIR)/host/bin/riscv64-buildroot-linux-gnu-
+ 
+ # Linux compilation arguments
+ obj-m := carfield.o
+-carfield-objs := carfield_driver.o carfield_fops.o ../common/hero_iommu.o
+-ccflags-y += -I$(src)/../common -Idrivers/iommu/riscv -DHERO_PLATFORM=$(PLATFORM)
++carfield-objs := carfield_driver.o carfield_fops.o ../common/hero_iommu.o ../common/hero_platform_gate.o
++ccflags-y += -I$(src)/../common -Idrivers/iommu/riscv -DNATIVE=1 -DBUILDROOT=2 -DHERO_PLATFORM=$(PLATFORM)
+ 
+ .PHONY: all dis clean build
+ 
+@@ -26,10 +22,10 @@
+ build: modules
+ 
+ modules:
+-	$(MAKE) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE_$(PLATFORM)) -C $(KERNEL_DIR_$(PLATFORM)) M=$(shell pwd) ARCH=riscv modules
++	$(MAKE) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -C $(KERNEL_DIR) M=$(shell pwd) ARCH=riscv modules
+ 
+ dis: modules
+-	$(CROSS_COMPILE_$(PLATFORM))objdump -DS carfield.ko > carfield.disasm
++	$(CROSS_COMPILE)objdump -DS carfield.ko > carfield.disasm
+ 
+ deploy:
+ 	cp carfield.ko $(HERO_ROOT)/cva6-sdk/rootfs/root
+--- a/sw/hero-driver/carfield/carfield.h
++++ b/sw/hero-driver/carfield/carfield.h
+@@ -41,6 +41,7 @@
+     struct shared_mem pcie_axi_bar_mem;
+     // DMA buffer list
+     struct list_head test_head;
++    struct mutex iommu_lock;
+     // IOMMU regions list
+     struct list_head iommu_region_list;
+     // IOMMU
+@@ -50,6 +51,12 @@
+     unsigned int buffer_size;
+     dev_t dev_num;
+     struct cdev cdev;
++};
++
++/* A file owns only its own mappings; foreign mm use is rejected. */
++struct card_file_context {
++    struct cardev_private_data *dev;
++    struct mm_struct *mm;
+ };
+ 
+ // Driver private data structure
+--- a/sw/hero-driver/carfield/carfield_driver.c
++++ b/sw/hero-driver/carfield/carfield_driver.c
+@@ -252,6 +252,7 @@
+     // Probe L3
+     probe_node(pdev, dev_data, &dev_data->l3_mem, "l3-buffer");
+ 
++    mutex_init(&dev_data->iommu_lock);
+     // IOMMU region list
+     INIT_LIST_HEAD(&dev_data->iommu_region_list);
+ 
+@@ -341,6 +342,13 @@
+     struct device *spatz_dev;
+     int ret;
+ 
++    /* No domain destruction while any page remains reachable/quarantined.
++     * The per-region module references prevent normal module unload. */
++    if (!list_empty(&dev_data->iommu_region_list)) {
++        dev_err(&pdev->dev, "HERO remove refused: pinned mappings remain\n");
++        return -EBUSY;
++    }
++
+     // ret = iommu_unmap(dev_data->iommu_domain, dev_data->l2_intl_0_mem.pbase,
+     //                   dev_data->l2_intl_0_mem.size);
+     // ret = iommu_unmap(dev_data->iommu_domain, dev_data->l2_cont_0_mem.pbase,
+@@ -395,6 +403,7 @@
+     .remove = card_platform_driver_remove,
+     .driver = {
+         .name = "eth-carfield",
++        .suppress_bind_attrs = true,
+         .of_match_table = carfield_of_match,
+     }};
+ 
+@@ -451,7 +460,7 @@
+ static void __exit card_platform_driver_cleanup(void) {
+     // Unregister the platform driver
+     platform_driver_unregister(&card_platform_driver);
+-    platform_driver_register(&spatz_platform_driver);
++    platform_driver_unregister(&spatz_platform_driver);
+ 
+     // Class destroy
+     class_destroy(cardrv_data.class_card);
+--- a/sw/hero-driver/carfield/carfield_driver.h
++++ b/sw/hero-driver/carfield/carfield_driver.h
+@@ -37,6 +37,9 @@
+ #define IOCTL_DMA_ALLOC _IOWR('C', 1, struct card_ioctl_arg *)
+ #define IOCTL_MEM_INFOS _IOWR('C', 2, struct card_ioctl_arg *)
+ #define IOCTL_IOMMU_MAP _IOWR('C', 3, struct card_ioctl_arg *)
++#define IOCTL_IOMMU_UNMAP _IOWR('C', 4, struct card_ioctl_arg *)
++#define IOCTL_IOMMU_SYNC_CPU _IOWR('C', 5, struct card_ioctl_arg *)
++#define IOCTL_IOMMU_SYNC_DEVICE _IOWR('C', 6, struct card_ioctl_arg *)
+ 
+ #define PTR_TO_DEVDATA_REGION(VAR, DEVDATA, X)                                 \
+     switch (X) {                                                               \
+--- a/sw/hero-driver/carfield/carfield_fops.c
++++ b/sw/hero-driver/carfield/carfield_fops.c
+@@ -34,7 +34,7 @@
+ ssize_t card_read(struct file *filp, char __user *buff, size_t count,
+                   loff_t *f_pos) {
+     struct cardev_private_data *cardev_data =
+-        (struct cardev_private_data *)filp->private_data;
++        ((struct card_file_context *)filp->private_data)->dev;
+ 
+     int max_size = cardev_data->buffer_size;
+ 
+@@ -71,16 +71,34 @@
+ }
+ 
+ int card_open(struct inode *inode, struct file *filp) {
++    struct card_file_context *ctx;
++    int ret = check_permission(PDATA_PERM, filp->f_mode);
++    if (ret) return ret;
++    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++    if (!ctx) return -ENOMEM;
++    ctx->dev = container_of(inode->i_cdev, struct cardev_private_data, cdev);
++    ctx->mm = current->mm;
++    mmgrab(ctx->mm);
++    filp->private_data = ctx;
++    return 0;
++}
++
++int card_release(struct inode *inode, struct file *filp) {
++    struct card_file_context *ctx = filp->private_data;
+     int ret;
+-    struct cardev_private_data *cardev_data;
+-    cardev_data = container_of(inode->i_cdev, struct cardev_private_data, cdev);
+-    filp->private_data = cardev_data;
+-    ret = check_permission(PDATA_PERM, filp->f_mode);
+-    return ret;
+-}
+-
+-int card_release(struct inode *inode, struct file *filp) {
+-    // pr_info("release was successful \n");
++    mutex_lock(&ctx->dev->iommu_lock);
++    ret = hero_iommu_release_owner(&ctx->dev->pdev->dev, ctx->dev->iommu_domain,
++                                   &ctx->dev->iommu_region_list, ctx);
++    mutex_unlock(&ctx->dev->iommu_lock);
++    if (ret) {
++        /* close() cannot report reliable cleanup failure. Keep the owner/mm
++         * and per-region module references alive with the quarantined pages. */
++        dev_err(&ctx->dev->pdev->dev,
++                "HERO close quarantined owner: pages NOT unpinned (%d)\n", ret);
++        return ret;
++    }
++    mmdrop(ctx->mm);
++    kfree(ctx);
+     return 0;
+ }
+ 
+@@ -90,7 +108,7 @@
+     char type[20];
+     int ret;
+     struct cardev_private_data *cardev_data =
+-        (struct cardev_private_data *)filp->private_data;
++        ((struct card_file_context *)filp->private_data)->dev;
+ 
+     switch (vma->vm_pgoff) {
+     case SOC_CTRL_MMAP_ID:
+@@ -180,7 +198,7 @@
+     void __user *argp = (void __user *)arg_user_addr;
+     // Get driver data
+     struct cardev_private_data *cardev_data =
+-        (struct cardev_private_data *)file->private_data;
++        ((struct card_file_context *)file->private_data)->dev;
+     // Fetch user arguments
+     struct card_ioctl_arg arg;
+     if (copy_from_user(&arg, argp, sizeof(struct card_ioctl_arg)))
+@@ -248,22 +266,37 @@
+         }
+         break;
+     }
+-    case IOCTL_IOMMU_MAP: {
+-        pr_debug("Driver received IOCTL_IOMMU_MAP\n");
+-
+-        // Here phys_adress to hold the iova (let's put in memory unused by the
+-        // device)
+-        arg.result_phys_addr = 0x80000000 + (arg.result_virt_addr % 0x40000000);
+-
+-        err = hero_iommu_region_add(
+-            cardev_data->iommu_domain, &cardev_data->iommu_region_list,
+-            arg.result_virt_addr, arg.result_phys_addr, arg.size);
+-
+-        if (err < 0) {
+-            pr_err("hero_iommu_region_add failed\n");
+-            return err;
++    case IOCTL_IOMMU_MAP:
++    case IOCTL_IOMMU_UNMAP:
++    case IOCTL_IOMMU_SYNC_CPU:
++    case IOCTL_IOMMU_SYNC_DEVICE: {
++        struct card_file_context *ctx = file->private_data;
++        if (current->mm != ctx->mm) return -EXDEV;
++        mutex_lock(&cardev_data->iommu_lock);
++        if (cmd == IOCTL_IOMMU_MAP) {
++            arg.result_phys_addr = HERO_IOVA_BASE +
++                                   (arg.result_virt_addr % HERO_IOVA_SIZE);
++            err = hero_iommu_region_add(&cardev_data->pdev->dev,
++                    cardev_data->iommu_domain, &cardev_data->iommu_region_list,
++                    ctx, arg.result_virt_addr, arg.result_phys_addr, arg.size);
++            if (!err && copy_to_user(argp, &arg, sizeof(arg))) {
++                int cleanup = hero_iommu_region_remove(&cardev_data->pdev->dev,
++                    cardev_data->iommu_domain, &cardev_data->iommu_region_list,
++                    ctx, arg.result_virt_addr, arg.result_phys_addr, arg.size);
++                /* Failed result delivery must also roll back its map. */
++                err = cleanup ? -EIO : -EFAULT;
++            }
++        } else if (cmd == IOCTL_IOMMU_UNMAP) {
++            err = hero_iommu_region_remove(&cardev_data->pdev->dev,
++                    cardev_data->iommu_domain, &cardev_data->iommu_region_list,
++                    ctx, arg.result_virt_addr, arg.result_phys_addr, arg.size);
++        } else {
++            err = hero_iommu_cache_sync(&cardev_data->pdev->dev,
++                    &cardev_data->iommu_region_list, ctx, arg.result_virt_addr,
++                    arg.result_phys_addr, arg.size, cmd == IOCTL_IOMMU_SYNC_CPU);
+         }
+-        break;
++        mutex_unlock(&cardev_data->iommu_lock);
++        return err;
+     }
+     case IOCTL_MEM_INFOS: {
+         pr_debug("Lookup %i\n", arg.mmap_id);
+@@ -280,7 +313,7 @@
+         break;
+     }
+     default:
+-        return -1;
++        return -ENOTTY;
+     }
+ 
+     // Send back result to user
+--- a/sw/hero-driver/common/hero_iommu.c
++++ b/sw/hero-driver/common/hero_iommu.c
+@@ -1,63 +1,182 @@
+-// Copyright 2024 ETH Zurich and University of Bologna.
+-// Licensed under the Apache License, Version 2.0, see LICENSE for details.
+ // SPDX-License-Identifier: GPL-2.0 OR Apache-2.0
+-//
+-// Cyril Koenig <cykoenig@iis.ee.ethz.ch>
+-
+-#include <linux/iommu.h>
+-#include <linux/mm.h>
+-#include <linux/types.h>
+-#include <linux/version.h>
++#include <linux/errno.h>
++#include <linux/limits.h>
++#include <linux/module.h>
++#include <linux/overflow.h>
++#include <linux/slab.h>
+ #include "hero_iommu.h"
+ 
+-int hero_iommu_region_add(struct iommu_domain *iommu_domain,
+-                          struct list_head *iommu_region_list, u64 user_addr, u64 iova,
+-                          u64 length) {
+-    int ret, i;
+-    unsigned long nr_pages = length >> PAGE_SHIFT;
+-    struct page **pages;
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)
++static struct hero_iommu_region *find_region(struct list_head *regions,
++        const void *owner, u64 user_addr, u64 iova, u64 length)
++{
++    struct hero_iommu_region *r;
++    list_for_each_entry(r, regions, list)
++        if (r->owner == owner && r->user_addr == user_addr &&
++            r->iova == iova && r->length == length)
++            return r;
++    return NULL;
++}
+ 
+-    if(user_addr & ~PAGE_MASK || length & ~PAGE_MASK || iova & ~PAGE_MASK) {
+-        pr_err("unaligned address or size (%llx %llx %llx)\n", user_addr, length, iova);
++static bool has_quarantine(struct list_head *regions)
++{
++    struct hero_iommu_region *r;
++    list_for_each_entry(r, regions, list)
++        if (r->quarantined) return true;
++    return false;
++}
++
++/* The caller holds every publisher stopped. Preserve exact progress on short
++ * unmaps so neither a retry nor another owner can recycle an alias too early. */
++static int revoke(struct device *dev, struct iommu_domain *domain,
++                  struct hero_iommu_region *r)
++{
++    size_t done;
++    while (r->bypass_mapped) {
++        u64 addr = r->iova + (r->bypass_mapped - 1) * PAGE_SIZE;
++        done = iommu_unmap(domain, addr + HERO_BYPASS_OFFSET, PAGE_SIZE);
++        if (done != PAGE_SIZE)
++            goto quarantine;
++        r->bypass_mapped--;
+     }
++    while (r->base_mapped) {
++        u64 addr = r->iova + (r->base_mapped - 1) * PAGE_SIZE;
++        done = iommu_unmap(domain, addr, PAGE_SIZE);
++        if (done != PAGE_SIZE)
++            goto quarantine;
++        r->base_mapped--;
++    }
++    /* This checked completion hook is mandatory even after a full-size unmap. */
++    if (hero_platform_invalidate_complete(dev, domain))
++        goto quarantine;
++    unpin_user_pages_dirty_lock(r->pages, r->nr_pages, true);
++    list_del(&r->list);
++    kfree(r->pages);
++    kfree(r);
++    module_put(THIS_MODULE);
++    return 0;
++quarantine:
++    r->quarantined = true;
++    dev_err(dev, "HERO revoke incomplete: retaining pinned pages and stopped publishers\n");
++    return -EIO;
++}
+ 
+-    pages =
+-        (struct page **)kcalloc(nr_pages, sizeof(struct page *), GFP_KERNEL);
+-    if (!pages) {
+-        pr_err("no memory available\n\r");
+-		return -ENOMEM;
+-	}
++int hero_iommu_region_add(struct device *dev, struct iommu_domain *domain,
++        struct list_head *regions, const void *owner,
++        u64 user_addr, u64 iova, u64 length)
++{
++    struct hero_iommu_region *r, *other;
++    u64 end, user_end;
++    long pinned;
++    unsigned long i;
++    int ret;
+ 
+-    //pr_info("pin_user_pages_fast %llx %llx %x %llx\n", user_addr, nr_pages,
+-    //        FOLL_WRITE, pages);
++    if (!domain)
++        return -ENODEV;
++    if (!length || ((user_addr | iova | length) & (PAGE_SIZE - 1)) ||
++        user_addr > ULONG_MAX || check_add_overflow(user_addr, length, &user_end) ||
++        user_end > ULONG_MAX || check_add_overflow(iova, length, &end) ||
++        iova < HERO_IOVA_BASE || end > HERO_IOVA_BASE + HERO_IOVA_SIZE ||
++        (length >> PAGE_SHIFT) > INT_MAX)
++        return -EINVAL;
++    list_for_each_entry(other, regions, list) {
++        if (other->quarantined)
++            return -EIO;
++        if (iova < other->iova + other->length && other->iova < end)
++            return -EEXIST;
++    }
++    /* Capability is checked BEFORE pinning or installing a PTE. */
++    ret = hero_platform_quiesce(dev);
++    if (ret)
++        return ret;
++    r = kzalloc(sizeof(*r), GFP_KERNEL);
++    if (!r) { ret = -ENOMEM; goto resume; }
++    r->nr_pages = length >> PAGE_SHIFT;
++    r->pages = kcalloc(r->nr_pages, sizeof(*r->pages), GFP_KERNEL);
++    if (!r->pages) { ret = -ENOMEM; kfree(r); goto resume; }
++    pinned = pin_user_pages_fast(user_addr, r->nr_pages,
++                                FOLL_WRITE | FOLL_LONGTERM, r->pages);
++    if (pinned < 0 || (unsigned long)pinned != r->nr_pages) {
++        if (pinned > 0)
++            unpin_user_pages(r->pages, pinned);
++        ret = pinned < 0 ? pinned : -EFAULT;
++        kfree(r->pages); kfree(r); goto resume;
++    }
++    r->owner = owner;
++    r->user_addr = user_addr;
++    r->iova = iova;
++    r->length = length;
++    /* Keep a module reference for each mapping, including quarantined ones. */
++    __module_get(THIS_MODULE);
++    list_add_tail(&r->list, regions);
++    for (i = 0; i < r->nr_pages; i++) {
++        ret = iommu_map(domain, iova + i * PAGE_SIZE,
++                        page_to_phys(r->pages[i]), PAGE_SIZE,
++                        IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
++        if (ret) goto rollback;
++        r->base_mapped++;
++        ret = iommu_map(domain, iova + i * PAGE_SIZE + HERO_BYPASS_OFFSET,
++                        page_to_phys(r->pages[i]) + HERO_BYPASS_OFFSET,
++                        PAGE_SIZE, IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
++        if (ret) goto rollback;
++        r->bypass_mapped++;
++    }
++    ret = hero_platform_invalidate_complete(dev, domain);
++    if (ret) goto rollback;
++    hero_platform_resume(dev);
++    return 0;
++rollback:
++    /* Do not expose an incomplete IOVA. No unpin until BOTH aliases are
++     * removed and their invalidation completion has actually been received. */
++    if (revoke(dev, domain, r))
++        return -EIO; /* publishers remain stopped; record remains owned */
++resume:
++    hero_platform_resume(dev);
++    return ret;
++}
+ 
+-    ret = pin_user_pages_fast(user_addr, nr_pages, FOLL_WRITE, pages);
++int hero_iommu_region_remove(struct device *dev, struct iommu_domain *domain,
++        struct list_head *regions, const void *owner,
++        u64 user_addr, u64 iova, u64 length)
++{
++    struct hero_iommu_region *r = find_region(regions, owner, user_addr, iova, length);
++    int ret;
++    if (!r) return -ENOENT;
++    ret = hero_platform_quiesce(dev);
++    if (ret) {
++        r->quarantined = true;
++        return -EIO; /* PTEs and pins remain; refuse new submissions/maps. */
++    }
++    ret = revoke(dev, domain, r);
++    if (!ret && !has_quarantine(regions)) hero_platform_resume(dev);
++    return ret;
++}
+ 
+-    if (ret < nr_pages || nr_pages == 0) {
+-        pr_err("pin_pages failed (%u)\n", ret);
+-        return -1;
++int hero_iommu_release_owner(struct device *dev, struct iommu_domain *domain,
++        struct list_head *regions, const void *owner)
++{
++    struct hero_iommu_region *r, *next;
++    int ret = 0;
++    list_for_each_entry_safe(r, next, regions, list) {
++        if (r->owner != owner) continue;
++        ret = hero_iommu_region_remove(dev, domain, regions, owner,
++                                      r->user_addr, r->iova, r->length);
++        if (ret) return ret;
+     }
++    return 0;
++}
+ 
+-    for (i = 0; i < nr_pages; i++) {
+-        iommu_map(iommu_domain, iova + PAGE_SIZE * i,
+-                  page_to_phys(pages[i]), PAGE_SIZE, IOMMU_READ | IOMMU_WRITE,
+-                  GFP_KERNEL);
+-        iommu_map(iommu_domain, iova + PAGE_SIZE * i + 0x200000000,
+-                  page_to_phys(pages[i]) + 0x200000000, PAGE_SIZE, IOMMU_READ | IOMMU_WRITE,
+-                  GFP_KERNEL);
+-    }
+-
+-    // Add to the buffer list
+-    // struct hero_iommu_region_node *new =
+-    //     kmalloc(sizeof(struct hero_iommu_region_node), GFP_KERNEL);
+-    // new->data = kmalloc(sizeof(struct hero_iommu_region), GFP_KERNEL);
+-    // new->data->user_addr = user_addr;
+-    // new->data->length = length;
+-    // new->data->iova = user_addr;
+-    // list_add_tail(&new->list, iommu_region_list);
+-    return nr_pages;
+-#else
+-    return -1;
+-#endif
++int hero_iommu_cache_sync(struct device *dev, struct list_head *regions,
++        const void *owner, u64 user_addr, u64 iova, u64 length, bool for_cpu)
++{
++    struct hero_iommu_region *r = find_region(regions, owner, user_addr, iova, length);
++    int ret;
++    if (!r) return -ENOENT;
++    if (has_quarantine(regions)) return -EIO;
++    ret = hero_platform_quiesce(dev);
++    if (ret) return ret;
++    ret = hero_platform_cache_sync(dev, r->pages, r->nr_pages, for_cpu);
++    if (!ret) hero_platform_resume(dev);
++    /* Cache failure also leaves publishers stopped and blocks new maps. */
++    else r->quarantined = true;
++    return ret;
+ }
+--- a/sw/hero-driver/common/hero_iommu.h
++++ b/sw/hero-driver/common/hero_iommu.h
+@@ -1,25 +1,50 @@
+-// Copyright 2024 ETH Zurich and University of Bologna.
+-// Licensed under the Apache License, Version 2.0, see LICENSE for details.
+ // SPDX-License-Identifier: GPL-2.0 OR Apache-2.0
+-//
+-// Cyril Koenig <cykoenig@iis.ee.ethz.ch>
++#pragma once
++#include <linux/iommu.h>
++#include <linux/list.h>
++#include <linux/mm.h>
++#include <linux/mutex.h>
+ 
+-#pragma once
+-
+-#include <linux/types.h>
++#define HERO_IOVA_BASE 0x80000000ULL
++#define HERO_IOVA_SIZE 0x40000000ULL
++#define HERO_BYPASS_OFFSET 0x200000000ULL
+ 
+ struct hero_iommu_region {
+-    u64 user_addr;
+-    u64 length;
+-    u64 iova;
++    struct list_head list;
++    const void *owner;
++    u64 user_addr, length, iova;
+     struct page **pages;
++    unsigned long nr_pages, base_mapped, bypass_mapped;
++    bool quarantined;
+ };
+ 
+-struct hero_iommu_region_node {
+-    struct list_head list;
+-    struct hero_iommu_region *data;
+-};
++/* Every entry point requires the device-wide iommu_lock. */
++int hero_iommu_region_add(struct device *dev, struct iommu_domain *domain,
++                         struct list_head *regions, const void *owner,
++                         u64 user_addr, u64 iova, u64 length);
++int hero_iommu_region_remove(struct device *dev, struct iommu_domain *domain,
++                            struct list_head *regions, const void *owner,
++                            u64 user_addr, u64 iova, u64 length);
++int hero_iommu_release_owner(struct device *dev, struct iommu_domain *domain,
++                             struct list_head *regions, const void *owner);
++int hero_iommu_cache_sync(struct device *dev, struct list_head *regions,
++                          const void *owner, u64 user_addr, u64 iova,
++                          u64 length, bool for_cpu);
+ 
+-int hero_iommu_region_add(struct iommu_domain *iommu_domain,
+-                          struct list_head *iommu_region_list, u64 user_addr, u64 iova,
+-                          u64 length);
++/* Platform acceptance boundary. Default implementations fail closed.
++ * quiesce: stop ALL domain publishers, drain accepted DMA read/write requests,
++ * wait for final write responses, and hold them stopped until resume().
++ * invalidate_complete: complete all outstanding page-table updates and context/
++ * IOTLB invalidations, using a hardware completion receipt with timeout/error
++ * propagation. iommu_unmap() or queue head advancement alone is NOT sufficient.
++ * cache_sync: complete CPU/private-cache and LLC clean/invalidate for every
++ * pinned page, covering the physical bypass alias. No asynchronous flush.
++ * resume: only release a successful quiesce; cannot create work by itself.
++ * These functions must be idempotent and must not re-enter the device mutex.
++ */
++int hero_platform_quiesce(struct device *dev);
++int hero_platform_invalidate_complete(struct device *dev,
++                                      struct iommu_domain *domain);
++int hero_platform_cache_sync(struct device *dev, struct page **pages,
++                             unsigned long nr_pages, bool for_cpu);
++void hero_platform_resume(struct device *dev);
+--- /dev/null
++++ b/sw/hero-driver/common/hero_platform_gate.c
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier: GPL-2.0 OR Apache-2.0
++#include <linux/errno.h>
++#include "hero_iommu.h"
++
++/* Replace this translation unit only after the pinned hardware contract is
++ * implemented and accepted. No module parameter can bypass this boundary. */
++int hero_platform_quiesce(struct device *dev) { return -EOPNOTSUPP; }
++int hero_platform_invalidate_complete(struct device *dev,
++                                      struct iommu_domain *domain)
++{ return -EOPNOTSUPP; }
++int hero_platform_cache_sync(struct device *dev, struct page **pages,
++                             unsigned long nr_pages, bool for_cpu)
++{ return -EOPNOTSUPP; }
++void hero_platform_resume(struct device *dev) { }
+--- a/sw/libhero/include/libhero/hero_api.h
++++ b/sw/libhero/include/libhero/hero_api.h
+@@ -305,6 +305,12 @@
+ 
+ uintptr_t hero_iommu_map_virt(HeroDev *dev, unsigned size_b, void *v_addr);
+ 
++/* Unmap/sync use the base IOVA returned by map, with the same page-sized
++ * length and original VA. Successful unmap is the permission to free(). */
++int hero_iommu_unmap_virt(HeroDev *dev, unsigned size_b, void *v_addr, uintptr_t iova);
++int hero_iommu_sync_for_cpu(HeroDev *dev, unsigned size_b, void *v_addr, uintptr_t iova);
++int hero_iommu_sync_for_device(HeroDev *dev, unsigned size_b, void *v_addr, uintptr_t iova);
++
+ int hero_iommu_map_virt_to_phys(HeroDev *dev, unsigned size_b, void *v_addr, uintptr_t p_addr);
+ 
+ /** Free memory previously allocated in contiguous L3.
+--- a/sw/libhero/src/common/driver.h
++++ b/sw/libhero/src/common/driver.h
+@@ -89,39 +89,43 @@
+ 
+ #ifdef DEVICE_IOMMU
+ uintptr_t hero_iommu_map_virt(HeroDev *dev, unsigned size_b, void *v_addr) {
+-    struct driver_ioctl_arg chunk;
+-    int err;
+-    if((uint32_t)v_addr & (uint32_t)0x1000 != 0 || (uint32_t)size_b & (uint32_t)0x1000 != 0) {
+-        pr_error("%s unaligned address or size to map\n", __func__);
+-        return NULL;
++    struct driver_ioctl_arg chunk = {0};
++    if (!size_b || (((uintptr_t)v_addr | size_b) & 0xfffU)) {
++        errno = EINVAL;
++        return 0;
+     }
+-    // MMAP requires page granularity
+     chunk.size = size_b;
+-    chunk.result_phys_addr = 0;
+-    chunk.result_virt_addr = v_addr;
+-    pr_trace("calling ioctl\n");
+-    err = ioctl(device_fd, IOCTL_IOMMU_MAP, &chunk);
+-    pr_trace("done\n");
+-    if (err) {
+-        pr_error("%s driver allocator failed\n", __func__);
+-        return NULL;
+-    }
+-    return chunk.result_phys_addr;
++    chunk.result_virt_addr = (uintptr_t)v_addr;
++    if (ioctl(device_fd, IOCTL_IOMMU_MAP, &chunk)) return 0;
++    return (uintptr_t)chunk.result_phys_addr;
+ }
+ 
+-int hero_iommu_map_virt_to_phys(HeroDev *dev, unsigned size_b, void *v_addr, uintptr_t p_addr) {
+-    struct driver_ioctl_arg chunk;
+-    int err;
+-    // MMAP requires page granularity
++static int hero_iommu_buffer_ioctl(unsigned int cmd, unsigned size_b,
++                                    void *v_addr, uintptr_t iova) {
++    struct driver_ioctl_arg chunk = {0};
+     chunk.size = size_b;
+-    chunk.result_phys_addr = p_addr;
+-    chunk.result_virt_addr = v_addr;
+-    pr_trace("calling ioctl\n");
+-    err = ioctl(device_fd, IOCTL_IOMMU_MAP, &chunk);
+-    pr_trace("done\n");
+-    if (err)
+-        pr_error("%s driver iommu\n", __func__);
++    chunk.result_virt_addr = (uintptr_t)v_addr;
++    chunk.result_phys_addr = iova; /* base IOVA, never the bypass address */
++    return ioctl(device_fd, cmd, &chunk);
++}
+ 
+-    return err;
++int hero_iommu_unmap_virt(HeroDev *dev, unsigned size_b, void *v_addr,
++                         uintptr_t iova) {
++    return hero_iommu_buffer_ioctl(IOCTL_IOMMU_UNMAP, size_b, v_addr, iova);
++}
++int hero_iommu_sync_for_cpu(HeroDev *dev, unsigned size_b, void *v_addr,
++                           uintptr_t iova) {
++    return hero_iommu_buffer_ioctl(IOCTL_IOMMU_SYNC_CPU, size_b, v_addr, iova);
++}
++int hero_iommu_sync_for_device(HeroDev *dev, unsigned size_b, void *v_addr,
++                              uintptr_t iova) {
++    return hero_iommu_buffer_ioctl(IOCTL_IOMMU_SYNC_DEVICE, size_b, v_addr, iova);
++}
++
++int hero_iommu_map_virt_to_phys(HeroDev *dev, unsigned size_b, void *v_addr,
++                               uintptr_t p_addr) {
++    /* The legacy ioctl never honored p_addr. Do not claim a requested map. */
++    errno = EOPNOTSUPP;
++    return -1;
+ }
+ #endif
