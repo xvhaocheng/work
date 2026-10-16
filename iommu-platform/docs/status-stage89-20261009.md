@@ -1,0 +1,28 @@
+# 当前状态 stage 89 2026年10月9日
+
+- stage: 89
+- date: 2026-10-09
+- 范围: 仅机制设计与交接；实现/复现交下游。
+- 执行: 0 模型、0 RTL、0 Linux、0 构建、0 上板、0 Claude。
+- 权威: [root-result-acceptance.json](/home/xvhaocheng/work/iommu-platform/out/higher-model-mechanism-20261009/round02/root-result-acceptance.json) 为准；[root-source-review.json](/home/xvhaocheng/work/iommu-platform/out/higher-model-mechanism-20261009/round02/root-source-review.json) 纠偏早期 worker。
+- 当前主推: L（首次 backend VALID 前按当前翻译局部性选择可互换目的缓冲）；以有界可行性保留推荐。
+- 不能单独主张新颖的部分: COPY_TO_POOL 接口本身不新；provided buffers/DAMN/IOTLB wall 已覆盖裸池/持久映射/局部性。
+- 备选: R（COPY 关系压缩 IOTLB）；字段子集 876 vs 1312，但 generic 任意关系字典精确复现；fixed-4KiB paired specialization 可能同等降低两侧结构，bit 节省非净 RTL 面积。
+- 低优先级: T；原生 PTE 续步仅一拍，缺真实长空窗。
+- L 定量: 手算 34/78->28/72；早期热固定 24/68 更优；随机 N64,h8,q4,delta6=-0.06134；N256,h16=-2.67517。
+- L 参考成本: 11387+4O bits；O=32 示例 11515 bits，向上取整为 1440B；O 实际完整 options 宽度待固定，另计 ports/packing/ECC/pipeline/spill/shadow/PA/bus/register；1MiB DDR 与 Linux 时间为独立系统成本，非 1440B 内 bits。
+- 已计字段: parent 含每 frontend 一个 native_job_id64；completion 含 tag/slot/generation/status。
+- R 定量: 876 vs 1312 bit，共享 context 952 vs 1388；generic 同 91/74；非净面积。
+- T 定量: 26/33 vs 26/34 仅 V<=26；longburst 31/22 更好；same-certificate max-fit 复现。
+- 纠正: firstVALID not READY；NEXT_ID read；parent not AXI burst；TouchEnable(NonblockEnable)；hit 非权限授予。
+- 本地证据: [frontend:240](/home/xvhaocheng/work/iommu-platform/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv:240)、[iotlb:35](/home/xvhaocheng/work/iommu-platform/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_iotlb.sv:35)、[tl_wrap:658](/home/xvhaocheng/work/iommu-platform/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv:658)、[ptw:384](/home/xvhaocheng/work/iommu-platform/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ptw.sv:384) 已核。
+- 文献: AXI-REALM 所核章节未提出未来 PTE 合同；CoLT 设计章节 4.1-4.2 已核；HPCA2014 全文核验待完成。
+- 未决: L 隐藏驻留可达性；L 全成本 vs 普通 IOTLB 容量；R paired mapping 生命周期；T 受保护服务上界。
+- 下一步 L1: 合法完整 COPY/release 历史生成隐藏目的驻留差异。
+- 下一步 L2: 全 native 资源容量小模型，同预算比较 fixed/software/hardware/prepare/extra entries。
+- 下一步 L3/L4: 局部性 sweep；原子 reserve/firstVALID/completion/permission/sync/generation 手推。
+- 下一步 R1/R2: 完整成本表与 generic 对照；通过后才做最小 sparse COPY 模型。
+- 下一步 T0: 只读共享服务资源和结构延迟边界；无长空窗即停。
+- 入口文件: [机制设计交接稿](/home/xvhaocheng/work/iommu-platform/docs/mechanism-design-handoff-20261009-round02.md)；[root-result-acceptance.json](/home/xvhaocheng/work/iommu-platform/out/higher-model-mechanism-20261009/round02/root-result-acceptance.json)。
+- 历史: [stage88 原文](/home/xvhaocheng/work/iommu-platform/docs/status-stage88-20261009.md) 已归档；本轮记录见 HANDOFF.md 与 validation.md 的 §89。
+- 审核: 设计 Codex root + 两关键设计席；接口证据/中文稿 DeepSeek；Codex 审核保存。

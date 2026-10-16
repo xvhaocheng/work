@@ -1,0 +1,201 @@
+# 软件更新 2026-10-04 操作指南
+
+**最新操作入口：下方“net3 固化入口（已通过实板）”。**
+
+## 状态总览
+- 已实现（软件/配置）：`platform-sd-update`、`platform-net-up`/`tests/board-net-up.sh`、`tests/board-fetch-update.sh`、`scripts/mac_update_reboot.py`、内核 `-cpn2-net1` 交付、1G full 以太网驱动等。
+- Linux/OpenSBI 已实际构建成功，65 项主机测试/RTL 接收仿真用例通过；SD、网口和重启链路尚未上板验收。
+- 本轮只修改软件，未修改 RTL、加载 BIT、写真实 SD 或重启板卡。
+- 作者/责任：DeepSeek 起草；Codex 复核并负责真实测试；最终结果由 Codex 更新。
+- 当前启动为 initramfs RAM，raw boot 分区未挂载；完整 worker/test 日志在 `out/software-update-20261004` 下。
+
+## 范围与安全
+- 只更新 `/dev/mmcblk0p1` 这个 32 MiB boot 分区，不是整张 SD 卡。
+- 分区尾部剩余空间写零；GPT、固定 type/UUID、其他分区不变，由 updater 校验；这些目前是软件/mock 测试结论，上板未验证。
+- updater 固定校验的 boot 分区 type GUID 为 `7412F7D5-A156-4B13-81DC-867174929325`，unique GUID 为 `46298C61-BAC2-44C9-A8FF-8FA61CF2BEE0`。
+- 无 A/B/自动回滚；更新中断或坏更新可能需要手动 SD 恢复。
+- 失败即停止，不自动重试、不自动重启。
+
+## 已实现的软件/配置
+- `platform-sd-update`：root 运行；拒绝符号链接；目标必须是 `/dev/mmcblk<数字>p1`；校验 `BLKGETSIZE64` 为 32 MiB；sysfs `partition=1`、`start=2048`、`size=65536`；512B 逻辑扇区；只读校验 GPT；拒绝已挂载；`flock` 独占；先把镜像读入内存再打开可写描述符；只写分区；`fsync`；不自动重启。
+- `platform-net-up` / `tests/board-net-up.sh`：只配置命令行指定的一个接口；静态地址；默认 dry-run，只有 `--apply` 才改状态；不启动 DHCP。
+- `tests/board-fetch-update.sh`：只接受 `http://`；先下载到 `.partial`；成功后默认 dry-run；`--write` 会重新下载并跳过手动 hash 对比，因此建议用下面的显式两段式。
+- `scripts/mac_update_reboot.py`：默认 dry-run；`--run` 必须显式给 `--port`、`--bit`、`--expected-kernel`、`--out`；通过 UART 确认 shell 存活，用 JTAG 加载 BIT，等待登录，读取 `uname -r` 和 `/proc/sys/kernel/random/boot_id`；失败停止，不重试。
+- 内核：`LOCALVERSION=-cpn2-net1`，实际内核 release 从 `delivery/kernel-release` 读取，不要硬编码 hash。
+- 以太网：第一版驱动只支持 1G full；`lowrisc_ethernet.c` 按实际 RTL 对齐 64 buffer、NAPI、phylib MDIO addr 1、timer TX、软件 RX FCS 检查/移除。
+- 构建器已检查 SD/PHY/ETH 相关配置全部为 `y`，交付包含 `linux.config`、`kernel-release`、`mac_update_reboot.py`。
+
+## 硬件限制与外部 JTAG 重启路径
+- 当前硬件/DT 没有原生 CPU-driven reset 路径；OpenSBI 的 `fdt_reset_init()` 只注册 DT 中实际可用的 reset 设备，当前 DT 没有，因此现阶段不能声明原生 reboot 可用。
+- 现阶段重启靠外部 JTAG：保持 JTAG 和串口连接，用 Mac helper 重新加载同一个已验证 BIT，从 SD 卡重新启动。
+- Mac helper 已处理无换行登录提示、`sync && echo` 确认、重启前后 UUID 必须变化；只要求重启后的内核等于目标新版本，允许从旧版本升级。Mac 需已安装 Python 3、pyserial 和 openFPGALoader，运行前释放其他程序占用的串口。
+- 不要盲目执行普通 `reboot` 命令。
+
+## 第一次上板前：手动安装 raw payload
+- 使用现有 Mac 写卡流程，手动选择正确的 SD 卡和 raw 32 MiB boot 分区。
+- 保持原 GPT 和其他分区，使用交付的 `fw_payload.bin` 覆盖原启动分区。它是原始镜像，不能当普通文件复制到挂载目录。
+- 首次由人安装；后续正常更新可由 Mac 端工具通过网口传镜像、串口发控制命令、JTAG 重启。
+
+## 上板网络示例（1Gbps）
+- Mac 和板子使用 1Gbps 网卡/链路。
+- 在 Mac 上手动给正确的以太网适配器设 `192.168.77.1/24`。
+- 在板子上先 dry-run：
+```
+platform-net-up eth0 --addr 192.168.77.2/24
+```
+确认无误后再实际应用：
+```
+platform-net-up eth0 --addr 192.168.77.2/24 --apply
+```
+- 注意：现有 rootfs 的 `ip` 可能是 BusyBox 版本，`ip -o` 兼容性需要关注；当前脚本使用 `ip -o addr show`，测试只在 mock 下检查，尚未上板运行。
+- 板子基础检查：
+```
+ip link show eth0
+cat /sys/class/net/eth0/carrier
+dmesg | grep -Ei 'mmc|mmcblk'
+cat /sys/class/block/mmcblk0p1/partition
+cat /sys/class/block/mmcblk0p1/start
+cat /sys/class/block/mmcblk0p1/size
+```
+期望 `partition=1`、`start=2048`、`size=65536`（512B sector）。已有 GPT 的固定 type/UUID 由 updater 校验。
+
+## Mac HTTP 服务
+```
+cd /path/to/out/software-update-20261004/delivery
+python3 -m http.server 8000 --bind 192.168.77.1
+```
+- 只在 delivery 目录运行，不要把私有文件或目录暴露到网络。
+
+## 板子下载与写 SD 卡
+先默认 dry-run，只下载一次：
+```
+platform-fetch-update http://192.168.77.1:8000/fw_payload.bin
+```
+它会下载到 `/tmp/fw_payload.bin`，然后做 dry-run 检查。
+
+在 Mac 端取 manifest/SHA256，在板子端对比：
+```
+shasum -a 256 /path/to/out/software-update-20261004/delivery/fw_payload.bin
+sha256sum /tmp/fw_payload.bin
+```
+如果 manifest 有对应 SHA256，以 manifest 为准。必须一致才写。
+
+显式写入，不要用 `--write` 重下载并跳过手动 hash：
+```
+platform-sd-update --device /dev/mmcblk0p1 --image /tmp/fw_payload.bin
+```
+等待输出 `PASS`，并确认 fsync 完成。失败即停止，不自动重试、不自动重启。
+
+## 外部 JTAG 重启验证
+在另一个终端进入同一个 `delivery` 目录，保留 HTTP 服务运行。
+先 dry-run（不带 `--run`）：
+```
+python3 mac_update_reboot.py --bit /path/to/SAMEKNOWNBIT.bit --port /dev/cu.usbserial-XXXX --expected-kernel "$(cat kernel-release)" --boot-timeout 300 --out fresh_reboot_dry_20261004
+```
+确认参数后再执行：
+```
+python3 mac_update_reboot.py --run --bit /path/to/SAMEKNOWNBIT.bit --port /dev/cu.usbserial-XXXX --expected-kernel "$(cat kernel-release)" --boot-timeout 300 --out fresh_reboot_20261004
+```
+- 以上是安全示例字符串，本次未执行。
+- 保持 JTAG 和串口连接。失败停止，不自动重试/重启。
+
+## 启动后验证
+- `uname -r` 必须等于 `cat delivery/kernel-release`。
+- 读取新的 `/proc/sys/kernel/random/boot_id`。
+- 用 `platform-net-up` 重新配置板子 IP；当前文件不会跨重启持久化静态 IP。
+- 用 `head -c 29363656 /dev/mmcblk0p1 | sha256sum` 只读校验本次交付镜像范围；字节数须随新镜像实际大小更新，结果应等于下载文件的 SHA256。
+- 不要盲目普通 `reboot`。
+
+## 第一次上板验收清单
+1. SD 枚举与 `platform-sd-update --dry-run`。
+2. PHY link 和 ping 通。
+3. 已知 payload 的 SHA256 一致。
+4. 只写同一个已知可用 payload。
+5. 用外部 JTAG 重载同一已验证 BIT 重启。
+6. 只有真实 PASS 后，AI 远程更新才可考虑投入运行。
+
+## 已执行的验证
+- SD 更新工具 23/23、根文件系统 13/13、下载/网络脚本 11/11、Mac 重启工具 15/15 通过。全部使用主机临时文件或假外设，无真实写卡。
+- 用实际 `axis_gmii_rx.sv` 和 `rgmii_lfsr.sv` 运行 3/3 Verilator 用例，确认 60/1514 字节帧包含 FCS，损坏 FCS 可从帧内容检测。它不是完整 MAC/PHY/IRQ 验证。
+- 网口驱动单独编译通过，checkpatch 为 0 错误/0 警告；Linux/OpenSBI 最终构建 exit0。
+- 核对生成的 initramfs 确实嵌入 Image，当前 Image 确实嵌入 fw_payload.bin，14 个打包工具与当前文件逐字节一致。
+- 原始构建、测试和完整 DeepSeek 返回保存在 `out/software-update-20261004/`。
+
+## 本次交付
+
+- 内核：`6.5.0-rc2-cpn2-net1-00093-gc0f5e13ea81f-dirty`。
+- `fw_payload.bin`：29363656 字节，小于 32 MiB。
+- SHA256：`c457dceb483aeb0f33f59a32c8b01236932d437565c7d983d5134840e99fbc53`。
+- 软件包：`out/software-update-20261004/software-update-20261004.tar.gz`；构建记录：`software-update-state.json`；内容核验：`embedded-artifact-acceptance.json`。
+- 旧 cpn1 镜像保存在 `out/software-update-20261004/previous/`，原 cpn1 交付目录保留。
+- 原生 `reboot` 仍需 CPU 可控硬件复位设备；本轮仅补 OpenSBI 标准设备树复位初始化，不虚构 MMIO 复位寄存器。
+
+## 2026-10-05 net2补充：百兆网口更新已实际上板通过
+
+net1千兆限制已修正，Linux只开放100/1000全双工；复用原构建器生成独立`out/software-update-net100-20261005/delivery`，内核cpn2-net2，BIT/BootROM未改。经UART小模块引导→SSH实际下载→板端32MiB启动分区更新/同步→同BIT JTAG加载，最终net2启动和carrier1均通过，未运行实验。现有reboot helper的空密码假设不能直接使用，实际登录用Mac现有run_research2_mac响应；UART分段避免输入溢出。自动开机IP与完全移除UART仍待。详见[最终记录](../out/composition-board-execution-20261005/LINUX_ETHERNET_STATUS.md)，本节以实际结果覆盖旧“未上板/仅支持千兆”等快照。
+
+## 2026-10-05 net3 固化入口（已通过实板）
+
+本节只讲这条流程怎么跑，不重复研究历史。所有操作说明都以本文件为准，不另建 README。
+
+### 本轮软件
+
+- 软件构建 exit0，内核版本：`6.5.0-rc2-cpn2-net3-00093-gc0f5e13ea81f-dirty`。builder 只做软件增量，不动 RTL/BootROM。
+
+- 构建命令（项目根目录执行）：
+```
+python3 scripts/build_update_software.py --output-dir=out/software-update-autonet-20261005 --local-version=-cpn2-net3
+```
+
+- 交付：`artifacts/software/software-update-autonet-20261005/delivery/fw_payload.bin` 和同目录 `kernel-release`。内核版本直接读 `kernel-release`，别硬猜 hash。
+
+- rootfs 网络配置：`etc/network/interfaces` 静态 `192.168.77.2/24`、不写 gateway；`etc/dhcpcd.conf` 加 `denyinterfaces eth0` 防 DHCP 覆盖；仍复用原 `S40network`，没新增网络服务。
+
+### Mac 端准备（已做过，备查）
+
+- 真实网卡是 USB 10/100 LAN（en11）。持久设为静态、不配路由器：
+```
+sudo networksetup -setmanual "USB 10/100 LAN" 192.168.77.1 255.255.255.0 ""
+networksetup -getinfo "USB 10/100 LAN"
+```
+  实际保存 exit0，已生效。
+
+- 板子登录沿用现有 `scripts/run_research2_mac.py` 里已有的登录响应；不新增板端免密授权、不打包 `authorized_keys`/公钥、不改账号权限、不把口令写进项目、不发 DeepSeek。
+
+### 正式跑（纯网；日常不用 UART，启动坏镜像时 UART 可用于恢复，JTAG 始终保留）
+先 cd 到 Mac 项目根再跑，用相对路径，别反复打长路径、别另写脚本：
+```
+cd '/Users/jojo/Desktop/在mac链接pfga(codex)'
+tools/method88-venv/bin/python scripts/mac_update_reboot.py --run --transport ssh --credential-script scripts/run_research2_mac.py --board-host 192.168.77.2 --host-ip 192.168.77.1 --payload artifacts/software/software-update-autonet-20261005/delivery/fw_payload.bin --bit tools/nonblock-pilot-20261004/banked-hit-v5.bit --expected-kernel "$(cat artifacts/software/software-update-autonet-20261005/delivery/kernel-release)" --out "results/linux-update-$(date +%Y%m%d-%H%M%S)" --boot-timeout 600 --update-timeout 3600 --jtag-hz 1000000
+```
+
+- `--credential-script` 指 `scripts/run_research2_mac.py`：只在 Mac 内存里做 AST 提取取登录响应，不执行该脚本、不输出/不保存口令；找不到、不唯一或认证失败就停。
+
+- BIT 用已验收的 `tools/nonblock-pilot-20261004/banked-hit-v5.bit`，用 `--bit` 明确指定该文件，别用默认。
+
+- 只同步 + JTAG 重载重启、不再写镜像时，省掉 `--payload`。注意：不能用“写同一个镜像”冒充只 reload。
+
+- 输出目录每次用新目录（本次 `results/ethernet-workflow-20261005-03`），不能覆盖上一次。
+
+### 流程链路
+SSH 先读原身份 → 工具临时起 HTTP 下载 → 板端已有 `platform-sd-update` 只写 `/dev/mmcblk0p1` 并 fsync → SSH sync → 用给定 BIT JTAG 重载 → 等 SSH 起来，比对 `uname` 等于预期、`boot_id` 变化 → 关掉工具自有 HTTP → 存 `result.json`。任一 write/sync/load 出错即停；不做额外 hash/回读/科学实验。
+
+### 失败处理（最少）
+
+- 下载/写入、同步或加载失败立即停止；开机联网在 600 秒内等待，超时停止。
+
+- 没真正通过就不能写 PASS。
+
+- 缺凭据、凭据不唯一或 SSH 认证失败：直接停，别绕。
+
+### 本轮状态
+
+- net3 软件构建及实板验收均通过。板上结果：`通过（写卡、同步、JTAG重载、开机自动联网及SSH身份验收exit0）`、`boot_id=1a955cce-bcdd-4f0a-9012-6e0c7eda8322`，原始结果已回传。
+
+- 参照：net2（旧 N、同 v5 BIT、百兆）此前已实际跑完整条链路并通过，约 24.34 分钟。本轮不改 RTL/BootROM，科学实验 0 次。
+
+- 新 composition BIT 已由另一对话独立做时序验收，本轮不加载它、不做 172 实验。
+
+- 证据在 `out/ethernet-workflow-20261005/` 和 Mac 的 `results/ethernet-workflow-20261005-03`。
+
+本次真实记录：入口exit0，总耗时34.45分钟，其中下载+SD写入26.31分钟、重载后联网验收6.45分钟；速度尚未优化。前两次初始SSH超时均在写卡/JTAG前停止；旧net2网口恢复与一次只读进度诊断用过UART，net3的传输、写卡和重载后自动联网流程不依赖UART。未新增hash、SD回读或科学实验，未加载另一对话的新composition BIT。DeepSeek起草配置、工具和说明，Codex审查修正、执行并实板验收。原始结果：[完整入口结果](../out/ethernet-workflow-20261005/ethernet-workflow-20261005-03/result.json)、[阶段记录](../out/ethernet-workflow-20261005/execution-state.json)。

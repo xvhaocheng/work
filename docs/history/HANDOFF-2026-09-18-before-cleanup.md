@@ -1,0 +1,376 @@
+# 历史交接快照：2026-09-18 清理前
+
+仅用于追溯。下文的“最新”“下一步”和版本号均保留其历史时点含义，不能作为当前操作指令。原文中的普通相对路径以 work 为根；Markdown 链接已重定位。
+
+[返回当前交接](../../HANDOFF.md)
+
+---
+
+# 论文平台交接
+
+## 2026-09-18 E3 v5 实施、完整构建和交付完成（最新）
+
+用户要求分析已完成实验、复审计划、实施并编译。00085 的9对/18子轮/342条观测已与UART独立核对，原数据未改；[分析](../../iommu-platform/docs/e3-diag-results-review.md)。正式A8八轮都触发，预热数量/末页相同，但A预热miss512→312/318，第1对目标/首查不同；旧8ms轮次差未稳定复现，仍不能证明D128/HOL。
+
+已实施v5真实V已接收未选中计数，覆盖A读占AR头时的后续V；新增候选门槛25..31、前史78..95、前两条插入身份46..63。带软件诊断的新D0/D128为diagnostic2/ioctl0x0b，要求v5 BIT。DS50/50和整批轮询保持。[新协议](../../iommu-platform/E3_QUEUE_PAIR.md)仅3短+10正式（2 A8 D0/D0、6 A8 D0/D128、2 A1控制），不补采；先看覆盖和可比性，不自动进入方法评估。
+
+主机RTL/真实controller联测、驱动76控制+3缓存+96小chunk、E3 CLI49/旧CLI69/rootfs5通过。软件和FPGA完整构建均退出0/manifest passed，BIT/MCS非空，清单哈希及关键导出源码核对通过；内核00086，FPGA结束UTC 00:56:45。构建起点0119909，CVA6 147c4d4a、IOMMU 137f5e5、Linux d2cd32d78918，lock/gitlink一致；后续仅文档提交。首次许可证失败已归档，完整地址/允许联网环境重试成功。成功日志未读，未审查时序报告。
+
+交付[README](../../iommu-platform/out/e3-followup-20260918/delivery/README.md)，证据out/e3-followup-20260918/{validation,build-status}.json。BIT SHA256 `8f90865ef1fb4f747e7a1f16c3a4992adf4499c56356e0d8d1679b8962d7342e`；payload `13dc664895f570925b6ae59f11cedbfefcb3de331c0d9d6518557b7ce4a7ea36`。标准manifest仅列BIT，MCS非空及哈希另记delivery.json。新版未上板，下一步同时更新BIT和SD软件，再按新协议有限采样；字段78..85是窗口内查询前史，86..93从ARM累计，不能直接与窗口stage entered比较。原时钟/CDC/IO边界保留。
+
+DeepSeek整理证据并给出CLI/桩/CLI测试提案；Codex独立复核原始数据与关键源码、负责RTL/驱动、应用审查提案及执行验证/编译。旧数据、产物及既有脏文档保留，无本机板卡操作。
+
+## 2026-09-18 00085 D0/D0 实板诊断完成（Mac回传）
+
+复用原E3 BIT，STAT0x501079fc，Linux00085启动。3短+6正式配对共18子轮执行/数据/观测检查通过，data_errors/quarantine/taint0，每轮256字段及19条观测完整；固定V0/A1，正式顺序A8,A8,A1,A8,A8,A1，没有补采。证据在 iommu-platform/out/mac-e3-diag-short-20260918-081411-run-1z6a407q/ 和 iommu-platform/out/mac-e3-diag-main-20260918-081411-run-1z6a407q/（相对work），各有records/assessment/summary.json，summary包含完整UART。用户明确批准后已回传。
+
+本轮正式12轮V预热256/256，A提交/完成/排空256/255/1；A8末页均7、下一页0。A8预热miss/S1 PTW首轮512，第二轮312（第1对318），工作量/末页相同但前史状态不同。A8八轮均触发、正式V miss均2，A miss多数5142（第1对次轮5133）；A1四轮无触发且正式miss0。第3对A1第二轮软件A返回到V开始间隔16.9236ms，不能当精确硬件发射差或指认具体中断。硬件MiB/s中位A8两轮109.10/109.07，A1两轮149.36/149.56。
+
+旧约8ms轮次差未在本诊断组稳定复现，但诊断有扰动，不称修复或D128/HOL因果完成。先独立复核预热HPM/软件启动区间，再决定最小状态/触发覆盖改动；本轮无RTL/驱动改动、重编或扩矩阵。已恢复printk、退出root、关闭串口。原哈希/SD回读跳过及时钟/CDC/IO边界保留。Mac详细报告E3_DIAG_RESULTS.md；DeepSeek整理证据表，Codex核对原始代码/JSON并执行测试与板卡操作。
+
+## 2026-09-18 E3 D0/D0 诊断软件构建完成（最新）
+
+用户“Dell可用DeepSeek，继续工作”后，承接已有DeepSeek代码地图和9/17结果，实施软件前史诊断。新增独立ioctl0x0a/能力位及 `idma_e3_pair --diagnostic 1`，固定D0/D0、同映射两轮，记录实际预热数/排空/末偏移、预热HPM及ARM/A/V提交软件区间；旧D0/D128保持。Linux `1b268b89200c`，构建顶层 `c5c4c43`，lock/gitlink一致，内核00085。仅测试去重在构建后修改；无编译源码变更。原文档脏改动保留。
+
+驱动64控制+3缓存+96小chunk、E3 CLI39、旧CLI69、rootfs5通过；软件完整构建退出0/manifest passed，产物哈希一致，成功日志未读。交付 [README](../../iommu-platform/out/e3-diag-20260918/delivery/README.md)，实验逻辑/字段/命令 [E3_DIAGNOSTIC](../../iommu-platform/E3_DIAGNOSTIC.md)，证据 `out/e3-diag-20260918/{validation,build-status}.json`。payload `1e4a49b08bfcbcbeb1e86eb17fb0836d373d5950d61b274b885d443f7c458f62`。
+
+新版未上板。只需更新SD软件，复用原E3 BIT `a99ce956…`，无RTL修改/FPGA重编。下一步3短验收+6对诊断（A8,A8,A1,A8,A8,A1；4096/warm256），采集新schema `idma.e3_diag.v1`、各轮19条观测/256字段/UART/退出/taint。无触发不补采、真错误停。先解释前史；软件时间区间不等于硬件发射，诊断有扰动；AR队头触发覆盖问题仍待硬件修订，不宣称因果完成。原时钟/CDC/IO边界保留。
+
+## 2026-09-18 DeepSeek 仓库接手梳理
+
+已由 DeepSeek Flash 思考模式梳理，Codex 对照关键 RTL/驱动/CLI、既有 E3 复核 JSON 及实际版本核查。后续优先读[当前代码地图与状态](../../iommu-platform/docs/repository-map-2026-09-18.md)。顶层 f8a0374；21 个组件 HEAD/父级已提交 gitlink 与 lock 一致，组件已跟踪文件无修改（未检查未跟踪文件/alternates，不等于完整 make check）。当前仍为 E3 排队定位成立、配对因果未成立；旧 README/AGENTS“尚未上板”已过时。原有文档修改保留，本次仅加接手记录，无实现修改、构建、测试或上板；下一步仍是 D0/D0 前史诊断及触发覆盖修正。
+
+接手时点提醒：上述地图早于本文件顶部的 E3 v5 实施，地图中的“当前没有 D0/D0 接口”、旧触发条件和版本指针均属历史状态；当前操作读 [E3_QUEUE_PAIR](../../iommu-platform/E3_QUEUE_PAIR.md)，源码行号按需重新定位。本次由 DeepSeek 对照说明、Codex 核对历史和最新协议，仅补此提醒，未重跑构建、测试或上板。
+
+## 2026-09-17 E3服务器独立复核与下一步（最新）
+
+15条配对JSON、30子轮、570条观测与UART逐项一致，正确性/退出/taint/窗口/AXI/path/E3/实际延迟检查通过，原文件未改。证据 `iommu-platform/out/mac-e3-main-20260917-222837-run-p0lbvbv7/server-review.{py,json}`；[详细分析](../../iommu-platform/docs/e3-results-review.md)。
+
+新定位：正式第一轮A1→A8，V读排队18→596.78周期、写4→263.62；选中后请求/自身服务/出队始终1/4/2。V写AW→WLAST 1111.31→1439.79，WLAST→B约18不变。内部增量落在选中前，不能直接称HOL/纯PTW或将累计时间相加。
+
+正式A8双触发0/10，因果验收未完成。第8/9对双轮均未触发仍第二轮快约8ms，轮次状态变化不是D128效果。静态代码确认触发只看AR FIFO头为V，A读在服务期间仍占头，漏掉V在其后的场景；不能据此断定首轮0触发唯一原因。10个实际触发A均为写，插入数均1（无完整身份）；正式5个V首查hit的跨配对探索性残余等待D0中位282、D128中位408，差126周期，仅线索。
+
+下一步先修对照条件：少量D0/D0软件诊断记录预热/启动前史（现CLI不支持，需软件改动，现BIT可用），并补足目标V排队识别及触发门槛诊断（需RTL/新BIT）；必要时有限请求/统一硬件启动，之后恢复D0/D128。不要扩样本代替可比性，不直接进入方法评估。本轮仅复核/文档，无RTL/软件修改、构建或上板。
+
+## 2026-09-17 E3实板采样完成：执行通过，配对因果条件未满足
+
+新migration-4dma-e3 BIT/Linux00084启动，STAT0x501079fc。按交付完成3短+12正式配对（30子轮），每轮256字段及19条观测齐全；数据错误/quarantine/taint0，任务/AXI/path/E3守恒和触发延迟精度检查通过。没有补采、扩矩阵或修改RTL。
+
+关键限制：正式10对A8第一轮触发0/10、第二轮8/10，两轮均触发0/10；首轮D0/128已交替。第一轮全V miss0/A miss6160；第二轮8次V2、2次V0，A miss5133/5136。硬件中位第一/二轮155.245/146.567ms（103.06/109.16MiB/s），不可当128周期因果效果。2对A1四轮无触发。短A8虽双触发但身份/前史/首次命中不同且有插入，亦非干净对照。先独立复核双轮状态及触发门槛，不以加样本替代问题解释。主机检查通过只说明测量正确性，不证明HOL。
+
+证据：iommu-platform/out/mac-e3-short-20260917-222837-run-p0lbvbv7/与iommu-platform/out/mac-e3-main-20260917-222837-run-p0lbvbv7/，各含records/assessment/summary.json（summary含完整UART，路径相对work）；Mac报告E3_STAGE_RESULTS.md。短测一次hrtimer延迟13439920ns保留。printk已恢复、退出root/关闭串口。原哈希/SD回读跳过及时钟/CDC/IO边界保留。
+
+## 2026-09-16 E3实现及软硬件构建完成（最新）
+
+已实现v4内部四段、首次查询、有界A/V及COMP写记录、单次A PTW响应D0/128，同一映射内分别预热/排空/核验两轮；DS50/50及批量轮询保持。源码构建起点bea8f57、CVA6 44068498、IOMMU1519510、Linux94a519eebf07，lock/gitlink一致；内核00084。新RTL/旧回归、驱动56场景（含3缓存）+96小chunk、E3 CLI23及rootfs验证通过，证据`iommu-platform/out/e3-service-20260916/validation.json`，仅模型验证。
+
+软件及FPGA均退出0/manifest passed，BIT/MCS非空，FPGA结束UTC 09:27:41。交付[README](../../iommu-platform/out/e3-service-20260916/delivery/README.md)，入口[E3_SERVICE](../../iommu-platform/E3_SERVICE.md)。BIT SHA256 a99ce9565b82449ca5eb0a8afc18c8b79cdf9e23a5a4e9197aafae02b5df98d4，payload c9b1ac46d6c9ef623f2a814477fb92d7ab62441eff97278cd3376f254d621a33。成功日志只保存，未审查时序；旧结果/产物保留，原时钟/CDC/IO边界不变。
+
+尚未上板。下一步用配套BIT和SD payload做3项配对短验收（Solo/A1/A8，各两轮），然后10对A8+2对A1、首轮D交替。每命令一个新schema JSON含两轮256字段，按两条seq分别收齐各19条旧观测，完整UART保留；无触发、首次V缺失、顺序变化不补采，真实错误停止。比较触发后V剩余等待并分报完整排队/自身服务，不能只看整批耗时或宣称HOL。
+
+## 2026-09-16 v3结果服务器独立复核与E3计划（最新）
+
+33条JSON及627条观测与回传UART逐项一致，退出/taint/正确性/排空/身份/窗口/AXI/路径守恒通过；原始结果未改。证据`iommu-platform/out/mac-path-main-20260916-164633-run-vvguros8/server-review.{py,json}`；[结果分析](../../iommu-platform/docs/path-results-review.md)。正式V miss全0；A8较A1硬件+47.75961ms/+44.57%，V内部读25→601.04/写11→268.68周期，入口1/出口0不变，写后段1130.37→1455.66。历史50/50吞吐差≤0.133%，不是严格开关开销测量。E4分段定位目标完成，仍未证明纯PTW或HOL。
+
+下一步[E3因果实验卡](../../iommu-platform/docs/e3-shared-service-plan.md)：同一请求细分排队/自身翻译/出队，锁存首次IOTLB查询；V已排队时选择性对一笔A PTW响应D=0/128周期，一窗口一次，同映射成对会话，10对A8+2对A1控制；AW/WLAST/B解释既有写后段增量。全部为待实现设计，需新RTL/软件/定向验证及一套新BIT，尚未启动。不能用当前命令假装已具备控制，也不扩页数/重做旧矩阵。
+
+本轮仅复核和文档，无RTL/软件修改、构建或新上板。保留轮询及成功日志仅保存的要求。A8软件窗口174.046ms与硬件154.920ms分报，done_to_read中位18.673ms；短测hrtimer日志和原HPM/哈希/SD回读/时钟CDC边界保留。
+
+## 2026-09-16 v3分段路径实板完成（Mac回传）
+
+配套migration-4dma-path / Linux00083启动，STAT0x501079fc、path_observe=Y。固定V0/A1，3短验收+Solo/A1/A8各10次正式全部通过；33组19条观测完整且守恒通过，data_errors/quarantine/taint0。硬件吞吐中位283.32/149.31/103.28 MiB/s，与上次50/50偏差均<0.14%；正式V miss全0，A8 A miss/S1 PTW全6160。V stage1读/写均值由A1的25/11升至A8的601/269周期，写stage3约1130→1456；不能称纯PTW或证明HOL，累计段时间不能相加。短测有一次hrtimer延迟日志，软件/硬件窗口分报。
+
+证据：iommu-platform/out/mac-path-short-20260916-164633-run-vvguros8/（3次）及out/mac-path-main-20260916-164633-run-vvguros8/（30次），各含records/assessment/summary.json，summary保存完整UART；两份assessment passed。Mac已恢复printk、退出root/关闭串口。没有重新编译/扩矩阵，下载哈希及SD回读按用户要求跳过；时钟/CDC/IO原待办保留。
+
+## 2026-09-16 分段路径观测构建交付完成（最新）
+
+用户“继续”授权执行后续机制计划第一步。已实现v3被动观测：按源DMA/读写/同ID顺序匹配，记录入口→TR、TR→COMP首次有效、COMP反压、COMP地址→RLAST/B四段；A跨窗口首尾单列，计数/ID/溢出错误拒绝有效结果。Linux批量默认要求v3，旧三行加16条path日志，全部在排空/验证后读取；CPU整批轮询及DS50/50保持。入口[E4_PATH](../../iommu-platform/E4_PATH.md)。
+
+构建源码：顶层a2e8475、CVA6 a1572926、Linux45bf76b15e36，lock/gitlink同步。真实RTL17场景+缩位计数/area/sum溢出、旧observer28+6、frontend联测4、驱动47场景+96小chunk通过，测试仅事件/MMIO模型。软件及FPGA均已退出0/manifest passed，BIT/MCS非空；内核00083。BIT SHA256 62f822d19851da0309b1a7e085197661caa72f6366fccf34d721fa418b941c29，payload 031025c1fb1551ab0e82610027f76106e7b2efe3052b45cda62ea39dc0173c6a。profile migration-4dma-path；日志out/e4-path-20260916/{software,fpga}.log，按要求成功日志未读、未审查时序报告。交付[README](../../iommu-platform/out/e4-path-20260916/delivery/README.md)，含BIT、SD payload、版本/验证/构建清单和SHA256SUMS。新版未上板，无新性能结论。
+
+下一步固定V=DMA0/A=DMA1，仅8项Solo两次及64项A8无预热短验收，随后Solo/A1/A8各10次4096项/warm256；每次同seq三条batch+16条path。原时钟/CDC/IO待办保留；旧结果/产物未删，不自动进入E2/E3控制或扩矩阵。
+
+## 2026-09-16 后续机制计划已整理（最新）
+
+用户要求制定接着执行的计划，见 [后续执行计划](../../iommu-platform/docs/next-mechanism-plan.md)。当前只规划，未改RTL/软件、编译或上板。顺序：DS50/50补入口/内部/出口/后段被动分段观测→新增字段必要短验收及固定角色Solo/A1/A8各10次→按证据选择E3内部阻塞、E4出口/数据因果对照或必要E2状态探测→一项方法及直接基线。E2非必经前置，V miss=2不自动触发扩展。
+
+先复用现有observer/Linux读出；需要按设备/读写/AXI ID及顺序匹配、处理A跨窗口在途，不能将并行累计等待相加作整批耗时。只先构建一套新DS50/50；按用户要求日志只保存、有报错才检查。方法阶段门槛为可重复等待位置+区分性干预+可控点及A代价口径，不要求先证明HOL或完成所有分支。
+
+## 2026-09-16 DS50回切服务器独立复核（最新）
+
+30条JSON/observer与回传UART逐项一致，退出/taint/数据/排空/身份/计数/窗口/AXI守恒通过。证据 out/mac-batch-ds50-20260916-135544-run-eawziww2/server-review.{py,json}；[结果解释](../../iommu-platform/docs/ds50-retest-results-review.md)。A8硬件中位154.99→118.19→154.88ms，A8较A1额外耗时44.71%→10.50%→44.72%；三组回切吞吐与首次中位差均<0.16%。回切A8的8/10为V miss0/A miss6160；第14、16项V2/A5141（硬件时间中位145.05ms），全保留。
+
+回切复现目标完成，DS敏感性证据增强；一次三阶段切换未固定跨启动映射/状态，仍不能称纯PTW代价或HOL证明。下一步方向为IOMMU翻译前/内部与翻译后数据等待的定位；未实施新观测、未构建/上板，无需再把本轮复测列为待办。
+
+## 2026-09-16 50/50 BIT回切复测完成（最新）
+
+已有 migration-4dma-batch（DS50/50）BIT回切成功，STAT0x501079fc，Linux00082正常。固定V=DMA0/A=DMA1，Solo/A1/A8各10次，30/30通过；硬件中位283.33/149.51/103.31MiB/s，软件中位282.76/147.94/93.25MiB/s。V miss/S1 PTW Solo/A1中位0，A8中位0（少数样本可2），A miss/PTW中位6160。A8恢复到约103MiB/s，与DS0/0的135.38MiB/s区分明确。数据错误/quarantine/taint0，observer检查通过。原始结果已回传out/mac-batch-ds50-20260916-135544-run-eawziww2/，Mac报告DS50_RETEST_RESULTS.md；无重新编译/刷卡，下载哈希/SD回读按用户要求跳过。
+
+## 2026-09-16 DS0结果服务器独立复核（最新）
+
+DS0的60条JSON/observer已逐项与回传UART对照，退出/taint/正确性/身份/计数/窗口/AXI守恒通过，原数据未改。证据 out/mac-batch-ds0-20260916-132332-run-ebgxhirr/server-review.{py,json}；[结果解释](../../iommu-platform/docs/ds0-batch-results-review.md)。相比历史同角色50/50，Solo/A1基本不变，A8～A64吞吐+31.14%～35.63%；A8相对A1额外硬件耗时44.71%→10.50%，支持DS敏感性，未证明HOL或纯翻译代价。
+
+比较边界：未同期回切50/50；DS0 A8～A64共40项V miss均2，A8的A miss6160→5141，映射/内部状态及HPM边界未严格匹配。建议下一项使用已有50/50 BIT回切，只复测Solo/A1/A8固定角色各10次，无需重编；尚未执行。本次仅复核/记录，无新RTL/软件/构建/上板。
+
+## 2026-09-16 DS0/0实板正式对照完成（最新）
+
+baseline-4dma-batch加载成功，STAT0x501079fc、Linux00082；固定V=DMA0/A=DMA1，六条件Solo/A1/A8/A16/A32/A64各10次，4096项/warmup256，60/60通过。按用户要求不短校准、不交换角色。数据错误/quarantine/taint0，observer计数/覆盖/窗口/AXI守恒通过。硬件中位MiB/s 283.17/149.59/135.38/131.61/129.98/128.64。
+
+较此前同角色DS50/50，Solo/A1基本不变，A8～A64提升约31%～36%；旧数据为历史对照，非同期交错采样。新版A8～A64共40项V miss/S1 PTW均2，Solo/A1均0；A miss/PTW中位0/5141/6940/7501/8331，S2全0。不能直接把提升折算单次PTW代价或证明HOL。原样保留全部样本，无补采。
+
+证据out/mac-batch-ds0-20260916-132332-run-ebgxhirr/，含原JSON/observer、统计及完整UART；Mac报告DS0_BATCH_RESULTS.md。未修改RTL/Linux或重编；原哈希/SD回读跳过、HPM/时钟/CDC/IO签核边界保留。已恢复printk并退出root，当前保持DS0/0配置。
+
+## 2026-09-16 DS0/0批量对照FPGA构建完成（最新）
+
+按下一步计划新增 `baseline-4dma-batch` 配置，仅将 DS input/output 从50/50改为0/0，批量RTL、Linux和软件保持不变。FPGA构建退出0，manifest `out/manifests/fpga-baseline-4dma-batch.json` 为passed；日志 `iommu-platform/out/e4-ds0-batch-20260916-fpga.log` 仅保存未审查。BIT `out/baseline-4dma-batch/fpga-src/cva6/corev_apu/fpga/work-fpga/ariane_xilinx.bit`，SHA256 `c6555d14245935820224a2cae2d835a65bade81fe993d5f8d626ec0ff2724050`；MCS同目录，SHA256 `b4dbe765ba25ae5d043b9782c488adb32b6402b2f2b07f1ccfe5540992461f7e`。尚未上板或采样，待用同一批量矩阵比较50/50与0/0。
+
+## 2026-09-16 batch结果服务器独立复核（最新）
+
+用户询问是否达预期。104条（短14+主60+扩展30）原JSON/observer逐项与回传summary内完整UART一致，正确性/退出/taint/任务/窗口/AXI守恒通过；原数据未改。证据 out/mac-batch-main-20260916-112954-run-9sa69rhc/server-review.{py,json}，解释见 [batch结果复核](../../iommu-platform/docs/batch-results-review.md)。
+
+本阶段自主供给、持续重叠、硬件慢化目标达成，机制未定：正式批次gap恒4095周期，共跑在途重叠约99.7%。V=DMA0的Solo/A1/A8硬件中位56.56/107.10/154.99ms，A8较A1耗时+44.7%/吞吐-30.9%；A1无miss已明显变慢，不能把全部损失归为翻译。90性能样本88个V miss0，主42/扩展28各2，完整保留。A16/32/64为后续固定角色扩展，未同期重采基线。仅复核及更新文档，无构建/新上板；下一步机制区分，不自动实施E2/E3。
+
+## 2026-09-16 A16/A32/A64固定角色实板扩展完成（最新）
+
+用户明确不短校准、不交换角色；固定V=DMA0/A=DMA1，4096项/warmup256，各10次轮换条件，30/30通过。数据错误/quarantine/taint0，30组observer窗口/计数/覆盖/AXI守恒通过。硬件MiB/s中位98.27/95.95/94.84，A miss/S1 PTW中位7246/7743/7976；第28项A16的V miss/PTW2，其余29项V0，完整保留未补采。S2全0。
+
+证据out/mac-batch-ext-20260916-114036-run-8pjv_djc/，包含原始JSON、观测、统计、完整UART；Mac报告BATCH_EXT_RESULTS.md。未重编或刷卡，旧Solo/A1/A8未重采，仅历史对照；不能单凭趋势归因为HOL/纯翻译。新增页数未独立短校准、未反向角色验收，原HPM/时钟/CDC/IO待办保留。
+
+## 2026-09-16 batch实板正式矩阵完成（最新）
+
+Mac新BIT/Linux00082完成14短校准+60正式样本，74/74通过；正式4096项/warmup256、Solo/A1/A8、双角色每条件10次轮换顺序。数据错误/quarantine/taint均0，observer计数/覆盖/H+gap/AXI守恒通过。硬件中位吞吐约283/149/103 MiB/s，双路在途重叠99.69%～99.79%。第42项DMA1+A8的V miss/PTW2，其余59项V0；A8 miss/PTW中位6160，第42项5141，完整保留无补采。不能归为纯翻译或HOL；硬件窗口与软件/HPM窗口分开统计。
+
+原始JSON、观测、统计和完整UART已回传 out/mac-batch-main-20260916-112954-run-9sa69rhc/；短校准 out/mac-batch-short-20260916-111626-run-n8mg7wsz/。Mac报告BATCH_MAIN_RESULTS.md，RTL/Linux未改、未重编，下载哈希/SD回读按用户要求跳过。原时钟/CDC/IO与完整HPM语义待办保留，不自动启动E2/E3。
+
+## 2026-09-16 硬件批量版构建交付完成（最新）
+
+用户已批准改RTL，并明确编译节约token：日志只保存，有报错才读取，不逐项审查成功日志/时序报告。实现入口 [E4_BATCH.md](../../iommu-platform/E4_BATCH.md)。硬件每项4KiB完成后自主接续并在页环回绕，CPU轮询整批；原软件模式保留。新CLI `--batch` / ioctl0x08 / JSON `idma.batch.v1`，强制observer v2，H+硬件gap窗口冻结于末项硬件完成，done_to_read另计；先A后V，A有限上限并在CPU发现V完成后STOP/排空。旧P/R不能套用。
+
+真实frontend批量11+旧模式对照12、observer28+2溢出、双frontend/observer联测4、驱动41+96小chunk及CLI回归通过。软件与最终FPGA构建均退出0，manifest为passed，BIT/MCS非空。Linux `b7979a1a06ac` / 00082，软件构建顶层 `e47b48e`。发现重复相同批次需清旧计数后主动中止首轮FPGA（130），修正回归通过；CVA6 `7ed43840cab2`、FPGA构建顶层 `3198fef`，独立profile `migration-4dma-batch`，软件未因RTL修正重编。 文档提交 `7b321a2`，各源码提交均保留在本地。
+
+交付 [README](../../iommu-platform/out/e4-batch-20260916/delivery/README.md)，含新BIT、SD用fw_payload.bin、说明、版本/构建清单及SHA256SUMS；证据/日志 `iommu-platform/out/e4-batch-20260916/`、build-status.json。首轮导出在out/migration-4dma-batch-aborted-before-repeat-fix保留。新版未上板；下一步Mac同时更新BIT/SD软件，先重复8项Solo、换角色、多页及8/64项A1/A8校准，再决定正式采样。旧E1/E4/用户文档保持，时钟/CDC/IO待办保留；本轮仅确认构建退出及产物，不审计成功日志/时序报告、不宣称新增时序签核。
+
+## 2026-09-16 E4服务器独立复核与下一步（最新）
+
+已复核Mac回传105条原JSON及86组观测，身份/任务数/正确性/HPR与AXI守恒通过；原数据未改，证据见 `iommu-platform/out/mac-e4-stage-20260916-094001-run-kzi_s0zc/server-review.json`。详细 [E4结果复核](../../iommu-platform/docs/e4-results-review.md)。60主样本H约56ms、全部V miss0；按同角色均值差，新增时间99.08%～99.92%在P。60样本（其中40共跑）both全0，V/A地址等待也为0；开关配对中位最大绝对变化0.5051%。不把P全称CPU，不宣称HOL或IOMMU无干扰。
+
+建议下一步保留轮询，先设计两路独立有限批量供给/软件轮询批次完成，校准真实请求重叠后再定位硬件干扰。仅建议，未实施/构建；用户未要求本轮直接改供给。现有HPR假设逐任务DONE读取，自主重发不能直接复用该有效性判据，需一起设计窗口。完整UART仍在Mac，本次核查JSON及回传配对，下载哈希/SD回读未做的边界保留。无需重复本轮105试次，不自动启动E2/E3。
+
+下一步问答已进一步限定为“硬件接续有限任务、软件轮询批次”，仍每路最多一个任务、4KiB拷贝、V固定页/A1或A8回绕、A覆盖V窗口后安全排空；先8/64项校准再主矩阵。原n_trans非DEFAULT循环逐页递增且无回绕，不能直接当新版拷贝接口。新硬件窗口按任务发出/实际完成定义，旧逐次DONE的P/R分开保留。详见E4结果复核文末，仅方案细化，尚无新代码/构建。
+
+## 2026-09-16 E4新版实板验收完成（最新）
+
+Mac以新observe BIT和Linux00081完成105/105：9短测、36开关开销、60主样本。86组time/axi_v/axi_a检查通过，data_errors/quarantine=0、taint0，开关配对中位变化最大0.506%，低于预定1%门槛。软硬件未再修改。
+
+主样本每条件10次：V H约56ms基本不变，P从Solo约346–349ms增至A1约767–769ms/A8约804–805ms，R约185–191ms；60主样本AXI both均0。支持优先核查供给/完成读取路径，不把P全部当CPU、不把H全部当IOMMU，不宣称HOL。下一步供给方式改动需另行明确，不自动实施E2/E3。
+
+证据：`iommu-platform/out/mac-e4-stage-20260916-094001-run-kzi_s0zc/` 内105条原JSON、86观测组、逐项判定及版本边界。完整UART在Mac results/serial/20260916-094001-console-x8xsc_f0/console.raw.log，详细说明E4_STAGE_RESULTS.md。首轮直接printk缺字，从内核dmesg恢复完整观测；后续临时loglevel4并逐次dmesg读回，结尾恢复7 4 1 7、observe=N、taint0，串口已退出。用户要求未做下载哈希/SD回读，期望哈希不能称Mac实测。旧E1与本轮不合并，原时钟/CDC/IO待办保留。
+
+## 2026-09-16 保留轮询、E4观测构建交付完成（最新）
+
+用户明确“暂时保留轮询,继续”，已实施Linux可读被动DMA观测，保留热循环、供给/缓存/排空和原ABI。入口 [E4_OBSERVER.md](../../iommu-platform/E4_OBSERVER.md)。CVA6 `540544ce`、Linux `853e60b234c3`，构建顶层 `228aed2`，文档及补充测试提交 `e53aaf9`，独立profile `migration-4dma-observe`。24+2个真实观测场景、12个frontend前后对照任务、驱动原19+新增11场景及96小chunk组合通过，软件/FPGA完整构建均退出0。
+
+默认关闭，由 `/sys/module/idma/parameters/observe` 开启并检查硬件标识；H/P/R和AXI在末个DONE读取时冻结，排空/校验后输出同seq的time/axi_v/axi_a三条记录。P/R含控制MMIO等待，不能全称CPU时间；缺硬件/无效观测不能伪PASS。
+
+交付 [README](../../iommu-platform/out/e4-observer-20260916/delivery/README.md)，内核00081；BIT SHA256 `41fa23d0aee476b603111df192c612f3d40e844067211564d2b8b175a60b9b90`，payload `d31fc2db4f620704563c8e4d75a50ce4a62e9e50b0a6e047b4f14cbc073d4ba6`。布线WNS0.177ns/WHS0.027ns、累计违例0，Slice96.55%；原时钟/CDC/IO待办保留。初始许可证网络失败及一次缺RISCV的手动重试保留，最终manifest记录同导出源码续建成功。
+
+**新版尚未上板。** 下一步Mac下载/核验新BIT与payload、按已有SD/JTAG流程更新，先观测关闭短功能试次→开启短Solo/角色互换/共跑及8/64任务计数校准→36条开关开销→60条E4主样本。旧BIT/软件/E1数据及用户研究文档改动保留；无需重建已通过版本，不扩充E1或启动E2/E3。
+
+## 2026-09-16 E4 最小观测方案细化（最新）
+
+用户“继续”后已把后续收敛成 [E4供给/完成观察实验卡](../../iommu-platform/docs/e4-supply-timing-plan.md)。优先Linux可读的被动硬件汇总，沿用Mac下载/SD/串口，不把未验证的ILA读取流程作为前置。用同一硬件时钟记录任务分配ID→完成、完成→对应DONE读取、DONE读取→下次提交，补mux两侧请求/返回/等待及重叠观测；不能把外设DONE读取时刻当CPU精确发现时刻。首末自动门控、A跨预热边界在途状态持续维护、ID/溢出/窗口恒等式校准等边界已写明。
+
+源码另确认DMA frontend处于WAIT时等本任务完成，8项FIFO不等于当前已能排队提交8项；本轮观测保持原供给方式。拟36个开关观测对照后60条Solo/A1/A8双角色主样本；新BIT/软件与原产物分开，新增产物须验收。当前只完成方案和代码落点核对，未改RTL/Linux、未构建/上板、未启动E2/E3。下一项实施是观测模块及对应边界测试，不扩充原E1参数矩阵。
+
+## 2026-09-16 E1 服务器复核与后续建议（最新）
+
+已读取Mac E1的协议/assessment及全部144条原始JSON，独立核对成功/完成数/校验/隔离状态，80主样本条件与时间一致。复核见 [E1结果与下一步](../../iommu-platform/docs/e1-results-review.md)，统计保存在原回传目录的server-review.json，原记录未改。主样本V miss全0；A1也全0但软件耗时已为Solo的1.728倍，A8/32为1.787～1.795倍且A miss8190。A8/32相对A1只额外约3.5%～3.9%；V backend active各组均约270万周期、基本不变。不能把约79%慢化归为纯翻译损失或HOL。
+
+下一步建议优先既定E4供给/计时核查：少量Solo/A1/A8，加最小软件汇总和板上请求到达/完成/重叠观测，先区分CPU供给/发现延迟与共享硬件等待，再按证据安排E2/E3。硬件观测尚未导出、需要新BIT；E2仍需同映射生命周期分阶段接口。建议未实施，本轮无代码修改/构建/新上板。保留E1已完成的范围，不重跑旧smoke或默认补全所有E0项目。
+
+## 2026-09-16 Mac 当前双路 E1 已完成（最新）
+
+缓存同步内核00080与SC.W修复BIT已在Mac实板通过两次新启动29组功能试次、单DID32组和双DID12组归属检查；其后18个探索性能样本独立保留。本次用户确认仅做当前双路E1，不含E2/E3。
+
+本轮144/144通过：16项有限HPM/冷热/进位回绕检查，48个预热/窗口敏感性样本，80个主样本（双角色，Solo/A1/A8/A32各10次）。data_errors/quarantine=0、taint0，脚本退出0。A1页软件观测耗时约Solo的1.73倍，A8/32页约1.79倍；敏感性归一化变化最大0.427%。未重建或刷卡，Mac串口已退出。
+
+证据：`iommu-platform/out/mac-e1-stage-20260916-032650-run-rbo67pvd/` 的records.json、assessment.json、summary.json（内含采样前协议）。Mac完整UART在results/serial/20260916-032650-console-jz4u_u_b/console.raw.log，说明E1_STAGE_RESULTS.md/HPM_REMAINING.md。
+
+范围严格限定软件计时E1、DS50/50。完整E0/P2仍未签核：S2正向、溢出IRQ、空窗口开销和硬件请求重叠缺接口，DDTW相邻事件漏计及时钟/CDC/IO待办保留；PTW字段不是独立页表访存量。无纯硬件慢化/HOL结论。下载哈希/SD回读按用户明确要求未做，不将期望哈希写成实测值。
+
+
+更新：2026-09-16。项目交接摘要；以用户新要求和实际文件状态为准，不代表完整聊天历史。
+
+## 2026-09-16 DMA 缓存同步修正版（最新，优先于下文历史状态）
+
+用户回传 `DMA_DIAGNOSTIC.md`：诊断版新启动首次 warmup32 通过，随后完整 smoke 首组 warmup0 失败，其余13组未运行，Linux正常/taint0。首错 offset912，dst=eb（恰为初始化值 ~14），FENCE.I 后=14，src始终14；支持 CPU 缓存旧视图，但尚未确认唯一根因。两次 JSON、首错和摘要已回传 `out/dma-smoke-debug-20260916/mac-20260916-*/`，完整串口仍在Mac。watchdog/遇错停止已在板上工作。
+
+本轮仅补当前 CVA6 平台 DMA 开始前和安全排空后的缓存同步，均在测量窗口外；保持真实错误EILSEQ，不改ABI/RTL。另确定并修复 `iova_to_phys` 将IOVA页号错误拼入PA的问题，旧 `*_pte_pa` 异常大地址不代表硬件实际翻译。Linux `3b47ab1645e412095b601e3be68b6347b9fad213`，构建顶层 `76de9ee73656cc90bdae5331be7020b5f905e205`。19个调度/诊断/缓存场景、96小chunk组合、16软件查询场景通过；移除任一同步回归能检出，旧查询16场景12失败/修正后0失败。完整软件构建及交付校验通过，修正版尚未上板。已有用户文档脏改动保留。
+
+最新入口：[DMA 缓存同步修正](../../iommu-platform/DMA_CACHE_SYNC.md)，交付 `iommu-platform/out/dma-cache-sync-20260916/delivery/`，内核 `6.5.0-rc2-00080-g3b47ab1645e4`，payload SHA256 `6f52ad85c4d2fc87e97301d98f1394216b843cd8be601b2965eca429caf74053`。需更新SD软件并回读，沿用SC.W修复BIT（df7c240…），旧交付保留。下一步新版首次warmup32→完整14组smoke；通过后另一新启动直接完整smoke。任何失败即停，不进入性能矩阵。功能通过后重新校准HPM/开销，不混用旧版性能样本；时钟/CDC/IO待办保留。
+
+## 2026-09-16 DMA smoke 失败（历史诊断阶段）
+
+用户提供 `DMA_SMOKE.md`：SC.W 修复 BIT 已上板，Linux 登录/proc 正常、taint=0，但 DMA smoke 未通过。原脚本依赖缺失的 BusyBox timeout，退出127且未发DMA；Mac临时兼容脚本首例 DMA0 单页/4096chunk/8次/warmup0 通过，下一例 warmup32 出现 EILSEQ/data_errors1。其余12例未运行，双路/HPM端到端校准未完成。输入摘要已归档 `iommu-platform/out/dma-smoke-debug-20260916/`；原始串口/JSON仍在Mac，尚未收到。
+
+诊断与交付入口：[DMA smoke 最小修正](../../iommu-platform/DMA_SMOKE_FIX.md)。两组同时改变预热和调用顺序，不能直接归因预热。静态查到 Linux 默认 coherent 与无外部DMA失效的WT缓存契约缺口；物理页复用后CPU读旧值是候选根因，尚未由实板首错值确认。最小驱动诊断 Linux `53d3113dee74761515fc08b6a4f984d41227c50f` 已提交：仅失败/排空后保存首错、当前CVA6 FENCE.I刷新后重读、记录IOVA/PA/软件页表PA，仍保留EILSEQ；不改ABI/正常测量/RTL，不把探针当最终一致性修复。主机原12+4诊断场景、96小chunk组合与驱动目标编译通过；timeout依赖修正和诊断软件交付结果以专门文档为准。此前用户的研究/计划文档脏改动保留，不代为提交。
+
+本轮软件已构建交付：`iommu-platform/out/dma-smoke-debug-20260916/delivery/`，构建顶层 `38774213f7cb8f3ea4240e6e127e363ae5f6be02`，Linux版本 `6.5.0-rc2-00079-g53d3113dee74`。独立 `platform-timeout` 已编译进rootfs，避免依赖缺失applet，smoke失败也收集dmesg；9项watchdog、5项rootfs检查通过，产物SHA256全部通过。新payload哈希 `58ba4d4ae9601ba8fad6064e217dabef51f897ac5461ca07fcc77eb9232836bb`。此次要更新SD软件，继续使用现有SC.W修复BIT；旧交付 `out/experiment-v1/` 保留。下一步由Mac按既有SD流程更新并单次复现DMA0，保存首错整行；新诊断尚未上板，数据问题未宣布修复。详见专门文档，不重建RTL或继续性能矩阵。
+
+## 2026-09-16 Mac 实板异常及修复（最新，优先于下文准备阶段历史）
+
+Mac 已完成 SD 更新/回读与 1 MHz JTAG 配置，Linux 进入用户空间后 proc/dentry 警告、generic_permission Oops，登录失败。问题和完整日志已同步 `iommu-platform/out/board-bringup-20260915-mac/`。实板诊断复现高半部 SC.W 失败误报成功，1000/1000；WT AXI 适配器在等待 B 响应时清掉字节偏移。CVA6 已修为保持偏移，提交 `7f086b73f19d8e4d48ed74a671e8315f827d2ce0`；真实生产模块回归旧版 54 场景/6 失败，修复版 54/0。
+
+用户已明确授权 RTL 修复、回归及重建新 BIT。新构建独立使用 `migration-4dma-scfix`（仍 DS 50/50、50 MHz、四 DMA），旧构建不覆盖；构建状态见 `iommu-platform/out/board-bringup-20260915-mac/fpga-build-status.json`，详见 [SC.W 修复与验证](../../iommu-platform/SC_WORD_FIX.md)。Linux 软件未改、SD 不需因这处 RTL 修复重写。新 BIT 上板、登录/smoke/HPM 尚未验证；Mac 板卡暂处 CPU 调试暂停状态。原时钟/CDC/IO 约束待办保留。初次调试寄存器缓存读取问题和需重新启动的边界在 Mac 的 LINUX_BOOT_FIX.md 及服务器证据目录中已记录。
+
+本次上板准备：用户使用 M1 Pro MacBook，代码/编译在实验室服务器；明确不想同时使用另一个 Windows 电脑。搜索后更新建议为 Mac 原生 openFPGALoader（项目明确支持 Genesys 2，Homebrew 有 Apple Silicon 包）下载服务器 `.bit`、SD 启动 Linux；需 Vivado 界面时再试 Parallels + Windows 11 ARM，已有其他 Digilent 板卡成功案例，当前用户组合未实测。Windows 实体机仅后备，非已接受方案。已定向核对 Boot ROM 的 GPT/原始分区读取及现有 JTAG/OpenOCD 入口；无 SD 启动完整 Linux 尚未验证，未安装本地工具、制卡、重建或上板。证据与边界见 [上板电脑与启动分工](../../iommu-platform/docs/board-host-setup.md)。
+
+## 先读这些
+
+- Mac 本地任务独立交接：[MAC_FPGA_HANDOFF.md](../../MAC_FPGA_HANDOFF.md)。包含单 Mac 下载方案、本地检查顺序、服务器 BIT 绝对路径及 2026-09-15 实算 SHA256；仅生成交接，尚未操作本地 Mac 或板卡。
+
+- 当前开发目录：`/home/xvhaocheng/work/iommu-platform`。旧工程 `/home/xvhaocheng/riscv-iommu-demo-refact` 和 `platform-archives/` 用作历史/备份，默认不在其中开发。
+- 研究重点是多 DMA 共享 IOMMU 的地址翻译干扰。容量影响、HOL、仲裁/互连竞争和软件供给影响是待区分假设，不能把吞吐变化直接写成机制证据。
+- **最新范围：用户要求“只做必要的软件修改”，避免软件臃肿。已仅修小 chunk 错源校验、补现有回归/smoke；不自动扩展限速、日志字段、HPM 槽、运行器或新模式。2026-09-15 已编译并更新交付镜像，包含本次修复。**
+- 用户已授权执行新实验软件并清理旧 benchmark。新版 `idma_experiment`、Linux 测量与 per-DID HPM 会话、rootfs/板上 smoke 已实现，主机检查和完整软件构建通过。旧四个程序及旧 ioctl 已退役，历史和旧产物保留。
+- **FPGA 是实验主线，仿真按需辅助，不是开始实验的前置门槛。当前主机没有连接 FPGA，用户尚未准备 SD 卡。** 新版尚未上板运行/HPM 校准；SD 启动方式继续保留，实际卡布局和加载文件需准备介质时核实。
+- 本轮未改 RTL、未重建 FPGA。已有 migration-4dma BIT/MCS、HPM RTL 定向测试和迁移阶段离线恢复结果保留；时钟/CDC/IO 约束审查仍待完成。
+- 源码面板已配置只显示顶层、CVA6、IOMMU、Linux；没有删组件或 `.git`，仍是顶层加 21 个组件。不要自动执行此前讨论过的裁剪或 Git 合并。
+- 2026-09-15 按用户要求执行 `make software JOBS=12`，退出 0，已更新 `out/experiment-v1/` 及版本/SHA256 清单；日志仅保存，未逐项审查，未重跑既有测试或 FPGA 构建。旧交付保留在 `out/experiment-v1-before-20260915T140327Z/`。下一步是设备启动、smoke 和 E0 校准。
+
+## 按任务找文件
+
+平台相对路径均相对于 `iommu-platform/`，按需定向读取，不默认扫描 Linux、`.git`、`out/` 或恢复副本。
+
+| 任务 | 入口 |
+|---|---|
+| 使用、构建、Git | [README](../../iommu-platform/README.md)、[构建说明](../../iommu-platform/docs/build.md) |
+| 本轮实现、参数、字段边界、测试命令 | [实验入口 v1](../../iommu-platform/docs/experiment-v1.md) |
+| v1 实现复审与建议改动 | [复审记录](../../iommu-platform/docs/experiment-v1-review.md)：小 chunk 软件问题已修、HPM RTL 问题待修；其余能力仅按所选实验需要实施 |
+| 组会讲解 access pattern 和实验逻辑 | [组会讲解稿](../../iommu-platform/docs/experiment-v1-presentation.md)：地址序列、工作集/拷贝量、时序、对照、一分钟口头稿 |
+| 最新构建证据、历史 FPGA 报告、待办 | [验证记录](../../iommu-platform/docs/validation.md) |
+| 新版软件交付 | [交付说明](../../iommu-platform/out/experiment-v1/README.md)、[版本/SHA256](../../iommu-platform/out/experiment-v1/delivery.json) |
+| 旧 benchmark 为什么退役 | [核查](../../iommu-platform/docs/benchmark-audit.md)，描述的是替换前版本 |
+| E0～E4 假设/对照/判据 | [实验总设计](../../iommu-platform/docs/experiment-plan.md) |
+| 投稿导向的问题、缓和措施与场景推演 | [论文推演草案](../../iommu-platform/docs/paper-scenarios-mitigation.md)：结果分支、创新性复核、措施前提/代价、公平对照和先行工作 |
+| 整篇论文的最新逻辑与优先级 | [论文逻辑](../../iommu-platform/docs/paper-logic.md)：缓存保护何时足够、翻译中/翻译后等待、最小措施、双方代价与投稿证据门槛 |
+| 面向尽快投稿的独立审查 | [审查记录](../../iommu-platform/docs/research-review-2026-09-09.md)：贡献收敛、W/闭环供给混杂、预热/统计单位、最小因果链与停止条件；建议尚未替代原计划 |
+| E1 候选负载 | [双路设计 v1](../../iommu-platform/docs/experiment-design-v1.md)，正式参数尚未收敛 |
+| 请求边界、FIFO/PTW 观测候选 | [观测分工](../../iommu-platform/docs/experiment-instrumentation.md)，额外 RTL 观测未接入 |
+| P0～P5 完整实施路线 | [FPGA 实施计划](../../iommu-platform/docs/experiment-implementation-plan.md) |
+| 论文方向、旧研究背景 | [研究总览](../../研究总览_2026-09-08.md)，注意其中迁移前路径与状态 |
+| 个人补丁来历 | [补丁说明](../../iommu-platform/docs/patches.md)，provenance 补丁已应用，勿重复 apply |
+| ABI、DMA 测量调度 | `linux/include/uapi/linux/idma.h`、`linux/drivers/misc/idma.c` |
+| per-DID HPM 所有权/配置/恢复 | `linux/drivers/iommu/riscv/iommu-hpm.c`、`linux/include/linux/riscv_iommu_hpm.h`、同目录 `iommu-sysfs.c` |
+| 当前唯一实验前端 | `bench/idma_experiment.c` |
+| 构建、rootfs、板上 smoke | `scripts/platform.py`、`scripts/rootfs.py`、`tests/board-smoke.sh` |
+| HPM RTL 与既有仿真 | `cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_hpm.sv`；`tests/hpm_test_top.sv`、`tests/hpm_test.cpp` |
+| 四 DMA/DID/PID/地址窗口 | `cva6/corev_apu/fpga/src/ariane_peripherals_xilinx.sv` |
+| IOMMU 容量、DS、FPGA 顶层 | `cva6/corev_apu/tb/ariane_soc_pkg.sv`、`cva6/corev_apu/fpga/src/ariane_xilinx.sv` |
+| iDMA 与 active cycles | `cva6/corev_apu/iDMA/`，由 CVA6 跟踪，没有独立 Git |
+
+## 已确认的实验范围
+
+后续讨论已修正目标：**争取方法论文，因果表征作为方法设计的前半段，不提前把终点限定为表征论文。** 本次重审 E0～E4/P0～P5 与 v1，文档补入 P4M 方法原型/直接基线/双方代价/冻结规则后验证，并明确 E2 阶段执行依赖、P2 分层校准；具体方法尚未选定。用户随后要求限制软件增量；预热/映射记录、A 间隔、UT_REQ 分母、运行记录器及新执行模式均为按需候选，不是自动待办。
+
+[复审](../../iommu-platform/docs/experiment-v1-review.md)发现两项可复现问题：① 旧模式仅将 DID 混入高位，小 chunk（1/2/4 字节）短试次漏检错设备源；已改为每字节带唯一 DMA 实例编号。新增 96 个正常/错源组合在旧代码检出 36 项失败，修复后全部通过，原 12 个调度场景也通过；驱动目标交叉编译通过。smoke 每路增加 8 页中前 4 页各拷贝一次、校验其余未触及页，无新接口。② HPM 对全局 valid 取沿，连续 UT_REQ→DDTW 可丢后者；生产 HPM 单元复现得 0/预期 1，有低 valid 间隔的对照正常。RTL 尚未修，当前六槽未选择 DDTW，不能据此说六槽全部失效。S1/S2 与 IOTLB miss 同处产生，不是独立 PTW 访存量或占用时间。原缺陷证据 [out/review-v1-20260909](../../iommu-platform/out/review-v1-20260909/README.md)仍对应修复前版本；修复验证见[验证记录](../../iommu-platform/docs/validation.md)。没有新板上数据；交付镜像已于 2026-09-15 更新。
+
+用户在独立审查任务中确认优先“尽快形成一篇扎实投稿”。[本轮审查](../../iommu-platform/docs/research-review-2026-09-09.md)建议首篇只打通一条能改变设计选择的因果链，不先实现所有机制/措施；保留 E0～E4 既定判据和 FPGA 主线。新增明确点：W 同时改变物理数据工作集与闭环到达率，事后匹配 A 吞吐可评措施代价但不自动识别纯翻译效应；需落实 A 预热相位和独立试次统计。补查 TPDS 2017 的软件管理 IOTLB 非阻塞先例，进一步限制泛称 Hit-under-Miss 创新；其机制并非当前硬件 PTW 的等价实现。上述均是审查建议，无新颖性确认、源码修改或新实验数据，用户尚未选定具体新主张。
+
+用户将本任务作为投稿导向的并行思考支线，推演问题、緩和措置和シナリオ，并要求实质创新。最新[论文逻辑](../../iommu-platform/docs/paper-logic.md)收敛为“缓存保护何时足够，何时还需干预共享服务”，沿用 E0～E4，优先区分替换、翻译中等待与翻译后出口等待，再选择最小必要措施。性能反转和等待预算仅保留为可选分支，不是必须出现的结果或已选实现。当前**没有已确认的创新点**：RTCSA 2025 已测 DMA/IOMMU 干扰，MASK/DWS 已有翻译感知反馈与组合控制，本次补查 STFM/ATLAS 也排除了“改为时间计费即创新”。下一步收敛少量因果实验卡及措施适用条件，在相近 A 进度下评价 V；仅更新研究文档和交接，未改代码、构建或产生实验数据。
+
+已补充微基准定位：机制与限定范围的预测可主要用微基准；同点重复、冻结规则后测试未见参数、真实应用外推是三层证据。真实 workload 不是当前研究前置条件；声明应用收益时再补对应证据。额度选择须先预测后验证，穷举最佳点仅作离线参照。默认 V 两个映射页/纯循环可能只呈容量阶跃，q 分区与额外时序控制尚未实现。
+
+已按用户要求将面向教授的简短讲稿改为[日语 Wiki 条目](../../iommu-platform/docs/experiment-v1-report-ja.md)，涵盖实验计划、v1 设计与实现状态。Notion 连续返回授权重试，未能读取或写入用户所指当前页面；页面同步仍待完成。本次仅更新文档风格，未改源码、重建或产生板上数据。
+
+用户希望组会能讲清 access pattern 和实验逻辑。已增加上表讲解稿并定向核对当前驱动：V 固定页对、A 顺序循环；每路一个软件未确认完成描述符；预热按 V 次数，切换时仅 V 回到偏移 0，A 相位继续。该次补充仅改说明，没有新构建/板上数据；实际地址与完整翻译上下文目前不在 JSON 中，不能宣称跨试次物理轨迹已固定。
+
+完整 E0 校准、E1 性能、E2 翻译状态、E3 阻塞、E4 路径/软件对照已提前规划；不是等 v1 结果出来再临时设计机制实验。当前仅完成 E0 准备/E1 的最小软件入口，不代表整套实验或 P2 板上校准已完成。
+
+新版只支持 4 KiB 基础页、顺序循环、Solo/双路；V 完成固定工作量就结束自身测量窗口，A 在预热和测量期间由同一 CPU 持续轮询补交，之后停止并排空。默认 V 源/目标各 1 页，A 源/目标各 8 页，chunk 4096，V transfers 4096、warmup 256。这些是试跑默认值，不是正式采样矩阵。
+
+- 主时间为首个 V 被测提交前到最后完成被软件观察到，含 CPU/MMIO/调度开销，不含 A 尾部排空。
+- `dma_active_cycles` 是 backend 非 idle 累加，不是 IOMMU 专属等待。
+- HPM V/A 各三槽，精确 DID 过滤、独占会话、保存恢复；`hpm_configured` 只表示配置回读成功，板上事件归属尚未校准。快照非原子，边界外 A 事件可能计入。
+- 补交间隙是软件观察完成到下一次提交触发读完成，含提交 MMIO；不等于硬件空闲时间。软件 in-flight 不证明请求重叠。
+- 失败会停止补交、排空；无法确认安全时保留映射/缓冲并隔离设备至重启，禁止继续实验。最终数据校验不证明每个重复描述符都实际正确搬运。
+- 新 ABI 查询/运行是 0x06/0x07；旧 0x01～0x05 返回 ENOTTY。旧 Solo/Pair/Multi/Once 当前均已删除，不能继续写“旧 independent 已实现所以可直接使用”。
+- 新程序没有 random、大页、BARE、四路独立流量、硬件请求重叠/阻塞观测或自动 slowdown。E2/E3 所需控制与额外观测未实现；Page Batching、IOTLB 预留、Hit-under-Miss 等仍是候选缓解方法。
+
+旧论文是 Accelerator-side IOMMU 的 Remote Page Walk 性能评估；英文稿在 `/home/xvhaocheng/thesis/2026_thesis_eng2/`。FPGA 模拟远端访问代价，不代表真实多 Chiplet/PCIe P2P 系统已搭好。
+
+## 当前版本与本轮验证
+
+下表为最小软件修复后的本地提交；Linux、顶层 gitlink 与 lock 一致，CVA6/IOMMU 未改。已有日语报告、研究草案及复审文档保留，部分文档尚未提交；交付镜像已按下表源码于 2026-09-15 更新，构建清单如实记录顶层文档 dirty 状态。
+
+| 仓库 | 分支 | 提交 |
+|---|---|---|
+| 顶层 | `codex/idma-experiment-v1` | `0bb9851` |
+| Linux | `codex/idma-experiment-v1` | `031e91dbadc115dafac957067135002b74035a10` |
+| CVA6 | `platform` | `7f64251542f9eaf2e80dced55d87c9d6e6a2ab79` |
+| IOMMU | `platform` | `da8a8011f2c52fb1e0c5fd8ae9b9757a5f0ffbb5` |
+| OpenSBI | `platform` | `e8d21bfdc2dd753314627968e496c3a1188f6dfb` |
+
+本轮起点顶层 `151c9a7ef2f2aea707c8f587b9b1906691a65430`、Linux `2ef3f4b82afd3d2b039d6c67f214e50f27f10198`，均干净。完整软件从顶层 `ffe55a40175937122b3d6be92a6c005099f16dfd` 构建，起止干净；结束提交仅更新文档，不改变被测源码。所有提交仅保存在本地，没有推送。
+
+已通过：
+
+- CLI 解析/ABI/错误传播 65 组。
+- 动态抽取真实 DMA 调度函数的 12 场景，含独立结束、循环补交、预热隔离、超时/中断排空和 quarantine；三类临时注入回归被检出。
+- 真实 HPM 控制逻辑 25 组，含六槽配置故障、状态恢复、互斥和进位；检出并修复两个索引宏参数未括住导致 Aggressor PTW 读错寄存器的问题。
+- rootfs 白名单/去重/设备节点 4 项；内核目标交叉编译、相关样式和 diff 检查。
+- `make check`：21 个组件干净，所有指针/lock 一致，无 alternates。
+- `make software JOBS=12`：新用户程序、rootfs、Linux Image、DTB、lloader、OpenSBI payload 全流程通过。DTC 原有 interrupt provider 缺少 `#address-cells` 警告仍在。
+- 交付目录全部 SHA256 校验通过；原 BIT/MCS 哈希未变。
+
+证据：`out/manifests/software-migration-4dma.json`、`out-experiment-software.log`、`out/experiment-v1/{delivery.json,SHA256SUMS}`。主机 harness 不验证真实 DMA 映射/MMIO 时序、RTL 事件准确性或板上压力。
+
+## 产物和历史验证
+
+`out/experiment-v1/` 集中保存新版 `fw_payload.bin`、Image、platform.dtb、rootfs.cpio、lloader、实验程序、smoke、lock、manifest、日志和 SHA256。它是软件产物集合，**不是已确认布局的 SD 整盘镜像**；不能假设所有文件都要拷入卡。
+
+覆盖软件前已备份到 `out/pre-experiment-v1-20260908T124529Z/`（含 archive.json）；旧 out/bench 可执行文件移入其中 legacy-benchmarks。旧 `out/migration-4dma/delivery.json` 是历史软硬件组合，其软件哈希不对应新版；当前组合看新 delivery.json。未删除 FPGA 报告/产物或旧源码历史。
+
+硬件为 Genesys 2/XC7K325T、RV64 CVA6 50 MHz、timer 25 MHz；4 DMA，DID 10～13、PID 20～23，IOTLB 16，DDTC/PDTC 各 8，HPM 31。
+
+- `migration-4dma`：DS 50/50，BIT/MCS 已构建，沿用作明确标注的校准候选。
+- `baseline-4dma`：DS 0/0，配置已准备，未构建/上板验证。正式样本不能混用两个配置。
+- 构建器只支持四路拓扑，改 DMA 数量不能只改 JSON。
+- 历史 HPM RTL 测试覆盖 pulse、held-valid、idle、DID filter、inhibit；相同测试检出旧 RTL 10/预期 1 的错误。这不是完整 IOMMU 系统仿真。
+- FPGA WNS 0.177 ns、WHS 0.038 ns、WPWS 0.062 ns，总负余量 0；仅表示现有约束满足。仍有 6 项 methodology Critical Warning（TIMING-4/6/7/27）及外部 IO delay 缺失，详见验证记录。
+- FPGA 实际导出源码 2,332 个跟踪 blob 与锁定提交一致，见 `out/migration-4dma/staged-source-audit.json`。旧 manifest 的顶层结束状态已单独说明，不据此否认实际源码审计。
+- BIT/MCS 和 routed timing/methodology 报告在 `out/migration-4dma/fpga-src/cva6/corev_apu/fpga/work-fpga/`。MCS 步骤会重建 Vivado 项目，别去已消失的 `ariane.runs/impl_1` 找报告。
+
+## 构建、备份与工作视图
+
+常用：`make check`、`make software JOBS=12`、`make hpm-test`、`make fpga PROFILE=migration-4dma`、`make bundle`。不要为熟悉仓库重跑完整构建；`make check` 会写 out/manifests，并非严格只读。
+
+本机工具：Vivado 2023.1（`/tools/Xilinx/Vivado/2023.1/bin/vivado`）、riscv64-linux-gnu GCC 11.4、riscv64-unknown-elf GCC 10.2、Verilator 4.038、Python 3.10。RISCV 默认 `/home/xvhaocheng/RISCV/riscv_tools`。许可证完整地址 `2100@opus4.apal.cs.waseda.ac.jp` 曾直连验证；短主机名 opus4 曾解析失败。没有新增 SSH 转发或 systemd 服务。
+
+组件修改须先提交，再依次更新父 gitlink 和 `sources.lock.json` 并提交；IOMMU 的链路是 IOMMU → CVA6 → 顶层。构建检查拒绝脏组件或不匹配指针。FPGA 导出目录已存在时拒绝覆盖，需按构建说明保留旧结果。
+
+来源：CVA6 `zero-day-labs/cva6 feat/iommu-refact` 锚点 `1f992d80`；IOMMU `zero-day-labs/riscv-iommu mc/dti-ats` 锚点 `c80bba7`，不是当前平台版本。保留接口修复、AW 优先大传输修复、HPM edge 修复、四 DMA 地址译码及 OpenSBI timer 修复；不要切回锚点覆盖个人更改。
+
+没有个人远端，直接 clone --recursive 不保证取到本地提交。`out/source-bundles/` 和 `platform-archives/restore-check` 已验证的是迁移阶段版本，**尚不含本轮实验修改**；要迁移新版先导出新 bundle。本轮没有重复完整离线恢复或覆盖旧 bundles。
+
+历史备份 `platform-archives/legacy-20260908` 保留 22 个旧仓库历史/diff/未跟踪文件/产物。`platform-archives/migration-tools` 是一次性脚本。均未删除。
+
+工作视图由外层 `.vscode/settings.json` 和 `iommu-platform.code-workspace` 控制，关闭自动展开并限制扫描，隐藏 OpenSBI/小依赖/恢复副本。尚未收到用户 Reload Window 后界面确认。组件裁剪和“缩减成 5 个 Git”只讨论过，用户澄清为界面需求后没有执行，也不是待办。apb_timer 在实际硬件中、tb 内有 SoC 包、vendor/modified 有在用 RTL；不能整目录删除。RV64 未实例化的两个宽度转换 IP 属于 Debug Module，不是 iDMA。
+
+## 后续接手
+
+软件交付已于 2026-09-15 更新，包含小 chunk 修复及新增 smoke。设备准备后使用 `out/experiment-v1/`，准备启动和日志通道，跑 platform-smoke（四路无预热/有预热 Solo、多页部分覆盖，加 DMA0/1 双路角色互换），随后做 E0：设备/HPM 归属、窗口与预热敏感性、真实压力校准。warmup=0 不自动等于 cold，命令成功不等于机制证据。独立时钟约束审查仍未完成。
+
+E2/E3 已有设计但无状态/请求控制实现。IOTLB 按上下文/页号等匹配，不能由 DID 不同断言条目独立；AW/AR FIFO 等待不能仅凭入口 stall，PTW active 未接父层；DS delayer 汇合多类数据结构请求，不是 PTW 专属干预。上游 vsim/类式 VIP 可按需参考，当前只验证 HPM Verilator 流程。
+
+需要历史决策原文时定向查源任务 **整理论文工作文件夹**：任务 ID `01a0806d-e7d2-7092-964c-0edd0919d17e`，host ID `remote-ssh-discovered:dell`。不要默认重读完整聊天。本轮未创建新对话。
+
+## 2026-09-16 SC 修复构建完成（最新结果）
+
+新 BIT/MCS 构建已通过，退出 0；完成 UTC：2026-09-15T15:56:47.509135+00:00。
+
+BIT：`/home/xvhaocheng/work/iommu-platform/out/migration-4dma-scfix/fpga-src/cva6/corev_apu/fpga/work-fpga/ariane_xilinx.bit`；11443722 bytes；SHA256 `df7c2400555bba8a95c4ab2b31526fa7958e669dd4c3bfd216140d01de22d5e3`。
+
+正式 routed timing：WNS 0.177 ns、WHS 0.010 ns、WPWS 0.062 ns，TNS/THS/TPWS 均为 0。已设置的时序约束满足，但 6 项时钟 Critical Warning 及 IO/CDC 审查待办保留。
+
+源码与 54 场景回归已通过，旧 BIT 未覆盖。新 BIT 尚未上板；Linux 登录和 DMA smoke/HPM 尚未验收，下一步用新 BIT 重新配置板卡，SD 不改。

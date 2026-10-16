@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * idma_nonblock_read -- fixed-address reader for the passive non-block
+ * observer window bank.
+ *
+ * Reads only /dev/mem at the iDMA0 register block (0x50000000). It selects the
+ * 16-word non-block bank through the index register at 0x70 and reads the data
+ * register at 0x78. The observer must already be frozen (status low bits == 4)
+ * before this helper runs: it never arms, opens, closes, or configures the DMA
+ * or the observer. No address or count is taken from the command line.
+ *
+ * One optional flag:
+ *   --diagnostics   additionally read the separate passive diagnostic bank at
+ *                   index 16..31 and print it as an extra "diagnostic" JSON
+ *                   object.  Without the flag the output is exactly the frozen
+ *                   16-word ABI (byte-for-byte the same fields and values).
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#define IDMA0_PHYS   0x50000000ULL
+#define MAP_SIZE     0x1000ULL
+
+#define REG_STATUS   0x60u   /* observer status (read only here) */
+#define REG_INDEX    0x70u   /* observer bank index             */
+#define REG_DATA     0x78u   /* observer bank data              */
+
+#define NB_WORDS     16
+#define NB_MAGIC     0x49444D414E424C01ULL
+#define NB_VERSION   1ULL
+
+/*
+ * Register-block index base of the non-block window bank.
+ * Task specification: index = 512 + 0xD00 + i  (== 0xF00 + i).
+ */
+#define NB_INDEX_BASE (512ULL + 0xD00ULL)
+
+/* Second, passive diagnostic bank: index NB_INDEX_BASE + 16 .. + 31. */
+#define DIAG_INDEX_BASE ((uint64_t)(NB_INDEX_BASE + NB_WORDS))
+
+#define DIAG_MAGIC        0x49444D414E444701ULL
+#define DIAG_VERSION      1ULL
+#define DIAG_FLAGS_FROZEN 4ULL   /* low bits: frozen=1, active=0, armed=0 */
+#define DIAG_FAST_WORD    15u    /* diag[15] == sum(core words 6..10)  */
+
+#if defined(__riscv)
+#define NB_BARRIER() __asm__ __volatile__("fence iorw, iorw" ::: "memory")
+#else
+#define NB_BARRIER() __sync_synchronize()
+#endif
+
+static volatile uint64_t *g_regs;
+
+static inline void nb_write(uint32_t off, uint64_t val)
+{
+    NB_BARRIER();
+    g_regs[off / 8u] = val;
+    NB_BARRIER();
+}
+
+static inline uint64_t nb_read(uint32_t off)
+{
+    uint64_t val;
+
+    NB_BARRIER();
+    val = g_regs[off / 8u];
+    NB_BARRIER();
+    return val;
+}
+
+static void emit_json(const uint64_t w[NB_WORDS], int diagnostics,
+                      const uint64_t d[NB_WORDS], uint64_t core_fast_sum)
+{
+    unsigned i;
+
+    printf("{\"schema\":\"idma-nonblock-window-v1\",");
+    printf("\"mode\":%" PRIu64 ",", w[2]);
+    printf("\"windowseq\":%" PRIu64 ",", w[4]);
+    printf("\"cycles\":%" PRIu64 ",", w[5]);
+    printf("\"fastcounts\":[");
+    for (i = 6; i <= 10; i++)
+        printf("%s%" PRIu64, i == 6 ? "" : ",", w[i]);
+    printf("],\"normalcounts\":[");
+    for (i = 11; i <= 13; i++)
+        printf("%s%" PRIu64, i == 11 ? "" : ",", w[i]);
+    printf("],\"words\":[");
+    for (i = 0; i < NB_WORDS; i++)
+        printf("%s%" PRIu64, i == 0 ? "" : ",", w[i]);
+    printf("]");
+    if (diagnostics) {
+        printf(",\"diagnostic\":{\"words\":[");
+        for (i = 0; i < NB_WORDS; i++)
+            printf("%s%" PRIu64, i == 0 ? "" : ",", d[i]);
+        printf("],\"core_fast_sum\":%" PRIu64 "}", core_fast_sum);
+    }
+    printf("}\n");
+}
+
+static void usage(const char *prog)
+{
+    fprintf(stderr, "usage: %s [--diagnostics]\n", prog);
+}
+
+int main(int argc, char **argv)
+{
+    uint64_t words[NB_WORDS];
+    uint64_t diag[NB_WORDS];
+    uint64_t orig_index, status, flags, sum, tmp;
+    uint64_t core_fast_sum = 0, core_seq_before = 0, core_seq_after = 0;
+    uint64_t core_flags_before = 0, core_flags_after = 0;
+    void *map;
+    int fd, rc = 0, ovf, diagnostics = 0;
+    unsigned i;
+    int argi;
+
+    for (argi = 1; argi < argc; argi++) {
+        if (strcmp(argv[argi], "--diagnostics") == 0) {
+            diagnostics = 1;
+        } else {
+            usage(argv[0]);
+            return 2;
+        }
+    }
+
+    memset(words, 0, sizeof(words));
+    memset(diag, 0, sizeof(diag));
+
+    fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (fd < 0) {
+        fprintf(stderr, "open /dev/mem: %s\n", strerror(errno));
+        return 2;
+    }
+
+    map = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+               (off_t)IDMA0_PHYS);
+    if (map == MAP_FAILED) {
+        fprintf(stderr, "mmap 0x%llx: %s\n",
+                (unsigned long long)IDMA0_PHYS, strerror(errno));
+        close(fd);
+        return 2;
+    }
+    g_regs = (volatile uint64_t *)map;
+
+    orig_index = nb_read(REG_INDEX);
+    status = nb_read(REG_STATUS);
+
+    if ((status & 0x7ULL) != 0x4ULL) {
+        fprintf(stderr,
+                "observer not frozen (status=0x%016" PRIx64
+                "): require low bits == 4\n", status);
+        rc = 3;
+        goto out_restore;
+    }
+
+    for (i = 0; i < NB_WORDS; i++) {
+        nb_write(REG_INDEX, NB_INDEX_BASE + (uint64_t)i);
+        words[i] = nb_read(REG_DATA);
+    }
+
+    flags = words[3];
+    if (words[0] != NB_MAGIC) {
+        fprintf(stderr, "bad magic: 0x%016" PRIx64 "\n", words[0]);
+        rc = 4;
+    }
+    if (words[1] != NB_VERSION) {
+        fprintf(stderr, "bad version: %" PRIu64 "\n", words[1]);
+        rc = 4;
+    }
+    if (words[2] != 1 && words[2] != 2) {
+        fprintf(stderr, "bad mode: %" PRIu64 "\n", words[2]);
+        rc = 4;
+    }
+    if ((flags & 0x7ULL) != 0x4ULL) {
+        fprintf(stderr,
+                "flags not frozen/!active/!armed: 0x%016" PRIx64 "\n", flags);
+        rc = 4;
+    }
+    if (words[15] != 0) {
+        fprintf(stderr,
+                "observer error bits set: 0x%016" PRIx64 "\n", words[15]);
+        rc = 4;
+    }
+
+    sum = 0;
+    ovf = 0;
+    for (i = 6; i <= 13; i++) {
+        if (__builtin_add_overflow(sum, words[i], &tmp)) {
+            ovf = 1;
+            break;
+        }
+        sum = tmp;
+    }
+    if (ovf) {
+        fprintf(stderr, "counter sum overflows 64 bits\n");
+        rc = 4;
+    } else if (sum != words[14]) {
+        fprintf(stderr,
+                "conservation failed: sum(6..13)=%" PRIu64
+                " != words[14]=%" PRIu64 "\n", sum, words[14]);
+        rc = 4;
+    }
+
+    /*
+     * Optional second bank.  Read-only, passive: reading index 16..31 must not
+     * perturb the frozen core window, so core seq/flags are re-read afterwards.
+     * The bank is only printed when it validated; nothing here is faked.
+     */
+    if (rc == 0 && diagnostics) {
+        core_seq_before = words[4];
+        core_flags_before = words[3];
+
+        for (i = 0; i < NB_WORDS; i++) {
+            nb_write(REG_INDEX, DIAG_INDEX_BASE + (uint64_t)i);
+            diag[i] = nb_read(REG_DATA);
+        }
+
+        nb_write(REG_INDEX, NB_INDEX_BASE + 4ULL);
+        core_seq_after = nb_read(REG_DATA);
+        nb_write(REG_INDEX, NB_INDEX_BASE + 3ULL);
+        core_flags_after = nb_read(REG_DATA);
+
+        if (diag[0] != DIAG_MAGIC) {
+            fprintf(stderr, "bad diagnostic magic: 0x%016" PRIx64 "\n",
+                    diag[0]);
+            rc = 4;
+        }
+        if (diag[1] != DIAG_VERSION) {
+            fprintf(stderr, "bad diagnostic version: %" PRIu64 "\n", diag[1]);
+            rc = 4;
+        }
+        if (diag[2] != words[2]) {
+            fprintf(stderr,
+                    "diagnostic mode %" PRIu64 " != core mode %" PRIu64 "\n",
+                    diag[2], words[2]);
+            rc = 4;
+        }
+        if (diag[3] != DIAG_FLAGS_FROZEN) {
+            fprintf(stderr, "bad diagnostic flags: 0x%016" PRIx64 "\n",
+                    diag[3]);
+            rc = 4;
+        }
+        if (diag[4] != words[4]) {
+            fprintf(stderr,
+                    "diagnostic seq %" PRIu64 " != core seq %" PRIu64 "\n",
+                    diag[4], words[4]);
+            rc = 4;
+        }
+        if (diag[5] != words[5]) {
+            fprintf(stderr,
+                    "diagnostic cycles %" PRIu64 " != core cycles %" PRIu64
+                    "\n", diag[5], words[5]);
+            rc = 4;
+        }
+        if (core_seq_after != core_seq_before) {
+            fprintf(stderr,
+                    "core seq changed during diagnostic read: %" PRIu64
+                    " -> %" PRIu64 "\n", core_seq_before, core_seq_after);
+            rc = 4;
+        }
+        if (core_flags_after != core_flags_before) {
+            fprintf(stderr,
+                    "core flags changed during diagnostic read: 0x%016" PRIx64
+                    " -> 0x%016" PRIx64 "\n",
+                    core_flags_before, core_flags_after);
+            rc = 4;
+        }
+
+        core_fast_sum = 0;
+        ovf = 0;
+        for (i = 6; i <= 10; i++) {
+            if (__builtin_add_overflow(core_fast_sum, words[i], &tmp)) {
+                ovf = 1;
+                break;
+            }
+            core_fast_sum = tmp;
+        }
+        if (ovf) {
+            fprintf(stderr, "diagnostic core fast sum overflows 64 bits\n");
+            rc = 4;
+        } else if (core_fast_sum != diag[DIAG_FAST_WORD]) {
+            fprintf(stderr,
+                    "diagnostic fast_accepts %" PRIu64
+                    " != sum(core fast 6..10) %" PRIu64 "\n",
+                    diag[DIAG_FAST_WORD], core_fast_sum);
+            rc = 4;
+        }
+    }
+
+    if (rc == 0)
+        emit_json(words, diagnostics, diag, core_fast_sum);
+
+out_restore:
+    nb_write(REG_INDEX, orig_index);
+    munmap(map, MAP_SIZE);
+    close(fd);
+    return rc;
+}
