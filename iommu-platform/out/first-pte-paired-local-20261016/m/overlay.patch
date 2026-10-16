@@ -1,0 +1,485 @@
+--- a/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ptw.sv
++++ b/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ptw.sv
+@@ -81,7 +81,9 @@
+     // Memory interface
+     input  axi_resp_t                   mem_resp_i,
+     output axi_req_t                    mem_req_o,
+-    output logic [1:0]                  e3_level_o
++    output logic [1:0]                  e3_level_o,
++    // FIRST-PTE-PAIRED-LOCAL-1: real accepted normal S1 occurrence, no added flop.
++    output logic                        m_normal_s1_start_o
+ );
+ 
+     localparam int unsigned PLEN = RVIOMMUCfg.PAddrWidth;
+@@ -149,6 +151,8 @@
+ 
+     // Edge-triggered init control
+     logic edge_trigger_q, edge_trigger_n;
++    assign m_normal_s1_start_o = (state_q == IDLE) && init_ptw_i &&
++        !edge_trigger_q && en_1S_i && !en_2S_i && !imp_init_i;
+     always_comb begin : ptw_init_control
+         edge_trigger_n = edge_trigger_q;
+         if (!edge_trigger_q && init_ptw_i)
+--- a/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv
++++ b/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv
+@@ -130,7 +130,13 @@
+     output logic policy_quiet_o,
+     output logic nonblock_fire_o,
+     output logic nonblock_busy_o,
+-    output logic [15:0] nonblock_diag_o
++    output logic [15:0] nonblock_diag_o,
++    // Test-local f1 bundle: direct same-clock wires to selected DRAM mux.
++    output logic m_normal_s1_start_o,
++    output logic m_ptw_active_o,
++    output logic m_qualified_start_o,
++    output logic m_start_bank_o,
++    output logic m_root_dram_o
+ );
+ 
+     initial begin
+@@ -691,6 +697,18 @@
+     axi_resp_t e3_ptw_resp;
+     logic e3_seen_q, e3_first_hit_q, e3_normal, e3_ptw_active;
+     logic [1:0] e3_level;
++    paddr_t m_root_base;
++    // Check the actual low-PLEN root used to form the first PTE address.
++    // Every root is 4KiB aligned; the complete page must decode to DRAM.
++    assign m_root_base = {iosatp_ppn_q[PPNW-1:0], 12'b0};
++    assign m_root_dram_o = (m_root_base >= paddr_t'(64'h8000_0000)) &&
++                           (m_root_base <= paddr_t'(64'hbfff_f000));
++    assign m_ptw_active_o = e3_ptw_active;
++    assign m_start_bank_o = req_data.bank;
++    assign m_qualified_start_o = m_normal_s1_start_o && req_valid &&
++        !req_data.is_debug && req_data.ttype == rv_iommu::UNTRANSLATED_W &&
++        !ddt_imp_trans_q && !pdt_imp_trans_q && !iova_is_msi_q &&
++        !gpaddr_is_msi && m_root_dram_o;
+     logic [63:0] e3_pte_q;
+     logic e3_capture, e3_available, e3_consume, e3_error, e3_a_s1_miss;
+     logic [7:0] e3_extra;
+@@ -769,6 +787,7 @@
+         .init_ptw_i         (ptw_init),
+ 
+         .active_o           (e3_ptw_active),
++        .m_normal_s1_start_o(m_normal_s1_start_o),
+         .e3_level_o         (e3_level),
+         .error_o            (ptw_error),
+         .error_2S_o         (ptw_error_2S),
+--- a/cva6/vendor/pulp-platform/axi/src/axi_mux.sv
++++ b/cva6/vendor/pulp-platform/axi/src/axi_mux.sv
+@@ -51,7 +51,11 @@
+   parameter bit          SpillB        = 1'b0,
+   // add spill register on read master ports, adds a cycle latency on read channels
+   parameter bit          SpillAr       = 1'b1,
+-  parameter bit          SpillR        = 1'b0
++  parameter bit          SpillR        = 1'b0,
++  // Test-local selected DRAM AR control; other mux instances remain bypassed.
++  parameter bit          MFirstPteEnable = 1'b0,
++  parameter int unsigned MFirstPteH = 64,
++  parameter bit          CommonDsFirstEnable = 1'b0
+ ) (
+   input  logic                       clk_i,    // Clock
+   input  logic                       rst_ni,   // Asynchronous reset active low
+@@ -61,7 +65,12 @@
+   output slv_resp_t [NoSlvPorts-1:0] slv_resps_o,
+   // master port (AXI outputs), connect slave modules here
+   output mst_req_t                   mst_req_o,
+-  input  mst_resp_t                  mst_resp_i
++  input  mst_resp_t                  mst_resp_i,
++  input logic m_enable_i, m_pair_qualified_i, m_start_i,
++  input logic m_ptw_active_i, m_start_bank_i,
++  output logic [15:0] m_state_o,
++  output logic m_p1_commit_o, m_arm_o, m_timeout_o, m_masked_o,
++  output logic [2:0] m_ds_quota_o
+ );
+ 
+   localparam int unsigned MstIdxBits    = $clog2(NoSlvPorts);
+@@ -71,6 +80,14 @@
+   if (NoSlvPorts == 32'h1) begin : gen_no_mux
+     assign mst_req_o      = slv_reqs_i[0];
+     assign slv_resps_o[0] = mst_resp_i;
++    assign m_state_o = '0;
++    assign m_p1_commit_o = 1'b0;
++    assign m_arm_o = 1'b0;
++    assign m_timeout_o = 1'b0;
++    assign m_masked_o = 1'b0;
++    assign m_ds_quota_o = '0;
++    initial if (MFirstPteEnable || CommonDsFirstEnable)
++      $fatal(1, "Local M/shared DS policy requires the four-input DRAM mux");
+   // other non degenerate cases
+   end else begin : gen_mux
+ 
+@@ -330,17 +347,48 @@
+     //--------------------------------------
+     // AR Channel
+     //--------------------------------------
++    logic [NoSlvPorts-1:0] m_ar_allow;
++    logic [NoSlvPorts-1:0][MstAxiIDWidth-1:0] m_raw_ids;
++    for (genvar j = 0; j < NoSlvPorts; j++) begin : gen_m_raw_ids
++      assign m_raw_ids[j] = slv_ar_chans[j].id;
++    end
++    if (MFirstPteEnable) begin : gen_m_gate
++      m_first_pte_gate #(
++        .NumIn(NoSlvPorts), .FullIdWidth(MstAxiIDWidth), .H(MFirstPteH)
++      ) i_first_pte_gate (
++        .clk_i, .rst_ni, .enable_i(m_enable_i),
++        .pair_qualified_i(m_pair_qualified_i), .start_i(m_start_i),
++        .ptw_active_i(m_ptw_active_i), .start_bank_i(m_start_bank_i),
++        .raw_id_i(m_raw_ids), .raw_valid_i(slv_ar_valids),
++        .select_valid_i(ar_valid), .select_ready_i(ar_ready),
++        .select_id_i(mst_ar_chan.id), .allow_o(m_ar_allow),
++        .state_o(m_state_o), .arm_o(m_arm_o), .p1_commit_o(m_p1_commit_o),
++        .timeout_o(m_timeout_o), .masked_o(m_masked_o)
++      );
++    end else begin : gen_no_m_gate
++      assign m_ar_allow = '1;
++      assign m_state_o = '0;
++      assign m_p1_commit_o = 1'b0;
++      assign m_arm_o = 1'b0;
++      assign m_timeout_o = 1'b0;
++      assign m_masked_o = 1'b0;
++    end
+     rr_arb_tree #(
+       .NumIn    ( NoSlvPorts    ),
+       .DataType ( mst_ar_chan_t ),
+       .AxiVldRdy( 1'b1          ),
+-      .LockIn   ( 1'b1          )
++      .LockIn   ( 1'b1          ),
++      .EnableReqMask(MFirstPteEnable),
++      .EnableDsFirst(CommonDsFirstEnable),
++      .DsPort(3)
+     ) i_ar_arbiter (
+       .clk_i  ( clk_i           ),
+       .rst_ni ( rst_ni          ),
+       .flush_i( 1'b0            ),
+       .rr_i   ( '0              ),
+       .req_i  ( slv_ar_valids   ),
++      .req_allow_i(m_ar_allow),
++      .ds_quota_o(m_ds_quota_o),
+       .gnt_o  ( slv_ar_readies  ),
+       .data_i ( slv_ar_chans    ),
+       .gnt_i  ( ar_ready        ),
+--- a/cva6/vendor/pulp-platform/axi/src/axi_xbar.sv
++++ b/cva6/vendor/pulp-platform/axi/src/axi_xbar.sv
+@@ -22,6 +22,11 @@
+   parameter axi_pkg::xbar_cfg_t Cfg                                   = '0,
+   /// Enable atomic operations support.
+   parameter bit  ATOPs                                                = 1'b1,
++  // FIRST-PTE local controls exist only at this selected output AR selector.
++  parameter bit MFirstPteEnable = 1'b0,
++  parameter int unsigned MFirstPteMstPort = 0,
++  parameter int unsigned MFirstPteH = 64,
++  parameter bit CommonDsFirstEnable = 1'b0,
+   /// Connectivity matrix
+   parameter bit [Cfg.NoSlvPorts-1:0][Cfg.NoMstPorts-1:0] Connectivity = '1,
+   /// AXI4+ATOP AW channel struct type for the slave ports.
+@@ -72,6 +77,11 @@
+   input  logic                                                          rst_ni,
+   /// Testmode enable, active high.
+   input  logic                                                          test_i,
++  input logic m_enable_i, m_pair_qualified_i, m_start_i,
++  input logic m_ptw_active_i, m_start_bank_i,
++  output logic [15:0] m_state_o,
++  output logic m_p1_commit_o, m_arm_o, m_timeout_o, m_masked_o,
++  output logic [2:0] m_ds_quota_o,
+   /// AXI4+ATOP requests to the slave ports.  
+   input  slv_req_t  [Cfg.NoSlvPorts-1:0]                                slv_ports_req_i,
+   /// AXI4+ATOP responses of the slave ports.  
+@@ -103,6 +113,18 @@
+   slv_req_t  [Cfg.NoMstPorts-1:0][Cfg.NoSlvPorts-1:0] mst_reqs;
+   slv_resp_t [Cfg.NoMstPorts-1:0][Cfg.NoSlvPorts-1:0] mst_resps;
+ 
++  logic [Cfg.NoMstPorts-1:0][15:0] m_states;
++  logic [Cfg.NoMstPorts-1:0] m_p1_commits, m_arms, m_timeouts, m_masks;
++  logic [Cfg.NoMstPorts-1:0][2:0] m_ds_quotas;
++  assign m_state_o = m_states[MFirstPteMstPort];
++  assign m_p1_commit_o = m_p1_commits[MFirstPteMstPort];
++  assign m_arm_o = m_arms[MFirstPteMstPort];
++  assign m_timeout_o = m_timeouts[MFirstPteMstPort];
++  assign m_masked_o = m_masks[MFirstPteMstPort];
++  assign m_ds_quota_o = m_ds_quotas[MFirstPteMstPort];
++  initial if (MFirstPteMstPort >= Cfg.NoMstPorts)
++    $fatal(1, "Local DRAM control master index is out of range");
++
+   axi_xbar_unmuxed #(
+     .Cfg          (Cfg),
+     .ATOPs        (ATOPs),
+@@ -151,7 +173,10 @@
+       .SpillW        ( Cfg.LatencyMode[3]     ),
+       .SpillB        ( Cfg.LatencyMode[2]     ),
+       .SpillAr       ( Cfg.LatencyMode[1]     ),
+-      .SpillR        ( Cfg.LatencyMode[0]     )
++      .SpillR        ( Cfg.LatencyMode[0]     ),
++      .MFirstPteEnable(MFirstPteEnable && i == MFirstPteMstPort),
++      .MFirstPteH(MFirstPteH),
++      .CommonDsFirstEnable(CommonDsFirstEnable && i == MFirstPteMstPort)
+     ) i_axi_mux (
+       .clk_i,   // Clock
+       .rst_ni,  // Asynchronous reset active low
+@@ -159,7 +184,12 @@
+       .slv_reqs_i  ( mst_reqs[i]         ),
+       .slv_resps_o ( mst_resps[i]        ),
+       .mst_req_o   ( mst_ports_req_o[i]  ),
+-      .mst_resp_i  ( mst_ports_resp_i[i] )
++      .mst_resp_i  ( mst_ports_resp_i[i] ),
++      .m_enable_i, .m_pair_qualified_i, .m_start_i,
++      .m_ptw_active_i, .m_start_bank_i,
++      .m_state_o(m_states[i]), .m_p1_commit_o(m_p1_commits[i]),
++      .m_arm_o(m_arms[i]), .m_timeout_o(m_timeouts[i]),
++      .m_masked_o(m_masks[i]), .m_ds_quota_o(m_ds_quotas[i])
+     );
+   end
+ 
+--- a/cva6/vendor/pulp-platform/common_cells/src/rr_arb_tree.sv
++++ b/cva6/vendor/pulp-platform/common_cells/src/rr_arb_tree.sv
+@@ -76,6 +76,12 @@
+   ///
+   /// Set to `1'b0` to disable.
+   parameter bit          FairArb    = 1'b1,
++  /// Test-local eligibility mask. Default bypass preserves all other instances.
++  /// Only used for the selected DRAM AR mux with internal priority and LockIn.
++  parameter bit          EnableReqMask = 1'b0,
++  /// Common paid DS-first/F4 policy, selected DRAM AR instance only.
++  parameter bit          EnableDsFirst = 1'b0,
++  parameter int unsigned DsPort = 3,
+   /// Dependent parameter, do **not** overwrite.
+   /// Width of the arbitration priority signal and the arbitrated index.
+   parameter int unsigned IdxWidth   = (NumIn > 32'd1) ? unsigned'($clog2(NumIn)) : 32'd1,
+@@ -93,6 +99,8 @@
+   input  idx_t                rr_i,
+   /// Input requests arbitration.
+   input  logic    [NumIn-1:0] req_i,
++  input  logic    [NumIn-1:0] req_allow_i,
++  output logic [2:0]          ds_quota_o,
+   /* verilator lint_off UNOPTFLAT */
+   /// Input request is granted.
+   output logic    [NumIn-1:0] gnt_o,
+@@ -109,6 +117,13 @@
+   output idx_t                idx_o
+ );
+ 
++  initial begin
++    if ((EnableReqMask || EnableDsFirst) && (!LockIn || ExtPrio || NumIn < 2))
++      $fatal(1, "Masked/DS-first arbitration requires internal LockIn arbitration");
++    if (EnableDsFirst && DsPort >= NumIn)
++      $fatal(1, "DS-first input index is out of range");
++  end
++
+   // pragma translate_off
+   `ifndef VERILATOR
+   `ifndef XSIM
+@@ -124,6 +139,7 @@
+     assign gnt_o[0] = gnt_i;
+     assign data_o   = data_i[0];
+     assign idx_o    = '0;
++    assign ds_quota_o = '0;
+   // non-degenerate cases
+   end else begin : gen_arbiter
+     localparam int unsigned NumLevels = unsigned'($clog2(NumIn));
+@@ -136,6 +152,38 @@
+     /* lint_off */
+     idx_t                       rr_q;
+     logic [NumIn-1:0]           req_d;
++    wire [NumIn-1:0] base_req = EnableReqMask ? (req_i & req_allow_i) : req_i;
++    logic [NumIn-1:0] eligible_req;
++    if (EnableDsFirst) begin : gen_ds_first_f4
++      logic [2:0] quota_q;
++      logic [NumIn-1:0] non_ds_req;
++      always_comb begin
++        non_ds_req = base_req;
++        non_ds_req[DsPort] = 1'b0;
++        eligible_req = base_req;
++        // Current-VALID priority only. No predicted future DS reservation.
++        if (base_req[DsPort]) begin
++          if ((quota_q == 3'd4) && (|non_ds_req)) begin
++            eligible_req = non_ds_req;
++          end else begin
++            eligible_req = '0;
++            eligible_req[DsPort] = 1'b1;
++          end
++        end
++      end
++      always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) quota_q <= '0;
++        else if (flush_i) quota_q <= '0;
++        else if (req_o && gnt_i) begin
++          if (idx_o != idx_t'(DsPort)) quota_q <= '0;
++          else if (quota_q != 3'd4) quota_q <= quota_q + 1'b1;
++        end
++      end
++      assign ds_quota_o = quota_q;
++    end else begin : gen_no_ds_first
++      assign eligible_req = base_req;
++      assign ds_quota_o = '0;
++    end
+ 
+     // the final arbitration decision can be taken from the root of the tree
+     assign req_o        = req_nodes[0];
+@@ -144,7 +192,7 @@
+ 
+     if (ExtPrio) begin : gen_ext_rr
+       assign rr_q       = rr_i;
+-      assign req_d      = req_i;
++      assign req_d      = eligible_req;
+     end else begin : gen_int_rr
+       idx_t rr_d;
+ 
+@@ -154,7 +202,7 @@
+         logic [NumIn-1:0] req_q;
+ 
+         assign lock_d     = req_o & ~gnt_i;
+-        assign req_d      = (lock_q) ? req_q : req_i;
++        assign req_d      = (lock_q) ? req_q : eligible_req;
+ 
+         always_ff @(posedge clk_i or negedge rst_ni) begin : p_lock_reg
+           if (!rst_ni) begin
+@@ -197,7 +245,7 @@
+           end
+         end
+       end else begin : gen_no_lock
+-        assign req_d = req_i;
++        assign req_d = eligible_req;
+       end
+ 
+       if (FairArb) begin : gen_fair_arb
+@@ -271,15 +319,15 @@
+ 
+             assign index_nodes[Idx0] = idx_t'(sel);
+             assign data_nodes[Idx0]  = (sel) ? data_i[l*2+1] : data_i[l*2];
+-            assign gnt_o[l*2]        = gnt_nodes[Idx0] & (AxiVldRdy | req_d[l*2])   & ~sel;
+-            assign gnt_o[l*2+1]      = gnt_nodes[Idx0] & (AxiVldRdy | req_d[l*2+1]) & sel;
++            assign gnt_o[l*2]        = gnt_nodes[Idx0] & ((AxiVldRdy && !EnableReqMask && !EnableDsFirst) | req_d[l*2])   & ~sel;
++            assign gnt_o[l*2+1]      = gnt_nodes[Idx0] & ((AxiVldRdy && !EnableReqMask && !EnableDsFirst) | req_d[l*2+1]) & sel;
+           end
+           // if only the first index is still in the vector...
+           if (unsigned'(l) * 2 == NumIn-1) begin : gen_first
+             assign req_nodes[Idx0]   = req_d[l*2];
+             assign index_nodes[Idx0] = '0;// always zero in this case
+             assign data_nodes[Idx0]  = data_i[l*2];
+-            assign gnt_o[l*2]        = gnt_nodes[Idx0] & (AxiVldRdy | req_d[l*2]);
++            assign gnt_o[l*2]        = gnt_nodes[Idx0] & ((AxiVldRdy && !EnableReqMask && !EnableDsFirst) | req_d[l*2]);
+           end
+           // if index is out of range, fill up with zeros (will get pruned)
+           if (unsigned'(l) * 2 > NumIn-1) begin : gen_out_of_range
+--- a/tests/m_first_pte_gate.sv
++++ b/tests/m_first_pte_gate.sv
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
++// FIRST-PTE-PAIRED-LOCAL-1, fixed V=DMA0/bank0, A=DMA1/bank1.
++// f1 is one receiver capture on the real PTW start edge. No event queue,
++// marker, AXI payload buffer, source capture or replay is introduced.
++module m_first_pte_gate #(
++  parameter int unsigned NumIn = 4,
++  parameter int unsigned FullIdWidth = 6,
++  parameter int unsigned H = 64,
++  parameter int unsigned DsPort = 3,
++  parameter int unsigned PayloadPort = 2,
++  parameter int unsigned RemWidth = $clog2(H+1)
++) (
++  input logic clk_i,
++  input logic rst_ni,
++  input logic enable_i,
++  input logic pair_qualified_i,
++  input logic start_i,
++  input logic ptw_active_i,
++  input logic start_bank_i,
++  input logic [NumIn-1:0][FullIdWidth-1:0] raw_id_i,
++  input logic [NumIn-1:0] raw_valid_i,
++  input logic select_valid_i,
++  input logic select_ready_i,
++  input logic [FullIdWidth-1:0] select_id_i,
++  output logic [NumIn-1:0] allow_o,
++  output logic [15:0] state_o,
++  output logic arm_o,
++  output logic p1_commit_o,
++  output logic timeout_o,
++  output logic masked_o
++);
++  logic pending_q, pending_d, escape_q, escape_d;
++  logic [RemWidth-1:0] remaining_q, remaining_d;
++  logic gate_active, walk_retired, non_ds_commit, exit_event;
++
++  // Full existing ID: {xbar source[1:0], original DMA source[1:0], local ID[1:0]}.
++  localparam logic [FullIdWidth-1:0] PtwId = FullIdWidth'(48);
++  localparam logic [FullIdWidth-1:0] AIdMask = FullIdWidth'(6'h3c);
++  localparam logic [FullIdWidth-1:0] AIdPrefix = FullIdWidth'(6'h24);
++
++  initial begin
++    if (NumIn != 4 || FullIdWidth != 6 || DsPort != 3 || PayloadPort != 2 ||
++        H != 64 || RemWidth != 7)
++      $fatal(1, "M local gate requires frozen four-port ID6/H64 contract");
++  end
++
++  assign gate_active = pending_q && (remaining_q != '0) &&
++                       enable_i && pair_qualified_i;
++  assign p1_commit_o = pending_q && select_valid_i && select_ready_i &&
++                       (select_id_i == PtwId);
++  assign walk_retired = pending_q && !ptw_active_i;
++  assign non_ds_commit = select_valid_i && select_ready_i &&
++                         (select_id_i[FullIdWidth-1 -: 2] != 2'(DsPort));
++  assign timeout_o = pending_q && (remaining_q == RemWidth'(1));
++  assign exit_event = p1_commit_o || walk_retired || timeout_o ||
++                      (pending_q && (remaining_q != '0) &&
++                       (!enable_i || !pair_qualified_i));
++  // Use old state only. A skipped occurrence is never queued for later replay.
++  assign arm_o = !pending_q && !escape_q && enable_i && pair_qualified_i &&
++                 start_i && !start_bank_i;
++
++  always_comb begin
++    allow_o = '1;
++    if (gate_active && ((raw_id_i[PayloadPort] & AIdMask) == AIdPrefix))
++      allow_o[PayloadPort] = 1'b0;
++  end
++  // This is a requested mask. An already locked winner remains eligible in
++  // rr_arb_tree; use the selector trace to distinguish held from new work.
++  assign masked_o = raw_valid_i[PayloadPort] && !allow_o[PayloadPort];
++
++  always_comb begin
++    pending_d = pending_q;
++    remaining_d = remaining_q;
++    escape_d = escape_q;
++    if (pending_q && (remaining_q != '0)) begin
++      remaining_d = remaining_q - 1'b1;
++      if (!enable_i || !pair_qualified_i) remaining_d = '0;
++    end
++    // H expiry only ends eligibility suppression; the first-PTE association
++    // survives until exact P1 acceptance or actual walker retirement.
++    if (p1_commit_o || walk_retired) begin
++      pending_d = 1'b0;
++      remaining_d = '0;
++    end
++    if (exit_event) escape_d = 1'b1;
++    // A non-DS acceptance on this same edge may satisfy escape. It cannot
++    // retroactively qualify arm_o, which uses the old escape/pending bits.
++    if (non_ds_commit) escape_d = 1'b0;
++    if (arm_o) begin
++      pending_d = 1'b1;
++      remaining_d = RemWidth'(H);
++    end
++  end
++
++  always_ff @(posedge clk_i or negedge rst_ni) begin
++    if (!rst_ni) begin
++      pending_q <= 1'b0;
++      remaining_q <= '0;
++      escape_q <= 1'b0;
++    end else begin
++      pending_q <= pending_d;
++      remaining_q <= remaining_d;
++      escape_q <= escape_d;
++    end
++  end
++
++  always_comb begin
++    state_o = '0;
++    state_o[0] = pending_q;
++    state_o[1] = gate_active;
++    state_o[2] = escape_q;
++    state_o[9:3] = remaining_q;
++    state_o[10] = enable_i && pair_qualified_i;
++    state_o[11] = arm_o;
++    state_o[12] = p1_commit_o;
++    state_o[13] = timeout_o;
++    state_o[14] = masked_o;
++    state_o[15] = walk_retired;
++  end
++endmodule

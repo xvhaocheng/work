@@ -1,3 +1,11 @@
+# 2026年10月16日 FIRST-PTE-PAIRED-LOCAL-1：真实局部RTL判别结束固定COPY收益版本
+
+[六段结果](../../iommu-platform/docs/first-pte-paired-local-20261016.md)：固定PN/AV零额外delay、每DMA一个normal4096COPY，cold/hot普通不分段与M完整quiet均4481/1749，除M观察事件外记录逐行相同；强O-prepared为4519/1794。M的合格V写walk3514晚于A末source RLAST3507，实际mask0；相对主动分段更快不能认领接口收益。结束这份程序/两历史收益主张，不自动调相位/扩协议/生产开发，不否定整个早意图家族。
+
+M及O-prepared已真正整合执行；前者有限held/READY/H/escape/F4单测通过，后者实际提前翻译并复用TC，1新sticky/无新headerFIFO。cold全冷12PTE、hot0PTE，未重现旧选择性冷前缀。O-local/job保留源码未跑性能；旧70不重跑。局部同锥综合O-prepared +80SliceLUT/+1FF/+14CARRY4，M helper9FF/28原语LUT不同范围不作全成本排序；初次报告Tcl失败及一次修复原样记账。[原始分析](../../iommu-platform/out/first-pte-paired-local-20261016/root/paired-analysis.json)／[接受](../../iommu-platform/out/first-pte-paired-local-20261016/root/root-result-acceptance.json)／[检查](../../iommu-platform/out/first-pte-paired-local-20261016/root/verification.json)。
+
+没有生产/ABI修改、新性能模型、全板构建、place/route、SD/加载/板测；B1/I/D/A5/A2与MIG暂停及独立工程事项保持。以下旧验证全文原样保留。
+
 # 2026年10月16日 FIRST-PTE-INTERFACE-COST-1：首PTE与legalizer成对源码设计
 
 已完成[六段报告](../../iommu-platform/docs/first-pte-interface-cost-20261016.md)。M-ID f1用真实start、固定同钟传播、已知DRAM根页及既有ID建立P1关联，H只停gate；独立COPY资格不等于bank不同。O-local可复用metadata FIFO pacing，O-tail-prepared可复用A TC持有第二段，RAW=0复用marker位，新增1个完成sticky及回线，不需新header FIFO。root纠正非DRAM成功P1后P2误认边界、完成驱动不等于立即物理发布，以及旧a_split占共享server的位置。

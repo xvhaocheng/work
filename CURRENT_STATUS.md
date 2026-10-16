@@ -1,16 +1,16 @@
-# 当前状态：首PTE与legalizer成对设计完成，建议一次局部实现判别
+# 当前状态：首PTE局部RTL判别完成，冻结COPY中的收益版本结束
 
-2026年10月16日（JST）。FIRST-PTE-INTERFACE-COST-1已完成源码驱动的两个具体设计。**建议只将M-ID同拍捕获与复用TC保持的O-tail-prepared作一次局部成对实现；结束“票据天然少状态、更便宜”的论证。**未选论文主线，未实现生产RTL，未取得新性能或成本测量。[研究计划](研究计划.md)为唯一总计划，[研究导航](研究导航.md)定位资产。
+2026年10月16日（JST）。FIRST-PTE-PAIRED-LOCAL-1已完成真实DMA/翻译模块＋行为DDR的局部RTL执行及小模块综合。**M与普通不分段基线的完整结果和已记录事务事件相同；V写walk启动时A源已全部读完，没有实际门控机会。结束这份固定程序/PN/cold-hot历史的M-ID收益主张，不调相位续造胜例。**接口与普通分段实现保留，不外推整个早意图家族或共享IOMMU方向无价值。未选论文主线；[总计划](研究计划.md)与[导航](研究导航.md)继续为统一入口。
 
-## 全局安排与下一判别
+## 全局安排与本轮裁决
 
-- M-ID以真实normal-S1 write start、同钟固定传播及既有ID关联P1；P1最早C3到共享selector，f1在C0生效。f2身份仍安全但可能错过L；held不可撤，H到期只停gate不清关联。静态资格绑定实际独立COPY及DRAM内S1根页表，不以bank/busy或timeout替代证明。
-- 普通legalizer可复用cap、metadata FIFO及AR holder完成paced读，local版可无独立pacing状态；frontend最后B不是读credit。强O-tail-prepared提前翻译并用既有TC保存L1，只新增1个完成sticky与回线，不需新header FIFO。实际TL等待/回授与M跨层线时序不同，尚无净胜结论。
-- 原70模拟／82检查结果只复用、未重跑：cold普通2066／票据2060／split零暴露2058；hot2050，short票据慢1，long快9，late失效。a_split占共享server，不是多AR固定拍数；新接线改变次序时不能在旧数加常数。同接口等价只排除独占调度主张。
-- 唯一后继提案FIRST-PTE-PAIRED-LOCAL-1：复用完整COPY夹具，局部实现与同约束控制锥成本比较，允许O合法提前准备；本轮未执行、不自动启动。若O以不高于M完整成本覆盖服务，或固定正常程序没有可用窗口，结束这个COPY/M-ID成本版本，不转成新协议链或自动升位其他方向。
-- mapping、B1/I/D/A5/A2及独立工程成果保留各自边界。MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；原10月15—28日窗口不重启。
+- 三个policy实际运行cold/hot：普通不分段与M最终quiet均4481/1749；强O-tail-prepared为4519/1794。单位是RTL仿真clock steps，非FPGA/MIG/原生应用时间。每lane4096B读写、512R beat、2AW/2B、1issue/1DONE、数据及quiet全部通过。
+- M cold：A源最后RLAST3507，V目的walk/M arm3514，P1 shared接受3570，实际mask0；hot无walk。M比主动分段快不构成贡献，因为普通O0已完全复现M。同一正常程序从配置前quiet出发，不强装旧模型前缀；本轮cold全冷12PTE/hot0PTE，未测试所有选择性冷历史。
+- O-prepared真实提前翻译并复用TC持有：L1 wait2939、L0真RLAST3379、done3380、L1共享首次offer3383；新增1sticky、无新header/payload FIFO。M有限RTL单测覆盖held/READY、P1、H/escape与F4；不是一般协议/恢复证明。tail-local/job源码保留、未跑性能，不继续凑矩阵。
+- 同锥O局部综合prepared比base +80 SliceLUT/+1FF/+14CARRY4；M helper为9FF/28原语LUT，范围不同不能作全成本排名。20ns仅综合后分析，无布局布线；完整route/CPU/物理内存收益unknown，不因此延长本版开发。
+- 本轮任务结束，无自动下一gate、协议或生产任务。旧70及短gap/长gap/late条件结果保留未重跑。B1/I/D/A5/A2、mapping/p5/D-CS1保持；MIG1792023314 paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；原10月15—28日窗口不重启。
 
-[六段比较与裁决](iommu-platform/docs/first-pte-interface-cost-20261016.md)／[M设计](iommu-platform/out/first-pte-interface-cost-20261016/m/source-design.md)／[O设计](iommu-platform/out/first-pte-interface-cost-20261016/o/source-design.md)／[root接受](iommu-platform/out/first-pte-interface-cost-20261016/root/root-result-acceptance.json)／[唯一后继合同](iommu-platform/out/first-pte-interface-cost-20261016/root/next-minimal-contract.json)／[本轮检查](iommu-platform/out/first-pte-interface-cost-20261016/root/verification.json)／[原条件模型](iommu-platform/out/mechanism-construction-20261016/model/README.md)
+[六段结果与裁决](iommu-platform/docs/first-pte-paired-local-20261016.md)／[原始结果分析](iommu-platform/out/first-pte-paired-local-20261016/root/paired-analysis.json)／[实际输入](iommu-platform/out/first-pte-paired-local-20261016/root/input-contract.json)／[root接受](iommu-platform/out/first-pte-paired-local-20261016/root/root-result-acceptance.json)／[局部成本](iommu-platform/out/first-pte-paired-local-20261016/cost/execution-results.md)／[验收记录](iommu-platform/out/first-pte-paired-local-20261016/root/verification.json)／[上一轮源码设计](iommu-platform/docs/first-pte-interface-cost-20261016.md)
 
 ## 各分支最新进展
 
@@ -20,7 +20,7 @@
 
 ## 硬件与执行状态
 
-本轮仅定向源码/已有原文核查、状态机与偏序设计、只读结构/算术辅助；新性能模型、旧70重跑、RTL仿真、生产RTL/Linux/ABI修改、构建、综合、hostprobe、板测均0。源级设计不等于协议/活性验证；现有error强制0是两侧共同缺项。当前源码overlay/组件HEAD与lock差异已绑定，不代表既有bitstream身份。Codex-only；M/O请求Sol/xhigh，结果/前作核对请求Sol/high；实际独立model/effort metadata unknown，未声称切换root。MIG暂停与上述实际时序边界保持。
+本轮执行6个固定局部RTL case、一次有限M单测及4次小控制锥OOC综合调用（2次综合成功后报告阶段失败、修正后2次报告完整）；无生产RTL/Linux/ABI修改、全板构建、place/route、加载或板测，无新性能模型/旧70重跑。复用行为DDR，R/W独立推进及每request startup为夹具规则，不能套旧2060/2058或称原生性能。现行NO_ERROR_HANDLING共同缺项保留。Codex-only；M/O请求Sol/xhigh、runner请求Sol/high，实际独立运行metadata unknown，未声称切换root。硬件暂停与既有时序边界保持。
 
 ## 独立工程事项
 

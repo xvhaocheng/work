@@ -1,0 +1,399 @@
+--- a/iommu-platform/cva6/corev_apu/iDMA/src/idma_legalizer.sv
++++ b/iommu-platform/cva6/corev_apu/iDMA/src/idma_legalizer.sv
+@@ -19,6 +19,10 @@
+     parameter int unsigned DataWidth = 32'd16,
+     /// Address width
+     parameter int unsigned AddrWidth = 32'd24,
++    /// Test-local fixed COPY organization: 0=original, 1=tail-local,
++    /// 2=tail-prepared, 3=job-local. The wrapper qualifies and encodes jobs
++    /// in the existing source-cap / decouple options; no option bit is added.
++    parameter int unsigned FirstPteReadPolicy = 0,
+     /// 1D iDMA request type:
+     /// - `length`: the length of the transfer in bytes
+     /// - `*_addr`: the source / target byte addresses of the transfer
+@@ -51,6 +55,10 @@
+     output logic r_valid_o,
+     /// Read request ready
+     input  logic r_ready_i,
++    /// Ask the backend to admit this descriptor only when the original
++    /// read metadata FIFO is empty. VALID remains ready-coupled and goes to
++    /// BOTH the metadata FIFO and AR holder through the same r_ready_i.
++    output logic first_pte_pace_o,
+ 
+     /// Write request; contains datapath and meta information
+     output idma_w_req_t w_req_o,
+@@ -133,6 +141,22 @@
+     assign is_read = (ttype_i != idma_pkg::WRITE);
+     assign is_write = (ttype_i != idma_pkg::READ);
+ 
++    // The register frontend cannot otherwise generate source cap 7. This
++    // existing option pattern is installed only on an eligible aligned 4KiB
++    // COPY by dma_core_wrap, and is saved in the original opt_tf_q register.
++    logic first_pte_profile;
++    assign first_pte_profile = FirstPteReadPolicy != 0 &&
++        opt_tf_q.src_reduce_len && opt_tf_q.src_max_llen == 3'd7 &&
++        !opt_tf_q.dst_reduce_len && opt_tf_q.decouple_rw &&
++        ttype_i == idma_pkg::DEFAULT;
++
++    // Registered nonempty version: there is no last-pop combinational bypass.
++    // Tail-local waits only for pending L1. Job-local paces every source burst.
++    // Tail-prepared issues descriptors early and holds L1 in the original TC.
++    assign first_pte_pace_o = first_pte_profile && r_tf_q.valid &&
++        ((FirstPteReadPolicy == 1 && r_tf_q.length == 1024) ||
++          FirstPteReadPolicy == 3);
++
+     //--------------------------------------
+     // read page boundary check
+     //--------------------------------------
+@@ -141,6 +165,11 @@
+         // should the "virtual" page be reduced? e.g. the transfers split into
+         // smaller chunks than the AXI page size?
+         r_page_addr_width = OffsetWidth + (opt_tf_q.src_reduce_len ? opt_tf_q.src_max_llen : 'd8);
++        // Preserve the original 256-beat prefix; source cap 7 is effective
++        // only for the final 2048 bytes in the two tail policies.
++        if ((FirstPteReadPolicy == 1 || FirstPteReadPolicy == 2) &&
++            first_pte_profile && r_tf_q.valid && r_tf_q.length > 2048)
++            r_page_addr_width = OffsetWidth + 8;
+         // a page can be a maximum of 4kB (12 bit)
+         r_page_addr_width = r_page_addr_width > PageAddrWidth ? PageAddrWidth : r_page_addr_width;
+     end
+@@ -404,7 +433,11 @@
+         offset:      r_addr_offset,
+         tailer:      OffsetWidth'(r_num_bytes + r_addr_offset),
+         shift:       opt_tf_q.shift,
+-        decouple_aw: opt_tf_q.decouple_aw
++        // RAW coupling is statically disabled for the prepared profile.
++        // Reuse the existing metadata bit as an L0 marker; no FIFO widening.
++        decouple_aw: FirstPteReadPolicy == 2 ?
++            (first_pte_profile && r_tf_q.valid && r_tf_q.length == 2048) :
++            opt_tf_q.decouple_aw
+     };
+ 
+     // assign the signals needed to set-up the write data path
+--- a/iommu-platform/cva6/corev_apu/iDMA/src/idma_backend.sv
++++ b/iommu-platform/cva6/corev_apu/iDMA/src/idma_backend.sv
+@@ -38,6 +38,8 @@
+     /// If not, software legalization is required to ensure the transfers are
+     /// AXI4-conformal
+     parameter bit HardwareLegalizer = 1'b1,
++    /// Test-local fixed COPY read organization; see idma_legalizer.
++    parameter int unsigned FirstPteReadPolicy = 0,
+     /// Reject zero-length transfers
+     parameter bit RejectZeroTransfers = 1'b1,
+     /// Should the error handler be present?
+@@ -100,6 +102,9 @@
+ 
+     /// iDMA busy flags
+     output idma_busy_t busy_o,
++    /// Prepared tail: sticky true only after the marked L0 metadata head
++    /// pops on an accepted real RLAST. Clear on this backend's parent accept.
++    output logic first_pte_l0_done_o,
+ 
+     input  logic [1:0]           ttype_i,
+     input  logic [DataWidth-1:0] wdata_i,
+@@ -236,6 +241,7 @@
+     idma_w_req_t w_req;
+     logic        r_valid, w_valid;
+     logic        r_ready, w_ready;
++    logic        first_pte_pace;
+ 
+     // It the current transfer the last burst in the 1D transfer?
+     logic w_last_burst;
+@@ -329,6 +335,7 @@
+             .Protocol          ( Protocol          ),
+             .DataWidth         ( DataWidth         ),
+             .AddrWidth         ( AddrWidth         ),
++            .FirstPteReadPolicy ( FirstPteReadPolicy ),
+             .idma_req_t        ( idma_req_t        ),
+             .idma_r_req_t      ( idma_r_req_t      ),
+             .idma_w_req_t      ( idma_w_req_t      ),
+@@ -345,6 +352,7 @@
+             .r_valid_o         ( r_valid            ),
+             .w_valid_o         ( w_valid            ),
+             .r_ready_i         ( r_ready            ),
++            .first_pte_pace_o  ( first_pte_pace     ),
+             .w_ready_i         ( w_ready            ),
+             .flush_i           ( legalizer_flush    ),
+             .kill_i            ( legalizer_kill     ),
+@@ -354,6 +362,7 @@
+         );
+ 
+     end else begin : gen_no_hw_legalizer
++        assign first_pte_pace = 1'b0;
+         // stream fork is used to synchronize the two decoupled channels without the need for a
+         // FIFO here.
+         stream_fork #(
+@@ -469,8 +478,30 @@
+     end
+ 
+     // data path, meta channels, and last queues have to be ready for the legalizer to be ready
+-    assign r_ready = r_dp_req_in_ready & ar_ready;
++    // The legalizer's VALID is ready-coupled. Gate the COMMON ready before
++    // it produces VALID, so metadata and AR holder accept exactly one pair.
++    // Only original registered FIFO nonempty is used; mid-R errors and
++    // parent B completion are not credits, and held AR is never withdrawn.
++    assign r_ready = r_dp_req_in_ready & ar_ready &
++                     (!first_pte_pace || !r_dp_req_out_valid);
+     assign w_ready = w_dp_req_in_ready & aw_ready & w_last_ready;
++
++    if (FirstPteReadPolicy == 2) begin : gen_first_pte_l0_done
++        logic l0_done_q;
++        always_ff @(posedge clk_i or negedge rst_ni) begin
++            if (!rst_ni) begin
++                l0_done_q <= 1'b0;
++            end else if (req_valid && req_ready_o) begin
++                l0_done_q <= 1'b0;
++            end else if (r_dp_req_out_valid && r_dp_req_out_ready &&
++                         r_dp_req_out.decouple_aw) begin
++                l0_done_q <= 1'b1;
++            end
++        end
++        assign first_pte_l0_done_o = l0_done_q;
++    end else begin : gen_no_first_pte_l0_done
++        assign first_pte_l0_done_o = 1'b0;
++    end
+ 
+ 
+     //--------------------------------------
+@@ -863,6 +894,14 @@
+     //--------------------------------------
+     `IDMA_NONSYNTH_BLOCK(
+     initial begin : proc_assert_params
++        first_pte_policy : assert(FirstPteReadPolicy <= 3) else
++            $fatal(1, "FirstPteReadPolicy must be 0..3");
++        first_pte_domain : assert(FirstPteReadPolicy == 0 ||
++            (HardwareLegalizer && Protocol == idma_pkg::AXI && DataWidth == 64 &&
++             BufferDepth * StrbWidth >= 4096 && ErrorCap == idma_pkg::NO_ERROR_HANDLING)) else
++            $fatal(1, "FirstPte policy requires the fixed 64-bit fullbuffer COPY profile");
++        first_pte_raw : assert(FirstPteReadPolicy != 2 || !RAWCouplingAvail) else
++            $fatal(1, "Prepared L0 marker reuses metadata decouple_aw and requires RAW=0");
+         axi_addr_width : assert(AddrWidth >= 32'd12) else
+             $fatal(1, "Parameter `AddrWidth` has to be >= 12!");
+         axi_id_width   : assert(AxiIdWidth > 32'd0) else
+--- a/iommu-platform/cva6/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
++++ b/iommu-platform/cva6/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
+@@ -26,6 +26,8 @@
+   parameter int unsigned              JobFifoDepth     = 32'd0,
+   parameter int unsigned              BufferDepth      = 32'h3, // Default = 3
+   parameter bit                       RAWCouplingAvail = 32'd0,
++  // Static local experiment policy. A only for 1/2; both DMA instances for 3.
++  parameter int unsigned FirstPteReadPolicy = 0,
+   parameter bit                       ObserverPort    = 1'b0,
+   parameter bit BatchPort = 1'b0,
+   parameter bit LaunchPort = 1'b0,
+@@ -48,6 +50,7 @@
+   output logic batch_gap_active_o,
+   output logic job_quiet_o,
+   output logic fullbuffer_job_o,
++  output logic first_pte_l0_done_o,
+   input  logic policy_enable_i, policy_allow_i, policy_abort_i, batch_reverse_i,
+   input  logic launch_hold_i, launch_go_i, launch_cancel_i,
+   output logic launch_held_o, launch_active_o, launch_cancelled_o, launch_error_o,
+@@ -129,6 +132,21 @@
+ 
+ 
+   if (!IsTwoD) begin : gen_one_d
++    idma_req_t burst_req_policy;
++    always_comb begin
++      burst_req_policy = burst_req_d;
++      // Match the original fullbuffer certificate eligibility at frontend
++      // job acceptance. Keep the original parent and its AXI attributes.
++      if (FirstPteReadPolicy != 0 && BufferDepth * (AxiDataWidth / 8) >= 4096 &&
++          ttype == idma_pkg::DEFAULT && burst_req_d.length == 4096 &&
++          burst_req_d.src_addr[11:0] == 0 && burst_req_d.dst_addr[11:0] == 0) begin
++        burst_req_policy.opt.beo.src_reduce_len = 1'b1;
++        burst_req_policy.opt.beo.src_max_llen = 3'd7;
++        burst_req_policy.opt.beo.dst_reduce_len = 1'b0;
++        burst_req_policy.opt.beo.dst_max_llen = '0;
++        burst_req_policy.opt.beo.decouple_rw = 1'b1;
++      end
++    end
+     /*
+      * DMA Frontend
+      */
+@@ -194,7 +212,7 @@
+         .testmode_i,
+         .flush_i    ( 1'b0                ),
+         .usage_o    ( /* NOT CONNECTED */ ),
+-        .data_i     ( burst_req_d         ),
++        .data_i     ( burst_req_policy    ),
+         .valid_i    ( be_valid_d          ),
+         .ready_o    ( be_ready_d          ),
+         .data_o     ( burst_req           ),
+@@ -312,6 +330,7 @@
+     .BufferDepth         ( BufferDepth                 ),
+     .TFLenWidth          ( TFLenWidth                  ),
+     .RAWCouplingAvail    ( RAWCouplingAvail            ),
++    .FirstPteReadPolicy  ( FirstPteReadPolicy           ),
+     .MaskInvalidData     ( 1'b0                        ),
+     .HardwareLegalizer   ( 1'b1                        ),
+     .RejectZeroTransfers ( 1'b1                        ),
+@@ -345,12 +364,18 @@
+     .protocol_req_o( axi_mst_req_o     ),
+     .protocol_rsp_i( axi_mst_rsp_i     ),
+     .busy_o        ( idma_busy         ),
++    .first_pte_l0_done_o,
+ 
+     .ttype_i       ( ttype             ),
+     .wdata_i       ( wdata             ),
+     .rdata_o       ( rdata             ),
+     .rdata_valid_o ( rdata_valid       )
+   );
++
++  initial begin
++    if (FirstPteReadPolicy > 3 || (FirstPteReadPolicy != 0 && IsTwoD))
++      $fatal(1, "FirstPteReadPolicy requires the fixed 1D COPY frontend");
++  end
+ 
+ endmodule : dma_core_wrap
+ 
+@@ -367,6 +392,7 @@
+   parameter int unsigned               MEM_SYS_DEPTH      = 32'd0,
+   parameter int unsigned               BUFFER_DEPTH       = 32'h3, // Default = 3
+   parameter bit                        RAW_COUPLING_AVAIL =  1'b0,
++  parameter int unsigned FirstPteReadPolicy = 0,
+   parameter bit                        OBSERVER_PORT    = 1'b0,
+   parameter bit BATCH_PORT = 1'b0,
+   parameter bit LAUNCH_PORT = 1'b0,
+@@ -386,6 +412,7 @@
+   output logic batch_gap_active_o,
+   output logic job_quiet_o,
+   output logic fullbuffer_job_o,
++  output logic first_pte_l0_done_o,
+   input  logic policy_enable_i, policy_allow_i, policy_abort_i, batch_reverse_i,
+   input  logic launch_hold_i, launch_go_i, launch_cancel_i,
+   output logic launch_held_o, launch_active_o, launch_cancelled_o, launch_error_o,
+@@ -434,6 +461,7 @@
+     .NumAxInFlight    ( NUM_AX_IN_FLIGHT   ),
+     .MemSysDepth      ( MEM_SYS_DEPTH      ),
+     .RAWCouplingAvail ( RAW_COUPLING_AVAIL ),
++    .FirstPteReadPolicy ( FirstPteReadPolicy ),
+     .IsTwoD           ( IS_TWO_D           ),
+     .ObserverPort     ( OBSERVER_PORT      ),
+     .BatchPort        ( BATCH_PORT         ),
+@@ -449,6 +477,7 @@
+   ) i_dma_core_wrap (
+       .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o, .batch_gap_active_o, .job_quiet_o,
+       .fullbuffer_job_o,
++      .first_pte_l0_done_o,
+       .policy_enable_i, .policy_allow_i, .policy_abort_i, .batch_reverse_i,
+       .launch_hold_i, .launch_go_i, .launch_cancel_i,
+       .launch_held_o, .launch_active_o, .launch_cancelled_o, .launch_error_o,
+--- a/iommu-platform/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
++++ b/iommu-platform/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
+@@ -23,6 +23,9 @@
+     /// Banked DMA integration may hold new reads behind the upstream W owner.
+     /// Legacy instances keep their original behavior when this is disabled.
+     parameter bit ReadAdmissionEnable = 1'b0,
++    /// Test-local prepared tail; enabled only for A's original-ID bank.
++    parameter bit FirstPtePreparedEnable = 1'b0,
++    parameter int unsigned FirstPteAId = 4,
+ 
+     /// Address data type
+     parameter type addr_t = logic,
+@@ -61,6 +64,7 @@
+     input  logic rst_ni,
+     input  logic read_admit_i,
+     input  logic fullbuffer_job_i,
++    input  logic first_pte_l0_done_i,
+ 
+     // AXI Translation Request Interface
+     input  axi_tr_req_t    tr_axi_req_i,
+@@ -325,6 +329,20 @@
+     //--------------------------------
+     logic complete_read;
+     logic complete_write;
++    logic first_pte_l1;
++    logic first_pte_hold_l1;
++
++    // The original IOVA header remains at the existing AR FIFO head until
++    // COMPLETE accepts it. Original ID width is retained inside a bank.
++    // The single eligible parent and quiet pair epoch bind this signature;
++    // this is deliberately not a general stream tag or a new header slot.
++    assign first_pte_l1 = FirstPtePreparedEnable && fullbuffer_job_i &&
++        is_read && ar_valid &&
++        ar_data.id == RVIOMMUCfg.AxiIdWidth'(FirstPteAId) &&
++        ar_data.stream_id == FullBufferDID &&
++        ar_data.addr[11:0] == 12'hc00 && ar_data.len == 8'd127 &&
++        ar_data.size == 3'd3 && ar_data.burst == axi_pkg::BURST_INCR;
++    assign first_pte_hold_l1 = first_pte_l1 && !first_pte_l0_done_i;
+ 
+     always_comb begin : completion_bus
+ 
+@@ -715,13 +733,18 @@
+             // Select slave
+             COMPLETE: begin
+ 
+-                complete_read = is_read;
++                // Gate before physical firstVALID; preserve the original
++                // AR head, translated PA and COMPLETE state while waiting.
++                complete_read = is_read && !first_pte_hold_l1;
+                 complete_write = is_write;
+ 
+-                if ((axi_comp_resp.ar_ready && is_read) ||
+-                    (axi_comp_resp.aw_ready && is_write)) begin
+-                    aw_ready    = is_write;
+-                    ar_ready    = is_read;
++                // READY may already be high while the gate hides VALID.
++                // Only a real completion handshake may pop either head.
++                // complete_read/write are exactly axi_comp_req.*_valid.
++                if ((complete_read && axi_comp_resp.ar_ready) ||
++                    (complete_write && axi_comp_resp.aw_ready)) begin
++                    aw_ready    = complete_write && axi_comp_resp.aw_ready;
++                    ar_ready    = complete_read && axi_comp_resp.ar_ready;
+                     state_n     = IDLE;
+                 end
+             end
+--- a/iommu-platform/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_banked_ctl.sv
++++ b/iommu-platform/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_banked_ctl.sv
+@@ -56,6 +56,10 @@
+ 
+     /// ORIGINAL AXI ID bit used to select the bank. MUST be < RVIOMMUCfg.AxiIdWidth.
+     parameter int BankIdBit = 0,
++    /// Same static policy as the local DMA wrappers; only policy 2 uses TC hold.
++    parameter int unsigned FirstPteReadPolicy = 0,
++    /// ORIGINAL incoming IOMMU AXI ID, after the platform DMA-port mux.
++    parameter int unsigned FirstPteAId = 4,
+ 
+     /// Address data type
+     parameter type addr_t = logic,
+@@ -95,6 +99,7 @@
+     input  logic rst_ni,
+ 
+     input logic [1:0] fullbuffer_jobs_i,
++    input logic first_pte_l0_done_i,
+ 
+     // AXI Translation Request Interface
+     input  axi_tr_req_t    tr_axi_req_i,
+@@ -133,6 +138,14 @@
+     // Immediate, Verilator-safe fatal checks.  `BankIdBit < AxiIdWidth` is the
+     // "unknown bank bit" assertion required by the architecture.
+     initial begin : validate_params
++        if (FirstPteReadPolicy > 3) begin
++            $fatal(1, "rv_iommu_banked_ctl: FirstPteReadPolicy must be 0..3");
++        end
++        if (FirstPteReadPolicy == 2 &&
++            (RVIOMMUCfg.AxiDataWidth != 64 ||
++             64'(FirstPteAId) >= (64'd1 << RVIOMMUCfg.AxiIdWidth))) begin
++            $fatal(1, "rv_iommu_banked_ctl: prepared profile needs 64-bit data and a full original A ID");
++        end
+         if (RVIOMMUCfg.AxiIdWidth < 1) begin
+             $fatal(1, "rv_iommu_banked_ctl: AxiIdWidth must be >= 1");
+         end
+@@ -316,6 +329,8 @@
+             .RVIOMMUCfg         (RVIOMMUCfgBank),
+             .E3Enable           (1'b0),   // legacy E3 counters are per-owner only
+             .ReadAdmissionEnable(1'b1),
++            .FirstPtePreparedEnable(FirstPteReadPolicy == 2 && b == FirstPteAId[BankIdBit]),
++            .FirstPteAId        (FirstPteAId),
+             .FullBufferDID      (24'(10 + b)),
+             .addr_t             (addr_t),
+             .paddr_t            (paddr_t),
+@@ -341,6 +356,7 @@
+             .rst_ni,
+             .read_admit_i       (bank_read_admit[b]),
+             .fullbuffer_job_i   (fullbuffer_jobs_i[b]),
++            .first_pte_l0_done_i (first_pte_l0_done_i),
+             .tr_axi_req_i       (bank_tr_req[b]),
+             .tr_axi_resp_o      (bank_tr_resp[b]),
+             .comp_axi_resp_i    (bank_comp_resp[b]),
