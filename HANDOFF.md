@@ -1,3 +1,9 @@
+# 2026年10月16日 RECONVERGENCE-1：三个具体版本未达到立项条件
+
+以`c981e01`为输入，[七段研究报告](iommu-platform/docs/research-reconvergence-20261016.md)完成原始失败复核、TC借用续行PTW、译后分段/返回预约和范围旧代回收的建设性设计/原文比较。GPUMMU2014与Neighborhood2018直接限制续行核心新意；118bit是可选副本机会，非相对强barrel净节省。REALM/credit表达译后分段关键动作；范围回收尚缺普通精确失效/完成证据/VT-d定向drain之后的匹配正常残余。三者当前均不立项，不强选主线、不排无辨别力实验，不因未知费用追加开发；不否定整个问题域。[原始失败证据](iommu-platform/out/research-reconvergence-20261016/failure-evidence.md)／[原文增量](references/research-reconvergence-20261016.md)／[接受](iommu-platform/out/research-reconvergence-20261016/root-result-acceptance.json)。
+
+E2/E3代表原始字段、p5四格、M0服务规则、CS1 world/事件、mapping O3及R107 receipt定向核查；p5具体失败根因、实板PN完整根因仍unknown，不拼接成统一解释。仅只读算术/源码/论文/设计，模型/旧实验重跑/RTL仿真/综合/生产修改/板测均0。First-PTE既有4481/1749与mask0保持；B1/I/D/A5/A2、mapping/p5/D-CS1、MIG暂停及原10月15—28日窗口均保留。Codex-only，实际模型独立metadata unknown。以下既有交接全文保留。
+
 # 2026年10月16日 FIRST-PTE-PAIRED-LOCAL-1：真实局部RTL判别结束固定COPY收益版本
 
 [六段结果](iommu-platform/docs/first-pte-paired-local-20261016.md)：固定PN/AV零额外delay、每DMA一个normal4096COPY，cold/hot普通不分段与M完整quiet均4481/1749，除M观察事件外记录逐行相同；强O-prepared为4519/1794。M的合格V写walk3514晚于A末source RLAST3507，实际mask0；相对主动分段更快不能认领接口收益。结束这份程序/两历史收益主张，不自动调相位/扩协议/生产开发，不否定整个早意图家族。

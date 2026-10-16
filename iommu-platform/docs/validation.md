@@ -1,3 +1,9 @@
+# 2026年10月16日 RECONVERGENCE-1：源码/原文研究比较，未启动新实验
+
+[七段报告](research-reconvergence-20261016.md)及[接受/检查](../out/research-reconvergence-20261016/root-result-acceptance.json)：按`c981e01`输入，复核历史原始记录，具体发展TC借用续行、译后分段/返回预约、范围旧代回收。前两版无具名强普通之后的具体差项，第三缺匹配正常残余；本轮不立项/不强选主线，不排等价实验。原文实际范围见[文献增量](../../references/research-reconvergence-20261016.md)，PDF结构预检UNAVAILABLE不写PASS。
+
+新模型/旧实验重跑/RTL仿真/综合/生产RTL-Linux/加载-板测均0；只读算术不是新性能结果。原始负结果与First-PTE停止范围保留，B1/I/D/A5/A2及MIG暂停不变。检查本轮导航/引用、共享文件保留及生产/历史输入未修改；不重做旧构建/实验/全历史验收。以下旧验证全文保留。
+
 # 2026年10月16日 FIRST-PTE-PAIRED-LOCAL-1：真实局部RTL判别结束固定COPY收益版本
 
 [六段结果](../../iommu-platform/docs/first-pte-paired-local-20261016.md)：固定PN/AV零额外delay、每DMA一个normal4096COPY，cold/hot普通不分段与M完整quiet均4481/1749，除M观察事件外记录逐行相同；强O-prepared为4519/1794。M的合格V写walk3514晚于A末source RLAST3507，实际mask0；相对主动分段更快不能认领接口收益。结束这份程序/两历史收益主张，不自动调相位/扩协议/生产开发，不否定整个早意图家族。
