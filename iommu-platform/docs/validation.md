@@ -1,3 +1,17 @@
+# 2026年10月16日 FIRST-PTE-ORDER-CONSTRUCTION-1：首PTE票据条件构造与接口成本边界
+
+当前探索转为M0首PTE顺序票据的**接口实现成本**：从M0普通DS-return优先依赖可调整已接受读顺序这一条件X出发，在实际PTW启动至payload首次AR承诺之间，用付费早意图保护一次首PTE顺序；保留原burst与返回路径。未选论文主线，未实现生产RTL，未证原生收益或独立新调度。
+
+冻结小模型一次70条模拟／82项检查通过，0参数搜索；全cold保留两路各4096B COPY、三笔PTE、四个B及最终drain。主例双方完成与quiet快6，短gap反慢1，longgap快9，晚intent无效；固定G2在cold追平、hot慢2。同付费接口普通if/else逐事件相同，只剥离策略增量。普通read 2×128零暴露费用时cold还快2、hot追平，仅多1个AR；已有legalizer可适配复用。a_split是公开假设而非已测硬件费用。 完整起点主cold quiet为2066→2060，hot为2050不变，short为2059→2060，long为2070→2061；零费用split cold为2058、hot为2050。
+
+下一具体判别是：保持原burst/R返回的早意图通路，其目标关联、资格、线路／状态／时序完整成本，能否低于复用legalizer的普通分段／返回组织成本，并取得有价值的服务结果。若a_split为实际暴露费用、h_e为仍及时到达后的候选额外费用，主例候选更快须a_split>2+h_e；intent真正迟到会丢失整个窗口，不能只按常数扣减。若普通实现以不高于候选的完整成本实现同等结果，该成本版本被覆盖。当前给条件界与最小费用问题，不自动追加硬件或全面条件审计。 下一合同FIRST-PTE-INTERFACE-COST-1只比较两个具体小实现：M-ID与已有legalizer复用。列出字段、保持、传播、AR及RLAST/错误职责和完整成本；不先做一般源码审计，不要求完整原生证据包，不自动改生产RTL或启动全系统。
+
+前轮mapping IOVA、持久B／V-C、owner与streaming诊断资产保留，作为可复用条件结论；其完整native证据包不再作为构思当前机制的强制下一gate。B1/I/D/A5/A2及独立工程边界保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；原10月15—28日窗口不重启，不自动升位其他分支。
+
+本轮仅新的独立Python条件模型，非MIG/RTL/FPGA/原生应用实验；生产源码修改、旧实验重跑、构建、hostprobe和板测均0。模型未覆盖真正held背压、缺目标／超时、reset/epoch、多walk公平逃逸或错误注入，不能称一般协议／活性证明。Codex-only；source请求Sol/high、design请求Astra/xhigh、model与documentation请求Sol/medium，actual独立model/effort metadata unknown，不以请求配置冒充实际运行证明。
+
+[本轮入口](../../iommu-platform/out/mechanism-construction-20261016/README.md)／[机制与强对照](../../iommu-platform/out/mechanism-construction-20261016/design/construction.md)／[模型结果](../../iommu-platform/out/mechanism-construction-20261016/model/README.md)／[root接受](../../iommu-platform/out/mechanism-construction-20261016/root/root-result-acceptance.json)／[下一最小合同](../../iommu-platform/out/mechanism-construction-20261016/root/next-minimal-contract.json)／[文档验收](../../iommu-platform/out/mechanism-construction-20261016/documentation/verification.json)。旧全文作为完整字节后缀保留；14组历史坏链单独登记，不修历史原文。
+
 # 2026年10月16日 MAP-IOVA-FALLBACK-BUDGET-1：地址预算与普通回退条件合同完成
 
 保留V-C／持久B及已核合法streaming交接；K槽＋满额O0不保证普通地址供给。同actual channel的普通skb TX与redirect SQ均取c->pdev，map失败drop不算有效完成。已核dma-iommu有效初始化g≤PAGE_SIZE可导出每整页live映射的实际IOVA费用为PAGE_SIZE。

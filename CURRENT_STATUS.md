@@ -1,12 +1,14 @@
-# 当前状态：持久B地址预算条件合同完成，下一为domain容量贡献证据
+# 当前状态：M0首PTE票据条件构造完成，下一判别接口实现成本
 
-2026年10月16日（JST）。**未实现、native未知、未选论文主线。** [研究计划](研究计划.md)为唯一总计划，[研究导航](研究导航.md)定位资产。
+2026年10月16日（JST）。当前探索转为M0首PTE顺序票据的**接口实现成本**：从M0普通DS-return优先依赖可调整已接受读顺序这一条件X出发，在实际PTW启动至payload首次AR承诺之间，用付费早意图保护一次首PTE顺序；保留原burst与返回路径。未选论文主线，未实现生产RTL，未证原生收益或独立新调度。 [研究计划](研究计划.md)为唯一总计划，[研究导航](研究导航.md)定位资产。
 
-## 全局安排与下一证据
+## 全局安排与下一判别
 
-- 保留V-C／持久B及已核合法streaming交接；K槽＋满额O0不保证普通地址供给。同actual channel的普通skb TX与redirect SQ均取c->pdev，map失败drop不算有效完成。已核dma-iommu有效初始化g≤PAGE_SIZE可导出每整页live映射的实际IOVA费用为PAGE_SIZE。
-- live、可复用rcache、FQ债务分账；K不界多代FQ，普通完整limit回退／清cache须保留。最强版本需可执行参与者／共同window容量合同，O3-Q/O3-R/O-COPY-B同享；无独占预算算法、native优势或实际压力证明。IOVA≠RAM，每策略物理并集去重，CPU／带宽／有效完成分报。
-- 下一MAP-DOMAIN-CAPACITY-CONTRIBUTION-EVIDENCE-1为evidence_gated_not_auto_scheduled：仅新且匹配的资源约束／完整成本／具体能力证据触发；不等待一般授权、CPU或RAM价值确认，不自动开发、建模、旧数据重搜或板测。 [本轮入口](iommu-platform/out/mapping-iova-budget-20261016/README.md)／[裁决](iommu-platform/out/mapping-iova-budget-20261016/root/decision-analysis.md)／[接受](iommu-platform/out/mapping-iova-budget-20261016/root/root-result-acceptance.json)／[下一证据gate](iommu-platform/out/mapping-iova-budget-20261016/root/next-minimal-contract.json)。
+- 一次冻结模型70模拟／82检查通过；保留两路各4096B COPY、cold三笔PTE、四个B及最终drain。完整起点quiet：cold2066→2060，hot2050不变，short2059→2060，long2070→2061，lateintent无效。同付费接口普通if/else逐事件相同，不能认领独占新调度。普通read2×128在零暴露费用下cold2058、hot2050，仅多1个AR；固定G2在cold追平、hot慢2。
+- 下一FIRST-PTE-INTERFACE-COST-1只比较M-ID与复用已有legalizer分段的两个具体小实现：字段、保持、传播、AR及RLAST/错误职责与完整成本。主例候选更快须实际暴露费用a_split>2+h_e；当前均未测，真正迟到会失去整个窗口。若普通以不高于候选的完整成本实现同等结果，该成本版本被覆盖；不要求先有全面原生证据包，不自动开发生产RTL或全系统。
+- 前轮mapping IOVA、持久B／V-C、owner与streaming诊断资产保留，作为可复用条件结论；其完整native证据包不再作为构思当前机制的强制下一gate。B1/I/D/A5/A2及独立工程边界保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；原10月15—28日窗口不重启，不自动升位其他分支。
+
+[本轮入口](iommu-platform/out/mechanism-construction-20261016/README.md)／[机制与强对照](iommu-platform/out/mechanism-construction-20261016/design/construction.md)／[模型结果](iommu-platform/out/mechanism-construction-20261016/model/README.md)／[root接受](iommu-platform/out/mechanism-construction-20261016/root/root-result-acceptance.json)／[下一最小合同](iommu-platform/out/mechanism-construction-20261016/root/next-minimal-contract.json)／[文档验收](iommu-platform/out/mechanism-construction-20261016/documentation/verification.json)
 
 ## 各分支最新进展
 
@@ -16,7 +18,7 @@
 
 ## 硬件与执行状态
 
-7个root primary来源（6 raw＋1 web）、25处直接读段、7项worker raw清单；2份新增HTTP200原件、5次HTTP429失败；6次web open＋3次find，0新搜索。来源保存为raw与web两类，普通TX完整raw未取得，不能称全部原件齐全。仅属provenance，非测量；0生产源码修改、新实验／模型、构建、hostprobe或板测。Codex-only；两证据席请求gpt-6.1-sol/high，文档席请求gpt-6.1-sol/medium，actual独立model/effort metadata unknown，不声称root切换。 B1/I/D/A5/A2与独立事项保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；原10月15—28日窗口不重启。 [执行账](iommu-platform/out/mapping-iova-budget-20261016/root/execution-ledger.json)。
+本轮仅新的独立Python条件模型，非MIG/RTL/FPGA/原生应用实验；生产源码修改、旧实验重跑、构建、hostprobe和板测均0。模型未覆盖真正held背压、缺目标／超时、reset/epoch、多walk公平逃逸或DMA协议错误注入，不能称一般协议／活性证明。Codex-only；source请求Sol/high、design请求Astra/xhigh、model与documentation请求Sol/medium，actual独立model/effort metadata unknown，不以请求配置冒充实际运行证明。 MIG1792023314暂停及WNS −0.391ns／598项setup失败／0新加载／实际债务unknown保持，原10月15—28日窗口不重启。
 
 ## 独立工程事项
 
