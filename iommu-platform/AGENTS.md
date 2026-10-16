@@ -1,5 +1,7 @@
 # 平台任务入口
 
+- 本项目修改完成并完成相应检查后，按上一级 [AGENTS.md](../AGENTS.md) 的“GitHub 持续同步”规则，将已完成的改动同步到顶层公开仓库 `xvhaocheng/work` 的 `main`；保留组件独立 Git，排除构建产物和真实凭据，无需逐次询问上传授权。
+
 - 模型与推理强度按上一级[AGENTS.md的任务分配策略](../AGENTS.md)执行，root和子agent均按当前任务选择，不再固定全树Sol/ultra；该策略是项目约定，非官方为本项目验证的最优配置。共享IOMMU任务继续Codex-only，研究方向、实验授权及暂停状态不因规则更新改变。
 - 若可访问上一级工作区，先读[当前状态](../CURRENT_STATUS.md)，按[唯一总计划](../研究计划.md)和[当前研究导航](../研究导航.md)定位任务；需要阶段进展与历史证据时定向读 `../HANDOFF.md`，避免默认全面扫描仓库。旧计划经[历史计划索引](docs/history/plans/README.md)定位。
 - 若该交接文件不在当前副本中，先读 `README.md`、`docs/validation.md`、`docs/patches.md`，再按需查 `sources.lock.json` 和相关源码。

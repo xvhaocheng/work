@@ -2762,3 +2762,8 @@ HERO height32四案P/N/H1/H2在执行前冻结，一次调用两个固定普通�
 ## 2026-10-16 工作区同步工具
 
 独立同步工程：DeepSeek起草，Codex审查及实际验证 `tools.test_github_sync` 26项全过，覆盖源码／数据与生成物筛选、嵌套仓库保持、特殊文件名、符号链接、大文件分片还原、损坏检测与路径逃逸拒绝。仅验证同步工具，不是IOMMU或FPGA验证；无构建和板操作。最终索引审计通过：803,869个Git条目、16个大文件及272个分片／清单齐全，0 gitlink及超限blob；1,574个上游Inputs测试素材补回且补入扫描0命中。私有 [work](https://github.com/xvhaocheng/work) 已创建并推送；源码快照远端提交及文件树与本地相同。最终HEAD、分批推送、凭据命中归因和具体清单记录在顶层 `.git/sync-preparation/`。
+
+
+## 2026-10-16 公开仓库与持续同步规则
+
+按用户明确要求将 `xvhaocheng/work` 改为公开；GitHub实际返回 `isPrivate=false`、默认分支main。根／平台AGENTS、README及状态／交接记录后续任务完成时增量同步的持续授权；本次为设置及文档变更，检查文档差异和远端提交，不重跑未变的同步工具或研究构建。由Codex直接执行，未使用DeepSeek。
