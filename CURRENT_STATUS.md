@@ -1,12 +1,12 @@
-# 当前状态：现成输入验收完成，后继仅条件触发
+# 当前状态：owner冷cache关联回收扩展，下一核发布与关闭
 
-2026年10月16日（JST）。**MAP-EVIDENCE-INPUT-1已完成有界输入验收，实际取得公开数据前缀及3份完整小文本，只作其他身份参考。当前合格匹配输入0，原生再用、fullCPU与netgain仍为null；匹配输入0不等再用或收益0。** 保留V1-N/K低完整成本整合假设，未证独立创新或净收益，未选论文主线。[研究计划](研究计划.md)为唯一总计划，[研究导航](研究导航.md)定位资产。
+2026年10月16日（JST）。**MAP-RECYCLE-RECLAIM-1已完成，选中owner-assisted private alloc.cache-only扩展：有限K关联有压力时，由源allocation owner显式取出合格冷闲页，撤B图后放回源cache。首版不含ring；这是新设计差项，不是重复数据核查，尚未实现或测得净赢。** 保留低完整实现成本整合假设，未证独占创新或净收益。[研究计划](研究计划.md)为唯一总计划，[研究导航](研究导航.md)定位资产。
 
 ## 全局安排与下一证据
 
-- Zenodo7727193整包791,012,771 bytes，本轮仅HTTP206取前8,388,608 bytes；读到70个tar header，最后1项不完整，按固定规则选3个完整小文本。未验整包MD5/gzip，余包未审，不能据样本断言整包无事件。论文主要Linux5.15/iPerf TCP；所读CPU分类CSV与DAT汇总不具当前source/B map/CQ/fullCPU关系。 [本轮入口](iommu-platform/out/mapping-evidence-input-20261016/README.md)／[裁决](iommu-platform/out/mapping-evidence-input-20261016/root/decision-analysis.md)／[接受](iommu-platform/out/mapping-evidence-input-20261016/root/root-result-acceptance.json)／[输入判定](iommu-platform/out/mapping-evidence-input-20261016/root/input-verdicts.json)／[后继gate](iommu-platform/out/mapping-evidence-input-20261016/root/next-minimal-contract.json)。
-- 后继MAP-INPUT-READY-GATE为conditional_trigger_not_queued：这批入口验收结束，不自动重复相同搜索、合同或旧阈值账。仅在具体新record/config、另一身份或设计差项，或具名member及决定问题出现时触发有界后继；不等一般授权/保证痛点，不自动采集、开发、全包下载或板测。
-- V1-N/K低完整实现成本整合假设保留：固定B/config、K预留lazy sparse关联、满额O0、无独立idle eviction，借真实frame/全部片段寿命整合。普通R/dma-buf slot/O3同享接口按各自覆盖范围判断，本轮未补完整实现成本差异，不新增novelty/netgain或共享干扰主张，未选论文主线。 [普通R比较](iommu-platform/out/mapping-integration-delta-20261016/owner/integration-analysis.md)／[dma-buf slot比较](iommu-platform/out/mapping-integration-delta-20261016/dmabuf/adapter-analysis.md)。CPU、物理S/P/C/Q并集与策略分配反馈、metadata/PTE、IOVA、带宽及有效完成分别报告；stock无idle B pin，不作天然payload RAM节省主张。 [前轮来源/观测合同](iommu-platform/out/mapping-reuse-opportunity-20261016/README.md)保留，不重复字段表。
+- 旧V1-N/K固定B/config、K预留lazy sparse、满额O0且无idle eviction；本扩展能在冷页不再自然return/alloc时周转B关联。须owner实际服务、取页阻止再分配、唯一撤图与必要CPU metadata退休后才能返K；无返槽时限保证，O0仍保服务。return-only不能保证清沉cache冷项，外扫pp_ref==1也不能判idle。 [本轮入口](iommu-platform/out/mapping-recycle-reclaim-20261016/README.md)／[裁决](iommu-platform/out/mapping-recycle-reclaim-20261016/root/decision-analysis.md)／[假设卡](iommu-platform/out/mapping-recycle-reclaim-20261016/root/hypothesis-card.json)／[接受](iommu-platform/out/mapping-recycle-reclaim-20261016/root/root-result-acceptance.json)／[下一合同](iommu-platform/out/mapping-recycle-reclaim-20261016/root/next-minimal-contract.json)。
+- root新核driver schedule入口、pool.napi及positive-budget零RXwork仍到post的路径，可投影新control hook；budget0绕过。poll在RCU读侧，不能等自身grace；pending/失唤醒/关闭寿命协议尚未实现，不能当成已有可靠pump。 下一MAP-OWNER-RECALL-PUBLISH-1已指定、未执行：仅核请求/pending→owner→ack/退休的发布、失唤醒及pool/B关闭寿命，给源码绑定的手工正反序列。不自动driver/collector/RTL、状态或性能模型、数据扫描、旧账或板测，不等一般授权/价值或保证痛点。
+- 不增独立逐TX/逐alloc use token，不等零热成本：miss合并pressure请求、owner唤醒/pump、扫描/lookup、unmap/sync、metadata退休、重建/churn及供给影响均计。 O0原本已有B-only卸图保留A；DMA_PMD已有安全idle隔离与分配器协同原理。普通R/slot/O3获得同接口可复现能力，不等已发表网络实现或已测完整成本相同；保留低完整实现成本整合假设，不认安全cut/token原则或策略独占创新，未选论文主线。 [具名普通R](iommu-platform/out/mapping-integration-delta-20261016/owner/integration-analysis.md)／[dma-buf slot比较](iommu-platform/out/mapping-integration-delta-20261016/dmabuf/adapter-analysis.md)。回收的是B关联库存，不等payload RAM减少，源pool的S仍在。CPU、真实S/P/C/Q并集及分配反馈、metadata/PTE、IOVA、临时取页/控制存储、带宽与完成分报；不套同一O0 PFN轨迹，原生数值仍null。 [前轮输入验收](iommu-platform/out/mapping-evidence-input-20261016/README.md)已结束，本轮不重复。
 
 ## 各分支最新进展
 
@@ -16,7 +16,7 @@
 
 ## 硬件与执行状态
 
-20项worker来源hash/size及4项完整作者条目href检查通过，仅属provenance。保存8项HTTP响应含2份challenge；0原生运行、artifact执行、host新probe、模型/旧账、构建、生产Linux/RTL/ABI/collector或设备动作。 [执行账](iommu-platform/out/mapping-evidence-input-20261016/root/execution-ledger.json)。Codex-only；两研究席请求Sol/high、文档Sol/medium，实际独立metadata unknown，未声称切换root。 B1/I/D/A5/A2及独立工程保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；10月15—28日窗口不重启。 上轮[只读host身份](iommu-platform/out/mapping-reuse-opportunity-20261016/root/host-readonly-identity.json)未重测。
+12项worker来源hash/size和16项root读段行界通过，仅provenance；本轮手工条件序列不是运行结果。0下载、0新模型/原生/旧账/构建、0host设备probe、生产driver/RTL/ABI编辑或硬件动作。 [执行账](iommu-platform/out/mapping-recycle-reclaim-20261016/root/execution-ledger.json)。Codex-only；source-cut请求Sol/xhigh、closest Sol/high、文档Sol/medium，实际独立metadata unknown，未声称root切换。 B1/I/D/A5/A2和并发GitHub/Linux/RTL独立事项保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；10月15—28日窗口不重启。
 
 ## 独立工程事项
 
