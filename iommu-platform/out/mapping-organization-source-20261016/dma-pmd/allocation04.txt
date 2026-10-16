@@ -1,0 +1,474 @@
+
+Message-ID: <20261003212241.3432303-5-lrizzo@google.com>
+Date: Sat,  3 Oct 2026 21:22:23 +0000
+From: Luigi Rizzo <lrizzo@...gle.com>
+To: Luigi Rizzo <rizzo.unipi@...il.com>, Joerg Roedel <joro@...tes.org>, 
+	Will Deacon <will@...nel.org>, Robin Murphy <robin.murphy@....com>, Christoph Hellwig <hch@....de>, 
+	Marek Szyprowski <m.szyprowski@...sung.com>, Andrew Morton <akpm@...ux-foundation.org>, 
+	Vlastimil Babka <vbabka@...nel.org>, David Hildenbrand <david@...nel.org>, 
+	"David S . Miller" <davem@...emloft.net>, Eric Dumazet <edumazet@...nel.org>, 
+	Jakub Kicinski <kuba@...nel.org>, Paolo Abeni <pabeni@...hat.com>
+Cc: Greg Kroah-Hartman <gregkh@...uxfoundation.org>, "Rafael J . Wysocki" <rafael@...nel.org>, 
+	Danilo Krummrich <dakr@...nel.org>, Jonathan Corbet <corbet@....net>, 
+	Jesper Dangaard Brouer <hawk@...nel.org>, Ilias Apalodimas <ilias.apalodimas@...aro.org>, 
+	Willem de Bruijn <willemb@...gle.com>, Kuniyuki Iwashima <kuniyu@...gle.com>, 
+	Joshua Washington <joshwash@...gle.com>, Harshitha Ramamurthy <hramamurthy@...gle.com>, 
+	Saeed Mahameed <saeedm@...dia.com>, Tariq Toukan <tariqt@...dia.com>, 
+	Tony Nguyen <anthony.l.nguyen@...el.com>, Przemek Kitszel <przemyslaw.kitszel@...el.com>, 
+	Alexander Lobakin <aleksander.lobakin@...el.com>, Michael Chan <michael.chan@...adcom.com>, 
+	Pavan Chebbi <pavan.chebbi@...adcom.com>, iommu@...ts.linux.dev, netdev@...r.kernel.org, 
+	linux-mm@...ck.org, driver-core@...ts.linux.dev, linux-doc@...r.kernel.org, 
+	linux-kernel@...r.kernel.org, Luigi Rizzo <lrizzo@...gle.com>
+Subject: [RFC: DMA_PMD 04/22] iommu/dma: add DMA_PMD pool block allocation
+
+Add dma_pmd_add_page(), dma_pmd_pool_alloc_bulk_node() (with single-page
+inline wrappers dma_pmd_pool_alloc_node() and dma_pmd_pool_alloc()), and
+dma_pmd_pool_has_free() to carve PMD_SIZE physical blocks into subpages
+of a pool's order with split_page_compound() and hand them out to callers.
+
+A parked subpage is kept frozen (refcount 0) and published with
+page_ref_unfreeze() when it is handed out, mirroring the way the page
+allocator shapes a page before publishing it, so a stray put_page() on a
+parked subpage trips a refcount check instead of freeing it twice.
+GFP flags asking for a placement a pool cannot choose - __GFP_THISNODE,
+__GFP_DMA, __GFP_DMA32 - are ignored, as documented at
+dma_pmd_pool_alloc_bulk_node(); __GFP_ZERO is honoured by zeroing at
+dispense.
+
+Also add a KUnit test case (test_pool_alloc_and_recycle) exercising pool
+allocation, recycling via __free_page(), and deferred teardown with
+in-flight blocks.
+
+Signed-off-by: Luigi Rizzo <lrizzo@...gle.com>
+---
+ drivers/iommu/dma-pmd-kunit.c |  41 ++++-
+ drivers/iommu/dma-pmd-pool.c  | 279 ++++++++++++++++++++++++++++++++++
+ include/linux/dma-pmd.h       |  40 +++++
+ 3 files changed, 359 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/iommu/dma-pmd-kunit.c b/drivers/iommu/dma-pmd-kunit.c
+index f80527eaf2e84..24978a5123f54 100644
+--- a/drivers/iommu/dma-pmd-kunit.c
++++ b/drivers/iommu/dma-pmd-kunit.c
+@@ -70,6 +70,7 @@ static void test_meta_pooled_toggle(struct kunit *test)
+ 	base_pfn = ALIGN_DOWN(pfn, 1UL << PMD_ORDER);
+ 	/* The buddy allocator returns naturally aligned blocks. */
+ 	KUNIT_EXPECT_EQ(test, pfn, base_pfn);
++	KUNIT_ASSERT_TRUE(test, dma_pmd_meta_ensure_pfn(pfn, true));
+ 	m = dma_pmd_meta_of_pfn(pfn);
+ 
+ 	KUNIT_EXPECT_FALSE(test, dma_is_pmd_page(pfn));
+@@ -85,10 +86,48 @@ static void test_meta_pooled_toggle(struct kunit *test)
+ 	__free_pages(page, PMD_ORDER);
+ }
+ 
++static void test_pool_alloc_and_recycle(struct kunit *test)
++{
++	struct dma_pmd_pool *pool;
++	struct page *p1, *p2;
++	unsigned int order;
++
++	KUNIT_EXPECT_NULL(test, dma_pmd_pool_destroy(NULL));
++
++	for (order = 0; order <= PMD_ORDER + 1; order++) {
++		pool = dma_pmd_pool_create(order, 2);
++		if (order > PMD_ORDER) {
++			KUNIT_EXPECT_NULL(test, pool);
++			continue;
++		}
++		KUNIT_ASSERT_NOT_NULL(test, pool);
++		KUNIT_EXPECT_FALSE(test, dma_pmd_pool_has_free(pool));
++
++		p1 = dma_pmd_pool_alloc(pool, GFP_KERNEL | __GFP_ZERO);
++		if (!p1)
++			dma_pmd_pool_destroy(pool);
++		KUNIT_ASSERT_NOT_NULL(test, p1);
++		KUNIT_EXPECT_TRUE(test, dma_is_pmd_page(page_to_pfn(p1)));
++		KUNIT_EXPECT_EQ(test, dma_pmd_pool_has_free(pool), order < PMD_ORDER);
++
++		/* Freeing p1 returns it to the pool; next allocation reuses index 0. */
++		__free_pages(p1, order);
++		KUNIT_EXPECT_TRUE(test, dma_pmd_pool_has_free(pool));
++		p2 = dma_pmd_pool_alloc(pool, GFP_KERNEL);
++		KUNIT_EXPECT_PTR_EQ(test, p1, p2);
++
++		/* Destroy with p2 still in flight; freeing p2 releases the 2M page. */
++		dma_pmd_pool_destroy(pool);
++		if (p2)
++			__free_pages(p2, order);
++	}
++}
++
+ static struct kunit_case dma_pmd_meta_test_cases[] = {
+ 	KUNIT_CASE(test_meta_init_and_roundtrip),
+ 	KUNIT_CASE(test_meta_invalid_phys),
+ 	KUNIT_CASE(test_meta_pooled_toggle),
++	KUNIT_CASE(test_pool_alloc_and_recycle),
+ 	{}
+ };
+ 
+@@ -98,5 +137,5 @@ static struct kunit_suite dma_pmd_meta_test_suite = {
+ };
+ 
+ kunit_test_suite(dma_pmd_meta_test_suite);
+-MODULE_DESCRIPTION("KUnit tests for struct dma_pmd_meta table");
++MODULE_DESCRIPTION("KUnit tests for struct dma_pmd_meta table and DMA_PMD pool");
+ MODULE_LICENSE("Dual BSD/GPL");
+diff --git a/drivers/iommu/dma-pmd-pool.c b/drivers/iommu/dma-pmd-pool.c
+index 5020265d52cd5..e6e5ba7c65f27 100644
+--- a/drivers/iommu/dma-pmd-pool.c
++++ b/drivers/iommu/dma-pmd-pool.c
+@@ -259,6 +259,285 @@ struct dma_pmd_pool *dma_pmd_pool_destroy(struct dma_pmd_pool *pool)
+ }
+ EXPORT_SYMBOL(dma_pmd_pool_destroy);
+ 
++/**
++ * dma_pmd_add_page - Allocate, split, and register a new PMD page
++ * @pool: Owning pool
++ * @gfp: GFP allocation flags
++ * @nid: Target NUMA node (or NUMA_NO_NODE for local node)
++ *
++ * Cost: Slow path (pool miss); allocates PMD page from buddy on @nid,
++ *       splits into compound blocks, and sets the PMD page's membership bit.
++ * Locking: Lockless with respect to @pool->lock (caller inserts into list).
++ * Frequency: Rare after warmup (only when the pool holds no PMD page with a
++ *            free block).
++ *
++ * Return: Pointer to new dma_pmd_meta with all usable blocks free, or NULL
++ *         on failure.
++ */
++static struct dma_pmd_meta *dma_pmd_add_page(struct dma_pmd_pool *pool,
++					     gfp_t gfp, int nid)
++{
++	/*
++	 * Require full GFP_KERNEL (not just gfpflags_allow_blocking()):
++	 * dma_pmd_meta_ensure_pfn() and dma_pmd_page_prepare() use GFP_KERNEL.
++	 */
++	bool can_block = (gfp & GFP_KERNEL) == GFP_KERNEL;
++	unsigned int nr = DMA_PMD_BLOCKS(pool->order);
++	struct dma_pmd_meta *meta;
++	gfp_t alloc_gfp, base_gfp;
++	struct page *page;
++
++	/*
++	 * A high-order allocation is expensive when it fails, and under fragmentation
++	 * it fails on every pool miss. For GFP_ATOMIC, back off briefly.
++	 */
++	if (!can_block && time_before(jiffies, READ_ONCE(pool->next_alloc_attempt)))
++		return NULL;
++
++	/*
++	 * The following flags are discarded:
++	 *
++	 * __GFP_MOVABLE would let the PMD page come from ZONE_MOVABLE or a CMA
++	 * pageblock. A pooled PMD page is pinned for the life of the pool and
++	 * has no movable_operations, so memory hot-remove and CMA allocation
++	 * would fail on it forever.
++	 *
++	 * __GFP_HIGHMEM goes because pooled blocks are handed out as
++	 * directly addressable DMA buffers, and __GFP_COMP because the PMD page
++	 * is shaped into compound pieces by hand. What is left is also free
++	 * of everything slab treats as a bug in GFP_SLAB_BUG_MASK, so the
++	 * metadata allocation below can use it as it stands.
++	 * __GFP_ZERO is handled per-block in dma_pmd_pool_alloc_bulk_node().
++	 */
++	base_gfp = gfp & ~(__GFP_COMP | __GFP_HIGHMEM | __GFP_MOVABLE | __GFP_ZERO);
++
++	/*
++	 * A caller that can block gets __GFP_RETRY_MAYFAIL so the allocation
++	 * is allowed to compact for an order-9 page, which is the difference
++	 * between a pool that is populated before traffic starts and one that
++	 * never populates at all on a fragmented machine. It still fails
++	 * rather than triggering the OOM killer: this is an optimisation, and
++	 * every caller has a working fallback.
++	 */
++	alloc_gfp = base_gfp | __GFP_NOWARN;
++	alloc_gfp |= can_block ? __GFP_RETRY_MAYFAIL : __GFP_NORETRY;
++
++	page = alloc_pages_node(nid, alloc_gfp, PMD_ORDER);
++	if (!page) {
++		/* Retry backoff; could be made shorter or tunable in future. */
++		if (!can_block)
++			WRITE_ONCE(pool->next_alloc_attempt,
++				   jiffies + DIV_ROUND_UP(HZ, 100));
++		return NULL;
++	}
++
++	/*
++	 * Ensure the metadata chunk for this PFN is populated. Fails if the PFN
++	 * is past the reservation, or if it belongs to hotplugged memory and the
++	 * caller cannot block to populate its metadata page.
++	 */
++	if (unlikely(!dma_pmd_meta_ensure_pfn(page_to_pfn(page), can_block))) {
++		__free_pages(page, PMD_ORDER);
++		return NULL;
++	}
++
++	/* Fails with -EBUSY if a concurrent PFN walker holds a speculative ref. */
++	if (split_page_compound(page, PMD_ORDER, pool->order)) {
++		__free_pages(page, PMD_ORDER);
++		return NULL;
++	}
++
++	meta = dma_pmd_meta_of_pfn(page_to_pfn(page));
++	memset(meta, 0, sizeof(*meta));
++	meta->pool = pool;
++	spin_lock_init(&meta->map_lock);
++
++	bitmap_set(meta->dirty_bitmap, 0, nr);
++	meta->nr_dirty = nr;
++
++	kref_get(&pool->refcount);
++
++	/*
++	 * Publish last. Once the bit is set, __free_pages_prepare() on any CPU
++	 * will route this PMD page's blocks back into the pool, so every @meta
++	 * field a reader consults has to be in place first.
++	 *
++	 * No explicit barrier: a block cannot reach any reader until this
++	 * function returns and the caller publishes the PMD page under
++	 * @pool->lock, whose release orders both stores against every consumer.
++	 */
++	WRITE_ONCE(meta->pooled, true);
++
++	return meta;
++}
++
++static unsigned int dma_pmd_scan_bitmap(struct dma_pmd_pool *pool,
++					unsigned long *bitmap, u16 *countp,
++					unsigned long base_pfn, unsigned int nr,
++					unsigned long want, struct page **out,
++					bool unfreeze)
++{
++	unsigned int idx, got = 0, used = 0;
++
++	if (!*countp || !want)
++		return 0;
++
++	for_each_set_bit(idx, bitmap, nr) {
++		struct page *block = pfn_to_page(base_pfn + (idx << pool->order));
++
++		__clear_bit(idx, bitmap);
++		used++;
++		if (unlikely(folio_contain_hwpoisoned_page(page_folio(block)))) {
++			pr_err_once("dma_pmd: poisoned block at pfn %lu, leaking it to keep pool %p intact\n",
++				    page_to_pfn(block), pool);
++		} else {
++			if (unfreeze)
++				page_ref_unfreeze(block, 1);
++			out[got++] = block;
++		}
++
++		if (used == *countp || got == want)
++			break;
++	}
++	*countp -= used;
++	pool->block_alloc_cnt += used;
++	return got;
++}
++
++/* Extract up to @want available blocks from @meta under @pool->lock. */
++static unsigned long dma_pmd_take_blocks(struct dma_pmd_pool *pool,
++					 struct dma_pmd_meta *meta,
++					 unsigned long want,
++					 struct page **out, bool zero)
++{
++	unsigned long base_pfn = dma_pmd_meta_to_pfn(meta);
++	unsigned int avail_before = dma_pmd_meta_avail(meta);
++	unsigned int nr = DMA_PMD_BLOCKS(pool->order);
++	unsigned int got = 0, used;
++
++	if (zero) {
++		got += dma_pmd_scan_bitmap(pool, meta->free_bitmap, &meta->nr_free,
++					   base_pfn, nr, want, out, true);
++		got += dma_pmd_scan_bitmap(pool, meta->dirty_bitmap, &meta->nr_dirty,
++					   base_pfn, nr, want - got, out + got, false);
++	} else {
++		got += dma_pmd_scan_bitmap(pool, meta->dirty_bitmap, &meta->nr_dirty,
++					   base_pfn, nr, want, out, false);
++		got += dma_pmd_scan_bitmap(pool, meta->free_bitmap, &meta->nr_free,
++					   base_pfn, nr, want - got, out + got, true);
++	}
++	used = avail_before - dma_pmd_meta_avail(meta);
++	if (!dma_pmd_meta_avail(meta) || WARN_ON_ONCE(!used)) {
++		meta->nr_free = 0;
++		meta->nr_dirty = 0;
++		list_move(&meta->list, &pool->full);
++	}
++
++	return got;
++}
++
++/**
++ * dma_pmd_pool_alloc_bulk_node - Allocate up to @nr_pages blocks from @pool
++ * @pool: Pool to allocate from
++ * @gfp: GFP flags used if a new PMD page must be allocated from buddy
++ * @nid: Target NUMA node if a new PMD page is allocated (or NUMA_NO_NODE)
++ * @nr_pages: Number of blocks requested
++ * @page_array: Output array of at least @nr_pages entries
++ *
++ * Cost: Fast path is O(nr_pages) bitmap scan from @pool->partial or @pool->idle
++ *       under a single lock acquisition. Slow path (both empty) calls
++ *       dma_pmd_add_page().
++ * Locking: Acquires @pool->lock (irqsave) for the bitmap scan. Drops lock
++ *          during slow-path PMD buddy allocation and per-block initialization.
++ * Frequency: High (called per RX buffer refill or per SKB TX page frag refill).
++ *
++ * A pool hands out a block of a PMD page it already owns, on the node that
++ * PMD page came from, so it cannot satisfy a hard placement constraint:
++ * requests with __GFP_THISNODE, __GFP_DMA or __GFP_DMA32 are declined, as is
++ * __GFP_ACCOUNT (pooled blocks are shared across callers and cannot be charged
++ * to a single memcg), so the caller falls back to the page allocator. Flags
++ * that only widen what is acceptable, such as __GFP_HIGHMEM, are ignored
++ * harmlessly.
++ *
++ * Return: Number of blocks placed in @page_array (0 on failure).
++ */
++unsigned long dma_pmd_pool_alloc_bulk_node(struct dma_pmd_pool *pool, gfp_t gfp,
++					   int nid, unsigned long nr_pages,
++					   struct page **page_array)
++{
++	unsigned long allocated = 0, flags, i;
++	bool zero;
++
++	if (unlikely(!pool || pool->destroyed || !nr_pages ||
++		     (gfp & (__GFP_DMA | __GFP_DMA32 | __GFP_THISNODE |
++			     __GFP_ACCOUNT))))
++		return 0;
++
++	zero = want_init_on_alloc(gfp);
++
++	spin_lock_irqsave(&pool->lock, flags);
++	while (allocated < nr_pages) {
++		struct dma_pmd_meta *meta;
++
++		/* Partially used pages first, idle ones next. */
++		meta = list_first_entry_or_null(&pool->partial, struct dma_pmd_meta, list);
++		if (!meta && !list_empty(&pool->idle)) {
++			meta = list_first_entry(&pool->idle, struct dma_pmd_meta, list);
++			list_move(&meta->list, &pool->partial);
++			pool->num_idle_pages--;
++		}
++		if (!meta) {
++			/* Fallback to a new allocation */
++			spin_unlock_irqrestore(&pool->lock, flags);
++			meta = dma_pmd_add_page(pool, gfp, nid);
++			if (!meta)
++				goto out_prep;
++			spin_lock_irqsave(&pool->lock, flags);
++			pool->pmd_alloc_cnt++;
++			list_add(&meta->list, &pool->partial);
++		}
++
++		allocated += dma_pmd_take_blocks(pool, meta,
++						 nr_pages - allocated,
++						 &page_array[allocated], zero);
++	}
++	spin_unlock_irqrestore(&pool->lock, flags);
++
++out_prep:
++	for (i = 0; i < allocated; i++) {
++		if (!page_count(page_array[i])) {
++			page_ref_unfreeze(page_array[i], 1);
++			if (zero)
++				memset(page_address(page_array[i]), 0, PAGE_SIZE << pool->order);
++		}
++	}
++	return allocated;
++}
++EXPORT_SYMBOL(dma_pmd_pool_alloc_bulk_node);
++
++/**
++ * dma_pmd_pool_has_free - Can @pool hand out a block without a new PMD page?
++ * @pool: Pool to query
++ *
++ * Cost: O(1) lockless list check.
++ * Locking: None. The answer is advisory and can be stale the moment it is
++ *          returned.
++ * Frequency: High; intended for per-buffer decisions on the RX path.
++ *
++ * For callers choosing between an existing non-pooled buffer and a pooled
++ * replacement. Answering "no" when the pool is empty keeps them from trading a
++ * perfectly reusable page for a failed allocation and another singly-mapped
++ * page, which is strictly worse than leaving it alone.
++ *
++ * Return: true if a PMD page with a free block is present.
++ */
++bool dma_pmd_pool_has_free(struct dma_pmd_pool *pool)
++{
++	return pool && !READ_ONCE(pool->destroyed) &&
++	       (!list_empty_careful(&pool->partial) || !list_empty_careful(&pool->idle));
++}
++EXPORT_SYMBOL(dma_pmd_pool_has_free);
++
+ /**
+  * __dma_pmd_free_page - Recycle a freed block back into its DMA_PMD pool
+  * @page: Block being freed
+diff --git a/include/linux/dma-pmd.h b/include/linux/dma-pmd.h
+index 236be50b7349f..085d9a730c278 100644
+--- a/include/linux/dma-pmd.h
++++ b/include/linux/dma-pmd.h
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/types.h>
+ #include <linux/mm.h>
++#include <linux/numa.h>
+ #include <linux/rcupdate.h>
+ 
+ struct device;
+@@ -77,6 +78,22 @@ static inline bool dma_pmd_free_page(struct page *page)
+  */
+ struct dma_pmd_pool *dma_pmd_pool_create(unsigned int order, unsigned int max_idle_pages);
+ struct dma_pmd_pool *dma_pmd_pool_destroy(struct dma_pmd_pool *pool);
++unsigned long dma_pmd_pool_alloc_bulk_node(struct dma_pmd_pool *pool, gfp_t gfp,
++					   int nid, unsigned long nr_pages,
++					   struct page **page_array);
++static inline struct page *dma_pmd_pool_alloc_node(struct dma_pmd_pool *pool,
++						   gfp_t gfp, int nid)
++{
++	struct page *page = NULL;
++
++	dma_pmd_pool_alloc_bulk_node(pool, gfp, nid, 1, &page);
++	return page;
++}
++static inline struct page *dma_pmd_pool_alloc(struct dma_pmd_pool *pool, gfp_t gfp)
++{
++	return dma_pmd_pool_alloc_node(pool, gfp, NUMA_NO_NODE);
++}
++bool dma_pmd_pool_has_free(struct dma_pmd_pool *pool);
+ 
+ #else /* !CONFIG_DMA_PMD */
+ 
+@@ -101,5 +118,28 @@ static inline struct dma_pmd_pool *dma_pmd_pool_destroy(struct dma_pmd_pool *poo
+ 	return NULL;
+ }
+ 
++static inline unsigned long
++dma_pmd_pool_alloc_bulk_node(struct dma_pmd_pool *pool, gfp_t gfp, int nid,
++			     unsigned long nr_pages, struct page **page_array)
++{
++	return 0;
++}
++
++static inline struct page *
++dma_pmd_pool_alloc_node(struct dma_pmd_pool *pool, gfp_t gfp, int nid)
++{
++	return NULL;
++}
++
++static inline struct page *dma_pmd_pool_alloc(struct dma_pmd_pool *pool, gfp_t gfp)
++{
++	return NULL;
++}
++
++static inline bool dma_pmd_pool_has_free(struct dma_pmd_pool *pool)
++{
++	return false;
++}
++
+ #endif /* CONFIG_DMA_PMD */
+ #endif /* _LINUX_DMA_PMD_H */
+-- 
+2.56.0.rc1.315.gc6ed9934b7-goog
+
+

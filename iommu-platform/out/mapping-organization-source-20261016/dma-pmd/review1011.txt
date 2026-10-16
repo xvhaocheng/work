@@ -1,0 +1,229 @@
+
+Message-ID: <astQu7_kbZRnbwng@google.com>
+Date: Sun, 11 Oct 2026 09:02:51 +0000
+From: Pranjal Shrivastava <praan@...gle.com>
+To: Luigi Rizzo <lrizzo@...gle.com>
+Cc: Luigi Rizzo <rizzo.unipi@...il.com>, Joerg Roedel <joro@...tes.org>,
+	Will Deacon <will@...nel.org>, Robin Murphy <robin.murphy@....com>,
+	Christoph Hellwig <hch@....de>,
+	Marek Szyprowski <m.szyprowski@...sung.com>,
+	Andrew Morton <akpm@...ux-foundation.org>,
+	Vlastimil Babka <vbabka@...nel.org>,
+	David Hildenbrand <david@...nel.org>,
+	"David S . Miller" <davem@...emloft.net>,
+	Eric Dumazet <edumazet@...nel.org>,
+	Jakub Kicinski <kuba@...nel.org>, Paolo Abeni <pabeni@...hat.com>,
+	Greg Kroah-Hartman <gregkh@...uxfoundation.org>,
+	"Rafael J . Wysocki" <rafael@...nel.org>,
+	Danilo Krummrich <dakr@...nel.org>,
+	Jonathan Corbet <corbet@....net>,
+	Jesper Dangaard Brouer <hawk@...nel.org>,
+	Ilias Apalodimas <ilias.apalodimas@...aro.org>,
+	Willem de Bruijn <willemb@...gle.com>,
+	Kuniyuki Iwashima <kuniyu@...gle.com>,
+	Joshua Washington <joshwash@...gle.com>,
+	Harshitha Ramamurthy <hramamurthy@...gle.com>,
+	Saeed Mahameed <saeedm@...dia.com>,
+	Tariq Toukan <tariqt@...dia.com>,
+	Tony Nguyen <anthony.l.nguyen@...el.com>,
+	Przemek Kitszel <przemyslaw.kitszel@...el.com>,
+	Alexander Lobakin <aleksander.lobakin@...el.com>,
+	Michael Chan <michael.chan@...adcom.com>,
+	Pavan Chebbi <pavan.chebbi@...adcom.com>, iommu@...ts.linux.dev,
+	netdev@...r.kernel.org, linux-mm@...ck.org,
+	driver-core@...ts.linux.dev, linux-doc@...r.kernel.org,
+	linux-kernel@...r.kernel.org
+Subject: Re: [RFC: DMA_PMD 00/22] DMA_PMD: PMD_SIZE-backed IO buffer pools
+
+On Sat, Oct 03, 2026 at 09:22:19PM +0000, Luigi Rizzo wrote:
+
+Hi Luigi,
+
+> Here is a subsystem called DMA_PMD on which I would like feedback on
+> architecture, possible enhancements, or kernel components that could be
+> reused to avoid duplication.
+> 
+
+Thanks for posting this series, it solves more than one problems.
+I went through the whole series and the following is my take on the
+overall design (I might wait before replying to individual patches
+hence this might be verbose).
+
+> I think it can be extremely useful for those affected by the HW/SW overhead
+> of IOMMU (especially IOTLB thrashing, see [1]), or confidential computing,
+> or preemptable VMs.
+> 
+> The (not too exaggerated) pitch line is
+> 
+> DMA_PMD has the performance of identity, guarantees that only IO buffers
+> can ever have active IOMMU or IOTLB mappings, removes the bounce buffer
+> overhead in confidential computing and preemptable VMs, and integrates
+> smoothly with existing kernel APIs.
+> 
+> === ARCHITECTURE
+> 
+> DMA_PMD was initially designed to address IOTLB thrashing (details in [1]),
+> but turned out to also resolve nicely the strict IOMMU overhead, and avoid
+> the bounce buffer overhead in preemptible VMs and Confidential Computing.
+> 
+
+I'm thinking if we can re-work the dma pools here to fit the needs of
+DMA PMD. Apart from that my main concern is the isolation model. 
+As implemented:
+
+- dma_unmap_*() of a pooled buffer is a no-op, i.e. unmap doesn't happen
+  till the page is retired.
+- the whole 2M page is mapped IOMMU_READ | IOMMU_WRITE, regardless of
+  the direction of the buffer that triggered the mapping
+- the mapping stays in every domain that ever mapped any block of the
+  page until the page is retired, which under steady traffic may be
+  never
+- the TX pools are per-CPU and shared by all sockets and devices.
+
+So, a NIC ends up with long-lived RW access to other sockets' data in
+the same 2M pages, including loopback payloads and kTLS SW plaintext
+(both come from sk_page_frag), and a DMA after unmap no longer faults
+but silently hits whoever owns the block next. For pooled memory this
+is identity-like isolation and weaker than DMA-FQ, whose exposure is
+bounded by the flush timeout. Thus, I'm not fully sure of the claim:
+"security guarantees comparable to strict IOMMU". 
+
+It also isn't opt-in: dma_is_pmd_phys() is checked for every device in
+iommu_dma_map_phys(), thus, any device that is handed a pooled page gets
+a window, including in domains where the admin asked for strict mode.
+I think DMA_PMD has to be an explicit per-group default-domain policy,
+like DMA-FQ: selectable through iommu_groups/N/type and/or a boot
+option, off by default, decided when the default domain is set up and
+recorded in the cookie and the map path can check it before doing any
+pool lookup.
+
+That is also the natural place to refuse untrusted devices. Today the
+window path runs after the swiotlb decision in iommu_dma_map_phys(),
+which for untrusted devices only bounces buffers that aren't
+granule-aligned, so a page-aligned pooled block gives an
+external-facing device a permanent RW 2M window over unrelated data.
+iommu_get_default_domain_type() already forces strict DMA for such groups
+DMA_PMD must not undo that.
+
+I'm thinking If pooled memory is going to be shared across opt-in
+devices anyway, would an explicit shared domain for opted-in devices
+be cleaner?
+
+It removes the per-domain machinery, but those devices then lose 
+isolation from each other for all DMA, and the core would need to 
+support a default domain shared across groups
+
+Additionally, we should handle edge cases where the dma unmap (or it's
+TLB flush) fails for some reason but the page is freed to buddy..
+
+> It works by combining several known techniques:
+> 
+> - transparently feed allocators of device memory (skb_page_frag_refill(),
+>   dma_alloc_attrs(), pagepool, ...) with DMA_PMD pages, i.e. physically
+>   contiguous PMD_SIZE (2MB) pages mapped via PDE_SIZE IOMMU entries
+> 
+> - heavy recycling of DMA_PMD pages (like pagepool) and lazy IOMMU unmapping
+>   (like DMA-FQ), BUT:
+> 
+> - like strict IOMMU (DMA), safely release memory back to the kernel only
+>   after destroying all of its IOMMU mappings and a synchronous IOTLB flush
+> 
+
+That's one of the strict-mode properties that this series keeps and two
+things undermine it today, dma_pmd_unmap_all() ignores the iommu_unmap()
+retval after it has already cleared the per-domain bits (for fellow 
+reviewers this is in patch 7). And window PTEs outlive driver unbind and
+DMA ownership trasnfer because  dma_pmd_domain_release() only runs when
+the cookie is freed, if a device is handed back from VFIO, it'll regain
+access to live host pages and patch 13 additionally gives up page_pool's
+destroy unmap of in-flight pafes.. The mappings need to go when the last
+DMA API user of the domain goes away not only at domain free..
+
+> - on allocation, DMA_PMD pages can be configured to be pinned in the host
+>   (hence suitable for preemptible VMs) and/or unencrypted (hence suitable
+>   for Confidential Computing), removing the need for bounce buffers
+> 
+
+In CoCo guests, dma_pmd.decrypt is swtiched on silently and applied to
+every pool. inclusing the per-CPU skb_page_frag_refill pools that serve
+every socket. Enabling tx_enable_dma_pmd thenmakes loopback payloads and
+kTLS plaintext host readable & writable before encyrption. Similarly
+decrypted Rx pages lose the private copythat swiotlb had making it
+possible for the host to change packets after the stack has looked at
+them.. Can we make it much more explicit to the Guest/ Guest user that
+they're opting in to sharing their data with host for performance?
+
+> - there are global and per-device optin /sys/device/.../dma_pmd_*
+>   and /proc/sys/net/core/tx_enable_dma_pmd
+> 
+
+Bools with sysfs files on every device having a dma_mask doesn't seem
+too nice.. the iommu policy belongs to the group's default domain..
+
+> NIC drivers can typically use dma_pmd with no modifications for rings,
+> tx buffers, rx buffers (if they use pagepool), and rx headers. For tx
+> headers, almost all drivers need changes (see later patches in the series)
+> to implement cheap bounce buffers and avoid individual 4K mappings.
+> 
+> The series has the following main components:
+> 
+> - a sparse array (similar to pageblock_flags) to quickly attach metadata
+>   to a 2MB page without fiddling with the struct page. Cost is 128B per 2MB
+>   page used as an IO buffer, totally negligible.
+> 
+
+IIUC, the entries are 256B and the array is sized from theoretical
+phys_addr space rather that from memory: up to 8G of KVA on x86 4-level,
+32G on arm64 with 48-bit PA and 512G 52-bit PA, where the chunk bitmap no
+longer fits in kmalloc, failing the init. Init also populates metadata
+for the entire RAM.. it'd be nice to size it from real memory ranges or
+use an xarray or per-section array with lazy population..
+
+> - dma_pmd_pool, a replacement for alloc_pages() that can be instantiated
+>   per-CPU or per receive queue. It handles the split of PMD_SIZE pages
+>   into order-N blocks, handles dma_map and unmap, and aggressively recycles
+>   entries. It is used to feed skb_page_frag_refill(), pagepool, and
+>   receive buffers for drivers that do not use pagepool.
+>   See [2] for "WHY NOT PAGEPOOL FOR TX AND EVERYTHING"
+> 
+
+I am seeing that the recycles page blocks bypass KASAN/KMSAN poisoning,
+page owner, alloc tagging and bad_page checks.. which might make a UAF
+go undetected. We might have to use it or a similar technique to ensure
+the UAF of a polled buffer remains safe in such a case.. IIRC,
+kasan_mempool_(un)poison_pages are used for such cache (I'd let the mm
+folks chime in on this). 
+
+> - dma_pmd_arena, is another allocator backed by DMA_PMD pages and
+>   is used exclusively as the backend for dma_alloc_attrs().
+>   Used for longer-lived allocations (descriptor/completion rings,
+>   rx and tx header buffers)
+> 
+> - glue code to hook DMA_PMD into pagepool [2], skb_page_frag_refill(),
+>   dma_alloc_attrs(), dma_map/unmap...
+> 
+
+On the IOMMU side there are also a few structural limits:
+
+- the domain registry has BITS_PER_LONG entries, and a decline is
+  cached in the cookie forever. Default domains are per IOMMU group,
+  often one per function (VFs included) on ACS-capable machines, and TX
+  pages reach every NIC, so a limit of 64 is reachable, and which 
+  devices get to pool would depend on probe order.
+- the per-domain window is a multi-TB alloc_iova() carved on the first
+  map, under a global IRQ-off lock, sized from iomem_resource.end and
+  from whichever device in the group maps firstF
+- I'm wondering it iova - base == PA (plus a fixed 16G offset), is safe? 
+  As devices learn host physical addresses.
+
+Can we consider giving each PMD page a dense slot number when it
+enters a pool, and using iova = base + slot * 2M? That keeps the O(1)
+map and the range-check unmap, shrinks the window to cap * 2M, works
+with narrower masks and stops exposing PAs, and per-domain tracking of
+mapped slots would lift the 64-domain limit as well. The window could
+then be reserved in iommu_dma_init_domain() through a dma-iommu helper,
+instead of handing the iova_domain to dma-pmd-map.c.
+
+Thanks,
+Praan
+

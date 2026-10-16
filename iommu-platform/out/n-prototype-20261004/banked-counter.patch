@@ -1,0 +1,119 @@
+--- a/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_banked_ctl.sv
++++ b/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_banked_ctl.sv
+@@ -483,70 +483,93 @@
+     //=========================================================================
+     // in_flight_o
+     //   Aggregates, over both banks:
+     //     * AW accepted at the upstream input until the upstream B handshake
+     //       (covers the whole write, including completion AW/AR accepted by the
+-    //       output and held downstream, i.e. "accepted output pressure")
++    //       output and held downstream, i.e. "accepted output pressure")
+     //     * AR accepted until the upstream R-LAST handshake
+-    //     * W beats accepted at the upstream input until forwarded to the
+-    //       completion port (covers partial W arriving before its AW and W
+-    //       beats parked in the per-bank W FIFOs)
++    //     * W-LAST bursts accepted at the upstream input until the upstream B
++    //       handshake.  A write is counted by its LAST beat and is NOT tracked
++    //       by downstream forwarding: a write rejected by a bank (translation
++    //       error) is consumed internally by that bank's error slave and
++    //       answered with an upstream B, but it is NEVER forwarded to the
++    //       completion port.  A forward-based W counter would therefore never
++    //       decrement for those beats and in_flight_o would stay stuck high
++    //       forever (phantom non-quiet).
++    //     * w_partial_q: set when a W burst has started (a non-LAST beat was
++    //       accepted upstream) and cleared when its LAST beat is accepted;
++    //       covers the window between the first beat of a burst and its LAST.
+     //     * both bank controller states (bank in_flight_o = state != IDLE)
+-    //   32-bit saturating-free counters, asserted bounded / no underflow.
++    //   32-bit counters, asserted bounded / no underflow.  Increment and
++    //   decrement on the same cycle are netted, so they can never produce a
++    //   false underflow or a spurious overflow report.
+     //=========================================================================
+-    logic aw_accept, ar_accept, w_accept, b_return, r_last_return, w_forward;
++    logic aw_accept, ar_accept, w_accept, w_nonlast_accept, w_last_accept,
++          b_return, r_last_return;
+ 
+-    assign aw_accept     = tr_axi_req_i.aw_valid && tr_axi_resp_o.aw_ready;
+-    assign ar_accept     = tr_axi_req_i.ar_valid && tr_axi_resp_o.ar_ready;
+-    assign w_accept      = tr_axi_req_i.w_valid  && tr_axi_resp_o.w_ready;
+-    assign b_return      = tr_axi_resp_o.b_valid && tr_axi_req_i.b_ready;
+-    assign r_last_return = tr_axi_resp_o.r_valid && tr_axi_req_i.r_ready && tr_axi_resp_o.r.last;
+-    assign w_forward     = comp_axi_req_o.w_valid && comp_axi_resp_i.w_ready;
++    assign aw_accept        = tr_axi_req_i.aw_valid && tr_axi_resp_o.aw_ready;
++    assign ar_accept        = tr_axi_req_i.ar_valid && tr_axi_resp_o.ar_ready;
++    assign w_accept         = tr_axi_req_i.w_valid  && tr_axi_resp_o.w_ready;
++    assign w_nonlast_accept = w_accept && !tr_axi_req_i.w.last;
++    assign w_last_accept    = w_accept &&  tr_axi_req_i.w.last;
++    assign b_return         = tr_axi_resp_o.b_valid && tr_axi_req_i.b_ready;
++    assign r_last_return    = tr_axi_resp_o.r_valid && tr_axi_req_i.r_ready && tr_axi_resp_o.r.last;
+ 
+     logic [31:0] inflight_aw_q, inflight_ar_q, inflight_w_q;
++    logic        w_partial_q;
+ 
+     always_ff @(posedge clk_i or negedge rst_ni) begin : inflight_counters
+         if (!rst_ni) begin
+             inflight_aw_q <= 32'd0;
+             inflight_ar_q <= 32'd0;
+             inflight_w_q  <= 32'd0;
++            w_partial_q   <= 1'b0;
+         end else begin
+             inflight_aw_q <= inflight_aw_q
+-                           + (aw_accept    ? 32'd1 : 32'd0)
+-                           - (b_return     ? 32'd1 : 32'd0);
++                           + (aw_accept     ? 32'd1 : 32'd0)
++                           - (b_return      ? 32'd1 : 32'd0);
+             inflight_ar_q <= inflight_ar_q
+-                           + (ar_accept    ? 32'd1 : 32'd0)
++                           + (ar_accept     ? 32'd1 : 32'd0)
+                            - (r_last_return ? 32'd1 : 32'd0);
+             inflight_w_q  <= inflight_w_q
+-                           + (w_accept     ? 32'd1 : 32'd0)
+-                           - (w_forward    ? 32'd1 : 32'd0);
++                           + (w_last_accept ? 32'd1 : 32'd0)
++                           - (b_return      ? 32'd1 : 32'd0);
++            w_partial_q   <= w_last_accept    ? 1'b0 :
++                             w_nonlast_accept ? 1'b1 :
++                             w_partial_q;
+         end
+     end
+ 
+     assign in_flight_o = (inflight_aw_q != 32'd0) ||
+                          (inflight_ar_q != 32'd0) ||
+                          (inflight_w_q  != 32'd0) ||
++                         w_partial_q ||
+                          bank_busy[0] || bank_busy[1];
+ 
+     // Bounded / no-underflow checks on the 32-bit in-flight counters.
++    // A decrement is only a real underflow when there is no matching increment
++    // in the same cycle; an increment only overflows when it is not cancelled
++    // by a decrement in the same cycle.
++    `ifndef SYNTHESIS
+     always_ff @(posedge clk_i) begin : inflight_bounds
+         if (rst_ni) begin
+-            if ((inflight_ar_q == 32'd0) && r_last_return) begin
++            if ((inflight_ar_q == 32'd0) && r_last_return && !ar_accept) begin
+                 $error("rv_iommu_banked_ctl: inflight_ar underflow");
+             end
+-            if ((inflight_aw_q == 32'd0) && b_return) begin
++            if ((inflight_aw_q == 32'd0) && b_return && !aw_accept) begin
+                 $error("rv_iommu_banked_ctl: inflight_aw underflow");
+             end
+-            if ((inflight_w_q == 32'd0) && w_forward) begin
++            if ((inflight_w_q == 32'd0) && b_return && !w_last_accept) begin
+                 $error("rv_iommu_banked_ctl: inflight_w underflow");
+             end
+-            if (inflight_aw_q == 32'hFFFF_FFFF) begin
++            if ((inflight_aw_q == 32'hFFFF_FFFF) && aw_accept && !b_return) begin
+                 $error("rv_iommu_banked_ctl: inflight_aw counter overflow");
+             end
+-            if (inflight_ar_q == 32'hFFFF_FFFF) begin
++            if ((inflight_ar_q == 32'hFFFF_FFFF) && ar_accept && !r_last_return) begin
+                 $error("rv_iommu_banked_ctl: inflight_ar counter overflow");
+             end
+-            if (inflight_w_q == 32'hFFFF_FFFF) begin
++            if ((inflight_w_q == 32'hFFFF_FFFF) && w_last_accept && !b_return) begin
+                 $error("rv_iommu_banked_ctl: inflight_w counter overflow");
+             end
+         end
+     end
++    `endif

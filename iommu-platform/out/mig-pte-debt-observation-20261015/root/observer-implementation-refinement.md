@@ -1,0 +1,33 @@
+# 观测器实施修正（执行中）
+
+本页记录新增观测工具的实现修正，不是机制试验或新收益结果。目前0次冻结工作负载尝试；实际goal保持active。
+
+初版通用AXI关联表通过101项新功能检查，但单独综合显示100.637ns、316级组合逻辑，不能在真实MIG的5ns UI周期运行。原SV、功能回执和时序报告保留为`*.associative*`，不把其功能检查冒作硬件通过。
+
+当前私有实施限定于已核生成MIG4.2/NORM的全局读返回FIFO行为。head/tail及occupancy直接维持已接受读；每次RVALID核对队头完整RID，并继续核LEN/RLAST/RESP和held稳定性。任何跨ID返回顺序违例都使记录无效，不作为零债务或可用负例。这项范围限定依赖原生成源定理及新构建实际来源绑定；不推广到通用可乱序AXI。它不强制MIG返回顺序，不驱动任何AXI控制。
+
+P选择和每ID occurrence、地址、长度、真实owner配对及32个前序快照的含义保持。ARM不清live债务；本沿Rfire先扣。P的全局FIFO退休证明此前接受项已退休，离线验证仍逐项检查快照和R日志守恒。完整窗口机会计数继续到close，选择不依赖K。
+
+post-capture读回改为两UI周期注册：并行选每项的64bit word、按组注册，再选择最终word。现有toggle mailbox等待rd_valid，不依赖固定一拍，因此增加的是读回延迟，没有向运行请求增加等待。3584-word文件布局和source间接INDEX宽度不变。
+
+每个64bit事件/held计数器从本epoch开始或更晚归零，每UI沿最多加1，所以不会先于唯一64bit tick溢出；tick溢出一直显式置错。每个前序项的fires_after_p受LEN+1≤256、逐拍扣减和退休限制，不会溢出32bit。独立32bit接受序号及perRID occurrence的溢出检测保留。去除这些可证明冗余的宽归约不会许可错误记录。
+
+源端RAM独立同步写、只复位有效数/指针；实际Synth8-7137警告已消失。源端新复位后复用检查通过，单独综合11 BRAM、2683 LUT、1308寄存器。它们是观测工具费用，不是候选机制面积。
+
+所有更正只在新包私有副本。重验只覆盖实际改变的新观测代码；未重跑旧科学实验、旧验证器、旧trace或关闭分支。最终必须通过完整设计时序、实际BIT/clock/reset绑定及真实记录校验，才能裁决方法空间和完成goal。
+
+
+## v2 lossless held codec
+
+UI200MHz/source50MHz exposes held cycles per beat. Replace per-VALID storage with1536 Rfire records; each includes a19-bit count of the immediately preceding held span, clipped at P acceptance. Continuous held tuple/data checks establish lossless reconstruction. Rfire+held+noVALID partition every selected-episode tick. Native bank1000..1dff, source bank0800..0bff, v2 tag and codec marker; original13-bit INDEX unchanged. Only passive log storage increases; actual workload/queue/buffer/PTW do not. Raw dump4608words/36864B.
+
+104 focused native checks,29 asynchronous readback checks and5 decoder test methods pass. New constrained OOC synth WNS−0.086ns/WHS+0.167ns (unplaced),23685LUT/23665registers/7.5BRAM36; this is not hardware timing acceptance. Full private routed acceptance decides whether this implementation can be loaded; no timing exception or clock change is authorized.
+
+
+## Actual placed-path correction
+
+Attempt5 placed timing−0.834ns traced FIFO-head ID validation into all predecessor time/held registers. Routing was severely congested (195508 then57738 overlapping nodes), and was stopped without a final routed verdict or any load/workload. Old synth/impl/raw source preserved in before-routefix/.
+
+A malformed return still sets sticky error2/3 and is unconditionally rejected. Accounting no longer waits for the high-fanout ID comparison; valid FIFO returns agree with observed RLAST. Record only one completed predecessor per edge in32x128 synchronous RAM; validity gates stale contents. Same-P-edge predecessor receipts and later slot reuse are covered. Final frozen v2 fields are unchanged; unfinished row time/held are not receipts. This moves4096 bits from broadcast register state into RAM.
+
+120 focused checks pass, including RAM stale-data/reset/lifetime and post-freeze reuse. Revised OOC19081LUT/19660FF/9.5BRAM36, UI5ns WNS+1.020ns/WHS+0.147ns. Full attempt6 pending; no source/clock/functional capacity/workload change.

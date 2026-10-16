@@ -1,0 +1,13 @@
+# Codex critical review — N draft not accepted
+- Status: reject for implementation; no RTL/driver changes or builds for N.
+- Current A/V are DID11/DID10. Same-DID-only reuse of the active A dc_q/pc_q cannot evaluate our cross-device mechanism. Honest local same-DID microprototype may exercise an interface but is NOT AV baseline and is not useful as next board package.
+- tc_wrap AR stream_fifo only exposes head (lines140-158); complete IDs use ar_data.id (340); head pops only COMPLETE/fire (714-718). Keeping A at head while routing completed younger V by tag "to correct head" is internally contradictory. Must retain full headers per slot and define extraction/dequeue + actual output header association and AXI same-ID ordering, W-data order. A tag alone does not create random-access queue.
+- Single lookup port does NOT inherently forbid time-multiplexed lookup during wait for memory. The current FSM prevents it; do not claim need second physical port as proven minimum. Compare timemux state-save/independent-context path with extra read port, account throughput/area.
+- A real V hit that is consumed must participate in stated replacement policy. Read-only probe may be side-effect-free diagnostic, not fair serviced-hit implementation by default. N/P identical update rule required.
+- Existing IOTLB content is insufficient authorization alone: V own DID/PID-valid, DC/PC stage modes, PSCID/GSCID, privilege/request type needed. Must own-context DDTC/PDT true lookup, or strictly validated context generation snapshot, with invalidation/fault barriers. Cannot A-context reuse for V. False permission must not return translated access.
+- New feature bits alone do not imply old driver rejection. idma_research2_preflight (h:488-518) checks known feature MASK subset, magic/version/role; extra bits are not inherently rejected. New experiment must explicitdetect generation semantic metadata, old tests remain unchanged. Linux necessity must come from actual control/data interface need, not invented rejection.
+- Prototype scope read-only is not complete 4KiB DMA performance; don't claim passive tap means translation request forward/completion occurred.
+- Existing outer AWAIT counts full TL delay not missingDDT, E2 proven64, E3 finite causal results retained.
+- Single controlled N success doesn't cancel all P; assess real finite capacity/outbound pressure cases; no artificially weaken N.
+Decision: Prior literature narrows claims. Keep ordinary nonblocking as necessary strong baseline only; no algorithm novelty proven, no justified full FPGA performance engineering yet. Next actionable artifact is corrected cross-context lifecycle spec with unresolved choices clearly blocked for implementation, not a claim ready.
+

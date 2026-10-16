@@ -1,0 +1,1180 @@
+--- a/corev_apu/fpga/src/ariane_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_xilinx.sv
+@@ -215,6 +215,11 @@
+ 
+ logic ddr_sync_reset;
+ logic ddr_clock_out;
++logic capture_calibrated, capture_selected_toggle;
++logic [12:0] capture_index;
++logic [63:0] capture_mig_rdata, capture_cache_status;
++logic capture_invalidate, capture_arm, capture_open, capture_close;
++
+ 
+ logic rst_n, rst;
+ logic rtc;
+@@ -836,6 +841,10 @@
+     .InclEthernet ( 1'b0         )
+     `endif
+ ) i_ariane_peripherals (
++    .capture_selected_toggle_i(capture_selected_toggle),
++    .capture_mig_rdata_i(capture_mig_rdata), .capture_cache_status_i(capture_cache_status),
++    .capture_index_o(capture_index), .capture_invalidate_o(capture_invalidate),
++    .capture_arm_o(capture_arm), .capture_open_o(capture_open), .capture_close_o(capture_close),
+     .clk_i        ( clk                          ),
+     .clk_200MHz_i ( ddr_clock_out                ),
+     .rst_ni       ( ndmreset_n                   ),
+@@ -1107,6 +1116,43 @@
+     .fan_pwm_o     ( fan_pwm    )
+ );
+ 
++// Private monitor starts at the actual MIG aresetn epoch. A startup
++// handshake before tracking becomes valid poisons the record, never a quiet claim.
++logic capture_epoch_started, capture_prestart_loss;
++logic capture_ui_arm, capture_ui_window, capture_rd_req, capture_rd_valid;
++logic [11:0] capture_rd_index;
++logic [63:0] capture_rd_data;
++logic capture_selected, capture_frozen;
++logic [31:0] capture_errors;
++always_ff @(posedge ddr_clock_out or negedge ndmreset_n) begin
++    if (!ndmreset_n) begin capture_epoch_started <= 0; capture_prestart_loss <= 0; end
++    else begin
++        capture_epoch_started <= 1;
++        if (!capture_epoch_started && (s_axi_arvalid && s_axi_arready || s_axi_rvalid)) capture_prestart_loss <= 1;
++    end
++end
++mig_capture_cdc i_capture_cdc (
++    .src_clk_i(clk), .src_rst_ni(ndmreset_n), .index_i(capture_index),
++    .invalidate_i(capture_invalidate), .arm_i(capture_arm), .open_i(capture_open), .close_i(capture_close),
++    .data_o(capture_mig_rdata), .status_o(capture_cache_status),
++    .dst_clk_i(ddr_clock_out), .dst_rst_ni(ndmreset_n),
++    .arm_o(capture_ui_arm), .window_o(capture_ui_window),
++    .rd_req_o(capture_rd_req), .rd_index_o(capture_rd_index), .rd_valid_i(capture_rd_valid), .rd_data_i(capture_rd_data)
++);
++mig_read_debt_observer i_capture_mig (
++    .clk_i(ddr_clock_out), .rst_ni(ndmreset_n),
++    .epoch_start_i(!capture_epoch_started), .known_empty_i(!capture_prestart_loss),
++    .calibrated_i(capture_calibrated), .epoch_i(32'd1),
++    .arm_i(capture_ui_arm), .window_i(capture_ui_window), .abort_i(1'b0), .external_loss_i(capture_prestart_loss),
++    .ar_eligible_i(s_axi_arid == 6'd48),
++    .arvalid_i(s_axi_arvalid), .arready_i(s_axi_arready), .arid_i(s_axi_arid), .araddr_i(s_axi_araddr[29:0]),
++    .arlen_i(s_axi_arlen), .arsize_i(s_axi_arsize), .arburst_i(s_axi_arburst),
++    .rvalid_i(s_axi_rvalid), .rready_i(s_axi_rready), .rid_i(s_axi_rid), .rlast_i(s_axi_rlast),
++    .rresp_i(s_axi_rresp), .rdata_i(s_axi_rdata),
++    .rd_req_i(capture_rd_req), .rd_index_i(capture_rd_index), .rd_valid_o(capture_rd_valid), .rd_data_o(capture_rd_data),
++    .selected_toggle_o(capture_selected_toggle), .selected_o(capture_selected), .frozen_o(capture_frozen), .errors_o(capture_errors)
++);
++
+ xlnx_mig_7_ddr3 i_ddr (
+     .sys_clk_p,
+     .sys_clk_n,
+@@ -1172,7 +1218,7 @@
+     .s_axi_rresp,
+     .s_axi_rlast,
+     .s_axi_rvalid,
+-    .init_calib_complete (            ), // keep open
++    .init_calib_complete ( capture_calibrated ), // passive calibration tap
+     .device_temp         (            ), // keep open
+     .sys_rst             ( cpu_resetn )
+ );
+--- a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+@@ -35,6 +35,10 @@
+     parameter int unsigned IOMMUDSFixedDelayInput  = 0,
+     parameter int unsigned IOMMUDSFixedDelayOutput = 0
+ ) (
++    input logic capture_selected_toggle_i,
++    input logic [63:0] capture_mig_rdata_i, capture_cache_status_i,
++    output logic [12:0] capture_index_o,
++    output logic capture_invalidate_o, capture_arm_o, capture_open_o, capture_close_o,
+     input  logic       clk_i           , // Clock
+     input  logic       clk_200MHz_i    ,
+     input  logic       rst_ni          , // Asynchronous reset active low
+@@ -886,6 +890,9 @@
+     rv_iommu::e3_tl_t e3_tl;
+     rv_iommu::research_t research;
+     logic nonblock_fire, nonblock_trans_accept;
++    logic capture_ptw_fire, capture_ptw_error;
++    logic [255:0] capture_ptw;
++
+     logic [1:0] composition_mode;
+     logic [23:0] composition_did;
+     logic composition_clear, composition_iommu_quiet;
+@@ -1001,12 +1008,46 @@
+         );
+ 
+         assign obs_cfg_rdata = obs_cfg_addr[0][7] ? launch_cfg_rdata : legacy_cfg_rdata;
++        assign capture_index_o = research_index;
++        assign capture_invalidate_o = research_write && research_index == 13'hf00 && research_wdata[0];
++        assign capture_arm_o = research_arm;
++        assign capture_open_o = research_open;
++        assign capture_close_o = research_close;
++        logic capture_owner_valid, capture_owner_frozen;
++        logic [63:0] capture_owner_data;
++        logic [31:0] capture_owner_error;
++        logic [3:0] capture_did_fire;
++        logic [23:0] capture_did [4];
++        logic [3:0] capture_did_conflict;
++        for (genvar l = 0; l < 4; l++) begin : gen_capture_did
++            assign capture_did_fire[l] = obs_arvalid[l] && obs_arready[l] || obs_awvalid[l] && obs_awready[l];
++            assign capture_did[l] = obs_arvalid[l] && obs_arready[l] ? axi_dma_tr_req[l].ar.stream_id : axi_dma_tr_req[l].aw.stream_id;
++            assign capture_did_conflict[l] = obs_arvalid[l] && obs_arready[l] && obs_awvalid[l] && obs_awready[l] &&
++                axi_dma_tr_req[l].ar.stream_id != axi_dma_tr_req[l].aw.stream_id;
++        end
++        mig_source_owner i_capture_source (
++            .clk_i, .rst_ni, .arm_i(research_arm), .open_i(research_open), .close_i(research_close),
++            .selected_toggle_async_i(capture_selected_toggle_i),
++            .issue_i(obs_issue), .done_i(obs_done), .issue_id_i(obs_issue_id), .done_id_i(obs_done_id),
++            .lane_did_fire_i(capture_did_fire), .lane_did_i(capture_did),
++            .ptw_fire_i(capture_ptw_fire), .ptw_error_i(capture_ptw_error || |capture_did_conflict), .ptw_i(capture_ptw),
++            .comp_fire_i(axi_iommu_comp_req.ar_valid && axi_iommu_comp_resp.ar_ready),
++            .comp_id_i(axi_iommu_comp_req.ar.id), .comp_addr_i(axi_iommu_comp_req.ar.addr),
++            .comp_len_i(axi_iommu_comp_req.ar.len), .comp_size_i(axi_iommu_comp_req.ar.size), .comp_burst_i(axi_iommu_comp_req.ar.burst),
++            .rd_req_i(research_index >= 13'h0800 && research_index <= 13'h0bff),
++            .rd_index_i(11'(research_index - 13'h0800)), .rd_valid_o(capture_owner_valid), .rd_data_o(capture_owner_data),
++            .frozen_o(capture_owner_frozen), .error_o(capture_owner_error)
++        );
+         if (InclIOMMU) begin : gen_research
+             assign research_policy_access = research_index[12:8] == 5'h0E;
+             assign composition_access = IOMMUNonblockMode == 3 &&
+                 research_index >= 13'hD20 && research_index <= 13'hD9F;
+             assign composition_index = research_index - 13'hD20;
+-            assign research_data = composition_access ? composition_data :
++            assign research_data = research_index == 13'hf00 ? capture_cache_status_i :
++                                   research_index == 13'hf01 ? 64'h4d444f3130313502 :
++                                   research_index >= 13'h0800 && research_index <= 13'h0bff ? capture_owner_data :
++                                   research_index >= 13'h1000 && research_index < 13'h1e00 ? capture_mig_rdata_i :
++                                   composition_access ? composition_data :
+                                    IOMMUNonblockMode != 0 && research_index[12:8] == 5'h0D ?
+                                    nonblock_data :
+                                    research_policy_access ? research_policy_data : research_observer_data;
+@@ -1460,6 +1501,7 @@
+             .e3_enable_i(e3_control[0]), .e3_arm_i(e3_control[1]),
+             .e3_active_i(e3_control[3]), .e3_delay128_i(e3_control[7]),
+             .e3_ctl_o(e3_ctl), .e3_tl_o(e3_tl), .research_o(research),
++            .capture_ptw_fire_o(capture_ptw_fire), .capture_ptw_error_o(capture_ptw_error), .capture_ptw_o(capture_ptw),
+             .nonblock_fire_o(nonblock_fire), .trans_accept_o(nonblock_trans_accept),
+             .nonblock_diag_o(nonblock_diag),
+             // Only DMA0/1 in this prototype have the whole-copy buffers.
+--- a/corev_apu/fpga/src/mig_capture_cdc.sv
++++ b/corev_apu/fpga/src/mig_capture_cdc.sv
+@@ -0,0 +1,86 @@
++// PRIVATE passive readback mailbox. No AXI ready/valid outputs.
++// Bundled index/data stay stable until the synchronized toggle is acknowledged.
++module mig_capture_cdc (
++  input logic src_clk_i, src_rst_ni,
++  input logic [12:0] index_i,
++  input logic invalidate_i, arm_i, open_i, close_i,
++  output logic [63:0] data_o, status_o,
++  input logic dst_clk_i, dst_rst_ni,
++  output logic arm_o, window_o,
++  output logic rd_req_o,
++  output logic [11:0] rd_index_o,
++  input logic rd_valid_i,
++  input logic [63:0] rd_data_i
++);
++  logic request_q, response_q, pending_q, valid_q;
++  logic [11:0] index_hold_q, cached_index_q;
++  logic [63:0] result_hold_q, cached_data_q;
++  logic arm_toggle_q, window_q;
++  (* ASYNC_REG = "TRUE" *) logic req_meta_q, req_sync_q;
++  (* ASYNC_REG = "TRUE" *) logic rsp_meta_q, rsp_sync_q;
++  (* ASYNC_REG = "TRUE" *) logic arm_meta_q, arm_sync_q;
++  (* ASYNC_REG = "TRUE" *) logic win_meta_q, win_sync_q;
++  logic req_seen_q, arm_seen_q, waiting_q;
++  wire query = index_i >= 13'h1000 && index_i < 13'h1e00;
++  assign data_o = valid_q && cached_index_q == index_i[11:0] ? cached_data_q : '0;
++  always_comb begin
++    status_o = '0;
++    status_o[0] = valid_q;
++    status_o[1] = pending_q;
++    status_o[27:16] = cached_index_q;
++    status_o[63:32] = 32'h4d434301;
++  end
++  always_ff @(posedge src_clk_i or negedge src_rst_ni) begin
++    if (!src_rst_ni) begin
++      request_q <= 0; pending_q <= 0; valid_q <= 0;
++      index_hold_q <= 0; cached_index_q <= 0; cached_data_q <= 0;
++      rsp_meta_q <= 0; rsp_sync_q <= 0;
++      arm_toggle_q <= 0; window_q <= 0;
++    end else begin
++      rsp_meta_q <= response_q;
++      rsp_sync_q <= rsp_meta_q;
++      if (arm_i) begin arm_toggle_q <= !arm_toggle_q; window_q <= 0; end
++      if (open_i) window_q <= 1;
++      if (close_i) window_q <= 0;
++      if (invalidate_i) valid_q <= 0;
++      if (pending_q && rsp_sync_q == request_q) begin
++        cached_data_q <= result_hold_q;
++        cached_index_q <= index_hold_q;
++        valid_q <= 1;
++        pending_q <= 0;
++      end
++      if (query && !pending_q && (!valid_q || cached_index_q != index_i[11:0])) begin
++        index_hold_q <= index_i[11:0];
++        request_q <= !request_q;
++        pending_q <= 1;
++        valid_q <= 0;
++      end
++    end
++  end
++  always_ff @(posedge dst_clk_i or negedge dst_rst_ni) begin
++    if (!dst_rst_ni) begin
++      req_meta_q <= 0; req_sync_q <= 0; req_seen_q <= 0;
++      response_q <= 0; waiting_q <= 0; result_hold_q <= 0;
++      arm_meta_q <= 0; arm_sync_q <= 0; arm_seen_q <= 0;
++      win_meta_q <= 0; win_sync_q <= 0;
++      arm_o <= 0; window_o <= 0; rd_req_o <= 0; rd_index_o <= 0;
++    end else begin
++      req_meta_q <= request_q; req_sync_q <= req_meta_q;
++      arm_meta_q <= arm_toggle_q; arm_sync_q <= arm_meta_q;
++      arm_seen_q <= arm_sync_q; arm_o <= arm_sync_q != arm_seen_q;
++      win_meta_q <= window_q; win_sync_q <= win_meta_q; window_o <= win_sync_q;
++      rd_req_o <= 0;
++      if (req_sync_q != req_seen_q && !waiting_q) begin
++        rd_index_o <= index_hold_q;
++        rd_req_o <= 1;
++        waiting_q <= 1;
++        req_seen_q <= req_sync_q;
++      end
++      if (waiting_q && rd_valid_i) begin
++        result_hold_q <= rd_data_i;
++        response_q <= req_seen_q;
++        waiting_q <= 0;
++      end
++    end
++  end
++endmodule
+--- a/corev_apu/fpga/src/mig_read_debt_observer.sv
++++ b/corev_apu/fpga/src/mig_read_debt_observer.sv
+@@ -0,0 +1,554 @@
++// SPDX-License-Identifier: Solderpad-0.51
++// PRIVATE passive observer. Every input is in the actual MIG ui_clk domain.
++// No observer output may drive an AXI handshake, scheduler or memory request.
++module mig_read_debt_observer #(
++  parameter int unsigned LiveSlots = 32,
++  parameter int unsigned EventDepth = 1536
++) (
++  input logic clk_i, rst_ni,
++  input logic epoch_start_i, known_empty_i, calibrated_i,
++  input logic [31:0] epoch_i,
++  input logic arm_i, window_i, abort_i, external_loss_i,
++  input logic ar_eligible_i,
++  input logic arvalid_i, arready_i,
++  input logic [5:0] arid_i,
++  input logic [29:0] araddr_i,
++  input logic [7:0] arlen_i,
++  input logic [2:0] arsize_i,
++  input logic [1:0] arburst_i,
++  input logic rvalid_i, rready_i,
++  input logic [5:0] rid_i,
++  input logic rlast_i,
++  input logic [1:0] rresp_i,
++  input logic [63:0] rdata_i,
++  input logic rd_req_i,
++  input logic [11:0] rd_index_i,
++  output logic rd_valid_o,
++  output logic [63:0] rd_data_o,
++  output logic selected_toggle_o,
++  output logic selected_o, frozen_o,
++  output logic [31:0] errors_o
++);
++  localparam logic [63:0] Magic = 64'h4d49474445425402;
++  localparam int EventBase = 'h200;
++  localparam int EventIndexW = $clog2(EventDepth);
++  localparam int SlotWidth = LiveSlots > 1 ? $clog2(LiveSlots) : 1;
++  typedef struct packed {
++    logic valid;
++    logic [5:0] id;
++    logic [29:0] addr;
++    logic [7:0] len;
++    logic [2:0] size;
++    logic [1:0] burst;
++    logic [31:0] ordinal, rid_occ;
++    logic [8:0] remaining;
++    logic [63:0] t_ar, held;
++  } live_t;
++  typedef struct packed {
++    logic valid, completed;
++    logic [5:0] id;
++    logic [29:0] addr;
++    logic [7:0] len;
++    logic [2:0] size;
++    logic [1:0] burst;
++    logic [31:0] ordinal, rid_occ;
++    logic [8:0] at_p, remaining;
++    logic [63:0] t_ar;
++    logic [31:0] fires_after_p;
++  } pred_t;
++  typedef struct packed {
++    logic tracking, calibration_seen, armed, window_seen, window_closed, window_prev;
++    logic selected, episode_done, frozen, selected_toggle;
++    logic p_first_valid, p_first_fire, p_last;
++    logic [31:0] errors, epoch, ordinal, head_ordinal;
++    logic [SlotWidth-1:0] head, tail;
++    logic [5:0] occupancy;
++    logic [13:0] total_debt;
++    logic [63:0] tick, start_tick, open_tick, close_tick, freeze_tick;
++    logic [63:0] accepted, r_fires, eligible;
++    logic [31:0] p_ordinal, p_rid_occ;
++    logic [5:0] p_id;
++    logic [29:0] p_addr;
++    logic [7:0] p_len;
++    logic [2:0] p_size;
++    logic [1:0] p_burst;
++    logic [8:0] p_remaining;
++    logic [63:0] p_t_ar, p_t_valid, p_t_fire, p_t_last, p_held;
++    logic [31:0] pred_count, pred_debt, max_live, event_count;
++    logic [18:0] pending_held;
++    logic [31:0] frozen_errors, frozen_max_live, frozen_ordinal;
++    logic [63:0] frozen_accepted, frozen_r_fires;
++    logic [63:0] held_cycles, no_valid_cycles;
++    logic ar_held, r_held;
++    logic [48:0] held_ar;
++    logic [72:0] held_r;
++  } state_t;
++  state_t q, n;
++  live_t live_q [LiveSlots], live_n [LiveSlots];
++  pred_t pred_q [LiveSlots], pred_n [LiveSlots];
++  logic [31:0] rid_occ_q [64], rid_occ_n [64];
++  (* ram_style = "block" *) logic [127:0] event_mem [EventDepth];
++  (* ram_style = "block" *) logic [127:0] completion_mem [LiveSlots];
++  logic completion_we, rd_completion_q, completion_valid_q;
++  logic [127:0] completion_wdata, completion_rdata_q;
++  logic r_id_match;
++  logic event_we;
++  logic [EventIndexW-1:0] event_waddr;
++  logic [127:0] event_wdata, event_rdata_q;
++  logic [63:0] static_data, static_data_q;
++  logic [63:0] pred_word [LiveSlots];
++  logic [63:0] pred_group_q [4];
++  logic [1:0] rd_group_q;
++  logic [4:0] pred_read_slot;
++  logic rd_event_q, rd_half_q, rd_pred_q, rd_pending_q;
++  logic ar_fire, r_fire, select_now;
++  int rslot, free_slot;
++  logic [48:0] ar_tuple;
++  logic [72:0] r_tuple;
++  assign ar_fire = arvalid_i && arready_i;
++  assign r_fire = rvalid_i && rready_i;
++  assign ar_tuple = {arburst_i, arsize_i, arlen_i, arid_i, araddr_i};
++  assign r_tuple = {rdata_i, rresp_i, rlast_i, rid_i};
++  assign selected_o = q.selected;
++  assign frozen_o = q.frozen;
++  assign selected_toggle_o = q.selected_toggle;
++  assign errors_o = q.frozen ? q.frozen_errors : q.errors;
++  assign pred_read_slot = 5'((int'(rd_index_i)-32)/8);
++
++  initial begin
++    assert (LiveSlots > 0 && LiveSlots <= 32);
++    assert (EventDepth >= 2 && EventDepth <= 1536);
++  end
++
++  // This private monitor binds the already verified generated MIG NORM AXI
++  // service, whose accepted reads retire in global FIFO order. Validate that
++  // invariant at every RVALID; a different RID at the head invalidates capture.
++  // This is not a generic AXI out-of-order monitor or a new service policy.
++  always_comb begin
++    n = q;
++    for (int i = 0; i < LiveSlots; i++) begin
++      live_n[i] = live_q[i];
++      pred_n[i] = pred_q[i];
++    end
++    for (int i = 0; i < 64; i++) rid_occ_n[i] = rid_occ_q[i];
++    completion_we = 0;
++    completion_wdata = '0;
++    r_id_match = 0;
++    event_we = 0;
++    event_waddr = EventIndexW'(q.event_count);
++    event_wdata = '0;
++    rslot = -1;
++    free_slot = -1;
++    select_now = q.tracking && q.armed && !q.frozen && !q.selected &&
++                 window_i && ar_fire && ar_eligible_i;
++
++    // A later ARM never clears accepted transactions or sticky track errors.
++    // epoch_start is accepted only once after the real MIG aresetn release,
++    // before any AR/R. Start before calibration so the first calibrated AR
++    // cannot escape. Calibration completion is a separate monotonic condition.
++    if (epoch_start_i) begin
++      if (!q.tracking && known_empty_i && !ar_fire && !rvalid_i) begin
++        n.tracking = 1;
++        n.calibration_seen = calibrated_i;
++        n.epoch = epoch_i;
++        n.head_ordinal = 1;
++        n.start_tick = q.tick;
++      end else n.errors[0] = 1;
++    end
++    if (q.tracking) begin
++      n.tick = q.tick + 1;
++      // Every 64-bit event/held counter starts at zero in this epoch (or
++      // later) and increments at most once per UI edge, hence cannot wrap
++      // before tick. Per-read fires_after_p is bounded by LEN+1 <= 256;
++      // length/RLAST checking retires that occurrence. Independent 32-bit
++      // accepted ordinals/occurrences retain their explicit overflow checks.
++      if (&q.tick) n.errors[6] = 1;
++      if (calibrated_i) n.calibration_seen = 1;
++      if ((q.calibration_seen && !calibrated_i) || epoch_i != q.epoch ||
++          (!calibrated_i && (ar_fire || rvalid_i))) n.errors[1] = 1;
++      if (external_loss_i) n.errors[9] = 1;
++
++      if (arm_i) begin
++        if (!calibrated_i) n.errors[1] = 1;
++        if (window_i || (q.armed && !q.frozen)) n.errors[10] = 1;
++        n.armed = 1;
++        n.window_seen = 0;
++        n.window_closed = 0;
++        n.window_prev = 0;
++        n.selected = 0;
++        n.episode_done = 0;
++        n.frozen = 0;
++        n.p_first_valid = 0;
++        n.p_first_fire = 0;
++        n.p_last = 0;
++        n.open_tick = 0;
++        n.close_tick = 0;
++        n.freeze_tick = 0;
++        n.eligible = 0;
++        n.p_ordinal = 0;
++        n.p_rid_occ = 0;
++        n.p_id = 0;
++        n.p_addr = 0;
++        n.p_len = 0;
++        n.p_size = 0;
++        n.p_burst = 0;
++        n.p_remaining = 0;
++        n.p_t_ar = 0;
++        n.p_t_valid = 0;
++        n.p_t_fire = 0;
++        n.p_t_last = 0;
++        n.p_held = 0;
++        n.pred_count = 0;
++        n.pred_debt = 0;
++        n.event_count = 0;
++        n.pending_held = 0;
++        n.held_cycles = 0;
++        n.no_valid_cycles = 0;
++        for (int i = 0; i < LiveSlots; i++) pred_n[i] = '0;
++      end
++      if (q.armed && !q.frozen) begin
++        n.window_prev = window_i;
++        if (window_i && !q.window_prev) begin
++          if (q.window_seen || q.window_closed) n.errors[11] = 1;
++          n.window_seen = 1;
++          n.open_tick = q.tick;
++        end
++        if (!window_i && q.window_prev) begin
++          n.window_closed = 1;
++          n.close_tick = q.tick;
++        end
++        if (window_i && ar_fire && ar_eligible_i) begin
++          n.eligible = q.eligible + 1;
++        end
++      end
++
++      if (q.ar_held && (!arvalid_i || ar_tuple != q.held_ar)) n.errors[7] = 1;
++      if (q.r_held && (!rvalid_i || r_tuple != q.held_r)) n.errors[8] = 1;
++      n.ar_held = arvalid_i && !arready_i;
++      n.r_held = rvalid_i && !rready_i;
++      n.held_ar = ar_tuple;
++      n.held_r = r_tuple;
++      // Error checking does not gate the large accounting fanout. Every
++      // malformed return is still sticky-invalid. Valid FIFO traces agree.
++      if (q.occupancy != 0) rslot = int'(q.head);
++      r_id_match = rslot >= 0 && live_q[q.head].valid && live_q[q.head].id == rid_i;
++      // R is processed before the P snapshot, including an RLAST on this edge.
++      if (rvalid_i) begin
++        if (!r_id_match) n.errors[2] = 1;
++        if (rresp_i != 0) n.errors[4] = 1;
++        if (rslot >= 0) begin
++          if (rlast_i != (live_q[q.head].remaining == 1)) n.errors[3] = 1;
++          if (!rready_i) begin
++            live_n[q.head].held = live_q[q.head].held + 1;
++          end
++          if (q.selected && q.head_ordinal == q.p_ordinal) begin
++            if (!q.p_first_valid) begin
++              n.p_first_valid = 1;
++              n.p_t_valid = q.tick;
++            end
++            if (!rready_i) begin
++              n.p_held = q.p_held + 1;
++            end
++            if (r_fire) begin
++              if (!q.p_first_fire) begin n.p_first_fire = 1; n.p_t_fire = q.tick; end
++              n.p_remaining = q.p_remaining - 1;
++              if (rlast_i) begin
++                n.p_last = 1;
++                n.p_t_last = q.tick;
++              end
++            end
++          end
++          if (r_fire) begin
++            live_n[q.head].remaining = live_q[q.head].remaining - 1;
++            n.total_debt = q.total_debt - 1;
++            if (rlast_i) begin
++              live_n[q.head].valid = 0;
++              n.occupancy = q.occupancy - 1;
++              n.head_ordinal = q.head_ordinal + 1;
++              n.head = int'(q.head) == LiveSlots-1 ? '0 : q.head + 1'b1;
++            end
++          end
++          // One FIFO head can retire per UI edge. Record its final time and
++          // lifetime held count in RAM, including a same-P-edge predecessor.
++          if (r_fire && rlast_i && (select_now ||
++              (q.selected && !q.episode_done && pred_q[q.head].valid &&
++               pred_q[q.head].ordinal == q.head_ordinal))) begin
++            completion_we = 1;
++            completion_wdata = {live_q[q.head].held, q.tick};
++          end
++          if (q.selected && !q.episode_done) begin
++            for (int i = 0; i < LiveSlots; i++) begin
++              // Snapshot i retains live slot i until that occurrence retires.
++              if (pred_q[i].valid && int'(q.head) == i && pred_q[i].ordinal == live_q[i].ordinal) begin
++                pred_n[i].remaining = live_n[i].remaining;
++                if (r_fire) begin
++                  pred_n[i].fires_after_p = pred_q[i].fires_after_p + 1;
++                  if (rlast_i) begin
++                    pred_n[i].completed = 1;
++                  end
++                end
++              end
++            end
++          end
++        end
++      end
++      if (r_fire) begin
++        n.r_fires = q.r_fires + 1;
++      end
++      if (select_now) begin
++        n.selected = 1;
++        n.selected_toggle = !q.selected_toggle;
++        n.p_ordinal = q.ordinal + 1;
++        n.p_rid_occ = rid_occ_q[arid_i] + 1;
++        n.p_id = arid_i;
++        n.p_addr = araddr_i;
++        n.p_len = arlen_i;
++        n.p_size = arsize_i;
++        n.p_burst = arburst_i;
++        n.p_remaining = {1'b0, arlen_i} + 1;
++        n.p_t_ar = q.tick;
++        n.pending_held = 0;
++        n.pred_count = {26'd0,q.occupancy};
++        n.pred_debt = {18'd0,n.total_debt};
++        for (int i = 0; i < LiveSlots; i++) begin
++          if (live_q[i].valid) begin
++            pred_n[i].valid = 1;
++            pred_n[i].completed = !live_n[i].valid;
++            pred_n[i].id = live_q[i].id;
++            pred_n[i].addr = live_q[i].addr;
++            pred_n[i].len = live_q[i].len;
++            pred_n[i].size = live_q[i].size;
++            pred_n[i].burst = live_q[i].burst;
++            pred_n[i].ordinal = live_q[i].ordinal;
++            pred_n[i].rid_occ = live_q[i].rid_occ;
++            pred_n[i].at_p = live_n[i].remaining;
++            pred_n[i].remaining = live_n[i].remaining;
++            pred_n[i].t_ar = live_q[i].t_ar;
++            pred_n[i].fires_after_p = 0;
++          end
++        end
++      end
++
++      // Lossless Rfire + preceding-held codec. A held VALID cannot drop or
++      // change tuple/data (checked above), so its exact preceding interval is
++      // recoverable from this count and the fire tick. Clip the first interval
++      // at the selected P edge, where this recording episode begins.
++      if ((q.selected && !q.episode_done && !q.frozen) || select_now) begin
++        if (rvalid_i) begin
++          if (r_fire && q.event_count < EventDepth) begin
++            event_we = 1;
++            event_wdata[63:0] = q.tick;
++            event_wdata[69:64] = rid_i;
++            event_wdata[70] = rlast_i;
++            event_wdata[72:71] = rresp_i;
++            event_wdata[73] = rvalid_i;
++            event_wdata[74] = rready_i;
++            event_wdata[75] = r_id_match;
++            event_wdata[76] = select_now;
++            event_wdata[95:77] = select_now ? 19'd0 : q.pending_held;
++            if (rslot >= 0) event_wdata[127:96] = q.head_ordinal;
++            n.event_count = q.event_count + 1;
++          end else if (r_fire) n.errors[12] = 1;
++          if (r_fire) n.pending_held = 0;
++          if (!rready_i) begin
++            n.pending_held = (select_now ? 19'd0 : q.pending_held) + 19'd1;
++            if (!select_now && &q.pending_held) n.errors[12] = 1;
++            n.held_cycles = q.held_cycles + 1;
++          end
++        end else begin
++          n.no_valid_cycles = q.no_valid_cycles + 1;
++        end
++      end
++
++      if (ar_fire) begin
++        n.accepted = q.accepted + 1;
++        n.ordinal = q.ordinal + 1;
++        rid_occ_n[arid_i] = rid_occ_q[arid_i] + 1;
++        if (&q.ordinal || &rid_occ_q[arid_i]) n.errors[6] = 1;
++        // FIFO slot ownership follows head/tail, so no second associative
++        // lookup through the updated table is needed to grant an AR slot.
++        if (int'(q.occupancy) < LiveSlots ||
++            (r_fire && rslot >= 0 && rlast_i)) free_slot = int'(q.tail);
++        if (free_slot < 0) n.errors[5] = 1;
++        else begin
++          live_n[q.tail] = '0;
++          live_n[q.tail].valid = 1;
++          live_n[q.tail].id = arid_i;
++          live_n[q.tail].addr = araddr_i;
++          live_n[q.tail].len = arlen_i;
++          live_n[q.tail].size = arsize_i;
++          live_n[q.tail].burst = arburst_i;
++          live_n[q.tail].ordinal = q.ordinal + 1;
++          live_n[q.tail].rid_occ = rid_occ_q[arid_i] + 1;
++          live_n[q.tail].remaining = {1'b0, arlen_i} + 1;
++          live_n[q.tail].t_ar = q.tick;
++          n.occupancy = n.occupancy + 1;
++          n.total_debt = n.total_debt + {6'd0,arlen_i} + 14'd1;
++          n.tail = int'(q.tail) == LiveSlots-1 ? '0 : q.tail + 1'b1;
++        end
++      end
++      if ({26'd0,n.occupancy} > q.max_live) n.max_live = {26'd0,n.occupancy};
++      // Checked global FIFO retirement means P cannot be head until every
++      // predecessor has retired. Offline validation also checks every row.
++      if (n.selected && n.p_last) n.episode_done = 1;
++      if (n.armed && n.window_closed && (!n.selected || n.episode_done) && !q.frozen) begin
++        n.frozen = 1;
++        n.freeze_tick = q.tick;
++      end
++      if (abort_i && q.armed && !q.frozen) begin
++        n.errors[13] = 1;
++        n.frozen = 1;
++        n.freeze_tick = q.tick;
++      end
++      if (n.frozen && !q.frozen) begin
++        n.frozen_errors = n.errors;
++        n.frozen_accepted = n.accepted;
++        n.frozen_r_fires = n.r_fires;
++        n.frozen_max_live = n.max_live;
++        n.frozen_ordinal = n.ordinal;
++      end
++    end else if (arm_i) n.errors[14] = 1;
++  end
++
++  always_comb begin
++    static_data = '0;
++    case (rd_index_i)
++      0: static_data = Magic;
++      1: begin
++        static_data[0] = q.tracking;
++        static_data[1] = q.armed;
++        static_data[2] = q.window_seen;
++        static_data[3] = q.window_closed;
++        static_data[4] = q.selected;
++        static_data[5] = q.episode_done;
++        static_data[6] = q.frozen;
++        static_data[7] = q.p_first_valid;
++        static_data[8] = q.p_first_fire;
++        static_data[9] = q.p_last;
++        static_data[10] = q.selected_toggle;
++        static_data[11] = q.calibration_seen;
++      end
++      2: static_data = {32'b0, q.frozen ? q.frozen_errors : q.errors};
++      3: static_data = {32'b0, q.epoch};
++      4: static_data = q.frozen ? q.freeze_tick : q.tick;
++      5: static_data = q.start_tick;
++      6: static_data = q.open_tick;
++      7: static_data = q.close_tick;
++      8: static_data = q.freeze_tick;
++      9: static_data = q.frozen ? q.frozen_accepted : q.accepted;
++      10: static_data = q.frozen ? q.frozen_r_fires : q.r_fires;
++      11: static_data = q.eligible;
++      12: static_data = {q.p_rid_occ, q.p_ordinal};
++      13: begin
++        static_data[29:0] = q.p_addr;
++        static_data[35:30] = q.p_id;
++        static_data[43:36] = q.p_len;
++        static_data[46:44] = q.p_size;
++        static_data[48:47] = q.p_burst;
++      end
++      14: static_data = q.p_t_ar;
++      15: static_data = q.p_t_valid;
++      16: static_data = q.p_t_fire;
++      17: static_data = q.p_t_last;
++      18: static_data = q.p_held;
++      19: begin static_data[8:0] = q.p_remaining; static_data[24:16] = {1'b0,q.p_len}+1; end
++      20: static_data = {32'b0, q.pred_count};
++      21: static_data = {32'b0, q.pred_debt};
++      22: static_data = {32'b0, q.frozen ? q.frozen_max_live : q.max_live};
++      23: static_data = {32'b0, q.event_count};
++      24: static_data = q.held_cycles;
++      25: static_data = q.no_valid_cycles;
++      26: static_data = {32'(EventDepth), 32'(LiveSlots)};
++      27: static_data = {32'b0, q.frozen ? q.frozen_ordinal : q.ordinal};
++      28: static_data = 64'h5246495245480001; // RFIREH: fire tick + preceding held19.
++      default: ;
++    endcase
++  end
++
++  // Parallel word selection and a registered grouped read avoid a serial
++  // 32-entry priority chain on the slow, post-capture MMIO path.
++  for (genvar i = 0; i < LiveSlots; i++) begin : gen_pred_words
++    always_comb begin
++      pred_word[i] = '0;
++      case (rd_index_i[2:0])
++              0: begin
++                pred_word[i][0] = pred_q[i].valid;
++                pred_word[i][1] = pred_q[i].completed;
++                pred_word[i][13:8] = pred_q[i].id;
++                pred_word[i][21:14] = pred_q[i].len;
++                pred_word[i][24:22] = pred_q[i].size;
++                pred_word[i][26:25] = pred_q[i].burst;
++                pred_word[i][35:27] = pred_q[i].at_p;
++                pred_word[i][44:36] = pred_q[i].remaining;
++              end
++              1: pred_word[i] = {pred_q[i].rid_occ, pred_q[i].ordinal};
++              2: pred_word[i] = {34'b0, pred_q[i].addr};
++              3: pred_word[i] = pred_q[i].t_ar;
++              6: pred_word[i] = {32'b0, pred_q[i].fires_after_p};
++              default: ;
++      endcase
++    end
++  end
++  for (genvar g = 0; g < 4; g++) begin : gen_pred_read_groups
++    logic [63:0] words [8];
++    for (genvar k = 0; k < 8; k++) begin : gen_words
++      if (g*8+k < LiveSlots) assign words[k] = pred_word[g*8+k];
++      else assign words[k] = '0;
++    end
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++      if (!rst_ni) pred_group_q[g] <= '0;
++      else if (rd_req_i) pred_group_q[g] <= words[pred_read_slot[2:0]];
++    end
++  end
++
++  // Event RAM is never bulk-cleared: event_count bounds the valid region.
++  // Fully registered read port permits BRAM implementation and a CDC mailbox.
++  always_ff @(posedge clk_i) begin
++    if (completion_we) completion_mem[q.head] <= completion_wdata;
++    if (rd_req_i && int'(rd_index_i) >= 32 && int'(rd_index_i) < 32+LiveSlots*8)
++      completion_rdata_q <= completion_mem[SlotWidth'(pred_read_slot)];
++    if (event_we) event_mem[event_waddr] <= event_wdata;
++    if (rd_req_i && int'(rd_index_i) >= EventBase &&
++        int'(rd_index_i) < EventBase+EventDepth*2)
++      event_rdata_q <= event_mem[EventIndexW'((int'(rd_index_i)-EventBase)/2)];
++  end
++  always_ff @(posedge clk_i or negedge rst_ni) begin
++    if (!rst_ni) begin
++      q <= '0;
++      for (int i = 0; i < LiveSlots; i++) begin live_q[i] <= '0; pred_q[i] <= '0; end
++      for (int i = 0; i < 64; i++) rid_occ_q[i] <= '0;
++      rd_valid_o <= 0;
++      static_data_q <= 0;
++      rd_completion_q <= 0;
++      completion_valid_q <= 0;
++      rd_event_q <= 0;
++      rd_half_q <= 0;
++      rd_pred_q <= 0;
++      rd_pending_q <= 0;
++      rd_group_q <= 0;
++      rd_data_o <= 0;
++    end else begin
++      q <= n;
++      for (int i = 0; i < LiveSlots; i++) begin live_q[i] <= live_n[i]; pred_q[i] <= pred_n[i]; end
++      for (int i = 0; i < 64; i++) rid_occ_q[i] <= rid_occ_n[i];
++      rd_pending_q <= rd_req_i;
++      rd_valid_o <= rd_pending_q;
++      if (rd_pending_q) begin
++        if (rd_event_q) rd_data_o <= rd_half_q ? event_rdata_q[127:64] : event_rdata_q[63:0];
++        else if (rd_pred_q && rd_completion_q)
++          rd_data_o <= completion_valid_q ? (rd_half_q ? completion_rdata_q[127:64] : completion_rdata_q[63:0]) : '0;
++        else if (rd_pred_q) rd_data_o <= pred_group_q[rd_group_q];
++        else rd_data_o <= static_data_q;
++      end
++      if (rd_req_i) begin
++        static_data_q <= static_data;
++        rd_completion_q <= rd_index_i[2:0] == 4 || rd_index_i[2:0] == 5;
++        completion_valid_q <= pred_q[SlotWidth'(pred_read_slot)].valid && pred_q[SlotWidth'(pred_read_slot)].completed;
++        rd_event_q <= int'(rd_index_i) >= EventBase && int'(rd_index_i) < EventBase+EventDepth*2;
++        rd_half_q <= rd_index_i[0];
++        rd_pred_q <= int'(rd_index_i) >= 32 && int'(rd_index_i) < 32+LiveSlots*8;
++        rd_group_q <= pred_read_slot[4:3];
++      end
++    end
++  end
++endmodule
+--- a/corev_apu/fpga/src/mig_source_owner.sv
++++ b/corev_apu/fpga/src/mig_source_owner.sv
+@@ -0,0 +1,236 @@
++// Private passive companion. No signal controls workload or AXI flow.
++module mig_source_owner (
++    input logic clk_i, rst_ni,
++    input logic arm_i, open_i, close_i,
++    input logic selected_toggle_async_i,
++    input logic [3:0] issue_i, done_i,
++    input logic [63:0] issue_id_i [4], done_id_i [4],
++    input logic [3:0] lane_did_fire_i,
++    input logic [23:0] lane_did_i [4],
++    input logic ptw_fire_i, ptw_error_i,
++    input logic [255:0] ptw_i,
++    input logic comp_fire_i,
++    input logic [3:0] comp_id_i,
++    input logic [63:0] comp_addr_i,
++    input logic [7:0] comp_len_i,
++    input logic [2:0] comp_size_i,
++    input logic [1:0] comp_burst_i,
++    input logic rd_req_i,
++    input logic [10:0] rd_index_i,
++    output logic rd_valid_o,
++    output logic [63:0] rd_data_o,
++    output logic frozen_o,
++    output logic [31:0] error_o
++);
++    localparam int PtwDepth = 64, CompDepth = 96;
++    localparam int PtwBase = 32, CompBase = PtwBase + PtwDepth*8;
++    (* ram_style = "block" *) logic [511:0] ptw_mem [PtwDepth];
++    (* ram_style = "block" *) logic [319:0] comp_mem [CompDepth];
++    logic [511:0] ptw_read_q;
++    logic [319:0] comp_read_q;
++    logic [63:0] header_read_q;
++    logic [2:0] read_word_q;
++    logic [1:0] read_bank_q;
++    // Wide records have one write and one synchronous read per clock.
++    logic [63:0] cycle_q, ptw_count_q, comp_count_q;
++    logic [31:0] comp_lane_count_q [4];
++    logic [63:0] window_ptw_q, window_normal_ptw_q;
++    logic [63:0] arm_cycle_q, open_cycle_q, close_cycle_q, freeze_cycle_q;
++    logic [5:0] ptw_wr_q;
++    logic [6:0] comp_wr_q;
++    logic [6:0] ptw_valid_q;
++    logic [7:0] comp_valid_q;
++    logic [3:0] lane_active_q, lane_active_n, lane_did_valid_q;
++    logic [63:0] lane_id_q [4], lane_id_n [4];
++    logic [31:0] lane_gen_q [4], lane_gen_n [4];
++    logic [23:0] lane_did_q [4];
++    logic [31:0] errors_q, lane_errors;
++    logic window_q, armed_q;
++    (* ASYNC_REG = "TRUE" *) logic selected_meta_q, selected_sync_q;
++    logic selected_seen_q;
++    logic [1:0] ptw_lane;
++    logic [2:0] ptw_matches;
++    logic [63:0] ptw_desc_id, ptw_desc_tag, comp_tag;
++    logic [1:0] comp_lane;
++    assign comp_lane = comp_id_i[3:2];
++    assign error_o = errors_q;
++
++    always_comb begin
++        lane_active_n = lane_active_q;
++        lane_errors = '0;
++        for (int l = 0; l < 4; l++) begin
++            lane_id_n[l] = lane_id_q[l];
++            lane_gen_n[l] = lane_gen_q[l];
++            // Retire the old descriptor before accepting a replacement.
++            if (done_i[l]) begin
++                if (!lane_active_q[l] || done_id_i[l] != lane_id_q[l]) lane_errors[0] = 1;
++                lane_active_n[l] = 0;
++            end
++            if (issue_i[l]) begin
++                if (lane_active_n[l] || issue_id_i[l] == 0) lane_errors[1] = 1;
++                if (&lane_gen_q[l]) lane_errors[2] = 1;
++                lane_active_n[l] = 1;
++                lane_id_n[l] = issue_id_i[l];
++                lane_gen_n[l] = lane_gen_q[l] + 1;
++            end
++            if (lane_did_fire_i[l] && lane_did_valid_q[l] && lane_did_i[l] != lane_did_q[l])
++                lane_errors[3] = 1;
++        end
++        ptw_lane = 0;
++        ptw_matches = 0;
++        for (int l = 0; l < 4; l++) begin
++            if (lane_did_valid_q[l] && lane_did_q[l] == ptw_i[55:32]) begin
++                ptw_lane = 2'(l);
++                ptw_matches = ptw_matches + 1;
++            end
++        end
++        ptw_desc_id = lane_id_n[ptw_lane];
++        ptw_desc_tag = '0;
++        ptw_desc_tag[31:0] = lane_gen_n[ptw_lane];
++        ptw_desc_tag[33:32] = ptw_lane;
++        ptw_desc_tag[34] = lane_active_n[ptw_lane];
++        ptw_desc_tag[35] = ptw_matches == 1;
++        ptw_desc_tag[38:36] = ptw_matches;
++        comp_tag = '0;
++        comp_tag[31:0] = lane_gen_n[comp_lane];
++        comp_tag[35:32] = comp_id_i;
++        comp_tag[43:36] = comp_len_i;
++        comp_tag[46:44] = comp_size_i;
++        comp_tag[48:47] = comp_burst_i;
++        comp_tag[50:49] = comp_lane;
++        comp_tag[51] = lane_active_n[comp_lane];
++        comp_tag[52] = lane_did_valid_q[comp_lane];
++    end
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            cycle_q <= 0; ptw_count_q <= 0; comp_count_q <= 0;
++            window_ptw_q <= 0; window_normal_ptw_q <= 0;
++            arm_cycle_q <= 0; open_cycle_q <= 0; close_cycle_q <= 0; freeze_cycle_q <= 0;
++            ptw_wr_q <= 0; comp_wr_q <= 0; ptw_valid_q <= 0; comp_valid_q <= 0;
++            lane_active_q <= 0; lane_did_valid_q <= 0;
++            errors_q <= 0; window_q <= 0; armed_q <= 0; frozen_o <= 0;
++            selected_meta_q <= 0; selected_sync_q <= 0; selected_seen_q <= 0;
++            for (int l = 0; l < 4; l++) begin
++                lane_id_q[l] <= 0; lane_gen_q[l] <= 0; lane_did_q[l] <= 0; comp_lane_count_q[l] <= 0;
++            end
++        end else begin
++            cycle_q <= cycle_q + 1;
++            errors_q <= errors_q | lane_errors | (ptw_error_i ? 32'h100 : 0);
++            if (&cycle_q) errors_q[4] <= 1;
++            selected_meta_q <= selected_toggle_async_i;
++            selected_sync_q <= selected_meta_q;
++            selected_seen_q <= selected_sync_q;
++            if (selected_sync_q != selected_seen_q) begin
++                frozen_o <= 1;
++                freeze_cycle_q <= cycle_q;
++            end
++            lane_active_q <= lane_active_n;
++            for (int l = 0; l < 4; l++) begin
++                lane_id_q[l] <= lane_id_n[l]; lane_gen_q[l] <= lane_gen_n[l];
++                if (lane_did_fire_i[l]) begin
++                    lane_did_q[l] <= lane_did_i[l]; lane_did_valid_q[l] <= 1;
++                end
++            end
++            // ARM changes capture state only, never generations or history.
++            if (arm_i) begin
++                armed_q <= 1; window_q <= 0; frozen_o <= 0;
++                arm_cycle_q <= cycle_q;
++                window_ptw_q <= 0; window_normal_ptw_q <= 0;
++                if (selected_sync_q != selected_seen_q) errors_q[5] <= 1;
++            end
++            if (open_i) begin window_q <= 1; open_cycle_q <= cycle_q; end
++            if (close_i) begin window_q <= 0; close_cycle_q <= cycle_q; end
++            if (ptw_fire_i) begin
++                ptw_count_q <= ptw_count_q + 1;
++                if (ptw_count_q >= 64'hffffffff) errors_q[6] <= 1;
++                // Source (open,close] opportunities, independent of UI selection.
++                if (window_q) begin
++                    window_ptw_q <= window_ptw_q + 1;
++                    if (&window_ptw_q) errors_q[6] <= 1;
++                    if (ptw_i[63]) begin
++                        window_normal_ptw_q <= window_normal_ptw_q + 1;
++                        if (&window_normal_ptw_q) errors_q[6] <= 1;
++                    end
++                end
++            end
++            if (comp_fire_i) begin
++                comp_count_q <= comp_count_q + 1;
++                comp_lane_count_q[comp_lane] <= comp_lane_count_q[comp_lane] + 1;
++                if (&comp_lane_count_q[comp_lane]) errors_q[7] <= 1;
++                if (&comp_count_q) errors_q[7] <= 1;
++                if (comp_id_i[1:0] != 0) errors_q[9] <= 1;
++            end
++            // Preserve same-edge records at freeze; no later record is added.
++            if (!frozen_o) begin
++                if (ptw_fire_i) begin
++                    ptw_wr_q <= ptw_wr_q + 1;
++                    if (int'(ptw_valid_q) < PtwDepth) ptw_valid_q <= ptw_valid_q + 1;
++                end
++                if (comp_fire_i) begin
++                    comp_wr_q <= comp_wr_q == 7'(CompDepth-1) ? 7'd0 : comp_wr_q + 1;
++                    if (int'(comp_valid_q) < CompDepth) comp_valid_q <= comp_valid_q + 1;
++                end
++            end
++        end
++    end
++
++    // The two RAM output registers have no reset; valid/bank reset prevents
++    // exposing an uninitialized location. Read only the occupied ring slots.
++    always_ff @(posedge clk_i) begin
++        // Data RAM is never reset. Valid counts and pointers delimit the
++        // records that may be consumed after the common reset.
++        if (!frozen_o) begin
++            if (ptw_fire_i) ptw_mem[ptw_wr_q] <= {ptw_desc_tag, ptw_desc_id,
++                ptw_i[255:192], ptw_i[191:128], ptw_i[127:64], ptw_i[63:0],
++                ptw_count_q + 64'd1, cycle_q};
++            if (comp_fire_i) comp_mem[comp_wr_q] <= {comp_tag, lane_id_n[comp_lane],
++                comp_addr_i, {32'd0, comp_lane_count_q[comp_lane] + 32'd1}, cycle_q};
++        end
++        if (rd_req_i && int'(rd_index_i) >= PtwBase && int'(rd_index_i) < CompBase)
++            ptw_read_q <= ptw_mem[(int'(rd_index_i)-PtwBase)/8];
++        if (rd_req_i && int'(rd_index_i) >= CompBase && int'(rd_index_i) < CompBase+CompDepth*5)
++            comp_read_q <= comp_mem[(int'(rd_index_i)-CompBase)/5];
++    end
++    always_comb begin
++        rd_data_o = header_read_q;
++        if (read_bank_q == 1) rd_data_o = ptw_read_q[int'(read_word_q)*64 +: 64];
++        if (read_bank_q == 2) rd_data_o = comp_read_q[int'(read_word_q)*64 +: 64];
++    end
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            rd_valid_o <= 0; header_read_q <= 0; read_bank_q <= 0; read_word_q <= 0;
++        end else begin
++            rd_valid_o <= rd_req_i;
++            if (rd_req_i) begin
++                header_read_q <= 0; read_bank_q <= 0; read_word_q <= 0;
++                if (int'(rd_index_i) >= PtwBase && int'(rd_index_i) < CompBase) begin
++                    read_bank_q <= 1; read_word_q <= 3'((int'(rd_index_i)-PtwBase)%8);
++                end else if (int'(rd_index_i) >= CompBase && int'(rd_index_i) < CompBase+CompDepth*5) begin
++                    read_bank_q <= 2; read_word_q <= 3'((int'(rd_index_i)-CompBase)%5);
++                end else case (rd_index_i)
++                    0: header_read_q <= 64'h4d49474f574e0001;
++                    1: header_read_q <= {errors_q, 29'd0, armed_q, window_q, frozen_o};
++                    2: header_read_q <= cycle_q;
++                    3: header_read_q <= arm_cycle_q;
++                    4: header_read_q <= open_cycle_q;
++                    5: header_read_q <= close_cycle_q;
++                    6: header_read_q <= freeze_cycle_q;
++                    7: header_read_q <= ptw_count_q;
++                    8: header_read_q <= comp_count_q;
++                    9: header_read_q <= window_ptw_q;
++                    10: header_read_q <= window_normal_ptw_q;
++                    11: header_read_q <= {33'd0, comp_valid_q, comp_wr_q, 3'd0, ptw_valid_q, ptw_wr_q};
++                    12: header_read_q <= {56'd0, lane_did_valid_q, lane_active_q};
++                    13,14,15,16: header_read_q <= {40'd0,lane_did_q[rd_index_i-13]};
++                    17,18,19,20: header_read_q <= lane_id_q[rd_index_i-17];
++                    21,22,23,24: header_read_q <= {32'd0,lane_gen_q[rd_index_i-21]};
++                    25: header_read_q <= {32'(CompBase),32'(PtwBase)};
++                    26: header_read_q <= {16'(CompDepth),16'd5,16'(PtwDepth),16'd8};
++                    27,28,29,30: header_read_q <= {32'd0,comp_lane_count_q[rd_index_i-27]};
++                    default: ;
++                endcase
++            end
++        end
++    end
++endmodule
+--- a/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ptw.sv
++++ b/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ptw.sv
+@@ -81,7 +81,8 @@
+     // Memory interface
+     input  axi_resp_t                   mem_resp_i,
+     output axi_req_t                    mem_req_o,
+-    output logic [1:0]                  e3_level_o
++    output logic [1:0]                  e3_level_o,
++    output logic [6:0]                  capture_state_o
+ );
+ 
+     localparam int unsigned PLEN = RVIOMMUCfg.PAddrWidth;
+@@ -116,6 +117,7 @@
+         STAGE_2_FINAL
+     } ptw_stage_t;
+     ptw_stage_t ptw_stage_q, ptw_stage_n;
++    assign capture_state_o = {implicit_trans_q, s1_lvl_q, main_lvl_q, ptw_stage_q};
+ 
+     // To cast input memory port to normal PTE data
+     rv_iommu::pte_t pte;
+--- a/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv
++++ b/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv
+@@ -130,7 +130,9 @@
+     output logic policy_quiet_o,
+     output logic nonblock_fire_o,
+     output logic nonblock_busy_o,
+-    output logic [15:0] nonblock_diag_o
++    output logic [15:0] nonblock_diag_o,
++    output logic capture_ptw_fire_o, capture_ptw_error_o,
++    output logic [255:0] capture_ptw_o
+ );
+ 
+     initial begin
+@@ -691,6 +693,39 @@
+     axi_resp_t e3_ptw_resp;
+     logic e3_seen_q, e3_first_hit_q, e3_normal, e3_ptw_active;
+     logic [1:0] e3_level;
++    logic [6:0] capture_ptw_state;
++    logic [31:0] capture_owner_gen_q;
++    logic capture_gen_error_q;
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin capture_owner_gen_q <= 0; capture_gen_error_q <= 0; end
++        else if (arb_req_valid && arb_req_ready) begin
++            capture_owner_gen_q <= capture_owner_gen_q + 1;
++            if (&capture_owner_gen_q) capture_gen_error_q <= 1;
++        end
++    end
++    assign capture_ptw_fire_o = e3_ptw_req.ar_valid && e3_ptw_resp.ar_ready;
++    assign capture_ptw_error_o = capture_gen_error_q;
++    always_comb begin
++        capture_ptw_o = 0;
++        capture_ptw_o[31:0] = capture_owner_gen_q;
++        capture_ptw_o[55:32] = req_data.did;
++        capture_ptw_o[61:56] = req_data.ttype;
++        capture_ptw_o[62] = req_data.bank;
++        capture_ptw_o[63] = e3_normal;
++        capture_ptw_o[127:64] = 64'(e3_ptw_req.ar.addr);
++        capture_ptw_o[191:128] = 64'(req_data.iova);
++        capture_ptw_o[211:192] = pscid_q;
++        capture_ptw_o[227:212] = gscid_q;
++        capture_ptw_o[234:228] = capture_ptw_state;
++        capture_ptw_o[235] = en_1S_q;
++        capture_ptw_o[236] = en_2S_q;
++        capture_ptw_o[237] = req_data.is_debug;
++        capture_ptw_o[238] = req_data.pid_valid;
++        capture_ptw_o[246:239] = e3_ptw_req.ar.len;
++        capture_ptw_o[249:247] = e3_ptw_req.ar.size;
++        capture_ptw_o[251:250] = e3_ptw_req.ar.burst;
++        capture_ptw_o[255:252] = e3_ptw_req.ar.id;
++    end
+     logic [63:0] e3_pte_q;
+     logic e3_capture, e3_available, e3_consume, e3_error, e3_a_s1_miss;
+     logic [7:0] e3_extra;
+@@ -770,6 +805,7 @@
+ 
+         .active_o           (e3_ptw_active),
+         .e3_level_o         (e3_level),
++        .capture_state_o    (capture_ptw_state),
+         .error_o            (ptw_error),
+         .error_2S_o         (ptw_error_2S),
+         .error_2S_int_o     (ptw_error_2S_int),
+--- a/corev_apu/riscv-iommu/rtl/rv_iommu_top.sv
++++ b/corev_apu/riscv-iommu/rtl/rv_iommu_top.sv
+@@ -114,7 +114,9 @@
+     output logic trans_accept_o,
+     output rv_iommu::device_id_t trans_did_o,
+     output rv_iommu::ttype_t trans_type_o,
+-    output rv_iommu::research_t research_o
++    output rv_iommu::research_t research_o,
++    output logic capture_ptw_fire_o, capture_ptw_error_o,
++    output logic [255:0] capture_ptw_o
+ );
+ 
+     initial begin
+@@ -558,7 +560,8 @@
+             .nonblock_diag_o(nonblock_diag_o),
+             .e3_enable_i, .e3_arm_i, .e3_active_i, .e3_delay128_i,
+             .e3_waiting_i(e3_ctl_o.victim_waiting != 0 && !e3_ctl_o.queue_error),
+-            .e3_o(e3_tl_o), .research_o
++            .e3_o(e3_tl_o), .research_o,
++            .capture_ptw_fire_o, .capture_ptw_error_o, .capture_ptw_o
+         );
+     end
+     else begin : gen_dc_ext
+@@ -640,7 +643,8 @@
+             .nonblock_diag_o(nonblock_diag_o),
+             .e3_enable_i, .e3_arm_i, .e3_active_i, .e3_delay128_i,
+             .e3_waiting_i(e3_ctl_o.victim_waiting != 0 && !e3_ctl_o.queue_error),
+-            .e3_o(e3_tl_o), .research_o
++            .e3_o(e3_tl_o), .research_o,
++            .capture_ptw_fire_o, .capture_ptw_error_o, .capture_ptw_o
+         );
+     end
+     endgenerate
+--- a/corev_apu/fpga/scripts/run.tcl
++++ b/corev_apu/fpga/scripts/run.tcl
+@@ -67,7 +67,7 @@
+ 
+ add_files -fileset constrs_1 -norecurse constraints/$project.xdc
+ 
+-synth_design -rtl -name rtl_1
++# Root: synth_1 performs authoritative elaboration; omit duplicate RTL-only opening.
+ 
+ set_property STEPS.SYNTH_DESIGN.ARGS.RETIMING true [get_runs synth_1]
+ 
+--- a/corev_apu/fpga/scripts/add_sources.tcl
++++ b/corev_apu/fpga/scripts/add_sources.tcl
+@@ -1,5 +1,5 @@
+-read_vhdl {/home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/apb_uart.vhd /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_clock_div.vhd /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_counter.vhd /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_edge_detect.vhd /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_fifo.vhd /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_input_filter.vhd /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_input_sync.vhd /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_mv_filter.vhd /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/uart_baudgen.vhd /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/uart_interrupt.vhd /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/uart_receiver.vhd /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/uart_transmitter.vhd}
+-read_verilog -sv {/home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/include/cv64a6_imafdc_sv39_config_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/include/riscv_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/include/ariane_dm_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/include/ariane_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/include/ariane_rvfi_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/include/ariane_axi_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/include/wt_cache_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/include/std_cache_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/include/axi_intf.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/include/instr_tracer_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/include/cvxif_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cvxif_example/include/cvxif_instr_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/cf_math_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/register_interface/src/reg_intf.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/tb/rvfi_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/packages/rv_iommu_cfg_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/tb/ariane_soc_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-dbg/src/dm_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/tb/ariane_axi_soc_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/idma_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend_reg_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/packages/rv_iommu_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/packages/rv_iommu_field_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/packages/rv_iommu_reg_pkg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/packages/rv_iommu_dti_ats_pkg.sv}
+-read_verilog -sv {/home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpga-support/rtl/SyncDpRam.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpga-support/rtl/AsyncDpRam.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpga-support/rtl/AsyncThreePortRam.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cvxif_fu.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cvxif_example/cvxif_example_coprocessor.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cvxif_example/instr_decoder.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/fifo_v3.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/lfsr.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/lzc.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/rr_arb_tree.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/shift_reg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/unread.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/popcount.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/exp_backoff.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/counter.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/delta_counter.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_cast_multi.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_classifier.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_divsqrt_multi.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_fma_multi.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_fma.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_noncomp.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_opgroup_block.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_opgroup_fmt_slice.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_opgroup_multifmt_slice.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_rounding.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_top.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/defs_div_sqrt_mvp.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/control_mvp.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/div_sqrt_top_mvp.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/iteration_div_sqrt_mvp.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/norm_div_sqrt_mvp.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/nrbd_nrsc_mvp.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/preprocess_mvp.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/ariane.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cva6.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/alu.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/fpu_wrap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/branch_unit.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/compressed_decoder.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/controller.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/csr_buffer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/csr_regfile.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/decoder.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/ex_stage.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/instr_realign.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/id_stage.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/issue_read_operands.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/issue_stage.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/load_unit.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/load_store_unit.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/lsu_bypass.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mult.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/multiplier.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/serdiv.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/perf_counters.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/ariane_regfile_ff.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/ariane_regfile_fpga.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/re_name.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/scoreboard.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/store_buffer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/amo_buffer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/store_unit.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/commit_stage.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/axi_shim.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/frontend/btb.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/frontend/bht.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/frontend/ras.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/frontend/instr_scan.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/frontend/instr_queue.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/frontend/frontend.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cache_subsystem/wt_dcache_ctrl.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cache_subsystem/wt_dcache_mem.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cache_subsystem/wt_dcache_missunit.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cache_subsystem/wt_dcache_wbuffer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cache_subsystem/wt_dcache.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cache_subsystem/cva6_icache.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cache_subsystem/wt_cache_subsystem.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/cache_subsystem/wt_axi_adapter.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/pmp/src/pmp.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/pmp/src/pmp_entry.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/common/local/util/sram.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv39/mmu.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv39/ptw.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv39/tlb.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv32/cva6_mmu_sv32.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv32/cva6_ptw_sv32.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv32/cva6_tlb_sv32.sv}
+-read_verilog -sv {/home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/tb/axi_adapter.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/bootrom/dromajo_bootrom.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/clint/axi_lite_interface.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/clint/clint.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/axi2apb/src/axi2apb.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/axi2apb/src/axi2apb_64_32.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/axi2apb/src/axi2apb_wrap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_timer/apb_timer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/apb_timer/timer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_ar_buffer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_aw_buffer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_b_buffer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_r_buffer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_single_slice.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_slice.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_slice_wrap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_w_buffer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_res_tbl.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_amos.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_amos_alu.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_atomics.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_atomics_wrap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_lrsc.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_lrsc_wrap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/axi_mem_if/src/axi2mem.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src/prim_subreg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src/prim_subreg_arb.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src/prim_subreg_ext.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src/prim_subreg_shadow.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/ext_interfaces/axi_iommu_intf.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/ext_interfaces/rv_iommu_ds_if.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/ext_interfaces/rv_iommu_prog_if.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_cq_handler.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_dbg_if_ctl.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_fault_arbiter.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_fq_handler.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_hpm.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_msi_ig.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_pq_handler.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_sw_if_wrap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_wsi_ig.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/regmap/rv_iommu_field.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/regmap/rv_iommu_field_arb.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/regmap/rv_iommu_regmap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ddtc.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ddtw.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_e3_delay.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_iotlb.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_mrifc.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_msiptw.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_nonblock_hit.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_pdtc.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_pdtw.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ptw.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_axi_bc.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_banked_ctl.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_e3_queue.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_ign_slv.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_mrif_handler.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/vendor/modified/rv_iommu_axi2apb_64_32.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend_reg_top.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/frontends/idma_transfer_id_gen.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/idma_stream_fifo.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/idma_fullbuffer_certificate.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/idma_buffer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/idma_error_handler.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/idma_channel_coupler.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/idma_axi_transport_layer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/idma_axi_lite_transport_layer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/idma_obi_transport_layer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/idma_legalizer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/idma_backend.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/midends/idma_nd_midend.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/rv_plic/rtl/rv_plic_target.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/rv_plic/rtl/rv_plic_gateway.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/rv_plic/rtl/plic_regmap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/rv_plic/rtl/plic_top.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-dbg/src/dmi_cdc.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-dbg/src/dmi_jtag.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-dbg/src/dmi_jtag_tap.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-dbg/src/dm_csrs.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-dbg/src/dm_mem.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-dbg/src/dm_sba.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-dbg/src/dm_top.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-dbg/debug_rom/debug_rom.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/register_interface/src/apb_to_reg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_multicut.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/rstgen_bypass.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/rstgen.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_mux.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_demux.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/exp_backoff.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/addr_decode.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_register.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/id_queue.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/onehot_to_bin.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_fifo.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/fall_through_register.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_cut.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_join.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_delayer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_to_axi_lite.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_id_prepend.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_atop_filter.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_err_slv.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_mux.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_demux_simple.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_demux.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_xbar_unmuxed.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_xbar.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/cdc_2phase.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/spill_register_flushable.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/spill_register.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_arbiter.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_arbiter_flushable.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/deprecated/fifo_v1.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/deprecated/fifo_v2.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_delay.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/common_cells/src/lfsr_16bit.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/tech_cells_generic/src/deprecated/cluster_clk_cells.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/tech_cells_generic/src/deprecated/pulp_clk_cells.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/tech_cells_generic/src/rtl/tc_clk.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/tb/ariane_testharness.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/tb/ariane_peripherals.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/tb/rvfi_tracer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/tb/common/uart.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/tb/common/SimDTM.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/tb/common/SimJTAG.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/riscv-iommu/rtl/rv_iommu_top.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/register_interface/src/axi_to_reg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/register_interface/src/axi_lite_to_reg.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_burst_splitter.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv39/mmu.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv39/ptw.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv39/tlb.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv39x4/cva6_mmu_sv39x4.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv39x4/cva6_ptw_sv39x4.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/core/mmu_sv39x4/cva6_tlb_sv39x4.sv}
+-read_verilog -sv {/home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane_peripherals_xilinx.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane_xilinx.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/dma_composition_control.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/dma_controlled_launcher.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/dma_e3_observer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/dma_e3_write_observer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/dma_nonblock_observer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/dma_observer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/dma_path_observer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/dma_research_e2_timing.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/dma_research_observer.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/dma_research_policy.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/fan_ctrl.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/bootrom/bootrom_32.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/bootrom/bootrom_64.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/axis_gmii_rx.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/axis_gmii_tx.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/dualmem_widen.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/dualmem_widen8.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/eth_mac_1g.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/eth_mac_1g_rgmii.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/eth_mac_1g_rgmii_fifo.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/framing_top.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/iddr.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/oddr.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/rgmii_core.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/rgmii_lfsr.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/rgmii_phy_if.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/rgmii_soc.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/ssio_ddr_in.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/common/local/util/tc_sram_fpga_wrapper.sv /home/xvhaocheng/work/iommu-platform/out/composition-isolated-20261007/fpga-src/cva6/vendor/pulp-platform/fpga-support/rtl/SyncSpRamBeNx64.sv}
++read_vhdl {/home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/apb_uart.vhd /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_clock_div.vhd /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_counter.vhd /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_edge_detect.vhd /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_fifo.vhd /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_input_filter.vhd /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_input_sync.vhd /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/slib_mv_filter.vhd /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/uart_baudgen.vhd /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/uart_interrupt.vhd /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/uart_receiver.vhd /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_uart/src/uart_transmitter.vhd}
++read_verilog -sv {/home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/include/cv64a6_imafdc_sv39_config_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/include/riscv_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/include/ariane_dm_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/include/ariane_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/include/ariane_rvfi_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/include/ariane_axi_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/include/wt_cache_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/include/std_cache_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/include/axi_intf.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/include/instr_tracer_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/include/cvxif_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cvxif_example/include/cvxif_instr_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/cf_math_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/register_interface/src/reg_intf.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/tb/rvfi_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/packages/rv_iommu_cfg_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/tb/ariane_soc_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-dbg/src/dm_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/tb/ariane_axi_soc_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/idma_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend_reg_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/packages/rv_iommu_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/packages/rv_iommu_field_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/packages/rv_iommu_reg_pkg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/packages/rv_iommu_dti_ats_pkg.sv}
++read_verilog -sv {/home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpga-support/rtl/SyncDpRam.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpga-support/rtl/AsyncDpRam.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpga-support/rtl/AsyncThreePortRam.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cvxif_fu.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cvxif_example/cvxif_example_coprocessor.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cvxif_example/instr_decoder.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/fifo_v3.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/lfsr.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/lzc.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/rr_arb_tree.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/shift_reg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/unread.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/popcount.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/exp_backoff.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/counter.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/delta_counter.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_cast_multi.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_classifier.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_divsqrt_multi.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_fma_multi.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_fma.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_noncomp.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_opgroup_block.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_opgroup_fmt_slice.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_opgroup_multifmt_slice.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_rounding.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpnew_top.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/defs_div_sqrt_mvp.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/control_mvp.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/div_sqrt_top_mvp.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/iteration_div_sqrt_mvp.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/norm_div_sqrt_mvp.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/nrbd_nrsc_mvp.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpnew/src/fpu_div_sqrt_mvp/hdl/preprocess_mvp.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/ariane.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cva6.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/alu.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/fpu_wrap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/branch_unit.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/compressed_decoder.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/controller.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/csr_buffer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/csr_regfile.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/decoder.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/ex_stage.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/instr_realign.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/id_stage.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/issue_read_operands.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/issue_stage.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/load_unit.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/load_store_unit.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/lsu_bypass.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mult.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/multiplier.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/serdiv.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/perf_counters.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/ariane_regfile_ff.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/ariane_regfile_fpga.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/re_name.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/scoreboard.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/store_buffer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/amo_buffer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/store_unit.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/commit_stage.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/axi_shim.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/frontend/btb.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/frontend/bht.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/frontend/ras.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/frontend/instr_scan.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/frontend/instr_queue.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/frontend/frontend.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cache_subsystem/wt_dcache_ctrl.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cache_subsystem/wt_dcache_mem.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cache_subsystem/wt_dcache_missunit.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cache_subsystem/wt_dcache_wbuffer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cache_subsystem/wt_dcache.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cache_subsystem/cva6_icache.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cache_subsystem/wt_cache_subsystem.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/cache_subsystem/wt_axi_adapter.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/pmp/src/pmp.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/pmp/src/pmp_entry.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/common/local/util/sram.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv39/mmu.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv39/ptw.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv39/tlb.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv32/cva6_mmu_sv32.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv32/cva6_ptw_sv32.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv32/cva6_tlb_sv32.sv}
++read_verilog -sv {/home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/tb/axi_adapter.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/bootrom/dromajo_bootrom.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/clint/axi_lite_interface.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/clint/clint.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/axi2apb/src/axi2apb.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/axi2apb/src/axi2apb_64_32.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/axi2apb/src/axi2apb_wrap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_timer/apb_timer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/apb_timer/timer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_ar_buffer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_aw_buffer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_b_buffer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_r_buffer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_single_slice.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_slice.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_slice_wrap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/axi_slice/src/axi_w_buffer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_res_tbl.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_amos.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_amos_alu.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_atomics.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_atomics_wrap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_lrsc.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/src/axi_riscv_atomics/src/axi_riscv_lrsc_wrap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/axi_mem_if/src/axi2mem.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src/prim_subreg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src/prim_subreg_arb.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src/prim_subreg_ext.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src/prim_subreg_shadow.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/ext_interfaces/axi_iommu_intf.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/ext_interfaces/rv_iommu_ds_if.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/ext_interfaces/rv_iommu_prog_if.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_cq_handler.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_dbg_if_ctl.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_fault_arbiter.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_fq_handler.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_hpm.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_msi_ig.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_pq_handler.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_sw_if_wrap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_wsi_ig.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/regmap/rv_iommu_field.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/regmap/rv_iommu_field_arb.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/software_interface/regmap/rv_iommu_regmap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ddtc.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ddtw.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_e3_delay.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_iotlb.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_mrifc.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_msiptw.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_nonblock_hit.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_pdtc.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_pdtw.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_ptw.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_axi_bc.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_banked_ctl.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_e3_queue.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_ign_slv.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_mrif_handler.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/vendor/modified/rv_iommu_axi2apb_64_32.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend_reg_top.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/frontends/idma_transfer_id_gen.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/idma_stream_fifo.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/idma_fullbuffer_certificate.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/idma_buffer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/idma_error_handler.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/idma_channel_coupler.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/idma_axi_transport_layer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/idma_axi_lite_transport_layer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/idma_obi_transport_layer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/idma_legalizer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/idma_backend.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/midends/idma_nd_midend.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/rv_plic/rtl/rv_plic_target.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/rv_plic/rtl/rv_plic_gateway.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/rv_plic/rtl/plic_regmap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/rv_plic/rtl/plic_top.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-dbg/src/dmi_cdc.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-dbg/src/dmi_jtag.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-dbg/src/dmi_jtag_tap.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-dbg/src/dm_csrs.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-dbg/src/dm_mem.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-dbg/src/dm_sba.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-dbg/src/dm_top.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-dbg/debug_rom/debug_rom.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/register_interface/src/apb_to_reg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_multicut.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/rstgen_bypass.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/rstgen.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_mux.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_demux.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/exp_backoff.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/addr_decode.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_register.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/id_queue.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/onehot_to_bin.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_fifo.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/fall_through_register.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_cut.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_join.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_delayer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_to_axi_lite.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_id_prepend.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_atop_filter.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_err_slv.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_mux.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_demux_simple.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_demux.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_xbar_unmuxed.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_xbar.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/cdc_2phase.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/spill_register_flushable.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/spill_register.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_arbiter.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_arbiter_flushable.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/deprecated/fifo_v1.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/deprecated/fifo_v2.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/stream_delay.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/common_cells/src/lfsr_16bit.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/tech_cells_generic/src/deprecated/cluster_clk_cells.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/tech_cells_generic/src/deprecated/pulp_clk_cells.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/tech_cells_generic/src/rtl/tc_clk.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/tb/ariane_testharness.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/tb/ariane_peripherals.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/tb/rvfi_tracer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/tb/common/uart.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/tb/common/SimDTM.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/tb/common/SimJTAG.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/riscv-iommu/rtl/rv_iommu_top.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/register_interface/src/axi_to_reg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/register_interface/src/axi_lite_to_reg.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/axi/src/axi_burst_splitter.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv39/mmu.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv39/ptw.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv39/tlb.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv39x4/cva6_mmu_sv39x4.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv39x4/cva6_ptw_sv39x4.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/core/mmu_sv39x4/cva6_tlb_sv39x4.sv}
++read_verilog -sv {/home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane_peripherals_xilinx.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane_xilinx.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/dma_composition_control.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/dma_controlled_launcher.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/dma_e3_observer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/dma_e3_write_observer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/dma_nonblock_observer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/dma_observer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/dma_path_observer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/dma_research_e2_timing.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/dma_research_observer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/dma_research_policy.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/fan_ctrl.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/mig_capture_cdc.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/mig_read_debt_observer.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/mig_source_owner.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/bootrom/bootrom_32.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/bootrom/bootrom_64.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/axis_gmii_rx.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/axis_gmii_tx.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/dualmem_widen.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/dualmem_widen8.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/eth_mac_1g.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/eth_mac_1g_rgmii.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/eth_mac_1g_rgmii_fifo.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/framing_top.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/iddr.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/oddr.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/rgmii_core.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/rgmii_lfsr.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/rgmii_phy_if.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/rgmii_soc.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/corev_apu/fpga/src/ariane-ethernet/ssio_ddr_in.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/common/local/util/tc_sram_fpga_wrapper.sv /home/xvhaocheng/work/iommu-platform/out/mig-pte-debt-observation-20261015/fpga-src/cva6/vendor/pulp-platform/fpga-support/rtl/SyncSpRamBeNx64.sv}

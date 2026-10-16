@@ -1,0 +1,177 @@
+--- a/tests/nonblock_coupled_test.cpp
++++ b/tests/nonblock_coupled_test.cpp
+@@ -30,6 +30,24 @@
+ //   * a 4096-cycle last-progress watchdog dumps detailed state on a stall.
+ //
++// Overlap mode (opt-in, --overlap)
++// --------------------------------
++// A second stimulus mode relaxes the strict serialization of the two 2 KiB
++// halves of one 4 KiB copy: the two ARs and the two AWs of one job may be in
++// flight concurrently on the upstream translation-request port.  This is the
++// exact R->W decoupling the real iDMA backend exposes when NumAxInFlight > 1
++// and RAWCouplingAvail = 0 (see cva6/corev_apu/iDMA/src/idma_backend.sv:472-473,
++// :554-557, :590-608, :612-625, :837-858).  The dependencies kept by the
++// harness in this mode are:
++//   * W data only from R beats that THIS same DMA actually handshook;
++//   * the same 3-entry R->W coupling FIFO shared by both halves of the DMA;
++//   * W beats strictly matched to the currently-issued AW;
++//   * both AWs of a job emitted in AW-issue order;
++//   * both B responses before the job is reported done / the next job issued;
++//   * the ordered, fully shared memory R-return queue (completion + DDTW +
++//     PTW) is unchanged; PTW is NOT priority-hoisted on a stalled data head.
++// The default mode is byte-for-byte identical to the pre-existing serial run,
++// so the existing PASS logs stay valid.
++//
+ // This is a test harness model.  It is NOT DDR and NOT the real iDMA backend:
+ // it has no XBAR, no rv_iommu_ds_if arbitration, no board axi_delayer and no
+ // ID remap.  It only reproduces the ordering/back-pressure shape of the board.
+@@ -149,6 +167,34 @@
+     struct Dma {
+         bool     used     = false;
+         uint32_t id       = 0;
+         uint32_t did      = 0;
+         uint64_t src_iova = 0, dst_iova = 0;
+         uint64_t src_pa   = 0, dst_pa   = 0;
+         uint32_t src_page = 0;
+ 
+         int      half = 0;          // 0 or 1; 2 -> job done
+         bool     job_done = true;
+ 
+-        bool     ar_want = false, ar_done = false;
+-        bool     aw_want = false, aw_done = false;
+-        uint32_t rx      = 0;       // source R beats consumed this half
+-        bool     r_last  = false;
+-        uint32_t wx      = 0;       // W beats emitted this half
+-        bool     b_done  = false;
++        // Per-half state.  Index 0/1 = half 0 / half 1 of the job.
++        // Serial mode touches only index `half`; overlap mode touches both.
++        bool     ar_want[2] = {false, false};
++        bool     ar_done[2] = {false, false};
++        bool     aw_want[2] = {false, false};
++        bool     aw_done[2] = {false, false};
++        uint32_t rx     [2] = {0, 0};   // source R beats this half
++        bool     r_last [2] = {false, false};
++        uint32_t wx     [2] = {0, 0};   // W beats emitted this half
++        bool     b_done [2] = {false, false};
+ 
+-        std::deque<Beat> cfifo;     // read->write coupling FIFO (<= COUPLE_DEPTH)
++        std::deque<Beat> cfifo;     // read->write coupling FIFO (<= COUPLE_DEPTH)
++                                    // shared across both halves of one DMA
+     };
+     Dma dma[2];                     // [0]=V (bank0), [1]=A (bank1)
+@@ -200,6 +246,21 @@
+     int order_ar_prefer = 0;
+     int order_aw_prefer = 0;
+ 
++    // Overlap mode: honor both halves of one 4 KiB job concurrently.
++    bool overlap_mode = false;
++
++    // Per-DMA selectors for the half whose AR / AW is currently on the wire,
++    // and per-DMA pointers to the half of the next returning R / B / W beat.
++    // They are all no-ops in serial mode (they stay 0 or 1).
++    int ar_half_sel     = -1;
++    int aw_half_sel     = -1;
++    int r_half_cur[2]   = {0, 0};
++    int b_half_cur[2]   = {0, 0};
++    int w_half_cur[2]   = {0, 0};
++
+     // liveness observation
+     long last_progress_cycle = 0;
+ 
+@@ -327,33 +388,41 @@
+         // Once the choice is made it is LOCKED until the handshake, so a second
+         // DMA becoming eligible cannot flip VALID ownership under a stalled beat.
+         if (ar_lock < 0) {
+-            int ar_d = -1;
++            int ar_d = -1, ar_h = -1;
+             if (order_ar_prefer == 0) {
+-                for (int d = 0; d < 2; ++d)
+-                    if (dma[d].used && !dma[d].job_done && dma[d].ar_want && !dma[d].ar_done) {
+-                        ar_d = d; break;
+-                    }
++                for (int d = 0; d < 2 && ar_d < 0; ++d) {
++                    if (!dma[d].used || dma[d].job_done) continue;
++                    for (int h = 0; h < 2; ++h) {
++                        if (dma[d].ar_want[h] && !dma[d].ar_done[h]) {
++                            ar_d = d; ar_h = h; break;
++                        }
++                    }
++                }
+             } else {
+-                for (int d = 1; d >= 0; --d)
+-                    if (dma[d].used && !dma[d].job_done && dma[d].ar_want && !dma[d].ar_done) {
+-                        ar_d = d; break;
+-                    }
++                for (int d = 1; d >= 0 && ar_d < 0; --d) {
++                    if (!dma[d].used || dma[d].job_done) continue;
++                    for (int h = 0; h < 2; ++h) {
++                        if (dma[d].ar_want[h] && !dma[d].ar_done[h]) {
++                            ar_d = d; ar_h = h; break;
++                        }
++                    }
++                }
+             }
+-            if (ar_d < 0 && warm_active && !warm_sent) ar_d = 2;
+-            ar_lock = ar_d;
++            if (ar_d < 0 && warm_active && !warm_sent) { ar_d = 2; ar_h = 0; }
++            ar_lock     = ar_d;
++            ar_half_sel = ar_h;
+         }
+         if (ar_lock == 2) {
+             top->tr_ar_valid = 1;
+@@ -358,7 +427,7 @@
+         } else if (ar_lock >= 0) {
+             Dma& m = dma[ar_lock];
+             top->tr_ar_valid = 1;
+             top->tr_ar_id    = m.id;
+-            top->tr_ar_addr  = m.src_iova + (uint64_t)m.half * 0x800;
++            top->tr_ar_addr  = m.src_iova + (uint64_t)ar_half_sel * 0x800;
+             top->tr_ar_len   = (uint8_t)BURST_LEN;
+             top->tr_ar_size  = 3;
+             top->tr_ar_burst = 1;
+@@ -375,32 +444,40 @@
+         // ---- AW : priority order selectable (see order_aw_prefer); asserted
+         //           independently of cfifo occupancy and read data ----------
+         if (aw_lock < 0) {
+-            int aw_d = -1;
++            int aw_d = -1, aw_h = -1;
+             if (order_aw_prefer == 0) {
+-                for (int d = 0; d < 2; ++d) {
++                for (int d = 0; d < 2 && aw_d < 0; ++d) {
+                     if (!dma[d].used || dma[d].job_done) continue;
+-                    if (!dma[d].aw_want || dma[d].aw_done) continue;
+-                    aw_d = d;
+-                    break;
++                    for (int h = 0; h < 2; ++h) {
++                        if (dma[d].aw_want[h] && !dma[d].aw_done[h]) {
++                            aw_d = d; aw_h = h; break;
++                        }
++                    }
+                 }
+             } else {
+-                for (int d = 1; d >= 0; --d) {
++                for (int d = 1; d >= 0 && aw_d < 0; --d) {
+                     if (!dma[d].used || dma[d].job_done) continue;
+-                    if (!dma[d].aw_want || dma[d].aw_done) continue;
+-                    aw_d = d;
+-                    break;
++                    for (int h = 0; h < 2; ++h) {
++                        if (dma[d].aw_want[h] && !dma[d].aw_done[h]) {
++                            aw_d = d; aw_h = h; break;
++                        }
++                    }
+                 }
+             }
+-            aw_lock = aw_d;
++            aw_lock     = aw_d;
++            aw_half_sel = aw_h;
+         }
+         if (aw_lock >= 0) {
+             Dma& m = dma[aw_lock];
+             top->tr_aw_valid = 1;
+             top->tr_aw_id    = m.id;
+-            top->tr_aw_addr  = m.dst_iova + (uint64_t)m.half * 0x800;
++            top->tr_aw_addr  = m.dst_iova + (uint64_t)aw_half_sel * 0x800;
+             top->tr_aw_len   = (uint8_t)BURST_LEN;
+             top->tr_aw_size  = 3;
+             top->tr_aw_burst = 1;

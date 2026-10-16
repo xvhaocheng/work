@@ -1,0 +1,119 @@
+u64 rtranslate(u16 bus_dev_func, rIOVA iova, u2 dir) {
+rIOTLB_entry e = riotlb_find( bus_dev_func, iova.rid );
+if( ! e ) {
+e = rtable_walk( bus_dev_func, iova );
+riotlb_insert( e );
+}
+if( e.rentry != iova.rentry )
+riotlb_entry_sync( bus_dev_func, iova, e );
+if( iova.offset >= e.rpte.size || ! (e.rpte.dir & dir) )
+io_page_fault();
+return e.rpte.phys_addr + iova.offset;
+}
+void riotlb_entry_sync(u16 bus_dev_func, rIOVA iova,
+rIOTLB_entry e)
+{
+rDEVICE d = get_domain( bus_dev_func );
+u18 next = (e.rentry + 1) % d.rings[e.rid].size;
+if( e.next.valid && (iova.rentry===next) ) {
+e.rpte = e.next; e.rentry = next;
+e.next.valid = 0;
+} else
+e = rtable_walk( bus_dev_func, iova );
+rprefetch( d, e );
+}
+rIOTLB_entry
+rtable_walk(u16 bus_dev_func, rIOVA iova)
+{
+rDEVICE d = get_domain( bus_dev_func );
+if( iova.rid >= d.size ||
+iova.rentry >= d.rings[iova.rid].size ||
+! d.rings[iova.rid].ring[iova.rentry].valid )
+io_page_fault();
+rIOTLB_entry e;
+rRING r = d.rings[iova.rid];
+e.bdf = bus_dev_func;
+e.rid = iova.rid;
+e.rentry = iova.rentry;
+e.rpte = r.ring[e.rentry]; // copy
+rprefetch( d, e );
+return e;
+}
+void rprefetch(rDEVICE d, rIOTLB_entry e) // async
+{
+rRING r = d.rings[e.rid];
+u18 next = (e.rentry + 1) % r.size;
+if( r.size > 1 && r.ring[next].valid )
+e.next = r.ring[next]; // copy
+}
+Figure 10. Outline of the rIOMMU hardware logic. All DMAs are carried out with IOVAs that are translated by rtranslate.
+rIOVA map(rDEVICE d, u16 rid, u64 pa, u30 size, u2 direction)
+{
+rRING r = d.rings[rid];
+locked { if( r.nmapped == r.size ) return OVERFLOW;
+u18 t = r.tail;
+r.tail = (r.tail + 1) % r.size;
+r.nmapped++; }
+r.ring[t].phys_addr = pa;
+r.ring[t].size = size;
+r.ring[t].dir = direction;
+r.ring[t].valid = 1;
+sync_mem( & r.ring[t] );
+return pack_iova( 0/*offset*/, t/*rentry*/, rid );
+}
+void unmap(rDEVICE d, rIOVA iova, bool end_of_burst) {
+rRING r = d.rings[iova.rid];
+r.ring[iova.rentry].valid = 0;
+locked { r.nmapped--; }
+sync_mem( & r.ring[iova.rentry] );
+if( end_of_burst )
+riotlb_invalidate( bus_dev_func(d), iova.rid );
+}
+void sync_mem(void * line) {
+if( ! riommu_pt_is_coherent() ) {
+memory_barrier();
+cache_line_flush( line );
+}
+memory_barrier();
+}
+Figure 11. Outline of the rIOMMU OS driver map and unmap routines, which respectively correspond to Figures 4 and 6.
+provided they conform to the size constraint encoded into the
+corresponding rPTE.
+The flow of unmap (Figure 11/right) corresponds to Figure
+6. Unmap gets an rIOVA, marks the associated rPTE as invalid
+(analogous to walking the table hierarchy), decrements the
+ring’s nmapped counter (analogous to IOVA deallocation),
+and synchronizes the memory to make the rPTE update
+visible to the rIOMMU. Recall that when the device driver
+is notified that its device has finished some DMAs, it loops
+through the relevant descriptors and sequentially unmaps their
+IOVAs (§2.3). The driver sets the end_of_burst parameter of
+unmap to true at the end of this loop upon the last IOVA,
+signifying that an rIOTLB_entry invalidation is required. One
+such invalidation is sufficient for the entire burst because, by
+design, each rRING has at most one rIOTLB_entry allocated in
+the rIOTLB.
+Our experimental measurements indicate that the average
+loop length of a throughput-sensitive workload such as Net-
+perf is ~200 iterations. This is long enough to make the amor-
+tized cost of IOTLB invalidations negligible, as in the deferred
+mode, but without sacrificing safety. Amortization, however,
+does not apply to latency-sensitive workloads. Nonetheless,
+the invalidation cost is small in comparison to the overall
+latency as will shortly be demonstrated.
+Finally, we consider the problem of synchronizing the
+memory between the IOMMU and its driver. In sync_mem
+(Figure 11 bottom/right), we see support for two hardware
+modes, corresponding to whether the IOMMU table walk is
+coherent with the CPU caches. The baseline Linux kernel
+queries the relevant IOMMU capability bit. If it finds that
+the two are not in the same coherency domain, it introduces
+an additional memory barrier followed by a cacheline flush.
+In the following section, we experimentally evaluate two
+simulated rIOMMU versions corresponding to these two
+modes.
+Applicability and Limitations We note in passing that
+rIOMMU relies on the predictability of the order of IOVA
+(un)mappings—not the order by which the IOVAs are used
+by the device. That is, so long as IOVAs are valid (mapped),
+they can be used out of order. They are merely indices to a

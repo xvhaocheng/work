@@ -1,0 +1,143 @@
+#include "Vmig_read_debt_observer.h"
+#include "verilated.h"
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <string>
+
+static Vmig_read_debt_observer d;
+static unsigned checks = 0;
+#ifndef TEST_LIVE_SLOTS
+#define TEST_LIVE_SLOTS 4
+#endif
+#ifndef TEST_EVENT_DEPTH
+#define TEST_EVENT_DEPTH 8
+#endif
+static void check(bool c, const std::string &s) {
+  ++checks;
+  if (!c) { std::cerr << "FAIL " << checks << " " << s << " errors=0x" << std::hex << d.errors_o << "\n"; std::exit(1); }
+}
+static void step() {
+  d.clk_i=0; d.eval(); d.clk_i=1; d.eval(); d.clk_i=0; d.eval();
+}
+static void reset_run() {
+  d.rst_ni=0; d.epoch_start_i=0; d.known_empty_i=0; d.calibrated_i=1; d.epoch_i=7;
+  d.arm_i=0; d.window_i=0; d.abort_i=0; d.external_loss_i=0; d.ar_eligible_i=0;
+  d.arvalid_i=0; d.arready_i=1; d.arid_i=0; d.araddr_i=0; d.arlen_i=0;
+  d.arsize_i=3; d.arburst_i=1; d.rvalid_i=0; d.rready_i=1; d.rid_i=0;
+  d.rlast_i=0; d.rresp_i=0; d.rdata_i=0; d.rd_req_i=0; d.rd_index_i=0;
+  step(); d.rst_ni=1; step(); d.known_empty_i=1; d.epoch_start_i=1; step();
+  d.epoch_start_i=0; d.known_empty_i=0;
+  check(d.errors_o==0,"certified known-empty starts tracking");
+}
+static void reset_precalibration() {
+  reset_run();
+  d.rst_ni=0; d.calibrated_i=0; step(); d.rst_ni=1; step();
+  d.known_empty_i=1; d.epoch_start_i=1; step();
+  d.epoch_start_i=0; d.known_empty_i=0;
+  check(d.errors_o==0,"real reset-release knownempty starts before calibration");
+}
+static void arm() { d.arm_i=1; step(); d.arm_i=0; }
+static void ar(unsigned id,unsigned len,unsigned addr,bool eligible=false) {
+  d.arid_i=id; d.arlen_i=len; d.araddr_i=addr; d.ar_eligible_i=eligible;
+  d.arvalid_i=1; step(); d.arvalid_i=0; d.ar_eligible_i=0;
+}
+static void beat(unsigned id,bool last,bool ready=true) {
+  d.rid_i=id; d.rlast_i=last; d.rvalid_i=1; d.rready_i=ready;
+  step(); d.rvalid_i=0; d.rready_i=1;
+}
+static uint64_t rd(unsigned index) {
+  d.rd_index_i=index; d.rd_req_i=1; step();
+  d.rd_req_i=0; step();
+  check(d.rd_valid_o,"registered read response valid");
+  auto v=d.rd_data_o; step(); return v;
+}
+int main(int argc,char **argv) {
+  Verilated::commandArgs(argc,argv);
+  reset_precalibration(); step();
+  d.calibrated_i=1; ar(32,0,0x1000); // First calibrated edge may accept AR.
+  arm(); d.window_i=1; ar(48,0,0x2000,true); beat(32,1); beat(48,1); d.window_i=0; step();
+  check(d.frozen_o && !d.errors_o && rd(21)==1,"first calibrated AR is tracked as carry-in");
+  reset_precalibration(); ar(32,0,0x1000);
+  check(d.errors_o&(1<<1),"AR acceptance before calibration invalid");
+  reset_precalibration(); beat(32,1);
+  check(d.errors_o&(1<<1),"RVALID before calibration invalid");
+  reset_precalibration(); arm();
+  check(d.errors_o&(1<<1),"ARM before calibration invalid");
+  reset_run(); ar(32,3,0x1000); arm(); d.window_i=1;
+  d.rid_i=32; d.rvalid_i=1; d.rlast_i=0; ar(48,0,0x2000,true); d.rvalid_i=0;
+  check(rd(21)==3,"ARLEN+1 minus same-edge Rfire gives k=3");
+  auto w=rd(32); check(((w>>27)&511)==3 && (w&1),"snapshot exact k");
+  d.window_i=0; step(); check(!d.frozen_o,"close waits for episode completion");
+  beat(32,0,false); beat(32,0); beat(32,0); beat(32,1);
+  beat(48,1,false); beat(48,1);
+  check(d.frozen_o && !d.errors_o,"clean episode freezes");
+  auto x=rd(15),y=rd(16),z=rd(36);
+  check(x<y,"firstRVALID differs from firstRfire under held output");
+  check(z<x,"payload last fire precedes P first valid");
+  check(rd(38)==3,"all post-P predecessor Rfires retained");
+  check(rd(23)==7,"selected log includes same-edge and held cycles");
+  w=rd(0x201); check((w&(1ull<<12)) && (w&(1ull<<11)) && (w&(1ull<<10)) && (w&(1ull<<9)),"same-edge R event flags");
+  x=rd(9); ar(1,0,0x3000); y=rd(9); check(x==y,"frozen readback coherent during continuing traffic");
+
+  reset_run(); ar(32,0,0x1000); ar(32,1,0x1100); arm(); d.window_i=1;
+  ar(48,0,0x2000,true); d.window_i=0; step();
+  beat(32,1); beat(32,0); beat(32,1); beat(48,1);
+  check(d.frozen_o && !d.errors_o,"same-RID FIFO with distinct lengths");
+  x=rd(33); y=rd(41);
+  check(x==0x0000000100000001ull && y==0x0000000200000002ull,"global ordinal/perRID occurrence");
+  check((rd(0x201)>>32)==1,"first RID return uses older occurrence");
+  check((rd(0x203)>>32)==2,"next RID return uses next occurrence");
+
+  reset_run(); ar(32,1,0x1000); ar(1,0,0x1200); arm(); d.window_i=1;
+  ar(48,0,0x2000,true); d.window_i=0; step();
+  beat(48,1);
+  check(d.errors_o&(1<<2),"return contrary to bound MIG FIFO invalidates observation");
+  check(rd(21)==3,"FIFO scope failure cannot erase accepted predecessor debt");
+
+  reset_run(); ar(32,255,0x1000);
+  for(unsigned i=0;i<255;i++) beat(32,0); beat(32,1);
+  arm(); d.window_i=1; ar(48,0,0x2000,true); beat(48,1); d.window_i=0; step();
+  check(d.frozen_o && !d.errors_o && rd(20)==0,"LEN255 is 256 beats, retires exactly before ARM");
+
+  reset_run(); ar(32,0,0x1000); beat(32,1); ar(32,0,0x1100);
+  arm(); d.window_i=1; ar(48,0,0x2000,true); beat(32,1); beat(48,1); d.window_i=0; step();
+  check(d.frozen_o && !d.errors_o,"reused live slot does not reuse accepted ordinal");
+  check(rd(41)==0x0000000200000002ull,"RID reuse after retirement keeps second occurrence");
+
+  reset_run(); ar(32,0,0x1000); arm(); d.window_i=1;
+  d.rvalid_i=1; d.rid_i=32; d.rlast_i=1; ar(48,0,0x2000,true); d.rvalid_i=0;
+  check(rd(21)==0 && d.selected_o,"selection independent of positive debt");
+  w=rd(32); check((w&3)==3 && ((w>>27)&511)==0,"same-edge completed predecessor retained with k=0");
+  beat(48,1); ar(48,0,0x2100,true); beat(48,1); d.window_i=0; step();
+  check(rd(11)==2,"eligible count continues across complete window");
+  check((rd(12)&0xffffffff)==2,"first eligible remains selected");
+
+  reset_run(); arm(); d.window_i=1; step(); d.window_i=0; step(); w=rd(1);
+  check(d.frozen_o && !d.selected_o && (w&12)==12,"no-PTE full window explicit");
+  reset_run(); arm(); d.window_i=1; ar(48,0,0x2000,true);
+  d.rvalid_i=1; d.rid_i=48; d.rlast_i=1; d.rready_i=0;
+  for(int i=0;i<TEST_EVENT_DEPTH+1;i++) step(); check(d.errors_o&(1<<12),"event overflow explicit without backpressure");
+  d.rready_i=1; step(); d.rvalid_i=0; d.window_i=0; step();
+  check(d.frozen_o && (d.errors_o&(1<<12)),"event overflow sticky in frozen capture");
+  check(rd(23)==TEST_EVENT_DEPTH,"event count saturates at actual RAM depth");
+  w=rd(0x200+2*(TEST_EVENT_DEPTH-1)+1);
+  check((w>>32)==1 && (w&(1<<9)) && !(w&(1<<10)),"last event RAM address preserves final held beat");
+  reset_run(); for(unsigned i=0;i<TEST_LIVE_SLOTS+1;i++) ar(i%64,0,0x1000+i*8);
+  check(d.errors_o&(1<<5),"live slot overflow explicit");
+  reset_run(); beat(32,1); check(d.errors_o&(1<<2),"unmatched RID invalid");
+  reset_run(); ar(32,1,0x1000); beat(32,1); check(d.errors_o&(1<<3),"early RLAST invalid");
+  reset_run(); ar(32,0,0x1000); beat(32,0); check(d.errors_o&(1<<3),"missing RLAST invalid");
+  reset_run(); ar(32,0,0x1000); d.rresp_i=2; beat(32,1); check(d.errors_o&(1<<4),"RRESP invalid");
+  reset_run(); ar(32,0,0x1000); beat(32,1,false); d.rdata_i=1; beat(32,1);
+  check(d.errors_o&(1<<8),"held R data change invalid");
+  reset_run(); d.arvalid_i=1; d.arready_i=0; d.arid_i=32; step(); d.araddr_i++; step();
+  check(d.errors_o&(1<<7),"held AR change invalid");
+  reset_run(); d.calibrated_i=0; step(); check(d.errors_o&(1<<1),"calibration drop invalid");
+  reset_run(); d.epoch_i=8; step(); check(d.errors_o&(1<<1),"epoch change invalid");
+  reset_run(); d.external_loss_i=1; step(); check(d.errors_o&(1<<9),"external loss invalid");
+  reset_run(); arm(); d.abort_i=1; step(); check(d.frozen_o && (d.errors_o&(1<<13)),"abort frozen and invalid");
+  reset_run(); ar(32,0,0x1000); d.known_empty_i=1; d.epoch_start_i=1; step();
+  check(d.errors_o&1,"epoch start cannot clear live ledger");
+  std::cout << "PASS " << checks << " focused checks\n"; d.final();
+}

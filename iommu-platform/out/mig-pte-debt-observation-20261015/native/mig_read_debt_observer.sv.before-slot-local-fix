@@ -1,0 +1,520 @@
+// SPDX-License-Identifier: Solderpad-0.51
+// PRIVATE passive observer. Every input is in the actual MIG ui_clk domain.
+// No observer output may drive an AXI handshake, scheduler or memory request.
+module mig_read_debt_observer #(
+  parameter int unsigned LiveSlots = 32,
+  parameter int unsigned EventDepth = 1024
+) (
+  input logic clk_i, rst_ni,
+  input logic epoch_start_i, known_empty_i, calibrated_i,
+  input logic [31:0] epoch_i,
+  input logic arm_i, window_i, abort_i, external_loss_i,
+  input logic ar_eligible_i,
+  input logic arvalid_i, arready_i,
+  input logic [5:0] arid_i,
+  input logic [29:0] araddr_i,
+  input logic [7:0] arlen_i,
+  input logic [2:0] arsize_i,
+  input logic [1:0] arburst_i,
+  input logic rvalid_i, rready_i,
+  input logic [5:0] rid_i,
+  input logic rlast_i,
+  input logic [1:0] rresp_i,
+  input logic [63:0] rdata_i,
+  input logic rd_req_i,
+  input logic [11:0] rd_index_i,
+  output logic rd_valid_o,
+  output logic [63:0] rd_data_o,
+  output logic selected_toggle_o,
+  output logic selected_o, frozen_o,
+  output logic [31:0] errors_o
+);
+  localparam logic [63:0] Magic = 64'h4d49474445425401;
+  localparam int EventBase = 'h200;
+  localparam int EventIndexW = $clog2(EventDepth);
+  localparam int SlotWidth = LiveSlots > 1 ? $clog2(LiveSlots) : 1;
+  typedef struct packed {
+    logic valid;
+    logic [5:0] id;
+    logic [29:0] addr;
+    logic [7:0] len;
+    logic [2:0] size;
+    logic [1:0] burst;
+    logic [31:0] ordinal, rid_occ;
+    logic [8:0] remaining;
+    logic [63:0] t_ar, held;
+  } live_t;
+  typedef struct packed {
+    logic valid, completed;
+    logic [5:0] id;
+    logic [29:0] addr;
+    logic [7:0] len;
+    logic [2:0] size;
+    logic [1:0] burst;
+    logic [31:0] ordinal, rid_occ;
+    logic [8:0] at_p, remaining;
+    logic [63:0] t_ar, t_last, held;
+    logic [31:0] fires_after_p;
+  } pred_t;
+  typedef struct packed {
+    logic tracking, calibration_seen, armed, window_seen, window_closed, window_prev;
+    logic selected, episode_done, frozen, selected_toggle;
+    logic p_first_valid, p_first_fire, p_last;
+    logic [31:0] errors, epoch, ordinal;
+    logic [SlotWidth-1:0] head, tail;
+    logic [5:0] occupancy;
+    logic [13:0] total_debt;
+    logic [63:0] tick, start_tick, open_tick, close_tick, freeze_tick;
+    logic [63:0] accepted, r_fires, eligible;
+    logic [31:0] p_ordinal, p_rid_occ;
+    logic [5:0] p_id;
+    logic [29:0] p_addr;
+    logic [7:0] p_len;
+    logic [2:0] p_size;
+    logic [1:0] p_burst;
+    logic [8:0] p_remaining;
+    logic [63:0] p_t_ar, p_t_valid, p_t_fire, p_t_last, p_held;
+    logic [31:0] pred_count, pred_debt, max_live, event_count;
+    logic [31:0] frozen_errors, frozen_max_live, frozen_ordinal;
+    logic [63:0] frozen_accepted, frozen_r_fires;
+    logic [63:0] held_cycles, no_valid_cycles;
+    logic ar_held, r_held;
+    logic [48:0] held_ar;
+    logic [72:0] held_r;
+  } state_t;
+  state_t q, n;
+  live_t live_q [LiveSlots], live_n [LiveSlots];
+  pred_t pred_q [LiveSlots], pred_n [LiveSlots];
+  logic [31:0] rid_occ_q [64], rid_occ_n [64];
+  (* ram_style = "block" *) logic [127:0] event_mem [EventDepth];
+  logic event_we;
+  logic [EventIndexW-1:0] event_waddr;
+  logic [127:0] event_wdata, event_rdata_q;
+  logic [63:0] static_data, static_data_q;
+  logic [63:0] pred_word [LiveSlots];
+  logic [63:0] pred_group_q [4];
+  logic [1:0] rd_group_q;
+  logic [4:0] pred_read_slot;
+  logic rd_event_q, rd_half_q, rd_pred_q, rd_pending_q;
+  logic ar_fire, r_fire, select_now;
+  int rslot, free_slot;
+  logic [48:0] ar_tuple;
+  logic [72:0] r_tuple;
+  assign ar_fire = arvalid_i && arready_i;
+  assign r_fire = rvalid_i && rready_i;
+  assign ar_tuple = {arburst_i, arsize_i, arlen_i, arid_i, araddr_i};
+  assign r_tuple = {rdata_i, rresp_i, rlast_i, rid_i};
+  assign selected_o = q.selected;
+  assign frozen_o = q.frozen;
+  assign selected_toggle_o = q.selected_toggle;
+  assign errors_o = q.frozen ? q.frozen_errors : q.errors;
+  assign pred_read_slot = 5'((int'(rd_index_i)-32)/8);
+
+  initial begin
+    assert (LiveSlots > 0 && LiveSlots <= 32);
+    assert (EventDepth >= 2 && EventDepth <= 1024 && (EventDepth & (EventDepth-1)) == 0);
+  end
+
+  // This private monitor binds the already verified generated MIG NORM AXI
+  // service, whose accepted reads retire in global FIFO order. Validate that
+  // invariant at every RVALID; a different RID at the head invalidates capture.
+  // This is not a generic AXI out-of-order monitor or a new service policy.
+  always_comb begin
+    n = q;
+    for (int i = 0; i < LiveSlots; i++) begin
+      live_n[i] = live_q[i];
+      pred_n[i] = pred_q[i];
+    end
+    for (int i = 0; i < 64; i++) rid_occ_n[i] = rid_occ_q[i];
+    event_we = 0;
+    event_waddr = EventIndexW'(q.event_count);
+    event_wdata = '0;
+    rslot = -1;
+    free_slot = -1;
+    select_now = q.tracking && q.armed && !q.frozen && !q.selected &&
+                 window_i && ar_fire && ar_eligible_i;
+
+    // A later ARM never clears accepted transactions or sticky track errors.
+    // epoch_start is accepted only once after the real MIG aresetn release,
+    // before any AR/R. Start before calibration so the first calibrated AR
+    // cannot escape. Calibration completion is a separate monotonic condition.
+    if (epoch_start_i) begin
+      if (!q.tracking && known_empty_i && !ar_fire && !rvalid_i) begin
+        n.tracking = 1;
+        n.calibration_seen = calibrated_i;
+        n.epoch = epoch_i;
+        n.start_tick = q.tick;
+      end else n.errors[0] = 1;
+    end
+    if (q.tracking) begin
+      n.tick = q.tick + 1;
+      // Every 64-bit event/held counter starts at zero in this epoch (or
+      // later) and increments at most once per UI edge, hence cannot wrap
+      // before tick. Per-read fires_after_p is bounded by LEN+1 <= 256;
+      // length/RLAST checking retires that occurrence. Independent 32-bit
+      // accepted ordinals/occurrences retain their explicit overflow checks.
+      if (&q.tick) n.errors[6] = 1;
+      if (calibrated_i) n.calibration_seen = 1;
+      if ((q.calibration_seen && !calibrated_i) || epoch_i != q.epoch ||
+          (!calibrated_i && (ar_fire || rvalid_i))) n.errors[1] = 1;
+      if (external_loss_i) n.errors[9] = 1;
+
+      if (arm_i) begin
+        if (!calibrated_i) n.errors[1] = 1;
+        if (window_i || (q.armed && !q.frozen)) n.errors[10] = 1;
+        n.armed = 1;
+        n.window_seen = 0;
+        n.window_closed = 0;
+        n.window_prev = 0;
+        n.selected = 0;
+        n.episode_done = 0;
+        n.frozen = 0;
+        n.p_first_valid = 0;
+        n.p_first_fire = 0;
+        n.p_last = 0;
+        n.open_tick = 0;
+        n.close_tick = 0;
+        n.freeze_tick = 0;
+        n.eligible = 0;
+        n.p_ordinal = 0;
+        n.p_rid_occ = 0;
+        n.p_id = 0;
+        n.p_addr = 0;
+        n.p_len = 0;
+        n.p_size = 0;
+        n.p_burst = 0;
+        n.p_remaining = 0;
+        n.p_t_ar = 0;
+        n.p_t_valid = 0;
+        n.p_t_fire = 0;
+        n.p_t_last = 0;
+        n.p_held = 0;
+        n.pred_count = 0;
+        n.pred_debt = 0;
+        n.event_count = 0;
+        n.held_cycles = 0;
+        n.no_valid_cycles = 0;
+        for (int i = 0; i < LiveSlots; i++) pred_n[i] = '0;
+      end
+      if (q.armed && !q.frozen) begin
+        n.window_prev = window_i;
+        if (window_i && !q.window_prev) begin
+          if (q.window_seen || q.window_closed) n.errors[11] = 1;
+          n.window_seen = 1;
+          n.open_tick = q.tick;
+        end
+        if (!window_i && q.window_prev) begin
+          n.window_closed = 1;
+          n.close_tick = q.tick;
+        end
+        if (window_i && ar_fire && ar_eligible_i) begin
+          n.eligible = q.eligible + 1;
+        end
+      end
+
+      if (q.ar_held && (!arvalid_i || ar_tuple != q.held_ar)) n.errors[7] = 1;
+      if (q.r_held && (!rvalid_i || r_tuple != q.held_r)) n.errors[8] = 1;
+      n.ar_held = arvalid_i && !arready_i;
+      n.r_held = rvalid_i && !rready_i;
+      n.held_ar = ar_tuple;
+      n.held_r = r_tuple;
+      if (q.occupancy != 0 && live_q[q.head].valid && live_q[q.head].id == rid_i)
+        rslot = int'(q.head);
+      // R is processed before the P snapshot, including an RLAST on this edge.
+      if (rvalid_i) begin
+        if (rslot < 0) n.errors[2] = 1;
+        if (rresp_i != 0) n.errors[4] = 1;
+        if (rslot >= 0) begin
+          if (rlast_i != (live_q[q.head].remaining == 1)) n.errors[3] = 1;
+          if (!rready_i) begin
+            live_n[q.head].held = live_q[q.head].held + 1;
+          end
+          if (q.selected && live_q[q.head].ordinal == q.p_ordinal) begin
+            if (!q.p_first_valid) begin
+              n.p_first_valid = 1;
+              n.p_t_valid = q.tick;
+            end
+            if (!rready_i) begin
+              n.p_held = q.p_held + 1;
+            end
+            if (r_fire) begin
+              if (!q.p_first_fire) begin n.p_first_fire = 1; n.p_t_fire = q.tick; end
+              n.p_remaining = q.p_remaining - 1;
+              if (live_q[q.head].remaining == 1) begin
+                n.p_last = 1;
+                n.p_t_last = q.tick;
+              end
+            end
+          end
+          if (r_fire) begin
+            live_n[q.head].remaining = live_q[q.head].remaining - 1;
+            n.total_debt = q.total_debt - 1;
+            if (live_q[q.head].remaining == 1) begin
+              live_n[q.head].valid = 0;
+              n.occupancy = q.occupancy - 1;
+              n.head = int'(q.head) == LiveSlots-1 ? '0 : q.head + 1'b1;
+            end
+          end
+          if (q.selected && !q.episode_done) begin
+            for (int i = 0; i < LiveSlots; i++) begin
+              if (pred_q[i].valid && pred_q[i].ordinal == live_q[q.head].ordinal) begin
+                pred_n[i].remaining = live_n[q.head].remaining;
+                pred_n[i].held = live_n[q.head].held;
+                if (r_fire) begin
+                  pred_n[i].fires_after_p = pred_q[i].fires_after_p + 1;
+                  if (live_q[q.head].remaining == 1) begin
+                    pred_n[i].completed = 1;
+                    pred_n[i].t_last = q.tick;
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+      if (r_fire) begin
+        n.r_fires = q.r_fires + 1;
+      end
+      if (select_now) begin
+        n.selected = 1;
+        n.selected_toggle = !q.selected_toggle;
+        n.p_ordinal = q.ordinal + 1;
+        n.p_rid_occ = rid_occ_q[arid_i] + 1;
+        n.p_id = arid_i;
+        n.p_addr = araddr_i;
+        n.p_len = arlen_i;
+        n.p_size = arsize_i;
+        n.p_burst = arburst_i;
+        n.p_remaining = {1'b0, arlen_i} + 1;
+        n.p_t_ar = q.tick;
+        n.pred_count = {26'd0,q.occupancy};
+        n.pred_debt = {18'd0,n.total_debt};
+        for (int i = 0; i < LiveSlots; i++) begin
+          if (live_q[i].valid) begin
+            pred_n[i].valid = 1;
+            pred_n[i].completed = !live_n[i].valid;
+            pred_n[i].id = live_q[i].id;
+            pred_n[i].addr = live_q[i].addr;
+            pred_n[i].len = live_q[i].len;
+            pred_n[i].size = live_q[i].size;
+            pred_n[i].burst = live_q[i].burst;
+            pred_n[i].ordinal = live_q[i].ordinal;
+            pred_n[i].rid_occ = live_q[i].rid_occ;
+            pred_n[i].at_p = live_n[i].remaining;
+            pred_n[i].remaining = live_n[i].remaining;
+            pred_n[i].t_ar = live_q[i].t_ar;
+            pred_n[i].t_last = !live_n[i].valid ? q.tick : 0;
+            pred_n[i].held = live_n[i].held;
+            pred_n[i].fires_after_p = 0;
+          end
+        end
+      end
+
+      // No telemetry backpressure. Overflow poisons the record immediately.
+      if ((q.selected && !q.episode_done && !q.frozen) || select_now) begin
+        if (rvalid_i) begin
+          if (q.event_count < EventDepth) begin
+            event_we = 1;
+            event_wdata[63:0] = q.tick;
+            event_wdata[69:64] = rid_i;
+            event_wdata[70] = rlast_i;
+            event_wdata[72:71] = rresp_i;
+            event_wdata[73] = rvalid_i;
+            event_wdata[74] = rready_i;
+            event_wdata[75] = rslot >= 0;
+            event_wdata[76] = select_now;
+            if (rslot >= 0) event_wdata[127:96] = live_q[q.head].ordinal;
+            n.event_count = q.event_count + 1;
+          end else n.errors[12] = 1;
+          if (!rready_i) begin
+            n.held_cycles = q.held_cycles + 1;
+          end
+        end else begin
+          n.no_valid_cycles = q.no_valid_cycles + 1;
+        end
+      end
+
+      if (ar_fire) begin
+        n.accepted = q.accepted + 1;
+        n.ordinal = q.ordinal + 1;
+        rid_occ_n[arid_i] = rid_occ_q[arid_i] + 1;
+        if (&q.ordinal || &rid_occ_q[arid_i]) n.errors[6] = 1;
+        // FIFO slot ownership follows head/tail, so no second associative
+        // lookup through the updated table is needed to grant an AR slot.
+        if (int'(q.occupancy) < LiveSlots ||
+            (r_fire && rslot >= 0 && live_q[q.head].remaining == 1)) free_slot = int'(q.tail);
+        if (free_slot < 0) n.errors[5] = 1;
+        else begin
+          live_n[q.tail] = '0;
+          live_n[q.tail].valid = 1;
+          live_n[q.tail].id = arid_i;
+          live_n[q.tail].addr = araddr_i;
+          live_n[q.tail].len = arlen_i;
+          live_n[q.tail].size = arsize_i;
+          live_n[q.tail].burst = arburst_i;
+          live_n[q.tail].ordinal = q.ordinal + 1;
+          live_n[q.tail].rid_occ = rid_occ_q[arid_i] + 1;
+          live_n[q.tail].remaining = {1'b0, arlen_i} + 1;
+          live_n[q.tail].t_ar = q.tick;
+          n.occupancy = n.occupancy + 1;
+          n.total_debt = n.total_debt + {6'd0,arlen_i} + 14'd1;
+          n.tail = int'(q.tail) == LiveSlots-1 ? '0 : q.tail + 1'b1;
+        end
+      end
+      if ({26'd0,n.occupancy} > q.max_live) n.max_live = {26'd0,n.occupancy};
+      // Checked global FIFO retirement means P cannot be head until every
+      // predecessor has retired. Offline validation also checks every row.
+      if (n.selected && n.p_last) n.episode_done = 1;
+      if (n.armed && n.window_closed && (!n.selected || n.episode_done) && !q.frozen) begin
+        n.frozen = 1;
+        n.freeze_tick = q.tick;
+      end
+      if (abort_i && q.armed && !q.frozen) begin
+        n.errors[13] = 1;
+        n.frozen = 1;
+        n.freeze_tick = q.tick;
+      end
+      if (n.frozen && !q.frozen) begin
+        n.frozen_errors = n.errors;
+        n.frozen_accepted = n.accepted;
+        n.frozen_r_fires = n.r_fires;
+        n.frozen_max_live = n.max_live;
+        n.frozen_ordinal = n.ordinal;
+      end
+    end else if (arm_i) n.errors[14] = 1;
+  end
+
+  always_comb begin
+    static_data = '0;
+    case (rd_index_i)
+      0: static_data = Magic;
+      1: begin
+        static_data[0] = q.tracking;
+        static_data[1] = q.armed;
+        static_data[2] = q.window_seen;
+        static_data[3] = q.window_closed;
+        static_data[4] = q.selected;
+        static_data[5] = q.episode_done;
+        static_data[6] = q.frozen;
+        static_data[7] = q.p_first_valid;
+        static_data[8] = q.p_first_fire;
+        static_data[9] = q.p_last;
+        static_data[10] = q.selected_toggle;
+        static_data[11] = q.calibration_seen;
+      end
+      2: static_data = {32'b0, q.frozen ? q.frozen_errors : q.errors};
+      3: static_data = {32'b0, q.epoch};
+      4: static_data = q.frozen ? q.freeze_tick : q.tick;
+      5: static_data = q.start_tick;
+      6: static_data = q.open_tick;
+      7: static_data = q.close_tick;
+      8: static_data = q.freeze_tick;
+      9: static_data = q.frozen ? q.frozen_accepted : q.accepted;
+      10: static_data = q.frozen ? q.frozen_r_fires : q.r_fires;
+      11: static_data = q.eligible;
+      12: static_data = {q.p_rid_occ, q.p_ordinal};
+      13: begin
+        static_data[29:0] = q.p_addr;
+        static_data[35:30] = q.p_id;
+        static_data[43:36] = q.p_len;
+        static_data[46:44] = q.p_size;
+        static_data[48:47] = q.p_burst;
+      end
+      14: static_data = q.p_t_ar;
+      15: static_data = q.p_t_valid;
+      16: static_data = q.p_t_fire;
+      17: static_data = q.p_t_last;
+      18: static_data = q.p_held;
+      19: begin static_data[8:0] = q.p_remaining; static_data[24:16] = {1'b0,q.p_len}+1; end
+      20: static_data = {32'b0, q.pred_count};
+      21: static_data = {32'b0, q.pred_debt};
+      22: static_data = {32'b0, q.frozen ? q.frozen_max_live : q.max_live};
+      23: static_data = {32'b0, q.event_count};
+      24: static_data = q.held_cycles;
+      25: static_data = q.no_valid_cycles;
+      26: static_data = {32'(EventDepth), 32'(LiveSlots)};
+      27: static_data = {32'b0, q.frozen ? q.frozen_ordinal : q.ordinal};
+      default: ;
+    endcase
+  end
+
+  // Parallel word selection and a registered grouped read avoid a serial
+  // 32-entry priority chain on the slow, post-capture MMIO path.
+  for (genvar i = 0; i < LiveSlots; i++) begin : gen_pred_words
+    always_comb begin
+      pred_word[i] = '0;
+      case (rd_index_i[2:0])
+              0: begin
+                pred_word[i][0] = pred_q[i].valid;
+                pred_word[i][1] = pred_q[i].completed;
+                pred_word[i][13:8] = pred_q[i].id;
+                pred_word[i][21:14] = pred_q[i].len;
+                pred_word[i][24:22] = pred_q[i].size;
+                pred_word[i][26:25] = pred_q[i].burst;
+                pred_word[i][35:27] = pred_q[i].at_p;
+                pred_word[i][44:36] = pred_q[i].remaining;
+              end
+              1: pred_word[i] = {pred_q[i].rid_occ, pred_q[i].ordinal};
+              2: pred_word[i] = {34'b0, pred_q[i].addr};
+              3: pred_word[i] = pred_q[i].t_ar;
+              4: pred_word[i] = pred_q[i].t_last;
+              5: pred_word[i] = pred_q[i].held;
+              6: pred_word[i] = {32'b0, pred_q[i].fires_after_p};
+              default: ;
+      endcase
+    end
+  end
+  for (genvar g = 0; g < 4; g++) begin : gen_pred_read_groups
+    logic [63:0] words [8];
+    for (genvar k = 0; k < 8; k++) begin : gen_words
+      if (g*8+k < LiveSlots) assign words[k] = pred_word[g*8+k];
+      else assign words[k] = '0;
+    end
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+      if (!rst_ni) pred_group_q[g] <= '0;
+      else if (rd_req_i) pred_group_q[g] <= words[pred_read_slot[2:0]];
+    end
+  end
+
+  // Event RAM is never bulk-cleared: event_count bounds the valid region.
+  // Fully registered read port permits BRAM implementation and a CDC mailbox.
+  always_ff @(posedge clk_i) begin
+    if (event_we) event_mem[event_waddr] <= event_wdata;
+    if (rd_req_i && int'(rd_index_i) >= EventBase &&
+        int'(rd_index_i) < EventBase+EventDepth*2)
+      event_rdata_q <= event_mem[EventIndexW'((int'(rd_index_i)-EventBase)/2)];
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      q <= '0;
+      for (int i = 0; i < LiveSlots; i++) begin live_q[i] <= '0; pred_q[i] <= '0; end
+      for (int i = 0; i < 64; i++) rid_occ_q[i] <= '0;
+      rd_valid_o <= 0;
+      static_data_q <= 0;
+      rd_event_q <= 0;
+      rd_half_q <= 0;
+      rd_pred_q <= 0;
+      rd_pending_q <= 0;
+      rd_group_q <= 0;
+      rd_data_o <= 0;
+    end else begin
+      q <= n;
+      for (int i = 0; i < LiveSlots; i++) begin live_q[i] <= live_n[i]; pred_q[i] <= pred_n[i]; end
+      for (int i = 0; i < 64; i++) rid_occ_q[i] <= rid_occ_n[i];
+      rd_pending_q <= rd_req_i;
+      rd_valid_o <= rd_pending_q;
+      if (rd_pending_q) begin
+        if (rd_event_q) rd_data_o <= rd_half_q ? event_rdata_q[127:64] : event_rdata_q[63:0];
+        else if (rd_pred_q) rd_data_o <= pred_group_q[rd_group_q];
+        else rd_data_o <= static_data_q;
+      end
+      if (rd_req_i) begin
+        static_data_q <= static_data;
+        rd_event_q <= int'(rd_index_i) >= EventBase && int'(rd_index_i) < EventBase+EventDepth*2;
+        rd_half_q <= rd_index_i[0];
+        rd_pred_q <= int'(rd_index_i) >= 32 && int'(rd_index_i) < 32+LiveSlots*8;
+        rd_group_q <= pred_read_slot[4:3];
+      end
+    end
+  end
+endmodule

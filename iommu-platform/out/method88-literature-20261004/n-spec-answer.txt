@@ -1,0 +1,226 @@
+Below are the directed forensic findings (with file:line evidence), the minimal-prototype assessment, and the requested spec document. No execution, no writes, no browsing were performed; every RTL/driver claim below is derived only from the files you supplied.
+
+---
+
+## §1 Where request metadata lives today, and what is missing
+
+### 1.1 The complete request type carries no AXI ID, no tag, no burst descriptor
+
+`cva6/corev_apu/riscv-iommu/rtl/rv_iommu_top.sv:117-125`
+
+```systemverilog
+typedef struct packed {
+    addr_t                  iova;
+    rv_iommu::device_id_t   did;
+    logic                   pid_valid;
+    rv_iommu::process_id_t  pid;
+    rv_iommu::ttype_t       ttype;
+    logic                   priv;
+    logic                   is_debug;
+} trans_req_data_t;
+```
+
+`trans_resp_data_t` (`:128-144`) returns `error, ignore, spaddr, is_mrif, mrif_data, range, bypass, fault_code, x,w,r,g,u,sum,t2gpa`. **No AXI ID; no request tag.** The response is matched to the request only implicitly, because the TC permits exactly one translation in flight.
+
+### 1.2 The only place where "full" metadata is retained is the AW/AR stream FIFOs — never a per-request buffer
+
+`transaction_controller/rv_iommu_trans_ctl_wrap.sv:110-158` instantiates `stream_fifo` on `axi_tr_aw_chan_t` / `axi_tr_ar_chan_t` with `DEPTH(RVIOMMUCfg.NumOutstandingTrans)`. Those FIFO entries contain the AXI channel structs (`id`, `stream_id`, `ss_id_valid`, `substream_id`, `mmu_atst`, `mmu_valid`, `mmu_flow`, `mmu_secsid`, `addr`, `len/size/burst`, `prot`, QoS/region/user). That is the *only* per-request context store in the request path.
+
+The control state machine copies those fields into a **single** register pair when it starts a translation:
+
+- AW capture, `:622-637` — `trans_req_data_n.iova = aw_data.addr`, `.did = aw_data.stream_id`, `.pid_valid = aw_data.ss_id_valid`, `.pid = aw_data.substream_id`, `ttype = (aw_data.mmu_atst && !aw_data.mmu_valid) ? TRANSLATED_W : UNTRANSLATED_W`, `.priv = aw_data.prot[0]`, `.is_debug = 1'b0`.
+- AR capture, `:640-662` — same fields from `ar_data`, plus `ttype` from `ar_data.prot[2]` (`TRANSLATED_RX/TRANSLATED_R` vs `UNTRANSLATED_RX/UNTRANSLATED_R`).
+
+Storage for the in-flight request: `:101-102` (`trans_req_data_q/n`, `trans_resp_data_q/n`) — one entry each.
+
+### 1.3 AXI ID is only re-associated to the completion channel by reading the FIFO head
+
+- `:326` `axi_comp_req.aw.id = aw_data.id`
+- `:340` `axi_comp_req.ar.id = ar_data.id`
+
+These are safe only because there is one outstanding translation. ID routing into B/R is done by an `axi_demux` in the same file: MRIF path `:427-455`, non-MRIF path `:535-563`, both with `AxiLookBits(RVIOMMUCfg.AxiIdWidth)` and `Spill*` — the response is routed back by the AXI ID. If the IOMMU ever returned the wrong ID for a request, that demux would mis-route.
+
+### 1.4 Real lookup sites are all single-ported and single-register
+
+- IOTLB lookup enable: `translation_logic/rv_iommu_tl_wrap.sv:243` `iotlb_lu = (state_q == PT) | (state_q == MSI)`; address key built at `:244-246` from `req_data.iova[GPLEN39-1:12]`, `pscid_q`, `gscid_q`.
+- IOTLB module: `translation_logic/rv_iommu_iotlb.sv:76-130`. One lookup port; `lu_hit` is a vector, but `lu_content_o`/`lu_hit_o` collapse to a single "the hit" (the loop overwrites at `:123-125`, so last-iterating match wins).
+- DDTC: `translation_logic/rv_iommu_ddtc.sv:61-81` — one lookup port keyed on `lu_did_i` (`:73`).
+- PDTC: `translation_logic/rv_iommu_pdtc.sv:59-79` — one lookup port keyed on `lu_did_i + lu_pid_i` (`:71`).
+- tl_wrap latched state: `rv_iommu_tl_wrap.sv:193-210` — one `dc_q`, one `pc_q`, one `en_1S_q/en_2S_q`, one `gscid_q/pscid_q`, one `spaddr_q`, one r/w/x/u/g.
+
+### 1.5 Where the permission and DDT/PDT/TTYP checks live
+
+- TTYP/context checks at DDT hit: `rv_iommu_tl_wrap.sv:1001-1007`.
+- PDT privilege (`PC.ta.ENS`): `:1128-1132`.
+- SV/PT first-stage permission check: `:1251-1268`.
+- Second-stage (G-stage) check: `:1270-1288`.
+- These all consume `req_data` (single register) plus `dc_q`/`pc_q` (single entry).
+
+### 1.6 Fault, invalidation, AR dequeue, AW/W ordering, response ID
+
+- Fault return: `rv_iommu_tl_wrap.sv:1398-1425` (ERROR state → `fault_valid_o`; waits for `fault_ready_i` → COMPLETE). `fault_data_o` assembled at `:332-341`.
+- Error response routing: `rv_iommu_trans_ctl_wrap.sv:396-408` (MRIF) and `:521-532` (non-MRIF), with error slave `axi_err_slv` at `:577-592`.
+- Invalidation: `rv_iommu_iotlb.sv:205-303` (VMA/GVMA tables), `rv_iommu_ddtc.sv:99-110` (IODIR.DDT), `rv_iommu_pdtc.sv:96-111` (IODIR.DDT/PDT). Command payload enters tl_wrap via `:98-99` (`iotinval_i`, `iodirinval_i`). Ordering guarantee comments: `rv_iommu_iotlb.sv:188-190` and `:268-270`.
+- AR dequeue: `rv_iommu_trans_ctl_wrap.sv:140-158` (AR FIFO; pop via `ar_ready`). `ar_ready` is asserted only in COMPLETE when `is_read` (`:714-718`). Slave-facing `ar_ready` output is `tr_ar_ready` (`:361`).
+- AW/W ordering protection: write counter `w_cnt_q` at `:168-174`; `incr_w_cnt` on `comp.aw` fire (`:172`), `decr_w_cnt` on `comp.w` last (`:173`); `w_ready` gated by `w_cnt_q != 0` (`:214`); `w_cnt_ovf` blocks new AW (`:200-201`, `:622`). The design comment at `:616-618` states AW is forwarded before AR specifically so a read-to-write DMA opens the W drain before the read data fills the write-data FIFO.
+- Response ID dependency in the completion bus: `:326-351` (aw fields from `aw_data`, ar fields from `ar_data`), W/B backpressure `:353-356`, response fan-out `:358-362`.
+
+### 1.7 Concrete failure points for any N>1 attempt on the *current* design
+
+1. No tag in `trans_req_data_t`/`trans_resp_data_t` → cannot associate a response with the correct AR when two ARs are outstanding. See `rv_iommu_top.sv:117-144`, `rv_iommu_trans_ctl_wrap.sv:101-102`, `:186-208`, `:326-340`.
+2. Single translation state machine in the TC: `rv_iommu_trans_ctl_wrap.sv:597-725` accepts a new request only from IDLE, and in AWAIT_RESP it just waits for `trans_resp_valid_i` (`:686-696`). A second AR cannot be admitted while one is walking.
+3. Single translation state machine in tl_wrap: `rv_iommu_tl_wrap.sv:886-1456` — IDLE→DDT→PDT→PT→(MSI)→ERROR/COMPLETE. There is no way to enter PT twice concurrently; all of `dc_q/pc_q/en_1S_q/en_2S_q/spaddr_q` are singular.
+4. Single lookup ports on IOTLB/DDTC/PDTC (`rv_iommu_iotlb.sv:76-130`, `rv_iommu_ddtc.sv:61-81`, `rv_iommu_pdtc.sv:59-79`) — a *second* lookup cannot occur in the same cycle, and time-sharing the port is precisely the behaviour that would suppress hit-under-miss.
+5. Only one `trans_resp_data_o` port exists; two completions in the same cycle are unrepresentable. See `rv_iommu_tl_wrap.sv:1446-1449` and `:71-75`.
+6. `req_ready` in tl_wrap is only asserted as a consequence of a completed translation leaving (via `trans_resp_valid_o & trans_resp_ready_i` at `:150-152`), so the arbiter/skid buffer (`:157-188`) will not free up until the walker returns.
+
+Observation taps do exist, but they are passive and never drive the datapath: `rv_iommu_pkg.sv:24-67` (E3/research structs), `rv_iommu_tl_wrap.sv:573-641`, `rv_iommu_iotlb.sv:367-400`. The old E3 tap (`rv_iommu_tl_wrap.sv:580-581, 592-594`) is scoped to `did==11`, first-visit PT, single-stage S1, non-implicit, non-MSI — this is what underlies the "limited A-miss/V-hit serial wait" evidence you mention; it does not and cannot show a *hit* completing while a miss is in flight, because no second request can enter.
+
+---
+
+## §2 Minimal interface changes needed for a bounded, honest N prototype
+
+Nothing below changes `NumIotlbEntries=16`, `NumDdtcEntries`, `NumPdtcEntries`, `NumOutstandingTrans`, or the DID/SSID values. No second walker, no second IOMMU. All changes are additive ports and one added tag.
+
+### 2.1 `translation_logic/rv_iommu_iotlb.sv` — add a probe lookup port
+
+One additional lookup:
+- inputs `lookup_probe_i`, `lu_probe_vpn_i[GPPNW39-1:0]`, `lu_probe_pscid_i`, `lu_probe_gscid_i`, `en_probe_1S_i`, `en_probe_2S_i`
+- outputs `lu_probe_hit_o`, `lu_probe_content_o`
+
+Constraint: this probe must **not** update `plru_tree_n`, `tags_n`, `content_n`. Today the PLRU update at `:332-346` consumes `lu_hit[i]`, and the update/flush at `:158-322` is pumped by `update_i`/`inval_i`. The probe must be orthogonal: read-only view of `tags_q`/`content_q`. The existing research tap already declares the required boundary ("Snapshot readers must reject a simultaneous update at a required quiescent boundary", `:367-368`) — adopt that rule; a probe in the same cycle as `update_i.update` or `inval_i` must be suppressed (or the probe caller must guarantee quiet, as the driver already does at `linux/drivers/misc/idma_research.h:58-69`).
+
+Reason: this is the *only* interface on the whole chip that admits a hit-under-miss observation. Without it, "second request still returns hit while first is in PTW" is not expressible.
+
+### 2.2 `translation_logic/rv_iommu_tl_wrap.sv` — add a probe request/response path, constrained
+
+- inputs `probe_req_data_i`, `probe_req_valid_i`, `probe_req_ready_o`
+- outputs (or muxed into `trans_resp_data_o`) the probe result
+
+Probe is allowed only when:
+- `state_q == PT` (miss in progress) and primary `iotlb_lu_hit == 0` (miss for the primary request is real);
+- `probe_req_data_i.did == req_data.did` and `probe_req_data_i.pid == req_data.pid`
+- same stage enables as the primary (`probe_req_data_i.ttype` is a read; `en_1S_q/en_2S_q/gscid_q/pscid_q` are assumed unchanged during the primary walk — this is guaranteed by the state machine because none of those registers change in PT until completion);
+- `IoModeBare` on the disabled side.
+
+On a probe hit, the probe forms `spaddr` combinatorially with the same rule as `:1292-1295` (`iotlb_lu_content.content_1S.ppn`, `req_data.iova[11:0]`) using the **probe's own iova**, and emits a response through the single `trans_resp_data_o` port with the probe's tag. It must apply the same permission checks (`:1251-1268` for S1) — if a permission fault exists, the probe returns the fault, not a hit. If the primary completes in the same cycle as a probe hit, arbitration must pick one; the simplest policy is "primary wins, probe stalls `probe_req_ready_o`".
+
+The observer `e3_o` (`:607-623`) and `research_o` (`:595-606`) do not need to change, but new read-only words may be added to the same tap if the experiment needs a tag/time delta.
+
+### 2.3 `transaction_controller/rv_iommu_trans_ctl_wrap.sv` — 2-slot metadata + tag routing
+
+- Extend `trans_req_data_q`/`n` (`:101-102`) into a 2-entry queue, and expose a second request port output to tl_wrap (`probe_req_data_o`, `probe_req_valid_o`, `probe_req_ready_i`).
+- Add a per-request tag field carried with the request and echoed on the response. The tag can be a small index (2-3 bits), provided it remains stable from the AR FIFO entry to the completion channel.
+- Route a probe completion by tag back to the correct AR FIFO head so the `axi_comp_req.ar.id = ar_data.id` binding (`:340`) stays correct. The AXI ID is unchanged.
+- AR #1 must stay dequeued only when the response is emitted (the current `ar_ready` discipline at `:714-718`) so the FIFO release order does not corrupt `trans_req_data_q`.
+- The write-drain discipline (`:168-174, :200-201, :214, :616-618`) must not change. In the constrained prototype, writes are not probed.
+
+### 2.4 `rtl/rv_iommu_top.sv` — struct extension
+
+- Add a tag to `trans_req_data_t` / `trans_resp_data_t` (`:117-144`). Every consumer listed in this file (TC `:363-369`, TL `:406-420`, ATS `:422-424`, debug `:431-433`, plus the two tl_wrap instantiations at `:387-459`, `:462-534`) will need the tag carried; ATS and debug paths can be zeroed for the prototype.
+
+### Explicitly forbidden in this batch
+
+- No forged assertions of `iotlb_lu_hit`, `research.hit`, or `e3_*` (`rv_iommu_tl_wrap.sv:600, 612`, `rv_iommu_iotlb.sv:123-125`).
+- No bypass of the checks at `rv_iommu_tl_wrap.sv:1251-1288` or `:1001-1007`.
+- No test-address peeking — every reason the probe can hit must derive solely from `probe_req_data_i.iova` and the live IOTLB state.
+- No duplication of the IOMMU, no second DDTW/PDTW/PTW (`rv_iommu_tl_wrap.sv:396-452, 496-532, 642-687`), no reduction of `NumIotlbEntries=16` (`rv_iommu_wrap.sv:31`).
+- No DID/SSID parameter re-pick to give one port silent priority (`ariane_peripherals_xilinx.sv:1186-1188`). The probe request must come from a real DMA stream.
+
+Cross-module dependencies of the above:
+- `rv_iommu_ds_if` arbitration (`rv_iommu_top.sv:285-322`) is not changed because the probe generates no DS access.
+- `rv_iommu_sw_if_wrap` invalidation feed (`rv_iommu_top.sv:541-620`) is unchanged.
+- The two `rv_iommu_tl_wrap` instantiations inside `rv_iommu_top.sv` (`:387-459` for base DC, `:462-534` for extended DC) both need the new ports, but only the base one needs to be live for the prototype.
+
+---
+
+## §3 Single, smallest honest RTL prototype scope, and the next batch
+
+### 3.1 Configuration (all set conservatively)
+
+- `MSITrans = MSI_DISABLED`, `InclATS = 0`, `InclPC = 0`, `InclDbg = 0`, `InclAxiBC = 1` (keep the 4 KiB boundary check, `rv_iommu_trans_ctl_wrap.sv:270-315`).
+- Single-stage S1 only (`en_1S=1, en_2S=0, iohgatp.mode==Bare`).
+- `NumIotlbEntries = 16`, `NumDdtcEntries`, `NumPdtcEntries`, `NumOutstandingTrans` unchanged.
+- All probe requests are `ttype == UNTRANSLATED_R`, non-crossing, and pinned to the same DID as the miss.
+
+### 3.2 Unsupported-request fallback
+
+Any request that does not meet the probe's constraints (different DID, different stage enables, MSI space, ATS, translated request) is transparently passed through the original single-request pipeline (`rv_iommu_tl_wrap.sv:886-1456` without the probe logic engaged). This is what "transparent fallback" means in your brief; the existing path is untouched.
+
+### 3.3 Linux compatibility (research2 ABI, BIT-only)
+
+- Keep the existing UAPI at `linux/include/uapi/linux/idma.h:211-254` and the existing roles at `:234-235`. Do not rewrite E2 (`:212, 215-228`) or METHOD (`:232-253`) semantics.
+- Add one new capability feature bit (or a new observation bank magic) inside the capability word at `idma_research.h:13-19`. The driver already checks unknown magic and unknown role and rejects (`idma_research.h:458-461, 476-478, 499-502, 509-511`), so an old 00093 payload cannot silently pass the new experiment; and the new build must not pretend role compatibility for role 1/2 experiments (do not set an E2/METHOD feature bit for an N test).
+- Preflight must check the new bit before any warmup DMA, matching the existing pattern at `idma_research.h:484-520`.
+- `linux/drivers/misc/idma_research.h:341-445` (`*_validate`) is E2/Cost-specific; the N experiment must not loosen those validations to sneak N through as E2. Add a separate observation bank (e.g. new magic) rather than reusing `IDMA_RESEARCH_RAW_WORDS 4096` fields for a different meaning.
+- No `devmem`, no fake role. Observation continues through the passive tap pattern established by `idma_research_read/write` (`:46-56`) — the driver only reads through `IDMA_OBS_INDEX_OFFSET`/`IDMA_OBS_DATA_OFFSET`, and the tap is read-only at the RTL (`rv_iommu_pkg.sv:24` comment; `rv_iommu_iotlb.sv:367-368`).
+
+### 3.4 Read + write drain and AW-order protection
+
+Full 4 KiB R+W acceptance still requires the current W-drain discipline (`rv_iommu_trans_ctl_wrap.sv:168-174, 200-201, 214, 616-618`). If the prototype only adds a read probe, phrase the outcome as a *hit-under-miss feasibility observation*, not as an N performance result and not as an R+W fairness result. This must be written into the spec file (see §4.4 below).
+
+### 3.5 Next batch (one cohesive batch, no more)
+
+1. Add the probe port to `rv_iommu_iotlb.sv` and adjust PLRU so the probe does not perturb (`:332-346`).
+2. Add the probe request/response path to `rv_iommu_tl_wrap.sv`, constrained to `state_q == PT` with primary miss and matching DID.
+3. Add the 2-slot metadata + tag in `rv_iommu_trans_ctl_wrap.sv` and route probes back to the correct FIFO head; keep the write counter untouched.
+4. Add the tag to `trans_req_data_t`/`trans_resp_data_t` in `rv_iommu_top.sv` and update the two tl_wrap instantiations.
+5. Add a passive observation bank with a fresh magic in `linux/drivers/misc/idma_research.h` and, if a new ioctl is needed, in `linux/include/uapi/linux/idma.h`.
+6. Add the minimal directed RTL testbench for the exact interleaving (see §5.2); simulation must be run by whoever executes, not assumed.
+
+---
+
+## §4 Real risk; what cannot close in a small batch; reject criteria
+
+### 4.1 Might not close in a small batch
+
+- If the probe request has a **different DID/PID**, `rv_iommu_ddtc.sv:61-81` and `rv_iommu_pdtc.sv:59-79` need a second lookup port. Without that port the probe cannot safely re-use `dc_q`/`pc_q`. The prototype must lock the probe to the same DID (and, when PC is enabled, the same PID).
+- IOTLB update-vs-probe race: if a probe runs concurrently with `update_i.update` or `inval_i`, the existing research boundary rule (`rv_iommu_iotlb.sv:367-368`) must be applied to the probe. The driver's "quiet" precondition (`idma_research.h:58-69`) is soft (software-observed); RTL must enforce a hard boundary or the observation is not reliable.
+- Single `trans_resp_data_o` (tl_wrap `:71-75`, `:1446-1449`): if a probe and the primary both complete on the same cycle, an arbiter is needed. It is not a full multi-port response, so completing two translations in the same cycle is impossible — this constrains the probe to *not* be scheduled to complete on the same cycle as the walker's returning response.
+- Routing a probe response back to the correct AR FIFO head requires new ID→FIFO association logic. The DMA cores emit `AxID('0)` (`ariane_peripherals_xilinx.sv:1188`; confirmation at `:943-946` via `obs_bad_id`), so the only source that can distinguish requests is the IOMMU's internal tag; it cannot come from the fabric.
+
+### 4.2 Criteria under which the whole thing should be **rejected** rather than pursued
+
+- If, after the changes above, the probe can only hit in the same cycle as the primary, or if the probe forces `state_q` out of PT (i.e., the second request must be deferred to the primary's completion), then the mechanism is by construction a serialisation and there is no hit-under-miss to observe. In that case return **REJECT**, not "probably achievable".
+- If the only way to keep 4 KiB R+W fair is to also duplicate the W-counter discipline, then the small batch is not closed; that is a separate concern the parent should review before agreeing to a scope change.
+- If someone proposes making the probe hit by asserting `iotlb_lu_hit`/`research.hit` in the RTL (`rv_iommu_iotlb.sv:123-125`, `rv_iommu_tl_wrap.sv:600, 612`), or by matching `e3_a_s1_miss` (`:592-594`) on test-specific DID values — that is the forbidden shortcut and is not accepted.
+
+### 4.3 Should a "safe independent lookup interface + targeted RTL environment" be built first? — **Yes, both are necessary.**
+
+- The independent probe port on `rv_iommu_iotlb.sv` is the *only* mechanism that can observe hit-under-miss. Without it there is no experiment to run.
+- The directed RTL testbench is required because the exact cycle relationship (AR#1 stuck in PTW, AR#2 arriving and hitting within a specific number of cycles) is not reproducible by the FPGA observation rig, which is steady-state oriented; the FPGA tap is purely read-only (`rv_iommu_pkg.sv:24-67`, `rv_iommu_iotlb.sv:367-400`, `ariane_peripherals_xilinx.sv:948-980, 986-1010`). Those taps observe the whole pipeline's user-visible behaviour; they cannot inject a controlled interleaving.
+- Do not assume the existing HPM path already verifies the IOMMU. The HPM access path (`rv_iommu_pkg.sv:576-610`, `rv_iommu_tl_wrap.sv:841-846, 907-914`) is an accounting/observation layer, not a functional verification of translation ordering.
+
+### 4.4 Simulation and FPGA status
+
+Neither simulation nor FPGA has been run for this prototype. No test claims are made anywhere in this document; the acceptance conditions below are what the parent should expect the batch to demonstrate, not what has been demonstrated.
+
+---
+
+## §5 The three concrete functional acceptance conditions
+
+1. **Legal hit can proceed while a miss is in flight (primary).**
+   With a first untranslated read whose IOVA misses the IOTLB (`rv_iommu_tl_wrap.sv:243, 271` show `iotlb_lu_hit==0` while `state_q==PT`), a second untranslated read whose IOVA is present in the IOTLB (same DID, same stage enables) must produce `trans_resp_valid_o` for the probe tag **before** the primary’s PTW response returns (`ptw_axi_resp_i.r_valid` at `rv_iommu_tl_wrap.sv:609`). Observable purely via the passive tap; no arbitration side effects.
+
+2. **Read/write, exceptions, invalidation safety.**
+   Any probe that fails the same permission checks as the primary (`rv_iommu_tl_wrap.sv:1251-1288`) must return an error, not a hit. Invalidation (`rv_iommu_iotlb.sv:205-303`) and update (`:306-320`) must be respected: a probe must not return a hit from an entry whose invalidation arrives in the same cycle. The error path (`rv_iommu_tl_wrap.sv:1398-1425`) and `axi_err_slv` (`rv_iommu_trans_ctl_wrap.sv:577-592`) must remain intact for both primary and probe. A write request must still respect the W-drain counter (`rv_iommu_trans_ctl_wrap.sv:168-174, 214`).
+
+3. **Backpressure and drain progress.**
+   Under continuous AR traffic, the count of observed A completions must be non-decreasing; with `probe_req_ready_o` deasserted, the primary must still be able to complete; after the driver declares `.quiet`, no AR may remain queued and `idma_research_quiet` (`idma_research.h:58-69`) must converge. `trans_req_valid_o`/`trans_resp_ready_o` handshake in tl_wrap (`:150-152, 671-674, 688-695`) must always have a path to progress when the peer is ready.
+
+---
+
+## Required files (minimal, next batch only)
+
+- `cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_iotlb.sv` — probe lookup port + PLRU isolation.
+- `cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv` — probe request/response path, constrained to same-DID/S1/miss-in-flight.
+- `cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv` — 2-slot request queue, tag plumbing, probe response routed to the correct AR FIFO head.
+- `cva6/corev_apu/riscv-iommu/rtl/rv_iommu_top.sv` — tag added to `trans_req_data_t`/`trans_resp_data_t`, both tl_wrap instantiations updated.
+- (Optional, only if the observation needs a new bank) `cva6/corev_apu/rsicv-iommu/packages/rv_iommu_pkg.sv` — new observation struct.
+- `linux/drivers/misc/idma_research.h` — new capability bit / new observation bank, preflight extension.
+- `linux/include/uapi/linux/idma.h` — the corresponding UAPI extension if a new ioctl or a new role is chosen (not a role rewrite).
+- New: a small directed RTL TB for the controlled miss-plus-hit interleaving.
+
+Explicitly **not** required (do not touch): `rv_iommu_ddtc.sv`, `rv_iommu_pdtc.sv` (they stay single-ported; constraint is DID/PID equality), `rv_iommu_wrap.sv` (defaults `NumIotlbEntries=16` unchanged at `:31`), the ATS/DTI path (`rv_iommu_top.sv:622-695`).
+
+---

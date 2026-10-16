@@ -1,0 +1,193 @@
+# Nonblock 依赖诊断（2026-10-04，v1 读接纳守卫，模型范围）
+
+状态：本文件只记录被提供日志与源码能够支持的 scoped（范围）C++ 模型诊断。不覆盖真实 DDR、真实 DMA、板级 A8 根因或全互连行为，也不宣布新颖性、性能增益或最终通过。所有“36 个场景通过”“12 个场景通过”只指已有 scoped 模型日志中的场景与 order（顺序）。作者归属：本诊断由 DeepSeek 起草、Codex 执行与校核，不是“本次未执行”。
+
+---
+
+## 1. 一句话摘要
+
+- 旧 banked scoped 模型（无守卫）在 `coupled-banked-vv.log:1-122` 出现 8/12 失败（a1 与 a8 系列）。
+- v1 读接纳守卫（`coupled-banked-guard-vv.log:1-78`）把失败压到 4/12：只剩 A8 系列（`mode1-a8-l1`、`mode1-a8-l31`、`mode2-a8-l1`、`mode2-a8-l31`）。
+- guard2 变化（在 AW 被接纳的同一周期阻止读选择，并叠加 owner admission）后，`coupled-banked-guard2-vv.log:1-26` 12/12 通过；`coupled-legacy-vv.log:1-26` 同 order 也 12/12 通过；`coupled-extra-orders.json:1-9` 记录 `aa`/`av` 额外 order 退出 0。三项合计 36 个 banked fixed 模型场景通过（vv + aa + av）；legacy 同 order 12 个场景通过。
+- 这确认了 AW FIFO 的“一拍可见性”竞争（见 §3.3），但仍是模型内的读写依赖与共享 R/W 观察，不是真实 DDR/DMA 结论，也不能直接算作 N 的增益。
+
+---
+
+## 2. 证据清单
+
+### 2.1 状态与结果
+
+- `out/n-prototype-20261004/v1-work-state.json:1-23`
+  - `status = two_fpga_builds_running_not_board_accepted`
+  - `original_board = 15/15 complete data_errors 0 taint 0`（板级原始计数，非模型；taint 是板级字段，Verilator 模型里没有 taint）
+  - `core_change = Codex read-admission guard v1；legacy 默认关闭；signed AW-minus-WLAST 加可见 AW 预留，以及同周期 AW 接纳优先`
+  - `actual_checks`：`legacy_control_vv = 12`，`banked_fixed_vv_aa_av = 36`，`joint = PASS`，`banked_ctl = PASS`，`helper_guard = PASS`
+  - `not_proven`：板级 hang 根因精确等于模型、所有互连/DDR、通用跨流数据依赖、N gain/novelty
+- `out/n-prototype-20261004/coupled-banked-vv.log:1-122`
+  - 旧 banked（无守卫）单次调用：12 个场景标题各一次，`nonblock_coupled_test: 8/12 scenarios FAILED`（`:122`）
+  - 8 个 STALL 转储对应 8 个失败场景（a1/a8 系列）
+- `out/n-prototype-20261004/coupled-banked-guard-vv.log:1-78`（cycle2 证据，v1 第一版守卫）
+  - 8/12 通过，4/12 失败；`nonblock_coupled_test: 4/12 scenarios FAILED`（`:78`）
+  - 失败即 A8 系列，STALL 状态见 `:1-13`、`:15-27`、`:29-41`、`:43-55`
+- `out/n-prototype-20261004/coupled-banked-guard2-vv.log:1-26`
+  - guard2 后 12 场景全部打印 `COUPLED-SUMMARY`，以 `PASS (12 scenarios)` 结束（`:26`）
+- `out/n-prototype-20261004/coupled-legacy-vv.log:1-26`
+  - legacy 同 order 12 场景通过
+- `out/n-prototype-20261004/coupled-extra-orders.json:1-9`
+  - `aa`、`av` 均 `exit: 0`
+- `out/n-prototype-20261004/joint-after-readguard.log:1-10`
+  - joint 数据通路 smoke 场景 `PASS`
+- `out/n-prototype-20261004/helper-nonzero-guard.log:1-2`
+  - runner/analyzer 的 zero/V/dual counter guard `PASS`
+
+### 2.2 关键源码
+
+- `cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_banked_ctl.sv`
+  - `:244-253`：输入 demux 在 W LAST 前保持 W ownership；跨 bank 读会填满 DMA 的 R→W FIFO，而 AW 不能进入该 demux，导致当前 owner 的 source data 或 page-table reads 无法通过共享内存返回，形成 circular wait（循环等待）。守卫的处理是延迟“选择”读，而不是撤回 AXI/TL VALID。
+  - `:254-266`：`w_unfilled_q` signed balance、`w_owner_q`、`restrict_reads`、`read_owner`、`bank_read_admit[0/1]`；新 AW 还通过 `tr_axi_req_i.aw_valid` 保留 admission；同一周期 AW handshake 进入某 bank 时，用 `!(aw_accept && aw_sel)` 阻止同周期选择旧 AR。
+  - `:259-262` 注释明确：新 AW 进入 bank 后，它的 FIFO head 下一周期才可见；不要提前一个周期选择旧 queued AR。
+  - `:312-354`：两个 bank 仍实例化 `rv_iommu_trans_ctl_wrap`，但 `ReadAdmissionEnable(1'b1)` 且接入 `read_admit_i`。
+  - `:542-582`：`in_flight_o` 聚合 AW/AR/W-LAST/bank busy，不是只看查表器。
+- `cva6/corev_apu/riscv-iommu/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv`
+  - `:23-25`：`ReadAdmissionEnable` 是 banked DMA 集成的新约束，legacy 默认关闭。
+  - `:61`：`read_admit_i` 输入。
+  - `:621-666`：IDLE 中 AW 优先于 AR；读只在 `(!ReadAdmissionEnable || read_admit_i)` 时进入 `REQ_TRANS`。
+  - `:713-723`：COMPLETE 中只有读完成才释放 AR，写完成才释放 AW。
+
+### 2.3 数据宽度（更正）
+
+- `tests/nonblock_coupled_test.cpp:70-72`：`PAGE_BEATS = 512`、`BURST_BEATS = 256`、`BURST_LEN = 255`（→ 256 拍）。
+- 一拍是 64 位字：`:232-250` 的读写按 8 字节一个 beat（`BURST_BEATS 256; // 2 KiB / 8 B`，`:71`）。
+- 一个 burst = 256 拍 × 8 B = 2 KiB；一个 page = 512 拍 × 8 B = 4 KiB；两个 256 拍 burst（half 0/1，各 0x800=2048 字节，见 `:361`、`:400`、`:647`）= 4 KiB，正好覆盖一个 page。
+- 不能因为“len=255 只覆盖一半”就反推 16 字节/拍。`len=255` 覆盖的是半个 page（2 KiB），所以每拍仍是 8 字节。
+
+---
+
+## 3. 模型循环（模型解释，非真实 DDR/DMA 根因）
+
+以下循环是 scoped C++ 模型中的依赖图。日志没有直接打印 A/V 标签，A/V 映射按端口/队列状态与测试源码给出，因此保留“模型解释”。
+
+### 3.1 旧 banked（无守卫）：8/12 失败
+
+证据 `coupled-banked-vv.log:2-12`：
+
+- `:2` `sharedR.head port=0 id=4 addr=0x0000000090000000 len=255 beat=5`（队列头是 A 的源读数据）
+- `:3` DMA0（V）`ar_done=1 aw_done=1 done=0`
+- `:4` DMA1（A）`aw_want=1 aw_done=0 rx=3 cfifo=3`
+- `:5` `caw_q.head id=0 addr=0x0000000080001000 got=0`（V 目的完成 AW 待处理）
+- `:9` `AW id=0 addr=0x0000000010001000`（V 目的 AW）
+- `:12` `mem_q=2 aw_order=1 w_owner=0`
+
+模型解释：共享有序 R 返回队列的队头是 A 的源读数据；A 的 cfifo 已满（3）无法消费队头；V 侧目的完成 AW 仍未落地（`caw_q` 非空），W 无法推进。读完成依赖共享 R 继续返回后续 beat，而形成模型级 circular wait（循环等待）。说明：同 ID 同 bank + AW/W 关联本身不足以排除共享 R/W 依赖；这不能证明真实 DDR 控制器会这样。
+
+### 3.2 v1 守卫后仍失败的 A8：cycle2 证据与推断
+
+证据 `coupled-banked-guard-vv.log:1-13`（`mode1-a8-l1` STALL；`:15-27`、`:29-41`、`:43-55` 同构）：
+
+- `:2` `sharedR.head port=0 id=4 addr=0x0000000090000000 len=255 beat=21 latency=0`（队头是 A 的源读数据，beat 21）
+- `:3` DMA0（V）`half=1 ar_done=1 aw_want=1 aw_done=0 rx=0 wx=0`
+- `:4` DMA1（A）`half=0 ar_done=1 aw_want=0 aw_done=1 rx=19 wx=16 cfifo=3`（A 已发 16 个 W beat，另有 3 个在耦合 FIFO）
+- `:5` `caw_q.head (empty)`
+- `:6` `exp_aw_q.head id=4 iova=0x0000000020008000 pa=0x0000000090100000 len=255`（A 目的 IOVA→PA 的完成 AW 尚未产生）
+- `:7` `last up_ar=yes up_aw=yes up_w=yes up_r=yes up_b=yes`
+- `:8` `AR id=0 addr=0x0000000010000800`（V 源 AR，half=1）
+- `:9` `AW id=4 addr=0x0000000020008000`（**A 目的 AW 已在上游被接纳**）
+- `:10` `W data=0x11f075d0211af943 strb=0xff last=0`
+- `:11` `R data=0x2b19e304a37b7502 last=0 resp=0`
+- `:12` `TL req_v=0 req_r=0 req_bank=1 resp_v=0 resp_r=0 resp_bank=0 ptw_active=1 ptw_r_fire=0 iotlb_look=0 iotlb_hit=0`（**PTW 活跃 = 1**）
+- `:13` `mem_q=2 caw_q=0 cb_q=0 exp_aw_q=1 aw_order=1 w_owner=1 in_flight=1 nonblock_busy=0 nonblock_fire=0`
+
+推断（明确标为推断）：
+
+- “A 的源数据 burst 排在目的 AW 之前”：共享有序 R 返回队列的队头是 A 的源读数据（`id=4`、`0x90000000`、`beat=21`，`:2`）。
+- “目的 AW 没有被物理转发”：A 的目的 AW 已提交并被上游接纳（`:7` `up_aw=yes`、`:9` `AW id=4 addr=0x20008000`），但没有对应的完成 AW（`:5` `caw_q` 空、`:6` `exp_aw_q=1`），写通道没有真正推进。
+- “PTW 返回被堵在数据后面”：PTW 活跃（`:12` `ptw_active=1`），其返回在同一个有序队列里排在 A 源数据之后；A 的耦合 FIFO 已满（`:4` `cfifo=3`），队头那颗 A 源 beat 不能被消费，队列不前进，PTW 返回因此被堵在数据后面（`mem_q=2`，`:13`）。
+
+不判定：日志没有 did 追踪，**不能断言这个 active 的 PTW 一定属于 A**；它也可能是共享转换引擎在为 V 工作。因此只写“PTW 活跃且其返回被数据挡住”，不写归属。
+
+### 3.3 已被 guard2 确认的一拍可见性竞争
+
+- 源码依据：`rv_iommu_banked_ctl.sv:254-266`（`bank_read_admit`、`read_owner` 与 `!(aw_accept && aw_sel)`）与 `:259-262` 注释；`rv_iommu_trans_ctl_wrap.sv:621-666`（IDLE 中 AW 先于 AR，读是否进入 `REQ_TRANS` 取决于 `read_admit_i`）；`:713-723`（COMPLETE 中读释放 AR、写释放 AW）。
+- 模型解释：新 AW 被接受到 bank 后，其 FIFO head 下一周期才对 bank 控制器可见；若同一周期还允许选择旧 queued AR，就可能出现一拍可见性竞争。guard2 的做法是：在 AW 被接纳的同一周期阻止读选择，并叠加 owner admission。
+- 结果确认：guard2 后 A8 系列 4 个场景全部通过（`coupled-banked-guard2-vv.log:11-13`、`:23-25` 均打印 `COUPLED-SUMMARY` 并以 `PASS (12 scenarios)` 结束）。这把 §3.2 的“一拍可见性竞争”从推断提升为“被 guard2 修复所确认的模型内机制”。
+- 仍是模型结论，不是真实 DDR/DMA 结论。
+
+---
+
+## 4. 已证实、未证实与观察线网问题
+
+### 4.1 已证实（仅限 scoped 模型 / 已有日志）
+
+- 旧 banked（无守卫）：`coupled-banked-vv.log:1-122` 出现 8/12 失败。
+- v1 守卫第一版：`coupled-banked-guard-vv.log:1-78` 8/12 通过、4/12 失败（只剩 A8）。
+- guard2：`coupled-banked-guard2-vv.log:1-26` 12 场景 PASS。
+- legacy 同 order：`coupled-legacy-vv.log:1-26` 12 场景 PASS。
+- 额外 order：`coupled-extra-orders.json:1-9` `aa`/`av` exit 0。
+- joint/helper smoke：`joint-after-readguard.log:1-10`、`helper-nonzero-guard.log:1-2`。
+
+### 4.2 观察与线网问题（更正）
+
+- `coupled-banked-vv.log` 是**一次调用**，不是两次运行：
+  - `+order=vv` 头只出现一次（`:105`），12 个场景标题各出现一次（`:106`—`:121`），没有“重复 `+order=vv`”。
+  - 失败场景（a1/a8 共 8 个）只打印场景标题、不打印 `COUPLED-SUMMARY`，原因是场景标题先打印（`tests/nonblock_coupled_test.cpp:986-987`），汇总只在场景成功走到末尾时打印（`:1053`），失败则在汇总前抛异常（`:1116-1124`）。这是“失败所以没有成功汇总”，不是观察/打印线网缺陷。
+  - 日志里 stderr 的 STALL 转储（`:1-104`）与 stdout 的场景标题/汇总在文件中先后出现，只是 stdout/stderr 缓冲与混合顺序造成的表面顺序差，属于同一进程的同一批输出。
+  - 因此，之前“第二次 vv 运行 / 观察或打印线网缺陷”的说法及其结论整体删除，不作为 RTL 根因。
+- 真实的观察线网问题在别处：
+  - Vivado 把 `nonblock_fire`、`nonblock_trans_accept`、`nonblock_did`、`nonblock_type` 当作未声明符号、默认 `wire`（`ariane_peripherals_xilinx.sv:1381-1382`，见 `wire-scope-evidence`，`fpga-serial.log:5193-5196/9908-9911`、`fpga-hit.log:5193-5196/9908-9911`）。这是 generate 作用域问题；源码已移到模块作用域，待新构建验证。
+  - 板级 helper 在 CLI 字节正确的情况下接受计数为 0，也是观察/线网层面的问题，需要在修复后重跑板级才能闭环。
+
+### 4.3 板级 A8 根因：未知
+
+`v1-work-state.json:5` 只记录恢复后的 boot/kernel/taint（`956fa8d0-... kernel00093 taint0`）。`v1-work-state.json:16-20` 明确列出未证明：板级 hang 根因精确等于模型、所有互连/DDR 行为、通用跨流数据依赖、N gain 或 novelty。没有“修复后板级重跑”的样本，因此**板级 A8 根因在修复后的板级重跑之前不能确认**，也不能把 §3 的模型循环直接写成板级 A8 根因。
+
+### 4.4 不宣称
+
+- 不宣称真实 DDR / 真实 DMA 行为。
+- 不宣称板级通过，也不宣称板级 A8 根因已定。
+- 不宣称性能增益。
+- 不宣称新颖性。
+- 不宣称完整 root HANDOFF 已读；本文件只基于提供日志与源码片段。
+
+---
+
+## 5. 科学含义：N 的 baseline（基线）与 bypass 机会
+
+`docs/research-n-prototype-spec-20261004.md:51-53` 要求 fair baseline 使用相同 replacement 更新规则，真实被服务 hit 必须参与既定替换策略。`:99-109` 说明两 bank 原型只是前人已知的有限 hit-under-miss 基线，不能把静态 bank 改名成额外保护方法，必须公平对照找剩余瓶颈。
+
+读接纳守卫的逻辑是：在 W owner 未释放或新 AW 可见前，延迟新读的“选择”。这避免了一类 circular wait，但同时会减少读在写未完成前绕过/前向的机会。因此：
+
+- 守卫的模型通过不能直接解释为 N 的收益。
+- 若 N 的普通 baseline 也加同类守卫，N 可展示的 bypass 机会可能减少。
+- 公平比较必须保持每类容量、仲裁/替换规则相同，并把守卫作为 baseline 成本计入。
+- N 的“前进”必须来自真实被服务的合法 hit，而不是只读 probe 或守卫下的延迟选择。
+
+---
+
+## 附：当前状态与交接（只列当前前沿）
+
+- 当前两个 FPGA 构建仍在运行；没有最终时序，也没有新的板级运行结果。
+- 观察线网问题（Vivado 未声明符号 / generate 作用域）已定位，源码已移到模块作用域，待新构建验证。
+- 板级 helper 接受计数为 0（CLI 字节正确）仍需修复后重跑板级确认。
+- 板级 A8 根因只有在修复后的板级重跑后才可能确认。
+- 模型一致不等于证明；以上全部只限 scoped 模型。
+
+---
+
+### Worker notes（给 Codex 的假设与验收）
+
+假设：
+- `coupled-banked-vv.log` 采自 `tests/nonblock_coupled_test.cpp` 的 stdout+stderr 合并输出；失败场景只打印标题是 `:986-987` 先打印、`:1053` 成功才汇总、`:1116-1124` 捕获异常所致（已由源码证实，未另跑）。
+- `coupled-banked-guard2-vv.log` 视作 guard2 的最终通过运行；`coupled-banked-guard-vv.log` 视作 v1 第一版守卫（8/12 通过）。
+- 板级原始计数取 `v1-work-state.json`，不在模型层重述 taint。
+- `rv_iommu_*.sv` 行号沿用上一份诊断的引用，我未直接读到源文件；请按新构建的源确认行号仍成立。
+
+未决：
+- guard2 与 v1-work-state `core_change` 的对应关系（是否为同一 guard 的两次迭代）需 Codex 对齐。
+- A 的完成 AW 未被“物理转发”的精确成因未定；本文件只作为推断，未定归属。
+- 板级 helper accepted=0 的确切线网节点未定。
+
+建议验收检查：
+1. `coupled-banked-guard2-vv.log`（及 `aa`/`av`）重跑仍 12/12；legacy 仍 12/12；旧 banked 仍 8/12 失败（作为对照）。
+2. 新 FPGA 构建日志中 `nonblock_fire` / `nonblock_trans_accept` / `nonblock_did` / `nonblock_type` 不再出现 `undeclared symbol`。
+3. 板级 helper 在 CLI 字节正确时 accepted 计数非 0。
+4. 修复后板级重跑产生新的 A8 样本，再决定板级根因是否可确认。
