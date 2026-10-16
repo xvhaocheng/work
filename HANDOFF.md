@@ -1,3 +1,15 @@
+# 2026年10月16日 MAP-IOVA-FALLBACK-BUDGET-1：地址预算与普通回退条件合同完成
+
+保留V-C／持久B及已核合法streaming交接；K槽＋满额O0不保证普通地址供给。同actual channel的普通skb TX与redirect SQ均取c->pdev，map失败drop不算有效完成。已核dma-iommu有效初始化g≤PAGE_SIZE可导出每整页live映射的实际IOVA费用为PAGE_SIZE。
+
+live、可复用rcache与待归还FQ地址债务分账；普通完整limit回退与rcache清理必须保留，unmap返回不总等地址可复用，K不界多代FQ债务。reserve_iova排除普通alloc，不是可消费owner票据。最强版本另需可执行参与者／共同window容量合同；O3-Q、O3-R、O-COPY-B同享，无独占预算算法或native优势／实际压力证明。IOVA与物理RAM分开，每策略S∪P∪C_app∪C_sw∪Q_retire去重，CPU、带宽及有效完成分别计。
+
+下一MAP-DOMAIN-CAPACITY-CONTRIBUTION-EVIDENCE-1为evidence_gated_not_auto_scheduled：仅新且匹配的资源约束／完整成本／具体能力证据触发；不等待一般授权、CPU或RAM价值确认，不自动开发、建模、旧数据重搜或板测。
+
+7个root primary来源（6 raw＋1 web）、25处直接读段、7项worker raw清单；2份新增HTTP200原件、5次HTTP429失败；6次web open＋3次find，0新搜索。来源保存为raw与web两类，普通TX完整raw未取得，不能称全部原件齐全。仅属provenance，非测量；0生产源码修改、新实验／模型、构建、hostprobe或板测。Codex-only；两证据席请求gpt-6.1-sol/high，文档席请求gpt-6.1-sol/medium，actual独立model/effort metadata unknown，不声称root切换。 B1/I/D/A5/A2与独立事项保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；原10月15—28日窗口不重启。
+
+[本轮入口](iommu-platform/out/mapping-iova-budget-20261016/README.md)／[裁决](iommu-platform/out/mapping-iova-budget-20261016/root/decision-analysis.md)／[接受](iommu-platform/out/mapping-iova-budget-20261016/root/root-result-acceptance.json)／[下一证据gate](iommu-platform/out/mapping-iova-budget-20261016/root/next-minimal-contract.json)／[文档验收](iommu-platform/out/mapping-iova-budget-20261016/documentation/verification.json)。前轮V-C、streaming与可见性资产保留；以下完整即时旧字节后缀保留，既存14组历史坏链仅登记。
+
 # 2026年10月16日 MAP-DMA-VISIBILITY-CONTRACT-1：持久B可见性条件合同完成
 
 保留V-C＋每轮合法CPU/A/B交接的持久整页B映射条件设计。保守CQ保留mode、frame、B整页base三个逻辑值，先B整页for_cpu再处理frame，无独立binding token；旧句柄和A sync均不代替B交接。 在固定dma-iommu中，物理起点及size按实际IOVA granule对齐的B整页map不走该处bounce；普通O0-T每包整页fresh map同获益。真实bounce旧数据反例只用于其触发分支。收益候选仍是少做IOVA/PTE，须覆盖sync、lookup、prepare、CQ、控制、关闭及失败费用；未实现、native未知、未选论文主线。

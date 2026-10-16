@@ -1,12 +1,12 @@
-# 当前状态：持久B映射可见性条件合同完成，下一为对齐复用证据门槛
+# 当前状态：持久B地址预算条件合同完成，下一为domain容量贡献证据
 
 2026年10月16日（JST）。**未实现、native未知、未选论文主线。** [研究计划](研究计划.md)为唯一总计划，[研究导航](研究导航.md)定位资产。
 
 ## 全局安排与下一证据
 
-- 保留V-C＋每轮合法CPU/A/B交接的持久整页B映射条件设计。保守CQ保留mode、frame、B整页base三个逻辑值，先B整页for_cpu再处理frame，无独立binding token；旧句柄和A sync均不代替B交接。
-- 在固定dma-iommu中，物理起点及size按实际IOVA granule对齐的B整页map不走该处bounce；普通O0-T每包整页fresh map同获益。真实bounce旧数据反例只用于其触发分支。收益候选仍是少做IOVA/PTE，须覆盖sync、lookup、prepare、CQ、控制、关闭及失败费用；未实现、native未知、未选论文主线。 CPU、带宽、有效完成和每策略S∪P∪C_app∪C_sw∪Q_retire物理并集分别报告并去重，区分应用复制与后端bounce；B非bounce不证明A非bounce，不强套同一PFN轨迹。
-- 下一MAP-ALIGNED-STREAM-REUSE-EVIDENCE-1为evidence_gated_not_auto_scheduled：仅新且匹配backend／granule／sync合同的完整成本与生命周期证据，或具体部署能力差项触发；不自动开发、实验、建模或重复旧数据搜索，不等一般许可、CPU／内存价值确认或用户保证痛点。 [本轮入口](iommu-platform/out/mapping-dma-visibility-20261016/README.md)／[裁决](iommu-platform/out/mapping-dma-visibility-20261016/root/decision-analysis.md)／[接受](iommu-platform/out/mapping-dma-visibility-20261016/root/root-result-acceptance.json)／[下一证据gate](iommu-platform/out/mapping-dma-visibility-20261016/root/next-minimal-contract.json)。
+- 保留V-C／持久B及已核合法streaming交接；K槽＋满额O0不保证普通地址供给。同actual channel的普通skb TX与redirect SQ均取c->pdev，map失败drop不算有效完成。已核dma-iommu有效初始化g≤PAGE_SIZE可导出每整页live映射的实际IOVA费用为PAGE_SIZE。
+- live、可复用rcache、FQ债务分账；K不界多代FQ，普通完整limit回退／清cache须保留。最强版本需可执行参与者／共同window容量合同，O3-Q/O3-R/O-COPY-B同享；无独占预算算法、native优势或实际压力证明。IOVA≠RAM，每策略物理并集去重，CPU／带宽／有效完成分报。
+- 下一MAP-DOMAIN-CAPACITY-CONTRIBUTION-EVIDENCE-1为evidence_gated_not_auto_scheduled：仅新且匹配的资源约束／完整成本／具体能力证据触发；不等待一般授权、CPU或RAM价值确认，不自动开发、建模、旧数据重搜或板测。 [本轮入口](iommu-platform/out/mapping-iova-budget-20261016/README.md)／[裁决](iommu-platform/out/mapping-iova-budget-20261016/root/decision-analysis.md)／[接受](iommu-platform/out/mapping-iova-budget-20261016/root/root-result-acceptance.json)／[下一证据gate](iommu-platform/out/mapping-iova-budget-20261016/root/next-minimal-contract.json)。
 
 ## 各分支最新进展
 
@@ -16,7 +16,7 @@
 
 ## 硬件与执行状态
 
-12个root主文件、26处root直接读段、16项worker清单、4份HTTP200原件和3次官方web open，仅属provenance，非测量。0生产源码修改、实验、状态／性能模型、构建、host设备probe或板测。Codex-only；API与backend请求gpt-6.1-sol/high，文档请求gpt-6.1-sol/medium；actual独立model/effort metadata unknown，不声称root切换。 B1/I/D/A5/A2与独立事项保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；10月15—28日窗口不重启。 详见[执行账](iommu-platform/out/mapping-dma-visibility-20261016/root/execution-ledger.json)。
+7个root primary来源（6 raw＋1 web）、25处直接读段、7项worker raw清单；2份新增HTTP200原件、5次HTTP429失败；6次web open＋3次find，0新搜索。来源保存为raw与web两类，普通TX完整raw未取得，不能称全部原件齐全。仅属provenance，非测量；0生产源码修改、新实验／模型、构建、hostprobe或板测。Codex-only；两证据席请求gpt-6.1-sol/high，文档席请求gpt-6.1-sol/medium，actual独立model/effort metadata unknown，不声称root切换。 B1/I/D/A5/A2与独立事项保持；MIG1792023314继续paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；原10月15—28日窗口不重启。 [执行账](iommu-platform/out/mapping-iova-budget-20261016/root/execution-ledger.json)。
 
 ## 独立工程事项
 
