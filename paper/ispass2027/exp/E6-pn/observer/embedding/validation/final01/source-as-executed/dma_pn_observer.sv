@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: Solderpad-0.51
+// Passive PN lifecycle capture. No output controls a DMA/translation data path.
+module dma_pn_observer #(
+    parameter bit Enable = 0,
+    parameter int unsigned NumPorts = 4
+) (
+    input logic clk_i, rst_ni,
+    input logic accepted_arm_i, has_a_i,
+    input logic [(NumPorts > 1 ? $clog2(NumPorts) : 1)-1:0] victim_i, aggressor_i,
+    input logic [NumPorts-1:0] issue_i, done_i, batch_active_i,
+    // Actual accepted full-strobe STOP of a selected frontend, not CPU time.
+    input logic accepted_stop_i,
+    // Original V-window gate and actual final V completion, respectively.
+    input logic obs_active_i, v_target_done_i,
+    input logic all_quiet_i,
+    input logic n_accept_i,
+    input logic [23:0] n_did_i,
+    output logic [63:0] aown_cycles_o, union_cycles_o, status_o,
+    output logic [31:0] n_did10_o, n_did11_o,
+    // Configuration protection only. Never connect to a data-path READY.
+    output logic capture_busy_o
+);
+    if (Enable) begin : gen_enabled
+        localparam int RoleWidth = NumPorts > 1 ? $clog2(NumPorts) : 1;
+        typedef struct packed {
+            // Exactly four 64-bit duration registers, no timestamp array/FIFO.
+            logic [63:0] a_age, a_latest, u_age, u_latest;
+            logic [31:0] n10, n11;
+            logic [RoleWidth-1:0] victim, aggressor;
+            logic armed, frozen, has_a, a_seen, a_done, u_seen, u_done;
+            logic target_seen, stop_seen;
+            logic [1:0] pending;
+            logic a_age_over, u_age_over, a_over, u_over;
+            logic edge_error, n_over, unexpected_did;
+        } state_t;
+        state_t state_q, state_n;
+        logic [1:0] issues, dones, batches;
+        logic any_error;
+
+        always_comb begin
+            issues = '0;
+            dones = '0;
+            batches = '0;
+            if (int'(state_q.victim) < NumPorts) begin
+                issues[0] = issue_i[state_q.victim];
+                dones[0] = done_i[state_q.victim];
+                batches[0] = batch_active_i[state_q.victim];
+            end
+            if (state_q.has_a && int'(state_q.aggressor) < NumPorts) begin
+                issues[1] = issue_i[state_q.aggressor];
+                dones[1] = done_i[state_q.aggressor];
+                batches[1] = batch_active_i[state_q.aggressor];
+            end
+        end
+
+        always_comb begin
+            state_n = state_q;
+            if (accepted_arm_i) begin
+                state_n = '0;
+                state_n.armed = 1;
+                state_n.has_a = has_a_i;
+                state_n.victim = victim_i;
+                state_n.aggressor = aggressor_i;
+                if ((state_q.armed && !state_q.frozen) || !all_quiet_i ||
+                    int'(victim_i) >= NumPorts ||
+                    (has_a_i && (int'(aggressor_i) >= NumPorts || victim_i == aggressor_i)))
+                    state_n.edge_error = 1;
+                if (int'(victim_i) < NumPorts &&
+                    (issue_i[victim_i] || done_i[victim_i] || batch_active_i[victim_i]))
+                    state_n.edge_error = 1;
+                if (has_a_i && int'(aggressor_i) < NumPorts &&
+                    (issue_i[aggressor_i] || done_i[aggressor_i] || batch_active_i[aggressor_i]))
+                    state_n.edge_error = 1;
+            end else if (state_q.armed && !state_q.frozen) begin
+                // Increment from the first issue edge. A done edge at t latches
+                // t-first_issue, not the preceding age or CPU STOP/quiet tail.
+                if (state_q.a_seen) begin
+                    if (&state_q.a_age) state_n.a_age_over = 1;
+                    else state_n.a_age = state_q.a_age + 1'b1;
+                end
+                if (state_q.u_seen) begin
+                    if (&state_q.u_age) state_n.u_age_over = 1;
+                    else state_n.u_age = state_q.u_age + 1'b1;
+                end
+                if (issues[1] && !state_q.a_seen) begin
+                    state_n.a_seen = 1;
+                    state_n.a_age = 0;
+                end
+                if (|issues && !state_q.u_seen) begin
+                    state_n.u_seen = 1;
+                    state_n.u_age = 0;
+                end
+                if (dones[1]) begin
+                    state_n.a_done = 1;
+                    state_n.a_latest = state_n.a_age;
+                    state_n.a_over = state_q.a_over || state_n.a_age_over;
+                end
+                if (|dones) begin
+                    state_n.u_done = 1;
+                    state_n.u_latest = state_n.u_age;
+                    state_n.u_over = state_q.u_over || state_n.u_age_over;
+                end
+                for (int lane = 0; lane < 2; lane++) begin
+                    // Original batch COUNT/WAIT make same-lane issue/done
+                    // mutually exclusive. Cross-lane simultaneous edges work.
+                    case ({issues[lane], dones[lane]})
+                        2'b10: begin
+                            if (state_q.pending[lane]) state_n.edge_error = 1;
+                            state_n.pending[lane] = 1;
+                        end
+                        2'b01: begin
+                            if (!state_q.pending[lane]) state_n.edge_error = 1;
+                            state_n.pending[lane] = 0;
+                        end
+                        2'b11: state_n.edge_error = 1;
+                        default: ;
+                    endcase
+                    if ((issues[lane] || dones[lane]) && !batches[lane])
+                        state_n.edge_error = 1;
+                end
+                if (state_q.target_seen && (issues[0] || dones[0]))
+                    state_n.edge_error = 1;
+                if (v_target_done_i) begin
+                    state_n.target_seen = 1;
+                    if (state_q.target_seen || !dones[0] || !obs_active_i)
+                        state_n.edge_error = 1;
+                end
+                if (accepted_stop_i) state_n.stop_seen = 1;
+
+                // Exact original (open,close] V window, including close edge.
+                // n_accept_i is the committed N handshake, never probe-hit.
+                if (obs_active_i && n_accept_i) begin
+                    case (n_did_i)
+                        24'd10: if (&state_q.n10) state_n.n_over = 1;
+                                else state_n.n10 = state_q.n10 + 1'b1;
+                        24'd11: if (&state_q.n11) state_n.n_over = 1;
+                                else state_n.n11 = state_q.n11 + 1'b1;
+                        default: state_n.unexpected_did = 1;
+                    endcase
+                end
+
+                if (state_n.stop_seen && !(|state_n.pending) &&
+                    !(|batches) && all_quiet_i) begin
+                    state_n.frozen = 1;
+                    if (!state_n.target_seen || !state_n.u_seen || !state_n.u_done ||
+                        (state_n.has_a && (!state_n.a_seen || !state_n.a_done)))
+                        state_n.edge_error = 1;
+                end
+            end
+        end
+
+        assign any_error = state_q.a_over || state_q.u_over || state_q.edge_error ||
+                           state_q.n_over || state_q.unexpected_did;
+        always_comb begin
+            aown_cycles_o = state_q.a_latest;
+            union_cycles_o = state_q.u_latest;
+            n_did10_o = state_q.n10;
+            n_did11_o = state_q.n11;
+            capture_busy_o = state_q.armed && !state_q.frozen;
+            status_o = '0;
+            status_o[0] = state_q.frozen;
+            status_o[1] = state_q.frozen && state_q.has_a && state_q.a_seen &&
+                          state_q.a_done && !any_error;
+            status_o[2] = state_q.frozen && state_q.u_seen && state_q.u_done &&
+                          state_q.target_seen && !any_error;
+            status_o[3] = state_q.a_over;
+            status_o[4] = state_q.u_over;
+            status_o[5] = state_q.edge_error;
+            status_o[6] = state_q.n_over;
+            status_o[7] = state_q.unexpected_did;
+        end
+        always_ff @(posedge clk_i or negedge rst_ni) begin
+            if (!rst_ni) state_q <= '0;
+            else state_q <= state_n;
+        end
+    end else begin : gen_disabled
+        assign aown_cycles_o = '0;
+        assign union_cycles_o = '0;
+        assign n_did10_o = '0;
+        assign n_did11_o = '0;
+        assign status_o = '0;
+        assign capture_busy_o = 1'b0;
+    end
+endmodule
