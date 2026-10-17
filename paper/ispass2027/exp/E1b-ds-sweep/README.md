@@ -5,11 +5,17 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Origin Date: 2026-10-17
-- Verification Status: ANALYZED（两 BIT 构建通过；新板测尚未执行）
+- Verification Status: VERIFIED（两 BIT 验收通过；新增100试次完成，每条件n=10）
 - Version Label: a1_ds_sweep_v1
 
 本目录由 A1 准备构建审核、采集和结果导入接口；FPGA/JTAG/UART 均由 Root 串行执行。
 已有 DS0 / DS50 正式 100 次不覆盖、不重测。DS25、DS100 各五条件十次，共新增 100 次。
+
+最终论文数据见[完整结果](final-results.md)和[最终包](checkpoints/ds-sweep-final02/paper-data.json)：
+新增100点，加明确引用的历史100点，共200点；四档五条件各n=10，失败/替换0。
+最终包含逐试次统一长表、Q1/Q3/IQR统计与三幅图的PDF/PNG/SVG。
+早先阶段快照是这些同一试次的累计视图，合并时只选最终包并按实际boot/sequence去重。
+DS0为原始硬件主结果，正DS仅用于数据结构访存附加延迟敏感性。
 
 ## 已完成的源码审核与离线验证
 
