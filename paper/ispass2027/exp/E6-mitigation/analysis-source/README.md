@@ -70,3 +70,16 @@ evidence_level均synthetic。先前37/39项原回执保留，不替代最终hist
 全零A stage有效trial0；另一条件10区组full=0,2,…18、有效trial9、权重full/90，
 逐区组桶范围保留，pooled mean按full加权而非trial均值。
 这些都是合成protocol fixture，不能用作论文性能、DMA或BIT验收证据。
+
+## CSV campaign row_id聚焦修订
+
+Root直接审阅发现hist trial loop覆盖外层experiment/sample_set前缀变量。
+实际代码仅把内部label变量改为trial_label，原外层prefix保持独立；统计和hist口径未改。
+[修订身份](row-id-revision.json)、[两campaign检查原回执](../analysis-validation/run01/row-id-revision-report.json)
+及[实际源码副本](../analysis-validation/run01/row-id-revision-source/)保存。
+两个不同sample_set各38448行均保留完整experiment/sample_set前缀，ID集合互不相交，
+所有source pointer仍逐项对应。原41项和先前源码副本作为原件保留。
+
+```sh
+python3 paper/ispass2027/exp/E6-mitigation/analysis-validation/verify_g_row_ids.py   --analysis-json <有限检查生成的analysis40/analysis.json>   --output <新row_id检查JSON>
+```
