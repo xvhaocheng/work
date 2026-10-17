@@ -27,6 +27,30 @@ KERNEL = '6.5.0-rc2-ispass2027-e4-e5-v1'
 CONDITIONS = {'leaf4k':4096,'leaf2m':2097152}
 
 
+# Exact recursive marker semantics reused from accepted E5 analyze_hist.py (6eaa15b).
+def synthetic_markers(value, path='$'):
+    """Retain explicit non-board evidence tags at every JSON nesting level."""
+    found = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            pointer = f'{path}.{key}'
+            flag = key in {'fixture_only', 'is_fixture', 'simulation_only', 'synthetic_fixture', 'mock_fixture'} \
+                and (child is True or str(child).lower() in {'true', '1'})
+            label = isinstance(child, str) and (
+                (key in {'evidence_level', 'evidence_kind', 'source_kind'} and
+                 any(token in child.lower() for token in ('fixture', 'synthetic', 'mock'))) or
+                (key in {'schema', 'condition'} and any(token in child.lower() for token in ('fixture', 'mock'))))
+            boot = key == 'boot_id' and isinstance(child, str) and child.startswith('HOST-FIXTURE')
+            if flag or label or boot:
+                found.append({'path': pointer, 'value': child})
+            found.extend(synthetic_markers(child, pointer))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.extend(synthetic_markers(child, f'{path}[{index}]'))
+    return found
+
+
+
 def save(path,value):
     Path(path).write_text(json.dumps(value,indent=2)+'\n')
 
@@ -309,7 +333,8 @@ def main():
     if args.check_only:
         print(json.dumps(bound,indent=2));return
     for path in [args.package/'manifest.json',Path(bound['source_record']),args.load_manifest,args.fpga_manifest,args.software_manifest]:
-        assert not json.loads(path.read_text()).get('fixture_only'), 'host fixtures cannot start collection'
+        markers=synthetic_markers(json.loads(path.read_text()),str(path))
+        assert not markers, 'host fixtures cannot start collection: '+str(markers[:1])
     args.output.mkdir(parents=True,exist_ok=False)
     manifest={'schema':'ispass2027.e4_pagesize.run.v1','status':'running',
               'started_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
