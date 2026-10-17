@@ -15,6 +15,7 @@
 - 已审核并将三席的第一批准备分支合入 `ispass/root-a`：E1b 构建/采集/任务内长表，E3 原始能力证据与 P0 方案，E6 DS0 角色互换采集器。Root 工作树的17项调度/采集接口、6项独立长表、15项历史分析拒绝检查、14项角色采集协议检查实际通过；均为主机检查，不记为新板测。
 - 已发现并接续原有两个运行中的 DS 构建，输出在主工作区 `iommu-platform/out/ispass2027-20261017-ds25-01`、`...-ds100-01`；不重复构建、不改变其输入。验收尚未完成。
 - 已建立[唯一板测队列](../board/queue.md)。UART 身份回执确认板仍为 DS50/pathv3，boot `b1eaa85f-01d7-4976-9dac-b57cc8af49b7`、taint=0，四 DMA 节点齐全；未切 BIT、未执行新增性能测量。
+- 已整理历史统一100次的论文可用 PATH 数据：[逐试次阶段CSV](../exp/E5-latency/baseline100/trial-stages.csv)共1600行、160组，每组10试次。Root 从原始records重算，JSON和CSV完全一致；保留 count/sum/max、boot/sequence、配置和原始命令入口，不生成请求分位数。DS0 A8 的 V读stage1跨试次均值中位数为142.504517周期，最大观察值795周期；这是阶段统计，不是新板测或请求p99。
 
 ## 关键数字
 
@@ -26,7 +27,7 @@
 
 E3 已直接核实真实 pathv3 batch 在 CLI、driver、RTL 均固定 4096B，并且 V/A 共用 chunk；全局实验锁也不允许通过两个进程拼接。A2 的 `exp/E3-workloads/p0-change-option.md` 给出只覆盖45点的 packed-ring、新独立长度操作、真实字节验证和 batch 地址推进方案。用户已明确回复“批准仅P0最小改动、构建和45点板测”。Root 接受该限定方案，已指派 A2 分小批实施和验证；完整三类负载、其他 RTL 扩展未获此次扩围。DS25/100 仍先使用已写 pathv3 payload，新版本身份和结果另存。
 
-E2 当前只有两条流、一个 `aggressor_id`，三至四路需软件接口扩展；E4 2MiB 映射仍核查中。E5 baseline v3 仅导出 sum/count/max 等聚合，不导出逐请求样本或直方图，只能复用运行中已有的 mean/max。E6 角色互换的动态角色 ARM 与 PATH mux 已直接核读，现有 BIT/driver 可以执行，独立 collector 已通过14项主机协议检查。E4/E5 需要的内核、driver 或 RTL 变化及 E6 缓解构建仍只提交 change-request，等待用户决定。
+E2 当前只有两条流、一个 `aggressor_id`，三至四路需软件接口扩展；E4 已确认实验driver逐4KiB建图，2MiB需显式软件映射及实际leaf验证，[请求](../exp/E4-pagesize/change-request.md)保持未实施。E5 baseline v3 仅导出 sum/count/max 等聚合，不导出逐请求样本或直方图，只能复用运行中已有的 mean/max。E6 角色互换的动态角色 ARM 与 PATH mux 已直接核读，现有 BIT/driver 可以执行，独立 collector 已通过14项主机协议检查。E4/E5 需要的内核、driver 或 RTL 变化及 E6 缓解构建仍只提交 change-request，等待用户决定。
 
 E2 实际冻结硬件 `ariane_soc::RVIOMMUCfg.NumHpmCounters=31`，6槽是软件会话限制。Root 已接受先做有界 multi HPM 软件接口：四个DID×三event共12槽，保留旧pair/Solo六槽及安全恢复语义；不改 RTL。多干扰者驱动批次须在 P0 驱动接口稳定后审查整合，V精确硬件窗口保留，未被PATH选中的设备不得冒充已有逐设备PATH观测。
 
