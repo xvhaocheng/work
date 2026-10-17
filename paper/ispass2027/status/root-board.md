@@ -42,3 +42,9 @@ P0 前端三处RTL变更已直接审查，79项有限真实frontend验证通过�
 最终仅推送任务分支。共享结果表的新增行由实验目录 CSV 提供，README/CURRENT_STATUS 更新建议在最终交接中列明；本会话不直接编辑这些共享文件，也不自行合 main。
 
 用户已明确允许实验途中持续同步**已采集、论文可用的数据**；逐试次数据、任务内统一CSV和阶段统计在有真实样本后分批提交，明确n及未完成条件，不等整轮结束。日志保留作追溯，不以推送日志冒充同步论文数据。准备分支已推送 `origin/ispass/root-a`；BIT/payload 留在本机。当前唯一活动DS campaign在主工作区`board/runs/ds-sweep-20261017-01/`，Root不改其活动文件，只在稳定边界冻结本任务CSV；原会话两档结束后保持DS100并交还板卡。
+
+## 后续授权与编译进展（2026-10-17 13:03Z）
+
+用户已补充授权未来清单中的必要RTL/Linux改动由agent在独立branch实现、编译，随后统一排队上板。原E4/E5及其余负载的只读请求状态据此转为准备：E4交A3、E5交A1、E3其余形态交A2，均先完成当前关键交付，再给出有界设计和实际代码审查；E6历史缓解最后准备，不恢复新机制探索。先前等待决定的段落保留为当时状态，以本更新为准。
+
+Root已直接审查E2 multi最终驱动/ABI/CLI、未知静默状态不标drained与STOP前in-flight修正，实际源码hash吻合最终有限测试：旧pair/P0 38场景有序MMIO trace与稳定M完全相同，新multi57有限场景和45CLI场景通过，真实RV64 idma.o/iommu-hpm.o编译通过，multi栈1312B。Linux稳定提交`acece3a3ab7d72ba1f936c1984b82a4a55f28d46`已被接受，平台`52c5fdd028bbf3b07deaf1d0f7e13e3a271b29d0`固定其gitlink和lock；A2已开始一次共同payload编译，含原三程序、P0和多设备CLI，release后缀`-ispass2027-p0-multi-v1`。主机验证不代替板测。
