@@ -1,0 +1,548 @@
+From c37c7eef45909ea2fa50637454bafa26ad64064d Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:52:05 +0900
+Subject: [PATCH 15/27] Add P4M batch gaps and common-window aggressor progress
+
+Source-organization: 2026-10-17; new commit authored at actual current time.
+Feature-ID: CVA6-P4M-GAP
+Original-source: e822bc9d
+Validation scope: source/patch identity only; no build, simulation or experiment.
+---
+ .../fpga/src/ariane_peripherals_xilinx.sv     |   1 +
+ corev_apu/fpga/src/dma_observer.sv            | 240 +++++++++++++++++-
+ .../register_64bit/idma_reg64_frontend.sv     |  75 +++++-
+ 3 files changed, 300 insertions(+), 16 deletions(-)
+
+diff --git a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+index af1798eb58a587b021d320d8f13601e0f5874af9..4b9f62c9537173e1ebd8ecb0aac9db6e89c7a3fa 100644
+--- a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+@@ -933,6 +933,7 @@ module ariane_peripherals #(
+         end
+         dma_observer #(.NumPorts(NumDMADevices), .PathEnable(InclIOMMU),
+                        .E3Enable(InclIOMMU), .ControlledEnable(InclIOMMU),
++                       .P4MEnable(InclIOMMU),
+                        .AxiIdWidth(ariane_soc::IdWidth)) i_dma_observer (
+             .clk_i, .rst_ni,
+             .cfg_valid_i(obs_cfg_valid[0] && !obs_cfg_addr[0][7]),
+diff --git a/corev_apu/fpga/src/dma_observer.sv b/corev_apu/fpga/src/dma_observer.sv
+index 31221c69b3ed1dec76fffc483f434a11003a40c1..4278b3c5f48d9ee7455687f7a685d15c17bacbbb 100644
+--- a/corev_apu/fpga/src/dma_observer.sv
++++ b/corev_apu/fpga/src/dma_observer.sv
+@@ -7,6 +7,7 @@ module dma_observer #(
+     parameter bit PathEnable = 0,
+     parameter bit E3Enable = 0,
+     parameter bit ControlledEnable = 0,
++    parameter bit P4MEnable = 0,
+     parameter int AxiIdWidth = 4
+ ) (
+     input logic clk_i, rst_ni,
+@@ -31,9 +32,10 @@ module dma_observer #(
+     output logic [7:0] e3_control_o, e3_index_o
+ );
+     // Low byte is interface version; a missing observer must never look valid.
+-    localparam logic [63:0] Magic = (ControlledEnable && E3Enable) ? 64'h49444d414f425306 :
++    localparam logic [63:0] Magic = P4MEnable ? 64'h49444d414f425307 :
++        ((ControlledEnable && E3Enable) ? 64'h49444d414f425306 :
+         (E3Enable ? 64'h49444d414f425305 :
+-        (PathEnable ? 64'h49444d414f425303 : 64'h49444d414f425302));
++        (PathEnable ? 64'h49444d414f425303 : 64'h49444d414f425302)));
+     localparam int Count = 35;
+     typedef enum logic [2:0] {OFF, ARMED, HARDWARE, POLL_WAIT, REFILL, FROZEN, BATCH_READ} phase_t;
+     phase_t phase_q, phase_n;
+@@ -48,6 +50,29 @@ module dma_observer #(
+     logic [1:0] victim_q, victim_n, aggressor_q, aggressor_n;
+     logic has_a_q, has_a_n, batch_q, batch_n;
+     logic finite_q, finite_n;
++    logic p4m_q, p4m_n;
++    // P4M per-lane task tracking and window snapshot. Every port keeps its own in-flight flag,
++    // descriptor id and sticky error evidence, continuous across warmup, window and drain; only
++    // the lanes ARM selects (victim, optional aggressor) are ever sampled.
++    logic [NumPorts-1:0] lane_task_q, lane_task_n;
++    logic [2:0] lane_err_q [NumPorts];
++    logic [2:0] lane_err_n [NumPorts];
++    logic [63:0] lane_id_q [NumPorts];
++    logic [63:0] lane_id_n [NumPorts];
++    logic p4m_open_q, p4m_open_n, p4m_closed_q, p4m_closed_n;
++    logic p4m_carry_q, p4m_carry_n, p4m_carry_done_q, p4m_carry_done_n;
++    logic p4m_start_q, p4m_start_n, p4m_end_q, p4m_end_n;
++    logic p4m_open_issue_q, p4m_open_issue_n;
++    logic a_issue_evt, a_done_evt, v_issue_evt, v_done_evt;
++    logic [63:0] p4m_open_id_q, p4m_open_id_n, p4m_close_id_q, p4m_close_id_n;
++    logic [63:0] p4m_first_done_id_q, p4m_first_done_id_n;
++    logic [63:0] p4m_last_done_id_q, p4m_last_done_id_n;
++    logic [CounterWidth-1:0] p4m_cycles_q, p4m_cycles_n;
++    logic [CounterWidth-1:0] p4m_a_issue_q, p4m_a_issue_n, p4m_a_done_q, p4m_a_done_n;
++    logic [CounterWidth-1:0] p4m_window_issue_q, p4m_window_issue_n;
++    logic [CounterWidth-1:0] p4m_window_done_q, p4m_window_done_n;
++    logic [31:0] p4m_error_q, p4m_error_n;
++    logic [63:0] p4m_data;
+     logic busy;
+     assign busy = active || phase_q == BATCH_READ;
+     logic active, v_pending, a_pending;
+@@ -111,6 +136,32 @@ module dma_observer #(
+             7'h78: if (int'(index_q) < Count) cfg_rdata_o = 64'(count_q[index_q]);
+                    else if (PathEnable && index_q >= 64 && index_q < 192) cfg_rdata_o = path_data;
+                    else if (E3Enable && index_q >= 192 && index_q < 448) cfg_rdata_o = e3_data_i;
++                   else if (P4MEnable && index_q >= 9'd448 && index_q < 9'd464) cfg_rdata_o = p4m_data;
++            default: ;
++        endcase
++    end
++
++    // P4M bank 448..463. Word 0 tags the capability; every other word is the snapshot taken
++    // at the (open, close] closing boundary and never changes afterwards.
++    always_comb begin
++        p4m_data = '0;
++        case (index_q)
++            9'd448: p4m_data = 64'h49444d4150344d01;
++            9'd449: p4m_data = 64'(p4m_cycles_q);
++            9'd450: p4m_data = 64'(p4m_a_issue_q);
++            9'd451: p4m_data = 64'(p4m_a_done_q);
++            9'd452: p4m_data = {63'b0, p4m_start_q};
++            9'd453: p4m_data = {63'b0, p4m_end_q};
++            9'd454: p4m_data = {63'b0, p4m_carry_done_q};
++            9'd455: p4m_data = {63'b0, p4m_open_issue_q};
++            9'd456: p4m_data = p4m_open_id_q;
++            9'd457: p4m_data = p4m_close_id_q;
++            9'd458: p4m_data = p4m_first_done_id_q;
++            9'd459: p4m_data = p4m_last_done_id_q;
++            9'd460: p4m_data = 64'(p4m_error_q);
++            9'd461: p4m_data = 64'(p4m_window_issue_q);
++            9'd462: p4m_data = 64'(p4m_window_done_q);
++            9'd463: p4m_data = {61'b0, p4m_carry_q, p4m_closed_q, has_a_q};
+             default: ;
+         endcase
+     end
+@@ -135,6 +186,29 @@ module dma_observer #(
+         delay_n = delay_q;
+         e3_arm = 0;
+         track_bad_n = track_bad_q;
++        p4m_n = p4m_q;
++        lane_task_n = lane_task_q;
++        for (int i = 0; i < NumPorts; i++) begin
++            lane_id_n[i] = lane_id_q[i];
++            lane_err_n[i] = lane_err_q[i];
++        end
++        p4m_open_n = p4m_open_q;
++        p4m_closed_n = p4m_closed_q;
++        p4m_carry_n = p4m_carry_q;
++        p4m_carry_done_n = p4m_carry_done_q;
++        p4m_start_n = p4m_start_q;
++        p4m_end_n = p4m_end_q;
++        p4m_open_issue_n = p4m_open_issue_q;
++        p4m_open_id_n = p4m_open_id_q;
++        p4m_close_id_n = p4m_close_id_q;
++        p4m_first_done_id_n = p4m_first_done_id_q;
++        p4m_last_done_id_n = p4m_last_done_id_q;
++        p4m_cycles_n = p4m_cycles_q;
++        p4m_a_issue_n = p4m_a_issue_q;
++        p4m_a_done_n = p4m_a_done_q;
++        p4m_window_issue_n = p4m_window_issue_q;
++        p4m_window_done_n = p4m_window_done_q;
++        p4m_error_n = p4m_error_q;
+         // Track continuously, including warmup and drain, never reset on ARM.
+         for (int i = 0; i < NumPorts; i++) begin
+             reads_n[i] = reads_q[i];
+@@ -164,6 +238,72 @@ module dma_observer #(
+             if (bad_id_i[i]) track_bad_n[i] = 1'b1;
+         end
+ 
++        // ---- P4M per-lane tracking ----
++        // Every port keeps its own in-flight flag, descriptor id and sticky error evidence from
++        // reset (warmup, window, drain), independently of the roles ARM selects; only the selected
++        // victim lane and optional aggressor lane are ever sampled. Retire first, then accept a
++        // replacement, so a prior-job DONE and a new ISSUE in the same cycle is a legal hand-off.
++        v_issue_evt = P4MEnable && issue_i[victim_q];
++        v_done_evt = P4MEnable && done_i[victim_q];
++        a_issue_evt = P4MEnable && has_a_q && issue_i[aggressor_q];
++        a_done_evt = P4MEnable && has_a_q && done_i[aggressor_q];
++        if (P4MEnable) begin
++            for (int i = 0; i < NumPorts; i++) begin
++                if (done_i[i]) begin
++                    if (!lane_task_q[i] || done_id_i[i] != lane_id_q[i]) lane_err_n[i][1] = 1'b1;
++                    lane_task_n[i] = 1'b0;
++                end
++                if (issue_i[i]) begin
++                    if (issue_id_i[i] == 0) lane_err_n[i][0] = 1'b1;
++                    if (lane_task_n[i]) lane_err_n[i][2] = 1'b1;
++                    lane_task_n[i] = 1'b1;
++                    lane_id_n[i] = issue_id_i[i];
++                end
++            end
++        end
++
++        // Window accumulation: (open, close]. Opening-edge lane events are excluded because the
++        // window flag is not yet set, closing-edge events are included because it is still clear.
++        // FROZEN and the post-close phases accumulate nothing, so an abort cannot move the bank.
++        if (P4MEnable && p4m_q && p4m_open_q && !p4m_closed_q &&
++            (phase_q == ARMED || active)) begin
++            if (v_issue_evt) begin
++                if (&p4m_window_issue_q) p4m_error_n[3] = 1'b1;
++                p4m_window_issue_n = p4m_window_issue_q + 1'b1;
++            end
++            if (v_done_evt) begin
++                if (&p4m_window_done_q) p4m_error_n[3] = 1'b1;
++                p4m_window_done_n = p4m_window_done_q + 1'b1;
++            end
++            if (a_issue_evt) begin
++                if (&p4m_a_issue_q) p4m_error_n[3] = 1'b1;
++                p4m_a_issue_n = p4m_a_issue_q + 1'b1;
++            end
++            if (a_done_evt) begin
++                if (&p4m_a_done_q) p4m_error_n[3] = 1'b1;
++                if (p4m_a_done_q == 0) p4m_first_done_id_n = done_id_i[aggressor_q];
++                p4m_last_done_id_n = done_id_i[aggressor_q];
++                p4m_a_done_n = p4m_a_done_q + 1'b1;
++                // The strict pre-opening cohort is the descriptor already in flight at the opening
++                // edge. Its done is recorded at most once and only for that descriptor; the cohort
++                // flag itself is the immutable at-opening snapshot and is never cleared.
++                if (p4m_carry_q && !p4m_carry_done_q && p4m_open_id_q != 64'd0 &&
++                    done_id_i[aggressor_q] == p4m_open_id_q) p4m_carry_done_n = 1'b1;
++            end
++        end
++
++        // Selected-lane error evidence for the frozen bank word 12. Unselected lanes are ignored,
++        // and evidence accumulates only while the observation is ARMED or active, so FROZEN and
++        // drain events (everything after an abort) can never change the bank.
++        if (P4MEnable && p4m_q && !p4m_closed_q && (phase_q == ARMED || active)) begin
++            p4m_error_n[0] = p4m_error_n[0] | lane_err_n[victim_q][0] |
++                (has_a_q && lane_err_n[aggressor_q][0]);
++            p4m_error_n[1] = p4m_error_n[1] | lane_err_n[victim_q][1] |
++                (has_a_q && lane_err_n[aggressor_q][1]);
++            p4m_error_n[2] = p4m_error_n[2] | lane_err_n[victim_q][2] |
++                (has_a_q && lane_err_n[aggressor_q][2]);
++        end
++
+         if (phase_q == ARMED && issue_i[victim_q]) begin
+             phase_n = HARDWARE;
+             expected_n = issue_id_i[victim_q];
+@@ -172,6 +312,20 @@ module dma_observer #(
+             count_n[30] = CounterWidth'((CounterWidth'(reads_n[victim_q]) << 16) | CounterWidth'(writes_n[victim_q]));
+             count_n[31] = has_a_q ? CounterWidth'((CounterWidth'(reads_n[aggressor_q]) << 16) | CounterWidth'(writes_n[aggressor_q])) : '0;
+             if (issue_id_i[victim_q] == 0) error_n[1] = 1'b1;
++            if (p4m_q) begin
++                // Opening edge. This cycle's lane events are excluded from the sums, the selected
++                // lane stock is sampled after them, and a selected job that was not issued here is
++                // the immutable strict pre-opening cohort. The opening job itself counts as the
++                // first V issue of the window, matching legacy count7.
++                p4m_open_n = 1'b1;
++                p4m_start_n = has_a_q && lane_task_n[aggressor_q];
++                p4m_end_n = 1'b0;
++                p4m_open_id_n = (has_a_q && lane_task_n[aggressor_q]) ? lane_id_n[aggressor_q] : 64'd0;
++                p4m_open_issue_n = a_issue_evt;
++                p4m_carry_n = has_a_q && lane_task_n[aggressor_q] && !a_issue_evt;
++                p4m_carry_done_n = 1'b0;
++                p4m_window_issue_n = 1'b1;
++            end
+         end
+         if (phase_q == ARMED || active) begin
+             if (track_bad_n[victim_q] || (has_a_q && track_bad_n[aggressor_q]))
+@@ -220,6 +374,15 @@ module dma_observer #(
+                                 phase_n = BATCH_READ;
+                                 count_n[32] = CounterWidth'((CounterWidth'(reads_n[victim_q]) << 16) | CounterWidth'(writes_n[victim_q]));
+                                 count_n[33] = has_a_q ? CounterWidth'((CounterWidth'(reads_n[aggressor_q]) << 16) | CounterWidth'(writes_n[aggressor_q])) : '0;
++                                if (p4m_q) begin
++                                    // Closing boundary: this cycle's lane events were already
++                                    // accumulated, the cycle count is the frozen count0 and the
++                                    // selected lane stock is sampled after the closing-edge events.
++                                    p4m_closed_n = 1'b1;
++                                    p4m_end_n = has_a_q && lane_task_n[aggressor_q];
++                                    p4m_close_id_n = (has_a_q && lane_task_n[aggressor_q]) ? lane_id_n[aggressor_q] : 64'd0;
++                                    p4m_cycles_n = count_n[0];
++                                end
+                             end else phase_n = REFILL;
+                         end else phase_n = POLL_WAIT;
+                     end
+@@ -260,6 +423,7 @@ module dma_observer #(
+                 7'h68: if (!busy && phase_q != ARMED) target_n = cfg_wdata_i;
+                          else error_n[0] = 1'b1;
+                 7'h70: if (cfg_wdata_i < 64'(Count) ||
++                          (P4MEnable && cfg_wdata_i >= 64'd448 && cfg_wdata_i < 64'd464) ||
+                           (PathEnable && cfg_wdata_i >= 64 && cfg_wdata_i < 192) ||
+                           (E3Enable && cfg_wdata_i >= 192 && cfg_wdata_i < 448)) index_n = cfg_wdata_i[8:0];
+                          else error_n[0] = 1'b1;
+@@ -268,11 +432,25 @@ module dma_observer #(
+                         if (busy || phase_q == ARMED) begin
+                             phase_n = FROZEN;
+                             error_n[4] = 1'b1;
++                            if (p4m_q && !p4m_closed_q) p4m_error_n[5] = 1'b1;
+                         end
+                     end else if (cfg_wdata_i == 4) begin
+                         if (busy || phase_q == ARMED) error_n[0] = 1'b1;
+-                        else begin phase_n = OFF; error_n = 0; path_clear = 1; path_n = 0; e3_n = 0; finite_n = 0; end
+-                    end else if ((cfg_wdata_i & ~(64'h000000001f030301 | (ControlledEnable && E3Enable ? 64'h0000000020000000 : 64'h0))) == 0 && cfg_wdata_i[0] &&
++                        else begin
++                            phase_n = OFF; error_n = 0; path_clear = 1; path_n = 0; e3_n = 0; finite_n = 0;
++                            p4m_n = 0; p4m_open_n = 0; p4m_closed_n = 0; p4m_carry_n = 0; p4m_carry_done_n = 0;
++                            p4m_start_n = 0; p4m_end_n = 0; p4m_open_issue_n = 0;
++                            p4m_open_id_n = 0; p4m_close_id_n = 0;
++                            p4m_first_done_id_n = 0; p4m_last_done_id_n = 0;
++                            p4m_cycles_n = 0; p4m_a_issue_n = 0; p4m_a_done_n = 0;
++                            p4m_window_issue_n = 0; p4m_window_done_n = 0; p4m_error_n = 0;
++                            // Lane tracking and its sticky errors survive CLEAR, just like AXI
++                            // stock tracking. A new ARM must not hide a lost descriptor history.
++                        end
++                    end else if ((cfg_wdata_i & ~(64'h000000001f030301 | (ControlledEnable && E3Enable ? 64'h0000000020000000 : 64'h0) | (P4MEnable ? 64'h0000000040000000 : 64'h0))) == 0 && cfg_wdata_i[0] &&
++                                 (!cfg_wdata_i[30] || (P4MEnable && cfg_wdata_i[25] && cfg_wdata_i[9:8] == 0 &&
++                                    (!cfg_wdata_i[24] || cfg_wdata_i[17:16] == 1) &&
++                                    !cfg_wdata_i[27] && !cfg_wdata_i[28] && !cfg_wdata_i[29])) &&
+                                  (!cfg_wdata_i[29] || (ControlledEnable && E3Enable && cfg_wdata_i[27] && cfg_wdata_i[26] && cfg_wdata_i[25] &&
+                                     target_q == 64'd1 && cfg_wdata_i[9:8] == 0 &&
+                                     (!cfg_wdata_i[24] || cfg_wdata_i[17:16] == 1))) &&
+@@ -296,12 +474,42 @@ module dma_observer #(
+                         e3_arm = cfg_wdata_i[27];
+                         delay_n = cfg_wdata_i[28];
+                         segment_n = 0;
++                        p4m_n = cfg_wdata_i[30];
++                        p4m_open_n = 1'b0;
++                        p4m_closed_n = 1'b0;
++                        p4m_carry_n = 1'b0;
++                        p4m_carry_done_n = 1'b0;
++                        p4m_start_n = 1'b0;
++                        p4m_end_n = 1'b0;
++                        p4m_open_issue_n = 1'b0;
++                        p4m_open_id_n = '0;
++                        p4m_close_id_n = '0;
++                        p4m_first_done_id_n = '0;
++                        p4m_last_done_id_n = '0;
++                        p4m_cycles_n = '0;
++                        p4m_a_issue_n = '0;
++                        p4m_a_done_n = '0;
++                        p4m_window_issue_n = '0;
++                        p4m_window_done_n = '0;
++                        p4m_error_n = '0;
+                         for (int i = 0; i < Count; i++) count_n[i] = 0;
+                     end else error_n[0] = 1'b1;
+                 end
+                 default: error_n[0] = 1'b1;
+             endcase
+         end
++
++        // P4M violations are sticky and invalidate the bank through error_q[8] (main status
++        // bit 40). Details stay readable at bank word 12. Once the observation is closed the bank
++        // (word 12 included) is frozen; a later abort is still reported in the main status and still
++        // invalidates the result, but it cannot rewrite the captured words.
++        if (p4m_q && !p4m_closed_q) begin
++            if (error_n[4]) p4m_error_n[4] = 1'b1;   // aborted observation inside the window
++            if (error_n[2]) p4m_error_n[3] = 1'b1;   // counter overflow inside the session
++            if (error_n[3]) p4m_error_n[7] = 1'b1;   // private AXI identity violation
++        end
++        if (p4m_q && error_n[4] && p4m_closed_q) error_n[8] = 1'b1; // post-close abort: invalid only
++        if (p4m_error_n != 32'd0) error_n[8] = 1'b1;
+     end
+ 
+     always_ff @(posedge clk_i or negedge rst_ni) begin
+@@ -321,6 +529,15 @@ module dma_observer #(
+             e3_q <= 0;
+             delay_q <= 0;
+             track_bad_q <= 0;
++            p4m_q <= 0;
++            lane_task_q <= 0;
++            for (int i = 0; i < NumPorts; i++) begin lane_id_q[i] <= 0; lane_err_q[i] <= 0; end
++            p4m_open_q <= 0; p4m_closed_q <= 0; p4m_carry_q <= 0; p4m_carry_done_q <= 0;
++            p4m_start_q <= 0; p4m_end_q <= 0; p4m_open_issue_q <= 0;
++            p4m_open_id_q <= 0; p4m_close_id_q <= 0;
++            p4m_first_done_id_q <= 0; p4m_last_done_id_q <= 0;
++            p4m_cycles_q <= 0; p4m_a_issue_q <= 0; p4m_a_done_q <= 0;
++            p4m_window_issue_q <= 0; p4m_window_done_q <= 0; p4m_error_q <= 0;
+             for (int i = 0; i < Count; i++) count_q[i] <= 0;
+             for (int i = 0; i < NumPorts; i++) begin reads_q[i] <= 0; writes_q[i] <= 0; end
+         end else begin
+@@ -339,6 +556,21 @@ module dma_observer #(
+             e3_q <= e3_n;
+             delay_q <= delay_n;
+             track_bad_q <= track_bad_n;
++            p4m_q <= p4m_n;
++            lane_task_q <= lane_task_n;
++            for (int i = 0; i < NumPorts; i++) begin
++                lane_id_q[i] <= lane_id_n[i];
++                lane_err_q[i] <= lane_err_n[i];
++            end
++            p4m_open_q <= p4m_open_n; p4m_closed_q <= p4m_closed_n;
++            p4m_carry_q <= p4m_carry_n; p4m_carry_done_q <= p4m_carry_done_n;
++            p4m_start_q <= p4m_start_n; p4m_end_q <= p4m_end_n;
++            p4m_open_issue_q <= p4m_open_issue_n;
++            p4m_open_id_q <= p4m_open_id_n; p4m_close_id_q <= p4m_close_id_n;
++            p4m_first_done_id_q <= p4m_first_done_id_n; p4m_last_done_id_q <= p4m_last_done_id_n;
++            p4m_cycles_q <= p4m_cycles_n; p4m_a_issue_q <= p4m_a_issue_n; p4m_a_done_q <= p4m_a_done_n;
++            p4m_window_issue_q <= p4m_window_issue_n; p4m_window_done_q <= p4m_window_done_n;
++            p4m_error_q <= p4m_error_n;
+             for (int i = 0; i < Count; i++) count_q[i] <= count_n[i];
+             for (int i = 0; i < NumPorts; i++) begin reads_q[i] <= reads_n[i]; writes_q[i] <= writes_n[i]; end
+         end
+diff --git a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+index e6d123765e86a8166ac2be7a61b3a726fe6f33ab..7c8d67bf1efb00b7fdb3bc9c61160ca5a1816c57 100644
+--- a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
++++ b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+@@ -60,12 +60,17 @@ module idma_reg64_frontend #(
+     localparam logic [7:0] NextIdOffset       = 8'h28;
+     // Launcher register forwarding lives in the upper bank, above the batch window.
+     localparam logic [7:0] LauncherBase       = 8'hb0;
+-
+-    typedef enum logic [1:0] {
+-        IDLE    = 2'b00,
+-        COUNT   = 2'b01,
+-        WAIT    = 2'b10,
+-        HOLD    = 2'b11
++    // P4M gap control/capability live in the batch high bank and are carved
++    // out before the launcher decode so they never alias the launcher window.
++    localparam logic [7:0] GapCyclesOffset    = 8'hd0;
++    localparam logic [7:0] GapCapOffset       = 8'hd8;
++
++    typedef enum logic [2:0] {
++        IDLE    = 3'b000,
++        COUNT   = 3'b001,
++        WAIT    = 3'b010,
++        HOLD    = 3'b011,
++        GAP     = 3'b100
+     } idma_state_t;
+     idma_state_t state_q, state_n;
+ 
+@@ -96,6 +101,10 @@ module idma_reg64_frontend #(
+     logic [12:0] batch_pages_q;
+     logic [63:0] batch_id_q;
+     logic batch_cfg_ok, batch_task_issue, batch_task_done;
++    logic [31:0] gap_cycles_q;
++    logic [31:0] gap_countdown_q, gap_countdown_n;
++    logic gap_access;
++    logic batch_stop_write;
+ 
+     // Controlled-launch state
+     logic launcher_access;
+@@ -109,9 +118,14 @@ module idma_reg64_frontend #(
+     logic [DmaRegisterWidth-1:0] launch_id_q, launch_id_n;
+ 
+     assign full_addr = 8'(dma_ctrl_req_i.addr);
++    // The gap slots are exact BatchPort decodes and must be carved out before
++    // the launcher window, otherwise d0/d8 would alias launcher b0..ff.
++    assign gap_access = BatchPort && dma_ctrl_req_i.valid &&
++                        (full_addr == GapCyclesOffset || full_addr == GapCapOffset);
+     // Launcher window is carved out before the batch high-bank decode so 0xb0..0xff
+-    // never aliases the batch bank.
+-    assign launcher_access = LaunchPort && ObserverPort && dma_ctrl_req_i.valid && (full_addr >= LauncherBase);
++    // never aliases the batch bank, except for the exact gap slots above.
++    assign launcher_access = LaunchPort && ObserverPort && dma_ctrl_req_i.valid &&
++                             (full_addr >= LauncherBase) && !gap_access;
+     assign batch_access = BatchPort && dma_ctrl_req_i.valid && full_addr[7] && !launcher_access;
+     assign batch_active_o = BatchPort && batch_enable_q && state_q != IDLE;
+     assign locked_write = batch_active_o && dma_ctrl_req_i.valid &&
+@@ -131,6 +145,7 @@ module idma_reg64_frontend #(
+             batch_enable_q <= 0; batch_stop_q <= 0; batch_stopped_q <= 0;
+             batch_error_q <= 0; batch_target_q <= 0; batch_pages_q <= 0;
+             batch_issued_q <= 0; batch_completed_q <= 0; batch_id_q <= 0;
++            gap_cycles_q <= 0;
+         end else if (BatchPort) begin
+             if (batch_enable_q && issue) begin
+                 batch_issued_q <= 0; batch_completed_q <= 0;
+@@ -141,6 +156,8 @@ module idma_reg64_frontend #(
+                 batch_completed_q <= batch_completed_q + 1'b1;
+                 if (batch_stop_q) batch_stopped_q <= 1;
+             end
++            if (batch_enable_q && state_q == GAP && (batch_stop_q || batch_stop_write))
++                batch_stopped_q <= 1;
+             if (locked_write) batch_error_q <= 1;
+             // While a controlled launch job is active the batch bank is read-only:
+             // the write is rejected (AXI error) but must not poison batch_error_q.
+@@ -157,6 +174,7 @@ module idma_reg64_frontend #(
+                             batch_error_q <= 0;
+                             batch_issued_q <= 0;
+                             batch_completed_q <= 0;
++                            gap_cycles_q <= 0;
+                         end
+                     end else batch_error_q <= 1;
+                     8'h90: if (dma_ctrl_req_i.wdata > 0 && dma_ctrl_req_i.wdata <= 64'h100000000)
+@@ -165,6 +183,10 @@ module idma_reg64_frontend #(
+                     8'h98: if (dma_ctrl_req_i.wdata > 0 && dma_ctrl_req_i.wdata <= 4096)
+                         batch_pages_q <= dma_ctrl_req_i.wdata[12:0];
+                         else batch_error_q <= 1;
++                    8'hd0: if (dma_ctrl_req_i.wdata[63:32] == 0)
++                        gap_cycles_q <= dma_ctrl_req_i.wdata[31:0];
++                        else batch_error_q <= 1;
++                    8'hd8: batch_error_q <= 1;
+                     default: batch_error_q <= 1;
+                 endcase
+             end
+@@ -199,6 +221,12 @@ module idma_reg64_frontend #(
+                                !batch_access && !observer_access && !launcher_access;
+     assign launch_locked_write = launch_busy && launch_base_write;
+ 
++    // Same-cycle STOP pulse for the GAP state.  This lets STOP win over a
++    // countdown-expiry edge in the same cycle as the 0x88 write.
++    assign batch_stop_write = batch_access && dma_ctrl_req_i.write && !launch_busy &&
++                              dma_ctrl_req_i.wstrb == 8'hff &&
++                              (full_addr == 8'h88) && (dma_ctrl_req_i.wdata == 2);
++
+     // Exactly 64-byte, DEFAULT, aligned, batch-disabled, idle-backend transfer with
+     // an all-zero configuration. CONF is compared per reg_pkg field to avoid packed
+     // aggregate comparison ambiguities.
+@@ -228,7 +256,8 @@ module idma_reg64_frontend #(
+     // ordinary job, so it is a preflight "frontend busy" indicator. It is
+     // intentionally wider than launch_ctrl_q (the controlled job only); use
+     // launch_held_o / launch_busy to distinguish the controlled job.
+-    assign launch_active_o    = LaunchPort && (state_q == HOLD || state_q == COUNT || state_q == WAIT);
++    assign launch_active_o    = LaunchPort && (state_q == HOLD || state_q == COUNT ||
++                                               state_q == WAIT || state_q == GAP);
+ 
+     assign obs_issue_o = batch_enable_q ? batch_task_issue :
+                          (LaunchPort && (launch_ctrl_q || launch_hold_i)) ?
+@@ -385,6 +414,8 @@ module idma_reg64_frontend #(
+                     8'h98: dma_ctrl_rsp_o.rdata = 64'(batch_pages_q);
+                     8'ha0: dma_ctrl_rsp_o.rdata = 64'(batch_completed_q);
+                     8'ha8: dma_ctrl_rsp_o.rdata = 64'(batch_issued_q);
++                    8'hd0: dma_ctrl_rsp_o.rdata = {32'd0, gap_cycles_q};
++                    8'hd8: dma_ctrl_rsp_o.rdata = 64'h49444d4147415001;
+                     default: dma_ctrl_rsp_o.error = 1;
+                 endcase
+             end
+@@ -407,6 +438,7 @@ module idma_reg64_frontend #(
+         transf_counter_n  = transf_counter_q;
+         transf_offset_n   = transf_offset_q;
+         active_cycles_n   = active_cycles_q + DmaRegisterWidth'(!backend_idle_i);
++        gap_countdown_n   = gap_countdown_q;
+         state_n           = state_q;
+ 
+         unique case (state_q)
+@@ -487,14 +519,32 @@ module idma_reg64_frontend #(
+                         trans_complete = 1'b1;
+                         id_retire      = 1'b1;
+                         state_n = IDLE;
+-                    end
+-
+-                    else begin
++                    end else if (batch_enable_q && gap_cycles_q != '0) begin
++                        // Non-final batch completion: wait before offering the
++                        // next task.  The first task is never delayed.
++                        state_n         = GAP;
++                        gap_countdown_n = gap_cycles_q;
++                    end else begin
+                         state_n = COUNT;
+                     end
+                 end
+             end
+ 
++            GAP: begin
++                // STOP wins over a same-cycle countdown expiry.  All issued
++                // jobs are already complete, so retire the functional batch ID
++                // without creating an extra obs_done.
++                if (batch_stop_q || batch_stop_write) begin
++                    id_retire = 1'b1;
++                    state_n   = IDLE;
++                end else if (gap_countdown_q <= 32'd1) begin
++                    state_n         = COUNT;
++                    gap_countdown_n = '0;
++                end else begin
++                    gap_countdown_n = gap_countdown_q - 32'd1;
++                end
++            end
++
+             HOLD: begin
+                 // No backend VALID here. Cancel retires the reserved ID without an
+                 // obs_issue/obs_done event; go starts the transfer.
+@@ -530,6 +580,7 @@ module idma_reg64_frontend #(
+     `FF(transf_counter_q,   transf_counter_n,   '0,     clk_i, rst_ni)
+     `FF(transf_offset_q,    transf_offset_n,    '0,     clk_i, rst_ni)
+     `FF(active_cycles_q,    active_cycles_n,    '0,     clk_i, rst_ni)
++    `FF(gap_countdown_q,    gap_countdown_n,    '0,     clk_i, rst_ni)
+     `FF(launch_ctrl_q,      launch_ctrl_n,      1'b0,   clk_i, rst_ni)
+     `FF(launch_id_q,        launch_id_n,        '0,     clk_i, rst_ni)
+ 

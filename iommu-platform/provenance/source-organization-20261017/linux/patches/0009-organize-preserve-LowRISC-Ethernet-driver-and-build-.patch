@@ -1,0 +1,999 @@
+From 32b96fe373e56611c9eee787580c1e475d7b52e9 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:58:30 +0900
+Subject: [PATCH 9/9] organize: preserve LowRISC Ethernet driver and build
+ integration
+
+---
+ drivers/net/ethernet/Kconfig                  |   1 +
+ drivers/net/ethernet/Makefile                 |   1 +
+ drivers/net/ethernet/lowrisc/Kconfig          |  21 +
+ drivers/net/ethernet/lowrisc/Makefile         |   6 +
+ .../net/ethernet/lowrisc/lowrisc_ethernet.c   | 913 ++++++++++++++++++
+ 5 files changed, 942 insertions(+)
+ create mode 100644 drivers/net/ethernet/lowrisc/Kconfig
+ create mode 100644 drivers/net/ethernet/lowrisc/Makefile
+ create mode 100644 drivers/net/ethernet/lowrisc/lowrisc_ethernet.c
+
+diff --git a/drivers/net/ethernet/Kconfig b/drivers/net/ethernet/Kconfig
+index 5a274b99f2992131505443f461a42f7f59a3bd07..21b1b513d459590cd86d8529f360ad91d378072e 100644
+--- a/drivers/net/ethernet/Kconfig
++++ b/drivers/net/ethernet/Kconfig
+@@ -122,6 +122,7 @@ config LANTIQ_XRX200
+ 
+ source "drivers/net/ethernet/adi/Kconfig"
+ source "drivers/net/ethernet/litex/Kconfig"
++source "drivers/net/ethernet/lowrisc/Kconfig"
+ source "drivers/net/ethernet/marvell/Kconfig"
+ source "drivers/net/ethernet/mediatek/Kconfig"
+ source "drivers/net/ethernet/mellanox/Kconfig"
+diff --git a/drivers/net/ethernet/Makefile b/drivers/net/ethernet/Makefile
+index 0d872d4efcd10b1d29752e7fcd6aede2ec657902..1c3f6779224eb6d89511d6e68e34a26d3a338e4e 100644
+--- a/drivers/net/ethernet/Makefile
++++ b/drivers/net/ethernet/Makefile
+@@ -56,6 +56,7 @@ obj-$(CONFIG_KORINA) += korina.o
+ obj-$(CONFIG_LANTIQ_ETOP) += lantiq_etop.o
+ obj-$(CONFIG_LANTIQ_XRX200) += lantiq_xrx200.o
+ obj-$(CONFIG_NET_VENDOR_LITEX) += litex/
++obj-$(CONFIG_LOWRISC_ETH) += lowrisc/
+ obj-$(CONFIG_NET_VENDOR_MARVELL) += marvell/
+ obj-$(CONFIG_NET_VENDOR_MEDIATEK) += mediatek/
+ obj-$(CONFIG_NET_VENDOR_MELLANOX) += mellanox/
+diff --git a/drivers/net/ethernet/lowrisc/Kconfig b/drivers/net/ethernet/lowrisc/Kconfig
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f824389a73e82e21286d73b098df9bfca9c64d8
+--- /dev/null
++++ b/drivers/net/ethernet/lowrisc/Kconfig
+@@ -0,0 +1,21 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# LowRISC/Ariane FPGA Ethernet driver configuration
++#
++
++config LOWRISC_ETH
++	tristate "LowRISC/Ariane FPGA Ethernet support"
++	depends on RISCV && 64BIT && OF
++	depends on HAS_IOMEM
++	select PHYLIB
++	select MDIO_BITBANG
++	select CRC32
++	help
++	  Say Y here if you want to use the gigabit Ethernet MAC of the
++	  LowRISC/Ariane FPGA platforms (Genesys II, Nexys Video, ...).
++
++	  The MAC is memory mapped in a 32 KiB AXI window and talks to the on
++	  board Realtek RTL8211E-VL PHY through a bit banged MDIO master.
++
++	  To compile this driver as a module, choose M here: the module will be
++	  called lowrisc_ethernet.
+diff --git a/drivers/net/ethernet/lowrisc/Makefile b/drivers/net/ethernet/lowrisc/Makefile
+new file mode 100644
+index 0000000000000000000000000000000000000000..193b40a99216568c715ffaaf217f8a4dce6472a9
+--- /dev/null
++++ b/drivers/net/ethernet/lowrisc/Makefile
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# Makefile for the LowRISC/Ariane Ethernet driver.
++#
++
++obj-$(CONFIG_LOWRISC_ETH) += lowrisc_ethernet.o
+diff --git a/drivers/net/ethernet/lowrisc/lowrisc_ethernet.c b/drivers/net/ethernet/lowrisc/lowrisc_ethernet.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..56b30b9298c39faa41b511ad076966c6feb00769
+--- /dev/null
++++ b/drivers/net/ethernet/lowrisc/lowrisc_ethernet.c
+@@ -0,0 +1,913 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * LowRISC / Ariane (CVA6) FPGA Fast/Gigabit Ethernet driver.
++ *
++ * The MAC implemented in cva6/corev_apu/fpga/src/ariane-ethernet/framing_top.sv
++ * is mapped into a 32 KiB AXI window.  It provides a single transmit buffer,
++ * an 8 slot receive ring and a bit banged MDIO master.  The PHY used on the
++ * Ariane FPGA boards is a Realtek RTL8211E-VL, driven through phylib.
++ *
++ * Hardware properties this driver has to respect:
++ *
++ *  - Registers are 32 bits wide and are accessed with readl()/writel() on
++ *    their 8 byte aligned low half.
++ *  - The packet memories are 64 bits wide and are only written completely
++ *    when all eight byte enables are set, so they are accessed with
++ *    readq()/writeq().  Byte wise access (memcpy_toio()) would only update
++ *    one half of a word (see the "web" generator in framing_top.sv).
++ *  - firstbuf/nextbuf are 4 bit ring pointers that wrap at 16 while the
++ *    slots are indexed with (buf & 7): the ring has eight slots of 2 KiB.
++ *  - The MAC has no transmit done interrupt, TPLR bit 31 has to be polled.
++ *  - There is no per frame receive error status: the AXIS tuser output of
++ *    axis_gmii_rx (bad FCS) is not routed to the register file and no error
++ *    counter exists. The driver checks the retained FCS in software and
++ *    reports only errors that it can establish from the frame bytes.
++ *
++ * Copyright (C) 2016 Jonathan Kimmitt <jrrk2@cam.ac.uk>
++ * Copyright (C) 2015 Microchip Technology (MDIO/PHY portions taken from the
++ *   original emac_lite derived ariane-lowrisc_100MHz.c driver)
++ * Copyright (C) 2007-2013 Xilinx, Inc. (original emac_lite driver from
++ *   John Williams <john.williams@xilinx.com>)
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the Free
++ * Software Foundation; either version 2 of the License, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#include <linux/bitops.h>
++#include <linux/crc32.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/etherdevice.h>
++#include <linux/ethtool.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/mdio-bitbang.h>
++#include <linux/mii.h>
++#include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/of.h>
++#include <linux/of_net.h>
++#include <linux/phy.h>
++#include <linux/platform_device.h>
++#include <linux/skbuff.h>
++#include <linux/spinlock.h>
++#include <linux/timer.h>
++#include <linux/types.h>
++#include <asm/unaligned.h>
++
++#define DRV_NAME		"lowrisc-eth"
++#define DRV_DESC		"LowRISC/Ariane FPGA Ethernet driver"
++
++/* Register offsets, see framing_top.sv. */
++#define LOWRISC_MACLO		0x0800	/* MAC address, low 32 bits */
++#define LOWRISC_MACHI		0x0808	/* MAC address high 16 bits + ctrl */
++#define LOWRISC_TPLR		0x0810	/* TX packet length and busy flag */
++#define LOWRISC_TFCS		0x0818	/* TX FCS status, write aborts a frame */
++#define LOWRISC_MDIOCTRL	0x0820	/* bit banged MDIO */
++#define LOWRISC_RFCS		0x0828	/* RX FCS status, write sets lastbuf */
++#define LOWRISC_RSR		0x0830	/* RX status, write releases a slot */
++#define LOWRISC_RPLR		0x0840	/* RX packet length, 8 entries */
++#define LOWRISC_TX_BUFF		0x1000	/* transmit buffer, 4 KiB */
++#define LOWRISC_RX_BUFF		0x4000	/* receive ring, 8 * 2 KiB */
++#define LOWRISC_IO_SIZE		0x8000
++
++/* MACHI */
++#define LOWRISC_MACHI_MAC_MASK	GENMASK(15, 0)
++#define LOWRISC_MACHI_ALLPKTS	BIT(22)	/* receive every packet */
++#define LOWRISC_MACHI_IRQ_EN	BIT(23)	/* receive interrupt enable */
++
++/* TPLR */
++#define LOWRISC_TPLR_BUSY	BIT(31)
++#define LOWRISC_TPLR_LEN_MASK	GENMASK(10, 0)
++
++/* RSR */
++#define LOWRISC_RSR_FIRST_MASK	GENMASK(3, 0)	/* oldest filled slot */
++#define LOWRISC_RSR_NEXT_MASK	GENMASK(7, 4)	/* next slot to fill */
++#define LOWRISC_RSR_DONE	BIT(12)		/* a frame is available */
++#define LOWRISC_RSR_IRQ		BIT(13)
++
++/* MDIOCTRL */
++#define LOWRISC_MDIO_MDC	BIT(0)
++#define LOWRISC_MDIO_OUT	BIT(1)
++#define LOWRISC_MDIO_OE		BIT(2)	/* active high, the MAC drives MDIO */
++#define LOWRISC_MDIO_IN		BIT(3)
++
++#define LOWRISC_RX_RING_SLOTS	8
++#define LOWRISC_RX_RING_MASK	(LOWRISC_RX_RING_SLOTS - 1)
++#define LOWRISC_RX_SLOT_SIZE	0x0800
++#define LOWRISC_MAX_FRAME	(ETH_DATA_LEN + ETH_HLEN + ETH_FCS_LEN)
++
++/*
++ * The MAC has no transmit done interrupt: completion is polled through
++ * TPLR_BUSY, either inline in the transmit path or from a timer.
++ */
++#define LOWRISC_TX_POLL_JIFFIES	1
++#define LOWRISC_TX_POLL_LOOPS	100
++#define LOWRISC_TX_TIMEOUT	(2 * HZ)
++
++/* PHY address strapped on the Ariane FPGA boards (RTL8211E-VL). */
++#define LOWRISC_PHY_ADDR	1
++
++struct lowrisc_priv {
++	struct mdiobb_ctrl ctrl;	/* MDIO bit-bang control */
++	struct net_device *ndev;
++	void __iomem *base;
++	struct napi_struct napi;
++	struct mii_bus *mii_bus;
++	struct timer_list tx_timer;
++	spinlock_t lock;		/* MACHI shadow and TX state */
++	u32 mac_ctrl;			/* shadow of MACHI */
++	u32 mdio_ctrl;			/* shadow of the MDIOCTRL output bits */
++	struct sk_buff *tx_skb;		/* frame currently in the TX buffer */
++	unsigned long tx_deadline;	/* "not busy" is trusted from here on */
++	unsigned int max_frame;
++	int irq;
++	u8 phy_addr;
++	bool tx_started;		/* the MAC was seen busy */
++	bool link_up;
++	bool running;			/* protected by lock */
++};
++
++/* ------------------------------------------------------------------ */
++/* MDIO bit banging                                                    */
++/* ------------------------------------------------------------------ */
++
++static void lowrisc_mdio_ctrl_write(struct lowrisc_priv *priv)
++{
++	writel(priv->mdio_ctrl, priv->base + LOWRISC_MDIOCTRL);
++}
++
++static void lowrisc_mdio_set_mdc(struct mdiobb_ctrl *ctrl, int level)
++{
++	struct lowrisc_priv *priv = container_of(ctrl, struct lowrisc_priv, ctrl);
++
++	if (level)
++		priv->mdio_ctrl |= LOWRISC_MDIO_MDC;
++	else
++		priv->mdio_ctrl &= ~LOWRISC_MDIO_MDC;
++	lowrisc_mdio_ctrl_write(priv);
++}
++
++static void lowrisc_mdio_set_dir(struct mdiobb_ctrl *ctrl, int output)
++{
++	struct lowrisc_priv *priv = container_of(ctrl, struct lowrisc_priv, ctrl);
++
++	/*
++	 * MDIOCTRL bit 2 is an active high output enable: ariane_peripherals_
++	 * xilinx.sv drives the MDIO IOBUF with T = ~phy_mdio_oe, so "1" means
++	 * "the MAC drives MDIO".
++	 */
++	if (output)
++		priv->mdio_ctrl |= LOWRISC_MDIO_OE;
++	else
++		priv->mdio_ctrl &= ~LOWRISC_MDIO_OE;
++	lowrisc_mdio_ctrl_write(priv);
++}
++
++static void lowrisc_mdio_set_data(struct mdiobb_ctrl *ctrl, int value)
++{
++	struct lowrisc_priv *priv = container_of(ctrl, struct lowrisc_priv, ctrl);
++
++	if (value)
++		priv->mdio_ctrl |= LOWRISC_MDIO_OUT;
++	else
++		priv->mdio_ctrl &= ~LOWRISC_MDIO_OUT;
++	lowrisc_mdio_ctrl_write(priv);
++}
++
++static int lowrisc_mdio_get_data(struct mdiobb_ctrl *ctrl)
++{
++	struct lowrisc_priv *priv = container_of(ctrl, struct lowrisc_priv, ctrl);
++
++	return !!(readl(priv->base + LOWRISC_MDIOCTRL) & LOWRISC_MDIO_IN);
++}
++
++static const struct mdiobb_ops lowrisc_mdiobb_ops = {
++	.owner = THIS_MODULE,
++	.set_mdc = lowrisc_mdio_set_mdc,
++	.set_mdio_dir = lowrisc_mdio_set_dir,
++	.set_mdio_data = lowrisc_mdio_set_data,
++	.get_mdio_data = lowrisc_mdio_get_data,
++};
++
++/* ------------------------------------------------------------------ */
++/* Register helpers                                                    */
++/* ------------------------------------------------------------------ */
++
++static void lowrisc_get_hwaddr(struct lowrisc_priv *priv, u8 *addr)
++{
++	u32 lo = readl(priv->base + LOWRISC_MACLO);
++	u32 hi = readl(priv->base + LOWRISC_MACHI) & LOWRISC_MACHI_MAC_MASK;
++
++	addr[0] = hi >> 8;
++	addr[1] = hi & 0xff;
++	addr[2] = lo >> 24;
++	addr[3] = lo >> 16;
++	addr[4] = lo >> 8;
++	addr[5] = lo;
++}
++
++static void lowrisc_set_hwaddr(struct lowrisc_priv *priv, const u8 *addr)
++{
++	unsigned long flags;
++	u32 lo;
++
++	/* MACLO/MACHI hold the address in network byte order. */
++	lo = ((u32)addr[2] << 24) | ((u32)addr[3] << 16) |
++	     ((u32)addr[4] << 8) | addr[5];
++
++	spin_lock_irqsave(&priv->lock, flags);
++	writel(lo, priv->base + LOWRISC_MACLO);
++	priv->mac_ctrl = (priv->mac_ctrl & ~LOWRISC_MACHI_MAC_MASK) |
++			 ((u32)addr[0] << 8) | addr[1];
++	writel(priv->mac_ctrl, priv->base + LOWRISC_MACHI);
++	/* lastbuf = 8: the receive ring has eight usable slots. */
++	writel(LOWRISC_RX_RING_SLOTS, priv->base + LOWRISC_RFCS);
++	spin_unlock_irqrestore(&priv->lock, flags);
++}
++
++static void lowrisc_irq_enable(struct lowrisc_priv *priv, bool enable)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&priv->lock, flags);
++	if (enable && priv->running)
++		priv->mac_ctrl |= LOWRISC_MACHI_IRQ_EN;
++	else
++		priv->mac_ctrl &= ~LOWRISC_MACHI_IRQ_EN;
++	writel(priv->mac_ctrl, priv->base + LOWRISC_MACHI);
++	spin_unlock_irqrestore(&priv->lock, flags);
++}
++
++static void lowrisc_rx_flush(struct lowrisc_priv *priv)
++{
++	u32 rsr;
++
++	/*
++	 * The MAC keeps filling the ring while the interface is down; move
++	 * firstbuf up to nextbuf to drop everything that was buffered.
++	 */
++	rsr = readl(priv->base + LOWRISC_RSR);
++	writel((rsr & LOWRISC_RSR_NEXT_MASK) >> 4, priv->base + LOWRISC_RSR);
++}
++
++/* ------------------------------------------------------------------ */
++/* Packet memory access                                                */
++/* ------------------------------------------------------------------ */
++
++/* Copy a frame into the transmit buffer, zero padding the last word. */
++static void lowrisc_tx_load(struct lowrisc_priv *priv, const void *src,
++			    unsigned int len)
++{
++	void __iomem *dst = priv->base + LOWRISC_TX_BUFF;
++	unsigned int i, words = (len + 7) / 8;
++
++	for (i = 0; i < words; i++) {
++		unsigned int n = min_t(unsigned int, 8, len - i * 8);
++		u64 word = 0;
++
++		memcpy(&word, src + i * 8, n);
++		writeq(word, dst + i * 8);
++	}
++}
++
++/* Copy a frame out of the receive ring slot @slot. */
++static void lowrisc_rx_store(struct lowrisc_priv *priv, void *dst, u32 slot,
++			     unsigned int len)
++{
++	void __iomem *src = priv->base + LOWRISC_RX_BUFF +
++			    (slot & LOWRISC_RX_RING_MASK) * LOWRISC_RX_SLOT_SIZE;
++	unsigned int i, words = (len + 7) / 8;
++
++	for (i = 0; i < words; i++) {
++		unsigned int n = min_t(unsigned int, 8, len - i * 8);
++		u64 word = readq(src + i * 8);
++
++		memcpy(dst + i * 8, &word, n);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* Transmit                                                            */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Release the transmit buffer when the MAC has finished the frame.  Must be
++ * called with priv->lock held.
++ */
++static bool lowrisc_tx_reclaim(struct lowrisc_priv *priv)
++{
++	struct net_device *ndev = priv->ndev;
++	struct sk_buff *skb = priv->tx_skb;
++
++	if (!skb)
++		return false;
++
++	if (readl(priv->base + LOWRISC_TPLR) & LOWRISC_TPLR_BUSY) {
++		priv->tx_started = true;
++		return false;
++	}
++
++	/*
++	 * The MAC raises TPLR_BUSY a couple of clocks after the length write
++	 * and drops it once the frame has left the MAC, so a "not busy"
++	 * sample is only trusted once the busy flag has been seen or after
++	 * a full timer tick (a frame can never take that long).
++	 */
++	if (!priv->tx_started && time_before(jiffies, priv->tx_deadline))
++		return false;
++
++	priv->tx_skb = NULL;
++	priv->tx_started = false;
++	ndev->stats.tx_packets++;
++	ndev->stats.tx_bytes += skb->len;
++	dev_consume_skb_any(skb);
++	if (priv->running)
++		netif_wake_queue(ndev);
++
++	return true;
++}
++
++static void lowrisc_tx_timer(struct timer_list *t)
++{
++	struct lowrisc_priv *priv = from_timer(priv, t, tx_timer);
++	unsigned long flags;
++
++	spin_lock_irqsave(&priv->lock, flags);
++	if (!lowrisc_tx_reclaim(priv) && priv->tx_skb)
++		mod_timer(&priv->tx_timer, jiffies + LOWRISC_TX_POLL_JIFFIES);
++	spin_unlock_irqrestore(&priv->lock, flags);
++}
++
++static netdev_tx_t lowrisc_start_xmit(struct sk_buff *skb,
++				      struct net_device *ndev)
++{
++	struct lowrisc_priv *priv = netdev_priv(ndev);
++	unsigned long flags;
++	unsigned int len;
++	int i;
++
++	if (unlikely(skb_is_nonlinear(skb) && skb_linearize(skb)))
++		goto drop;
++
++	len = skb->len;
++	if (unlikely(len < ETH_HLEN || len > priv->max_frame ||
++		     len > LOWRISC_TPLR_LEN_MASK))
++		goto drop;
++
++	spin_lock_irqsave(&priv->lock, flags);
++	if (unlikely(!priv->running)) {
++		spin_unlock_irqrestore(&priv->lock, flags);
++		goto drop;
++	}
++	if (priv->tx_skb) {
++		netif_stop_queue(ndev);
++		spin_unlock_irqrestore(&priv->lock, flags);
++		return NETDEV_TX_BUSY;
++	}
++
++	priv->tx_skb = skb;
++	priv->tx_started = false;
++	priv->tx_deadline = jiffies + LOWRISC_TX_POLL_JIFFIES;
++
++	lowrisc_tx_load(priv, skb->data, len);
++	/* Every buffer word has to reach the MAC before the length write
++	 * starts the frame.
++	 */
++	wmb();
++	writel(len, priv->base + LOWRISC_TPLR);
++
++	/*
++	 * The MAC has no transmit done interrupt.  A frame takes 12 us at
++	 * most, so completion is normally seen here; otherwise the timer
++	 * finishes the transfer and wakes the queue again.
++	 */
++	for (i = 0; i < LOWRISC_TX_POLL_LOOPS; i++) {
++		if (lowrisc_tx_reclaim(priv))
++			break;
++		udelay(1);
++	}
++
++	if (priv->tx_skb) {
++		netif_stop_queue(ndev);
++		mod_timer(&priv->tx_timer, priv->tx_deadline);
++	}
++	spin_unlock_irqrestore(&priv->lock, flags);
++
++	return NETDEV_TX_OK;
++
++drop:
++	ndev->stats.tx_dropped++;
++	dev_kfree_skb_any(skb);
++	return NETDEV_TX_OK;
++}
++
++static void lowrisc_tx_timeout(struct net_device *ndev, unsigned int txqueue)
++{
++	struct lowrisc_priv *priv = netdev_priv(ndev);
++	unsigned long flags;
++
++	dev_err_ratelimited(&ndev->dev, "transmit timeout, aborting frame\n");
++
++	spin_lock_irqsave(&priv->lock, flags);
++	/* Writing TFCS drops a pending length/start request. */
++	writel(0, priv->base + LOWRISC_TFCS);
++	if (priv->tx_skb) {
++		ndev->stats.tx_errors++;
++		dev_kfree_skb_any(priv->tx_skb);
++		priv->tx_skb = NULL;
++	}
++	priv->tx_started = false;
++	del_timer(&priv->tx_timer);
++	if (priv->running)
++		netif_wake_queue(ndev);
++	spin_unlock_irqrestore(&priv->lock, flags);
++}
++
++/* ------------------------------------------------------------------ */
++/* Receive                                                             */
++/* ------------------------------------------------------------------ */
++
++static irqreturn_t lowrisc_isr(int irq, void *dev_id)
++{
++	struct lowrisc_priv *priv = dev_id;
++	u32 rsr;
++
++	rsr = readl(priv->base + LOWRISC_RSR);
++	if (!(rsr & LOWRISC_RSR_DONE))
++		return IRQ_NONE;
++
++	/*
++	 * A frame is really pending: mask the level triggered interrupt
++	 * source, the NAPI poll re-arms it once the ring is drained.
++	 */
++	lowrisc_irq_enable(priv, false);
++
++	if (napi_schedule_prep(&priv->napi))
++		__napi_schedule(&priv->napi);
++
++	return IRQ_HANDLED;
++}
++
++static int lowrisc_poll(struct napi_struct *napi, int budget)
++{
++	struct lowrisc_priv *priv = container_of(napi, struct lowrisc_priv, napi);
++	struct net_device *ndev = priv->ndev;
++	int received = 0;
++
++	while (received < budget) {
++		struct sk_buff *skb;
++		u32 rsr, slot;
++		unsigned int len;
++
++		rsr = readl(priv->base + LOWRISC_RSR);
++		if (!(rsr & LOWRISC_RSR_DONE))
++			break;
++
++		slot = rsr & LOWRISC_RSR_FIRST_MASK;
++		len = readl(priv->base + LOWRISC_RPLR +
++			    (slot & LOWRISC_RX_RING_MASK) * 8);
++
++		/* axis_gmii_rx emits the four FCS bytes into the RX RAM. */
++		if (unlikely(len < ETH_ZLEN + ETH_FCS_LEN ||
++			     len > priv->max_frame)) {
++			ndev->stats.rx_length_errors++;
++			ndev->stats.rx_dropped++;
++		} else {
++			skb = napi_alloc_skb(napi, len);
++			if (unlikely(!skb)) {
++				ndev->stats.rx_dropped++;
++			} else {
++				lowrisc_rx_store(priv, skb->data, slot, len);
++				len -= ETH_FCS_LEN;
++				/* No per-slot error bit is exposed by framing_top. */
++				if ((crc32_le(~0U, skb->data, len) ^ ~0U) !=
++				    get_unaligned_le32(skb->data + len)) {
++					ndev->stats.rx_crc_errors++;
++					ndev->stats.rx_errors++;
++					ndev->stats.rx_dropped++;
++					dev_kfree_skb_any(skb);
++					goto release_slot;
++				}
++				skb_put(skb, len);
++				skb->protocol = eth_type_trans(skb, ndev);
++				napi_gro_receive(napi, skb);
++				ndev->stats.rx_packets++;
++				ndev->stats.rx_bytes += len;
++			}
++		}
++
++		/*
++		 * Release the slot only after the data has been copied
++		 * out: the MAC may reuse it as soon as firstbuf moved
++		 * past it.
++		 */
++release_slot:
++		writel((slot + 1) & LOWRISC_RSR_FIRST_MASK,
++		       priv->base + LOWRISC_RSR);
++		received++;
++	}
++
++	if (received < budget) {
++		if (napi_complete_done(napi, received))
++			lowrisc_irq_enable(priv, true);
++	}
++
++	return received;
++}
++
++static void lowrisc_adjust_link(struct net_device *ndev)
++{
++	struct lowrisc_priv *priv = netdev_priv(ndev);
++	struct phy_device *phydev = ndev->phydev;
++	bool link_ok;
++
++	if (!phydev)
++		return;
++
++	/* The RTL detects the PHY receive clock and selects the 100 Mbit/s
++	 * MII pacing or 1000 Mbit/s GMII path. Keep full duplex only.
++	 */
++	link_ok = phydev->link &&
++		  (phydev->speed == SPEED_100 || phydev->speed == SPEED_1000) &&
++		  phydev->duplex == DUPLEX_FULL;
++	if (link_ok == priv->link_up)
++		return;
++
++	priv->link_up = link_ok;
++	if (link_ok) {
++		netdev_info(ndev, "link up, %u Mbit/s, full duplex\n",
++			    phydev->speed);
++		netif_carrier_on(ndev);
++	} else {
++		if (phydev->link)
++			netdev_warn(ndev, "unsupported link: %u Mbit/s, %s duplex\n",
++				    phydev->speed,
++				    phydev->duplex ? "full" : "half");
++		else
++			netdev_info(ndev, "link down\n");
++		netif_carrier_off(ndev);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* MDIO bus and PHY                                                    */
++/* ------------------------------------------------------------------ */
++
++static void lowrisc_mdio_remove(struct lowrisc_priv *priv)
++{
++	struct net_device *ndev = priv->ndev;
++
++	if (ndev->phydev)
++		phy_disconnect(ndev->phydev);
++
++	if (priv->mii_bus) {
++		mdiobus_unregister(priv->mii_bus);
++		free_mdio_bitbang(priv->mii_bus);
++		priv->mii_bus = NULL;
++	}
++}
++
++static int lowrisc_mdio_probe(struct lowrisc_priv *priv,
++			      struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct net_device *ndev = priv->ndev;
++	struct phy_device *phydev;
++	phy_interface_t interface = PHY_INTERFACE_MODE_RGMII;
++	struct mii_bus *bus;
++	int ret;
++
++	priv->ctrl.ops = &lowrisc_mdiobb_ops;
++	bus = alloc_mdio_bitbang(&priv->ctrl);
++	if (!bus)
++		return -ENOMEM;
++
++	bus->name = "lowrisc-eth-mdio";
++	bus->parent = dev;
++	/* the bit banging helpers are handed the mdiobb_ctrl */
++	bus->priv = &priv->ctrl;
++	snprintf(bus->id, MII_BUS_ID_SIZE, "lowrisc-eth");
++	/* only scan the strapped PHY address */
++	bus->phy_mask = ~(u32)BIT(priv->phy_addr);
++	priv->mii_bus = bus;
++
++	ret = mdiobus_register(bus);
++	if (ret) {
++		priv->mii_bus = NULL;
++		free_mdio_bitbang(bus);
++		return ret;
++	}
++
++	phydev = mdiobus_get_phy(bus, priv->phy_addr);
++	if (!phydev) {
++		dev_err(dev, "no PHY at MDIO address %u\n", priv->phy_addr);
++		ret = -ENODEV;
++		goto err_unregister;
++	}
++
++	/*
++	 * The MAC derives its 90 degree transmit clock internally and the
++	 * RTL8211E straps leave its internal delays off, so plain RGMII is
++	 * the right mode here; a phy-mode property still wins.
++	 */
++	if (of_get_phy_mode(dev->of_node, &interface)) {
++		interface = PHY_INTERFACE_MODE_RGMII;
++		dev_info(dev, "no phy-mode property, assuming rgmii\n");
++	}
++
++	phydev = phy_connect(ndev, phydev_name(phydev), lowrisc_adjust_link,
++			     interface);
++	if (IS_ERR(phydev)) {
++		ret = PTR_ERR(phydev);
++		dev_err(dev, "cannot attach PHY: %d\n", ret);
++		goto err_unregister;
++	}
++
++	/* Advertise the full duplex 100/1000 Mbit/s paths supported by the RTL. */
++	phy_set_max_speed(phydev, SPEED_1000);
++	linkmode_clear_bit(ETHTOOL_LINK_MODE_10baseT_Half_BIT,
++			   phydev->supported);
++	linkmode_clear_bit(ETHTOOL_LINK_MODE_10baseT_Full_BIT,
++			   phydev->supported);
++	linkmode_clear_bit(ETHTOOL_LINK_MODE_100baseT_Half_BIT,
++			   phydev->supported);
++	linkmode_clear_bit(ETHTOOL_LINK_MODE_1000baseT_Half_BIT,
++			   phydev->supported);
++	linkmode_copy(phydev->advertising, phydev->supported);
++	phy_attached_info(phydev);
++
++	return 0;
++
++err_unregister:
++	mdiobus_unregister(bus);
++	priv->mii_bus = NULL;
++	free_mdio_bitbang(bus);
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* netdev callbacks                                                    */
++/* ------------------------------------------------------------------ */
++
++static void lowrisc_set_rx_mode(struct net_device *ndev)
++{
++	struct lowrisc_priv *priv = netdev_priv(ndev);
++	unsigned long flags;
++	bool promiscuous = !!(ndev->flags & IFF_PROMISC);
++
++	/*
++	 * The MAC only filters the exact, the broadcast and the
++	 * 01:00:5e:xx:xx:xx addresses, so fall back to promiscuous mode
++	 * whenever multicast addresses have to be received.
++	 */
++	if (!netdev_mc_empty(ndev) || (ndev->flags & IFF_ALLMULTI))
++		promiscuous = true;
++
++	spin_lock_irqsave(&priv->lock, flags);
++	if (promiscuous)
++		priv->mac_ctrl |= LOWRISC_MACHI_ALLPKTS;
++	else
++		priv->mac_ctrl &= ~LOWRISC_MACHI_ALLPKTS;
++	writel(priv->mac_ctrl, priv->base + LOWRISC_MACHI);
++	spin_unlock_irqrestore(&priv->lock, flags);
++}
++
++static int lowrisc_set_mac_address(struct net_device *ndev, void *p)
++{
++	struct lowrisc_priv *priv = netdev_priv(ndev);
++	struct sockaddr *addr = p;
++
++	if (!is_valid_ether_addr(addr->sa_data))
++		return -EADDRNOTAVAIL;
++
++	eth_hw_addr_set(ndev, addr->sa_data);
++	lowrisc_set_hwaddr(priv, ndev->dev_addr);
++
++	return 0;
++}
++
++static int lowrisc_open(struct net_device *ndev)
++{
++	struct lowrisc_priv *priv = netdev_priv(ndev);
++	unsigned long flags;
++	int ret;
++
++	priv->max_frame = ndev->mtu + ETH_HLEN + ETH_FCS_LEN;
++
++	/* Program the address and the ring length, then drop everything
++	 * the MAC buffered while the interface was down.
++	 */
++	lowrisc_set_hwaddr(priv, ndev->dev_addr);
++	lowrisc_rx_flush(priv);
++
++	ret = request_irq(priv->irq, lowrisc_isr, 0, ndev->name, priv);
++	if (ret) {
++		dev_err(&ndev->dev, "cannot request IRQ %d: %d\n", priv->irq,
++			ret);
++		return ret;
++	}
++
++	napi_enable(&priv->napi);
++	spin_lock_irqsave(&priv->lock, flags);
++	priv->running = true;
++	priv->link_up = false;
++	spin_unlock_irqrestore(&priv->lock, flags);
++	lowrisc_irq_enable(priv, true);
++	netif_start_queue(ndev);
++
++	if (ndev->phydev)
++		phy_start(ndev->phydev);
++
++	return 0;
++}
++
++static int lowrisc_stop(struct net_device *ndev)
++{
++	struct lowrisc_priv *priv = netdev_priv(ndev);
++	unsigned long flags;
++
++	spin_lock_irqsave(&priv->lock, flags);
++	priv->running = false;
++	priv->mac_ctrl &= ~LOWRISC_MACHI_IRQ_EN;
++	writel(priv->mac_ctrl, priv->base + LOWRISC_MACHI);
++	spin_unlock_irqrestore(&priv->lock, flags);
++	netif_tx_disable(ndev);
++	synchronize_irq(priv->irq);
++	if (ndev->phydev)
++		phy_stop(ndev->phydev);
++	priv->link_up = false;
++	/* synchronise with the NAPI poll before touching the hardware */
++	napi_disable(&priv->napi);
++	lowrisc_irq_enable(priv, false);
++	free_irq(priv->irq, priv);
++
++	/* the timer must be gone before the transmit state is cleared */
++	del_timer_sync(&priv->tx_timer);
++
++	spin_lock_irqsave(&priv->lock, flags);
++	/* drop a frame the MAC may still be working on */
++	writel(0, priv->base + LOWRISC_TFCS);
++	if (priv->tx_skb) {
++		dev_kfree_skb_any(priv->tx_skb);
++		priv->tx_skb = NULL;
++	}
++	priv->tx_started = false;
++	spin_unlock_irqrestore(&priv->lock, flags);
++
++	netif_carrier_off(ndev);
++
++	return 0;
++}
++
++static const struct ethtool_ops lowrisc_ethtool_ops = {
++	.get_link = ethtool_op_get_link,
++	.get_link_ksettings = phy_ethtool_get_link_ksettings,
++	.set_link_ksettings = phy_ethtool_set_link_ksettings,
++};
++
++static const struct net_device_ops lowrisc_netdev_ops = {
++	.ndo_open = lowrisc_open,
++	.ndo_stop = lowrisc_stop,
++	.ndo_start_xmit = lowrisc_start_xmit,
++	.ndo_set_mac_address = lowrisc_set_mac_address,
++	.ndo_set_rx_mode = lowrisc_set_rx_mode,
++	.ndo_tx_timeout = lowrisc_tx_timeout,
++	.ndo_validate_addr = eth_validate_addr,
++};
++
++static const struct of_device_id lowrisc_of_match[] = {
++	{ .compatible = "lowrisc-eth" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, lowrisc_of_match);
++
++static int lowrisc_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct net_device *ndev;
++	struct lowrisc_priv *priv;
++	struct resource *res;
++	u8 hwaddr[ETH_ALEN];
++	u32 phy_addr;
++	int ret, irq;
++
++	ndev = alloc_etherdev(sizeof(*priv));
++	if (!ndev)
++		return -ENOMEM;
++
++	priv = netdev_priv(ndev);
++	priv->ndev = ndev;
++	spin_lock_init(&priv->lock);
++	timer_setup(&priv->tx_timer, lowrisc_tx_timer, 0);
++	SET_NETDEV_DEV(ndev, dev);
++	platform_set_drvdata(pdev, ndev);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	priv->base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(priv->base)) {
++		ret = PTR_ERR(priv->base);
++		goto err_free_netdev;
++	}
++	if (resource_size(res) < LOWRISC_IO_SIZE) {
++		dev_err(dev, "register window is too small\n");
++		ret = -EINVAL;
++		goto err_free_netdev;
++	}
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		ret = irq;
++		goto err_free_netdev;
++	}
++	priv->irq = irq;
++
++	if (of_property_read_u32(dev->of_node, "phy-addr", &phy_addr) ||
++	    phy_addr >= PHY_MAX_ADDR)
++		phy_addr = LOWRISC_PHY_ADDR;
++	priv->phy_addr = phy_addr;
++
++	ndev->netdev_ops = &lowrisc_netdev_ops;
++	ndev->ethtool_ops = &lowrisc_ethtool_ops;
++	ndev->watchdog_timeo = LOWRISC_TX_TIMEOUT;
++	/* no jumbo frames */
++	ndev->max_mtu = ETH_DATA_LEN;
++	priv->max_frame = ndev->mtu + ETH_HLEN + ETH_FCS_LEN;
++	netif_napi_add(ndev, &priv->napi, lowrisc_poll);
++	netif_carrier_off(ndev);
++
++	ret = of_get_ethdev_address(dev->of_node, ndev);
++	if (ret == -EPROBE_DEFER)
++		goto err_napi;
++	if (ret) {
++		/* No address in the device tree: fall back to the one the
++		 * boot loader programmed into the MAC, or a random one.
++		 */
++		lowrisc_get_hwaddr(priv, hwaddr);
++		if (is_valid_ether_addr(hwaddr))
++			eth_hw_addr_set(ndev, hwaddr);
++		else
++			eth_hw_addr_random(ndev);
++	}
++
++	lowrisc_set_hwaddr(priv, ndev->dev_addr);
++
++	ret = lowrisc_mdio_probe(priv, pdev);
++	if (ret)
++		goto err_napi;
++
++	ret = register_netdev(ndev);
++	if (ret) {
++		dev_err(dev, "cannot register network device\n");
++		goto err_mdio;
++	}
++
++	dev_info(dev, "%s: irq %d, MAC %pM, phy %s\n", ndev->name, priv->irq,
++		ndev->dev_addr, phydev_name(ndev->phydev));
++
++	return 0;
++
++err_mdio:
++	lowrisc_mdio_remove(priv);
++err_napi:
++	netif_napi_del(&priv->napi);
++err_free_netdev:
++	free_netdev(ndev);
++	return ret;
++}
++
++static int lowrisc_remove(struct platform_device *pdev)
++{
++	struct net_device *ndev = platform_get_drvdata(pdev);
++	struct lowrisc_priv *priv = netdev_priv(ndev);
++
++	unregister_netdev(ndev);
++	lowrisc_mdio_remove(priv);
++	netif_napi_del(&priv->napi);
++	free_netdev(ndev);
++
++	return 0;
++}
++
++static struct platform_driver lowrisc_driver = {
++	.probe = lowrisc_probe,
++	.remove = lowrisc_remove,
++	.driver = {
++		.name = DRV_NAME,
++		.of_match_table = lowrisc_of_match,
++	},
++};
++module_platform_driver(lowrisc_driver);
++
++MODULE_DESCRIPTION(DRV_DESC);
++MODULE_AUTHOR("Jonathan Kimmitt <jrrk2@cam.ac.uk>");
++MODULE_LICENSE("GPL");

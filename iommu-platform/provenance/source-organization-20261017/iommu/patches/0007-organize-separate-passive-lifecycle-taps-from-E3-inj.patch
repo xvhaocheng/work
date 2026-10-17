@@ -1,0 +1,434 @@
+From 5304477888b627546fa5f46ef36735f78f0ee504 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:50:27 +0900
+Subject: [PATCH 07/12] organize: separate passive lifecycle taps from E3
+ injection
+
+---
+ Bender.yml                                    |  1 +
+ packages/rv_iommu_pkg.sv                      | 45 +++++++++++
+ rtl/rv_iommu_top.sv                           | 14 +++-
+ .../rv_iommu_e3_queue.sv                      | 39 ++++++++++
+ .../rv_iommu_trans_ctl_wrap.sv                | 36 ++++++++-
+ rtl/translation_logic/rv_iommu_iotlb.sv       | 38 +++++++++-
+ rtl/translation_logic/rv_iommu_ptw.sv         |  6 +-
+ rtl/translation_logic/rv_iommu_tl_wrap.sv     | 74 +++++++++++++++++--
+ 8 files changed, 240 insertions(+), 13 deletions(-)
+ create mode 100644 rtl/transaction_controller/rv_iommu_e3_queue.sv
+
+diff --git a/Bender.yml b/Bender.yml
+index bfd4c8322b32d9f215db6393a3d8e90bd5aaa193..da1af8862595c2583daf97615615fb12fb7c37ce 100644
+--- a/Bender.yml
++++ b/Bender.yml
+@@ -66,6 +66,7 @@ sources:
+   - rtl/transaction_controller/rv_iommu_axi_bc.sv
+   - rtl/transaction_controller/rv_iommu_ign_slv.sv
+   - rtl/transaction_controller/rv_iommu_mrif_handler.sv
++  - rtl/transaction_controller/rv_iommu_e3_queue.sv
+   - rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
+ 
+   - rtl/software_interface/regmap/rv_iommu_field_arb.sv
+diff --git a/packages/rv_iommu_pkg.sv b/packages/rv_iommu_pkg.sv
+index 3f029a456443ecd7867d90a9c06778e922bf299f..4d93542326cc1cace93f0442d4627d3ef2345350 100644
+--- a/packages/rv_iommu_pkg.sv
++++ b/packages/rv_iommu_pkg.sv
+@@ -21,6 +21,51 @@
+ 
+ package rv_iommu;
+ 
++    // Bounded FPGA experiment taps. No observer signal participates in arbitration.
++    typedef struct packed {
++        logic select_valid, select_write;
++        logic [7:0] select_id;
++        logic [23:0] select_did;
++        logic [63:0] select_iova;
++        logic [31:0] victim_waiting;
++        logic queue_error;
++        logic head_valid;
++        logic [7:0] head_id;
++        logic [23:0] head_did;
++        logic [63:0] head_iova;
++        logic [2:0] state;
++        logic [23:0] current_did;
++        logic [63:0] current_iova;
++        logic quiet;
++        logic request_fire, response_fire, response_error;
++    } e3_ctl_t;
++    typedef struct packed {
++        logic lookup, hit, normal, ptw_active;
++        logic [23:0] did;
++        logic ptw_r_fire, a_s1_miss;
++        logic capture, available, consume, error;
++        logic [7:0] extra;
++        logic [1:0] level;
++        logic [63:0] pte_address;
++    } e3_tl_t;
++
++    // Passive research ABI: two words per IOTLB entry. No tap controls IOATC.
++    // low: VPN[28:0], PSCID[48:29], S1/S2[49:50], valid[51],
++    // S1 1G/2M[52:53], S2 1G/2M[54:55], S1 global[56].
++    // high: GSCID[15:0]. All other bits are zero.
++    typedef struct packed {
++        logic [15:0][127:0] entries, entries_next;
++        logic [31:0] plru;
++        logic [15:0] replace_mask;
++        logic update, invalidate, supported;
++        logic [23:0] did;
++        logic normal, lookup, hit;
++        logic [63:0] iova;
++        logic [19:0] pscid;
++        logic [15:0] gscid;
++        logic stage1, stage2;
++    } research_t;
++
+     // ----------------
+     //# Address Length
+     // ----------------
+diff --git a/rtl/rv_iommu_top.sv b/rtl/rv_iommu_top.sv
+index 85c5f79092dc0f5a7637e605e92c144a727598ce..9938519fc54494af5d546973aa51a2d6db9128f9 100644
+--- a/rtl/rv_iommu_top.sv
++++ b/rtl/rv_iommu_top.sv
+@@ -95,7 +95,10 @@ module rv_iommu_top
+     input  axis_req_t      ats_downstream_req_i,
+     output axis_rsp_t      ats_downstream_resp_o,
+ 
+-    output logic [(RVIOMMUCfg.NumIntVec-1):0] wsi_wires_o
++    output logic [(RVIOMMUCfg.NumIntVec-1):0] wsi_wires_o,
++    output rv_iommu::e3_ctl_t e3_ctl_o,
++    output rv_iommu::e3_tl_t e3_tl_o,
++    output rv_iommu::research_t research_o
+ );
+ 
+     typedef logic [(RVIOMMUCfg.AxiAddrWidth-1):0] addr_t;
+@@ -369,7 +372,8 @@ module rv_iommu_top
+         .mrif_fault_valid_o (mrif_fault_valid),
+         .mrif_fault_ready_i (mrif_fault_ready),
+ 
+-        .in_flight_o        (in_flight)
++        .in_flight_o        (in_flight),
++        .e3_o              (e3_ctl_o)
+     );
+ 
+     //---------------------------
+@@ -444,7 +448,8 @@ module rv_iommu_top
+ 
+             .fault_data_o           (fault_data),
+             .fault_valid_o          (fault_valid),
+-            .fault_ready_i          (fault_ready)
++            .fault_ready_i          (fault_ready),
++            .e3_o(e3_tl_o), .research_o
+         );
+     end
+     else begin : gen_dc_ext
+@@ -515,7 +520,8 @@ module rv_iommu_top
+ 
+             .fault_data_o           (fault_data),
+             .fault_valid_o          (fault_valid),
+-            .fault_ready_i          (fault_ready)
++            .fault_ready_i          (fault_ready),
++            .e3_o(e3_tl_o), .research_o
+         );
+     end
+     endgenerate
+diff --git a/rtl/transaction_controller/rv_iommu_e3_queue.sv b/rtl/transaction_controller/rv_iommu_e3_queue.sv
+new file mode 100644
+index 0000000000000000000000000000000000000000..649abf9c54d3f8a3747405936c829eb9e33016cb
+--- /dev/null
++++ b/rtl/transaction_controller/rv_iommu_e3_queue.sv
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: Solderpad-0.51
++// Passive count of accepted V reads that have not been selected for service.
++// Selection removes a request here even though the AX FIFO retains its head
++// until COMPLETE. No signal from this module changes normal arbitration.
++module rv_iommu_e3_queue #(
++    parameter int unsigned Depth = 4
++) (
++    input logic clk_i, rst_ni,
++    input logic ar_fire_i,
++    input logic [7:0] ar_id_i,
++    input logic [23:0] ar_did_i,
++    input logic select_i, select_write_i,
++    input logic [7:0] select_id_i,
++    input logic [23:0] select_did_i,
++    output logic [31:0] waiting_o,
++    output logic error_o
++);
++    localparam int unsigned Width = $clog2(Depth + 1) > 0 ? $clog2(Depth + 1) : 1;
++    logic [Width-1:0] count_q;
++    logic push, pop;
++    assign push = ar_fire_i && ar_id_i == 0 && ar_did_i == 24'd10;
++    assign pop = select_i && !select_write_i && select_id_i == 0 && select_did_i == 24'd10;
++    assign waiting_o = 32'(count_q);
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            count_q <= 0;
++            error_o <= 0;
++        end else begin
++            case ({push, pop})
++                2'b10: if (count_q < Depth) count_q <= count_q + 1'b1;
++                       else error_o <= 1;
++                2'b01: if (count_q != 0) count_q <= count_q - 1'b1;
++                       else error_o <= 1;
++                2'b11: if (count_q == 0) error_o <= 1; // Registered, non-fall-through FIFO.
++                default: ;
++            endcase
++        end
++    end
++endmodule
+diff --git a/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv b/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
+index cd59deb95f0ba5a8f59844a30331c912681bdbd1..93c5c9721d3aefe2a6ffe343fbda27dbc7816c68 100644
+--- a/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
++++ b/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
+@@ -82,7 +82,8 @@ module rv_iommu_trans_ctl_wrap #(
+     output logic                mrif_fault_valid_o,
+     input  logic                mrif_fault_ready_i,
+ 
+-    output logic in_flight_o
++    output logic in_flight_o,
++    output rv_iommu::e3_ctl_t e3_o
+ );
+ 
+     typedef enum logic [2:0] {
+@@ -171,6 +172,39 @@ module rv_iommu_trans_ctl_wrap #(
+     assign decr_w_cnt = (w_valid & w_ready & w_data.last);
+     logic w_cnt_ovf;
+ 
++    logic [31:0] e3_waiting;
++    logic e3_queue_error;
++    rv_iommu_e3_queue #(.Depth(RVIOMMUCfg.NumOutstandingTrans)) i_queue (
++        .clk_i, .rst_ni,
++        .ar_fire_i(tr_axi_req_i.ar_valid && tr_ar_ready && tr_axi_req_i.ar.id == '0),
++        .ar_id_i(8'(tr_axi_req_i.ar.id)), .ar_did_i(tr_axi_req_i.ar.stream_id),
++        .select_i(e3_o.select_valid && ar_data.id == '0), .select_write_i(e3_o.select_write),
++        .select_id_i(e3_o.select_id), .select_did_i(e3_o.select_did),
++        .waiting_o(e3_waiting), .error_o(e3_queue_error)
++    );
++    always_comb begin
++        e3_o = '0;
++        e3_o.victim_waiting = e3_waiting;
++        e3_o.queue_error = e3_queue_error;
++        e3_o.state = state_q;
++        e3_o.current_did = trans_req_data_q.did;
++        e3_o.current_iova = 64'(trans_req_data_q.iova);
++        e3_o.quiet = state_q == IDLE && !aw_valid && !ar_valid;
++        e3_o.select_valid = state_q == IDLE &&
++            ((aw_valid && !w_cnt_ovf) || ar_valid);
++        e3_o.select_write = aw_valid && !w_cnt_ovf;
++        e3_o.select_id = e3_o.select_write ? 8'(aw_data.id) : 8'(ar_data.id);
++        e3_o.select_did = e3_o.select_write ? aw_data.stream_id : ar_data.stream_id;
++        e3_o.select_iova = e3_o.select_write ? 64'(aw_data.addr) : 64'(ar_data.addr);
++        e3_o.head_valid = ar_valid;
++        e3_o.head_id = 8'(ar_data.id);
++        e3_o.head_did = ar_data.stream_id;
++        e3_o.head_iova = 64'(ar_data.addr);
++        e3_o.request_fire = trans_req_valid_o && trans_req_ready_i;
++        e3_o.response_fire = trans_resp_valid_i && trans_resp_ready_o;
++        e3_o.response_error = trans_resp_data_i.error;
++    end
++
+     assign w_ready = (w_cnt_q != '0) ? (axi_comp_resp.w_ready) : (1'b0);
+ 
+     stream_fifo #(
+diff --git a/rtl/translation_logic/rv_iommu_iotlb.sv b/rtl/translation_logic/rv_iommu_iotlb.sv
+index 9cd819ace299b37dabf143524774efa4bd84c75e..4018a7ff82cfcf0d39a83994f52093e86a66627c 100644
+--- a/rtl/translation_logic/rv_iommu_iotlb.sv
++++ b/rtl/translation_logic/rv_iommu_iotlb.sv
+@@ -41,7 +41,8 @@ module rv_iommu_iotlb #(
+     input  logic                            en_1S_i,
+     input  logic                            en_2S_i,
+     output logic                            lu_hit_o,
+-    output rv_iommu::iotlb_content_t        lu_content_o
++    output rv_iommu::iotlb_content_t        lu_content_o,
++    output rv_iommu::research_t            research_o
+ );
+ 
+     // Tags
+@@ -363,6 +364,41 @@ module rv_iommu_iotlb #(
+         end
+     end
+ 
++    // Only read the actual pre-edge and next state. Snapshot readers must
++    // reject a simultaneous update at a required quiescent boundary.
++    always_comb begin
++        research_o = '0;
++        research_o.supported = RVIOMMUCfg.NumIotlbEntries == 16;
++        research_o.plru = 32'(plru_tree_q);
++        research_o.invalidate = inval_i.inval_vma || inval_i.inval_gvma;
++        research_o.update = update_i.update && !research_o.invalidate;
++        for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries && i < 16; i++) begin
++            research_o.replace_mask[i] = replace_en[i];
++            research_o.entries[i][28:0] = {tags_q[i].vpn2, tags_q[i].vpn1, tags_q[i].vpn0};
++            research_o.entries[i][48:29] = tags_q[i].pscid;
++            research_o.entries[i][49] = tags_q[i].en_1S;
++            research_o.entries[i][50] = tags_q[i].en_2S;
++            research_o.entries[i][51] = tags_q[i].valid;
++            research_o.entries[i][52] = content_q[i].content_1S.is_1G;
++            research_o.entries[i][53] = content_q[i].content_1S.is_2M;
++            research_o.entries[i][54] = content_q[i].content_2S.is_1G;
++            research_o.entries[i][55] = content_q[i].content_2S.is_2M;
++            research_o.entries[i][56] = content_q[i].content_1S.g;
++            research_o.entries[i][79:64] = tags_q[i].gscid;
++            research_o.entries_next[i][28:0] = {tags_n[i].vpn2, tags_n[i].vpn1, tags_n[i].vpn0};
++            research_o.entries_next[i][48:29] = tags_n[i].pscid;
++            research_o.entries_next[i][49] = tags_n[i].en_1S;
++            research_o.entries_next[i][50] = tags_n[i].en_2S;
++            research_o.entries_next[i][51] = tags_n[i].valid;
++            research_o.entries_next[i][52] = content_n[i].content_1S.is_1G;
++            research_o.entries_next[i][53] = content_n[i].content_1S.is_2M;
++            research_o.entries_next[i][54] = content_n[i].content_2S.is_1G;
++            research_o.entries_next[i][55] = content_n[i].content_2S.is_2M;
++            research_o.entries_next[i][56] = content_n[i].content_1S.g;
++            research_o.entries_next[i][79:64] = tags_n[i].gscid;
++        end
++    end
++
+     // sequential process
+     always_ff @(posedge clk_i or negedge rst_ni) begin
+         if(!rst_ni) begin
+diff --git a/rtl/translation_logic/rv_iommu_ptw.sv b/rtl/translation_logic/rv_iommu_ptw.sv
+index 14b554dfdc80886474c9a419fc5df8c5a3f351d3..5ef5ed0047eabde1866e497e797f96cf3ff9db36 100644
+--- a/rtl/translation_logic/rv_iommu_ptw.sv
++++ b/rtl/translation_logic/rv_iommu_ptw.sv
+@@ -80,7 +80,8 @@ module rv_iommu_ptw #(
+     
+     // Memory interface
+     input  axi_resp_t                   mem_resp_i,
+-    output axi_req_t                    mem_req_o
++    output axi_req_t                    mem_req_o,
++    output logic [1:0]                  e3_level_o
+ );
+ 
+     localparam int unsigned PLEN = RVIOMMUCfg.PAddrWidth;
+@@ -106,6 +107,7 @@ module rv_iommu_ptw #(
+     } ptw_lvl_t;
+     ptw_lvl_t main_lvl_q, main_lvl_n;
+     ptw_lvl_t s1_lvl_n, s1_lvl_q;
++    assign e3_level_o = s1_lvl_q;
+ 
+     // Internal PTW stages
+     typedef enum logic [1:0] {
+@@ -693,4 +695,4 @@ module rv_iommu_ptw #(
+         end
+     end
+ 
+-endmodule
+\ No newline at end of file
++endmodule
+diff --git a/rtl/translation_logic/rv_iommu_tl_wrap.sv b/rtl/translation_logic/rv_iommu_tl_wrap.sv
+index 41be6e1cb6de7c1a9a6ea07883aeb692ccf069de..615b6452def60308f8939a9dba66e21cfa710820 100644
+--- a/rtl/translation_logic/rv_iommu_tl_wrap.sv
++++ b/rtl/translation_logic/rv_iommu_tl_wrap.sv
+@@ -117,7 +117,9 @@ module rv_iommu_tl_wrap
+     // Translation fault reporting port
+     output fault_data_t fault_data_o,
+     output logic        fault_valid_o,
+-    input  logic        fault_ready_i
++    input  logic        fault_ready_i,
++    output rv_iommu::e3_tl_t e3_o,
++    output rv_iommu::research_t research_o
+ );
+ 
+     localparam int unsigned PLEN = RVIOMMUCfg.PAddrWidth;
+@@ -235,6 +237,7 @@ module rv_iommu_tl_wrap
+     rv_iommu::iotlb_content_t       iotlb_lu_content;
+     rv_iommu::iotlb_up_t            ptw_iotlb_update, msi_iotlb_update;
+     rv_iommu::iotlb_up_t            iotlb_update;
++    rv_iommu::research_t            iotlb_research;
+     assign iotlb_lu         = (state_q == PT) | (state_q == MSI);
+     assign iotlb_lu_vpn     = req_data.iova[rv_iommu::GPLEN39-1:12];
+     assign iotlb_lu_pscid   = pscid_q;
+@@ -558,12 +561,72 @@ module rv_iommu_tl_wrap
+         .en_1S_i        (en_1S_q),
+         .en_2S_i        (en_2S_q),
+         .lu_hit_o       (iotlb_lu_hit),
+-        .lu_content_o   (iotlb_lu_content)
++        .lu_content_o   (iotlb_lu_content),
++        .research_o     (iotlb_research)
+     );
+ 
+     //-------------------
+     // Page Table Walker
+     //-------------------
++    axi_req_t e3_ptw_req;
++    axi_resp_t e3_ptw_resp;
++    logic e3_seen_q, e3_first_hit_q, e3_normal, e3_ptw_active;
++    logic [1:0] e3_level;
++    logic [63:0] e3_pte_q;
++    logic e3_capture, e3_available, e3_consume, e3_error, e3_a_s1_miss;
++    logic [7:0] e3_extra;
++    assign e3_normal = req_valid && !req_data.is_debug &&
++        (req_data.ttype == rv_iommu::UNTRANSLATED_R || req_data.ttype == rv_iommu::UNTRANSLATED_W);
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin e3_seen_q <= 0; e3_first_hit_q <= 0; e3_pte_q <= 0; end
++        else begin
++            if (state_q == IDLE) begin e3_seen_q <= 0; e3_first_hit_q <= 0; end
++            else if (state_q == PT && !e3_seen_q) begin
++                e3_seen_q <= 1; e3_first_hit_q <= iotlb_lu_hit;
++            end
++            if (e3_ptw_req.ar_valid && e3_ptw_resp.ar_ready) e3_pte_q <= 64'(e3_ptw_req.ar.addr);
++        end
++    end
++    assign e3_a_s1_miss = e3_normal && req_data.did == 24'd11 &&
++        state_q == PT && e3_seen_q && !e3_first_hit_q && en_1S_q && !en_2S_q &&
++        !ddt_imp_trans_q && !pdt_imp_trans_q && !iova_is_msi_q && !gpaddr_is_msi;
++    always_comb begin
++        research_o = iotlb_research;
++        research_o.did = req_data.did;
++        research_o.normal = e3_normal;
++        research_o.lookup = e3_normal && state_q == PT && !e3_seen_q;
++        research_o.hit = iotlb_lu_hit;
++        research_o.iova = 64'(req_data.iova);
++        research_o.pscid = iotlb_lu_pscid;
++        research_o.gscid = iotlb_lu_gscid;
++        research_o.stage1 = en_1S_q;
++        research_o.stage2 = en_2S_q;
++    end
++    always_comb begin
++        e3_o = '0;
++        e3_o.ptw_r_fire = ptw_axi_resp_i.r_valid && ptw_axi_req_o.r_ready;
++        e3_o.a_s1_miss = e3_a_s1_miss;
++        e3_o.lookup = state_q == PT && !e3_seen_q;
++        e3_o.hit = iotlb_lu_hit;
++        e3_o.normal = e3_normal;
++        e3_o.did = req_data.did;
++        e3_o.ptw_active = e3_ptw_active;
++        e3_o.level = e3_level;
++        e3_o.pte_address = e3_pte_q;
++        e3_o.capture = e3_capture;
++        e3_o.available = e3_available;
++        e3_o.consume = e3_consume;
++        e3_o.extra = e3_extra;
++        e3_o.error = e3_error;
++    end
++    // Observation projection: the PTW AXI request/response remain direct wires.
++    assign ptw_axi_req_o = e3_ptw_req;
++    assign e3_ptw_resp = ptw_axi_resp_i;
++    assign e3_capture = 0;
++    assign e3_available = 0;
++    assign e3_consume = 0;
++    assign e3_error = 0;
++    assign e3_extra = 0;
+     rv_iommu_ptw #(
+         .RVIOMMUCfg         (RVIOMMUCfg),
+         .addr_t             (addr_t),
+@@ -576,7 +639,8 @@ module rv_iommu_tl_wrap
+ 
+         .init_ptw_i         (ptw_init),
+ 
+-        .active_o           ( ),
++        .active_o           (e3_ptw_active),
++        .e3_level_o         (e3_level),
+         .error_o            (ptw_error),
+         .error_2S_o         (ptw_error_2S),
+         .error_2S_int_o     (ptw_error_2S_int),
+@@ -590,8 +654,8 @@ module rv_iommu_tl_wrap
+         .iosatp_ppn_i       (iosatp_ppn_q),
+         .iohgatp_ppn_i      (iohgatp_ppn_q),
+ 
+-        .mem_resp_i         (ptw_axi_resp_i),
+-        .mem_req_o          (ptw_axi_req_o),
++        .mem_resp_i         (e3_ptw_resp),
++        .mem_req_o          (e3_ptw_req),
+ 
+         .iova_i             (req_data.iova),
+         .pscid_i            (pscid_q),

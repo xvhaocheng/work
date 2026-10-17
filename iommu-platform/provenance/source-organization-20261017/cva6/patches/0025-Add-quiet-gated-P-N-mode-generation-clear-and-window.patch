@@ -1,0 +1,542 @@
+From 46cfd935b2106e8e92d7d7ade2d1d222913a3c82 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:52:05 +0900
+Subject: [PATCH 25/27] Add quiet-gated P/N mode generation, clear and window
+ accounting
+
+Source-organization: 2026-10-17; new commit authored at actual current time.
+Feature-ID: CVA6-COMPOSITION-CONTROL
+Original-source: frozen original working source
+Validation scope: source/patch identity only; no build, simulation or experiment.
+Contains both passive counters and active configuration outputs; mode/clear writes affect the later IOMMU policy interface. Not a purely passive observer.
+---
+ corev_apu/fpga/src/dma_composition_control.sv | 520 ++++++++++++++++++
+ 1 file changed, 520 insertions(+)
+ create mode 100644 corev_apu/fpga/src/dma_composition_control.sv
+
+diff --git a/corev_apu/fpga/src/dma_composition_control.sv b/corev_apu/fpga/src/dma_composition_control.sv
+new file mode 100644
+index 0000000000000000000000000000000000000000..04312ee786074cd6d1a7f8b05afa54e15113949c
+--- /dev/null
++++ b/corev_apu/fpga/src/dma_composition_control.sv
+@@ -0,0 +1,520 @@
++// SPDX-License-Identifier: Solderpad-0.51
++//
++// dma_composition_control
++//
++// New-profile mode/clear control and (open, close] window observer.
++// The module is passive with respect to AXI and the IOTLB data paths: it only
++// exposes the new mode, protected DID and a same-cycle clear pulse on an
++// accepted offset-2 config write.
++//
++// 128-word relative bank, selected by index_i[6:0] where index_i == 0 maps to
++// D20.  Only word 2 is writable.  All other writes are ignored.
++//
++// Entry layout matches rv_iommu_iotlb research_o.entries:
++//   bit 51      : valid
++//   bits 48:29 : PSCID
++//
++// The production array ports are unpacked 16 x 128 bit arrays.  The test top
++// converts its flat Verilator public array into these unpacked arrays.
++//
++// lookup_i is the translation logic's one-cycle first-lookup pulse for each
++// normal request.  Window counters 12:20 count every lookup_i pulse while the
++// window is active; seen_lookup_v/a are only used to latch the first PSCID for
++// offsets 38/39.
++//
++// Test-only compile hook: CVC_TEST_GEN_FULL initializes generation to all ones.
++// It is not a port parameter and default synthesis sees generation = 0.
++//
++module dma_composition_control (
++    input  logic               clk_i,
++    input  logic               rst_ni,
++
++    input  logic               cfg_write_i,
++    input  logic [6:0]         index_i,
++    input  logic [63:0]        wdata_i,
++    output logic [63:0]        rdata_o,
++
++    input  logic               quiet_i,
++    input  logic               supported_i,
++    input  logic               arm_i,
++    input  logic               open_i,
++    input  logic               close_i,
++
++    output logic [1:0]         mode_o,
++    output logic [23:0]        protected_did_o,
++    output logic               clear_o,
++
++    input  logic               lookup_i,
++    input  logic               lookup_hit_i,
++    input  logic               normal_i,
++    input  logic               stage1_i,
++    input  logic               stage2_i,
++    input  logic [23:0]        lookup_did_i,
++    input  logic [19:0]        lookup_pscid_i,
++
++    input  logic               accept_i,
++    input  logic               fast_i,
++    input  logic [23:0]        fast_did_i,
++
++    input  logic [1:0]         gap_active_i,
++
++    input  logic               update_i,
++    input  logic               invalidate_i,
++    input  logic [23:0]        update_did_i,
++    input  logic [15:0]        replace_mask_i,
++    input  logic [127:0]       entries_i [16],
++    input  logic [127:0]       entries_next_i [16],
++    input  logic [31:0]        plru_i
++);
++
++    localparam logic [63:0] COMP_MAGIC = 64'h49444D4143504E01;
++    localparam logic [63:0] COMP_ABI   = 64'd1;
++    localparam logic [63:0] PROT_MASK  = 64'd3;
++
++    localparam logic [1:0] MODE_S  = 2'd0;
++    localparam logic [1:0] MODE_N  = 2'd1;
++    localparam logic [1:0] MODE_P  = 2'd2;
++    localparam logic [1:0] MODE_PN = 2'd3;
++
++    localparam logic [23:0] DID_V = 24'd10;
++    localparam logic [23:0] DID_A = 24'd11;
++
++    localparam int ENTRY_VALID_BIT = 51;
++    localparam int PSCID_LSB = 29;
++    localparam int PSCID_MSB = 48;
++
++    // Counters 12:20 count every lookup_i pulse while the window is active.
++    // lookup_i is the translation logic's one-cycle first-lookup pulse for each
++    // normal request, not a per-window first event.
++    localparam int W_LOOKUP_V = 12;
++    localparam int W_HIT_V    = 13;
++    localparam int W_MISS_V   = 14;
++    localparam int W_LOOKUP_A = 15;
++    localparam int W_HIT_A    = 16;
++    localparam int W_MISS_A   = 17;
++    localparam int W_LOOKUP_O = 18;
++    localparam int W_HIT_O    = 19;
++    localparam int W_MISS_O   = 20;
++    localparam int W_FAST_V   = 21;
++    localparam int W_FAST_A   = 22;
++    localparam int W_FAST_O   = 23;
++    localparam int W_GAP_V    = 24;
++    localparam int W_GAP_A    = 25;
++    localparam int W_FILL_V   = 26;
++    localparam int W_FILL_A   = 27;
++    localparam int W_FILL_O   = 28;
++    localparam int W_REPL     = 29;
++    localparam int W_PART     = 30;
++    localparam int W_INVAL    = 31;
++    localparam int W_FIRST_BAD= 32;
++    localparam int W_FAST_N   = 33;
++
++    typedef enum logic [1:0] {S_OFF, S_ARMED, S_ACTIVE, S_FROZEN} state_e;
++
++    state_e      state_q, state_d;
++    logic [63:0] seq_q, seq_d;
++    logic [63:0] cycles_q, cycles_d;
++    logic [4:0]  err_q, err_d;
++    logic [63:0] cnt_q [40];
++    logic [63:0] cnt_d [40];
++
++    logic [63:0] win_cfg_q, win_cfg_d;
++    logic [63:0] win_gen_q, win_gen_d;
++
++    logic [31:0] plru_open_q, plru_open_d;
++    logic [31:0] plru_close_q, plru_close_d;
++
++    logic [19:0] pscid_v_q, pscid_v_d;
++    logic [19:0] pscid_a_q, pscid_a_d;
++
++    logic        seen_lookup_v_q, seen_lookup_v_d;
++    logic        seen_lookup_a_q, seen_lookup_a_d;
++
++    logic [127:0] entries_open_q [16];
++    logic [127:0] entries_open_d [16];
++    logic [127:0] entries_close_q [16];
++    logic [127:0] entries_close_d [16];
++
++    logic [1:0]  mode_q;
++    logic [23:0] protected_did_q;
++    logic [63:0] generation_q;
++    logic [2:0]  last_status_q;
++
++`ifdef CVC_TEST_GEN_FULL
++    localparam logic [63:0] INIT_GENERATION = {64{1'b1}};
++`else
++    localparam logic [63:0] INIT_GENERATION = 64'd0;
++`endif
++
++    logic cfg_busy;
++    logic cfg_data_legal;
++    logic quiet_obs;
++    logic [3:0] repl_idx;
++    logic lookup_ok;
++
++    always_comb begin
++        cfg_busy = !quiet_i || (state_q == S_ARMED) || (state_q == S_ACTIVE) ||
++                   arm_i || open_i || close_i;
++    end
++
++    always_comb begin
++        cfg_data_legal = (wdata_i[63:32] == 32'd0) &&
++                         (wdata_i[7:2] == 6'd0) &&
++                         ((wdata_i[31:8] == DID_V) || (wdata_i[31:8] == DID_A));
++    end
++
++    always_comb begin
++        quiet_obs = quiet_i && !(state_q == S_ARMED || state_q == S_ACTIVE) &&
++                    !arm_i && !open_i && !close_i;
++    end
++
++    always_comb begin
++        lookup_ok = normal_i && stage1_i && !stage2_i;
++    end
++
++    always_comb begin
++        repl_idx = 4'd0;
++        for (int i = 0; i < 16; i++) begin
++            if (replace_mask_i[i]) repl_idx = i[3:0];
++        end
++    end
++
++    always_comb begin
++        clear_o = rst_ni && cfg_write_i && (index_i == 7'd2) && !cfg_busy &&
++                  supported_i && cfg_data_legal &&
++                  (generation_q != {64{1'b1}});
++    end
++
++    always_ff @(posedge clk_i) begin
++        if (!rst_ni) begin
++            mode_q          <= MODE_S;
++            protected_did_q <= DID_V;
++            generation_q    <= INIT_GENERATION;
++            last_status_q   <= 3'd0;
++        end else if (cfg_write_i && (index_i == 7'd2)) begin
++            if (cfg_busy) begin
++                last_status_q <= 3'd1;
++            end else if (!supported_i || !cfg_data_legal) begin
++                last_status_q <= 3'd2;
++            end else if (generation_q == {64{1'b1}}) begin
++                last_status_q <= 3'd3;
++            end else begin
++                last_status_q   <= 3'd0;
++                mode_q          <= wdata_i[1:0];
++                protected_did_q <= wdata_i[31:8];
++                generation_q    <= generation_q + 64'd1;
++            end
++        end
++    end
++
++    always_comb begin
++        state_d = state_q;
++        seq_d = seq_q;
++        cycles_d = cycles_q;
++        err_d = err_q;
++        for (int i = 0; i < 40; i++) cnt_d[i] = cnt_q[i];
++        win_cfg_d = win_cfg_q;
++        win_gen_d = win_gen_q;
++        plru_open_d = plru_open_q;
++        plru_close_d = plru_close_q;
++        pscid_v_d = pscid_v_q;
++        pscid_a_d = pscid_a_q;
++        seen_lookup_v_d = seen_lookup_v_q;
++        seen_lookup_a_d = seen_lookup_a_q;
++        for (int i = 0; i < 16; i++) begin
++            entries_open_d[i] = entries_open_q[i];
++            entries_close_d[i] = entries_close_q[i];
++        end
++
++        if (arm_i) begin
++            if (open_i || close_i) begin
++                err_d[0] = 1'b1;
++            end else if (state_q == S_ACTIVE) begin
++                err_d[0] = 1'b1;
++            end else begin
++                state_d = S_ARMED;
++                err_d = 5'd0;
++                cycles_d = 64'd0;
++                for (int i = 0; i < 40; i++) cnt_d[i] = 64'd0;
++                seen_lookup_v_d = 1'b0;
++                seen_lookup_a_d = 1'b0;
++                pscid_v_d = 20'd0;
++                pscid_a_d = 20'd0;
++                win_cfg_d = {32'd0, protected_did_q, 6'd0, mode_q};
++                win_gen_d = generation_q;
++                plru_open_d = 32'd0;
++                plru_close_d = 32'd0;
++                for (int i = 0; i < 16; i++) begin
++                    entries_open_d[i] = 128'd0;
++                    entries_close_d[i] = 128'd0;
++                end
++                if (seq_q == {64{1'b1}}) err_d[1] = 1'b1;
++                else seq_d = seq_q + 64'd1;
++            end
++        end
++
++        if (open_i) begin
++            if (arm_i) begin
++                err_d[0] = 1'b1;
++            end else if (state_q == S_ARMED) begin
++                state_d = S_ACTIVE;
++                plru_open_d = plru_i;
++                for (int i = 0; i < 16; i++) entries_open_d[i] = entries_i[i];
++            end else begin
++                err_d[0] = 1'b1;
++            end
++        end
++
++        if (close_i) begin
++            if (arm_i) begin
++                err_d[0] = 1'b1;
++            end else if (state_q == S_ACTIVE) begin
++                state_d = S_FROZEN;
++                plru_close_d = plru_i;
++                for (int i = 0; i < 16; i++) entries_close_d[i] = entries_next_i[i];
++            end else begin
++                err_d[0] = 1'b1;
++            end
++        end
++
++        if (state_q == S_ACTIVE) begin
++            if (cycles_d == {64{1'b1}}) err_d[1] = 1'b1;
++            else cycles_d = cycles_d + 64'd1;
++
++            if (gap_active_i[0]) begin
++                if (cnt_d[W_GAP_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                else cnt_d[W_GAP_V] = cnt_d[W_GAP_V] + 64'd1;
++            end
++            if (gap_active_i[1]) begin
++                if (cnt_d[W_GAP_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                else cnt_d[W_GAP_A] = cnt_d[W_GAP_A] + 64'd1;
++            end
++
++            if (lookup_i) begin
++                if (lookup_did_i == DID_V) begin
++                    if (cnt_d[W_LOOKUP_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                    else cnt_d[W_LOOKUP_V] = cnt_d[W_LOOKUP_V] + 64'd1;
++                    if (lookup_hit_i) begin
++                        if (cnt_d[W_HIT_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_HIT_V] = cnt_d[W_HIT_V] + 64'd1;
++                    end else begin
++                        if (cnt_d[W_MISS_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_MISS_V] = cnt_d[W_MISS_V] + 64'd1;
++                    end
++                    if (lookup_ok) begin
++                        if (!seen_lookup_v_d) begin
++                            seen_lookup_v_d = 1'b1;
++                            pscid_v_d = lookup_pscid_i;
++                        end
++                    end else begin
++                        if (cnt_d[W_FIRST_BAD] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FIRST_BAD] = cnt_d[W_FIRST_BAD] + 64'd1;
++                        err_d[3] = 1'b1;
++                    end
++                end else if (lookup_did_i == DID_A) begin
++                    if (cnt_d[W_LOOKUP_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                    else cnt_d[W_LOOKUP_A] = cnt_d[W_LOOKUP_A] + 64'd1;
++                    if (lookup_hit_i) begin
++                        if (cnt_d[W_HIT_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_HIT_A] = cnt_d[W_HIT_A] + 64'd1;
++                    end else begin
++                        if (cnt_d[W_MISS_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_MISS_A] = cnt_d[W_MISS_A] + 64'd1;
++                    end
++                    if (lookup_ok) begin
++                        if (!seen_lookup_a_d) begin
++                            seen_lookup_a_d = 1'b1;
++                            pscid_a_d = lookup_pscid_i;
++                        end
++                    end else begin
++                        if (cnt_d[W_FIRST_BAD] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FIRST_BAD] = cnt_d[W_FIRST_BAD] + 64'd1;
++                        err_d[3] = 1'b1;
++                    end
++                end else begin
++                    if (cnt_d[W_LOOKUP_O] == {64{1'b1}}) err_d[1] = 1'b1;
++                    else cnt_d[W_LOOKUP_O] = cnt_d[W_LOOKUP_O] + 64'd1;
++                    if (lookup_hit_i) begin
++                        if (cnt_d[W_HIT_O] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_HIT_O] = cnt_d[W_HIT_O] + 64'd1;
++                    end else begin
++                        if (cnt_d[W_MISS_O] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_MISS_O] = cnt_d[W_MISS_O] + 64'd1;
++                    end
++                    if (!lookup_ok) begin
++                        if (cnt_d[W_FIRST_BAD] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FIRST_BAD] = cnt_d[W_FIRST_BAD] + 64'd1;
++                        err_d[3] = 1'b1;
++                    end
++                end
++            end
++
++            if (fast_i) begin
++                if (accept_i) begin
++                    if (fast_did_i == DID_V) begin
++                        if (cnt_d[W_FAST_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FAST_V] = cnt_d[W_FAST_V] + 64'd1;
++                    end else if (fast_did_i == DID_A) begin
++                        if (cnt_d[W_FAST_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FAST_A] = cnt_d[W_FAST_A] + 64'd1;
++                    end else begin
++                        if (cnt_d[W_FAST_O] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FAST_O] = cnt_d[W_FAST_O] + 64'd1;
++                    end
++                    if (!((mode_q == MODE_N) || (mode_q == MODE_PN))) begin
++                        if (cnt_d[W_FAST_N] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FAST_N] = cnt_d[W_FAST_N] + 64'd1;
++                        err_d[2] = 1'b1;
++                    end
++                end else begin
++                    err_d[0] = 1'b1;
++                end
++            end
++
++            if (update_i) begin
++                if ((replace_mask_i != 16'd0) &&
++                    ((replace_mask_i & (replace_mask_i - 16'd1)) == 16'd0)) begin
++                    if (update_did_i == DID_V) begin
++                        if (cnt_d[W_FILL_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FILL_V] = cnt_d[W_FILL_V] + 64'd1;
++                    end else if (update_did_i == DID_A) begin
++                        if (cnt_d[W_FILL_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FILL_A] = cnt_d[W_FILL_A] + 64'd1;
++                    end else begin
++                        if (cnt_d[W_FILL_O] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FILL_O] = cnt_d[W_FILL_O] + 64'd1;
++                    end
++
++                    if ((mode_q == MODE_P) || (mode_q == MODE_PN)) begin
++                        if (update_did_i == protected_did_q) begin
++                            if (repl_idx >= 4'd2) begin
++                                if (cnt_d[W_PART] == {64{1'b1}}) err_d[1] = 1'b1;
++                                else cnt_d[W_PART] = cnt_d[W_PART] + 64'd1;
++                                err_d[4] = 1'b1;
++                            end
++                        end else begin
++                            if (repl_idx < 4'd2) begin
++                                if (cnt_d[W_PART] == {64{1'b1}}) err_d[1] = 1'b1;
++                                else cnt_d[W_PART] = cnt_d[W_PART] + 64'd1;
++                                err_d[4] = 1'b1;
++                            end
++                        end
++                    end
++
++                    if (entries_i[repl_idx][ENTRY_VALID_BIT] &&
++                        (entries_i[repl_idx][PSCID_MSB:PSCID_LSB] !=
++                         entries_next_i[repl_idx][PSCID_MSB:PSCID_LSB])) begin
++                        if (cnt_d[W_REPL] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_REPL] = cnt_d[W_REPL] + 64'd1;
++                    end
++                end else begin
++                    err_d[3] = 1'b1;
++                end
++            end
++
++            if (invalidate_i) begin
++                if (cnt_d[W_INVAL] == {64{1'b1}}) err_d[1] = 1'b1;
++                else cnt_d[W_INVAL] = cnt_d[W_INVAL] + 64'd1;
++            end
++        end
++    end
++
++    always_ff @(posedge clk_i) begin
++        if (!rst_ni) begin
++            state_q <= S_OFF;
++            seq_q <= 64'd0;
++            cycles_q <= 64'd0;
++            err_q <= 5'd0;
++            for (int i = 0; i < 40; i++) cnt_q[i] <= 64'd0;
++            win_cfg_q <= 64'd0;
++            win_gen_q <= 64'd0;
++            plru_open_q <= 32'd0;
++            plru_close_q <= 32'd0;
++            pscid_v_q <= 20'd0;
++            pscid_a_q <= 20'd0;
++            seen_lookup_v_q <= 1'b0;
++            seen_lookup_a_q <= 1'b0;
++            for (int i = 0; i < 16; i++) begin
++                entries_open_q[i] <= 128'd0;
++                entries_close_q[i] <= 128'd0;
++            end
++        end else begin
++            state_q <= state_d;
++            seq_q <= seq_d;
++            cycles_q <= cycles_d;
++            err_q <= err_d;
++            for (int i = 0; i < 40; i++) cnt_q[i] <= cnt_d[i];
++            win_cfg_q <= win_cfg_d;
++            win_gen_q <= win_gen_d;
++            plru_open_q <= plru_open_d;
++            plru_close_q <= plru_close_d;
++            pscid_v_q <= pscid_v_d;
++            pscid_a_q <= pscid_a_d;
++            seen_lookup_v_q <= seen_lookup_v_d;
++            seen_lookup_a_q <= seen_lookup_a_d;
++            for (int i = 0; i < 16; i++) begin
++                entries_open_q[i] <= entries_open_d[i];
++                entries_close_q[i] <= entries_close_d[i];
++            end
++        end
++    end
++
++    assign mode_o = mode_q;
++    assign protected_did_o = protected_did_q;
++
++    always_comb begin
++        rdata_o = 64'd0;
++        case (index_i)
++            7'd0:  rdata_o = COMP_MAGIC;
++            7'd1:  rdata_o = COMP_ABI;
++            7'd2:  rdata_o = {32'd0, protected_did_q, 6'd0, mode_q};
++            7'd3:  rdata_o = generation_q;
++            7'd4:  rdata_o = {61'd0, last_status_q};
++            7'd5:  rdata_o = {63'd0, quiet_obs};
++            7'd6:  rdata_o = {61'd0, (state_q == S_FROZEN), (state_q == S_ACTIVE), (state_q == S_ARMED)};
++            7'd7:  rdata_o = seq_q;
++            7'd8:  rdata_o = cycles_q;
++            7'd9:  rdata_o = {59'd0, err_q};
++            7'd10: rdata_o = win_cfg_q;
++            7'd11: rdata_o = win_gen_q;
++            7'd12: rdata_o = cnt_q[W_LOOKUP_V];
++            7'd13: rdata_o = cnt_q[W_HIT_V];
++            7'd14: rdata_o = cnt_q[W_MISS_V];
++            7'd15: rdata_o = cnt_q[W_LOOKUP_A];
++            7'd16: rdata_o = cnt_q[W_HIT_A];
++            7'd17: rdata_o = cnt_q[W_MISS_A];
++            7'd18: rdata_o = cnt_q[W_LOOKUP_O];
++            7'd19: rdata_o = cnt_q[W_HIT_O];
++            7'd20: rdata_o = cnt_q[W_MISS_O];
++            7'd21: rdata_o = cnt_q[W_FAST_V];
++            7'd22: rdata_o = cnt_q[W_FAST_A];
++            7'd23: rdata_o = cnt_q[W_FAST_O];
++            7'd24: rdata_o = cnt_q[W_GAP_V];
++            7'd25: rdata_o = cnt_q[W_GAP_A];
++            7'd26: rdata_o = cnt_q[W_FILL_V];
++            7'd27: rdata_o = cnt_q[W_FILL_A];
++            7'd28: rdata_o = cnt_q[W_FILL_O];
++            7'd29: rdata_o = cnt_q[W_REPL];
++            7'd30: rdata_o = cnt_q[W_PART];
++            7'd31: rdata_o = cnt_q[W_INVAL];
++            7'd32: rdata_o = cnt_q[W_FIRST_BAD];
++            7'd33: rdata_o = cnt_q[W_FAST_N];
++            7'd34: rdata_o = PROT_MASK;
++            7'd35: rdata_o = 64'd0;
++            7'd36: rdata_o = {32'd0, plru_open_q};
++            7'd37: rdata_o = {32'd0, plru_close_q};
++            7'd38: rdata_o = {44'd0, pscid_v_q};
++            7'd39: rdata_o = {44'd0, pscid_a_q};
++            default: begin
++                if ((index_i >= 7'd64) && (index_i <= 7'd95)) begin
++                    rdata_o = index_i[0] ? entries_open_q[index_i[4:1]][127:64]
++                                         : entries_open_q[index_i[4:1]][63:0];
++                end else if ((index_i >= 7'd96) && (index_i <= 7'd127)) begin
++                    rdata_o = index_i[0] ? entries_close_q[index_i[4:1]][127:64]
++                                         : entries_close_q[index_i[4:1]][63:0];
++                end
++            end
++        endcase
++    end
++
++endmodule

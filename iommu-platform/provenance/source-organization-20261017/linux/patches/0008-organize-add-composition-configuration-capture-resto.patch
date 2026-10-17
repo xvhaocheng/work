@@ -1,0 +1,395 @@
+From b28ad3ae99d44ed3bf2d4bd83c434f8b12bea41d Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:58:30 +0900
+Subject: [PATCH 8/9] organize: add composition configuration capture
+ restoration and session integration
+
+---
+ drivers/misc/idma.c          | 194 +++++++++++++++++++++++++++++++++--
+ drivers/misc/idma_research.h |   2 +-
+ 2 files changed, 189 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/misc/idma.c b/drivers/misc/idma.c
+index e242bbb1d1a9e3fa75715868c833d51d62504ecc..c6be07dee406178811584030d680cb6a1dd7b628 100644
+--- a/drivers/misc/idma.c
++++ b/drivers/misc/idma.c
+@@ -51,6 +51,7 @@ MODULE_LICENSE("GPL v2");
+ #define IDMA_OBS_MAGIC_V6 0x49444d414f425306ULL
+ #define IDMA_OBS_MAGIC_V7 0x49444d414f425307ULL
+ #define IDMA_OBS_MAGIC_V8 0x49444d414f425308ULL
++#define IDMA_OBS_MAGIC_V9 0x49444d414f425309ULL /* P4M/composition, no path/E3 */
+ #define IDMA_E3_MAGIC 0x49444d4145330001ULL
+ #define IDMA_E3_MAGIC_V2 0x49444d4145330002ULL
+ #define IDMA_OBS_VALUES 34
+@@ -130,6 +131,7 @@ struct idma_stream {
+ 	u64 transfer_id, deadline_ns, last_complete_ns;
+ 	bool mapped_src, mapped_dst, in_flight, retain;
+ 	bool batch_configured, batch_started, reverse;
++	bool composition_trace;
+ 	struct idma_experiment_stats *stats;
+ 	struct idma_e3_diag_lane *diagnostic;
+ };
+@@ -465,6 +467,17 @@ static int idma_submit(struct idma_stream *s, bool measured)
+ 	return 0;
+ }
+ 
++static bool idma_composition_trace;
++module_param_named(composition_trace, idma_composition_trace, bool, 0644);
++MODULE_PARM_DESC(composition_trace, "Trace composition stages (default false)");
++
++static void idma_comp_stage(bool enabled, struct device *dev, const char *stage,
++			    int ret)
++{
++	if (enabled)
++		dev_info(dev, "idma_comp stage=%s ret=%d\n", stage, ret);
++}
++
+ /*
+  * Bounded software batch start.  Both register sets are configured before any
+  * NEXT_ID trigger.  Only the ordered A-then-V trigger reads and their software
+@@ -519,6 +532,7 @@ static int idma_batch_start(struct idma_stream *v, struct idma_stream *a,
+ 	idma_submit_config(v);
+ 
+ 	start->attempted = true;
++	idma_comp_stage(v->composition_trace, v->dev, "pair-enter", 0);
+ 	preempt_disable();
+ 	local_irq_save(flags);
+ 
+@@ -570,6 +584,7 @@ static int idma_batch_start(struct idma_stream *v, struct idma_stream *a,
+ 	/* Commit bookkeeping never runs with IRQs or preemption disabled. */
+ 	local_irq_restore(flags);
+ 	preempt_enable();
++	idma_comp_stage(v->composition_trace, v->dev, "pair-return", 0);
+ 
+ 	if (!v_id) {
+ 		/*
+@@ -979,8 +994,11 @@ static int idma_observation_prepare(struct idma_observation *o, bool enabled)
+ 	if (!o->control)
+ 		return -ENODEV;
+ 	magic = readq(o->control->reg + IDMA_OBS_MAGIC_OFFSET);
+-	o->path = o->p4m || o->e3 || (o->batch && READ_ONCE(idma_path_observe));
+-	if (o->p4m && magic != IDMA_OBS_MAGIC_V8 && magic != IDMA_OBS_MAGIC_V7)
++	/* V9 retains window accounting but physically omits the old path timers. */
++	o->path = magic != IDMA_OBS_MAGIC_V9 &&
++		(o->p4m || o->e3 || (o->batch && READ_ONCE(idma_path_observe)));
++	if (o->p4m && magic != IDMA_OBS_MAGIC_V9 &&
++	    magic != IDMA_OBS_MAGIC_V8 && magic != IDMA_OBS_MAGIC_V7)
+ 		return -EOPNOTSUPP;
+ 	if (o->controlled && magic != IDMA_OBS_MAGIC_V6 &&
+ 	    magic != IDMA_OBS_MAGIC_V8 && magic != IDMA_OBS_MAGIC_V7)
+@@ -995,7 +1013,8 @@ static int idma_observation_prepare(struct idma_observation *o, bool enabled)
+ 	    magic != IDMA_OBS_MAGIC_V8 && magic != IDMA_OBS_MAGIC_V7)
+ 		return -EOPNOTSUPP;
+ 	if (o->control->did != 10 ||
+-	    (magic != IDMA_OBS_MAGIC_V8 && magic != IDMA_OBS_MAGIC_V7 && magic != IDMA_OBS_MAGIC_V6 &&
++	    (magic != IDMA_OBS_MAGIC_V9 && magic != IDMA_OBS_MAGIC_V8 &&
++	     magic != IDMA_OBS_MAGIC_V7 && magic != IDMA_OBS_MAGIC_V6 &&
+ 	     magic != IDMA_OBS_MAGIC_V5 && magic != IDMA_OBS_MAGIC_V4 &&
+ 	     magic != IDMA_OBS_MAGIC_V3 &&
+ 	     (o->path || (magic != IDMA_OBS_MAGIC_V2 && (o->batch || magic != IDMA_OBS_MAGIC)))))
+@@ -2252,11 +2271,95 @@ static int idma_research_capture_ext(struct idma_device *d,
+ 				     const struct idma_research2_config *cfg,
+ 				     int error);
+ 
++/* New, independent hardware bank. All calls hold idma_experiment_lock. */
++#define IDMA_COMPOSITION_BASE (512U + 0xd20U)
++
++static u64 idma_composition_read(struct idma_device *d, unsigned int word)
++{
++	writeq(IDMA_COMPOSITION_BASE + word, d->reg + IDMA_OBS_INDEX_OFFSET);
++	return readq(d->reg + IDMA_OBS_DATA_OFFSET);
++}
++
++static int idma_composition_configure(struct idma_device *d, u32 mode, u32 did,
++				      u64 *generation)
++{
++	u64 old, now, status, config = ((u64)did << 8) | mode;
++
++	if (idma_composition_read(d, 0) != IDMA_COMPOSITION_MAGIC ||
++	    idma_composition_read(d, 1) != IDMA_COMPOSITION_ABI)
++		return -EOPNOTSUPP;
++	old = idma_composition_read(d, 3);
++	if (old == U64_MAX)
++		return -EOVERFLOW;
++	if (idma_composition_read(d, 5) != 1)
++		return -EBUSY;
++	writeq(IDMA_COMPOSITION_BASE + 2, d->reg + IDMA_OBS_INDEX_OFFSET);
++	writeq(config, d->reg + IDMA_OBS_DATA_OFFSET);
++	/* Same-clock atomic clear/config/ack: ordered read observes that edge. */
++	status = idma_composition_read(d, 4);
++	now = idma_composition_read(d, 3);
++	if (status == 1)
++		return -EBUSY;
++	if (status || now != old + 1 || idma_composition_read(d, 2) != config)
++		return -EIO;
++	*generation = now;
++	return 0;
++}
++
++static int idma_composition_capture(struct idma_device *d,
++				    struct idma_composition *p, int error)
++{
++	u64 config = ((u64)p->protected_did << 8) | p->mode;
++	unsigned int i;
++
++	for (i = 0; i < IDMA_COMPOSITION_WORDS; i++)
++		p->raw[i] = idma_composition_read(d, i);
++	p->raw_captured = 1;
++	if (error)
++		return error;
++	if (p->raw[0] != IDMA_COMPOSITION_MAGIC || p->raw[1] != 1 ||
++	    p->raw[2] != config || p->raw[3] != p->generation ||
++	    p->raw[6] != 4 || p->raw[9] || p->raw[10] != config ||
++	    p->raw[11] != p->generation || !p->raw[7] ||
++	    p->raw[8] != p->p4m.window[1] || p->raw[34] != 3)
++		return -EIO;
++	for (i = 12; i <= 18; i += 3)
++		if (p->raw[i] != p->raw[i + 1] + p->raw[i + 2])
++			return -EIO;
++	if (p->raw[24] > p->raw[8] || p->raw[25] ||
++	    (!p->victim_gap_cycles && p->raw[24]) ||
++	    (p->victim_gap_cycles && p->p4m.experiment.victim_transfers > 1 &&
++	     !p->raw[24]) || p->raw[30] || p->raw[32] || p->raw[33])
++		return -EIO;
++	/* Reserved words are an ABI check, not experimental outcome filtering. */
++	if (p->raw[35])
++		return -EIO;
++	for (i = 40; i < 64; i++)
++		if (p->raw[i])
++			return -EPROTO;
++	return 0;
++}
++
++static int idma_composition_restore(struct idma_device *d,
++				    struct idma_composition *p)
++{
++	u64 deadline = ktime_get_ns() + NSEC_PER_SEC;
++
++	/* Never force a cache clear across an unfinished DMA or response. */
++	while (idma_composition_read(d, 5) != 1) {
++		if (ktime_get_ns() >= deadline)
++			return -ETIMEDOUT;
++		cond_resched();
++	}
++	return idma_composition_configure(d, 0, 10, &p->restored_generation);
++}
++
+ static long idma_run_session2(struct idma_device *victim,
+ 			      struct idma_experiment *request, bool batch, struct idma_e3_pair *pair,
+ 			      struct idma_e3_diag_round *diagnostic, bool queue_pair,
+ 			      struct idma_p4m *p4m, struct idma_research *research,
+-			      const struct idma_research2_config *cfg)
++			      const struct idma_research2_config *cfg,
++			      struct idma_composition *composition)
+ {
+ 	struct idma_experiment e = *request;
+ 	struct idma_stream streams[2] = {};
+@@ -2272,6 +2375,8 @@ static long idma_run_session2(struct idma_device *victim,
+ 	u64 start, end = 0, deadline, stamp;
+ 	int ret, drain_ret, verify_ret, observation_ret, p4m_ret;
+ 	unsigned int round = 0;
++	bool comp_trace = composition != NULL &&
++		READ_ONCE(idma_composition_trace);
+ 
+ 	memset(&e.status, 0, sizeof(e) - offsetof(struct idma_experiment, status));
+ 	e.victim_did = victim->did;
+@@ -2328,9 +2433,22 @@ static long idma_run_session2(struct idma_device *victim,
+ 		ret = -EBUSY;
+ 		goto out_put;
+ 	}
++	if (composition) {
++		idma_comp_stage(comp_trace, victim->miscdev.parent,
++				"pre-config", 0);
++		ret = idma_composition_configure(victim, composition->mode,
++				composition->protected_did, &composition->generation);
++		idma_comp_stage(comp_trace, victim->miscdev.parent,
++				"post-config", ret);
++		if (ret)
++			goto out_put;
++		composition->configured = 1;
++		composition->restore_status = -EINPROGRESS;
++	}
+ 	ret = idma_stream_prepare(v, victim, e.victim_pages, e.chunk_bytes, &e.victim);
+ 	if (ret)
+ 		goto out_cleanup;
++	v->composition_trace = comp_trace;
+ 	if (a) {
+ 		ret = idma_stream_prepare(a, aggressor, e.aggressor_pages,
+ 					  e.chunk_bytes, &e.aggressor);
+@@ -2380,6 +2498,7 @@ static long idma_run_session2(struct idma_device *victim,
+ 		idma_snapshot(hpm, v, a, &before, active_before);
+ 		diag->warm_begin_ns = ktime_get_ns();
+ 	}
++	idma_comp_stage(v->composition_trace, v->dev, "warm-start", 0);
+ 	if (a && (!batch || e.warmup_transfers)) {
+ 		ret = idma_submit(a, false);
+ 		if (ret)
+@@ -2397,6 +2516,7 @@ static long idma_run_session2(struct idma_device *victim,
+ 			diag->lane[1].warm_next_offset = a->next_offset;
+ 		}
+ 	}
++	idma_comp_stage(v->composition_trace, v->dev, "warm-done", ret);
+ 	if (ret)
+ 		goto out_drain;
+ 	/* Every measured V task starts at the same address after warmup. */
+@@ -2424,14 +2544,17 @@ static long idma_run_session2(struct idma_device *victim,
+ 		ret = idma_batch_configure(v, e.victim_transfers);
+ 		if (!ret && a)
+ 			ret = idma_batch_configure(a, IDMA_EXPERIMENT_MAX_TRANSFERS);
++		idma_comp_stage(v->composition_trace, v->dev,
++				"batch-config-done", ret);
+ 		if (ret)
+ 			goto out_drain;
+ 	}
+ 	if (p4m) {
+-		ret = idma_gap_program_readback(v, 0);
++		ret = idma_gap_program_readback(v, composition ? composition->victim_gap_cycles : 0);
+ 		if (!ret && a)
+ 			ret = idma_gap_program_readback(a,
+ 							p4m->aggressor_gap_cycles);
++		idma_comp_stage(v->composition_trace, v->dev, "gap-done", ret);
+ 		if (ret)
+ 			goto out_drain;
+ 	}
+@@ -2454,6 +2577,7 @@ static long idma_run_session2(struct idma_device *victim,
+ 			goto out_drain;
+ 	}
+ 	ret = idma_observation_arm(&observation, victim, aggressor, e.victim_transfers);
++	idma_comp_stage(v->composition_trace, v->dev, "arm-done", ret);
+ 	if (ret)
+ 		goto out_drain;
+ 	stamp = ktime_get_ns();
+@@ -2463,10 +2587,12 @@ static long idma_run_session2(struct idma_device *victim,
+ 	start = ktime_get_ns();
+ 	e.snapshot_before_ns = start - stamp;
+ 	e.measurement_started = 1;
++	idma_comp_stage(v->composition_trace, v->dev, "prewindow", 0);
+ 	ret = batch ? idma_batch_window(v, a, deadline, &end, &batch_start) :
+ 		idma_run_window(v, a, e.victim_transfers, deadline, true, &end);
+ 	e.victim_elapsed_ns = end - start;
+ 	e.measurement_complete = !ret;
++	idma_comp_stage(v->composition_trace, v->dev, "window-return", ret);
+ 	e.victim.in_flight_at_end = v->in_flight;
+ 	e.aggressor.in_flight_at_end = a && a->in_flight;
+ 	/* Stop autonomous A after V observation; hardware window is already frozen. */
+@@ -2483,7 +2609,9 @@ static long idma_run_session2(struct idma_device *victim,
+ 	if (a)
+ 		idma_snapshot_delta(&e.aggressor, 1, &before, &after,
+ 				    active_before[1], active_after[1]);
++	idma_comp_stage(v->composition_trace, v->dev, "snapshot-after", ret);
+  out_drain:
++	idma_comp_stage(v->composition_trace, v->dev, "drain-start", ret);
+ 	if (batch) {
+ 		idma_batch_stop(v);
+ 		idma_batch_stop(a);
+@@ -2510,6 +2638,7 @@ static long idma_run_session2(struct idma_device *victim,
+ 		if (!ret && e.victim.completed != e.victim_transfers)
+ 			ret = -EIO;
+ 	}
++	idma_comp_stage(v->composition_trace, v->dev, "drain-end", ret);
+ 	riscv_iommu_hpm_release(hpm);
+ 	if (!ret) {
+ 		/* Both lanes are drained: reacquire CPU visibility before any check. */
+@@ -2527,6 +2656,7 @@ static long idma_run_session2(struct idma_device *victim,
+ 	observation_ret = idma_observation_finish(&observation, &e, ret);
+ 	if (observation_ret && !ret)
+ 		ret = observation_ret;
++	idma_comp_stage(v->composition_trace, v->dev, "obs-finish", ret);
+ 	if (p4m) {
+ 		p4m_ret = idma_p4m_finish(&observation, &e, p4m, ret);
+ 		if (p4m_ret && !ret)
+@@ -2559,6 +2689,17 @@ static long idma_run_session2(struct idma_device *victim,
+ 		idma_batch_disable(v);
+ 		idma_batch_disable(a);
+ 	}
++	if (composition && composition->configured) {
++		int capture_ret = idma_composition_capture(victim, composition, ret);
++
++		if (!ret)
++			ret = capture_ret;
++		composition->restore_status = idma_composition_restore(victim, composition);
++		if (!ret)
++			ret = composition->restore_status;
++		idma_comp_stage(v->composition_trace, v->dev, "restored",
++				composition->restore_status);
++	}
+ 	if (pair) {
+ 		if (observation.armed) {
+ 			observation_ret = idma_e3_finish(&observation, &e, pair->observation[round]);
+@@ -2613,7 +2754,7 @@ static long idma_run_session(struct idma_device *victim,
+ 			     struct idma_p4m *p4m, struct idma_research *research)
+ {
+ 	return idma_run_session2(victim, request, batch, pair, diagnostic,
+-				 queue_pair, p4m, research, NULL);
++				 queue_pair, p4m, research, NULL, NULL);
+ }
+ 
+ static long idma_run_p4m(struct idma_device *victim, void __user *uarg)
+@@ -2636,6 +2777,45 @@ static long idma_run_p4m(struct idma_device *victim, void __user *uarg)
+ 	return ret;
+ }
+ 
++static long idma_run_composition(struct idma_device *victim, void __user *uarg)
++{
++	struct idma_composition *p;
++	struct idma_experiment *e;
++	long ret;
++
++	if (!capable(CAP_SYS_RAWIO))
++		return -EPERM;
++	p = memdup_user(uarg, sizeof(*p));
++	if (IS_ERR(p))
++		return PTR_ERR(p);
++	memset(&p->status, 0, sizeof(*p) - offsetof(struct idma_composition, status));
++	idma_p4m_clear_outputs(&p->p4m);
++	e = &p->p4m.experiment;
++	ret = -EPROTO;
++	if (p->abi_version != IDMA_COMPOSITION_ABI || p->struct_size != sizeof(*p))
++		goto out;
++	ret = -EINVAL;
++	if (p->mode > 3 || (p->protected_did != 10 && p->protected_did != 11) ||
++	    (p->victim_gap_cycles != 0 && p->victim_gap_cycles != 1000 &&
++	     p->victim_gap_cycles != 4000) ||
++	    memchr_inv(p->reserved, 0, sizeof(p->reserved)) ||
++	    p->p4m.aggressor_gap_cycles || e->victim_pages != 1 ||
++	    (e->aggressor_pages != 1 && e->aggressor_pages != 8 && e->aggressor_pages != 16) ||
++	    e->victim_transfers > 4096 || e->warmup_transfers > 4096)
++		goto out;
++	ret = idma_p4m_validate(victim, &p->p4m);
++	if (!ret)
++		ret = idma_run_session2(victim, e, true, NULL, NULL, false,
++				       &p->p4m, NULL, NULL, p);
++ out:
++	p->status = ret;
++	e->status = ret;
++	if (copy_to_user(uarg, p, sizeof(*p)))
++		ret = -EFAULT;
++	kfree(p);
++	return ret;
++}
++
+ static long idma_run_experiment_mode(struct idma_device *victim,
+ 				     struct idma_experiment __user *uarg, bool batch)
+ {
+@@ -2726,6 +2906,8 @@ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ 		return idma_research2_caps_ioctl(idma, (void __user *)arg);
+ 	case IDMA_IOC_RUN_E3_CONTROLLED:
+ 		return idma_run_e3_controlled(idma, (void __user *)arg);
++	case IDMA_IOC_RUN_COMPOSITION:
++		return idma_run_composition(idma, (void __user *)arg);
+ 	case IDMA_IOC_RUN_P4M:
+ 		return idma_run_p4m(idma, (void __user *)arg);
+ 	case IDMA_IOC_RUN_E3_QUEUE_PAIR:
+diff --git a/drivers/misc/idma_research.h b/drivers/misc/idma_research.h
+index c7d7662ee8bcef428f6cb1334cfdfec3922118df..0e1756798de7e9546edc14bcf3af6bb715973622 100644
+--- a/drivers/misc/idma_research.h
++++ b/drivers/misc/idma_research.h
+@@ -809,7 +809,7 @@ static long idma_run_research2(struct idma_device *victim, void __user *uarg)
+ 		ret = idma_p4m_validate_cfg(victim, &r->p4m, cfg);
+ 		if (!ret)
+ 			ret = idma_run_session2(victim, e, true, NULL, NULL, false,
+-						&r->p4m, r, cfg);
++						&r->p4m, r, cfg, NULL);
+ 		if (!ret)
+ 			r->stage = 5;
+ 	} else {

@@ -3885,3 +3885,12 @@ DeepSeek Flash共4次工具／修订提案，实际返回合计301,415 tokens；
 用户明确要求将 `xvhaocheng/work` 改为公开，并要求以后项目改动也同步到该仓库。已通过GitHub CLI修改可见性并实际核对 `isPrivate=false`、默认分支main。根及平台AGENTS.md记录持续授权：每次完成项目源码、配置、脚本、测试、文档或研究证据修改并检查后，增量提交推送；继续排除构建产物和真实凭据，大文件沿用分片，保留内部组件Git和并发未完成工作，正常推送并核对远端，不逐次询问上传。该规则应用于后续任务完成流程，不建立后台监听／定时任务，也不恢复暂停的研究或实验。
 
 本次仅修改仓库可见性和记录明确授权，由Codex直接执行，未调用DeepSeek或子agent。历史“私有”记录保留为当时事实；当前状态和README已指向公开仓库。文档提交与远端验证记录保存在 `.git/sync-preparation/public-policy-verification.json`。
+
+
+## 2026-10-17 原版基线与研究扩展源码整理
+
+按用户“固定原版和必要适配基线、按功能和依赖拆分扩展、对应历史实验，保留历史数据且不启动实验”的要求完成静态整理。入口为 [source-organization-20261017](iommu-platform/provenance/source-organization-20261017/README.md)。固定 CVA6 原始 `1f992d8`＋IOMMU 原child `f8f918a`，另列目标组件上游 `c80bba7`；必要四DMA／接口配对 `54c6257`＋`7bea3f2`，独立修复后 `ba8cdd1`＋`85b157e`，研究终点 `991074e`＋`0b79394`。修复层含AW服务先后改变，不能称stock。组件新提交仅使用新codex引用，旧HEAD／索引／refs／未提交源码保留；补丁和增量bundle保存精确新身份，恢复前提另列。
+
+IOMMU与CVA6分别拆成12／27个功能提交，实际补丁顺序与语义依赖分列；Linux保留既有分立历史并拆当前dirty修复／研究接口，OpenSBI单独固定reset适配。历史索引79行、13份核心build共1115显式源条目、106去重源字节、236份选定元数据副本；16份旧manifest版本锁从点名commit取回且SHA逐项一致。早期dirty全量、隐式include／环境闭包缺口仍unknown；功能映射明确不主张新旧源码等价或重现旧数值。
+
+复用现有platform archive staging，仅导出原版与修复基座并核对源身份，不调用Make或实验入口；原sources.lock/configs未改。所有新基线仍source-fixed-only，原版性能基线尚未建立。此前PLRU消融已取得victim与18配置证据，本次未重跑；CURRENT纠正A37／总39及“替换未执行”的过时概述。无新编译／测试／仿真／综合／板测，暂停研究和MIG保持。Codex-only，无DeepSeek或Claude。完整静态回执及限制见整理入口。

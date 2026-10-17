@@ -1,0 +1,873 @@
+diff --git a/Bender.yml b/Bender.yml
+index 8e0bec7..332cf2a 100644
+--- a/Bender.yml
++++ b/Bender.yml
+@@ -68,6 +68,7 @@ sources:
+   - rtl/transaction_controller/rv_iommu_mrif_handler.sv
+   - rtl/transaction_controller/rv_iommu_e3_queue.sv
+   - rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
++  - rtl/transaction_controller/rv_iommu_banked_ctl.sv
+ 
+   - rtl/software_interface/regmap/rv_iommu_field_arb.sv
+   - rtl/software_interface/regmap/rv_iommu_field.sv
+@@ -92,6 +93,7 @@ sources:
+   - rtl/translation_logic/rv_iommu_pdtw.sv
+   - rtl/translation_logic/rv_iommu_ptw.sv
+   - rtl/translation_logic/rv_iommu_e3_delay.sv
++  - rtl/translation_logic/rv_iommu_nonblock_hit.sv
+   - rtl/translation_logic/rv_iommu_tl_wrap.sv
+ 
+   - rtl/rv_iommu_top.sv
+diff --git a/rtl/ext_interfaces/rv_iommu_ds_if.sv b/rtl/ext_interfaces/rv_iommu_ds_if.sv
+index 2e6ba75..ac66855 100644
+--- a/rtl/ext_interfaces/rv_iommu_ds_if.sv
++++ b/rtl/ext_interfaces/rv_iommu_ds_if.sv
+@@ -112,6 +112,11 @@ module rv_iommu_ds_if #(
+     aw_chan_t aw_data;
+     logic aw_valid;
+     logic aw_ready;
++    logic aw_spill_ready;
++    logic w_fifo_full, w_fifo_empty;
++
++    // Every accepted AW must retain its owner until the corresponding WLAST.
++    assign aw_ready = aw_spill_ready && !w_fifo_full;
+     stream_arbiter #(
+         .DATA_T (aw_chan_t),
+         .N_INP  (5)
+@@ -134,8 +139,8 @@ module rv_iommu_ds_if #(
+         .rst_ni     (rst_ni),
+ 
+         .data_i     (aw_data),
+-        .valid_i    (aw_valid),
+-        .ready_o    (aw_ready),
++        .valid_i    (aw_valid && !w_fifo_full),
++        .ready_o    (aw_spill_ready),
+ 
+         .data_o     (ds_req_o.aw),
+         .valid_o    (ds_req_o.aw_valid),
+@@ -145,6 +150,7 @@ module rv_iommu_ds_if #(
+     // W Channel
+     logic[2:0] w_select, w_select_fifo;
+     logic w_valid;
++    logic w_mux_valid;
+     logic w_ready;
+     w_chan_t w_data;
+ 
+@@ -156,8 +162,8 @@ module rv_iommu_ds_if #(
+             1:          w_select = 3'd1; // FQ
+             2:          w_select = 3'd2; // MRIF Handler
+             3:          w_select = 3'd3; // MSI IG
+-            3:          w_select = 3'd4; // PQ
+-            default:    w_select = 2'd0; // CQ
++            4:          w_select = 3'd4; // PQ
++            default:    w_select = 3'd0; // CQ
+         endcase
+     end
+ 
+@@ -170,8 +176,8 @@ module rv_iommu_ds_if #(
+       .rst_ni     (rst_ni),
+       .flush_i    (1'b0),
+       .testmode_i (1'b0),
+-      .full_o     ( ),
+-      .empty_o    ( ),
++      .full_o     (w_fifo_full),
++      .empty_o    (w_fifo_empty),
+       .usage_o    ( ),
+       .data_i     (w_select),
+       .push_i     (aw_valid & aw_ready),
+@@ -183,15 +189,19 @@ module rv_iommu_ds_if #(
+         .DATA_T (w_chan_t),
+         .N_INP  (5)
+     ) i_stream_mux_w (
+-        .inp_data_i  ({msi_ig_req_i.w, mrif_handler_req_i.w, fq_req_i.w, cq_req_i.w, pq_req_i.w}),
+-        .inp_valid_i ({msi_ig_req_i.w_valid, mrif_handler_req_i.w_valid, fq_req_i.w_valid, cq_req_i.w_valid, pq_req_i.w_valid}),
+-        .inp_ready_o ({msi_ig_resp_o.w_ready, mrif_handler_resp_o.w_ready, fq_resp_o.w_ready, cq_resp_o.w_ready, pq_resp_o.w_ready}),
++        // Packed index must match the owner selected from AWID above.
++        .inp_data_i  ({pq_req_i.w, msi_ig_req_i.w, mrif_handler_req_i.w, fq_req_i.w, cq_req_i.w}),
++        .inp_valid_i ({pq_req_i.w_valid, msi_ig_req_i.w_valid, mrif_handler_req_i.w_valid, fq_req_i.w_valid, cq_req_i.w_valid}),
++        .inp_ready_o ({pq_resp_o.w_ready, msi_ig_resp_o.w_ready, mrif_handler_resp_o.w_ready, fq_resp_o.w_ready, cq_resp_o.w_ready}),
+         .inp_sel_i   (w_select_fifo),
+         .oup_data_o  (w_data),
+-        .oup_valid_o (w_valid),
+-        .oup_ready_i (w_ready)
++        .oup_valid_o (w_mux_valid),
++        .oup_ready_i (w_ready && !w_fifo_empty)
+     );
+ 
++    // An empty queue's stale selector must not consume a producer's W data.
++    assign w_valid = w_mux_valid && !w_fifo_empty;
++
+     spill_register #(
+         .T          (w_chan_t),
+         .Bypass     (1'b0)
+diff --git a/rtl/rv_iommu_top.sv b/rtl/rv_iommu_top.sv
+index 21afd48..559225b 100644
+--- a/rtl/rv_iommu_top.sv
++++ b/rtl/rv_iommu_top.sv
+@@ -25,6 +25,10 @@ module rv_iommu_top
+     /// RISC-V IOMMU configuration struct
+     parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
+     parameter bit E3Enable = 0,
++    parameter bit BankedEnable = 0,
++    parameter bit NonblockEnable = 0,
++    parameter bit PolicyEnable = 0,
++    parameter int BankIdBit = 0,
+ 
+     /*** Translation Request Interface ***/
+     parameter type axi_tr_aw_chan_t     = logic,
+@@ -71,6 +75,11 @@ module rv_iommu_top
+ ) (
+     input  logic clk_i,
+     input  logic rst_ni,
++    input  logic nonblock_enable_i,
++    input  logic policy_partition_i, policy_clear_i,
++    input  rv_iommu::device_id_t policy_did_i,
++    output logic policy_quiet_o,
++    input  logic [1:0] fullbuffer_jobs_i,
+ 
+     // Translation Request Interface (Slave)
+     input  axi_tr_req_t    tr_req_i,
+@@ -100,9 +109,19 @@ module rv_iommu_top
+     input logic e3_enable_i, e3_arm_i, e3_active_i, e3_delay128_i,
+     output rv_iommu::e3_ctl_t e3_ctl_o,
+     output rv_iommu::e3_tl_t e3_tl_o,
++    output logic nonblock_fire_o,
++    output logic [15:0] nonblock_diag_o,
++    output logic trans_accept_o,
++    output rv_iommu::device_id_t trans_did_o,
++    output rv_iommu::ttype_t trans_type_o,
+     output rv_iommu::research_t research_o
+ );
+ 
++    initial begin
++        if (NonblockEnable && !BankedEnable)
++            $fatal(1, "NonblockEnable requires lifecycle-tagged banked controller");
++    end
++
+     typedef logic [(RVIOMMUCfg.AxiAddrWidth-1):0] addr_t;
+     typedef logic [(RVIOMMUCfg.PAddrWidth-1):0] paddr_t;
+ 
+@@ -122,10 +141,12 @@ module rv_iommu_top
+         rv_iommu::ttype_t       ttype;
+         logic                   priv;
+         logic                   is_debug;
++        logic                   bank;
+     } trans_req_data_t;
+ 
+     // Translation response structure
+     typedef struct packed {
++        logic                       bank;
+         logic                       error;
+         logic                       ignore;
+         paddr_t                     spaddr;
+@@ -166,6 +187,9 @@ module rv_iommu_top
+     } fault_data_t;
+ 
+     trans_req_data_t    trans_req_data;
++    assign trans_accept_o = trans_req_valid && trans_req_ready;
++    assign trans_did_o = trans_req_data.did;
++    assign trans_type_o = trans_req_data.ttype;
+     logic               trans_req_valid;
+     logic               trans_req_ready;
+ 
+@@ -253,7 +277,14 @@ module rv_iommu_top
+     logic           mrif_fault_valid;
+     logic           mrif_fault_ready;
+ 
+-    logic in_flight;
++    logic in_flight, policy_tl_quiet;
++    assign policy_quiet_o = policy_tl_quiet && !in_flight &&
++        !tr_req_i.ar_valid && !tr_req_i.aw_valid && !tr_req_i.w_valid &&
++        !tr_resp_o.r_valid && !tr_resp_o.b_valid &&
++        !comp_req_o.ar_valid && !comp_req_o.aw_valid && !comp_req_o.w_valid &&
++        !comp_resp_i.r_valid && !comp_resp_i.b_valid &&
++        !ds_req_o.ar_valid && !ds_req_o.aw_valid && !ds_req_o.w_valid &&
++        !ds_resp_i.r_valid && !ds_resp_i.b_valid;
+ 
+     logic atsinval_to, atsinval_inflight;
+ 
+@@ -324,6 +355,67 @@ module rv_iommu_top
+     //--------------------------------
+     // Transaction Controller Wrapper
+     //--------------------------------
++    if (BankedEnable) begin : gen_banked_ctl
++    rv_iommu_banked_ctl #(
++        .RVIOMMUCfg         (RVIOMMUCfg),
++        .E3Enable          (1'b0),
++        .BankIdBit         (BankIdBit),
++
++        .addr_t             (addr_t),
++        .paddr_t            (paddr_t),
++        .trans_req_data_t   (trans_req_data_t),
++        .trans_resp_data_t  (trans_resp_data_t),
++        .fault_data_t       (fault_data_t),
++
++        .axi_tr_aw_chan_t   (axi_tr_aw_chan_t),
++        .axi_tr_w_chan_t    (axi_tr_w_chan_t),
++        .axi_tr_b_chan_t    (axi_tr_b_chan_t),
++        .axi_tr_r_chan_t    (axi_tr_r_chan_t),
++        .axi_tr_ar_chan_t   (axi_tr_ar_chan_t),
++        .axi_tr_req_t       (axi_tr_req_t),
++        .axi_tr_resp_t      (axi_tr_resp_t),
++
++        .axi_comp_aw_chan_t (axi_comp_aw_chan_t),
++        .axi_comp_w_chan_t  (axi_comp_w_chan_t),
++        .axi_comp_b_chan_t  (axi_comp_b_chan_t),
++        .axi_comp_ar_chan_t (axi_comp_ar_chan_t),
++        .axi_comp_r_chan_t  (axi_comp_r_chan_t),
++        .axi_comp_req_t     (axi_comp_req_t),
++        .axi_comp_resp_t    (axi_comp_resp_t),
++
++        .axi_ds_req_t       (axi_ds_req_t),
++        .axi_ds_resp_t      (axi_ds_resp_t)
++    ) i_rv_iommu_banked_ctl (
++        .clk_i              (clk_i),
++        .rst_ni             (rst_ni),
++        .fullbuffer_jobs_i   (fullbuffer_jobs_i),
++
++        .tr_axi_req_i       (tr_req_i),
++        .tr_axi_resp_o      (tr_resp_o),
++
++        .comp_axi_resp_i    (comp_resp_i),
++        .comp_axi_req_o     (comp_req_o),
++
++        .trans_req_data_o   (trans_req_data),
++        .trans_req_valid_o  (trans_req_valid),
++        .trans_req_ready_i  (trans_req_ready),
++
++        .trans_resp_data_i  (trans_resp_data),
++        .trans_resp_valid_i (trans_resp_valid),
++        .trans_resp_ready_o (trans_resp_ready),
++
++        .mrif_axi_req_o     (mrif_handler_axi_req),
++        .mrif_axi_resp_i    (mrif_handler_axi_resp),
++
++        .mrif_fault_data_o  (mrif_fault_data),
++        .mrif_fault_valid_o (mrif_fault_valid),
++        .mrif_fault_ready_i (mrif_fault_ready),
++
++        .in_flight_o        (in_flight),
++        .e3_o              (e3_ctl_o)
++    );
++
++    end else begin : gen_serial_ctl
+     rv_iommu_trans_ctl_wrap #(
+         .RVIOMMUCfg         (RVIOMMUCfg),
+         .E3Enable          (E3Enable),
+@@ -353,6 +445,8 @@ module rv_iommu_top
+     ) i_rv_iommu_trans_ctl_wrap (
+         .clk_i              (clk_i),
+         .rst_ni             (rst_ni),
++        .read_admit_i        (1'b1),
++        .fullbuffer_job_i    (1'b0),
+ 
+         .tr_axi_req_i       (tr_req_i),
+         .tr_axi_resp_o      (tr_resp_o),
+@@ -379,6 +473,8 @@ module rv_iommu_top
+         .e3_o              (e3_ctl_o)
+     );
+ 
++    end
++
+     //---------------------------
+     // Translation Logic Wrapper
+     //---------------------------
+@@ -386,6 +482,8 @@ module rv_iommu_top
+     if (RVIOMMUCfg.MSITrans == rv_iommu_cfg::MSI_DISABLED) begin : gen_dc_base
+         rv_iommu_tl_wrap #(
+             .RVIOMMUCfg         (RVIOMMUCfg),
++            .NonblockEnable    (NonblockEnable),
++            .PolicyEnable(PolicyEnable),
+             .E3Enable          (E3Enable),
+ 
+             .addr_t             (addr_t),
+@@ -453,6 +551,11 @@ module rv_iommu_top
+             .fault_data_o           (fault_data),
+             .fault_valid_o          (fault_valid),
+             .fault_ready_i          (fault_ready),
++            .nonblock_enable_i(nonblock_enable_i),
++            .policy_partition_i, .policy_clear_i, .policy_did_i,
++            .policy_quiet_o(policy_tl_quiet),
++            .nonblock_fire_o(nonblock_fire_o),
++            .nonblock_diag_o(nonblock_diag_o),
+             .e3_enable_i, .e3_arm_i, .e3_active_i, .e3_delay128_i,
+             .e3_waiting_i(e3_ctl_o.victim_waiting != 0 && !e3_ctl_o.queue_error),
+             .e3_o(e3_tl_o), .research_o
+@@ -461,6 +564,8 @@ module rv_iommu_top
+     else begin : gen_dc_ext
+         rv_iommu_tl_wrap #(
+             .RVIOMMUCfg         (RVIOMMUCfg),
++            .NonblockEnable    (NonblockEnable),
++            .PolicyEnable(PolicyEnable),
+             .E3Enable          (E3Enable),
+ 
+             .addr_t             (addr_t),
+@@ -528,6 +633,11 @@ module rv_iommu_top
+             .fault_data_o           (fault_data),
+             .fault_valid_o          (fault_valid),
+             .fault_ready_i          (fault_ready),
++            .nonblock_enable_i(nonblock_enable_i),
++            .policy_partition_i, .policy_clear_i, .policy_did_i,
++            .policy_quiet_o(policy_tl_quiet),
++            .nonblock_fire_o(nonblock_fire_o),
++            .nonblock_diag_o(nonblock_diag_o),
+             .e3_enable_i, .e3_arm_i, .e3_active_i, .e3_delay128_i,
+             .e3_waiting_i(e3_ctl_o.victim_waiting != 0 && !e3_ctl_o.queue_error),
+             .e3_o(e3_tl_o), .research_o
+diff --git a/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv b/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
+index 1fce875..928c673 100644
+--- a/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
++++ b/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
+@@ -20,6 +20,9 @@ module rv_iommu_trans_ctl_wrap #(
+     /// RISC-V IOMMU configuration struct
+     parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
+     parameter bit E3Enable = 1'b0,
++    /// Banked DMA integration may hold new reads behind the upstream W owner.
++    /// Legacy instances keep their original behavior when this is disabled.
++    parameter bit ReadAdmissionEnable = 1'b0,
+ 
+     /// Address data type
+     parameter type addr_t = logic,
+@@ -51,10 +54,13 @@ module rv_iommu_trans_ctl_wrap #(
+ 
+     // Data Structures Interface data types
+     parameter type axi_ds_req_t = logic,
+-    parameter type axi_ds_resp_t = logic
++    parameter type axi_ds_resp_t = logic,
++    parameter logic [23:0] FullBufferDID = 24'd0
+ ) (
+     input  logic clk_i,
+     input  logic rst_ni,
++    input  logic read_admit_i,
++    input  logic fullbuffer_job_i,
+ 
+     // AXI Translation Request Interface
+     input  axi_tr_req_t    tr_axi_req_i,
+@@ -637,7 +643,8 @@ module rv_iommu_trans_ctl_wrap #(
+                 end
+ 
+                 // Read request received
+-                else if (ar_valid) begin
++                else if (ar_valid && (!ReadAdmissionEnable || read_admit_i ||
++                         (fullbuffer_job_i && ar_data.stream_id == FullBufferDID))) begin
+                     // Tags
+                     trans_req_data_n.iova       = ar_data.addr;
+                     trans_req_data_n.did        = ar_data.stream_id;
+diff --git a/rtl/translation_logic/rv_iommu_ddtc.sv b/rtl/translation_logic/rv_iommu_ddtc.sv
+index 042b227..94c94e0 100644
+--- a/rtl/translation_logic/rv_iommu_ddtc.sv
++++ b/rtl/translation_logic/rv_iommu_ddtc.sv
+@@ -20,6 +20,7 @@
+ module rv_iommu_ddtc #(
+     /// RISC-V IOMMU configuration struct
+     parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
++    parameter bit TouchEnable = 0,
+ 
+     /// Device Context type
+     parameter type dc_t = logic,
+@@ -37,6 +38,7 @@ module rv_iommu_ddtc #(
+ 
+     // Lookup
+     input  logic                    lookup_i,
++    input  logic                    touch_i,
+     input  rv_iommu::device_id_t    lu_did_i,
+     output dc_t                     lu_content_o,
+     output logic                    lu_hit_o
+@@ -136,7 +138,7 @@ module rv_iommu_ddtc #(
+             shift       = 0;
+             new_index   = 0;
+ 
+-            if (lu_hit[i]) begin
++            if (lu_hit[i] && (!TouchEnable || touch_i)) begin
+                 for (int unsigned lvl = 0; lvl < $clog2(RVIOMMUCfg.NumDdtcEntries); lvl++) begin 
+                     idx_base = $unsigned((2**lvl)-1);
+                     shift = $clog2(RVIOMMUCfg.NumDdtcEntries) - lvl;
+diff --git a/rtl/translation_logic/rv_iommu_iotlb.sv b/rtl/translation_logic/rv_iommu_iotlb.sv
+index 4018a7f..0668310 100644
+--- a/rtl/translation_logic/rv_iommu_iotlb.sv
++++ b/rtl/translation_logic/rv_iommu_iotlb.sv
+@@ -22,7 +22,12 @@
+ 
+ module rv_iommu_iotlb #(
+     /// RISC-V IOMMU configuration struct
+-    parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg
++    parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
++    parameter bit TouchEnable = 0,
++    parameter bit PolicyEnable = 0,
++    // Composition experiment: independent history for fixed ways 0-1 / 2-15.
++    // Other geometries/masks and the default instance retain shared PLRU.
++    parameter bit PartitionLocalHistory = 0
+ )(
+     input  logic                        clk_i,
+     input  logic                        rst_ni,
+@@ -30,11 +35,16 @@ module rv_iommu_iotlb #(
+     // Flush
+     input  rv_iommu::iotlb_inval_t      inval_i,
+ 
++    // Experimental replacement allocation only; no lookup/permission change.
++    input logic policy_clear_i,
++    input logic [RVIOMMUCfg.NumIotlbEntries-1:0] policy_mask_i,
++
+     // Update
+     input  rv_iommu::iotlb_up_t         update_i,
+ 
+     // Lookup
+     input  logic                            lookup_i,
++    input  logic                            touch_i,
+     input  logic [rv_iommu::GPPNW39-1:0]    lu_vpn_i,
+     input  rv_iommu::pscid_t                lu_pscid_i,
+     input  rv_iommu::gscid_t                lu_gscid_i,
+@@ -202,7 +212,9 @@ module rv_iommu_iotlb #(
+                 |1 |1 |0   |    Invalidate all entries corresponding to the IOVA in ADDR field, associated to the VM identified by GSCID, including those with G=1
+                 |1 |1 |1   |    Invalidate all entries corresponding to the IOVA in ADDR field, for the VM address space identified by GSCID and PSCID.
+             */
+-            if(inval_i.inval_vma) begin
++            if (PolicyEnable && policy_clear_i) begin
++                tags_n[i].valid = 1'b0;
++            end else if(inval_i.inval_vma) begin
+                 unique case ({inval_i.gv, inval_i.av, inval_i.pscv})
+                     3'b000: begin
+                         // all host address space entries are flushed
+@@ -326,6 +338,40 @@ module rv_iommu_iotlb #(
+     //-----------------------------------------------
+     logic[(RVIOMMUCfg.NumIotlbEntries-2):0] plru_tree_q, plru_tree_n;
+ 
++    function automatic logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] history_nodes(
++        input logic [RVIOMMUCfg.NumIotlbEntries-1:0] owners
++    );
++        logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] nodes;
++        nodes = '0;
++        for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++)
++            nodes[RVIOMMUCfg.NumIotlbEntries-1+i] = owners[i];
++        for (int i = RVIOMMUCfg.NumIotlbEntries-2; i >= 0; i--)
++            nodes[i] = nodes[2*i+1] | nodes[2*i+2];
++        return nodes;
++    endfunction
++
++    localparam logic [RVIOMMUCfg.NumIotlbEntries-1:0] ProtectedWays =
++        RVIOMMUCfg.NumIotlbEntries'(16'h0003);
++    localparam logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] ProtectedNodes =
++        history_nodes(ProtectedWays);
++    localparam logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] BackgroundNodes =
++        history_nodes(~ProtectedWays);
++    logic partition_local_active;
++    assign partition_local_active = PartitionLocalHistory && PolicyEnable &&
++        RVIOMMUCfg.NumIotlbEntries == 16 &&
++        ((policy_mask_i == ProtectedWays) || (policy_mask_i == ~ProtectedWays));
++
++    logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] eligible_nodes;
++    logic [RVIOMMUCfg.NumIotlbEntries-1:0] allocation_mask;
++    assign allocation_mask = PolicyEnable ? policy_mask_i : '1;
++    always_comb begin
++        eligible_nodes = '0;
++        for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++)
++            eligible_nodes[RVIOMMUCfg.NumIotlbEntries-1+i] = allocation_mask[i];
++        for (int i = RVIOMMUCfg.NumIotlbEntries-2; i >= 0; i--)
++            eligible_nodes[i] = eligible_nodes[2*i+1] | eligible_nodes[2*i+2];
++    end
++
+     always_comb begin : plru_replacement
+         plru_tree_n = plru_tree_q;
+         
+@@ -335,18 +381,29 @@ module rv_iommu_iotlb #(
+             shift       = 0;
+             new_index   = 0;
+ 
+-            if (lu_hit[i]) begin
++            if (lu_hit[i] && (!TouchEnable || touch_i)) begin
+                 for (int unsigned lvl = 0; lvl < $clog2(RVIOMMUCfg.NumIotlbEntries); lvl++) begin
+                     idx_base = $unsigned((2**lvl)-1);
+                     shift = $clog2(RVIOMMUCfg.NumIotlbEntries) - lvl;
+                     new_index =  ~((i >> (shift-1)) & 32'b1);
+-                    plru_tree_n[idx_base + (i >> shift)] = new_index[0];
++                    // Fill ownership belongs to the main request, but a hit
++                    // may belong to a different fast request. Derive touch
++                    // ownership from the resident way, never policy_mask_i.
++                    // A branch used by only one child of this partition is
++                    // forced by the allocation mask and needs no history.
++                    if (!partition_local_active ||
++                        (i < 2 ?
++                         (ProtectedNodes[2*(idx_base + (i >> shift))+1] &&
++                          ProtectedNodes[2*(idx_base + (i >> shift))+2]) :
++                         (BackgroundNodes[2*(idx_base + (i >> shift))+1] &&
++                          BackgroundNodes[2*(idx_base + (i >> shift))+2])))
++                        plru_tree_n[idx_base + (i >> shift)] = new_index[0];
+                 end
+             end
+         end
+ 
+         for (int unsigned i = 0; i < RVIOMMUCfg.NumIotlbEntries; i += 1) begin
+-            automatic logic en;
++            automatic logic en, choose_right;
+             automatic int unsigned idx_base, shift, new_index;
+             en = 1'b1;
+ 
+@@ -354,14 +411,17 @@ module rv_iommu_iotlb #(
+                 idx_base = $unsigned((2**lvl)-1);
+                 shift = $clog2(RVIOMMUCfg.NumIotlbEntries) - lvl;
+                 new_index =  (i >> (shift-1)) & 32'b1;
+-                if (new_index[0]) begin
+-                    en &= plru_tree_q[idx_base + (i>>shift)];
+-                end else begin
+-                    en &= ~plru_tree_q[idx_base + (i>>shift)];
+-                end
++                // Follow tree-PLRU whenever that child has eligible leaves.
++                // A full mask reproduces the original victim bit for bit.
++                choose_right = eligible_nodes[2*(idx_base + (i>>shift))+2] &&
++                    (!eligible_nodes[2*(idx_base + (i>>shift))+1] ||
++                     plru_tree_q[idx_base + (i>>shift)]);
++                if (new_index[0]) en &= choose_right;
++                else en &= ~choose_right;
+             end
+-            replace_en[i] = en;
++            replace_en[i] = en && allocation_mask[i];
+         end
++        if (PolicyEnable && policy_clear_i) plru_tree_n = '0;
+     end
+ 
+     // Only read the actual pre-edge and next state. Snapshot readers must
+@@ -371,7 +431,8 @@ module rv_iommu_iotlb #(
+         research_o.supported = RVIOMMUCfg.NumIotlbEntries == 16;
+         research_o.plru = 32'(plru_tree_q);
+         research_o.invalidate = inval_i.inval_vma || inval_i.inval_gvma;
+-        research_o.update = update_i.update && !research_o.invalidate;
++        research_o.update = update_i.update && !research_o.invalidate &&
++                            !(PolicyEnable && policy_clear_i);
+         for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries && i < 16; i++) begin
+             research_o.replace_mask[i] = replace_en[i];
+             research_o.entries[i][28:0] = {tags_q[i].vpn2, tags_q[i].vpn1, tags_q[i].vpn0};
+diff --git a/rtl/translation_logic/rv_iommu_ptw.sv b/rtl/translation_logic/rv_iommu_ptw.sv
+index 519ff10..5ef5ed0 100644
+--- a/rtl/translation_logic/rv_iommu_ptw.sv
++++ b/rtl/translation_logic/rv_iommu_ptw.sv
+@@ -425,9 +425,11 @@ module rv_iommu_ptw #(
+                                     // superpages
+                                     if (main_lvl_q == LVL2)
+                                         final_gpa[20:0] = iova_q[20:0];
+-                                    if (main_lvl_q == LVL1)
++                                    else if (main_lvl_q == LVL1)
+                                         final_gpa[29:0] = iova_q[29:0];
+-                                    else begin
++                                    // LVL3 is a valid 4 KiB leaf; keep the PPN
++                                    // and page offset assembled above.
++                                    else if (main_lvl_q != LVL3) begin
+                                         pf_excep_n  = 1'b1;
+                                         state_n     = ERROR;
+                                     end
+@@ -462,7 +464,9 @@ module rv_iommu_ptw #(
+                                         pptr[20:0] = gpa_x_q[20:0];
+                                     else if (main_lvl_q == LVL1)
+                                         pptr[29:0] = gpa_x_q[29:0];
+-                                    else begin
++                                    // A 4 KiB G-stage leaf also keeps the
++                                    // already assembled PPN and page offset.
++                                    else if (main_lvl_q != LVL3) begin
+                                         pf_excep_n  = 1'b1;
+                                         state_n     = ERROR;
+                                     end
+diff --git a/rtl/translation_logic/rv_iommu_tl_wrap.sv b/rtl/translation_logic/rv_iommu_tl_wrap.sv
+index 772f239..7a4e08b 100644
+--- a/rtl/translation_logic/rv_iommu_tl_wrap.sv
++++ b/rtl/translation_logic/rv_iommu_tl_wrap.sv
+@@ -26,6 +26,8 @@ module rv_iommu_tl_wrap
+     /// RISC-V IOMMU configuration struct
+     parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
+     parameter bit E3Enable = 0,
++    parameter bit NonblockEnable = 0,
++    parameter bit PolicyEnable = 0,
+ 
+     /// Address data type
+     parameter type addr_t = logic,
+@@ -121,9 +123,20 @@ module rv_iommu_tl_wrap
+     input  logic        fault_ready_i,
+     input logic e3_enable_i, e3_arm_i, e3_active_i, e3_waiting_i, e3_delay128_i,
+     output rv_iommu::e3_tl_t e3_o,
+-    output rv_iommu::research_t research_o
++    output rv_iommu::research_t research_o,
++    input logic nonblock_enable_i,
++    input logic policy_partition_i, policy_clear_i,
++    input rv_iommu::device_id_t policy_did_i,
++    output logic policy_quiet_o,
++    output logic nonblock_fire_o,
++    output logic nonblock_busy_o,
++    output logic [15:0] nonblock_diag_o
+ );
+ 
++    initial begin
++        if (PolicyEnable && (!NonblockEnable || RVIOMMUCfg.NumIotlbEntries != 16))
++            $fatal(1, "Composition requires nonblocking-capable 16-entry IOTLB");
++    end
+     localparam int unsigned PLEN = RVIOMMUCfg.PAddrWidth;
+     localparam int unsigned PPNW = PLEN-12;
+ 
+@@ -141,6 +154,17 @@ module rv_iommu_tl_wrap
+     //-----------------
+     // Request Arbiter
+     //-----------------
++    trans_resp_data_t slow_resp_data, fast_resp_data;
++    logic slow_resp_valid, slow_resp_ready, fast_resp_valid, fast_resp_ready;
++    logic normal_trans_ready, normal_gate, n_intercept, n_accept, n_busy;
++    logic n_window;
++    logic [15:0] n_diag;
++    logic n_ddtc_lu, n_ddtc_touch, n_iotlb_lu, n_iotlb_touch;
++    device_id_t n_ddtc_did;
++    logic [GPPNW39-1:0] n_iotlb_vpn;
++    pscid_t n_iotlb_pscid;
++    logic cache_ddtc_hit, cache_iotlb_hit;
++    logic cache_iotlb_en1, cache_iotlb_en2;
+     trans_req_data_t    arb_req_data;
+     logic               arb_req_valid;
+     logic               arb_req_ready;
+@@ -148,7 +172,7 @@ module rv_iommu_tl_wrap
+     logic               req_valid;
+     logic               req_ready;
+     assign req_ready = (debug_resp_valid_o & debug_resp_ready_i) |
+-                       (trans_resp_valid_o & trans_resp_ready_i) |
++                       (slow_resp_valid & slow_resp_ready) |
+                        (ats_trans_resp_valid_o & ats_trans_resp_ready_i) ;
+ 
+     // Priority is given to normal transactions
+@@ -163,8 +187,10 @@ module rv_iommu_tl_wrap
+         .rst_ni         (rst_ni),
+ 
+         .inp_data_i     ({ats_trans_req_data_i,     debug_req_data_i,     trans_req_data_i }),
+-        .inp_valid_i    ({ats_trans_req_valid_i,    debug_req_valid_i,    trans_req_valid_i}),
+-        .inp_ready_o    ({ats_trans_req_ready_o,    debug_req_ready_o,    trans_req_ready_o}),
++        .inp_valid_i    ({ats_trans_req_valid_i && normal_gate,
++                          debug_req_valid_i && normal_gate,
++                          trans_req_valid_i && normal_gate}),
++        .inp_ready_o    ({ats_trans_req_ready_o,    debug_req_ready_o,    normal_trans_ready}),
+ 
+         .oup_data_o     (arb_req_data),
+         .oup_valid_o    (arb_req_valid),
+@@ -220,8 +246,10 @@ module rv_iommu_tl_wrap
+     logic                    ddtc_lu_hit;
+     dc_t                     ddtc_dc;
+     ddtc_up_t                ddtc_update;
+-    assign ddtc_lu          = (state_q == DDT) | ats_ddtc_valid_i;
+-    assign ddtc_lu_did      = ats_ddtc_valid_i ? ats_ddtc_did_i : req_data.did;
++    assign ddtc_lu          = (state_q == DDT) | ats_ddtc_valid_i | n_ddtc_lu;
++    assign ddtc_lu_did      = n_ddtc_lu ? n_ddtc_did :
++                             ats_ddtc_valid_i ? ats_ddtc_did_i : req_data.did;
++    assign ddtc_lu_hit = cache_ddtc_hit && !n_ddtc_lu;
+     assign ats_ddtc_ready_o = ~ddtc_lu_hit;
+     assign ats_ddtc_tc_o.en_pri = dc_q.tc.en_pri;
+     assign ats_ddtc_tc_o.en_ats = dc_q.tc.en_ats;
+@@ -240,20 +268,96 @@ module rv_iommu_tl_wrap
+     rv_iommu::iotlb_up_t            ptw_iotlb_update, msi_iotlb_update;
+     rv_iommu::iotlb_up_t            iotlb_update;
+     rv_iommu::research_t            iotlb_research;
+-    assign iotlb_lu         = (state_q == PT) | (state_q == MSI);
+-    assign iotlb_lu_vpn     = req_data.iova[rv_iommu::GPLEN39-1:12];
+-    assign iotlb_lu_pscid   = pscid_q;
+-    assign iotlb_lu_gscid   = gscid_q;
++    assign iotlb_lu         = (state_q == PT) | (state_q == MSI) | n_iotlb_lu;
++    assign iotlb_lu_vpn     = n_iotlb_lu ? n_iotlb_vpn : req_data.iova[rv_iommu::GPLEN39-1:12];
++    assign iotlb_lu_pscid   = n_iotlb_lu ? n_iotlb_pscid : pscid_q;
++    assign iotlb_lu_gscid   = n_iotlb_lu ? '0 : gscid_q;
++    assign cache_iotlb_en1 = n_iotlb_lu ? 1'b1 : en_1S_q;
++    assign cache_iotlb_en2 = n_iotlb_lu ? 1'b0 : en_2S_q;
++    assign iotlb_lu_hit = cache_iotlb_hit && !n_iotlb_lu;
+     assign iotlb_update     = (msi_iotlb_update.update) ?
+                               (msi_iotlb_update) :
+                               (ptw_iotlb_update);
+ 
++    // Two lifecycle tags (one outstanding request per bank), one response port.
++    // A rejected probe never handshakes: the original arbiter later accepts it.
++    assign normal_gate = !NonblockEnable ||
++                         (state_q == IDLE && !req_valid && !n_intercept);
++    assign trans_req_ready_o = n_intercept ? n_accept : (normal_trans_ready && normal_gate);
++    assign nonblock_fire_o = n_accept;
++    assign nonblock_busy_o = n_busy;
++    // All lifecycle storage must be empty; incoming VALID also excludes a
++    // same-edge configuration. Never reset or discard a pending response.
++    assign policy_quiet_o = state_q == IDLE && !req_valid && !arb_req_valid &&
++        !trans_req_valid_i && !ats_trans_req_valid_i && !debug_req_valid_i &&
++        !ats_ddtc_valid_i && !n_busy && !n_intercept && !n_accept &&
++        !fast_resp_valid && !slow_resp_valid && !ats_trans_resp_valid_o &&
++        !debug_resp_valid_o && !fault_valid_o && !e3_ptw_active &&
++        !ddtw_axi_req_o.ar_valid && !pdtw_axi_req_o.ar_valid &&
++        !ptw_axi_req_o.ar_valid && !msiptw_axi_req_o.ar_valid &&
++        !ddtw_axi_resp_i.r_valid && !pdtw_axi_resp_i.r_valid &&
++        !ptw_axi_resp_i.r_valid && !msiptw_axi_resp_i.r_valid &&
++        !iotlb_update.update && !ddtc_update.update &&
++        !iotinval_i.inval_vma && !iotinval_i.inval_gvma &&
++        !iodirinval_i.inval_ddtc && !iodirinval_i.inval_pdtc;
++    assign n_window = state_q == PT && e3_ptw_active && en_1S_q &&
++                      !en_2S_q && !ddt_imp_trans_q && !pdt_imp_trans_q &&
++                      !req_data.is_debug && trans_req_data_i.bank != req_data.bank &&
++                      !ats_ddtc_valid_i && !debug_req_valid_i && !ats_trans_req_valid_i;
++    assign nonblock_diag_o = {n_diag[15:1],
++        (state_q == PT && e3_ptw_active && en_1S_q && !en_2S_q)};
++    if (NonblockEnable) begin : gen_nonblock_hit
++        rv_iommu_nonblock_hit #(
++            .PAddrWidth(PLEN),
++            .HasMsiContext(RVIOMMUCfg.MSITrans != rv_iommu_cfg::MSI_DISABLED),
++            .dc_t(dc_t), .req_t(trans_req_data_t),
++            .resp_t(trans_resp_data_t), .ddtp_t(iommu_reg2hw_ddtp_reg_t)
++        ) i_hit (
++            .clk_i, .rst_ni, .enable_i(nonblock_enable_i),
++            .window_i(n_window),
++            .candidate_i(trans_req_data_i), .candidate_valid_i(trans_req_valid_i),
++            .normal_fire_i(trans_req_valid_i && normal_trans_ready && normal_gate),
++            .invalidate_i(iotinval_i.inval_vma || iotinval_i.inval_gvma ||
++                          iodirinval_i.inval_ddtc || iodirinval_i.inval_pdtc),
++            .ddtp_i(ddtp_i), .intercept_o(n_intercept), .accept_o(n_accept),
++            .busy_o(n_busy), .ddtc_lookup_o(n_ddtc_lu), .ddtc_touch_o(n_ddtc_touch),
++            .ddtc_did_o(n_ddtc_did), .ddtc_hit_i(cache_ddtc_hit), .ddtc_dc_i(ddtc_dc),
++            .iotlb_lookup_o(n_iotlb_lu), .iotlb_touch_o(n_iotlb_touch),
++            .iotlb_vpn_o(n_iotlb_vpn), .iotlb_pscid_o(n_iotlb_pscid),
++            .iotlb_hit_i(cache_iotlb_hit), .iotlb_content_i(iotlb_lu_content),
++            .response_o(fast_resp_data), .response_valid_o(fast_resp_valid),
++            .response_ready_i(fast_resp_ready), .diag_o(n_diag)
++        );
++    end else begin : gen_no_nonblock_hit
++        assign n_diag = '0;
++        assign n_intercept = 0;
++        assign n_accept = 0;
++        assign n_busy = 0;
++        assign n_ddtc_lu = 0;
++        assign n_ddtc_touch = 0;
++        assign n_ddtc_did = '0;
++        assign n_iotlb_lu = 0;
++        assign n_iotlb_touch = 0;
++        assign n_iotlb_vpn = '0;
++        assign n_iotlb_pscid = '0;
++        assign fast_resp_data = '0;
++        assign fast_resp_valid = 0;
++    end
++    stream_arbiter #(.DATA_T(trans_resp_data_t), .N_INP(2), .ARBITER("rr"))
++        i_nonblock_response_arbiter (
++            .clk_i, .rst_ni, .inp_data_i({fast_resp_data, slow_resp_data}),
++            .inp_valid_i({fast_resp_valid, slow_resp_valid}),
++            .inp_ready_o({fast_resp_ready, slow_resp_ready}),
++            .oup_data_o(trans_resp_data_o), .oup_valid_o(trans_resp_valid_o),
++            .oup_ready_i(trans_resp_ready_i)
++        );
++
+     //-----------------
+     // Walkers Control
+     //-----------------
+     // DDTW
+     logic ddtw_init;
+-    assign ddtw_init = ddtc_lu & ~ddtc_lu_hit;
++    assign ddtw_init = ((state_q == DDT) | ats_ddtc_valid_i) & ~ddtc_lu_hit;
+     logic ddtw_error;
+     rv_iommu::cause_t ddtw_cause;
+     logic ddtw_imp_init;
+@@ -355,21 +459,23 @@ module rv_iommu_tl_wrap
+     logic ignore_q, ignore_n;
+     logic is_mrif_q, is_mrif_n;
+     rv_iommu::mrifc_content_t mrif_q, mrif_n;
+-    assign trans_resp_data_o.error      = error_q;
+-    assign trans_resp_data_o.ignore     = ignore_q;
+-    assign trans_resp_data_o.spaddr     = spaddr_q;
+-    assign trans_resp_data_o.is_mrif    = is_mrif_q;
+-    assign trans_resp_data_o.mrif_data  = mrif_q;
+-    assign trans_resp_data_o.range      = range_q;
+-    assign trans_resp_data_o.bypass     = bypass_q;
+-    assign trans_resp_data_o.fault_code = error_code_q;
+-    assign trans_resp_data_o.w          = w_q;
+-    assign trans_resp_data_o.r          = r_q;
+-    assign trans_resp_data_o.x          = x_q;
+-    assign trans_resp_data_o.sum        = sum_q;
+-    assign trans_resp_data_o.g          = g_q;
+-    assign trans_resp_data_o.u          = u_q;
+-    assign trans_resp_data_o.t2gpa      = t2gpa_q;
++    assign slow_resp_data.bank = req_data.bank;
++    assign ats_trans_resp_data_o.bank = req_data.bank;
++    assign slow_resp_data.error      = error_q;
++    assign slow_resp_data.ignore     = ignore_q;
++    assign slow_resp_data.spaddr     = spaddr_q;
++    assign slow_resp_data.is_mrif    = is_mrif_q;
++    assign slow_resp_data.mrif_data  = mrif_q;
++    assign slow_resp_data.range      = range_q;
++    assign slow_resp_data.bypass     = bypass_q;
++    assign slow_resp_data.fault_code = error_code_q;
++    assign slow_resp_data.w          = w_q;
++    assign slow_resp_data.r          = r_q;
++    assign slow_resp_data.x          = x_q;
++    assign slow_resp_data.sum        = sum_q;
++    assign slow_resp_data.g          = g_q;
++    assign slow_resp_data.u          = u_q;
++    assign slow_resp_data.t2gpa      = t2gpa_q;
+ 
+     //----------------------
+     // ATS Translation response
+@@ -394,6 +500,7 @@ module rv_iommu_tl_wrap
+     // Device Directory Table Cache
+     //------------------------------
+     rv_iommu_ddtc #(
++        .TouchEnable(NonblockEnable),
+         .RVIOMMUCfg     (RVIOMMUCfg),
+         .dc_t           (dc_t),
+         .ddtc_up_t      (ddtc_up_t)
+@@ -406,9 +513,10 @@ module rv_iommu_tl_wrap
+         .update_i       (ddtc_update),
+ 
+         .lookup_i       (ddtc_lu),
++        .touch_i        (!n_ddtc_lu || n_ddtc_touch),
+         .lu_did_i       (ddtc_lu_did),
+         .lu_content_o   (ddtc_dc),
+-        .lu_hit_o       (ddtc_lu_hit)
++        .lu_hit_o       (cache_ddtc_hit)
+     );
+ 
+     //-------------------------------
+@@ -547,22 +655,31 @@ module rv_iommu_tl_wrap
+     // IO Translation Look-aside Buffer
+     //----------------------------------
+     rv_iommu_iotlb #(
++        .TouchEnable(NonblockEnable),
++        .PolicyEnable(PolicyEnable),
++        .PartitionLocalHistory(PolicyEnable),
+         .RVIOMMUCfg     (RVIOMMUCfg)
+     ) i_rv_iommu_iotlb (
+         .clk_i          (clk_i),
+         .rst_ni         (rst_ni),
+ 
+-        .inval_i        (iotinval_i),
+-
+         .update_i       (iotlb_update),
++        .inval_i        (iotinval_i),
++        .policy_clear_i (PolicyEnable && policy_clear_i),
++        // Owner is the stable main PTW/MSI request, never a fast probe DID.
++        .policy_mask_i  (PolicyEnable && policy_partition_i ?
++            (req_data.did == policy_did_i ?
++             RVIOMMUCfg.NumIotlbEntries'(16'h0003) :
++             RVIOMMUCfg.NumIotlbEntries'(16'hfffc)) : '1),
+ 
+         .lookup_i       (iotlb_lu),
++        .touch_i        (!n_iotlb_lu || n_iotlb_touch),
+         .lu_vpn_i       (iotlb_lu_vpn),
+         .lu_pscid_i     (iotlb_lu_pscid),
+         .lu_gscid_i     (iotlb_lu_gscid),
+-        .en_1S_i        (en_1S_q),
+-        .en_2S_i        (en_2S_q),
+-        .lu_hit_o       (iotlb_lu_hit),
++        .en_1S_i        (cache_iotlb_en1),
++        .en_2S_i        (cache_iotlb_en2),
++        .lu_hit_o       (cache_iotlb_hit),
+         .lu_content_o   (iotlb_lu_content),
+         .research_o     (iotlb_research)
+     );
+@@ -834,7 +951,7 @@ module rv_iommu_tl_wrap
+ 
+         // Default values
+         debug_resp_valid_o     = 1'b0;
+-        trans_resp_valid_o     = 1'b0;
++        slow_resp_valid     = 1'b0;
+         ats_trans_resp_valid_o = 1'b0;
+         fault_valid_o          = 1'b0;
+ 
+@@ -1443,8 +1560,8 @@ module rv_iommu_tl_wrap
+                 end
+                 // Normal translation
+                 else begin
+-                    trans_resp_valid_o  = 1'b1;
+-                    if (trans_resp_ready_i) begin
++                    slow_resp_valid  = 1'b1;
++                    if (slow_resp_ready) begin
+                         state_n = IDLE;
+                     end
+                 end

@@ -36,6 +36,8 @@
 | 文档与补丁来历 | [docs](../iommu-platform/docs/)、[validation](../iommu-platform/docs/validation.md)、[patches](../iommu-platform/docs/patches.md)、[provenance](../iommu-platform/provenance/) | 协议、报告与已纳入提交的迁移补丁；provenance 是审查副本，不要重复应用 |
 | 基础镜像 | [assets/README](../iommu-platform/assets/README.md) | 固定 rootfs 基础与来源限制；不是全用户空间已从源重建 |
 
+原版、必要适配、独立修复与研究扩展的固定提交见[源码组织](../iommu-platform/provenance/source-organization-20261017/README.md)，历史运行身份见[对应索引](../iommu-platform/provenance/source-organization-20261017/history/README.md)。新增引用与恢复包保留原组件历史；五个源码profile仅供静态导出，不是已构建／已运行的Make配置。
+
 ## 按问题进入代码
 
 | 问题 | 最小入口链 |

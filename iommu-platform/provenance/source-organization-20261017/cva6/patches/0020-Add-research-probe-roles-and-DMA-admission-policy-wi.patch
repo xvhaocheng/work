@@ -1,0 +1,1768 @@
+From 35247ca216c450b54dc92d8b40f5c1a82e59e2a0 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:52:05 +0900
+Subject: [PATCH 20/27] Add research probe roles and DMA admission policy with
+ accepted-command fixes
+
+Source-organization: 2026-10-17; new commit authored at actual current time.
+Feature-ID: CVA6-RESEARCH-POLICY
+Original-source: 6f968ec9, a0497a8d, 475f3e19, a1b08934
+Validation scope: source/patch identity only; no build, simulation or experiment.
+---
+ .../fpga/src/ariane_peripherals_xilinx.sv     |  53 +-
+ corev_apu/fpga/src/ariane_xilinx.sv           |   3 +
+ corev_apu/fpga/src/dma_observer.sv            |   6 +-
+ corev_apu/fpga/src/dma_research_e2_timing.sv  | 313 +++++++
+ corev_apu/fpga/src/dma_research_observer.sv   |  92 +-
+ corev_apu/fpga/src/dma_research_policy.sv     | 862 ++++++++++++++++++
+ .../register_64bit/idma_reg64_frontend.sv     |  83 +-
+ .../src/systems/cva6_reg/dma_core_wrap.sv     |   8 +
+ 8 files changed, 1395 insertions(+), 25 deletions(-)
+ create mode 100644 corev_apu/fpga/src/dma_research_e2_timing.sv
+ create mode 100644 corev_apu/fpga/src/dma_research_policy.sv
+
+diff --git a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+index df2ffba401f0efcf2282cb8ecb0de158b6b192a4..1410abb435e89567c23ad61d2dd5be6b3a73ab2d 100644
+--- a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+@@ -30,6 +30,7 @@ module ariane_peripherals #(
+     parameter bit InclDMA      =  0,
+     parameter bit InclIOMMU    =  0,
+     parameter bit IOMMULegacyE3Observer = 1,
++    parameter int unsigned IOMMUResearchRole = 0,
+     parameter int unsigned IOMMUDSFixedDelayInput  = 0,
+     parameter int unsigned IOMMUDSFixedDelayOutput = 0
+ ) (
+@@ -922,6 +923,9 @@ module ariane_peripherals #(
+         logic [NumDMADevices-1:0] obs_rlast, obs_b, obs_bad_id;
+         logic [12:0] research_index;
+         logic [63:0] research_data, research_wdata;
++        logic [63:0] research_observer_data, research_policy_data;
++        logic policy_enable, policy_allow, policy_abort, research_reverse;
++        logic research_policy_access;
+         logic research_write, research_dma_quiet, research_arm, research_open, research_close;
+         logic [127:0] research_entries [16], research_entries_next [16];
+         for (genvar r = 0; r < 16; r++) begin : gen_research_entries
+@@ -977,10 +981,13 @@ module ariane_peripherals #(
+ 
+         assign obs_cfg_rdata = obs_cfg_addr[0][7] ? launch_cfg_rdata : legacy_cfg_rdata;
+         if (InclIOMMU) begin : gen_research
+-            dma_research_observer i_research (
+-                .clk_i, .rst_ni, .cfg_valid_i(research_write),
+-                .cfg_write_i(research_write), .index_i(research_index),
+-                .wdata_i(research_wdata), .rdata_o(research_data),
++            assign research_policy_access = research_index[12:8] == 5'h0E;
++            assign research_data = research_policy_access ? research_policy_data : research_observer_data;
++            dma_research_observer #(.ResearchRole(IOMMUResearchRole)) i_research (
++                .clk_i, .rst_ni, .cfg_valid_i(research_write && !research_policy_access),
++                .cfg_write_i(research_write && !research_policy_access), .index_i(research_index),
++                .wdata_i(research_wdata), .rdata_o(research_observer_data),
++                .reverse_order_o(research_reverse),
+                 .quiet_i(research_dma_quiet && e3_ctl.quiet && !e3_tl.ptw_active),
+                 .supported_i(research.supported),
+                 .entries_i(research_entries), .entries_next_i(research_entries_next),
+@@ -1001,8 +1008,41 @@ module ariane_peripherals #(
+                 .p4m_arm_i(research_arm), .p4m_open_i(research_open),
+                 .p4m_close_i(research_close)
+             );
++            if (IOMMUResearchRole == 2) begin : gen_policy
++                dma_research_policy i_policy (
++                    .clk_i, .rst_ni,
++                    .cfg_valid_i(research_write && research_policy_access),
++                    .cfg_write_i(research_write && research_policy_access),
++                    .index_i(research_index), .wdata_i(research_wdata),
++                    .rdata_o(research_policy_data),
++                    .quiet_i(research_dma_quiet && e3_ctl.quiet && !e3_tl.ptw_active),
++                    .supported_i(research.supported),
++                    .v_active_i(batch_active[0]), .v_done_i(obs_done[0]),
++                    .a_issue_i(obs_issue[1]), .a_done_i(obs_done[1]),
++                    .ctl_state_i(e3_ctl.state), .ctl_did_i(e3_ctl.current_did),
++                    .select_fire_i(e3_ctl.select_valid), .select_did_i(e3_ctl.select_did),
++                    .lookup_i(research.lookup), .lookup_hit_i(research.hit),
++                    .lookup_did_i(research.did), .ptw_r_fire_i(e3_tl.ptw_r_fire),
++                    .response_error_i((e3_ctl.response_fire && e3_ctl.response_error) ||
++                                      (research.update && !research.normal)),
++                    .policy_enable_o(policy_enable), .policy_allow_o(policy_allow),
++                    .policy_abort_o(policy_abort)
++                );
++            end else begin : gen_no_policy
++                assign research_policy_data = '0;
++                assign policy_enable = 1'b0;
++                assign policy_allow = 1'b0;
++                assign policy_abort = 1'b0;
++            end
+         end else begin : gen_no_research
+             assign research_data = '0;
++            assign research_policy_access = 1'b0;
++            assign research_observer_data = '0;
++            assign research_policy_data = '0;
++            assign research_reverse = 1'b0;
++            assign policy_enable = 1'b0;
++            assign policy_allow = 1'b0;
++            assign policy_abort = 1'b0;
+         end
+         if (InclIOMMU) begin : gen_launcher
+             dma_controlled_launcher #(.NumPorts(NumDMADevices)) i_launcher (
+@@ -1141,6 +1181,7 @@ module ariane_peripherals #(
+                 .BATCH_PORT (1'b1),
+                 .OBSERVER_PORT      ( i == 0                   ),
+                 .LAUNCH_PORT        ( InclIOMMU && i < 2       ),
++                .RESEARCH_PORT      ( InclIOMMU && IOMMUResearchRole != 0 && i == 1 ),
+ 
+                 .DEVICE_ID          ( 24'(10 + i)              ),
+                 .PROCESS_ID         ( 20'(20 + i)              ),
+@@ -1148,6 +1189,10 @@ module ariane_peripherals #(
+             ) i_dma (
+                 .obs_issue_o(obs_issue[i]), .obs_done_o(obs_done[i]), .obs_poll_o(obs_poll[i]),
+                 .batch_active_o(batch_active[i]),
++                .policy_enable_i(i == 1 && policy_enable),
++                .policy_allow_i(i == 1 && policy_allow),
++                .policy_abort_i(i == 1 && policy_abort),
++                .batch_reverse_i(i == 1 && research_reverse),
+                 .obs_issue_id_o(obs_issue_id[i]), .obs_done_id_o(obs_done_id[i]), .obs_poll_id_o(obs_poll_id[i]),
+                 .obs_cfg_valid_o(obs_cfg_valid[i]), .obs_cfg_write_o(obs_cfg_write[i]),
+                 .obs_cfg_addr_o(obs_cfg_addr[i]), .obs_cfg_wdata_o(obs_cfg_wdata[i]),
+diff --git a/corev_apu/fpga/src/ariane_xilinx.sv b/corev_apu/fpga/src/ariane_xilinx.sv
+index 748d677bb5a45545a23aa748afce1426510eec40..3b2b3385bf08e8abfb59740606774b92cec52cc3 100644
+--- a/corev_apu/fpga/src/ariane_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_xilinx.sv
+@@ -167,6 +167,8 @@ localparam int unsigned IOMMUDSFixedDelayOutput = 50;
+ // Legacy E3 tracing remains enabled unless a profile explicitly disables it.
+ // The research profile disables this module to recover FPGA capacity.
+ localparam int unsigned IOMMULegacyE3Observer = 1;
++// 0 legacy profiles; 1 E2 v2; 2 method v2. Set by the pinned platform builder.
++localparam int unsigned IOMMUResearchRole = 0;
+ 
+ `AXI_TYPEDEF_ALL(axi_slave,
+                  logic [    AxiAddrWidth-1:0],
+@@ -816,6 +818,7 @@ ariane_peripherals #(
+     .IOMMUDSFixedDelayInput  ( IOMMUDSFixedDelayInput  ),
+     .IOMMUDSFixedDelayOutput ( IOMMUDSFixedDelayOutput ),
+     .IOMMULegacyE3Observer   ( IOMMULegacyE3Observer   ),
++    .IOMMUResearchRole       ( IOMMUResearchRole       ),
+     `ifdef KINTEX7
+     .InclSPI      ( 1'b1         ),
+     .InclEthernet ( 1'b1         )
+diff --git a/corev_apu/fpga/src/dma_observer.sv b/corev_apu/fpga/src/dma_observer.sv
+index 09370d2b9e89c0454f78c2f39be4fd68df0b3190..25ff895d726c545c990b72f393fe60e70c2e4843 100644
+--- a/corev_apu/fpga/src/dma_observer.sv
++++ b/corev_apu/fpga/src/dma_observer.sv
+@@ -92,7 +92,9 @@ module dma_observer #(
+     assign research_wdata_o = cfg_wdata_i;
+     assign research_write_o = ResearchEnable && cfg_valid_i && cfg_write_i &&
+         cfg_wstrb_i == 8'hff && cfg_addr_i == 7'h78 && index_q >= 13'd512;
+-    assign research_arm_o = ResearchEnable && p4m_n && phase_n == ARMED && phase_q != ARMED;
++    // research_arm_o is decoded in the accepted ARM command branch below.
++    // Deriving it from phase_n unnecessarily sends poll/readback data through
++    // the research counter reset path, although polls cannot enter ARMED.
+     assign research_open_o = ResearchEnable && p4m_q && phase_q == ARMED && issue_i[victim_q];
+     assign research_close_o = ResearchEnable && p4m_closed_n && !p4m_closed_q;
+     always_comb begin
+@@ -189,6 +191,7 @@ module dma_observer #(
+ 
+     always_comb begin
+         phase_n = phase_q;
++        research_arm_o = 1'b0;
+         for (int i = 0; i < Count; i++) count_n[i] = count_q[i];
+         segment_n = segment_q;
+         error_n = error_q;
+@@ -485,6 +488,7 @@ module dma_observer #(
+                                  int'(cfg_wdata_i[9:8]) < NumPorts && int'(cfg_wdata_i[17:16]) < NumPorts &&
+                                  (!cfg_wdata_i[24] || cfg_wdata_i[9:8] != cfg_wdata_i[17:16])) begin
+                         phase_n = ARMED;
++                        research_arm_o = ResearchEnable && cfg_wdata_i[30];
+                         error_n = 0;
+                         victim_n = cfg_wdata_i[9:8];
+                         aggressor_n = cfg_wdata_i[17:16];
+diff --git a/corev_apu/fpga/src/dma_research_e2_timing.sv b/corev_apu/fpga/src/dma_research_e2_timing.sv
+new file mode 100644
+index 0000000000000000000000000000000000000000..566393c1064d679554ee9826d80e5ab5e7dee53a
+--- /dev/null
++++ b/corev_apu/fpga/src/dma_research_e2_timing.sv
+@@ -0,0 +1,313 @@
++// SPDX-License-Identifier: Solderpad-0.51
++//
++// E2 probe timing block for the 2026-10-03 two-BIT implementation contract.
++//
++// This module is passive: none of its outputs drive DMA, IOTLB, translation,
++// command queues, or interrupts.  It only records the V/DID10 interval after a
++// legally accepted PROBE command.  The observer instantiates it read-only.
++//
++// Register meaning in the observer local index window (D80..D8F):
++//   D80 magic 0x49444d4145325431 (IDMAE2T1)
++//   D81 version 1
++//   D82 error
++//   D83 flags[2:0] = issue_seen, select_seen, done_seen
++//   D84 V issue epoch after PROBE
++//   D85 first V select epoch
++//   D86 V done epoch
++//   D87 done - issue cycles
++//   D88 first_select - issue cycles
++//   D89 V REQ_TRANS/AWAIT_RESP occupancy cycles
++//   D8A V COMPLETE cycles
++//   D8B V select count
++//   D8C V hit count
++//   D8D V miss count
++//   D8E..D8F reserved (read zero)
++//
++// Timing contract implemented here:
++//   * phase_i gates the block.  Only the observer E2_PROBE phase (3) measures:
++//     issue/done/select/lookup events, repeat detection and every error bit that
++//     belongs to the armed/active/done interval.  IDLE/ARM_WARM/ARM_A/READY
++//     traffic is ignored completely (no counts, no flags, no error).
++//   * In FREEZE (4) and ABORT (5) every field, error_o included, is held bit
++//     for bit until the legal CLEAR.  Later ordinary V issue/done/select/lookup
++//     or fault activity cannot pollute a frozen result.
++//   * The occupancy interval is (issue, done]: the issue edge itself is not an
++//     occupancy cycle, the done edge is.  D87/D88 are epoch differences and
++//     therefore also follow (issue, done].  Select/lookup events on the issue
++//     edge are still recorded and counted.
++//   * A backwards or wrapping epoch never silently wraps the unsigned
++//     difference: error bit 6 is set and the affected cycle field is stored as
++//     zero when done < issue or first_select < issue.
++//
++// Error bits:
++//   [0] counter overflow
++//   [1] duplicate V issue
++//   [2] V done without issue
++//   [3] duplicate V done
++//   [4] response_error during active interval
++//   [5] unsupported during armed/active interval
++//   [6] epoch went backwards (done < issue or first_select < issue)
++//   [7] duplicate/illegal probe_accept (old data preserved; not flagged while
++//       FREEZE/ABORT holds the block)
++//
++// Clearing is accepted only from the already-legal observer CLEAR path.  clear_i
++// has priority over every other input and releases a frozen result.
++module dma_research_e2_timing #(
++    parameter int unsigned CounterWidth = 64
++) (
++    input  logic          clk_i,
++    input  logic          rst_ni,
++
++    input  logic          clear_i,
++    input  logic          probe_accept_i,
++    input  logic [2:0]    phase_i,
++    input  logic [63:0]   epoch_i,
++
++    input  logic          issue_v_i,
++    input  logic          done_v_i,
++    input  logic          select_v_i,
++    input  logic          ctl_v_i,
++    input  logic [2:0]    ctl_state_i,
++    input  logic          lookup_v_i,
++    input  logic          lookup_hit_i,
++    input  logic          response_error_i,
++    input  logic          unsupported_i,
++
++    output logic [15:0]   error_o,
++    output logic [63:0]   flags_o,
++    output logic [63:0]   issue_epoch_o,
++    output logic [63:0]   first_select_epoch_o,
++    output logic [63:0]   done_epoch_o,
++    output logic [63:0]   done_issue_cycles_o,
++    output logic [63:0]   first_select_issue_cycles_o,
++    output logic [63:0]   v_main_cycles_o,
++    output logic [63:0]   v_comp_cycles_o,
++    output logic [63:0]   v_select_count_o,
++    output logic [63:0]   v_hit_count_o,
++    output logic [63:0]   v_miss_count_o
++);
++
++    localparam logic [2:0] ST_REQ_TRANS  = 3'd1;
++    localparam logic [2:0] ST_AWAIT_RESP = 3'd2;
++    localparam logic [2:0] ST_COMPLETE   = 3'd4;
++
++    localparam logic [2:0] T_IDLE   = 3'd0;
++    localparam logic [2:0] T_ARMED  = 3'd1;
++    localparam logic [2:0] T_ACTIVE = 3'd2;
++    localparam logic [2:0] T_DONE   = 3'd3;
++
++    // observer E2 phases (phase_i); only E2_PROBE measures
++    localparam logic [2:0] E2_PROBE  = 3'd3;
++    localparam logic [2:0] E2_FREEZE = 3'd4;
++    localparam logic [2:0] E2_ABORT  = 3'd5;
++
++    logic [2:0]  state_q, state_n;
++    logic [15:0] err_q, err_n;
++    logic [63:0] flags_q, flags_n;
++
++    logic [63:0] issue_epoch_q, issue_epoch_n;
++    logic [63:0] first_select_epoch_q, first_select_epoch_n;
++    logic [63:0] done_epoch_q, done_epoch_n;
++    logic [63:0] done_issue_q, done_issue_n;
++    logic [63:0] first_select_issue_q, first_select_issue_n;
++
++    logic [CounterWidth-1:0] v_main_q, v_main_n;
++    logic [CounterWidth-1:0] v_comp_q, v_comp_n;
++    logic [CounterWidth-1:0] v_sel_q,  v_sel_n;
++    logic [CounterWidth-1:0] v_hit_q,  v_hit_n;
++    logic [CounterWidth-1:0] v_miss_q, v_miss_n;
++
++    // phase_i gating: only E2_PROBE measures, FREEZE/ABORT hold everything.
++    logic phase_window;      // phase_i == E2_PROBE
++    logic phase_frozen;      // phase_i == E2_FREEZE || phase_i == E2_ABORT
++
++    // Interval (issue, done]: the issue edge is inside the measurement window
++    // for select/lookup, but it is not an occupancy cycle.
++    logic issue_edge;
++    logic interval_open;     // issue edge or already past it
++    logic main_comp_active;  // strictly after the issue edge
++    logic [63:0] issue_epoch_now;
++
++    assign phase_window = (phase_i == E2_PROBE);
++    assign phase_frozen = (phase_i == E2_FREEZE) || (phase_i == E2_ABORT);
++
++    assign issue_edge       = (state_q == T_ARMED) && issue_v_i;
++    assign interval_open    = issue_edge || (state_q == T_ACTIVE);
++    assign main_comp_active = (state_q == T_ACTIVE);
++
++    assign issue_epoch_now = issue_edge ? epoch_i : issue_epoch_q;
++
++    always_comb begin
++        state_n = state_q;
++        err_n   = err_q;
++        flags_n = flags_q;
++
++        issue_epoch_n = issue_epoch_q;
++        first_select_epoch_n = first_select_epoch_q;
++        done_epoch_n = done_epoch_q;
++        done_issue_n = done_issue_q;
++        first_select_issue_n = first_select_issue_q;
++
++        v_main_n = v_main_q;
++        v_comp_n = v_comp_q;
++        v_sel_n  = v_sel_q;
++        v_hit_n  = v_hit_q;
++        v_miss_n = v_miss_q;
++
++        if (clear_i) begin
++            state_n = T_IDLE;
++            err_n   = 16'd0;
++            flags_n = 64'd0;
++            issue_epoch_n = 64'd0;
++            first_select_epoch_n = 64'd0;
++            done_epoch_n = 64'd0;
++            done_issue_n = 64'd0;
++            first_select_issue_n = 64'd0;
++            v_main_n = '0;
++            v_comp_n = '0;
++            v_sel_n  = '0;
++            v_hit_n  = '0;
++            v_miss_n = '0;
++        end else if (phase_frozen) begin
++            // FREEZE (4) / ABORT (5): hold every recorded field bit for bit,
++            // error_o included, until the legal CLEAR arrives.  Ordinary V
++            // issue/done/select/lookup or fault activity belongs to a later,
++            // unrelated interval and must not pollute a frozen result.
++        end else begin
++            // A duplicate / illegal PROBE acceptance is flagged but never
++            // overwrites data already recorded for the session.
++            if (probe_accept_i) begin
++                if (state_q == T_IDLE) state_n = T_ARMED;
++                else                   err_n[7] = 1'b1;
++            end
++
++            // Only the observer E2_PROBE phase measures.  ARM_WARM/ARM_A/
++            // READY/IDLE traffic is ignored (no counts, no flags, no error).
++            if (phase_window) begin
++                if (unsupported_i && ((state_q == T_ARMED) || (state_q == T_ACTIVE)))
++                    err_n[5] = 1'b1;
++                if (response_error_i && interval_open)
++                    err_n[4] = 1'b1;
++
++                if (issue_v_i) begin
++                    if (state_q == T_ARMED) begin
++                        state_n = T_ACTIVE;
++                        issue_epoch_n = epoch_i;
++                        flags_n[0] = 1'b1;
++                    end else if ((state_q == T_ACTIVE) || (state_q == T_DONE)) begin
++                        err_n[1] = 1'b1;
++                    end
++                end
++
++                if (done_v_i) begin
++                    if (interval_open) begin
++                        state_n = T_DONE;
++                        done_epoch_n = epoch_i;
++                        flags_n[2] = 1'b1;
++                        if (epoch_i < issue_epoch_now) begin
++                            // Epoch moved backwards: never store a wrapped
++                            // unsigned difference.
++                            err_n[6] = 1'b1;
++                            done_issue_n = 64'd0;
++                        end else begin
++                            done_issue_n = epoch_i - issue_epoch_now;
++                        end
++                    end else if (state_q == T_DONE) begin
++                        err_n[3] = 1'b1;
++                    end else if (state_q == T_ARMED) begin
++                        err_n[2] = 1'b1;
++                        state_n = T_DONE;
++                        done_epoch_n = epoch_i;
++                        flags_n[2] = 1'b1;
++                    end
++                end
++
++                // Occupancy covers (issue, done] only: the issue edge itself is
++                // not an occupancy cycle, the done edge is.
++                if (main_comp_active) begin
++                    if (ctl_v_i && ((ctl_state_i == ST_REQ_TRANS) || (ctl_state_i == ST_AWAIT_RESP))) begin
++                        if (&v_main_q) err_n[0] = 1'b1;
++                        v_main_n = v_main_q + 1'b1;
++                    end
++                    if (ctl_v_i && (ctl_state_i == ST_COMPLETE)) begin
++                        if (&v_comp_q) err_n[0] = 1'b1;
++                        v_comp_n = v_comp_q + 1'b1;
++                    end
++                end
++
++                // Select/lookup events on the issue edge are still recorded.
++                if (interval_open) begin
++                    if (select_v_i) begin
++                        if (&v_sel_q) err_n[0] = 1'b1;
++                        v_sel_n = v_sel_q + 1'b1;
++                        if (!flags_q[1]) begin
++                            first_select_epoch_n = epoch_i;
++                            flags_n[1] = 1'b1;
++                            if (epoch_i < issue_epoch_now) begin
++                                err_n[6] = 1'b1;
++                                first_select_issue_n = 64'd0;
++                            end else begin
++                                first_select_issue_n = epoch_i - issue_epoch_now;
++                            end
++                        end
++                    end
++                    if (lookup_v_i) begin
++                        if (lookup_hit_i) begin
++                            if (&v_hit_q) err_n[0] = 1'b1;
++                            v_hit_n = v_hit_q + 1'b1;
++                        end else begin
++                            if (&v_miss_q) err_n[0] = 1'b1;
++                            v_miss_n = v_miss_q + 1'b1;
++                        end
++                    end
++                end
++            end  // phase_window: only E2_PROBE measures
++        end
++    end
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            state_q <= T_IDLE;
++            err_q   <= 16'd0;
++            flags_q <= 64'd0;
++            issue_epoch_q <= 64'd0;
++            first_select_epoch_q <= 64'd0;
++            done_epoch_q <= 64'd0;
++            done_issue_q <= 64'd0;
++            first_select_issue_q <= 64'd0;
++            v_main_q <= '0;
++            v_comp_q <= '0;
++            v_sel_q  <= '0;
++            v_hit_q  <= '0;
++            v_miss_q <= '0;
++        end else begin
++            state_q <= state_n;
++            err_q   <= err_n;
++            flags_q <= flags_n;
++            issue_epoch_q <= issue_epoch_n;
++            first_select_epoch_q <= first_select_epoch_n;
++            done_epoch_q <= done_epoch_n;
++            done_issue_q <= done_issue_n;
++            first_select_issue_q <= first_select_issue_n;
++            v_main_q <= v_main_n;
++            v_comp_q <= v_comp_n;
++            v_sel_q  <= v_sel_n;
++            v_hit_q  <= v_hit_n;
++            v_miss_q <= v_miss_n;
++        end
++    end
++
++    assign error_o = err_q;
++    assign flags_o = flags_q;
++    assign issue_epoch_o = issue_epoch_q;
++    assign first_select_epoch_o = first_select_epoch_q;
++    assign done_epoch_o = done_epoch_q;
++    assign done_issue_cycles_o = done_issue_q;
++    assign first_select_issue_cycles_o = first_select_issue_q;
++    assign v_main_cycles_o = 64'(v_main_q);
++    assign v_comp_cycles_o = 64'(v_comp_q);
++    assign v_select_count_o = 64'(v_sel_q);
++    assign v_hit_count_o = 64'(v_hit_q);
++    assign v_miss_count_o = 64'(v_miss_q);
++
++endmodule
+diff --git a/corev_apu/fpga/src/dma_research_observer.sv b/corev_apu/fpga/src/dma_research_observer.sv
+index e719aa06ff7bcc7136e1f7851013fc5224555d79..44e42014f2492f6422b3724c83f03b15f7f2e6a8 100644
+--- a/corev_apu/fpga/src/dma_research_observer.sv
++++ b/corev_apu/fpga/src/dma_research_observer.sv
+@@ -19,6 +19,7 @@
+ // pscid at [48:29], en1 at 49, en2 at 50, valid at 51, S1 is1G/is2M at 52/53,
+ // S2 is1G/is2M at 54/55, S1 global at 56, bits [63:57] and [127:80] zero.
+ module dma_research_observer #(
++    parameter int unsigned ResearchRole = 0,
+     parameter int unsigned CounterWidth = 64,
+     parameter int unsigned NumEntries   = 16,
+     parameter int unsigned EventDepth   = 256,
+@@ -67,7 +68,8 @@ module dma_research_observer #(
+ 
+     input  logic          p4m_arm_i,
+     input  logic          p4m_open_i,
+-    input  logic          p4m_close_i
++    input  logic          p4m_close_i,
++    output logic          reverse_order_o
+ );
+ 
+     // ------------------------------------------------------------------ consts
+@@ -142,6 +144,7 @@ module dma_research_observer #(
+ 
+     // E2
+     logic [2:0]  e2_phase_q;
++    logic reverse_order_q;
+     logic [63:0] epoch_q, a_elapsed_q, astart_q, deadline_q, probestart_q, freeze_ts_q;
+     logic [15:0] event_count_q;
+     logic [31:0] inval_count_q, update_count_q, quiet_timeout_q;
+@@ -271,6 +274,20 @@ module dma_research_observer #(
+     // ------------------------------------------------------ derived comb wires
+     logic [2:0] ph;
+     assign ph = e2_phase_q;
++    // The frontend latches order at batch creation. Frozen/legacy sessions
++    // must not leak a previous E2 reverse setting into an unrelated batch.
++    assign reverse_order_o = (ResearchRole != 0) && reverse_order_q &&
++        (((mode_q == MODE_E2) && (ph == E2_ARM_A)) ||
++         ((mode_q == MODE_COST) && cost_active_q));
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) reverse_order_q <= 1'b0;
++        else if (acc_clear) reverse_order_q <= 1'b0;
++        else if (cfg_valid_i && cfg_write_i && index_i == 13'h0F10 &&
++                 ResearchRole != 0 && quiet_i && ph == E2_IDLE &&
++                 !cost_active_q && wdata_i[63:1] == 0)
++            reverse_order_q <= wdata_i[0];
++    end
+ 
+     logic e2_active_phase;
+     assign e2_active_phase = (ph == E2_ARM_WARM) || (ph == E2_ARM_A) ||
+@@ -374,6 +391,44 @@ module dma_research_observer #(
+         .total_o    (agg_total_o),
+         .err_o      (agg_err_o)
+     );
++    // ------------------------------------------------- E2 probe timing block
++    // Passive only: all outputs feed the read mux.  Legal PROBE/CLEAR pulses
++    // come from the observer acceptance decode above; V lane is DID10.
++    logic [15:0] e2t_error;
++    logic [63:0] e2t_flags, e2t_issue_epoch, e2t_first_select_epoch, e2t_done_epoch;
++    logic [63:0] e2t_done_issue_cycles, e2t_first_select_issue_cycles;
++    logic [63:0] e2t_v_main, e2t_v_comp, e2t_v_select, e2t_v_hit, e2t_v_miss;
++
++    dma_research_e2_timing u_dma_research_e2_timing (
++        .clk_i                     (clk_i),
++        .rst_ni                    (rst_ni),
++        .clear_i                   (acc_clear),
++        .probe_accept_i            (acc_probe),
++        .phase_i                   (ph),
++        .epoch_i                   (epoch_q),
++        .issue_v_i                 (issue_i[0]),
++        .done_v_i                  (done_i[0]),
++        .select_v_i                (select_fire_i && (select_did_i == DID_V)),
++        .ctl_v_i                   (ctl_did_i == DID_V),
++        .ctl_state_i               (ctl_state_i),
++        .lookup_v_i                (lookup_i && (lookup_did_i == DID_V)),
++        .lookup_hit_i              (lookup_hit_i),
++        .response_error_i          (response_error_i),
++        .unsupported_i             (!supported_i),
++        .error_o                   (e2t_error),
++        .flags_o                   (e2t_flags),
++        .issue_epoch_o             (e2t_issue_epoch),
++        .first_select_epoch_o      (e2t_first_select_epoch),
++        .done_epoch_o              (e2t_done_epoch),
++        .done_issue_cycles_o       (e2t_done_issue_cycles),
++        .first_select_issue_cycles_o(e2t_first_select_issue_cycles),
++        .v_main_cycles_o           (e2t_v_main),
++        .v_comp_cycles_o           (e2t_v_comp),
++        .v_select_count_o          (e2t_v_select),
++        .v_hit_count_o             (e2t_v_hit),
++        .v_miss_count_o            (e2t_v_miss)
++    );
++
+     assign main_cyc = (ctl_state_i == ST_REQ_TRANS) || (ctl_state_i == ST_AWAIT_RESP);
+     assign comp_cyc = (ctl_state_i == ST_COMPLETE);
+ 
+@@ -764,6 +819,11 @@ module dma_research_observer #(
+                         dst_set_n  = 1'b1;
+                     end
+                 end
++                13'h0F10: begin
++                    if (ResearchRole == 0 || !quiet_i || ph != E2_IDLE ||
++                        cost_active_q || wdata_i[63:1] != 0)
++                        e2_err_n[0] = 1'b1;
++                end
+                 default: e2_err_n[0] = 1'b1;
+             endcase
+         end
+@@ -1507,6 +1567,36 @@ module dma_research_observer #(
+             end else begin
+                 rdata_o = 64'd0;
+             end
++        end else if (index_i >= 13'h0F00 && index_i <= 13'h0F10) begin
++            if (ResearchRole != 0) begin
++                case (index_i)
++                    13'h0F00: rdata_o = 64'h49444d4132434150;
++                    13'h0F01: rdata_o = 64'd1;
++                    13'h0F02: rdata_o = 64'(ResearchRole);
++                    13'h0F03: rdata_o = ResearchRole == 2 ? 64'd15 : 64'd7;
++                    13'h0F10: rdata_o = {63'd0, reverse_order_q};
++                    default: rdata_o = 64'd0;
++                endcase
++            end
++        end else if (index_i >= 13'h0D80 && index_i < 13'h0D90) begin
++            unique case (index_i)
++                13'h0D80: rdata_o = 64'h49444d4145325431;
++                13'h0D81: rdata_o = 64'd1;
++                13'h0D82: rdata_o = {48'd0, e2t_error};
++                13'h0D83: rdata_o = e2t_flags;
++                13'h0D84: rdata_o = e2t_issue_epoch;
++                13'h0D85: rdata_o = e2t_first_select_epoch;
++                13'h0D86: rdata_o = e2t_done_epoch;
++                13'h0D87: rdata_o = e2t_done_issue_cycles;
++                13'h0D88: rdata_o = e2t_first_select_issue_cycles;
++                13'h0D89: rdata_o = e2t_v_main;
++                13'h0D8A: rdata_o = e2t_v_comp;
++                13'h0D8B: rdata_o = e2t_v_select;
++                13'h0D8C: rdata_o = e2t_v_hit;
++                13'h0D8D: rdata_o = e2t_v_miss;
++                13'h0D8E, 13'h0D8F: rdata_o = 64'd0;
++                default: rdata_o = 64'd0;
++            endcase
+         end
+     end
+ 
+diff --git a/corev_apu/fpga/src/dma_research_policy.sv b/corev_apu/fpga/src/dma_research_policy.sv
+new file mode 100644
+index 0000000000000000000000000000000000000000..96b25456c92a6bacab6826e716d208b34f1436ef
+--- /dev/null
++++ b/corev_apu/fpga/src/dma_research_policy.sv
+@@ -0,0 +1,862 @@
++`default_nettype none
++//=============================================================================
++// dma_research_policy.sv
++//
++// Standalone research Method control policy block (bank E00..E5F).
++// NEW FILE - no existing RTL is modified.
++//
++// Implements docs/research-two-bit-v2.md Method control (independent module,
++// bank E00 onwards).
++//
++// Address decode
++// --------------
++//   index_i is the FULL peripheral index of the E bank, i.e. 0xE00..0xE5F.
++//   index_i[12:8] must equal 5'h0E (bank E); index_i[7:0] is the in-bank
++//   offset 0x00..0x5F.  Read and write use exactly the same decode; no offset
++//   is added or subtracted anywhere.
++//
++// Register map (in-bank offset)
++// ---------------------------------------------------------------------------
++//  E00 r  magic     0x49444d414d435431  (IDMAMCT1)
++//  E01 r  version   1
++//  E02 r  error     sticky, see E_* bits
++//  E03 r  status    bit0 armed / bit1 frozen / bit2 abort
++//  E04 w  command   1 ARM / 2 ABORT / 3 FREEZE / 4 CLEAR   (reads 0)
++//      FREEZE keeps the abort flag and the sticky error diagnostics: a normal
++//      FREEZE reads E03=2, a FREEZE of an aborted run reads E03=6.  Only a
++//      legal CLEAR (or reset) drops the diagnostics.
++//  E05 rw mode                    default 0
++//  E06 rw window_cycles           default 16384    (legal 1..WINDOW_MAX)
++//  E07 rw target_bytes            default 51540
++//  E08 rw deadband_bytes          default 4096
++//  E09 rw initial_budget          default 8000
++//  E0A rw min_budget              default 1
++//  E0B rw max_budget              default 32768
++//  E0C rw budget_step             default 512
++//  E0D rw credit_cap              default 65536
++//  E0E rw hit_weight              default 1
++//  E0F rw miss_weight             default 100
++//  E10 rw ptw_weight              default 100
++//  --- statistics (read only, CounterWidth wide) -----------------------------
++//  E20 complete (fully V-active) billing windows
++//  E21 V done events
++//  E22 V done bytes (4096 per done)
++//  E23 windows whose observed bytes < target
++//  E24 total shortfall bytes (target - observed)
++//  E25 permission_closed_cycles : cycles with policy_enable_o=1 and the
++//      admission permission closed by the registered error/abort state or by
++//      the balance/feedback deny.  There is no a_wait input, so this is NOT
++//      claimed to be actual ADMIT-blocked cycles.
++//  E26 total charge
++//  E27 total replenish
++//  E28 A issue events
++//  E29 A done events
++//  E2A cycles with non-zero charge
++//  E2B A-owned lookup hit events
++//  E2C A-owned lookup miss events
++//  E2D A-owned PTW return events (ctl_did==DID_A and ptw_r_fire)
++//  E2E cycles with ctl_did==DID_A (A-owner cycles)
++//  E2F A select fires
++//  E30 A-owned lookup events (hit+miss)
++//  E31 A-owned lookup miss events
++//  E32 A REQ_TRANS/AWAIT_RESP cycles
++//  E33 window boundaries closed
++//  E34 window boundaries that were NOT fully V-active
++//  E35 feedback steps that increased b
++//  E36 feedback steps that decreased b
++//  E37 mode6 gap loads
++//  E38 mode7 stale charges applied
++//  E39 cycles with armed=1 and frozen=0
++//  E3A final signed balance C (two's complement, 64 bit)
++//  E3B minimum b seen
++//  E3C maximum b seen
++//  E3D final b
++//  E3E longest V-active run with no V done (cycles, 64 bit)
++//  E3F reserved, reads 0
++//  E40..E5F V-done-per-complete-active-window histogram, 32 buckets:
++//          bucket k (k=0..30) = windows with k V done, bucket 31 = >=31
++// ---------------------------------------------------------------------------
++//  Cost per mode:
++//    0 unlimited/no charge | 1 A issue = 4096 B | 2 A select = 1
++//    3 A lookup miss = 1   | 4 weighted (hit/miss/ptw) | 5 A REQ_TRANS/
++//    AWAIT_RESP cycle = 1  | 6 V-only feedback gap (no per-cycle charge)
++//    7 stale actual (previous complete fixed window A REQ_TRANS/AWAIT_RESP
++//      cycles charged at the next window end)
++//=============================================================================
++
++module dma_research_policy #(
++    parameter bit          Enabled      = 1'b1,
++    parameter int unsigned CounterWidth = 64,
++    parameter logic [23:0] DID_A        = 24'd11,   // A translation id (0x0B)
++    parameter logic [2:0]  ST_REQ_TRANS = 3'd1,
++    parameter logic [2:0]  ST_AWAIT_RESP= 3'd2,
++    parameter logic [2:0]  ST_COMPLETE  = 3'd4,     // never charged as actual
++    parameter logic [31:0] WINDOW_MAX   = 32'd16_777_215
++)(
++    input  wire logic        clk_i,
++    input  wire logic        rst_ni,
++
++    input  wire logic        cfg_valid_i,
++    input  wire logic        cfg_write_i,
++    input  wire logic [12:0] index_i,
++    input  wire logic [63:0] wdata_i,
++    output logic [63:0] rdata_o,
++
++    input  wire logic        quiet_i,
++    input  wire logic        supported_i,
++
++    input  wire logic        v_active_i,
++    input  wire logic        a_issue_i,
++    input  wire logic        a_done_i,
++    input  wire logic        v_done_i,
++    input  wire logic [2:0]  ctl_state_i,
++    input  wire logic [23:0] ctl_did_i,
++    input  wire logic        select_fire_i,
++    input  wire logic [23:0] select_did_i,
++    input  wire logic        lookup_i,
++    input  wire logic        lookup_hit_i,
++    input  wire logic [23:0] lookup_did_i,
++    input  wire logic        ptw_r_fire_i,
++    input  wire logic        response_error_i,
++
++    output logic        policy_enable_o,
++    output logic        policy_allow_o,
++    output logic        policy_abort_o
++);
++
++    //=========================================================================
++    // 1. Constants
++    //=========================================================================
++    localparam logic [63:0] MAGIC      = 64'h49444d414d435431; // IDMAMCT1
++    localparam logic [63:0] VERSION    = 64'd1;
++    localparam logic [63:0] BYTES_DONE = 64'd4096;
++
++    localparam logic [4:0]  BANK_E     = 5'h0E;   // index_i[12:8] for E00..E5F
++
++    // full counter mask; an increment larger than the counter range is still
++    // detected (see cnt_ovf).
++    localparam logic [63:0] CNT_MASK =
++        (CounterWidth >= 64) ? 64'hFFFF_FFFF_FFFF_FFFF
++                             : ((64'h1 << CounterWidth[5:0]) - 64'h1);
++
++    // in-bank offsets (0x00..0x5F)
++    localparam logic [7:0] R_MAGIC    = 8'h00;
++    localparam logic [7:0] R_VERSION  = 8'h01;
++    localparam logic [7:0] R_ERROR    = 8'h02;
++    localparam logic [7:0] R_STATUS   = 8'h03;
++    localparam logic [7:0] R_COMMAND  = 8'h04;
++    localparam logic [7:0] R_MODE     = 8'h05;
++    localparam logic [7:0] R_WINDOW   = 8'h06;
++    localparam logic [7:0] R_TARGET   = 8'h07;
++    localparam logic [7:0] R_DEADBAND = 8'h08;
++    localparam logic [7:0] R_INITBUD  = 8'h09;
++    localparam logic [7:0] R_MINBUD   = 8'h0A;
++    localparam logic [7:0] R_MAXBUD   = 8'h0B;
++    localparam logic [7:0] R_STEP     = 8'h0C;
++    localparam logic [7:0] R_CAP      = 8'h0D;
++    localparam logic [7:0] R_WHIT     = 8'h0E;
++    localparam logic [7:0] R_WMISS    = 8'h0F;
++    localparam logic [7:0] R_WPTW     = 8'h10;
++    localparam logic [7:0] R_LASTWR   = 8'h10;
++
++    localparam logic [7:0] S_BALANCE   = 8'h3A;
++    localparam logic [7:0] S_BMIN      = 8'h3B;
++    localparam logic [7:0] S_BMAX      = 8'h3C;
++    localparam logic [7:0] S_BFINAL    = 8'h3D;
++    localparam logic [7:0] S_NODONE    = 8'h3E;
++    localparam logic [7:0] S_HIST_BASE = 8'h40;
++    localparam logic [7:0] S_HIST_LAST = 8'h5F;
++
++    // sticky error bits (E02)
++    localparam int E_BADADDR  = 0;  // bad index / wrong bank / high bits set
++    localparam int E_BADCMD   = 1;  // unknown command code
++    localparam int E_UNSUP    = 2;  // ARM/ABORT while !supported_i or Enabled=0
++    localparam int E_CFGLOCK  = 3;  // config write while armed
++    localparam int E_CNTOVF   = 4;  // statistics counter overflow
++    localparam int E_BALOVF   = 5;  // signed balance overflow during charge/refill
++    localparam int E_CLEARILL = 6;  // illegal CLEAR (armed or not quiet)
++    localparam int E_FRZILL   = 7;  // FREEZE while not quiet
++    localparam int E_ARMSTATE = 8;  // ARM/ABORT/FREEZE in a wrong state
++    localparam int E_OBS      = 9;  // observation error while armed
++    localparam int E_BADCFG   = 10; // config does not satisfy ARM predicates
++    localparam int E_SUPDROP  = 11; // supported_i deasserted while armed
++
++    // statistics counter indices -> E20..E39
++    localparam int ST_WIN       = 0;  // E20
++    localparam int ST_VDONE     = 1;  // E21
++    localparam int ST_VBYTES    = 2;  // E22
++    localparam int ST_SHORTW    = 3;  // E23
++    localparam int ST_SHORTB    = 4;  // E24
++    localparam int ST_PERMCLOSE = 5;  // E25 permission_closed_cycles
++    localparam int ST_CHARGE    = 6;  // E26
++    localparam int ST_REPLEN    = 7;  // E27
++    localparam int ST_AISSUE    = 8;  // E28
++    localparam int ST_ADONE     = 9;  // E29
++    localparam int ST_CHARGECYC = 10; // E2A
++    localparam int ST_HIT       = 11; // E2B
++    localparam int ST_MISS      = 12; // E2C
++    localparam int ST_PTW       = 13; // E2D
++    localparam int ST_AOWN      = 14; // E2E
++    localparam int ST_SEL       = 15; // E2F
++    localparam int ST_LUTA      = 16; // E30
++    localparam int ST_LUTAMISS  = 17; // E31
++    localparam int ST_ACTUALCYC = 18; // E32
++    localparam int ST_WINALL    = 19; // E33
++    localparam int ST_WINPART   = 20; // E34
++    localparam int ST_FBUP      = 21; // E35
++    localparam int ST_FBDN      = 22; // E36
++    localparam int ST_GAPL      = 23; // E37
++    localparam int ST_STALE     = 24; // E38
++    localparam int ST_ARMEDCYC  = 25; // E39
++    localparam int NSTAT        = 26;
++    localparam int NHIST        = 32;
++
++    // reset-time defaults
++    localparam logic [31:0] DEF_MODE     = 32'd0;
++    localparam logic [31:0] DEF_WINDOW   = 32'd16384;
++    localparam logic [31:0] DEF_TARGET   = 32'd51540;
++    localparam logic [31:0] DEF_DEADBAND = 32'd4096;
++    localparam logic [31:0] DEF_INITBUD  = 32'd8000;
++    localparam logic [31:0] DEF_MINBUD   = 32'd1;
++    localparam logic [31:0] DEF_MAXBUD   = 32'd32768;
++    localparam logic [31:0] DEF_STEP     = 32'd512;
++    localparam logic [31:0] DEF_CAP      = 32'd65536;
++    localparam logic [31:0] DEF_WHIT     = 32'd1;
++    localparam logic [31:0] DEF_WMISS    = 32'd100;
++    localparam logic [31:0] DEF_WPTW     = 32'd100;
++
++    //=========================================================================
++    // 2. State
++    //=========================================================================
++    logic        armed_q, frozen_q, aborted_q;
++    logic [63:0] err_q;
++
++    logic [31:0] mode_q, window_q, target_q, deadband_q, initbud_q,
++                 minbud_q, maxbud_q, step_q, cap_q,
++                 whit_q, wmiss_q, wptw_q;
++
++    logic signed [63:0] balance_q;
++    logic [63:0]        b_q, bmin_q, bmax_q;
++    logic [63:0]        prev_main_q, win_main_q;
++    logic [63:0]        win_cnt_q, win_vdone_q;
++    logic               win_allact_q;
++    logic [63:0]        nodone_run_q, nodone_max_q;
++    logic [63:0]        m6_cd_q;
++
++    logic [CounterWidth-1:0] stat_q [0:NSTAT-1];
++    logic [CounterWidth-1:0] hist_q [0:NHIST-1];
++
++    logic [63:0] stat_inc [0:NSTAT-1];
++    logic [64:0] stat_sum [0:NSTAT-1];
++    logic [63:0] hist_inc [0:NHIST-1];
++    logic [64:0] hist_sum [0:NHIST-1];
++
++    //=========================================================================
++    // 3. Helper functions
++    //=========================================================================
++    // zero-extend a CounterWidth value to 64 bit
++    function automatic logic [63:0] zext64(input logic [CounterWidth-1:0] v);
++        logic [63:0] r;
++        begin
++            r = 64'd0;
++            for (int i = 0; i < CounterWidth; i++) r[i] = v[i];
++            zext64 = r;
++        end
++    endfunction
++
++    // exact (CounterWidth + 1)-bit sum; the full value is kept so that an
++    // increment larger than CNT_MASK is still detected below.
++    function automatic logic [64:0] cadd(input logic [CounterWidth-1:0] c,
++                                         input logic [63:0]          inc);
++        logic [64:0] w;
++        begin
++            w    = {1'b0, zext64(c)} + {1'b0, inc};
++            cadd = w;
++        end
++    endfunction
++
++    //=========================================================================
++    // 4. Event qualifiers (peripheral clk domain)
++    //=========================================================================
++    logic ev_sel_a, ev_lut_a, ev_lut_hit_a, ev_lut_miss_a, ev_ptw_a,
++          ev_actual_a, ev_aown;
++
++    assign ev_sel_a      = select_fire_i && (select_did_i == DID_A);
++    assign ev_lut_a      = lookup_i      && (lookup_did_i == DID_A);
++    assign ev_lut_hit_a  = ev_lut_a &&  lookup_hit_i;
++    assign ev_lut_miss_a = ev_lut_a && !lookup_hit_i;
++    assign ev_ptw_a      = ptw_r_fire_i  && (ctl_did_i == DID_A);
++    // actual cost: only REQ_TRANS / AWAIT_RESP.  COMPLETE is NOT charged.
++    assign ev_actual_a   = (ctl_did_i == DID_A) &&
++                           ((ctl_state_i == ST_REQ_TRANS) ||
++                            (ctl_state_i == ST_AWAIT_RESP)) &&
++                           (ctl_state_i != ST_COMPLETE);
++    assign ev_aown       = (ctl_did_i == DID_A);
++
++    //=========================================================================
++    // 5. Window control
++    //=========================================================================
++    logic        win_run, win_last, act_all_now, win_complete;
++    logic [63:0] vdone_now, vdone_bytes_now, wnd_m1;
++
++    assign wnd_m1       = {32'd0, window_q} - 64'd1;
++    assign win_run      = armed_q & ~frozen_q;
++    assign win_last     = win_run & (window_q != 32'd0) & (win_cnt_q == wnd_m1);
++    assign act_all_now  = win_allact_q & v_active_i;   // first and last cycle
++    assign vdone_now    = win_vdone_q + (v_done_i ? 64'd1 : 64'd0);
++    assign win_complete = win_last & act_all_now;
++
++    // win_vdone_q <= window_q <= WINDOW_MAX < 2^64, so 64-bit is sufficient.
++    assign vdone_bytes_now = vdone_now * BYTES_DONE;
++
++    //=========================================================================
++    // 6. Cost / charge / balance
++    //=========================================================================
++    logic [63:0] cost_ev, charge_now, refill_now, main_inc, shortfall_bytes;
++    logic        stale_cyc, refill_en;
++
++    always_comb begin
++        cost_ev = 64'd0;
++        case (mode_q)
++            32'd0: cost_ev = 64'd0;
++            32'd1: cost_ev = a_issue_i ? BYTES_DONE : 64'd0;
++            32'd2: cost_ev = ev_sel_a  ? 64'd1 : 64'd0;
++            32'd3: cost_ev = ev_lut_miss_a ? 64'd1 : 64'd0;
++            32'd4: cost_ev = (ev_lut_hit_a  ? {32'd0, whit_q}  : 64'd0)
++                           + (ev_lut_miss_a ? {32'd0, wmiss_q} : 64'd0)
++                           + (ev_ptw_a      ? {32'd0, wptw_q}  : 64'd0);
++            32'd5: cost_ev = ev_actual_a ? 64'd1 : 64'd0;
++            default: cost_ev = 64'd0;   // 6 and 7 carry no per-cycle cost
++        endcase
++    end
++
++    assign stale_cyc  = win_last & (mode_q == 32'd7);
++    assign charge_now = (win_run ? cost_ev : 64'd0) + (stale_cyc ? prev_main_q : 64'd0);
++
++    // mode7 accumulates A REQ_TRANS/AWAIT_RESP cycles (ev_actual_a), NOT all
++    // A-owner cycles.
++    assign main_inc = (win_run & (mode_q == 32'd7) & ev_actual_a) ? 64'd1 : 64'd0;
++
++    // Refill happens at every complete fixed billing window end (win_last),
++    // even when V was inactive or the window was only partially active, so A
++    // cannot dead-lock on an empty budget.  Only feedback and the histogram
++    // are restricted to fully V-active windows.
++    assign refill_en  = win_last & (mode_q != 32'd0) & (mode_q != 32'd6);
++    assign refill_now = refill_en ? b_q : 64'd0;
++
++    logic signed [65:0] bal_s, bal_c, bal_r, bal_r_clamped;
++    logic signed [65:0] cap_s;
++    logic               bal_c_ovf, bal_r_ovf, bal_ovf;
++    logic signed [63:0] bal_next;
++
++    assign bal_s = {{2{balance_q[63]}}, balance_q};
++    assign bal_c = bal_s - $signed({2'b00, charge_now});
++    assign bal_r = bal_c + $signed({2'b00, refill_now});
++    assign cap_s = $signed({2'b00, cap_q});
++
++    always_comb begin
++        // positive side only is capped by credit_cap; debt is never forgiven
++        if (refill_en && (bal_r > cap_s)) bal_r_clamped = cap_s;
++        else                              bal_r_clamped = bal_r;
++    end
++
++    // signed underflow is caught on the charge itself, before refill/cap could
++    // mask it
++    assign bal_c_ovf = (bal_c[65:63] != 3'b000) && (bal_c[65:63] != 3'b111);
++    assign bal_r_ovf = (bal_r_clamped[65:63] != 3'b000) &&
++                       (bal_r_clamped[65:63] != 3'b111);
++    assign bal_ovf   = bal_c_ovf | bal_r_ovf;
++
++    assign bal_next = bal_ovf
++                    ? (bal_r_clamped[65] ? {1'b1, {63{1'b0}}} : {1'b0, {63{1'b1}}})
++                    : bal_r_clamped[63:0];
++
++    //=========================================================================
++    // 7. Adaptive feedback
++    //=========================================================================
++    logic signed [65:0] obs_s, tgt_s, db_s;
++    logic               fb_inc, fb_dec;
++    logic [63:0]        b_next, b_inc_val, b_dec_val;
++
++    assign obs_s = $signed({2'b00, vdone_bytes_now});
++    assign tgt_s = $signed({34'd0, target_q});
++    assign db_s  = $signed({34'd0, deadband_q});
++
++    always_comb begin
++        // Negative feedback, direction unchanged:
++        //   billing modes: V above target -> raise A budget so V drops.
++        //   mode 6: V below target -> raise the gap so V recovers.
++        if (mode_q == 32'd6) begin
++            fb_inc = (obs_s + db_s < tgt_s);   // V slow -> gap up
++            fb_dec = (obs_s > tgt_s + db_s);
++        end else begin
++            fb_inc = (obs_s > tgt_s + db_s);   // V fast -> budget up
++            fb_dec = (obs_s + db_s < tgt_s);
++        end
++    end
++
++    logic signed [64:0] b_up_s, b_dn_s;
++    assign b_up_s = $signed({1'b0, b_q}) + $signed({33'd0, step_q});
++    assign b_dn_s = $signed({1'b0, b_q}) - $signed({33'd0, step_q});
++    assign b_inc_val = (b_up_s > $signed({33'd0, maxbud_q})) ? {32'd0, maxbud_q}
++                                                             : b_up_s[63:0];
++    assign b_dec_val = (b_dn_s < $signed({33'd0, minbud_q})) ? {32'd0, minbud_q}
++                                                             : b_dn_s[63:0];
++    assign b_next    = fb_inc ? b_inc_val : (fb_dec ? b_dec_val : b_q);
++
++    assign shortfall_bytes = {32'd0, target_q} - vdone_bytes_now;
++
++    //=========================================================================
++    // 8. mode6 gap countdown
++    //=========================================================================
++    logic [63:0] m6_cd_dec, m6_cd_next;
++    logic        gap_load;
++
++    assign m6_cd_dec = (win_run && (m6_cd_q != 64'd0)) ? (m6_cd_q - 64'd1) : m6_cd_q;
++
++    always_comb begin
++        m6_cd_next = m6_cd_dec;
++        gap_load   = 1'b0;
++        // Every A done reloads the gap.  The first copy is admitted before any
++        // A done, so it never sees a gap; the first A done already loads one.
++        if (win_run && (mode_q == 32'd6) && a_done_i) begin
++            m6_cd_next = b_q;
++            gap_load   = 1'b1;
++        end
++    end
++
++    //=========================================================================
++    // 9. Statistics increments and overflow
++    //=========================================================================
++    logic [4:0] hist_idx;
++    assign hist_idx = (vdone_now >= 64'd31) ? 5'd31 : vdone_now[4:0];
++
++    always_comb begin
++        for (int i = 0; i < NSTAT; i++) stat_inc[i] = 64'd0;
++        for (int i = 0; i < NHIST; i++) hist_inc[i] = 64'd0;
++
++        stat_inc[ST_ARMEDCYC]  = win_run ? 64'd1 : 64'd0;
++        stat_inc[ST_PERMCLOSE] = perm_closed ? 64'd1 : 64'd0;
++        stat_inc[ST_CHARGE]    = charge_now;
++        stat_inc[ST_CHARGECYC] = (charge_now != 64'd0) ? 64'd1 : 64'd0;
++        stat_inc[ST_REPLEN]    = refill_now;
++
++        stat_inc[ST_VDONE]     = (win_run && v_done_i)  ? 64'd1 : 64'd0;
++        stat_inc[ST_VBYTES]    = (win_run && v_done_i)  ? BYTES_DONE : 64'd0;
++        stat_inc[ST_AISSUE]    = (win_run && a_issue_i) ? 64'd1 : 64'd0;
++        stat_inc[ST_ADONE]     = (win_run && a_done_i)  ? 64'd1 : 64'd0;
++        stat_inc[ST_HIT]       = (win_run && ev_lut_hit_a)  ? 64'd1 : 64'd0;
++        stat_inc[ST_MISS]      = (win_run && ev_lut_miss_a) ? 64'd1 : 64'd0;
++        stat_inc[ST_PTW]       = (win_run && ev_ptw_a)      ? 64'd1 : 64'd0;
++        stat_inc[ST_AOWN]      = (win_run && ev_aown)       ? 64'd1 : 64'd0;
++        stat_inc[ST_SEL]       = (win_run && ev_sel_a)      ? 64'd1 : 64'd0;
++        stat_inc[ST_LUTA]      = (win_run && ev_lut_a)      ? 64'd1 : 64'd0;
++        stat_inc[ST_LUTAMISS]  = (win_run && ev_lut_miss_a) ? 64'd1 : 64'd0;
++        stat_inc[ST_ACTUALCYC] = (win_run && ev_actual_a)   ? 64'd1 : 64'd0;
++
++        stat_inc[ST_WIN]     = win_complete ? 64'd1 : 64'd0;
++        stat_inc[ST_WINALL]  = win_last ? 64'd1 : 64'd0;
++        stat_inc[ST_WINPART] = (win_last && !act_all_now) ? 64'd1 : 64'd0;
++        stat_inc[ST_GAPL]    = gap_load ? 64'd1 : 64'd0;
++        stat_inc[ST_STALE]   = stale_cyc ? 64'd1 : 64'd0;
++
++        stat_inc[ST_SHORTW]  = (win_complete && (obs_s < tgt_s)) ? 64'd1 : 64'd0;
++        stat_inc[ST_SHORTB]  = (win_complete && (obs_s < tgt_s)) ? shortfall_bytes
++                                                                 : 64'd0;
++        stat_inc[ST_FBUP]    = (win_complete && (mode_q != 32'd0) && fb_inc) ? 64'd1 : 64'd0;
++        stat_inc[ST_FBDN]    = (win_complete && (mode_q != 32'd0) && fb_dec) ? 64'd1 : 64'd0;
++
++        if (win_complete) hist_inc[hist_idx] = 64'd1;
++    end
++
++    logic cnt_ovf;
++
++    always_comb begin
++        cnt_ovf = 1'b0;
++        for (int i = 0; i < NSTAT; i++) stat_sum[i] = cadd(stat_q[i], stat_inc[i]);
++        for (int i = 0; i < NHIST; i++) hist_sum[i] = cadd(hist_q[i], hist_inc[i]);
++        // Compare against the full counter mask so an increment larger than
++        // the counter range is reported even when the low bits wrap.
++        for (int i = 0; i < NSTAT; i++)
++            if (stat_sum[i] > {1'b0, CNT_MASK}) cnt_ovf = 1'b1;
++        for (int i = 0; i < NHIST; i++)
++            if (hist_sum[i] > {1'b0, CNT_MASK}) cnt_ovf = 1'b1;
++    end
++
++    //=========================================================================
++    // 10. Register write decode (combinational)
++    //=========================================================================
++    logic        wr_any, wr_ok, bank_sel, obs_err_now, sup_drop_now;
++    logic [63:0] new_err, err_add;
++    logic        do_arm, do_abort, do_freeze, do_clear, cfg_wr;
++    logic        cfg_bad;
++
++    assign bank_sel = (index_i[12:8] == BANK_E);
++
++    assign wr_any = cfg_valid_i & cfg_write_i;
++    assign wr_ok  = wr_any
++                  & bank_sel
++                  & (index_i[7:0] >= R_COMMAND)
++                  & (index_i[7:0] <= R_LASTWR)
++                  & (wdata_i[63:32] == 32'd0);
++
++    assign cfg_bad = (mode_q > 32'd7)
++                   | (window_q == 32'd0)
++                   | (window_q > WINDOW_MAX)
++                   | ({32'd0, minbud_q} > {32'd0, maxbud_q})
++                   | ({32'd0, initbud_q} < {32'd0, minbud_q})
++                   | ({32'd0, initbud_q} > {32'd0, maxbud_q})
++                   | (step_q == 32'd0)
++                   | ({32'd0, cap_q} < {32'd0, maxbud_q})
++                   | (((mode_q != 32'd0) && (mode_q != 32'd6)) && (minbud_q == 32'd0))
++                   | ((mode_q == 32'd4) &&
++                      (({32'd0, whit_q} + {32'd0, wmiss_q} + {32'd0, wptw_q}) == 64'd0));
++
++    always_comb begin
++        new_err   = 64'd0;
++        do_arm    = 1'b0;
++        do_abort  = 1'b0;
++        do_freeze = 1'b0;
++        do_clear  = 1'b0;
++        cfg_wr    = 1'b0;
++
++        if (wr_any && !wr_ok) new_err[E_BADADDR] = 1'b1;
++
++        if (wr_ok) begin
++            case (index_i[7:0])
++                R_COMMAND: begin
++                    case (wdata_i[31:0])
++                        32'd1: begin // ARM
++                            if (!Enabled || !supported_i)
++                                new_err[E_UNSUP]    = 1'b1;
++                            else if (armed_q || frozen_q || !quiet_i)
++                                new_err[E_ARMSTATE] = 1'b1;
++                            else if (cfg_bad)
++                                new_err[E_BADCFG]   = 1'b1;
++                            else
++                                do_arm              = 1'b1;
++                        end
++                        32'd2: begin // ABORT
++                            if (!armed_q || frozen_q)
++                                new_err[E_ARMSTATE] = 1'b1;
++                            else if (!Enabled || !supported_i)
++                                new_err[E_UNSUP]    = 1'b1;
++                            else
++                                do_abort            = 1'b1;
++                        end
++                        32'd3: begin // FREEZE (requires fully drained -> quiet)
++                            if (!armed_q || frozen_q)
++                                new_err[E_ARMSTATE] = 1'b1;
++                            else if (!quiet_i)
++                                new_err[E_FRZILL]   = 1'b1;
++                            else
++                                do_freeze           = 1'b1;
++                        end
++                        32'd4: begin // CLEAR
++                            if (!quiet_i || armed_q)
++                                new_err[E_CLEARILL] = 1'b1;
++                            else
++                                do_clear            = 1'b1;
++                        end
++                        default: new_err[E_BADCMD] = 1'b1;
++                    endcase
++                end
++                default: begin
++                    cfg_wr = 1'b1;
++                    if (armed_q) new_err[E_CFGLOCK] = 1'b1;
++                end
++            endcase
++        end
++    end
++
++    assign obs_err_now  = armed_q & ~frozen_q & response_error_i;
++    assign sup_drop_now = armed_q & ~supported_i;
++
++    assign err_add = (obs_err_now  ? (64'd1 << E_OBS)     : 64'd0)
++                   | (sup_drop_now ? (64'd1 << E_SUPDROP) : 64'd0)
++                   | (cnt_ovf      ? (64'd1 << E_CNTOVF)  : 64'd0)
++                   | (bal_ovf      ? (64'd1 << E_BALOVF)  : 64'd0);
++
++    //=========================================================================
++    // 11. Policy outputs
++    //=========================================================================
++    logic enable_core, allow_core, err_any_reg, err_any_now, abort_eff,
++          block_all, perm_closed;
++
++    assign enable_core = Enabled & armed_q & ~frozen_q;
++    assign err_any_reg = (err_q != 64'd0);
++    // any sticky or same-cycle protocol error blocks new admission and aborts
++    assign err_any_now = (new_err != 64'd0) | obs_err_now | sup_drop_now
++                       | cnt_ovf | bal_ovf;
++    // ABORT closes admission the same cycle it is decoded; it does not stop
++    // in-flight billing (enable_core stays set until FREEZE).
++    assign abort_eff   = aborted_q | do_abort;
++    assign block_all   = err_any_reg | err_any_now;
++
++    always_comb begin
++        case (mode_q)
++            32'd0:   allow_core = 1'b1;                  // unlimited
++            32'd6:   allow_core = (m6_cd_next == 64'd0); // gap countdown
++            default: allow_core = (bal_next >= 0);       // balance after charge
++        endcase
++    end
++
++    // E25 uses only the registered error/abort state and the balance decision,
++    // never the same-cycle counter overflow, so statistics cannot feed back
++    // into the outputs.
++    assign perm_closed = enable_core & (abort_eff | err_any_reg | ~allow_core);
++
++    assign policy_enable_o = enable_core;
++    assign policy_allow_o  = enable_core & ~abort_eff & ~block_all & allow_core;
++    // Only registered errors terminate the frontend.  Its completion/retire
++    // logic feeds observation counters, so sending same-cycle overflow back
++    // through abort creates a combinational feedback path after synthesis.
++    // Admission is still closed immediately above; in-flight work drains and
++    // the sticky error terminates the frontend from the next cycle onward.
++    assign policy_abort_o  = enable_core & (abort_eff | err_any_reg);
++
++    //=========================================================================
++    // 12. Register read mux
++    //=========================================================================
++    always_comb begin
++        rdata_o = 64'd0;
++        if (bank_sel) begin
++            case (index_i[7:0])
++                R_MAGIC:    rdata_o = MAGIC;
++                R_VERSION:  rdata_o = VERSION;
++                R_ERROR:    rdata_o = err_q;
++                R_STATUS:   rdata_o = {61'd0, aborted_q, frozen_q, armed_q};
++                R_COMMAND:  rdata_o = 64'd0;
++                R_MODE:     rdata_o = {32'd0, mode_q};
++                R_WINDOW:   rdata_o = {32'd0, window_q};
++                R_TARGET:   rdata_o = {32'd0, target_q};
++                R_DEADBAND: rdata_o = {32'd0, deadband_q};
++                R_INITBUD:  rdata_o = {32'd0, initbud_q};
++                R_MINBUD:   rdata_o = {32'd0, minbud_q};
++                R_MAXBUD:   rdata_o = {32'd0, maxbud_q};
++                R_STEP:     rdata_o = {32'd0, step_q};
++                R_CAP:      rdata_o = {32'd0, cap_q};
++                R_WHIT:     rdata_o = {32'd0, whit_q};
++                R_WMISS:    rdata_o = {32'd0, wmiss_q};
++                R_WPTW:     rdata_o = {32'd0, wptw_q};
++
++                8'h20: rdata_o = zext64(stat_q[ST_WIN]);
++                8'h21: rdata_o = zext64(stat_q[ST_VDONE]);
++                8'h22: rdata_o = zext64(stat_q[ST_VBYTES]);
++                8'h23: rdata_o = zext64(stat_q[ST_SHORTW]);
++                8'h24: rdata_o = zext64(stat_q[ST_SHORTB]);
++                8'h25: rdata_o = zext64(stat_q[ST_PERMCLOSE]);
++                8'h26: rdata_o = zext64(stat_q[ST_CHARGE]);
++                8'h27: rdata_o = zext64(stat_q[ST_REPLEN]);
++                8'h28: rdata_o = zext64(stat_q[ST_AISSUE]);
++                8'h29: rdata_o = zext64(stat_q[ST_ADONE]);
++                8'h2A: rdata_o = zext64(stat_q[ST_CHARGECYC]);
++                8'h2B: rdata_o = zext64(stat_q[ST_HIT]);
++                8'h2C: rdata_o = zext64(stat_q[ST_MISS]);
++                8'h2D: rdata_o = zext64(stat_q[ST_PTW]);
++                8'h2E: rdata_o = zext64(stat_q[ST_AOWN]);
++                8'h2F: rdata_o = zext64(stat_q[ST_SEL]);
++                8'h30: rdata_o = zext64(stat_q[ST_LUTA]);
++                8'h31: rdata_o = zext64(stat_q[ST_LUTAMISS]);
++                8'h32: rdata_o = zext64(stat_q[ST_ACTUALCYC]);
++                8'h33: rdata_o = zext64(stat_q[ST_WINALL]);
++                8'h34: rdata_o = zext64(stat_q[ST_WINPART]);
++                8'h35: rdata_o = zext64(stat_q[ST_FBUP]);
++                8'h36: rdata_o = zext64(stat_q[ST_FBDN]);
++                8'h37: rdata_o = zext64(stat_q[ST_GAPL]);
++                8'h38: rdata_o = zext64(stat_q[ST_STALE]);
++                8'h39: rdata_o = zext64(stat_q[ST_ARMEDCYC]);
++
++                S_BALANCE: rdata_o = balance_q;
++                S_BMIN:    rdata_o = bmin_q;
++                S_BMAX:    rdata_o = bmax_q;
++                S_BFINAL:  rdata_o = b_q;
++                S_NODONE:  rdata_o = nodone_max_q;
++
++                default: begin
++                    if (index_i[7:0] >= S_HIST_BASE && index_i[7:0] <= S_HIST_LAST)
++                        rdata_o = zext64(hist_q[index_i[4:0]]);
++                    else
++                        rdata_o = 64'd0;
++                end
++            endcase
++        end
++    end
++
++    //=========================================================================
++    // 13. V-active-without-done run length
++    //=========================================================================
++    logic [63:0] nodone_run_next, nodone_max_next;
++    assign nodone_run_next = (win_run && v_active_i && !v_done_i)
++                           ? (nodone_run_q + 64'd1) : 64'd0;
++    assign nodone_max_next = (nodone_run_next > nodone_max_q)
++                           ? nodone_run_next : nodone_max_q;
++
++    //=========================================================================
++    // 14. Sequential update
++    //=========================================================================
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            armed_q   <= 1'b0;
++            frozen_q  <= 1'b0;
++            aborted_q <= 1'b0;
++            err_q     <= 64'd0;
++
++            mode_q     <= DEF_MODE;
++            window_q   <= DEF_WINDOW;
++            target_q   <= DEF_TARGET;
++            deadband_q <= DEF_DEADBAND;
++            initbud_q  <= DEF_INITBUD;
++            minbud_q   <= DEF_MINBUD;
++            maxbud_q   <= DEF_MAXBUD;
++            step_q     <= DEF_STEP;
++            cap_q      <= DEF_CAP;
++            whit_q     <= DEF_WHIT;
++            wmiss_q    <= DEF_WMISS;
++            wptw_q     <= DEF_WPTW;
++
++            balance_q   <= {32'd0, DEF_INITBUD};
++            b_q         <= {32'd0, DEF_INITBUD};
++            bmin_q      <= {32'd0, DEF_INITBUD};
++            bmax_q      <= {32'd0, DEF_INITBUD};
++            prev_main_q <= 64'd0;
++            win_main_q  <= 64'd0;
++            win_cnt_q   <= 64'd0;
++            win_vdone_q <= 64'd0;
++            win_allact_q<= 1'b0;
++            nodone_run_q<= 64'd0;
++            nodone_max_q<= 64'd0;
++            m6_cd_q     <= 64'd0;
++
++            for (int i = 0; i < NSTAT; i++) stat_q[i] <= {CounterWidth{1'b0}};
++            for (int i = 0; i < NHIST; i++) hist_q[i] <= {CounterWidth{1'b0}};
++        end else begin
++            //-----------------------------------------------------------------
++            // statistics
++            //-----------------------------------------------------------------
++            for (int i = 0; i < NSTAT; i++)
++                stat_q[i] <= do_clear ? {CounterWidth{1'b0}}
++                                      : stat_sum[i][CounterWidth-1:0];
++            for (int i = 0; i < NHIST; i++)
++                hist_q[i] <= do_clear ? {CounterWidth{1'b0}}
++                                      : hist_sum[i][CounterWidth-1:0];
++
++            //-----------------------------------------------------------------
++            // datapath (armed, not frozen)
++            //-----------------------------------------------------------------
++            if (win_run) begin
++                balance_q <= bal_next;
++
++                if (win_last) begin
++                    win_cnt_q    <= 64'd0;
++                    win_allact_q <= 1'b1;
++                    win_vdone_q  <= 64'd0;
++                end else begin
++                    win_cnt_q    <= win_cnt_q + 64'd1;
++                    win_allact_q <= act_all_now;
++                    win_vdone_q  <= vdone_now;
++                end
++
++                // mode7 stale base rotation: every complete fixed window,
++                // independent of V activity
++                if (win_last) begin
++                    prev_main_q <= win_main_q + main_inc;
++                    win_main_q  <= 64'd0;
++                end else begin
++                    win_main_q  <= win_main_q + main_inc;
++                end
++
++                // feedback + b seen tracking (fully V-active windows only)
++                if (win_complete && (mode_q != 32'd0) && (fb_inc || fb_dec)) begin
++                    b_q <= b_next;
++                    if (b_next < bmin_q) bmin_q <= b_next;
++                    if (b_next > bmax_q) bmax_q <= b_next;
++                end
++
++                m6_cd_q <= m6_cd_next;
++            end
++
++            nodone_run_q <= nodone_run_next;
++            nodone_max_q <= nodone_max_next;
++
++            //-----------------------------------------------------------------
++            // commands (win_run is deasserted whenever ARM/CLEAR can fire)
++            //-----------------------------------------------------------------
++            if (do_arm) begin
++                armed_q     <= 1'b1;
++                aborted_q   <= 1'b0;
++                frozen_q    <= 1'b0;
++                balance_q   <= {32'd0, initbud_q};   // no clamping
++                b_q         <= {32'd0, initbud_q};
++                bmin_q      <= {32'd0, initbud_q};
++                bmax_q      <= {32'd0, initbud_q};
++                prev_main_q <= 64'd0;
++                win_main_q  <= 64'd0;
++                win_cnt_q   <= 64'd0;
++                win_allact_q<= 1'b1;
++                win_vdone_q <= 64'd0;
++                m6_cd_q     <= 64'd0;
++                nodone_run_q<= 64'd0;
++            end
++
++            if (do_abort) aborted_q <= 1'b1;
++
++            if (do_freeze) begin
++                // FREEZE (quiet) leaves armed=0 / frozen=1 so the next legal
++                // CLEAR is accepted.  aborted_q is deliberately NOT cleared:
++                // abort / failure diagnostics are retained until CLEAR, so a
++                // frozen aborted run still reads status 6 (frozen|aborted).
++                armed_q  <= 1'b0;
++                frozen_q <= 1'b1;
++            end
++
++            if (do_clear) begin
++                armed_q     <= 1'b0;
++                aborted_q   <= 1'b0;
++                frozen_q    <= 1'b0;
++                balance_q   <= {32'd0, initbud_q};
++                b_q         <= {32'd0, initbud_q};
++                bmin_q      <= {32'd0, initbud_q};
++                bmax_q      <= {32'd0, initbud_q};
++                prev_main_q <= 64'd0;
++                win_main_q  <= 64'd0;
++                win_cnt_q   <= 64'd0;
++                win_allact_q<= 1'b0;
++                win_vdone_q <= 64'd0;
++                m6_cd_q     <= 64'd0;
++                nodone_run_q<= 64'd0;
++                nodone_max_q<= 64'd0;
++            end
++
++            //-----------------------------------------------------------------
++            // configuration writes (rejected while armed)
++            //-----------------------------------------------------------------
++            if (cfg_wr && !armed_q) begin
++                case (index_i[7:0])
++                    R_MODE:     mode_q     <= wdata_i[31:0];
++                    R_WINDOW:   window_q   <= wdata_i[31:0];
++                    R_TARGET:   target_q   <= wdata_i[31:0];
++                    R_DEADBAND: deadband_q <= wdata_i[31:0];
++                    R_INITBUD:  initbud_q  <= wdata_i[31:0];
++                    R_MINBUD:   minbud_q   <= wdata_i[31:0];
++                    R_MAXBUD:   maxbud_q   <= wdata_i[31:0];
++                    R_STEP:     step_q     <= wdata_i[31:0];
++                    R_CAP:      cap_q      <= wdata_i[31:0];
++                    R_WHIT:     whit_q     <= wdata_i[31:0];
++                    R_WMISS:    wmiss_q    <= wdata_i[31:0];
++                    R_WPTW:     wptw_q     <= wdata_i[31:0];
++                    default: ;
++                endcase
++            end
++
++            //-----------------------------------------------------------------
++            // sticky errors: reset or a legal CLEAR are the only recovery
++            //-----------------------------------------------------------------
++            if (do_clear) err_q <= 64'd0;
++            else          err_q <= err_q | new_err | err_add;
++        end
++    end
++
++endmodule
++
++`default_nettype wire
+diff --git a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+index 7c8d67bf1efb00b7fdb3bc9c61160ca5a1816c57..ab8e9a83c6b62e548d1f977e57d5513c9e447640 100644
+--- a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
++++ b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+@@ -16,6 +16,7 @@ module idma_reg64_frontend #(
+     parameter bit ObserverPort = 1'b0,
+     parameter bit BatchPort = 1'b0,
+     parameter bit LaunchPort = 1'b0,
++    parameter bit ResearchPort = 1'b0,
+     /// Device ID
+     parameter logic [23:0]  DEVICE_ID        = 24'd1,
+     /// Process ID
+@@ -30,6 +31,8 @@ module idma_reg64_frontend #(
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
+     output logic batch_active_o,
++    // ResearchPort policy gate (active only when ResearchPort).
++    input  logic policy_enable_i, policy_allow_i, policy_abort_i, batch_reverse_i,
+     // Optional controlled-launch handshake (active only when LaunchPort).
+     input  logic launch_hold_i, launch_go_i, launch_cancel_i,
+     output logic launch_held_o, launch_active_o, launch_cancelled_o, launch_error_o,
+@@ -70,10 +73,19 @@ module idma_reg64_frontend #(
+         COUNT   = 3'b001,
+         WAIT    = 3'b010,
+         HOLD    = 3'b011,
+-        GAP     = 3'b100
++        GAP     = 3'b100,
++        ADMIT   = 3'b101
+     } idma_state_t;
+     idma_state_t state_q, state_n;
+ 
++    // ResearchPort=0 must keep the old behaviour exactly, including when the new
++    // inputs are left unconnected by legacy instantiations.
++    logic policy_enable, policy_allow, policy_abort, batch_reverse;
++    assign policy_enable = ResearchPort ? policy_enable_i : 1'b0;
++    assign policy_allow  = ResearchPort ? policy_allow_i  : 1'b0;
++    assign policy_abort  = ResearchPort ? policy_abort_i  : 1'b0;
++    assign batch_reverse = ResearchPort ? batch_reverse_i : 1'b0;
++
+     logic [63:0]    transf_counter_q, transf_counter_n;
+     logic [63:0]    transf_offset_q, transf_offset_n;
+ 
+@@ -99,6 +111,7 @@ module idma_reg64_frontend #(
+     logic batch_enable_q, batch_stop_q, batch_stopped_q, batch_error_q;
+     logic [32:0] batch_target_q, batch_issued_q, batch_completed_q;
+     logic [12:0] batch_pages_q;
++    logic        batch_reverse_q;
+     logic [63:0] batch_id_q;
+     logic batch_cfg_ok, batch_task_issue, batch_task_done;
+     logic [31:0] gap_cycles_q;
+@@ -145,18 +158,21 @@ module idma_reg64_frontend #(
+             batch_enable_q <= 0; batch_stop_q <= 0; batch_stopped_q <= 0;
+             batch_error_q <= 0; batch_target_q <= 0; batch_pages_q <= 0;
+             batch_issued_q <= 0; batch_completed_q <= 0; batch_id_q <= 0;
++            batch_reverse_q <= 0;
+             gap_cycles_q <= 0;
+         end else if (BatchPort) begin
+             if (batch_enable_q && issue) begin
+                 batch_issued_q <= 0; batch_completed_q <= 0;
+                 batch_stop_q <= 0; batch_stopped_q <= 0; batch_id_q <= next_id;
++                batch_reverse_q <= batch_reverse;
+             end
+             if (batch_task_issue) batch_issued_q <= batch_issued_q + 1'b1;
+             if (batch_task_done) begin
+                 batch_completed_q <= batch_completed_q + 1'b1;
+                 if (batch_stop_q) batch_stopped_q <= 1;
+             end
+-            if (batch_enable_q && state_q == GAP && (batch_stop_q || batch_stop_write))
++            if (batch_enable_q && (state_q == GAP || state_q == ADMIT) &&
++                (batch_stop_q || batch_stop_write || policy_abort))
+                 batch_stopped_q <= 1;
+             if (locked_write) batch_error_q <= 1;
+             // While a controlled launch job is active the batch bank is read-only:
+@@ -257,7 +273,8 @@ module idma_reg64_frontend #(
+     // intentionally wider than launch_ctrl_q (the controlled job only); use
+     // launch_held_o / launch_busy to distinguish the controlled job.
+     assign launch_active_o    = LaunchPort && (state_q == HOLD || state_q == COUNT ||
+-                                               state_q == WAIT || state_q == GAP);
++                                               state_q == WAIT || state_q == GAP ||
++                                               state_q == ADMIT);
+ 
+     assign obs_issue_o = batch_enable_q ? batch_task_issue :
+                          (LaunchPort && (launch_ctrl_q || launch_hold_i)) ?
+@@ -468,17 +485,25 @@ module idma_reg64_frontend #(
+                         dma_ctrl_rsp_o.ready = 1;
+                         dma_ctrl_rsp_o.error = 1;
+                     end else if (dma_reg2hw.num_bytes.q != '0) begin
+-
+                         issue = 1'b1;
+                         dma_hw2reg.next_id.d = next_id;
+-                        dma_ctrl_rsp_o.ready = ready_i;
+-
+                         transf_counter_n = batch_enable_q ? 64'(batch_target_q) : dma_reg2hw.n_trans.q;
+-                        transf_offset_n  = '0;
+-                        state_n          = COUNT;
+-                        if (batch_enable_q && !ready_i) begin
+-                            issue = 0;
+-                            state_n = IDLE;
++                        if (batch_enable_q && policy_enable) begin
++                            // First policy-gated batch copy: reserve the functional ID
++                            // and wait for backend idle plus allow before offering VALID.
++                            dma_ctrl_rsp_o.ready = 1'b1;
++                            transf_offset_n = (batch_enable_q && batch_reverse)
++                                ? ((64'(batch_pages_q) - 64'd1) << 12) : '0;
++                            state_n = ADMIT;
++                        end else begin
++                            dma_ctrl_rsp_o.ready = ready_i;
++                            transf_offset_n = (batch_enable_q && batch_reverse)
++                                ? ((64'(batch_pages_q) - 64'd1) << 12) : '0;
++                            state_n = COUNT;
++                            if (batch_enable_q && !ready_i) begin
++                                issue = 0;
++                                state_n = IDLE;
++                            end
+                         end
+                     end
+                 end
+@@ -494,12 +519,18 @@ module idma_reg64_frontend #(
+                 burst_req_o.dst_addr = dma_reg2hw.dst_addr.q + transf_offset_q;
+ 
+                 if (ready_i) begin
+-
+                     state_n          = WAIT;
+                     transf_counter_n = transf_counter_q - 1;
+-                    transf_offset_n  = transf_offset_q + 13'h1000;
+-                    if (batch_enable_q && transf_offset_n == (64'(batch_pages_q) << 12))
+-                        transf_offset_n = 0;
++                    if (batch_enable_q && batch_reverse_q) begin
++                        if (transf_offset_q == 0)
++                            transf_offset_n = (64'(batch_pages_q) - 64'd1) << 12;
++                        else
++                            transf_offset_n = transf_offset_q - 13'h1000;
++                    end else begin
++                        transf_offset_n  = transf_offset_q + 13'h1000;
++                        if (batch_enable_q && transf_offset_n == (64'(batch_pages_q) << 12))
++                            transf_offset_n = 0;
++                    end
+                 end
+             end
+ 
+@@ -515,15 +546,17 @@ module idma_reg64_frontend #(
+                         state_n        = IDLE;
+                     end else if ((transf_counter_q == '0) ||
+                             (!batch_enable_q && dma_reg2hw.conf.ttype.q == idma_pkg::DEFAULT) ||
+-                            (batch_enable_q && batch_stop_q)) begin
++                            (batch_enable_q && (batch_stop_q || policy_abort))) begin
+                         trans_complete = 1'b1;
+                         id_retire      = 1'b1;
+                         state_n = IDLE;
+                     end else if (batch_enable_q && gap_cycles_q != '0) begin
+                         // Non-final batch completion: wait before offering the
+-                        // next task.  The first task is never delayed.
++                        // next task.  The first task is never delayed by gap.
+                         state_n         = GAP;
+                         gap_countdown_n = gap_cycles_q;
++                    end else if (batch_enable_q && policy_enable) begin
++                        state_n = ADMIT;
+                     end else begin
+                         state_n = COUNT;
+                     end
+@@ -534,17 +567,29 @@ module idma_reg64_frontend #(
+                 // STOP wins over a same-cycle countdown expiry.  All issued
+                 // jobs are already complete, so retire the functional batch ID
+                 // without creating an extra obs_done.
+-                if (batch_stop_q || batch_stop_write) begin
++                if (batch_stop_q || batch_stop_write || policy_abort) begin
+                     id_retire = 1'b1;
+                     state_n   = IDLE;
+                 end else if (gap_countdown_q <= 32'd1) begin
+-                    state_n         = COUNT;
++                    state_n         = (batch_enable_q && policy_enable) ? ADMIT : COUNT;
+                     gap_countdown_n = '0;
+                 end else begin
+                     gap_countdown_n = gap_countdown_q - 32'd1;
+                 end
+             end
+ 
++            ADMIT: begin
++                // ResearchPort admission gate: no backend VALID is asserted here.
++                // STOP or policy abort can retire immediately; otherwise wait for
++                // an idle backend and an allow before offering the next copy.
++                if (batch_stop_q || batch_stop_write || policy_abort) begin
++                    id_retire = 1'b1;
++                    state_n   = IDLE;
++                end else if (backend_idle_i && policy_allow) begin
++                    state_n = COUNT;
++                end
++            end
++
+             HOLD: begin
+                 // No backend VALID here. Cancel retires the reserved ID without an
+                 // obs_issue/obs_done event; go starts the transfer.
+diff --git a/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv b/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
+index a506121dd4c5c0ba09a94e3f4fd49f33530584ac..29290e61b19a4b81f7e6d035218c4429b91ccf76 100644
+--- a/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
++++ b/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
+@@ -29,6 +29,7 @@ module dma_core_wrap #(
+   parameter bit                       ObserverPort    = 1'b0,
+   parameter bit BatchPort = 1'b0,
+   parameter bit LaunchPort = 1'b0,
++  parameter bit ResearchPort = 1'b0,
+   parameter bit                       IsTwoD           = 32'd0,
+   parameter type                      axi_mst_req_t    = logic,
+   parameter type                      axi_mst_rsp_t    = logic,
+@@ -44,6 +45,7 @@ module dma_core_wrap #(
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
+   output logic batch_active_o,
++  input  logic policy_enable_i, policy_allow_i, policy_abort_i, batch_reverse_i,
+   input  logic launch_hold_i, launch_go_i, launch_cancel_i,
+   output logic launch_held_o, launch_active_o, launch_cancelled_o, launch_error_o,
+     output logic [63:0] obs_issue_id_o, obs_done_id_o, obs_poll_id_o,
+@@ -131,6 +133,7 @@ module dma_core_wrap #(
+       .ObserverPort ( ObserverPort ),
+       .BatchPort ( BatchPort ),
+       .LaunchPort ( LaunchPort ),
++      .ResearchPort ( ResearchPort ),
+       .dma_regs_req_t  ( dma_regs_req_t ),
+       .dma_regs_rsp_t  ( dma_regs_rsp_t ),
+       .burst_req_t     ( idma_req_t     ),
+@@ -140,6 +143,7 @@ module dma_core_wrap #(
+       .AxID            ( AxID           )
+     ) i_dma_frontend (
+       .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o,
++      .policy_enable_i, .policy_allow_i, .policy_abort_i, .batch_reverse_i,
+       .launch_hold_i, .launch_go_i, .launch_cancel_i,
+       .launch_held_o, .launch_active_o, .launch_cancelled_o, .launch_error_o,
+       .obs_issue_id_o, .obs_done_id_o, .obs_poll_id_o,
+@@ -347,6 +351,7 @@ module dma_core_wrap_intf #(
+   parameter bit                        OBSERVER_PORT    = 1'b0,
+   parameter bit BATCH_PORT = 1'b0,
+   parameter bit LAUNCH_PORT = 1'b0,
++  parameter bit RESEARCH_PORT = 1'b0,
+   parameter bit                        IS_TWO_D           =  1'b0,
+ 
+   parameter logic [23:0]               DEVICE_ID          = 24'd1,
+@@ -359,6 +364,7 @@ module dma_core_wrap_intf #(
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
+   output logic batch_active_o,
++  input  logic policy_enable_i, policy_allow_i, policy_abort_i, batch_reverse_i,
+   input  logic launch_hold_i, launch_go_i, launch_cancel_i,
+   output logic launch_held_o, launch_active_o, launch_cancelled_o, launch_error_o,
+     output logic [63:0] obs_issue_id_o, obs_done_id_o, obs_poll_id_o,
+@@ -410,6 +416,7 @@ module dma_core_wrap_intf #(
+     .ObserverPort     ( OBSERVER_PORT      ),
+     .BatchPort        ( BATCH_PORT         ),
+     .LaunchPort       ( LAUNCH_PORT        ),
++    .ResearchPort     ( RESEARCH_PORT      ),
+     .axi_mst_req_t    ( axi_mst_req_t      ),
+     .axi_mst_rsp_t    ( axi_mst_resp_t     ),
+     .axi_slv_req_t    ( axi_slv_req_t      ),
+@@ -419,6 +426,7 @@ module dma_core_wrap_intf #(
+     .AxID             ( AxID               )
+   ) i_dma_core_wrap (
+       .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o,
++      .policy_enable_i, .policy_allow_i, .policy_abort_i, .batch_reverse_i,
+       .launch_hold_i, .launch_go_i, .launch_cancel_i,
+       .launch_held_o, .launch_active_o, .launch_cancelled_o, .launch_error_o,
+       .obs_issue_id_o, .obs_done_id_o, .obs_poll_id_o,

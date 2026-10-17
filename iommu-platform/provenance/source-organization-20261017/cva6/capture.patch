@@ -1,0 +1,1429 @@
+From 20c93721d719b03dbc17cd4f58d04dd21a97f2d5 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:50:15 +0900
+Subject: [PATCH] Capture original CVA6 source files and original indexed
+ gitlink
+
+This is a new capture commit, not a historical experiment commit.
+Indexed IOMMU pointer 238a39e differs from actual child HEAD 57eb562 plus dirty source.
+Reconstructed research profiles bind the independently organized IOMMU instead.
+---
+ Makefile                                      |   1 +
+ .../fpga/src/ariane_peripherals_xilinx.sv     | 186 ++++++-
+ corev_apu/fpga/src/ariane_xilinx.sv           |   3 +
+ corev_apu/fpga/src/dma_composition_control.sv | 520 ++++++++++++++++++
+ corev_apu/fpga/src/dma_nonblock_observer.sv   | 256 +++++++++
+ corev_apu/fpga/src/dma_observer.sv            |   7 +-
+ corev_apu/iDMA/Bender.yml                     |   1 +
+ .../register_64bit/idma_reg64_frontend.sv     |   7 +
+ .../iDMA/src/idma_fullbuffer_certificate.sv   |  47 ++
+ corev_apu/iDMA/src/idma_stream_fifo.sv        |   5 +-
+ .../src/systems/cva6_reg/dma_core_wrap.sv     |  27 +-
+ .../pulp-platform/common_cells/src/fifo_v3.sv |  11 +-
+ .../common_cells/src/stream_fifo.sv           |   6 +-
+ 13 files changed, 1038 insertions(+), 39 deletions(-)
+ create mode 100644 corev_apu/fpga/src/dma_composition_control.sv
+ create mode 100644 corev_apu/fpga/src/dma_nonblock_observer.sv
+ create mode 100644 corev_apu/iDMA/src/idma_fullbuffer_certificate.sv
+
+diff --git a/Makefile b/Makefile
+index 465baa3e37a90be5dd6bd8c0ed4b57d43010ca6c..6cc30f694c9dd99c470be019cdc824c0592e45a7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -182,6 +182,7 @@ src :=  corev_apu/tb/axi_adapter.sv
+         corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv           \
+         corev_apu/iDMA/src/frontends/idma_transfer_id_gen.sv                         \
+         corev_apu/iDMA/src/idma_stream_fifo.sv                                       \
++        corev_apu/iDMA/src/idma_fullbuffer_certificate.sv                                       \
+         corev_apu/iDMA/src/idma_buffer.sv                                            \
+         corev_apu/iDMA/src/idma_error_handler.sv                                     \
+         corev_apu/iDMA/src/idma_channel_coupler.sv                                   \
+diff --git a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+index 1410abb435e89567c23ad61d2dd5be6b3a73ab2d..7ad7e80ccc24f08e771f14ba96a3e3eb68b01f2c 100644
+--- a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+@@ -31,6 +31,7 @@ module ariane_peripherals #(
+     parameter bit InclIOMMU    =  0,
+     parameter bit IOMMULegacyE3Observer = 1,
+     parameter int unsigned IOMMUResearchRole = 0,
++    parameter int unsigned IOMMUNonblockMode = 0,
+     parameter int unsigned IOMMUDSFixedDelayInput  = 0,
+     parameter int unsigned IOMMUDSFixedDelayOutput = 0
+ ) (
+@@ -884,12 +885,22 @@ module ariane_peripherals #(
+     rv_iommu::e3_ctl_t e3_ctl;
+     rv_iommu::e3_tl_t e3_tl;
+     rv_iommu::research_t research;
++    logic nonblock_fire, nonblock_trans_accept;
++    logic [1:0] composition_mode;
++    logic [23:0] composition_did;
++    logic composition_clear, composition_iommu_quiet;
++    logic [15:0] nonblock_diag;
++    rv_iommu::device_id_t nonblock_did;
++    rv_iommu::ttype_t nonblock_type;
+     logic [7:0] e3_control, e3_index;
+     logic [63:0] e3_data;
+     logic e3_error;
+     if (!InclDMA) begin : gen_no_e3_control
+         assign e3_control = 0;
+         assign e3_index = 0;
++        assign composition_mode = 0;
++        assign composition_did = 24'd10;
++        assign composition_clear = 0;
+     end
+ 
+     typedef logic [DmaAxiIdWidth-1:0] dma_iommu_id_t;
+@@ -898,6 +909,9 @@ module ariane_peripherals #(
+                             rv_iommu::device_id_t, logic, rv_iommu::process_id_t)
+     axi_dma_tr_req_t  [NumDMADevices-1:0] axi_dma_tr_req;
+     axi_dma_tr_resp_t [NumDMADevices-1:0] axi_dma_tr_resp;
++    // Shared DMA full-buffer status.  Width mirrors NumDMADevices;
++    // only the low two bits are consumed by fullbuffer_jobs_i.
++    logic [NumDMADevices-1:0] fullbuffer_jobs;
+ 
+     // AXI Bus between System Interconnect and IOMMU Programming IF
+     `AXI_TYPEDEF_ALL(axi_prog, iommu_addr_t, iommu_slv_id_t, 
+@@ -912,6 +926,7 @@ module ariane_peripherals #(
+     //------------
+     if (InclDMA) begin : gen_dma
+         logic [NumDMADevices-1:0] obs_issue, obs_done, obs_poll, batch_active;
++        logic [NumDMADevices-1:0] batch_gap_active, job_quiet;
+         logic [63:0] obs_issue_id [NumDMADevices], obs_done_id [NumDMADevices], obs_poll_id [NumDMADevices];
+         logic [NumDMADevices-1:0] obs_cfg_valid, obs_cfg_write;
+         logic [7:0] obs_cfg_addr [NumDMADevices];
+@@ -926,6 +941,9 @@ module ariane_peripherals #(
+         logic [63:0] research_observer_data, research_policy_data;
+         logic policy_enable, policy_allow, policy_abort, research_reverse;
+         logic research_policy_access;
++        logic [63:0] nonblock_data, composition_data;
++        logic composition_access;
++        logic [12:0] composition_index;
+         logic research_write, research_dma_quiet, research_arm, research_open, research_close;
+         logic [127:0] research_entries [16], research_entries_next [16];
+         for (genvar r = 0; r < 16; r++) begin : gen_research_entries
+@@ -945,7 +963,10 @@ module ariane_peripherals #(
+                 (axi_dma_tr_resp[o].r_valid && |axi_dma_tr_resp[o].r.id) ||
+                 (axi_dma_tr_resp[o].b_valid && |axi_dma_tr_resp[o].b.id);
+         end
+-        dma_observer #(.NumPorts(NumDMADevices), .PathEnable(InclIOMMU),
++        // Composition records its own window counters and snapshots. The old
++        // per-transaction path timers are needed only by legacy profiles/E3.
++        dma_observer #(.NumPorts(NumDMADevices),
++                       .PathEnable(InclIOMMU && (IOMMUNonblockMode != 3 || IOMMULegacyE3Observer)),
+                        .E3Enable(InclIOMMU && IOMMULegacyE3Observer),
+                        .ControlledEnable(InclIOMMU && IOMMULegacyE3Observer),
+                        .P4MEnable(InclIOMMU), .ResearchEnable(InclIOMMU),
+@@ -982,32 +1003,90 @@ module ariane_peripherals #(
+         assign obs_cfg_rdata = obs_cfg_addr[0][7] ? launch_cfg_rdata : legacy_cfg_rdata;
+         if (InclIOMMU) begin : gen_research
+             assign research_policy_access = research_index[12:8] == 5'h0E;
+-            assign research_data = research_policy_access ? research_policy_data : research_observer_data;
+-            dma_research_observer #(.ResearchRole(IOMMUResearchRole)) i_research (
+-                .clk_i, .rst_ni, .cfg_valid_i(research_write && !research_policy_access),
+-                .cfg_write_i(research_write && !research_policy_access), .index_i(research_index),
+-                .wdata_i(research_wdata), .rdata_o(research_observer_data),
+-                .reverse_order_o(research_reverse),
+-                .quiet_i(research_dma_quiet && e3_ctl.quiet && !e3_tl.ptw_active),
+-                .supported_i(research.supported),
+-                .entries_i(research_entries), .entries_next_i(research_entries_next),
+-                .plru_i(research.plru), .update_i(research.update),
+-                .invalidate_i(research.invalidate), .replace_mask_i(research.replace_mask),
+-                .update_did_i(research.did), .lookup_i(research.lookup),
+-                .lookup_hit_i(research.hit), .lookup_did_i(research.did),
+-                .lookup_iova_i(research.iova), .lookup_pscid_i(research.pscid),
+-                .lookup_gscid_i(research.gscid), .lookup_stage1_i(research.stage1),
+-                .lookup_stage2_i(research.stage2), .ctl_state_i(e3_ctl.state),
+-                .ctl_did_i(e3_ctl.current_did), .select_fire_i(e3_ctl.select_valid),
+-                .select_did_i(e3_ctl.select_did),
+-                .response_error_i((e3_ctl.response_fire && e3_ctl.response_error) ||
+-                                  (research.update && !research.normal)),
+-                .issue_i(obs_issue[1:0]), .done_i(obs_done[1:0]),
+-                .issue_id_i('{obs_issue_id[0], obs_issue_id[1]}),
+-                .done_id_i('{obs_done_id[0], obs_done_id[1]}),
+-                .p4m_arm_i(research_arm), .p4m_open_i(research_open),
+-                .p4m_close_i(research_close)
+-            );
++            assign composition_access = IOMMUNonblockMode == 3 &&
++                research_index >= 13'hD20 && research_index <= 13'hD9F;
++            assign composition_index = research_index - 13'hD20;
++            assign research_data = composition_access ? composition_data :
++                                   IOMMUNonblockMode != 0 && research_index[12:8] == 5'h0D ?
++                                   nonblock_data :
++                                   research_policy_access ? research_policy_data : research_observer_data;
++            // Composition has its own accepted-request counters. Do not also
++            // build the legacy diagnostic bank for this profile.
++            if (IOMMUNonblockMode != 0 && IOMMUNonblockMode != 3) begin : gen_nonblock_observer
++                dma_nonblock_observer #(.Mode(IOMMUNonblockMode)) i_nonblock_obs (
++                    .clk(clk_i), .rst(!rst_ni), .arm(research_arm),
++                    .open(research_open), .close(research_close),
++                    .index(research_index[7:0]), .rdata(nonblock_data),
++                    .accept(nonblock_trans_accept), .fast(nonblock_fire),
++                    .did(nonblock_did), .ttype(nonblock_type),
++                    .diag_events(nonblock_diag)
++                );
++            end else begin : gen_no_nonblock_observer
++                assign nonblock_data = '0;
++            end
++            if (IOMMUNonblockMode == 3) begin : gen_composition
++                dma_composition_control i_composition (
++                    .clk_i, .rst_ni,
++                    .cfg_write_i(research_write && composition_access),
++                    .index_i(composition_index[6:0]), .wdata_i(research_wdata),
++                    .rdata_o(composition_data),
++                    .quiet_i(composition_iommu_quiet && research_dma_quiet &&
++                             (&job_quiet) && !(|obs_issue) &&
++                             !(|launch_active) && !(|launch_held)),
++                    .supported_i(research.supported),
++                    .arm_i(research_arm), .open_i(research_open), .close_i(research_close),
++                    .mode_o(composition_mode), .protected_did_o(composition_did),
++                    .clear_o(composition_clear),
++                    .lookup_i(research.lookup), .lookup_hit_i(research.hit),
++                    .normal_i(research.normal), .stage1_i(research.stage1),
++                    .stage2_i(research.stage2), .lookup_did_i(research.did),
++                    .lookup_pscid_i(research.pscid),
++                    .accept_i(nonblock_trans_accept), .fast_i(nonblock_fire),
++                    .fast_did_i(nonblock_did), .gap_active_i(batch_gap_active[1:0]),
++                    .update_i(research.update), .invalidate_i(research.invalidate),
++                    .update_did_i(research.did), .replace_mask_i(research.replace_mask),
++                    .entries_i(research_entries), .entries_next_i(research_entries_next),
++                    .plru_i(research.plru)
++                );
++            end else begin : gen_no_composition
++                assign composition_mode = 0;
++                assign composition_did = 24'd10;
++                assign composition_clear = 0;
++                assign composition_data = 0;
++            end
++            // The old E2/COST event recorder is not read by composition's
++            // ioctl. Keep the shared index/window interface above, but avoid
++            // a second snapshot/event store and its translation-to-RAM path.
++            if (IOMMUNonblockMode != 3) begin : gen_legacy_research
++                dma_research_observer #(.ResearchRole(IOMMUResearchRole)) i_research (
++                    .clk_i, .rst_ni, .cfg_valid_i(research_write && !research_policy_access && !composition_access),
++                    .cfg_write_i(research_write && !research_policy_access && !composition_access), .index_i(research_index),
++                    .wdata_i(research_wdata), .rdata_o(research_observer_data),
++                    .reverse_order_o(research_reverse),
++                    .quiet_i(research_dma_quiet && e3_ctl.quiet && !e3_tl.ptw_active),
++                    .supported_i(research.supported),
++                    .entries_i(research_entries), .entries_next_i(research_entries_next),
++                    .plru_i(research.plru), .update_i(research.update),
++                    .invalidate_i(research.invalidate), .replace_mask_i(research.replace_mask),
++                    .update_did_i(research.did), .lookup_i(research.lookup),
++                    .lookup_hit_i(research.hit), .lookup_did_i(research.did),
++                    .lookup_iova_i(research.iova), .lookup_pscid_i(research.pscid),
++                    .lookup_gscid_i(research.gscid), .lookup_stage1_i(research.stage1),
++                    .lookup_stage2_i(research.stage2), .ctl_state_i(e3_ctl.state),
++                    .ctl_did_i(e3_ctl.current_did), .select_fire_i(e3_ctl.select_valid),
++                    .select_did_i(e3_ctl.select_did),
++                    .response_error_i((e3_ctl.response_fire && e3_ctl.response_error) ||
++                                      (research.update && !research.normal)),
++                    .issue_i(obs_issue[1:0]), .done_i(obs_done[1:0]),
++                    .issue_id_i('{obs_issue_id[0], obs_issue_id[1]}),
++                    .done_id_i('{obs_done_id[0], obs_done_id[1]}),
++                    .p4m_arm_i(research_arm), .p4m_open_i(research_open),
++                    .p4m_close_i(research_close)
++                );
++            end else begin : gen_no_legacy_research
++                assign research_observer_data = '0;
++                assign research_reverse = 1'b0;
++            end
+             if (IOMMUResearchRole == 2) begin : gen_policy
+                 dma_research_policy i_policy (
+                     .clk_i, .rst_ni,
+@@ -1036,6 +1115,13 @@ module ariane_peripherals #(
+             end
+         end else begin : gen_no_research
+             assign research_data = '0;
++            assign composition_mode = 0;
++            assign composition_did = 24'd10;
++            assign composition_clear = 0;
++            assign composition_access = 0;
++            assign composition_index = 0;
++            assign composition_data = 0;
++            assign nonblock_data = '0;
+             assign research_policy_access = 1'b0;
+             assign research_observer_data = '0;
+             assign research_policy_data = '0;
+@@ -1174,6 +1260,13 @@ module ariane_peripherals #(
+                 .AXI_SLV_ID_WIDTH   ( ariane_soc::IdWidthSlave ),
+                 .AXI_USER_WIDTH     ( AxiUserWidth             ),
+                 .JOB_FIFO_DEPTH     ( 8                        ),
++                // N v2: a frozen batch job is one aligned 4 KiB copy. Keep
++                // its full source data until the paired write can drain, so
++                // a read-ahead burst cannot block the shared R return path.
++                // S and N use the same capacity; other DMA/legacy modes keep
++                // the existing three-beat buffer. Larger/multi-job streams
++                // are outside this prototype's dependency argument.
++                .BUFFER_DEPTH       ( IOMMUNonblockMode != 0 && i < 2 ? 512 : 3 ),
+                 .NUM_AX_IN_FLIGHT   ( 8                        ),
+                 .MEM_SYS_DEPTH      ( 0                        ),
+                 .RAW_COUPLING_AVAIL ( 0                        ),
+@@ -1189,6 +1282,8 @@ module ariane_peripherals #(
+             ) i_dma (
+                 .obs_issue_o(obs_issue[i]), .obs_done_o(obs_done[i]), .obs_poll_o(obs_poll[i]),
+                 .batch_active_o(batch_active[i]),
++                .batch_gap_active_o(batch_gap_active[i]), .job_quiet_o(job_quiet[i]),
++                .fullbuffer_job_o(fullbuffer_jobs[i]),
+                 .policy_enable_i(i == 1 && policy_enable),
+                 .policy_allow_i(i == 1 && policy_allow),
+                 .policy_abort_i(i == 1 && policy_abort),
+@@ -1223,6 +1318,7 @@ module ariane_peripherals #(
+     // AXI transactions directed to the DMA config port are responded with error.
+     else begin : gen_dma_disabled
+ 
++        assign fullbuffer_jobs = '0;
+ 		// AXI Bus between System Interconnect (Mst) and iDMA Configuration Port (Slv)
+ 		ariane_axi_soc::req_slv_t axi_dma_cfg_req;
+ 		ariane_axi_soc::resp_slv_t axi_dma_cfg_resp;
+@@ -1293,8 +1389,24 @@ module ariane_peripherals #(
+         //--------------
+         // RISC-V IOMMU
+         //--------------
++        // Keep extended 64-byte device contexts compatible with the existing
++        // Linux image. The banked prototype excludes MRIF, not flat MSI.
++        function automatic rv_iommu_cfg::rv_iommu_cfg_t nonblock_cfg();
++            rv_iommu_cfg::rv_iommu_cfg_t cfg = ariane_soc::RVIOMMUCfg;
++            if (IOMMUNonblockMode != 0) cfg.MSITrans = rv_iommu_cfg::MSI_BT_ONLY;
++            return cfg;
++        endfunction
++        initial begin
++            if (IOMMUNonblockMode > 3 ||
++                (IOMMUNonblockMode != 0 && (IOMMUResearchRole != 0 || IOMMULegacyE3Observer)))
++                $fatal(1, "Banked prototype cannot use legacy E3/COST observers");
++        end
+         rv_iommu_top #(
+-            .RVIOMMUCfg   (ariane_soc::RVIOMMUCfg),
++            .RVIOMMUCfg   (nonblock_cfg()),
++            .BankedEnable(IOMMUNonblockMode != 0),
++            .NonblockEnable(IOMMUNonblockMode != 0),
++            .PolicyEnable(IOMMUNonblockMode == 3),
++            .BankIdBit(DmaAxiIdWidth),
+             .E3Enable(InclDMA),
+ 
+             .axi_tr_aw_chan_t       (axi_tr_aw_chan_t),
+@@ -1331,6 +1443,11 @@ module ariane_peripherals #(
+         ) i_riscv_iommu (
+             .clk_i        (clk_i),
+             .rst_ni       (rst_ni),
++            .nonblock_enable_i(IOMMUNonblockMode == 3 ? composition_mode[0] :
++                               IOMMUNonblockMode == 2),
++            .policy_partition_i(IOMMUNonblockMode == 3 && composition_mode[1]),
++            .policy_clear_i(composition_clear), .policy_did_i(composition_did),
++            .policy_quiet_o(composition_iommu_quiet),
+             .tr_req_i     (axi_iommu_tr_req),
+             .tr_resp_o    (axi_iommu_tr_resp),
+             .comp_resp_i  (axi_iommu_comp_resp),
+@@ -1342,7 +1459,12 @@ module ariane_peripherals #(
+             .wsi_wires_o  (irq_sources[(ariane_soc::RVIOMMUCfg.NumIntVec-1)+7:7]),
+             .e3_enable_i(e3_control[0]), .e3_arm_i(e3_control[1]),
+             .e3_active_i(e3_control[3]), .e3_delay128_i(e3_control[7]),
+-            .e3_ctl_o(e3_ctl), .e3_tl_o(e3_tl), .research_o(research)
++            .e3_ctl_o(e3_ctl), .e3_tl_o(e3_tl), .research_o(research),
++            .nonblock_fire_o(nonblock_fire), .trans_accept_o(nonblock_trans_accept),
++            .nonblock_diag_o(nonblock_diag),
++            // Only DMA0/1 in this prototype have the whole-copy buffers.
++            .fullbuffer_jobs_i(IOMMUNonblockMode != 0 ? fullbuffer_jobs[1:0] : 2'b00),
++            .trans_did_o(nonblock_did), .trans_type_o(nonblock_type)
+         );
+ 
+     //----------
+@@ -1355,6 +1477,12 @@ module ariane_peripherals #(
+     end else begin : gen_iommu_disabled
+ 
+         assign research = '0;
++        assign nonblock_fire = 1'b0;
++        assign composition_iommu_quiet = 1'b0;
++        assign nonblock_diag = '0;
++        assign nonblock_trans_accept = 1'b0;
++        assign nonblock_did = '0;
++        assign nonblock_type = '0;
+ 
+         axi_err_slv #(
+             .AxiIdWidth ( ariane_soc::IdWidthSlave   ),
+diff --git a/corev_apu/fpga/src/ariane_xilinx.sv b/corev_apu/fpga/src/ariane_xilinx.sv
+index 3b2b3385bf08e8abfb59740606774b92cec52cc3..3a34ee79d51fd31d7f822c8046e569eb491c2c8b 100644
+--- a/corev_apu/fpga/src/ariane_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_xilinx.sv
+@@ -169,6 +169,7 @@ localparam int unsigned IOMMUDSFixedDelayOutput = 50;
+ localparam int unsigned IOMMULegacyE3Observer = 1;
+ // 0 legacy profiles; 1 E2 v2; 2 method v2. Set by the pinned platform builder.
+ localparam int unsigned IOMMUResearchRole = 0;
++    localparam int unsigned IOMMUNonblockMode = 0;
+ 
+ `AXI_TYPEDEF_ALL(axi_slave,
+                  logic [    AxiAddrWidth-1:0],
+@@ -806,6 +807,7 @@ end
+   logic [3:0] unused_switches = 4'b0000;
+ `endif
+ 
++
+ ariane_peripherals #(
+     .AxiAddrWidth ( AxiAddrWidth     ),
+     .AxiDataWidth ( AxiDataWidth     ),
+@@ -819,6 +821,7 @@ ariane_peripherals #(
+     .IOMMUDSFixedDelayOutput ( IOMMUDSFixedDelayOutput ),
+     .IOMMULegacyE3Observer   ( IOMMULegacyE3Observer   ),
+     .IOMMUResearchRole       ( IOMMUResearchRole       ),
++    .IOMMUNonblockMode       ( IOMMUNonblockMode       ),
+     `ifdef KINTEX7
+     .InclSPI      ( 1'b1         ),
+     .InclEthernet ( 1'b1         )
+diff --git a/corev_apu/fpga/src/dma_composition_control.sv b/corev_apu/fpga/src/dma_composition_control.sv
+new file mode 100644
+index 0000000000000000000000000000000000000000..04312ee786074cd6d1a7f8b05afa54e15113949c
+--- /dev/null
++++ b/corev_apu/fpga/src/dma_composition_control.sv
+@@ -0,0 +1,520 @@
++// SPDX-License-Identifier: Solderpad-0.51
++//
++// dma_composition_control
++//
++// New-profile mode/clear control and (open, close] window observer.
++// The module is passive with respect to AXI and the IOTLB data paths: it only
++// exposes the new mode, protected DID and a same-cycle clear pulse on an
++// accepted offset-2 config write.
++//
++// 128-word relative bank, selected by index_i[6:0] where index_i == 0 maps to
++// D20.  Only word 2 is writable.  All other writes are ignored.
++//
++// Entry layout matches rv_iommu_iotlb research_o.entries:
++//   bit 51      : valid
++//   bits 48:29 : PSCID
++//
++// The production array ports are unpacked 16 x 128 bit arrays.  The test top
++// converts its flat Verilator public array into these unpacked arrays.
++//
++// lookup_i is the translation logic's one-cycle first-lookup pulse for each
++// normal request.  Window counters 12:20 count every lookup_i pulse while the
++// window is active; seen_lookup_v/a are only used to latch the first PSCID for
++// offsets 38/39.
++//
++// Test-only compile hook: CVC_TEST_GEN_FULL initializes generation to all ones.
++// It is not a port parameter and default synthesis sees generation = 0.
++//
++module dma_composition_control (
++    input  logic               clk_i,
++    input  logic               rst_ni,
++
++    input  logic               cfg_write_i,
++    input  logic [6:0]         index_i,
++    input  logic [63:0]        wdata_i,
++    output logic [63:0]        rdata_o,
++
++    input  logic               quiet_i,
++    input  logic               supported_i,
++    input  logic               arm_i,
++    input  logic               open_i,
++    input  logic               close_i,
++
++    output logic [1:0]         mode_o,
++    output logic [23:0]        protected_did_o,
++    output logic               clear_o,
++
++    input  logic               lookup_i,
++    input  logic               lookup_hit_i,
++    input  logic               normal_i,
++    input  logic               stage1_i,
++    input  logic               stage2_i,
++    input  logic [23:0]        lookup_did_i,
++    input  logic [19:0]        lookup_pscid_i,
++
++    input  logic               accept_i,
++    input  logic               fast_i,
++    input  logic [23:0]        fast_did_i,
++
++    input  logic [1:0]         gap_active_i,
++
++    input  logic               update_i,
++    input  logic               invalidate_i,
++    input  logic [23:0]        update_did_i,
++    input  logic [15:0]        replace_mask_i,
++    input  logic [127:0]       entries_i [16],
++    input  logic [127:0]       entries_next_i [16],
++    input  logic [31:0]        plru_i
++);
++
++    localparam logic [63:0] COMP_MAGIC = 64'h49444D4143504E01;
++    localparam logic [63:0] COMP_ABI   = 64'd1;
++    localparam logic [63:0] PROT_MASK  = 64'd3;
++
++    localparam logic [1:0] MODE_S  = 2'd0;
++    localparam logic [1:0] MODE_N  = 2'd1;
++    localparam logic [1:0] MODE_P  = 2'd2;
++    localparam logic [1:0] MODE_PN = 2'd3;
++
++    localparam logic [23:0] DID_V = 24'd10;
++    localparam logic [23:0] DID_A = 24'd11;
++
++    localparam int ENTRY_VALID_BIT = 51;
++    localparam int PSCID_LSB = 29;
++    localparam int PSCID_MSB = 48;
++
++    // Counters 12:20 count every lookup_i pulse while the window is active.
++    // lookup_i is the translation logic's one-cycle first-lookup pulse for each
++    // normal request, not a per-window first event.
++    localparam int W_LOOKUP_V = 12;
++    localparam int W_HIT_V    = 13;
++    localparam int W_MISS_V   = 14;
++    localparam int W_LOOKUP_A = 15;
++    localparam int W_HIT_A    = 16;
++    localparam int W_MISS_A   = 17;
++    localparam int W_LOOKUP_O = 18;
++    localparam int W_HIT_O    = 19;
++    localparam int W_MISS_O   = 20;
++    localparam int W_FAST_V   = 21;
++    localparam int W_FAST_A   = 22;
++    localparam int W_FAST_O   = 23;
++    localparam int W_GAP_V    = 24;
++    localparam int W_GAP_A    = 25;
++    localparam int W_FILL_V   = 26;
++    localparam int W_FILL_A   = 27;
++    localparam int W_FILL_O   = 28;
++    localparam int W_REPL     = 29;
++    localparam int W_PART     = 30;
++    localparam int W_INVAL    = 31;
++    localparam int W_FIRST_BAD= 32;
++    localparam int W_FAST_N   = 33;
++
++    typedef enum logic [1:0] {S_OFF, S_ARMED, S_ACTIVE, S_FROZEN} state_e;
++
++    state_e      state_q, state_d;
++    logic [63:0] seq_q, seq_d;
++    logic [63:0] cycles_q, cycles_d;
++    logic [4:0]  err_q, err_d;
++    logic [63:0] cnt_q [40];
++    logic [63:0] cnt_d [40];
++
++    logic [63:0] win_cfg_q, win_cfg_d;
++    logic [63:0] win_gen_q, win_gen_d;
++
++    logic [31:0] plru_open_q, plru_open_d;
++    logic [31:0] plru_close_q, plru_close_d;
++
++    logic [19:0] pscid_v_q, pscid_v_d;
++    logic [19:0] pscid_a_q, pscid_a_d;
++
++    logic        seen_lookup_v_q, seen_lookup_v_d;
++    logic        seen_lookup_a_q, seen_lookup_a_d;
++
++    logic [127:0] entries_open_q [16];
++    logic [127:0] entries_open_d [16];
++    logic [127:0] entries_close_q [16];
++    logic [127:0] entries_close_d [16];
++
++    logic [1:0]  mode_q;
++    logic [23:0] protected_did_q;
++    logic [63:0] generation_q;
++    logic [2:0]  last_status_q;
++
++`ifdef CVC_TEST_GEN_FULL
++    localparam logic [63:0] INIT_GENERATION = {64{1'b1}};
++`else
++    localparam logic [63:0] INIT_GENERATION = 64'd0;
++`endif
++
++    logic cfg_busy;
++    logic cfg_data_legal;
++    logic quiet_obs;
++    logic [3:0] repl_idx;
++    logic lookup_ok;
++
++    always_comb begin
++        cfg_busy = !quiet_i || (state_q == S_ARMED) || (state_q == S_ACTIVE) ||
++                   arm_i || open_i || close_i;
++    end
++
++    always_comb begin
++        cfg_data_legal = (wdata_i[63:32] == 32'd0) &&
++                         (wdata_i[7:2] == 6'd0) &&
++                         ((wdata_i[31:8] == DID_V) || (wdata_i[31:8] == DID_A));
++    end
++
++    always_comb begin
++        quiet_obs = quiet_i && !(state_q == S_ARMED || state_q == S_ACTIVE) &&
++                    !arm_i && !open_i && !close_i;
++    end
++
++    always_comb begin
++        lookup_ok = normal_i && stage1_i && !stage2_i;
++    end
++
++    always_comb begin
++        repl_idx = 4'd0;
++        for (int i = 0; i < 16; i++) begin
++            if (replace_mask_i[i]) repl_idx = i[3:0];
++        end
++    end
++
++    always_comb begin
++        clear_o = rst_ni && cfg_write_i && (index_i == 7'd2) && !cfg_busy &&
++                  supported_i && cfg_data_legal &&
++                  (generation_q != {64{1'b1}});
++    end
++
++    always_ff @(posedge clk_i) begin
++        if (!rst_ni) begin
++            mode_q          <= MODE_S;
++            protected_did_q <= DID_V;
++            generation_q    <= INIT_GENERATION;
++            last_status_q   <= 3'd0;
++        end else if (cfg_write_i && (index_i == 7'd2)) begin
++            if (cfg_busy) begin
++                last_status_q <= 3'd1;
++            end else if (!supported_i || !cfg_data_legal) begin
++                last_status_q <= 3'd2;
++            end else if (generation_q == {64{1'b1}}) begin
++                last_status_q <= 3'd3;
++            end else begin
++                last_status_q   <= 3'd0;
++                mode_q          <= wdata_i[1:0];
++                protected_did_q <= wdata_i[31:8];
++                generation_q    <= generation_q + 64'd1;
++            end
++        end
++    end
++
++    always_comb begin
++        state_d = state_q;
++        seq_d = seq_q;
++        cycles_d = cycles_q;
++        err_d = err_q;
++        for (int i = 0; i < 40; i++) cnt_d[i] = cnt_q[i];
++        win_cfg_d = win_cfg_q;
++        win_gen_d = win_gen_q;
++        plru_open_d = plru_open_q;
++        plru_close_d = plru_close_q;
++        pscid_v_d = pscid_v_q;
++        pscid_a_d = pscid_a_q;
++        seen_lookup_v_d = seen_lookup_v_q;
++        seen_lookup_a_d = seen_lookup_a_q;
++        for (int i = 0; i < 16; i++) begin
++            entries_open_d[i] = entries_open_q[i];
++            entries_close_d[i] = entries_close_q[i];
++        end
++
++        if (arm_i) begin
++            if (open_i || close_i) begin
++                err_d[0] = 1'b1;
++            end else if (state_q == S_ACTIVE) begin
++                err_d[0] = 1'b1;
++            end else begin
++                state_d = S_ARMED;
++                err_d = 5'd0;
++                cycles_d = 64'd0;
++                for (int i = 0; i < 40; i++) cnt_d[i] = 64'd0;
++                seen_lookup_v_d = 1'b0;
++                seen_lookup_a_d = 1'b0;
++                pscid_v_d = 20'd0;
++                pscid_a_d = 20'd0;
++                win_cfg_d = {32'd0, protected_did_q, 6'd0, mode_q};
++                win_gen_d = generation_q;
++                plru_open_d = 32'd0;
++                plru_close_d = 32'd0;
++                for (int i = 0; i < 16; i++) begin
++                    entries_open_d[i] = 128'd0;
++                    entries_close_d[i] = 128'd0;
++                end
++                if (seq_q == {64{1'b1}}) err_d[1] = 1'b1;
++                else seq_d = seq_q + 64'd1;
++            end
++        end
++
++        if (open_i) begin
++            if (arm_i) begin
++                err_d[0] = 1'b1;
++            end else if (state_q == S_ARMED) begin
++                state_d = S_ACTIVE;
++                plru_open_d = plru_i;
++                for (int i = 0; i < 16; i++) entries_open_d[i] = entries_i[i];
++            end else begin
++                err_d[0] = 1'b1;
++            end
++        end
++
++        if (close_i) begin
++            if (arm_i) begin
++                err_d[0] = 1'b1;
++            end else if (state_q == S_ACTIVE) begin
++                state_d = S_FROZEN;
++                plru_close_d = plru_i;
++                for (int i = 0; i < 16; i++) entries_close_d[i] = entries_next_i[i];
++            end else begin
++                err_d[0] = 1'b1;
++            end
++        end
++
++        if (state_q == S_ACTIVE) begin
++            if (cycles_d == {64{1'b1}}) err_d[1] = 1'b1;
++            else cycles_d = cycles_d + 64'd1;
++
++            if (gap_active_i[0]) begin
++                if (cnt_d[W_GAP_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                else cnt_d[W_GAP_V] = cnt_d[W_GAP_V] + 64'd1;
++            end
++            if (gap_active_i[1]) begin
++                if (cnt_d[W_GAP_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                else cnt_d[W_GAP_A] = cnt_d[W_GAP_A] + 64'd1;
++            end
++
++            if (lookup_i) begin
++                if (lookup_did_i == DID_V) begin
++                    if (cnt_d[W_LOOKUP_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                    else cnt_d[W_LOOKUP_V] = cnt_d[W_LOOKUP_V] + 64'd1;
++                    if (lookup_hit_i) begin
++                        if (cnt_d[W_HIT_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_HIT_V] = cnt_d[W_HIT_V] + 64'd1;
++                    end else begin
++                        if (cnt_d[W_MISS_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_MISS_V] = cnt_d[W_MISS_V] + 64'd1;
++                    end
++                    if (lookup_ok) begin
++                        if (!seen_lookup_v_d) begin
++                            seen_lookup_v_d = 1'b1;
++                            pscid_v_d = lookup_pscid_i;
++                        end
++                    end else begin
++                        if (cnt_d[W_FIRST_BAD] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FIRST_BAD] = cnt_d[W_FIRST_BAD] + 64'd1;
++                        err_d[3] = 1'b1;
++                    end
++                end else if (lookup_did_i == DID_A) begin
++                    if (cnt_d[W_LOOKUP_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                    else cnt_d[W_LOOKUP_A] = cnt_d[W_LOOKUP_A] + 64'd1;
++                    if (lookup_hit_i) begin
++                        if (cnt_d[W_HIT_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_HIT_A] = cnt_d[W_HIT_A] + 64'd1;
++                    end else begin
++                        if (cnt_d[W_MISS_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_MISS_A] = cnt_d[W_MISS_A] + 64'd1;
++                    end
++                    if (lookup_ok) begin
++                        if (!seen_lookup_a_d) begin
++                            seen_lookup_a_d = 1'b1;
++                            pscid_a_d = lookup_pscid_i;
++                        end
++                    end else begin
++                        if (cnt_d[W_FIRST_BAD] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FIRST_BAD] = cnt_d[W_FIRST_BAD] + 64'd1;
++                        err_d[3] = 1'b1;
++                    end
++                end else begin
++                    if (cnt_d[W_LOOKUP_O] == {64{1'b1}}) err_d[1] = 1'b1;
++                    else cnt_d[W_LOOKUP_O] = cnt_d[W_LOOKUP_O] + 64'd1;
++                    if (lookup_hit_i) begin
++                        if (cnt_d[W_HIT_O] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_HIT_O] = cnt_d[W_HIT_O] + 64'd1;
++                    end else begin
++                        if (cnt_d[W_MISS_O] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_MISS_O] = cnt_d[W_MISS_O] + 64'd1;
++                    end
++                    if (!lookup_ok) begin
++                        if (cnt_d[W_FIRST_BAD] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FIRST_BAD] = cnt_d[W_FIRST_BAD] + 64'd1;
++                        err_d[3] = 1'b1;
++                    end
++                end
++            end
++
++            if (fast_i) begin
++                if (accept_i) begin
++                    if (fast_did_i == DID_V) begin
++                        if (cnt_d[W_FAST_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FAST_V] = cnt_d[W_FAST_V] + 64'd1;
++                    end else if (fast_did_i == DID_A) begin
++                        if (cnt_d[W_FAST_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FAST_A] = cnt_d[W_FAST_A] + 64'd1;
++                    end else begin
++                        if (cnt_d[W_FAST_O] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FAST_O] = cnt_d[W_FAST_O] + 64'd1;
++                    end
++                    if (!((mode_q == MODE_N) || (mode_q == MODE_PN))) begin
++                        if (cnt_d[W_FAST_N] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FAST_N] = cnt_d[W_FAST_N] + 64'd1;
++                        err_d[2] = 1'b1;
++                    end
++                end else begin
++                    err_d[0] = 1'b1;
++                end
++            end
++
++            if (update_i) begin
++                if ((replace_mask_i != 16'd0) &&
++                    ((replace_mask_i & (replace_mask_i - 16'd1)) == 16'd0)) begin
++                    if (update_did_i == DID_V) begin
++                        if (cnt_d[W_FILL_V] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FILL_V] = cnt_d[W_FILL_V] + 64'd1;
++                    end else if (update_did_i == DID_A) begin
++                        if (cnt_d[W_FILL_A] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FILL_A] = cnt_d[W_FILL_A] + 64'd1;
++                    end else begin
++                        if (cnt_d[W_FILL_O] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_FILL_O] = cnt_d[W_FILL_O] + 64'd1;
++                    end
++
++                    if ((mode_q == MODE_P) || (mode_q == MODE_PN)) begin
++                        if (update_did_i == protected_did_q) begin
++                            if (repl_idx >= 4'd2) begin
++                                if (cnt_d[W_PART] == {64{1'b1}}) err_d[1] = 1'b1;
++                                else cnt_d[W_PART] = cnt_d[W_PART] + 64'd1;
++                                err_d[4] = 1'b1;
++                            end
++                        end else begin
++                            if (repl_idx < 4'd2) begin
++                                if (cnt_d[W_PART] == {64{1'b1}}) err_d[1] = 1'b1;
++                                else cnt_d[W_PART] = cnt_d[W_PART] + 64'd1;
++                                err_d[4] = 1'b1;
++                            end
++                        end
++                    end
++
++                    if (entries_i[repl_idx][ENTRY_VALID_BIT] &&
++                        (entries_i[repl_idx][PSCID_MSB:PSCID_LSB] !=
++                         entries_next_i[repl_idx][PSCID_MSB:PSCID_LSB])) begin
++                        if (cnt_d[W_REPL] == {64{1'b1}}) err_d[1] = 1'b1;
++                        else cnt_d[W_REPL] = cnt_d[W_REPL] + 64'd1;
++                    end
++                end else begin
++                    err_d[3] = 1'b1;
++                end
++            end
++
++            if (invalidate_i) begin
++                if (cnt_d[W_INVAL] == {64{1'b1}}) err_d[1] = 1'b1;
++                else cnt_d[W_INVAL] = cnt_d[W_INVAL] + 64'd1;
++            end
++        end
++    end
++
++    always_ff @(posedge clk_i) begin
++        if (!rst_ni) begin
++            state_q <= S_OFF;
++            seq_q <= 64'd0;
++            cycles_q <= 64'd0;
++            err_q <= 5'd0;
++            for (int i = 0; i < 40; i++) cnt_q[i] <= 64'd0;
++            win_cfg_q <= 64'd0;
++            win_gen_q <= 64'd0;
++            plru_open_q <= 32'd0;
++            plru_close_q <= 32'd0;
++            pscid_v_q <= 20'd0;
++            pscid_a_q <= 20'd0;
++            seen_lookup_v_q <= 1'b0;
++            seen_lookup_a_q <= 1'b0;
++            for (int i = 0; i < 16; i++) begin
++                entries_open_q[i] <= 128'd0;
++                entries_close_q[i] <= 128'd0;
++            end
++        end else begin
++            state_q <= state_d;
++            seq_q <= seq_d;
++            cycles_q <= cycles_d;
++            err_q <= err_d;
++            for (int i = 0; i < 40; i++) cnt_q[i] <= cnt_d[i];
++            win_cfg_q <= win_cfg_d;
++            win_gen_q <= win_gen_d;
++            plru_open_q <= plru_open_d;
++            plru_close_q <= plru_close_d;
++            pscid_v_q <= pscid_v_d;
++            pscid_a_q <= pscid_a_d;
++            seen_lookup_v_q <= seen_lookup_v_d;
++            seen_lookup_a_q <= seen_lookup_a_d;
++            for (int i = 0; i < 16; i++) begin
++                entries_open_q[i] <= entries_open_d[i];
++                entries_close_q[i] <= entries_close_d[i];
++            end
++        end
++    end
++
++    assign mode_o = mode_q;
++    assign protected_did_o = protected_did_q;
++
++    always_comb begin
++        rdata_o = 64'd0;
++        case (index_i)
++            7'd0:  rdata_o = COMP_MAGIC;
++            7'd1:  rdata_o = COMP_ABI;
++            7'd2:  rdata_o = {32'd0, protected_did_q, 6'd0, mode_q};
++            7'd3:  rdata_o = generation_q;
++            7'd4:  rdata_o = {61'd0, last_status_q};
++            7'd5:  rdata_o = {63'd0, quiet_obs};
++            7'd6:  rdata_o = {61'd0, (state_q == S_FROZEN), (state_q == S_ACTIVE), (state_q == S_ARMED)};
++            7'd7:  rdata_o = seq_q;
++            7'd8:  rdata_o = cycles_q;
++            7'd9:  rdata_o = {59'd0, err_q};
++            7'd10: rdata_o = win_cfg_q;
++            7'd11: rdata_o = win_gen_q;
++            7'd12: rdata_o = cnt_q[W_LOOKUP_V];
++            7'd13: rdata_o = cnt_q[W_HIT_V];
++            7'd14: rdata_o = cnt_q[W_MISS_V];
++            7'd15: rdata_o = cnt_q[W_LOOKUP_A];
++            7'd16: rdata_o = cnt_q[W_HIT_A];
++            7'd17: rdata_o = cnt_q[W_MISS_A];
++            7'd18: rdata_o = cnt_q[W_LOOKUP_O];
++            7'd19: rdata_o = cnt_q[W_HIT_O];
++            7'd20: rdata_o = cnt_q[W_MISS_O];
++            7'd21: rdata_o = cnt_q[W_FAST_V];
++            7'd22: rdata_o = cnt_q[W_FAST_A];
++            7'd23: rdata_o = cnt_q[W_FAST_O];
++            7'd24: rdata_o = cnt_q[W_GAP_V];
++            7'd25: rdata_o = cnt_q[W_GAP_A];
++            7'd26: rdata_o = cnt_q[W_FILL_V];
++            7'd27: rdata_o = cnt_q[W_FILL_A];
++            7'd28: rdata_o = cnt_q[W_FILL_O];
++            7'd29: rdata_o = cnt_q[W_REPL];
++            7'd30: rdata_o = cnt_q[W_PART];
++            7'd31: rdata_o = cnt_q[W_INVAL];
++            7'd32: rdata_o = cnt_q[W_FIRST_BAD];
++            7'd33: rdata_o = cnt_q[W_FAST_N];
++            7'd34: rdata_o = PROT_MASK;
++            7'd35: rdata_o = 64'd0;
++            7'd36: rdata_o = {32'd0, plru_open_q};
++            7'd37: rdata_o = {32'd0, plru_close_q};
++            7'd38: rdata_o = {44'd0, pscid_v_q};
++            7'd39: rdata_o = {44'd0, pscid_a_q};
++            default: begin
++                if ((index_i >= 7'd64) && (index_i <= 7'd95)) begin
++                    rdata_o = index_i[0] ? entries_open_q[index_i[4:1]][127:64]
++                                         : entries_open_q[index_i[4:1]][63:0];
++                end else if ((index_i >= 7'd96) && (index_i <= 7'd127)) begin
++                    rdata_o = index_i[0] ? entries_close_q[index_i[4:1]][127:64]
++                                         : entries_close_q[index_i[4:1]][63:0];
++                end
++            end
++        endcase
++    end
++
++endmodule
+diff --git a/corev_apu/fpga/src/dma_nonblock_observer.sv b/corev_apu/fpga/src/dma_nonblock_observer.sv
+new file mode 100644
+index 0000000000000000000000000000000000000000..285d358d4cdd8aaa6649708983236169f6addf40
+--- /dev/null
++++ b/corev_apu/fpga/src/dma_nonblock_observer.sv
+@@ -0,0 +1,256 @@
++// SPDX-License-Identifier: Solderpad-0.51
++//
++// dma_nonblock_observer
++//
++// Passive, non-blocking (open, close] window observer. The module only samples
++// the DMA monitor bus; no output feeds back into the DMA or AXI data paths, and
++// the register bank is read-only from software.
++//
++// 16-word read-only bank, selected by the 8-bit index port:
++//   0  magic  0x49444D414E424C01
++//   1  version 1
++//   2  Mode
++//   3  flags  {.., frozen, active, armed}
++//   4  seq    monotonic, incremented once per ARM
++//   5  cycles active cycles counted inside (open, close]
++//   6  fast DID10 read
++//   7  fast DID10 write
++//   8  fast DID11 read
++//   9  fast DID11 write
++//  10  fast other
++//  11  normal DID10
++//  12  normal DID11
++//  13  normal other
++//  14  all accepted (== sum of words 6..13)
++//  15  sticky error bits
++//
++// Indices 16..31 expose a separate passive diagnostic bank; the original
++// words 0..15 are unchanged. Other indices read zero. rst is synchronous
++// and active high.
++//
++module dma_nonblock_observer #(
++    parameter int unsigned Mode = 2
++) (
++    input  logic        clk,
++    input  logic        rst,
++    input  logic        arm,
++    input  logic        open,
++    input  logic        close,
++    input  logic [7:0]  index,
++    output logic [63:0] rdata,
++    input  logic        accept,
++    input  logic        fast,
++    input  logic [23:0] did,
++    input  logic [5:0]  ttype,
++    input  logic [15:0] diag_events = 16'd0
++);
++    localparam logic [63:0] NB_MAGIC   = 64'h49444D414E424C01;
++    localparam logic [63:0] NB_VERSION = 64'd1;
++    localparam logic [63:0] DIAG_MAGIC = 64'h49444D414E444701;
++
++    // DID / transaction-type encodings used by the IOMMU.
++    localparam logic [23:0] DID_V = 24'd10;
++    localparam logic [23:0] DID_A = 24'd11;
++    localparam logic [5:0]  TT_R  = 6'b000010; // UNTRANSLATED_R
++    localparam logic [5:0]  TT_W  = 6'b000011; // UNTRANSLATED_W
++
++    // Error bit positions inside word 15.
++    localparam int E_OPEN_NO_ARM  = 0;
++    localparam int E_CLOSE_NO_ACT = 1;
++    localparam int E_OVERLAP      = 2;
++    localparam int E_OVERFLOW     = 3;
++    localparam int E_FAST_NO_ACPT = 4;
++    localparam int E_FAST_MODE1   = 5;
++    localparam int E_FAST_BAD_TT  = 6;
++
++    typedef enum logic [1:0] {S_OFF, S_ARMED, S_ACTIVE, S_FROZEN} state_e;
++
++    state_e      state_q, state_d;
++    logic [63:0] seq_q,   seq_d;
++    logic [63:0] cnt_q [16];
++    logic [63:0] cnt_d [16];
++    logic [63:0] err_q,   err_d;
++    logic [15:0] diag_seen_q, diag_seen_d;
++    logic [63:0] diag_cnt_q [9], diag_cnt_d [9];
++    logic diag_overflow_q, diag_overflow_d;
++
++    // Event classification selects (module scope so always_comb stays simple).
++    logic        ff_r10, ff_w10, ff_r11, ff_w11, ff_other;
++    logic        nn_10, nn_11, nn_other;
++    logic [3:0]  cat;
++    logic        arm_overlap;
++
++    always_comb begin
++        ff_r10   = fast && (did == DID_V) && (ttype == TT_R);
++        ff_w10   = fast && (did == DID_V) && (ttype == TT_W);
++        ff_r11   = fast && (did == DID_A) && (ttype == TT_R);
++        ff_w11   = fast && (did == DID_A) && (ttype == TT_W);
++        ff_other = fast && !(ff_r10 || ff_w10 || ff_r11 || ff_w11);
++        nn_10    = !fast && (did == DID_V);
++        nn_11    = !fast && (did == DID_A);
++        nn_other = !fast && (did != DID_V) && (did != DID_A);
++
++        cat = 4'd0;
++        if (accept) begin
++            if (ff_r10)        cat = 4'd6;
++            else if (ff_w10)   cat = 4'd7;
++            else if (ff_r11)   cat = 4'd8;
++            else if (ff_w11)   cat = 4'd9;
++            else if (fast)     cat = 4'd10;
++            else if (nn_10)    cat = 4'd11;
++            else if (nn_11)    cat = 4'd12;
++            else               cat = 4'd13;
++        end
++
++        arm_overlap = arm && (open || close);
++
++        state_d = state_q;
++        seq_d   = seq_q;
++        err_d   = err_q;
++        diag_seen_d = diag_seen_q;
++        diag_overflow_d = diag_overflow_q;
++        for (int i = 0; i < 9; i++) diag_cnt_d[i] = diag_cnt_q[i];
++        for (int i = 0; i < 16; i++) cnt_d[i] = cnt_q[i];
++
++        // ---- commands ----
++        // ARM clears the window and arms. Invalid while active or when asserted
++        // together with OPEN/CLOSE: set overlap error and preserve the window.
++        if (arm) begin
++            if (arm_overlap) begin
++                err_d[E_OVERLAP] = 1'b1;
++            end else if (state_q == S_ACTIVE) begin
++                err_d[E_OVERLAP] = 1'b1;
++            end else begin
++                state_d = S_ARMED;
++                err_d   = '0;
++                diag_seen_d = '0;
++                diag_overflow_d = 1'b0;
++                for (int i = 0; i < 9; i++) diag_cnt_d[i] = '0;
++                for (int i = 0; i < 16; i++) cnt_d[i] = '0;
++                if (seq_q == {64{1'b1}}) err_d[E_OVERFLOW] = 1'b1;
++                else                     seq_d = seq_q + 64'd1;
++            end
++        end
++
++        // OPEN is only legal from registered ARMED, with no same-cycle ARM.
++        // No open-edge event is counted.
++        if (open) begin
++            if (arm) begin
++                err_d[E_OVERLAP] = 1'b1; // ARM/OPEN overlap is invalid
++            end else if (state_q == S_ARMED) begin
++                state_d = S_ACTIVE;
++            end else if (state_q == S_ACTIVE) begin
++                err_d[E_OVERLAP] = 1'b1; // open while active
++            end else begin
++                err_d[E_OPEN_NO_ARM] = 1'b1; // open without arm
++            end
++        end
++
++        // CLOSE is only legal while registered ACTIVE, with no same-cycle ARM.
++        // Freezes the window.
++        if (close) begin
++            if (arm) begin
++                err_d[E_OVERLAP] = 1'b1; // ARM/CLOSE overlap is invalid
++            end else if (state_q == S_ACTIVE) begin
++                state_d = S_FROZEN;
++            end else begin
++                err_d[E_CLOSE_NO_ACT] = 1'b1;
++            end
++        end
++
++        // ---- window accumulation (open, close] ----
++        // Counting keys off the registered state, so the open-edge cycle is
++        // excluded and the close-edge cycle (state still S_ACTIVE) is included.
++        if (state_q == S_ACTIVE) begin
++            diag_seen_d = diag_seen_d | diag_events;
++            // Counts map to events 3..11. Probe phases can cross the window
++            // boundary; their counts need not form a complete lifecycle here.
++            for (int i = 0; i < 9; i++) begin
++                if (diag_events[i+3]) begin
++                    if (diag_cnt_d[i] == {64{1'b1}}) diag_overflow_d = 1'b1;
++                    else diag_cnt_d[i] = diag_cnt_d[i] + 64'd1;
++                end
++            end
++            if (cnt_d[5] == {64{1'b1}}) err_d[E_OVERFLOW] = 1'b1;
++            else                        cnt_d[5] = cnt_d[5] + 64'd1;
++
++            if (accept) begin
++                if (cnt_d[14] == {64{1'b1}}) err_d[E_OVERFLOW] = 1'b1;
++                else                         cnt_d[14] = cnt_d[14] + 64'd1;
++
++                if (cnt_d[cat] == {64{1'b1}}) err_d[E_OVERFLOW] = 1'b1;
++                else                          cnt_d[cat] = cnt_d[cat] + 64'd1;
++            end
++        end
++
++        // ---- fast protocol errors (sticky), only while a window is open/armed ----
++        if (state_q == S_ARMED || state_q == S_ACTIVE) begin
++            if (fast && !accept)                               err_d[E_FAST_NO_ACPT] = 1'b1;
++            if ((Mode == 1) && fast)                           err_d[E_FAST_MODE1]   = 1'b1;
++            if (fast && !((ttype == TT_R) || (ttype == TT_W))) err_d[E_FAST_BAD_TT]  = 1'b1;
++        end
++    end
++
++    always_comb begin
++        rdata = 64'd0;
++        case (index)
++            8'd0:  rdata = NB_MAGIC;
++            8'd1:  rdata = NB_VERSION;
++            8'd2:  rdata = 64'(Mode);
++            8'd3:  rdata = {61'd0, (state_q == S_FROZEN),
++                                     (state_q == S_ACTIVE),
++                                     (state_q == S_ARMED)};
++            8'd4:  rdata = seq_q;
++            8'd5:  rdata = cnt_q[5];
++            8'd6:  rdata = cnt_q[6];
++            8'd7:  rdata = cnt_q[7];
++            8'd8:  rdata = cnt_q[8];
++            8'd9:  rdata = cnt_q[9];
++            8'd10: rdata = cnt_q[10];
++            8'd11: rdata = cnt_q[11];
++            8'd12: rdata = cnt_q[12];
++            8'd13: rdata = cnt_q[13];
++            8'd14: rdata = cnt_q[14];
++            8'd15: rdata = err_q;
++            // Separate diagnostic bank: original words 0..15 stay unchanged.
++            8'd16: rdata = DIAG_MAGIC;
++            8'd17: rdata = 64'd1;
++            8'd18: rdata = 64'(Mode);
++            8'd19: rdata = {diag_overflow_q, 60'd0, (state_q == S_FROZEN),
++                                     (state_q == S_ACTIVE), (state_q == S_ARMED)};
++            8'd20: rdata = seq_q;
++            8'd21: rdata = cnt_q[5];
++            8'd22: rdata = {48'd0, diag_seen_q};
++            8'd23: rdata = diag_cnt_q[0];
++            8'd24: rdata = diag_cnt_q[1];
++            8'd25: rdata = diag_cnt_q[2];
++            8'd26: rdata = diag_cnt_q[3];
++            8'd27: rdata = diag_cnt_q[4];
++            8'd28: rdata = diag_cnt_q[5];
++            8'd29: rdata = diag_cnt_q[6];
++            8'd30: rdata = diag_cnt_q[7];
++            8'd31: rdata = diag_cnt_q[8];
++            default: rdata = 64'd0;
++        endcase
++    end
++
++    always_ff @(posedge clk) begin
++        if (rst) begin
++            state_q <= S_OFF;
++            seq_q   <= 64'd0;
++            err_q   <= 64'd0;
++            diag_seen_q <= '0;
++            diag_overflow_q <= 1'b0;
++            for (int i = 0; i < 9; i++) diag_cnt_q[i] <= 64'd0;
++            for (int i = 0; i < 16; i++) cnt_q[i] <= 64'd0;
++        end else begin
++            state_q <= state_d;
++            seq_q   <= seq_d;
++            err_q   <= err_d;
++            diag_seen_q <= diag_seen_d;
++            diag_overflow_q <= diag_overflow_d;
++            for (int i = 0; i < 9; i++) diag_cnt_q[i] <= diag_cnt_d[i];
++            for (int i = 0; i < 16; i++) cnt_q[i] <= cnt_d[i];
++        end
++    end
++endmodule
+diff --git a/corev_apu/fpga/src/dma_observer.sv b/corev_apu/fpga/src/dma_observer.sv
+index 25ff895d726c545c990b72f393fe60e70c2e4843..97c2d96e19beb344520ff1164ec3d7e21ffa3813 100644
+--- a/corev_apu/fpga/src/dma_observer.sv
++++ b/corev_apu/fpga/src/dma_observer.sv
+@@ -39,7 +39,12 @@ module dma_observer #(
+     output logic research_arm_o, research_open_o, research_close_o
+ );
+     // Low byte is interface version; a missing observer must never look valid.
+-    localparam logic [63:0] Magic = ResearchEnable ? 64'h49444d414f425308 :
++    // V9: composition/P4M bank with neither legacy path timers nor E3.
++    // A distinct version makes old drivers reject this trimmed interface.
++    localparam bit TrimmedComposition = ResearchEnable && P4MEnable &&
++        !PathEnable && !E3Enable && !ControlledEnable;
++    localparam logic [63:0] Magic = TrimmedComposition ? 64'h49444d414f425309 :
++        ResearchEnable ? 64'h49444d414f425308 :
+         (P4MEnable ? 64'h49444d414f425307 :
+         ((ControlledEnable && E3Enable) ? 64'h49444d414f425306 :
+         (E3Enable ? 64'h49444d414f425305 :
+diff --git a/corev_apu/iDMA/Bender.yml b/corev_apu/iDMA/Bender.yml
+index 95b1b081093ce7ec0e67d2260d166498ccad2204..7a3159bf90c0ba66ca910f7c04bbb73b71aa2abf 100644
+--- a/corev_apu/iDMA/Bender.yml
++++ b/corev_apu/iDMA/Bender.yml
+@@ -25,6 +25,7 @@ sources:
+   - src/frontends/idma_transfer_id_gen.sv
+   - src/idma_pkg.sv
+   - src/idma_stream_fifo.sv
++  - src/idma_fullbuffer_certificate.sv
+   # Level 1
+   - src/idma_buffer.sv
+   - src/idma_error_handler.sv
+diff --git a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+index ab8e9a83c6b62e548d1f977e57d5513c9e447640..bcfb06acb01f5f57e551b98714bc5dddf8d1fc4b 100644
+--- a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
++++ b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+@@ -31,6 +31,8 @@ module idma_reg64_frontend #(
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
+     output logic batch_active_o,
++    output logic batch_gap_active_o,
++    output logic job_quiet_o,
+     // ResearchPort policy gate (active only when ResearchPort).
+     input  logic policy_enable_i, policy_allow_i, policy_abort_i, batch_reverse_i,
+     // Optional controlled-launch handshake (active only when LaunchPort).
+@@ -141,6 +143,11 @@ module idma_reg64_frontend #(
+                              (full_addr >= LauncherBase) && !gap_access;
+     assign batch_access = BatchPort && dma_ctrl_req_i.valid && full_addr[7] && !launcher_access;
+     assign batch_active_o = BatchPort && batch_enable_q && state_q != IDLE;
++    // Passive observation of actual inserted wait; no control feedback.
++    assign batch_gap_active_o = BatchPort && batch_enable_q && state_q == GAP;
++    // Covers software jobs, queued backend work and a same-cycle launch read.
++    assign job_quiet_o = state_q == IDLE && backend_idle_i && !valid_o &&
++                         !issue && !dma_reg2hw.next_id.re;
+     assign locked_write = batch_active_o && dma_ctrl_req_i.valid &&
+                           dma_ctrl_req_i.write && !batch_access && !observer_access && !launcher_access;
+     assign batch_cfg_ok = !batch_error_q && batch_target_q != 0 && batch_target_q <= 33'h100000000 &&
+diff --git a/corev_apu/iDMA/src/idma_fullbuffer_certificate.sv b/corev_apu/iDMA/src/idma_fullbuffer_certificate.sv
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed3cd18cbebde91fa21dd4b7f94c7278f8aee50c
+--- /dev/null
++++ b/corev_apu/iDMA/src/idma_fullbuffer_certificate.sv
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier: Solderpad-0.51
++// Permission for one complete, aligned 4 KiB copy in a sufficiently large
++// data buffer. Samples accepted frontend jobs and retired backend jobs only;
++// it never changes either handshake. The register frontend serializes jobs.
++// Unexpected overlap/retirement revokes this new permission until reset.
++module idma_fullbuffer_certificate #(
++    parameter int unsigned CapacityBytes = 0
++) (
++    input logic clk_i, rst_ni,
++    input logic job_fire_i, job_done_i, normal_copy_i,
++    input logic [63:0] length_i, src_i, dst_i,
++    output logic permit_o
++);
++    logic pending_q, eligible_q, fault_q;
++    logic eligible;
++    assign eligible = CapacityBytes >= 4096 && normal_copy_i &&
++                      length_i == 64'd4096 && src_i[11:0] == 0 && dst_i[11:0] == 0;
++    assign permit_o = pending_q && eligible_q && !fault_q && normal_copy_i;
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            pending_q <= 1'b0;
++            eligible_q <= 1'b0;
++            fault_q <= 1'b0;
++        end else begin
++            case ({job_fire_i, job_done_i})
++                2'b10: begin
++                    if (pending_q) fault_q <= 1'b1;
++                    pending_q <= 1'b1;
++                    eligible_q <= eligible;
++                end
++                2'b01: begin
++                    if (!pending_q) fault_q <= 1'b1;
++                    pending_q <= 1'b0;
++                    eligible_q <= 1'b0;
++                end
++                2'b11: begin
++                    // Replace a completed sole job; an immediately completed
++                    // job with no predecessor needs no read permission.
++                    pending_q <= pending_q;
++                    eligible_q <= pending_q && eligible;
++                end
++                default: ;
++            endcase
++        end
++    end
++endmodule
+diff --git a/corev_apu/iDMA/src/idma_stream_fifo.sv b/corev_apu/iDMA/src/idma_stream_fifo.sv
+index 73f7d33593d8c247a4f14d763860b2aa791b43d6..67b8b8a0f44d25ce93e1174bf9f33e33252d0f7f 100644
+--- a/corev_apu/iDMA/src/idma_stream_fifo.sv
++++ b/corev_apu/iDMA/src/idma_stream_fifo.sv
+@@ -104,7 +104,10 @@ module idma_stream_fifo #(
+         // stream fifo
+         stream_fifo #(
+             .DEPTH        ( Depth  ),
+-            .T            ( type_t )
++            .T            ( type_t ),
++            // Full 4 KiB N/S byte lanes use the existing FPGA RAM queue.
++            // Small legacy queues and other payload types keep their storage.
++            .FORCE_FPGA_RAM ( Depth == 32'd512 && $bits(type_t) == 8 )
+         ) i_stream_fifo (
+             .clk_i,
+             .rst_ni,
+diff --git a/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv b/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
+index 29290e61b19a4b81f7e6d035218c4429b91ccf76..23633f6d4de1a8e4fedd6695338156671d02bfec 100644
+--- a/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
++++ b/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
+@@ -45,6 +45,9 @@ module dma_core_wrap #(
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
+   output logic batch_active_o,
++  output logic batch_gap_active_o,
++  output logic job_quiet_o,
++  output logic fullbuffer_job_o,
+   input  logic policy_enable_i, policy_allow_i, policy_abort_i, batch_reverse_i,
+   input  logic launch_hold_i, launch_go_i, launch_cancel_i,
+   output logic launch_held_o, launch_active_o, launch_cancelled_o, launch_error_o,
+@@ -142,7 +145,7 @@ module dma_core_wrap #(
+       .AxiIdWidth      ( AxiIdWidth     ),
+       .AxID            ( AxID           )
+     ) i_dma_frontend (
+-      .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o,
++      .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o, .batch_gap_active_o, .job_quiet_o,
+       .policy_enable_i, .policy_allow_i, .policy_abort_i, .batch_reverse_i,
+       .launch_hold_i, .launch_go_i, .launch_cancel_i,
+       .launch_held_o, .launch_active_o, .launch_cancelled_o, .launch_error_o,
+@@ -167,6 +170,19 @@ module dma_core_wrap #(
+       .rdata_valid_i    ( rdata_valid       )
+     );
+ 
++    idma_fullbuffer_certificate #(
++        .CapacityBytes (BufferDepth * (AxiDataWidth / 8))
++    ) i_fullbuffer_certificate (
++        .clk_i, .rst_ni,
++        .job_fire_i (be_valid_d && be_ready_d),
++        .job_done_i (idma_rsp_valid && idma_rsp_ready),
++        .normal_copy_i (ttype == idma_pkg::DEFAULT),
++        .length_i (64'(burst_req_d.length)),
++        .src_i (64'(burst_req_d.src_addr)),
++        .dst_i (64'(burst_req_d.dst_addr)),
++        .permit_o (fullbuffer_job_o)
++    );
++
+     stream_fifo #(
+         .FALL_THROUGH ( 1'b0         ),
+         .DATA_WIDTH   ( AxiDataWidth ),
+@@ -192,6 +208,9 @@ module dma_core_wrap #(
+ 
+   end else begin : gen_two_d
+     assign batch_active_o = 1'b0;
++    assign batch_gap_active_o = 1'b0;
++    assign job_quiet_o = 1'b0; // unsupported frontend cannot authorize switching
++    assign fullbuffer_job_o = 1'b0;
+     assign obs_issue_o = 1'b0;
+     assign obs_done_o = 1'b0;
+     assign obs_poll_o = 1'b0;
+@@ -364,6 +383,9 @@ module dma_core_wrap_intf #(
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
+   output logic batch_active_o,
++  output logic batch_gap_active_o,
++  output logic job_quiet_o,
++  output logic fullbuffer_job_o,
+   input  logic policy_enable_i, policy_allow_i, policy_abort_i, batch_reverse_i,
+   input  logic launch_hold_i, launch_go_i, launch_cancel_i,
+   output logic launch_held_o, launch_active_o, launch_cancelled_o, launch_error_o,
+@@ -425,7 +447,8 @@ module dma_core_wrap_intf #(
+     .PROCESS_ID       ( PROCESS_ID         ),
+     .AxID             ( AxID               )
+   ) i_dma_core_wrap (
+-      .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o,
++      .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o, .batch_gap_active_o, .job_quiet_o,
++      .fullbuffer_job_o,
+       .policy_enable_i, .policy_allow_i, .policy_abort_i, .batch_reverse_i,
+       .launch_hold_i, .launch_go_i, .launch_cancel_i,
+       .launch_held_o, .launch_active_o, .launch_cancelled_o, .launch_error_o,
+diff --git a/vendor/pulp-platform/common_cells/src/fifo_v3.sv b/vendor/pulp-platform/common_cells/src/fifo_v3.sv
+index 11b77e02583bd4b2da6eec0255b1b0c66f489ad1..417e0ef2205a5f294c9c55033f1640c459a53792 100644
+--- a/vendor/pulp-platform/common_cells/src/fifo_v3.sv
++++ b/vendor/pulp-platform/common_cells/src/fifo_v3.sv
+@@ -16,7 +16,9 @@ module fifo_v3 #(
+     parameter int unsigned DEPTH        = 8,    // depth can be arbitrary from 0 to 2**32
+     parameter type dtype                = logic [DATA_WIDTH-1:0],
+     // DO NOT OVERWRITE THIS PARAMETER
+-    parameter int unsigned ADDR_DEPTH   = (DEPTH > 1) ? $clog2(DEPTH) : 1
++    parameter int unsigned ADDR_DEPTH   = (DEPTH > 1) ? $clog2(DEPTH) : 1,
++    // Local FPGA storage selection; keep existing positional parameters intact.
++    parameter bit          FORCE_FPGA_RAM = 1'b0
+ )(
+     input  logic  clk_i,            // Clock
+     input  logic  rst_ni,           // Asynchronous reset active low
+@@ -36,6 +38,7 @@ module fifo_v3 #(
+     // local parameter
+     // FIFO depth - handle the case of pass-through, synthesizer will do constant propagation
+     localparam int unsigned FifoDepth = (DEPTH > 0) ? DEPTH : 1;
++    localparam bit UseFpgaRam = ariane_pkg::FPGA_EN || FORCE_FPGA_RAM;
+     // clock gating control
+     logic gate_clock;
+     // pointer to the read and write section of the queue
+@@ -70,7 +73,7 @@ module fifo_v3 #(
+         read_pointer_n  = read_pointer_q;
+         write_pointer_n = write_pointer_q;
+         status_cnt_n    = status_cnt_q;
+-        if (ariane_pkg::FPGA_EN) begin
++        if (UseFpgaRam) begin
+              fifo_ram_we             = '0;
+              fifo_ram_read_address   = read_pointer_q;
+              fifo_ram_write_address  = '0;
+@@ -84,7 +87,7 @@ module fifo_v3 #(
+ 
+         // push a new element to the queue
+         if (push_i && ~full_o) begin
+-            if (ariane_pkg::FPGA_EN) begin
++            if (UseFpgaRam) begin
+                 fifo_ram_we = 1'b1;
+                 fifo_ram_write_address = write_pointer_q;
+                 fifo_ram_wdata = data_i;
+@@ -149,7 +152,7 @@ module fifo_v3 #(
+         end
+     end
+ 
+-    if (ariane_pkg::FPGA_EN) begin : gen_fpga_queue
++    if (UseFpgaRam) begin : gen_fpga_queue
+         AsyncDpRam #(
+             .ADDR_WIDTH (ADDR_DEPTH),
+             .DATA_DEPTH (DEPTH),
+diff --git a/vendor/pulp-platform/common_cells/src/stream_fifo.sv b/vendor/pulp-platform/common_cells/src/stream_fifo.sv
+index e7c60e57e2f82abe691bba138674dba7cdacec76..ecd61140d03905222d21ed04d45ef921af8325b8 100644
+--- a/vendor/pulp-platform/common_cells/src/stream_fifo.sv
++++ b/vendor/pulp-platform/common_cells/src/stream_fifo.sv
+@@ -19,7 +19,8 @@ module stream_fifo #(
+     parameter int unsigned DEPTH        = 8,
+     parameter type         T            = logic [DATA_WIDTH-1:0],
+     // DO NOT OVERWRITE THIS PARAMETER
+-    parameter int unsigned ADDR_DEPTH  = (DEPTH > 1) ? $clog2(DEPTH) : 1
++    parameter int unsigned ADDR_DEPTH  = (DEPTH > 1) ? $clog2(DEPTH) : 1,
++    parameter bit          FORCE_FPGA_RAM = 1'b0
+ ) (
+     input  logic                  clk_i,      // Clock
+     input  logic                  rst_ni,     // Asynchronous reset active low
+@@ -48,7 +49,8 @@ module stream_fifo #(
+         .FALL_THROUGH   (FALL_THROUGH),
+         .DATA_WIDTH     (DATA_WIDTH),
+         .DEPTH          (DEPTH),
+-        .dtype(T)
++        .dtype(T),
++        .FORCE_FPGA_RAM (FORCE_FPGA_RAM)
+     ) fifo_i (
+         .clk_i,
+         .rst_ni,

@@ -1,0 +1,1231 @@
+From e729d498e80f866281fa136ddb163c884714b9e8 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:52:05 +0900
+Subject: [PATCH 14/27] Control finite held DMA jobs and A-read-triggered
+ victim launch
+
+Source-organization: 2026-10-17; new commit authored at actual current time.
+Feature-ID: CVA6-HELD-LAUNCH
+Original-source: 2b04936d
+Validation scope: source/patch identity only; no build, simulation or experiment.
+---
+ .../fpga/src/ariane_peripherals_xilinx.sv     |  55 +-
+ corev_apu/fpga/src/dma_controlled_launcher.sv | 539 ++++++++++++++++++
+ corev_apu/fpga/src/dma_observer.sv            |  20 +-
+ .../register_64bit/idma_reg64_frontend.sv     | 235 ++++++--
+ .../src/systems/cva6_reg/dma_core_wrap.sv     |  20 +-
+ 5 files changed, 812 insertions(+), 57 deletions(-)
+ create mode 100644 corev_apu/fpga/src/dma_controlled_launcher.sv
+
+diff --git a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+index 2e9fee3a7d8ade887a69be70c9346f739440cc78..af1798eb58a587b021d320d8f13601e0f5874af9 100644
+--- a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+@@ -911,9 +911,11 @@ module ariane_peripherals #(
+         logic [NumDMADevices-1:0] obs_issue, obs_done, obs_poll, batch_active;
+         logic [63:0] obs_issue_id [NumDMADevices], obs_done_id [NumDMADevices], obs_poll_id [NumDMADevices];
+         logic [NumDMADevices-1:0] obs_cfg_valid, obs_cfg_write;
+-        logic [6:0] obs_cfg_addr [NumDMADevices];
+-        logic [63:0] obs_cfg_wdata [NumDMADevices], obs_cfg_rdata;
++        logic [7:0] obs_cfg_addr [NumDMADevices];
++        logic [63:0] obs_cfg_wdata [NumDMADevices], legacy_cfg_rdata, launch_cfg_rdata, obs_cfg_rdata;
+         logic [7:0] obs_cfg_wstrb [NumDMADevices];
++        logic [NumDMADevices-1:0] launch_hold, launch_go, launch_cancel;
++        logic [NumDMADevices-1:0] launch_held, launch_active, launch_cancelled, launch_error;
+         logic [NumDMADevices-1:0] obs_arvalid, obs_awvalid, obs_arready, obs_awready;
+         logic [NumDMADevices-1:0] obs_rlast, obs_b, obs_bad_id;
+         for (genvar o = 0; o < NumDMADevices; o++) begin : gen_dma_observation
+@@ -930,12 +932,13 @@ module ariane_peripherals #(
+                 (axi_dma_tr_resp[o].b_valid && |axi_dma_tr_resp[o].b.id);
+         end
+         dma_observer #(.NumPorts(NumDMADevices), .PathEnable(InclIOMMU),
+-                       .E3Enable(InclIOMMU),
++                       .E3Enable(InclIOMMU), .ControlledEnable(InclIOMMU),
+                        .AxiIdWidth(ariane_soc::IdWidth)) i_dma_observer (
+             .clk_i, .rst_ni,
+-            .cfg_valid_i(obs_cfg_valid[0]), .cfg_write_i(obs_cfg_write[0]),
+-            .cfg_addr_i(obs_cfg_addr[0]), .cfg_wdata_i(obs_cfg_wdata[0]),
+-            .cfg_wstrb_i(obs_cfg_wstrb[0]), .cfg_rdata_o(obs_cfg_rdata),
++            .cfg_valid_i(obs_cfg_valid[0] && !obs_cfg_addr[0][7]),
++            .cfg_write_i(obs_cfg_write[0]),
++            .cfg_addr_i(obs_cfg_addr[0][6:0]), .cfg_wdata_i(obs_cfg_wdata[0]),
++            .cfg_wstrb_i(obs_cfg_wstrb[0]), .cfg_rdata_o(legacy_cfg_rdata),
+             .e3_data_i(e3_data), .e3_error_i(e3_error), .e3_control_o(e3_control), .e3_index_o(e3_index),
+             .issue_i(obs_issue), .done_i(obs_done), .poll_i(obs_poll),
+             .batch_active_i(batch_active),
+@@ -956,6 +959,38 @@ module ariane_peripherals #(
+                        axi_iommu_comp_resp.r_valid && axi_iommu_comp_resp.r.last && axi_iommu_comp_req.r_ready})
+         );
+ 
++        assign obs_cfg_rdata = obs_cfg_addr[0][7] ? launch_cfg_rdata : legacy_cfg_rdata;
++        if (InclIOMMU) begin : gen_launcher
++            dma_controlled_launcher #(.NumPorts(NumDMADevices)) i_launcher (
++                .clk_i, .rst_ni,
++                .cfg_valid_i(obs_cfg_valid[0] && obs_cfg_addr[0][7]),
++                .cfg_write_i(obs_cfg_write[0]),
++                .cfg_addr_i(obs_cfg_addr[0]),
++                .cfg_wdata_i(obs_cfg_wdata[0]),
++                .cfg_wstrb_i(obs_cfg_wstrb[0]),
++                .cfg_rdata_o(launch_cfg_rdata),
++                .frontend_held_i(launch_held),
++                .frontend_active_i(launch_active),
++                .frontend_cancelled_i(launch_cancelled),
++                .frontend_error_i(launch_error),
++                .obs_issue_i(obs_issue), .obs_done_i(obs_done),
++                .obs_issue_id_i(obs_issue_id), .obs_done_id_i(obs_done_id),
++                .selected_i(e3_ctl.select_valid),
++                .select_write_i(e3_ctl.select_write),
++                .select_id_i(e3_ctl.select_id),
++                .select_did_i(e3_ctl.select_did),
++                .select_iova_i(e3_ctl.select_iova),
++                .launch_hold_o(launch_hold),
++                .launch_go_o(launch_go),
++                .launch_cancel_o(launch_cancel)
++            );
++        end else begin : gen_no_launcher
++            assign launch_hold = '0;
++            assign launch_go = '0;
++            assign launch_cancel = '0;
++            assign launch_cfg_rdata = '0;
++        end
++
+         dma_e3_observer i_e3_observer (
+             .clk_i,.rst_ni,.arm_i(e3_control[1]),.clear_i(e3_control[2]),
+             .active_i(e3_control[3]),.open_i(e3_control[4]),.close_i(e3_control[5]),
+@@ -1056,6 +1091,7 @@ module ariane_peripherals #(
+                 .IS_TWO_D           ( 0                        ),
+                 .BATCH_PORT (1'b1),
+                 .OBSERVER_PORT      ( i == 0                   ),
++                .LAUNCH_PORT        ( InclIOMMU && i < 2       ),
+ 
+                 .DEVICE_ID          ( 24'(10 + i)              ),
+                 .PROCESS_ID         ( 20'(20 + i)              ),
+@@ -1067,6 +1103,13 @@ module ariane_peripherals #(
+                 .obs_cfg_valid_o(obs_cfg_valid[i]), .obs_cfg_write_o(obs_cfg_write[i]),
+                 .obs_cfg_addr_o(obs_cfg_addr[i]), .obs_cfg_wdata_o(obs_cfg_wdata[i]),
+                 .obs_cfg_wstrb_o(obs_cfg_wstrb[i]), .obs_cfg_rdata_i(obs_cfg_rdata),
++                .launch_hold_i(launch_hold[i]),
++                .launch_go_i(launch_go[i]),
++                .launch_cancel_i(launch_cancel[i]),
++                .launch_held_o(launch_held[i]),
++                .launch_active_o(launch_active[i]),
++                .launch_cancelled_o(launch_cancelled[i]),
++                .launch_error_o(launch_error[i]),
+                 .clk_i          ( clk_i              ),
+                 .rst_ni         ( rst_ni             ),
+                 .testmode_i     ( 1'b0               ),
+diff --git a/corev_apu/fpga/src/dma_controlled_launcher.sv b/corev_apu/fpga/src/dma_controlled_launcher.sv
+new file mode 100644
+index 0000000000000000000000000000000000000000..f390088904d71e4eb4abe94df85729e9ebff222c
+--- /dev/null
++++ b/corev_apu/fpga/src/dma_controlled_launcher.sv
+@@ -0,0 +1,539 @@
++// SPDX-License-Identifier: Solderpad-0.51
++// Controlled launcher for the iDMA observer-port frontend.
++// This block does not gate AXI. It only observes E3 select, frontend status,
++// and backend issue/done, and drives hold/go/cancel to the controlled ports.
++//
++// Error bits [63:32] are sticky until a successful PREP or CLEAR while inactive.
++// bit  name
++//  0   bad_cfg_strobe          partial cfg_wstrb_i
++//  1   bad_command             unknown or unsupported command
++//  2   bad_prep                PREP not allowed in current state
++//  3   bad_go                  GO not allowed in current state
++//  4   abort_inactive          ABORT while not active/frozen
++//  5   frontend_error          frontend_error_i while owned
++//  6   unexpected_issue        obs_issue_i on unselected port or in PREP
++//  7   unexpected_done         obs_done_i on unselected port or in PREP
++//  8   done_without_issue      obs_done_i before obs_issue_i
++//  9   issue_id_zero           actual issue ID is zero
++// 10   done_id_mismatch        done ID differs from captured issue ID
++// 11   extra_issue             more than one issue on a lane
++// 12   extra_done              more than one done on a lane
++// 13   tick_overflow           64-bit tick counter saturated
++// 14   bad_index               c0 index outside 0..31
++// 15   bad_c8_write            write to read-only c8
++// 16   bad_b0_write            write to read-only b0
++// 17   cancel_issue_race       frontend_cancelled and obs_issue same edge
++module dma_controlled_launcher #(
++    parameter int unsigned NumPorts = 4
++) (
++    input  logic clk_i, rst_ni,
++    // 8-bit MMIO cfg window: b0 magic, b8 command/status, c0 index, c8 data.
++    input  logic cfg_valid_i, cfg_write_i,
++    input  logic [7:0] cfg_addr_i,
++    input  logic [63:0] cfg_wdata_i,
++    input  logic [7:0] cfg_wstrb_i,
++    output logic [63:0] cfg_rdata_o,
++    // Controlled frontend status.
++    input  logic [NumPorts-1:0] frontend_held_i,
++    input  logic [NumPorts-1:0] frontend_active_i,
++    input  logic [NumPorts-1:0] frontend_cancelled_i,
++    input  logic [NumPorts-1:0] frontend_error_i,
++    // Actual backend accept/completion.
++    input  logic [NumPorts-1:0] obs_issue_i,
++    input  logic [NumPorts-1:0] obs_done_i,
++    input  logic [63:0] obs_issue_id_i [NumPorts],
++    input  logic [63:0] obs_done_id_i [NumPorts],
++    // E3 select tap.  Only select_id is AXI-visible; obs IDs are NEXT_ID.
++    input  logic selected_i,
++    input  logic select_write_i,
++    input  logic [7:0] select_id_i,
++    input  logic [23:0] select_did_i,
++    input  logic [63:0] select_iova_i,
++    // Frontend controls.
++    output logic [NumPorts-1:0] launch_hold_o,
++    output logic [NumPorts-1:0] launch_go_o,
++    output logic [NumPorts-1:0] launch_cancel_o
++);
++    localparam logic [63:0] MAGIC = 64'h49444d414c4e4301;
++    localparam int unsigned V_PORT = 0;
++    localparam int unsigned A_PORT = 1;
++    localparam logic [7:0] A_SEL_ID = 8'd4;
++    localparam logic [23:0] A_DID = 24'd11;
++    localparam logic [63:0] CMD_PREP = 64'h1;
++    localparam logic [63:0] CMD_GO = 64'h2;
++    localparam logic [63:0] CMD_ABORT = 64'h4;
++    localparam logic [63:0] CMD_CLEAR = 64'h8;
++    localparam logic [63:0] CMD_HAS_A = 64'h100;
++
++    localparam int ERR_BAD_STROBE = 0;
++    localparam int ERR_BAD_CMD = 1;
++    localparam int ERR_BAD_PREP = 2;
++    localparam int ERR_BAD_GO = 3;
++    localparam int ERR_ABORT = 4;
++    localparam int ERR_FRONTEND = 5;
++    localparam int ERR_UNEXP_ISSUE = 6;
++    localparam int ERR_UNEXP_DONE = 7;
++    localparam int ERR_DONE_NO_ISSUE = 8;
++    localparam int ERR_ISSUE_ID = 9;
++    localparam int ERR_DONE_ID = 10;
++    localparam int ERR_EXTRA_ISSUE = 11;
++    localparam int ERR_EXTRA_DONE = 12;
++    localparam int ERR_TICK_OVF = 13;
++    localparam int ERR_BAD_INDEX = 14;
++    localparam int ERR_BAD_C8_WRITE = 15;
++    localparam int ERR_BAD_B0_WRITE = 16;
++    localparam int ERR_CANCEL_ISSUE_RACE = 17;
++
++    typedef enum logic [1:0] {ST_OFF, ST_PREP, ST_RUNNING, ST_FROZEN} state_t;
++    state_t state_q, state_n;
++
++    logic [31:0] error_q, error_n;
++    logic [63:0] ticks_q, ticks_n;
++    logic [NumPorts-1:0] expected_mask_q, expected_mask_n;
++    logic [NumPorts-1:0] hold_mask_q, hold_mask_n;
++    logic [NumPorts-1:0] issued_mask_q, issued_mask_n;
++    logic [NumPorts-1:0] done_mask_q, done_mask_n;
++    logic [NumPorts-1:0] cancelled_mask_q, cancelled_mask_n;
++    logic [NumPorts-1:0] seen_held_q, seen_held_n;
++    logic aborted_q, aborted_n;
++    logic has_a_q, has_a_n;
++    logic [7:0] index_q, index_n;
++
++    logic [63:0] issue_id_q [NumPorts], issue_id_n [NumPorts];
++    logic [63:0] done_id_q [NumPorts], done_id_n [NumPorts];
++    logic issue_id_valid_q [NumPorts], issue_id_valid_n [NumPorts];
++    logic done_id_valid_q [NumPorts], done_id_valid_n [NumPorts];
++    logic [63:0] issue_count_q [NumPorts], issue_count_n [NumPorts];
++    logic [63:0] done_count_q [NumPorts], done_count_n [NumPorts];
++    logic [63:0] issue_ts_q [NumPorts], issue_ts_n [NumPorts];
++    logic [63:0] done_ts_q [NumPorts], done_ts_n [NumPorts];
++    logic issue_ts_valid_q [NumPorts], issue_ts_valid_n [NumPorts];
++    logic done_ts_valid_q [NumPorts], done_ts_valid_n [NumPorts];
++
++    logic [63:0] go_a_ts_q, go_a_ts_n;
++    logic [63:0] a_select_ts_q, a_select_ts_n;
++    logic [63:0] go_v_ts_q, go_v_ts_n;
++    logic go_a_ts_valid_q, go_a_ts_valid_n;
++    logic a_select_ts_valid_q, a_select_ts_valid_n;
++    logic go_v_ts_valid_q, go_v_ts_valid_n;
++
++    logic [7:0] selected_id_q, selected_id_n;
++    logic [23:0] selected_did_q, selected_did_n;
++    logic [63:0] selected_iova_q, selected_iova_n;
++    logic selected_write_q, selected_write_n;
++
++    logic [NumPorts-1:0] go_pulse_q, go_pulse_n;
++    logic a_go_sent_q, a_go_sent_n;
++    logic v_go_sent_q, v_go_sent_n;
++    logic a_select_seen_q, a_select_seen_n;
++
++    logic [63:0] status_word;
++    logic new_abort_cmd, abort_eff;
++
++    assign new_abort_cmd = cfg_valid_i && cfg_write_i && (cfg_wstrb_i == 8'hff) &&
++                           (cfg_addr_i == 8'hb8) && (cfg_wdata_i == CMD_ABORT);
++    assign abort_eff = aborted_q || new_abort_cmd;
++
++    assign launch_hold_o = hold_mask_q;
++    assign launch_go_o = abort_eff ? '0 : go_pulse_q;
++
++    always_comb begin : status_comb
++        status_word = '0;
++        status_word[63:32] = error_q;
++        status_word[15:12] = 4'(frontend_active_i);
++        status_word[11:8]  = 4'(frontend_held_i);
++        status_word[3] = aborted_q;
++        status_word[2] = (state_q == ST_FROZEN);
++        status_word[1] = (state_q == ST_RUNNING);
++        status_word[0] = (state_q == ST_PREP);
++    end
++
++    always_comb begin : cancel_comb
++        launch_cancel_o = '0;
++        if ((state_q == ST_PREP || state_q == ST_RUNNING) && abort_eff) begin
++            for (int p = 0; p < NumPorts; p++) begin
++                if (expected_mask_q[p] && hold_mask_q[p] && frontend_held_i[p] &&
++                    !issued_mask_q[p] && !cancelled_mask_q[p]) begin
++                    launch_cancel_o[p] = 1'b1;
++                end
++            end
++        end
++    end
++
++    always_comb begin : read_comb
++        cfg_rdata_o = '0;
++        case (cfg_addr_i)
++            8'hb0: cfg_rdata_o = MAGIC;
++            8'hb8: cfg_rdata_o = status_word;
++            8'hc0: cfg_rdata_o = {56'b0, index_q};
++            8'hc8: begin
++                case (index_q)
++                    8'd0:  cfg_rdata_o = MAGIC;
++                    8'd1:  cfg_rdata_o = {32'b0, error_q};
++                    8'd2:  cfg_rdata_o = status_word;
++                    8'd3:  cfg_rdata_o = ticks_q;
++                    8'd4:  cfg_rdata_o = go_a_ts_q;
++                    8'd5:  cfg_rdata_o = a_select_ts_q;
++                    8'd6:  cfg_rdata_o = go_v_ts_q;
++                    8'd7:  cfg_rdata_o = issue_ts_q[V_PORT];
++                    8'd8:  cfg_rdata_o = issue_ts_q[A_PORT];
++                    8'd9:  cfg_rdata_o = done_ts_q[V_PORT];
++                    8'd10: cfg_rdata_o = done_ts_q[A_PORT];
++                    8'd11: cfg_rdata_o = issue_id_q[V_PORT];
++                    8'd12: cfg_rdata_o = issue_id_q[A_PORT];
++                    8'd13: cfg_rdata_o = done_id_q[V_PORT];
++                    8'd14: cfg_rdata_o = done_id_q[A_PORT];
++                    8'd15: cfg_rdata_o = 64'(issued_mask_q);
++                    8'd16: cfg_rdata_o = 64'(done_mask_q);
++                    8'd17: cfg_rdata_o = 64'(cancelled_mask_q);
++                    8'd18: cfg_rdata_o = 64'(seen_held_q);
++                    8'd19: cfg_rdata_o = 64'(expected_mask_q);
++                    8'd20: cfg_rdata_o = 64'(selected_id_q);
++                    8'd21: cfg_rdata_o = 64'(selected_did_q);
++                    8'd22: cfg_rdata_o = selected_iova_q;
++                    8'd23: cfg_rdata_o = {63'b0, selected_write_q};
++                    8'd24: cfg_rdata_o = issue_count_q[V_PORT];
++                    8'd25: cfg_rdata_o = issue_count_q[A_PORT];
++                    8'd26: cfg_rdata_o = done_count_q[V_PORT];
++                    8'd27: cfg_rdata_o = done_count_q[A_PORT];
++                    8'd28: cfg_rdata_o = {63'b0, has_a_q};
++                    8'd29: cfg_rdata_o = 64'(frontend_held_i);
++                    8'd30: cfg_rdata_o = 64'(frontend_active_i);
++                    8'd31: cfg_rdata_o = '0;
++                    default: cfg_rdata_o = '0;
++                endcase
++            end
++            default: cfg_rdata_o = '0;
++        endcase
++    end
++
++    always_comb begin : main_comb
++        state_n = state_q;
++        error_n = error_q;
++        ticks_n = ticks_q;
++        expected_mask_n = expected_mask_q;
++        hold_mask_n = hold_mask_q;
++        issued_mask_n = issued_mask_q;
++        done_mask_n = done_mask_q;
++        cancelled_mask_n = cancelled_mask_q;
++        seen_held_n = seen_held_q;
++        aborted_n = aborted_q;
++        has_a_n = has_a_q;
++        index_n = index_q;
++        go_a_ts_n = go_a_ts_q;
++        a_select_ts_n = a_select_ts_q;
++        go_v_ts_n = go_v_ts_q;
++        go_a_ts_valid_n = go_a_ts_valid_q;
++        a_select_ts_valid_n = a_select_ts_valid_q;
++        go_v_ts_valid_n = go_v_ts_valid_q;
++        selected_id_n = selected_id_q;
++        selected_did_n = selected_did_q;
++        selected_iova_n = selected_iova_q;
++        selected_write_n = selected_write_q;
++        go_pulse_n = '0;
++        a_go_sent_n = a_go_sent_q;
++        v_go_sent_n = v_go_sent_q;
++        a_select_seen_n = a_select_seen_q;
++
++        for (int p = 0; p < NumPorts; p++) begin
++            issue_id_n[p] = issue_id_q[p];
++            done_id_n[p] = done_id_q[p];
++            issue_id_valid_n[p] = issue_id_valid_q[p];
++            done_id_valid_n[p] = done_id_valid_q[p];
++            issue_count_n[p] = issue_count_q[p];
++            done_count_n[p] = done_count_q[p];
++            issue_ts_n[p] = issue_ts_q[p];
++            done_ts_n[p] = done_ts_q[p];
++            issue_ts_valid_n[p] = issue_ts_valid_q[p];
++            done_ts_valid_n[p] = done_ts_valid_q[p];
++        end
++
++        // Tick counter while owned. Saturates and sets sticky fault.
++        if (state_q == ST_PREP || state_q == ST_RUNNING) begin
++            if (ticks_q == {64{1'b1}}) begin
++                error_n[ERR_TICK_OVF] = 1'b1;
++            end else begin
++                ticks_n = ticks_q + 1'b1;
++            end
++        end
++
++        // Track held seen while owned.
++        if (state_q == ST_PREP || state_q == ST_RUNNING) begin
++            seen_held_n = seen_held_q | frontend_held_i;
++        end
++
++        // Record frontend error while owned.
++        if ((state_q == ST_PREP || state_q == ST_RUNNING) &&
++            |(frontend_error_i & expected_mask_q)) begin
++            error_n[ERR_FRONTEND] = 1'b1;
++        end
++
++        // Actual backend events.  IDs are arbitrary non-zero NEXT_ID values.
++        if (state_q == ST_PREP || state_q == ST_RUNNING) begin
++            if (|(obs_issue_i & ~expected_mask_q)) error_n[ERR_UNEXP_ISSUE] = 1'b1;
++            if (|(obs_done_i & ~expected_mask_q)) error_n[ERR_UNEXP_DONE] = 1'b1;
++            for (int p = 0; p < NumPorts; p++) begin
++                if (obs_issue_i[p] && expected_mask_q[p]) begin
++                    if (state_q == ST_PREP) error_n[ERR_UNEXP_ISSUE] = 1'b1;
++                    if (issued_mask_q[p]) error_n[ERR_EXTRA_ISSUE] = 1'b1;
++                    if (obs_issue_id_i[p] == 64'd0) error_n[ERR_ISSUE_ID] = 1'b1;
++                    if (!issue_id_valid_q[p]) begin
++                        issue_id_n[p] = obs_issue_id_i[p];
++                        issue_id_valid_n[p] = 1'b1;
++                    end
++                    issued_mask_n[p] = 1'b1;
++                    issue_count_n[p] = issue_count_q[p] + 1'b1;
++                    if (!issue_ts_valid_q[p]) begin
++                        issue_ts_n[p] = ticks_q;
++                        issue_ts_valid_n[p] = 1'b1;
++                    end
++                end
++                if (obs_done_i[p] && expected_mask_q[p]) begin
++                    if (state_q == ST_PREP) error_n[ERR_UNEXP_DONE] = 1'b1;
++                    if (!issued_mask_q[p] && !obs_issue_i[p]) error_n[ERR_DONE_NO_ISSUE] = 1'b1;
++                    if (done_mask_q[p]) error_n[ERR_EXTRA_DONE] = 1'b1;
++                    if (issue_id_valid_q[p] && obs_done_id_i[p] != issue_id_q[p]) begin
++                        error_n[ERR_DONE_ID] = 1'b1;
++                    end
++                    done_mask_n[p] = 1'b1;
++                    done_count_n[p] = done_count_q[p] + 1'b1;
++                    if (!done_id_valid_q[p]) begin
++                        done_id_n[p] = obs_done_id_i[p];
++                        done_id_valid_n[p] = 1'b1;
++                    end
++                    if (!done_ts_valid_q[p]) begin
++                        done_ts_n[p] = ticks_q;
++                        done_ts_valid_n[p] = 1'b1;
++                    end
++                end
++                if (obs_issue_i[p] && frontend_cancelled_i[p]) begin
++                    error_n[ERR_CANCEL_ISSUE_RACE] = 1'b1;
++                end
++            end
++        end
++
++        // Command writes.
++        if (cfg_valid_i && cfg_write_i) begin
++            if (cfg_wstrb_i != 8'hff) begin
++                error_n[ERR_BAD_STROBE] = 1'b1;
++            end else begin
++                case (cfg_addr_i)
++                    8'hb0: error_n[ERR_BAD_B0_WRITE] = 1'b1;
++                    8'hb8: begin
++                        if ((cfg_wdata_i & ~CMD_HAS_A) == CMD_PREP) begin
++                            if ((state_q == ST_OFF || state_q == ST_FROZEN) &&
++                                frontend_active_i == '0 && frontend_held_i == '0) begin
++                                state_n = ST_PREP;
++                                aborted_n = 1'b0;
++                                error_n = '0;
++                                has_a_n = cfg_wdata_i[8];
++                                expected_mask_n = '0;
++                                expected_mask_n[V_PORT] = 1'b1;
++                                expected_mask_n[A_PORT] = cfg_wdata_i[8];
++                                hold_mask_n = expected_mask_n;
++                                issued_mask_n = '0;
++                                done_mask_n = '0;
++                                cancelled_mask_n = '0;
++                                seen_held_n = '0;
++                                ticks_n = '0;
++                                go_a_ts_n = '0; a_select_ts_n = '0; go_v_ts_n = '0;
++                                go_a_ts_valid_n = 1'b0; a_select_ts_valid_n = 1'b0; go_v_ts_valid_n = 1'b0;
++                                selected_id_n = '0; selected_did_n = '0; selected_iova_n = '0; selected_write_n = 1'b0;
++                                go_pulse_n = '0;
++                                a_go_sent_n = 1'b0; v_go_sent_n = 1'b0; a_select_seen_n = 1'b0;
++                                for (int p = 0; p < NumPorts; p++) begin
++                                    issue_id_n[p] = '0; done_id_n[p] = '0;
++                                    issue_id_valid_n[p] = 1'b0; done_id_valid_n[p] = 1'b0;
++                                    issue_count_n[p] = '0; done_count_n[p] = '0;
++                                    issue_ts_n[p] = '0; done_ts_n[p] = '0;
++                                    issue_ts_valid_n[p] = 1'b0; done_ts_valid_n[p] = 1'b0;
++                                end
++                            end else begin
++                                error_n[ERR_BAD_PREP] = 1'b1;
++                            end
++                        end else if (cfg_wdata_i == CMD_GO) begin
++                            if (state_q == ST_PREP && error_n == '0 &&
++                                (frontend_held_i & expected_mask_q) == expected_mask_q) begin
++                                state_n = ST_RUNNING;
++                                if (has_a_q) begin
++                                    go_pulse_n[A_PORT] = 1'b1;
++                                    a_go_sent_n = 1'b1;
++                                    if (!go_a_ts_valid_q) begin
++                                        go_a_ts_n = ticks_q + 1'b1;
++                                        go_a_ts_valid_n = 1'b1;
++                                    end
++                                end else begin
++                                    go_pulse_n[V_PORT] = 1'b1;
++                                    v_go_sent_n = 1'b1;
++                                    if (!go_v_ts_valid_q) begin
++                                        go_v_ts_n = ticks_q + 1'b1;
++                                        go_v_ts_valid_n = 1'b1;
++                                    end
++                                end
++                            end else begin
++                                error_n[ERR_BAD_GO] = 1'b1;
++                            end
++                        end else if (cfg_wdata_i == CMD_ABORT) begin
++                            if (state_q == ST_OFF) begin
++                                state_n = ST_FROZEN;
++                                aborted_n = 1'b1;
++                                hold_mask_n = '0;
++                            end else if (state_q == ST_PREP || state_q == ST_RUNNING) begin
++                                aborted_n = 1'b1;
++                                state_n = ST_RUNNING;
++                            end else begin
++                                error_n[ERR_ABORT] = 1'b1;
++                            end
++                        end else if (cfg_wdata_i == CMD_CLEAR) begin
++                            if (state_q == ST_OFF || state_q == ST_FROZEN) begin
++                                state_n = ST_OFF;
++                                aborted_n = 1'b0;
++                                error_n = '0;
++                                expected_mask_n = '0;
++                                hold_mask_n = '0;
++                                issued_mask_n = '0;
++                                done_mask_n = '0;
++                                cancelled_mask_n = '0;
++                                seen_held_n = '0;
++                                ticks_n = '0;
++                                go_a_ts_n = '0; a_select_ts_n = '0; go_v_ts_n = '0;
++                                go_a_ts_valid_n = 1'b0; a_select_ts_valid_n = 1'b0; go_v_ts_valid_n = 1'b0;
++                                selected_id_n = '0; selected_did_n = '0; selected_iova_n = '0; selected_write_n = 1'b0;
++                                go_pulse_n = '0;
++                                a_go_sent_n = 1'b0; v_go_sent_n = 1'b0; a_select_seen_n = 1'b0;
++                                for (int p = 0; p < NumPorts; p++) begin
++                                    issue_id_n[p] = '0; done_id_n[p] = '0;
++                                    issue_id_valid_n[p] = 1'b0; done_id_valid_n[p] = 1'b0;
++                                    issue_count_n[p] = '0; done_count_n[p] = '0;
++                                    issue_ts_n[p] = '0; done_ts_n[p] = '0;
++                                    issue_ts_valid_n[p] = 1'b0; done_ts_valid_n[p] = 1'b0;
++                                end
++                            end else begin
++                                error_n[ERR_BAD_CMD] = 1'b1;
++                            end
++                        end else begin
++                            error_n[ERR_BAD_CMD] = 1'b1;
++                        end
++                    end
++                    8'hc0: begin
++                        if (cfg_wdata_i < 64'd32) index_n = cfg_wdata_i[7:0];
++                        else error_n[ERR_BAD_INDEX] = 1'b1;
++                    end
++                    8'hc8: error_n[ERR_BAD_C8_WRITE] = 1'b1;
++                    default: error_n[ERR_BAD_CMD] = 1'b1;
++                endcase
++            end
++        end
++
++        // A select capture and V go, but ABORT wins same-edge.
++        if (!abort_eff && state_q == ST_RUNNING && has_a_q && !a_select_seen_q && !v_go_sent_q) begin
++            if (selected_i && !select_write_i && select_id_i == A_SEL_ID && select_did_i == A_DID &&
++                (obs_issue_i[A_PORT] || issued_mask_q[A_PORT])) begin
++                a_select_seen_n = 1'b1;
++                selected_id_n = select_id_i;
++                selected_did_n = select_did_i;
++                selected_iova_n = select_iova_i;
++                selected_write_n = select_write_i;
++                if (!a_select_ts_valid_q) begin
++                    a_select_ts_n = ticks_q;
++                    a_select_ts_valid_n = 1'b1;
++                end
++                go_pulse_n[V_PORT] = 1'b1;
++                v_go_sent_n = 1'b1;
++                if (!go_v_ts_valid_q) begin
++                    go_v_ts_n = ticks_q + 1'b1;
++                    go_v_ts_valid_n = 1'b1;
++                end
++            end
++        end
++
++        // Abort drain: record only actual frontend_cancelled pulses.
++        if ((state_q == ST_PREP || state_q == ST_RUNNING) && abort_eff) begin
++            for (int p = 0; p < NumPorts; p++) begin
++                if (expected_mask_q[p] && hold_mask_q[p] && frontend_cancelled_i[p]) begin
++                    if (obs_issue_i[p]) begin
++                        error_n[ERR_CANCEL_ISSUE_RACE] = 1'b1;
++                    end else if (!cancelled_mask_q[p]) begin
++                        cancelled_mask_n[p] = 1'b1;
++                        hold_mask_n[p] = 1'b0;
++                    end
++                end
++            end
++        end
++
++        // Finish conditions, only after drain.
++        if (state_q == ST_RUNNING && !aborted_q) begin
++            if (issued_mask_q == expected_mask_q && done_mask_q == expected_mask_q &&
++                (frontend_held_i & expected_mask_q) == '0 &&
++                (frontend_active_i & expected_mask_q) == '0) begin
++                state_n = ST_FROZEN;
++                hold_mask_n = '0;
++            end
++        end
++        if (state_q == ST_RUNNING && aborted_q) begin
++            if ((frontend_held_i & expected_mask_q) == '0 &&
++                (frontend_active_i & expected_mask_q) == '0 &&
++                (issued_mask_q & ~done_mask_q) == '0 &&
++                ((expected_mask_q & ~issued_mask_q & ~cancelled_mask_q & seen_held_q) == '0)) begin
++                state_n = ST_FROZEN;
++                hold_mask_n = '0;
++            end
++        end
++    end
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            state_q <= ST_OFF;
++            error_q <= '0;
++            ticks_q <= '0;
++            expected_mask_q <= '0;
++            hold_mask_q <= '0;
++            issued_mask_q <= '0;
++            done_mask_q <= '0;
++            cancelled_mask_q <= '0;
++            seen_held_q <= '0;
++            aborted_q <= 1'b0;
++            has_a_q <= 1'b0;
++            index_q <= '0;
++            go_a_ts_q <= '0; a_select_ts_q <= '0; go_v_ts_q <= '0;
++            go_a_ts_valid_q <= 1'b0; a_select_ts_valid_q <= 1'b0; go_v_ts_valid_q <= 1'b0;
++            selected_id_q <= '0; selected_did_q <= '0; selected_iova_q <= '0; selected_write_q <= 1'b0;
++            go_pulse_q <= '0;
++            a_go_sent_q <= 1'b0; v_go_sent_q <= 1'b0; a_select_seen_q <= 1'b0;
++            for (int p = 0; p < NumPorts; p++) begin
++                issue_id_q[p] <= '0; done_id_q[p] <= '0;
++                issue_id_valid_q[p] <= 1'b0; done_id_valid_q[p] <= 1'b0;
++                issue_count_q[p] <= '0; done_count_q[p] <= '0;
++                issue_ts_q[p] <= '0; done_ts_q[p] <= '0;
++                issue_ts_valid_q[p] <= 1'b0; done_ts_valid_q[p] <= 1'b0;
++            end
++        end else begin
++            state_q <= state_n;
++            error_q <= error_n;
++            ticks_q <= ticks_n;
++            expected_mask_q <= expected_mask_n;
++            hold_mask_q <= hold_mask_n;
++            issued_mask_q <= issued_mask_n;
++            done_mask_q <= done_mask_n;
++            cancelled_mask_q <= cancelled_mask_n;
++            seen_held_q <= seen_held_n;
++            aborted_q <= aborted_n;
++            has_a_q <= has_a_n;
++            index_q <= index_n;
++            go_a_ts_q <= go_a_ts_n; a_select_ts_q <= a_select_ts_n; go_v_ts_q <= go_v_ts_n;
++            go_a_ts_valid_q <= go_a_ts_valid_n; a_select_ts_valid_q <= a_select_ts_valid_n;
++            go_v_ts_valid_q <= go_v_ts_valid_n;
++            selected_id_q <= selected_id_n; selected_did_q <= selected_did_n;
++            selected_iova_q <= selected_iova_n; selected_write_q <= selected_write_n;
++            go_pulse_q <= go_pulse_n;
++            a_go_sent_q <= a_go_sent_n; v_go_sent_q <= v_go_sent_n; a_select_seen_q <= a_select_seen_n;
++            for (int p = 0; p < NumPorts; p++) begin
++                issue_id_q[p] <= issue_id_n[p]; done_id_q[p] <= done_id_n[p];
++                issue_id_valid_q[p] <= issue_id_valid_n[p]; done_id_valid_q[p] <= done_id_valid_n[p];
++                issue_count_q[p] <= issue_count_n[p]; done_count_q[p] <= done_count_n[p];
++                issue_ts_q[p] <= issue_ts_n[p]; done_ts_q[p] <= done_ts_n[p];
++                issue_ts_valid_q[p] <= issue_ts_valid_n[p]; done_ts_valid_q[p] <= done_ts_valid_n[p];
++            end
++        end
++    end
++endmodule
+diff --git a/corev_apu/fpga/src/dma_observer.sv b/corev_apu/fpga/src/dma_observer.sv
+index c815510c3cceef01472ceeaa7e6571e78a04e71a..31221c69b3ed1dec76fffc483f434a11003a40c1 100644
+--- a/corev_apu/fpga/src/dma_observer.sv
++++ b/corev_apu/fpga/src/dma_observer.sv
+@@ -6,6 +6,7 @@ module dma_observer #(
+     parameter int unsigned OutstandingWidth = 8,
+     parameter bit PathEnable = 0,
+     parameter bit E3Enable = 0,
++    parameter bit ControlledEnable = 0,
+     parameter int AxiIdWidth = 4
+ ) (
+     input logic clk_i, rst_ni,
+@@ -30,8 +31,9 @@ module dma_observer #(
+     output logic [7:0] e3_control_o, e3_index_o
+ );
+     // Low byte is interface version; a missing observer must never look valid.
+-    localparam logic [63:0] Magic = E3Enable ? 64'h49444d414f425305 :
+-        (PathEnable ? 64'h49444d414f425303 : 64'h49444d414f425302);
++    localparam logic [63:0] Magic = (ControlledEnable && E3Enable) ? 64'h49444d414f425306 :
++        (E3Enable ? 64'h49444d414f425305 :
++        (PathEnable ? 64'h49444d414f425303 : 64'h49444d414f425302));
+     localparam int Count = 35;
+     typedef enum logic [2:0] {OFF, ARMED, HARDWARE, POLL_WAIT, REFILL, FROZEN, BATCH_READ} phase_t;
+     phase_t phase_q, phase_n;
+@@ -45,6 +47,7 @@ module dma_observer #(
+     logic [8:0] index_q, index_n;
+     logic [1:0] victim_q, victim_n, aggressor_q, aggressor_n;
+     logic has_a_q, has_a_n, batch_q, batch_n;
++    logic finite_q, finite_n;
+     logic busy;
+     assign busy = active || phase_q == BATCH_READ;
+     logic active, v_pending, a_pending;
+@@ -124,6 +127,7 @@ module dma_observer #(
+         aggressor_n = aggressor_q;
+         has_a_n = has_a_q;
+         batch_n = batch_q;
++        finite_n = finite_q;
+         path_n = path_q;
+         path_arm = 0;
+         path_clear = 0;
+@@ -173,7 +177,7 @@ module dma_observer #(
+             if (track_bad_n[victim_q] || (has_a_q && track_bad_n[aggressor_q]))
+                 error_n[3] = 1'b1;
+         end
+-        if (batch_q && (active || phase_q == ARMED && issue_i[victim_q]) &&
++        if (!finite_q && batch_q && (active || phase_q == ARMED && issue_i[victim_q]) &&
+             has_a_q && !batch_active_i[aggressor_q]) error_n[5] = 1'b1;
+         if (phase_q == BATCH_READ) begin
+             bump(34, 1'b1);
+@@ -267,8 +271,11 @@ module dma_observer #(
+                         end
+                     end else if (cfg_wdata_i == 4) begin
+                         if (busy || phase_q == ARMED) error_n[0] = 1'b1;
+-                        else begin phase_n = OFF; error_n = 0; path_clear = 1; path_n = 0; e3_n = 0; end
+-                    end else if ((cfg_wdata_i & ~64'h000000001f030301) == 0 && cfg_wdata_i[0] &&
++                        else begin phase_n = OFF; error_n = 0; path_clear = 1; path_n = 0; e3_n = 0; finite_n = 0; end
++                    end else if ((cfg_wdata_i & ~(64'h000000001f030301 | (ControlledEnable && E3Enable ? 64'h0000000020000000 : 64'h0))) == 0 && cfg_wdata_i[0] &&
++                                 (!cfg_wdata_i[29] || (ControlledEnable && E3Enable && cfg_wdata_i[27] && cfg_wdata_i[26] && cfg_wdata_i[25] &&
++                                    target_q == 64'd1 && cfg_wdata_i[9:8] == 0 &&
++                                    (!cfg_wdata_i[24] || cfg_wdata_i[17:16] == 1))) &&
+                                  (!cfg_wdata_i[28] || cfg_wdata_i[27]) &&
+                                  (!cfg_wdata_i[27] || (E3Enable && cfg_wdata_i[26] && cfg_wdata_i[9:8] == 0 &&
+                                     (!cfg_wdata_i[24] || cfg_wdata_i[17:16] == 1))) &&
+@@ -282,6 +289,7 @@ module dma_observer #(
+                         aggressor_n = cfg_wdata_i[17:16];
+                         has_a_n = cfg_wdata_i[24];
+                         batch_n = cfg_wdata_i[25];
++                        finite_n = cfg_wdata_i[29];
+                         path_n = cfg_wdata_i[26];
+                         path_arm = cfg_wdata_i[26];
+                         e3_n = cfg_wdata_i[27];
+@@ -308,6 +316,7 @@ module dma_observer #(
+             aggressor_q <= 0;
+             has_a_q <= 0;
+             batch_q <= 0;
++            finite_q <= 0;
+             path_q <= 0;
+             e3_q <= 0;
+             delay_q <= 0;
+@@ -325,6 +334,7 @@ module dma_observer #(
+             aggressor_q <= aggressor_n;
+             has_a_q <= has_a_n;
+             batch_q <= batch_n;
++            finite_q <= finite_n;
+             path_q <= path_n;
+             e3_q <= e3_n;
+             delay_q <= delay_n;
+diff --git a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+index 49b2f20fb24fc6eb26ad43db4b5b2d7f64b2562b..e6d123765e86a8166ac2be7a61b3a726fe6f33ab 100644
+--- a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
++++ b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+@@ -15,6 +15,7 @@ module idma_reg64_frontend #(
+     parameter type          burst_req_t      = logic,
+     parameter bit ObserverPort = 1'b0,
+     parameter bit BatchPort = 1'b0,
++    parameter bit LaunchPort = 1'b0,
+     /// Device ID
+     parameter logic [23:0]  DEVICE_ID        = 24'd1,
+     /// Process ID
+@@ -29,9 +30,12 @@ module idma_reg64_frontend #(
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
+     output logic batch_active_o,
++    // Optional controlled-launch handshake (active only when LaunchPort).
++    input  logic launch_hold_i, launch_go_i, launch_cancel_i,
++    output logic launch_held_o, launch_active_o, launch_cancelled_o, launch_error_o,
+     output logic [63:0] obs_issue_id_o, obs_done_id_o, obs_poll_id_o,
+     output logic obs_cfg_valid_o, obs_cfg_write_o,
+-    output logic [6:0] obs_cfg_addr_o,
++    output logic [7:0] obs_cfg_addr_o,
+     output logic [63:0] obs_cfg_wdata_o,
+     output logic [7:0] obs_cfg_wstrb_o,
+     input logic [63:0] obs_cfg_rdata_i,
+@@ -52,13 +56,16 @@ module idma_reg64_frontend #(
+ );
+ 
+     localparam int unsigned DmaRegisterWidth = 64;
+-    localparam int unsigned DmaRegisterBlockAw = 7;
+-    localparam logic [DmaRegisterBlockAw-1:0] ActiveCyclesOffset = 7'h50;
++    localparam logic [7:0] ActiveCyclesOffset = 8'h50;
++    localparam logic [7:0] NextIdOffset       = 8'h28;
++    // Launcher register forwarding lives in the upper bank, above the batch window.
++    localparam logic [7:0] LauncherBase       = 8'hb0;
+ 
+-    typedef enum logic [1:0] { 
++    typedef enum logic [1:0] {
+         IDLE    = 2'b00,
+         COUNT   = 2'b01,
+-        WAIT    = 2'b10
++        WAIT    = 2'b10,
++        HOLD    = 2'b11
+     } idma_state_t;
+     idma_state_t state_q, state_n;
+ 
+@@ -76,6 +83,7 @@ module idma_reg64_frontend #(
+     logic [DmaRegisterWidth-1:0] active_cycles_q, active_cycles_n;
+     logic issue;
+     logic trans_complete;
++    logic id_retire;
+     logic active_cycles_read;
+ 
+     dma_regs_rsp_t dma_ctrl_rsp_tmp;
+@@ -88,11 +96,26 @@ module idma_reg64_frontend #(
+     logic [12:0] batch_pages_q;
+     logic [63:0] batch_id_q;
+     logic batch_cfg_ok, batch_task_issue, batch_task_done;
++
++    // Controlled-launch state
++    logic launcher_access;
++    logic launch_busy;
++    logic launch_cfg_ok;
++    logic launch_next_id_read;
++    logic launch_base_write;
++    logic launch_prepare_err;
++    logic launch_locked_write;
++    logic launch_ctrl_q, launch_ctrl_n;
++    logic [DmaRegisterWidth-1:0] launch_id_q, launch_id_n;
++
+     assign full_addr = 8'(dma_ctrl_req_i.addr);
+-    assign batch_access = BatchPort && dma_ctrl_req_i.valid && full_addr[7];
++    // Launcher window is carved out before the batch high-bank decode so 0xb0..0xff
++    // never aliases the batch bank.
++    assign launcher_access = LaunchPort && ObserverPort && dma_ctrl_req_i.valid && (full_addr >= LauncherBase);
++    assign batch_access = BatchPort && dma_ctrl_req_i.valid && full_addr[7] && !launcher_access;
+     assign batch_active_o = BatchPort && batch_enable_q && state_q != IDLE;
+     assign locked_write = batch_active_o && dma_ctrl_req_i.valid &&
+-                          dma_ctrl_req_i.write && !batch_access && !observer_access;
++                          dma_ctrl_req_i.write && !batch_access && !observer_access && !launcher_access;
+     assign batch_cfg_ok = !batch_error_q && batch_target_q != 0 && batch_target_q <= 33'h100000000 &&
+                           batch_pages_q != 0 && batch_pages_q <= 4096 &&
+                           dma_reg2hw.num_bytes.q == 4096 &&
+@@ -119,7 +142,9 @@ module idma_reg64_frontend #(
+                 if (batch_stop_q) batch_stopped_q <= 1;
+             end
+             if (locked_write) batch_error_q <= 1;
+-            if (batch_access && dma_ctrl_req_i.write) begin
++            // While a controlled launch job is active the batch bank is read-only:
++            // the write is rejected (AXI error) but must not poison batch_error_q.
++            if (batch_access && dma_ctrl_req_i.write && !launch_busy) begin
+                 if (dma_ctrl_req_i.wstrb != 8'hff) batch_error_q <= 1;
+                 else if (full_addr == 8'h88 && dma_ctrl_req_i.wdata == 2)
+                     batch_stop_q <= 1;
+@@ -146,27 +171,80 @@ module idma_reg64_frontend #(
+         end
+     end
+ 
+-    assign observer_access = ObserverPort && !batch_access && dma_ctrl_req_i.valid &&
+-        (dma_ctrl_req_i.addr[6:0] == 7'h58 || dma_ctrl_req_i.addr[6:0] == 7'h60 ||
+-         dma_ctrl_req_i.addr[6:0] == 7'h68 || dma_ctrl_req_i.addr[6:0] == 7'h70 ||
+-         dma_ctrl_req_i.addr[6:0] == 7'h78);
++    // Legacy observer window decoded on the exact 8-bit address (no high alias).
++    assign observer_access = ObserverPort && !batch_access && !launcher_access && dma_ctrl_req_i.valid &&
++        (full_addr == 8'h58 || full_addr == 8'h60 ||
++         full_addr == 8'h68 || full_addr == 8'h70 || full_addr == 8'h78);
++
+     always_comb begin
+         base_req = dma_ctrl_req_i;
+-        base_req.valid = dma_ctrl_req_i.valid && !observer_access && !batch_access && !locked_write;
++        base_req.valid = dma_ctrl_req_i.valid && !observer_access && !launcher_access && !batch_access &&
++                         !locked_write && !launch_locked_write && !(launch_busy && launch_next_id_read);
+     end
+-    assign obs_cfg_valid_o = observer_access;
++
++    // Launcher writes never reach the register file, so the window is forwarded to
++    // the external register block through the observer config bus. Without the
++    // launcher_access term the external block would never see launcher traffic.
++    assign obs_cfg_valid_o = observer_access || launcher_access;
+     assign obs_cfg_write_o = dma_ctrl_req_i.write;
+-    assign obs_cfg_addr_o = dma_ctrl_req_i.addr[6:0];
++    assign obs_cfg_addr_o  = full_addr;
+     assign obs_cfg_wdata_o = dma_ctrl_req_i.wdata;
+     assign obs_cfg_wstrb_o = dma_ctrl_req_i.wstrb;
+-    assign obs_issue_o = batch_enable_q ? batch_task_issue : issue;
+-    assign obs_issue_id_o = batch_enable_q ? 64'(batch_issued_q) + 1 : next_id;
++
++    // Controlled-launch helpers
++    assign launch_busy = LaunchPort && launch_ctrl_q;
++    assign launch_next_id_read = LaunchPort && dma_ctrl_req_i.valid && !dma_ctrl_req_i.write &&
++                                 (full_addr == NextIdOffset);
++    assign launch_base_write = LaunchPort && dma_ctrl_req_i.valid && dma_ctrl_req_i.write &&
++                               !batch_access && !observer_access && !launcher_access;
++    assign launch_locked_write = launch_busy && launch_base_write;
++
++    // Exactly 64-byte, DEFAULT, aligned, batch-disabled, idle-backend transfer with
++    // an all-zero configuration. CONF is compared per reg_pkg field to avoid packed
++    // aggregate comparison ambiguities.
++    assign launch_cfg_ok = (dma_reg2hw.conf.ttype.q     == idma_pkg::DEFAULT) &&
++                           (dma_reg2hw.conf.pv.q         == 1'b0) &&
++                           (dma_reg2hw.conf.cache.q      == 4'b0) &&
++                           (dma_reg2hw.conf.decouple.q   == 1'b0) &&
++                           (dma_reg2hw.conf.deburst.q    == 1'b0) &&
++                           (dma_reg2hw.conf.serialize.q  == 1'b0) &&
++                           (dma_reg2hw.num_bytes.q       == 64'd64) &&
++                           (dma_reg2hw.src_addr.q[5:0]   == '0) &&
++                           (dma_reg2hw.dst_addr.q[5:0]   == '0) &&
++                           !batch_enable_q &&
++                           backend_idle_i;
++
++    assign launch_prepare_err = LaunchPort && state_q == IDLE && launch_hold_i && launch_next_id_read &&
++                                (launch_cancel_i || !launch_cfg_ok);
++
++    assign launch_error_o = LaunchPort && (launch_prepare_err ||
++        (launch_busy && launch_next_id_read) ||
++        launch_locked_write ||
++        (launch_busy && batch_access && dma_ctrl_req_i.write));
++
++    assign launch_cancelled_o = LaunchPort && state_q == HOLD && launch_cancel_i;
++    assign launch_held_o      = LaunchPort && state_q == HOLD;
++    // launch_active_o tracks ANY active transfer (HOLD/COUNT/WAIT), including an
++    // ordinary job, so it is a preflight "frontend busy" indicator. It is
++    // intentionally wider than launch_ctrl_q (the controlled job only); use
++    // launch_held_o / launch_busy to distinguish the controlled job.
++    assign launch_active_o    = LaunchPort && (state_q == HOLD || state_q == COUNT || state_q == WAIT);
++
++    assign obs_issue_o = batch_enable_q ? batch_task_issue :
++                         (LaunchPort && (launch_ctrl_q || launch_hold_i)) ?
++                            (launch_ctrl_q && state_q == COUNT && ready_i) : issue;
++    assign obs_issue_id_o = batch_enable_q ? 64'(batch_issued_q) + 1 :
++                            (LaunchPort && (launch_ctrl_q || launch_hold_i)) ?
++                               (launch_ctrl_q ? launch_id_q : next_id) : next_id;
+     assign obs_done_o = batch_enable_q ? batch_task_done : trans_complete;
+-    // Value the functional ID generator will publish at this retirement edge.
++    // For a controlled job report the reserved ID; otherwise keep the raw generator
++    // behaviour (previous observer semantics).
+     assign obs_done_id_o = batch_enable_q ? 64'(batch_completed_q) + 1 :
+-                           ((&done_id) ? 64'd2 : done_id + 64'd1);
++                           ((LaunchPort && launch_ctrl_q && trans_complete) ? launch_id_q :
++                            ((&done_id) ? 64'd2 : done_id + 64'd1));
+     assign obs_poll_o = dma_ctrl_req_i.valid && !dma_ctrl_req_i.write &&
+-                       !batch_access && dma_ctrl_req_i.addr[6:0] == 7'h30 && dma_ctrl_rsp_o.ready;
++                       !batch_access && !observer_access && !launcher_access &&
++                       full_addr == 8'h30 && dma_ctrl_rsp_o.ready;
+     assign obs_poll_id_o = batch_enable_q ?
+         ((state_q == IDLE && done_id == batch_id_q) ? 64'(batch_completed_q) : 64'd0) : dma_ctrl_rsp_o.rdata;
+ 
+@@ -204,8 +282,8 @@ module idma_reg64_frontend #(
+         burst_req_o.opt.device_id          = DEVICE_ID;
+             // Process ID
+         burst_req_o.opt.pv                 = dma_reg2hw.conf.pv.q;
+-        burst_req_o.opt.process_id         = (dma_reg2hw.conf.pv.q) ? 
+-                                             (PROCESS_ID) : 
++        burst_req_o.opt.process_id         = (dma_reg2hw.conf.pv.q) ?
++                                             (PROCESS_ID) :
+                                              ('0);
+             // DMA only supports incremental burst
+         burst_req_o.opt.src.burst          = axi_pkg::BURST_INCR;
+@@ -252,7 +330,7 @@ module idma_reg64_frontend #(
+         dma_hw2reg.status.d  = ~backend_idle_i;
+         active_cycles_read   = dma_ctrl_req_i.valid &&
+                                !dma_ctrl_req_i.write &&
+-                               (dma_ctrl_req_i.addr[DmaRegisterBlockAw-1:0] == ActiveCyclesOffset);
++                               (full_addr == ActiveCyclesOffset);
+ 
+         dma_ctrl_rsp_o = dma_ctrl_rsp_tmp;
+         if (active_cycles_read) begin
+@@ -267,28 +345,52 @@ module idma_reg64_frontend #(
+             dma_ctrl_rsp_o.ready = 1'b1;
+         end
+ 
++        if (launcher_access) begin
++            dma_ctrl_rsp_o.rdata = obs_cfg_rdata_i;
++            dma_ctrl_rsp_o.error = 1'b0;
++            dma_ctrl_rsp_o.ready = 1'b1;
++        end
++
+         if (locked_write) begin
+             dma_ctrl_rsp_o.ready = 1;
+             dma_ctrl_rsp_o.error = 1;
+         end
++
++        if (launch_locked_write) begin
++            dma_ctrl_rsp_o.ready = 1;
++            dma_ctrl_rsp_o.error = 1;
++            dma_ctrl_rsp_o.rdata = '0;
++        end
++
++        if (launch_busy && launch_next_id_read) begin
++            dma_ctrl_rsp_o.ready = 1;
++            dma_ctrl_rsp_o.error = 1;
++            dma_ctrl_rsp_o.rdata = '0;
++        end
++
+         if (batch_access) begin
+             dma_ctrl_rsp_o.ready = 1;
+             dma_ctrl_rsp_o.error = 0;
+             dma_ctrl_rsp_o.rdata = 0;
+-            case (full_addr)
+-                8'h80: dma_ctrl_rsp_o.rdata = 64'h49444d4142544301;
+-                8'h88: dma_ctrl_rsp_o.rdata = {31'd0, batch_error_q, 28'd0,
+-                    (batch_completed_q != 0 && batch_completed_q == batch_target_q && !batch_active_o),
+-                    batch_stopped_q, batch_active_o, batch_enable_q};
+-                8'h90: dma_ctrl_rsp_o.rdata = 64'(batch_target_q);
+-                8'h98: dma_ctrl_rsp_o.rdata = 64'(batch_pages_q);
+-                8'ha0: dma_ctrl_rsp_o.rdata = 64'(batch_completed_q);
+-                8'ha8: dma_ctrl_rsp_o.rdata = 64'(batch_issued_q);
+-                default: dma_ctrl_rsp_o.error = 1;
+-            endcase
++            if (LaunchPort && launch_busy && dma_ctrl_req_i.write) begin
++                // Controlled job active: batch bank is read-only.
++                dma_ctrl_rsp_o.error = 1;
++            end else begin
++                case (full_addr)
++                    8'h80: dma_ctrl_rsp_o.rdata = 64'h49444d4142544301;
++                    8'h88: dma_ctrl_rsp_o.rdata = {31'd0, batch_error_q, 28'd0,
++                        (batch_completed_q != 0 && batch_completed_q == batch_target_q && !batch_active_o),
++                        batch_stopped_q, batch_active_o, batch_enable_q};
++                    8'h90: dma_ctrl_rsp_o.rdata = 64'(batch_target_q);
++                    8'h98: dma_ctrl_rsp_o.rdata = 64'(batch_pages_q);
++                    8'ha0: dma_ctrl_rsp_o.rdata = 64'(batch_completed_q);
++                    8'ha8: dma_ctrl_rsp_o.rdata = 64'(batch_issued_q);
++                    default: dma_ctrl_rsp_o.error = 1;
++                endcase
++            end
+         end
+ 
+-        // use full width id from generator
++        // DONE keeps the raw ID generator value (no launch-specific override).
+         dma_hw2reg.done.d = done_id;
+ 
+         dma_hw2reg.rdata.de = rdata_valid_i;
+@@ -296,6 +398,10 @@ module idma_reg64_frontend #(
+ 
+         issue           = 1'b0;
+         trans_complete  = 1'b0;
++        id_retire       = 1'b0;
++
++        launch_ctrl_n   = launch_ctrl_q;
++        launch_id_n     = launch_id_q;
+ 
+         // Counter data
+         transf_counter_n  = transf_counter_q;
+@@ -306,14 +412,31 @@ module idma_reg64_frontend #(
+         unique case (state_q)
+ 
+             IDLE: begin
+-            
+-                // start transaction upon next_id read (and having a valid config)
+-                if (dma_reg2hw.next_id.re) begin
++
++                if (LaunchPort && launch_hold_i && launch_next_id_read) begin
++                    // Controlled preparation: reserve an ID and enter HOLD, or
++                    // reject (invalid config / simultaneous cancel) without
++                    // allocating an ID.
++                    if (launch_cancel_i || !launch_cfg_ok) begin
++                        dma_ctrl_rsp_o.ready = 1;
++                        dma_ctrl_rsp_o.error = 1;
++                    end else begin
++                        issue               = 1'b1;
++                        dma_hw2reg.next_id.d = next_id;
++                        dma_ctrl_rsp_o.ready = 1;
++                        dma_ctrl_rsp_o.error = 0;
++                        launch_id_n         = next_id;
++                        launch_ctrl_n       = 1'b1;
++                        transf_counter_n    = dma_reg2hw.n_trans.q;
++                        transf_offset_n     = '0;
++                        state_n             = HOLD;
++                    end
++                end else if (dma_reg2hw.next_id.re) begin
+                     if (batch_enable_q && !batch_cfg_ok) begin
+                         dma_ctrl_rsp_o.ready = 1;
+                         dma_ctrl_rsp_o.error = 1;
+                     end else if (dma_reg2hw.num_bytes.q != '0) begin
+-                        
++
+                         issue = 1'b1;
+                         dma_hw2reg.next_id.d = next_id;
+                         dma_ctrl_rsp_o.ready = ready_i;
+@@ -330,8 +453,9 @@ module idma_reg64_frontend #(
+             end
+ 
+             COUNT: begin
+-            
+-                // Send request to FIFO
++
++                // Send request to FIFO. VALID stays asserted (and addresses stable)
++                // regardless of later cancel/hold/go until the backend is ready.
+                 valid_o              = 1'b1;
+ 
+                 burst_req_o.src_addr = dma_reg2hw.src_addr.q + transf_offset_q;
+@@ -348,12 +472,20 @@ module idma_reg64_frontend #(
+             end
+ 
+             WAIT: begin
+-                
++
+                 if (trans_complete_i) begin
+-                    if ((transf_counter_q == '0) || 
++                    if (launch_ctrl_q) begin
++                        // Controlled job completion.
++                        trans_complete = 1'b1;
++                        id_retire      = 1'b1;
++                        launch_ctrl_n  = 1'b0;
++                        launch_id_n    = '0;
++                        state_n        = IDLE;
++                    end else if ((transf_counter_q == '0) ||
+                             (!batch_enable_q && dma_reg2hw.conf.ttype.q == idma_pkg::DEFAULT) ||
+                             (batch_enable_q && batch_stop_q)) begin
+                         trans_complete = 1'b1;
++                        id_retire      = 1'b1;
+                         state_n = IDLE;
+                     end
+ 
+@@ -363,6 +495,19 @@ module idma_reg64_frontend #(
+                 end
+             end
+ 
++            HOLD: begin
++                // No backend VALID here. Cancel retires the reserved ID without an
++                // obs_issue/obs_done event; go starts the transfer.
++                if (launch_cancel_i) begin
++                    id_retire     = 1'b1;
++                    launch_ctrl_n = 1'b0;
++                    launch_id_n   = '0;
++                    state_n       = IDLE;
++                end else if (launch_go_i) begin
++                    state_n       = COUNT;
++                end
++            end
++
+             default: begin
+                 state_n = IDLE;
+             end
+@@ -376,7 +521,7 @@ module idma_reg64_frontend #(
+         .clk_i,
+         .rst_ni,
+         .issue_i      ( issue             ),
+-        .retire_i     ( trans_complete    ),
++        .retire_i     ( id_retire         ),
+         .next_o       ( next_id           ),
+         .completed_o  ( done_id           )
+     );
+@@ -385,5 +530,7 @@ module idma_reg64_frontend #(
+     `FF(transf_counter_q,   transf_counter_n,   '0,     clk_i, rst_ni)
+     `FF(transf_offset_q,    transf_offset_n,    '0,     clk_i, rst_ni)
+     `FF(active_cycles_q,    active_cycles_n,    '0,     clk_i, rst_ni)
++    `FF(launch_ctrl_q,      launch_ctrl_n,      1'b0,   clk_i, rst_ni)
++    `FF(launch_id_q,        launch_id_n,        '0,     clk_i, rst_ni)
+ 
+ endmodule : idma_reg64_frontend
+diff --git a/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv b/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
+index 69a9596e5363436802e43ff691d5e9dbc2790b9d..a506121dd4c5c0ba09a94e3f4fd49f33530584ac 100644
+--- a/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
++++ b/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
+@@ -28,6 +28,7 @@ module dma_core_wrap #(
+   parameter bit                       RAWCouplingAvail = 32'd0,
+   parameter bit                       ObserverPort    = 1'b0,
+   parameter bit BatchPort = 1'b0,
++  parameter bit LaunchPort = 1'b0,
+   parameter bit                       IsTwoD           = 32'd0,
+   parameter type                      axi_mst_req_t    = logic,
+   parameter type                      axi_mst_rsp_t    = logic,
+@@ -43,9 +44,11 @@ module dma_core_wrap #(
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
+   output logic batch_active_o,
++  input  logic launch_hold_i, launch_go_i, launch_cancel_i,
++  output logic launch_held_o, launch_active_o, launch_cancelled_o, launch_error_o,
+     output logic [63:0] obs_issue_id_o, obs_done_id_o, obs_poll_id_o,
+     output logic obs_cfg_valid_o, obs_cfg_write_o,
+-    output logic [6:0] obs_cfg_addr_o,
++    output logic [7:0] obs_cfg_addr_o,
+     output logic [63:0] obs_cfg_wdata_o,
+     output logic [7:0] obs_cfg_wstrb_o,
+     input logic [63:0] obs_cfg_rdata_i,
+@@ -127,6 +130,7 @@ module dma_core_wrap #(
+     idma_reg64_frontend #(
+       .ObserverPort ( ObserverPort ),
+       .BatchPort ( BatchPort ),
++      .LaunchPort ( LaunchPort ),
+       .dma_regs_req_t  ( dma_regs_req_t ),
+       .dma_regs_rsp_t  ( dma_regs_rsp_t ),
+       .burst_req_t     ( idma_req_t     ),
+@@ -136,6 +140,8 @@ module dma_core_wrap #(
+       .AxID            ( AxID           )
+     ) i_dma_frontend (
+       .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o,
++      .launch_hold_i, .launch_go_i, .launch_cancel_i,
++      .launch_held_o, .launch_active_o, .launch_cancelled_o, .launch_error_o,
+       .obs_issue_id_o, .obs_done_id_o, .obs_poll_id_o,
+       .obs_cfg_valid_o, .obs_cfg_write_o, .obs_cfg_addr_o,
+       .obs_cfg_wdata_o, .obs_cfg_wstrb_o, .obs_cfg_rdata_i,
+@@ -193,6 +199,10 @@ module dma_core_wrap #(
+     assign obs_cfg_addr_o = '0;
+     assign obs_cfg_wdata_o = '0;
+     assign obs_cfg_wstrb_o = '0;
++    assign launch_held_o = 1'b0;
++    assign launch_active_o = 1'b0;
++    assign launch_cancelled_o = 1'b0;
++    assign launch_error_o = 1'b0;
+ 
+     `IDMA_TYPEDEF_FULL_ND_REQ_T(idma_nd_req_t, idma_req_t, tf_len_t, tf_len_t)
+ 
+@@ -336,6 +346,7 @@ module dma_core_wrap_intf #(
+   parameter bit                        RAW_COUPLING_AVAIL =  1'b0,
+   parameter bit                        OBSERVER_PORT    = 1'b0,
+   parameter bit BATCH_PORT = 1'b0,
++  parameter bit LAUNCH_PORT = 1'b0,
+   parameter bit                        IS_TWO_D           =  1'b0,
+ 
+   parameter logic [23:0]               DEVICE_ID          = 24'd1,
+@@ -348,9 +359,11 @@ module dma_core_wrap_intf #(
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
+   output logic batch_active_o,
++  input  logic launch_hold_i, launch_go_i, launch_cancel_i,
++  output logic launch_held_o, launch_active_o, launch_cancelled_o, launch_error_o,
+     output logic [63:0] obs_issue_id_o, obs_done_id_o, obs_poll_id_o,
+     output logic obs_cfg_valid_o, obs_cfg_write_o,
+-    output logic [6:0] obs_cfg_addr_o,
++    output logic [7:0] obs_cfg_addr_o,
+     output logic [63:0] obs_cfg_wdata_o,
+     output logic [7:0] obs_cfg_wstrb_o,
+     input logic [63:0] obs_cfg_rdata_i,
+@@ -396,6 +409,7 @@ module dma_core_wrap_intf #(
+     .IsTwoD           ( IS_TWO_D           ),
+     .ObserverPort     ( OBSERVER_PORT      ),
+     .BatchPort        ( BATCH_PORT         ),
++    .LaunchPort       ( LAUNCH_PORT        ),
+     .axi_mst_req_t    ( axi_mst_req_t      ),
+     .axi_mst_rsp_t    ( axi_mst_resp_t     ),
+     .axi_slv_req_t    ( axi_slv_req_t      ),
+@@ -405,6 +419,8 @@ module dma_core_wrap_intf #(
+     .AxID             ( AxID               )
+   ) i_dma_core_wrap (
+       .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o,
++      .launch_hold_i, .launch_go_i, .launch_cancel_i,
++      .launch_held_o, .launch_active_o, .launch_cancelled_o, .launch_error_o,
+       .obs_issue_id_o, .obs_done_id_o, .obs_poll_id_o,
+       .obs_cfg_valid_o, .obs_cfg_write_o, .obs_cfg_addr_o,
+       .obs_cfg_wdata_o, .obs_cfg_wstrb_o, .obs_cfg_rdata_i,

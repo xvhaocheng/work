@@ -1,0 +1,354 @@
+From 991074e7fca9eddd33c61d72767c3729f573dc3e Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:52:05 +0900
+Subject: [PATCH 27/27] Connect banked P/N research modes and bind the complete
+ IOMMU research source
+
+Source-organization: 2026-10-17; new commit authored at actual current time.
+Feature-ID: CVA6-BANKED-PN-WIRING
+Original-source: frozen original working source
+Validation scope: source/patch identity only; no build, simulation or experiment.
+Atomic ABI binding to child P2: mode1 banked S, mode2 N, mode3 quiet-gated S/N/P/PN; DMA0/1 512-beat buffers, full-copy permission, MSI_BT_ONLY, counters and guarded configuration. Legacy default mode remains 0, which does not make this tree stock.
+---
+ .../fpga/src/ariane_peripherals_xilinx.sv     | 186 +++++++++++++++---
+ corev_apu/fpga/src/ariane_xilinx.sv           |   3 +
+ corev_apu/riscv-iommu                         |   2 +-
+ 3 files changed, 161 insertions(+), 30 deletions(-)
+
+diff --git a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+index 1410abb435e89567c23ad61d2dd5be6b3a73ab2d..7ad7e80ccc24f08e771f14ba96a3e3eb68b01f2c 100644
+--- a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+@@ -31,6 +31,7 @@ module ariane_peripherals #(
+     parameter bit InclIOMMU    =  0,
+     parameter bit IOMMULegacyE3Observer = 1,
+     parameter int unsigned IOMMUResearchRole = 0,
++    parameter int unsigned IOMMUNonblockMode = 0,
+     parameter int unsigned IOMMUDSFixedDelayInput  = 0,
+     parameter int unsigned IOMMUDSFixedDelayOutput = 0
+ ) (
+@@ -884,12 +885,22 @@ module ariane_peripherals #(
+     rv_iommu::e3_ctl_t e3_ctl;
+     rv_iommu::e3_tl_t e3_tl;
+     rv_iommu::research_t research;
++    logic nonblock_fire, nonblock_trans_accept;
++    logic [1:0] composition_mode;
++    logic [23:0] composition_did;
++    logic composition_clear, composition_iommu_quiet;
++    logic [15:0] nonblock_diag;
++    rv_iommu::device_id_t nonblock_did;
++    rv_iommu::ttype_t nonblock_type;
+     logic [7:0] e3_control, e3_index;
+     logic [63:0] e3_data;
+     logic e3_error;
+     if (!InclDMA) begin : gen_no_e3_control
+         assign e3_control = 0;
+         assign e3_index = 0;
++        assign composition_mode = 0;
++        assign composition_did = 24'd10;
++        assign composition_clear = 0;
+     end
+ 
+     typedef logic [DmaAxiIdWidth-1:0] dma_iommu_id_t;
+@@ -898,6 +909,9 @@ module ariane_peripherals #(
+                             rv_iommu::device_id_t, logic, rv_iommu::process_id_t)
+     axi_dma_tr_req_t  [NumDMADevices-1:0] axi_dma_tr_req;
+     axi_dma_tr_resp_t [NumDMADevices-1:0] axi_dma_tr_resp;
++    // Shared DMA full-buffer status.  Width mirrors NumDMADevices;
++    // only the low two bits are consumed by fullbuffer_jobs_i.
++    logic [NumDMADevices-1:0] fullbuffer_jobs;
+ 
+     // AXI Bus between System Interconnect and IOMMU Programming IF
+     `AXI_TYPEDEF_ALL(axi_prog, iommu_addr_t, iommu_slv_id_t, 
+@@ -912,6 +926,7 @@ module ariane_peripherals #(
+     //------------
+     if (InclDMA) begin : gen_dma
+         logic [NumDMADevices-1:0] obs_issue, obs_done, obs_poll, batch_active;
++        logic [NumDMADevices-1:0] batch_gap_active, job_quiet;
+         logic [63:0] obs_issue_id [NumDMADevices], obs_done_id [NumDMADevices], obs_poll_id [NumDMADevices];
+         logic [NumDMADevices-1:0] obs_cfg_valid, obs_cfg_write;
+         logic [7:0] obs_cfg_addr [NumDMADevices];
+@@ -926,6 +941,9 @@ module ariane_peripherals #(
+         logic [63:0] research_observer_data, research_policy_data;
+         logic policy_enable, policy_allow, policy_abort, research_reverse;
+         logic research_policy_access;
++        logic [63:0] nonblock_data, composition_data;
++        logic composition_access;
++        logic [12:0] composition_index;
+         logic research_write, research_dma_quiet, research_arm, research_open, research_close;
+         logic [127:0] research_entries [16], research_entries_next [16];
+         for (genvar r = 0; r < 16; r++) begin : gen_research_entries
+@@ -945,7 +963,10 @@ module ariane_peripherals #(
+                 (axi_dma_tr_resp[o].r_valid && |axi_dma_tr_resp[o].r.id) ||
+                 (axi_dma_tr_resp[o].b_valid && |axi_dma_tr_resp[o].b.id);
+         end
+-        dma_observer #(.NumPorts(NumDMADevices), .PathEnable(InclIOMMU),
++        // Composition records its own window counters and snapshots. The old
++        // per-transaction path timers are needed only by legacy profiles/E3.
++        dma_observer #(.NumPorts(NumDMADevices),
++                       .PathEnable(InclIOMMU && (IOMMUNonblockMode != 3 || IOMMULegacyE3Observer)),
+                        .E3Enable(InclIOMMU && IOMMULegacyE3Observer),
+                        .ControlledEnable(InclIOMMU && IOMMULegacyE3Observer),
+                        .P4MEnable(InclIOMMU), .ResearchEnable(InclIOMMU),
+@@ -982,32 +1003,90 @@ module ariane_peripherals #(
+         assign obs_cfg_rdata = obs_cfg_addr[0][7] ? launch_cfg_rdata : legacy_cfg_rdata;
+         if (InclIOMMU) begin : gen_research
+             assign research_policy_access = research_index[12:8] == 5'h0E;
+-            assign research_data = research_policy_access ? research_policy_data : research_observer_data;
+-            dma_research_observer #(.ResearchRole(IOMMUResearchRole)) i_research (
+-                .clk_i, .rst_ni, .cfg_valid_i(research_write && !research_policy_access),
+-                .cfg_write_i(research_write && !research_policy_access), .index_i(research_index),
+-                .wdata_i(research_wdata), .rdata_o(research_observer_data),
+-                .reverse_order_o(research_reverse),
+-                .quiet_i(research_dma_quiet && e3_ctl.quiet && !e3_tl.ptw_active),
+-                .supported_i(research.supported),
+-                .entries_i(research_entries), .entries_next_i(research_entries_next),
+-                .plru_i(research.plru), .update_i(research.update),
+-                .invalidate_i(research.invalidate), .replace_mask_i(research.replace_mask),
+-                .update_did_i(research.did), .lookup_i(research.lookup),
+-                .lookup_hit_i(research.hit), .lookup_did_i(research.did),
+-                .lookup_iova_i(research.iova), .lookup_pscid_i(research.pscid),
+-                .lookup_gscid_i(research.gscid), .lookup_stage1_i(research.stage1),
+-                .lookup_stage2_i(research.stage2), .ctl_state_i(e3_ctl.state),
+-                .ctl_did_i(e3_ctl.current_did), .select_fire_i(e3_ctl.select_valid),
+-                .select_did_i(e3_ctl.select_did),
+-                .response_error_i((e3_ctl.response_fire && e3_ctl.response_error) ||
+-                                  (research.update && !research.normal)),
+-                .issue_i(obs_issue[1:0]), .done_i(obs_done[1:0]),
+-                .issue_id_i('{obs_issue_id[0], obs_issue_id[1]}),
+-                .done_id_i('{obs_done_id[0], obs_done_id[1]}),
+-                .p4m_arm_i(research_arm), .p4m_open_i(research_open),
+-                .p4m_close_i(research_close)
+-            );
++            assign composition_access = IOMMUNonblockMode == 3 &&
++                research_index >= 13'hD20 && research_index <= 13'hD9F;
++            assign composition_index = research_index - 13'hD20;
++            assign research_data = composition_access ? composition_data :
++                                   IOMMUNonblockMode != 0 && research_index[12:8] == 5'h0D ?
++                                   nonblock_data :
++                                   research_policy_access ? research_policy_data : research_observer_data;
++            // Composition has its own accepted-request counters. Do not also
++            // build the legacy diagnostic bank for this profile.
++            if (IOMMUNonblockMode != 0 && IOMMUNonblockMode != 3) begin : gen_nonblock_observer
++                dma_nonblock_observer #(.Mode(IOMMUNonblockMode)) i_nonblock_obs (
++                    .clk(clk_i), .rst(!rst_ni), .arm(research_arm),
++                    .open(research_open), .close(research_close),
++                    .index(research_index[7:0]), .rdata(nonblock_data),
++                    .accept(nonblock_trans_accept), .fast(nonblock_fire),
++                    .did(nonblock_did), .ttype(nonblock_type),
++                    .diag_events(nonblock_diag)
++                );
++            end else begin : gen_no_nonblock_observer
++                assign nonblock_data = '0;
++            end
++            if (IOMMUNonblockMode == 3) begin : gen_composition
++                dma_composition_control i_composition (
++                    .clk_i, .rst_ni,
++                    .cfg_write_i(research_write && composition_access),
++                    .index_i(composition_index[6:0]), .wdata_i(research_wdata),
++                    .rdata_o(composition_data),
++                    .quiet_i(composition_iommu_quiet && research_dma_quiet &&
++                             (&job_quiet) && !(|obs_issue) &&
++                             !(|launch_active) && !(|launch_held)),
++                    .supported_i(research.supported),
++                    .arm_i(research_arm), .open_i(research_open), .close_i(research_close),
++                    .mode_o(composition_mode), .protected_did_o(composition_did),
++                    .clear_o(composition_clear),
++                    .lookup_i(research.lookup), .lookup_hit_i(research.hit),
++                    .normal_i(research.normal), .stage1_i(research.stage1),
++                    .stage2_i(research.stage2), .lookup_did_i(research.did),
++                    .lookup_pscid_i(research.pscid),
++                    .accept_i(nonblock_trans_accept), .fast_i(nonblock_fire),
++                    .fast_did_i(nonblock_did), .gap_active_i(batch_gap_active[1:0]),
++                    .update_i(research.update), .invalidate_i(research.invalidate),
++                    .update_did_i(research.did), .replace_mask_i(research.replace_mask),
++                    .entries_i(research_entries), .entries_next_i(research_entries_next),
++                    .plru_i(research.plru)
++                );
++            end else begin : gen_no_composition
++                assign composition_mode = 0;
++                assign composition_did = 24'd10;
++                assign composition_clear = 0;
++                assign composition_data = 0;
++            end
++            // The old E2/COST event recorder is not read by composition's
++            // ioctl. Keep the shared index/window interface above, but avoid
++            // a second snapshot/event store and its translation-to-RAM path.
++            if (IOMMUNonblockMode != 3) begin : gen_legacy_research
++                dma_research_observer #(.ResearchRole(IOMMUResearchRole)) i_research (
++                    .clk_i, .rst_ni, .cfg_valid_i(research_write && !research_policy_access && !composition_access),
++                    .cfg_write_i(research_write && !research_policy_access && !composition_access), .index_i(research_index),
++                    .wdata_i(research_wdata), .rdata_o(research_observer_data),
++                    .reverse_order_o(research_reverse),
++                    .quiet_i(research_dma_quiet && e3_ctl.quiet && !e3_tl.ptw_active),
++                    .supported_i(research.supported),
++                    .entries_i(research_entries), .entries_next_i(research_entries_next),
++                    .plru_i(research.plru), .update_i(research.update),
++                    .invalidate_i(research.invalidate), .replace_mask_i(research.replace_mask),
++                    .update_did_i(research.did), .lookup_i(research.lookup),
++                    .lookup_hit_i(research.hit), .lookup_did_i(research.did),
++                    .lookup_iova_i(research.iova), .lookup_pscid_i(research.pscid),
++                    .lookup_gscid_i(research.gscid), .lookup_stage1_i(research.stage1),
++                    .lookup_stage2_i(research.stage2), .ctl_state_i(e3_ctl.state),
++                    .ctl_did_i(e3_ctl.current_did), .select_fire_i(e3_ctl.select_valid),
++                    .select_did_i(e3_ctl.select_did),
++                    .response_error_i((e3_ctl.response_fire && e3_ctl.response_error) ||
++                                      (research.update && !research.normal)),
++                    .issue_i(obs_issue[1:0]), .done_i(obs_done[1:0]),
++                    .issue_id_i('{obs_issue_id[0], obs_issue_id[1]}),
++                    .done_id_i('{obs_done_id[0], obs_done_id[1]}),
++                    .p4m_arm_i(research_arm), .p4m_open_i(research_open),
++                    .p4m_close_i(research_close)
++                );
++            end else begin : gen_no_legacy_research
++                assign research_observer_data = '0;
++                assign research_reverse = 1'b0;
++            end
+             if (IOMMUResearchRole == 2) begin : gen_policy
+                 dma_research_policy i_policy (
+                     .clk_i, .rst_ni,
+@@ -1036,6 +1115,13 @@ module ariane_peripherals #(
+             end
+         end else begin : gen_no_research
+             assign research_data = '0;
++            assign composition_mode = 0;
++            assign composition_did = 24'd10;
++            assign composition_clear = 0;
++            assign composition_access = 0;
++            assign composition_index = 0;
++            assign composition_data = 0;
++            assign nonblock_data = '0;
+             assign research_policy_access = 1'b0;
+             assign research_observer_data = '0;
+             assign research_policy_data = '0;
+@@ -1174,6 +1260,13 @@ module ariane_peripherals #(
+                 .AXI_SLV_ID_WIDTH   ( ariane_soc::IdWidthSlave ),
+                 .AXI_USER_WIDTH     ( AxiUserWidth             ),
+                 .JOB_FIFO_DEPTH     ( 8                        ),
++                // N v2: a frozen batch job is one aligned 4 KiB copy. Keep
++                // its full source data until the paired write can drain, so
++                // a read-ahead burst cannot block the shared R return path.
++                // S and N use the same capacity; other DMA/legacy modes keep
++                // the existing three-beat buffer. Larger/multi-job streams
++                // are outside this prototype's dependency argument.
++                .BUFFER_DEPTH       ( IOMMUNonblockMode != 0 && i < 2 ? 512 : 3 ),
+                 .NUM_AX_IN_FLIGHT   ( 8                        ),
+                 .MEM_SYS_DEPTH      ( 0                        ),
+                 .RAW_COUPLING_AVAIL ( 0                        ),
+@@ -1189,6 +1282,8 @@ module ariane_peripherals #(
+             ) i_dma (
+                 .obs_issue_o(obs_issue[i]), .obs_done_o(obs_done[i]), .obs_poll_o(obs_poll[i]),
+                 .batch_active_o(batch_active[i]),
++                .batch_gap_active_o(batch_gap_active[i]), .job_quiet_o(job_quiet[i]),
++                .fullbuffer_job_o(fullbuffer_jobs[i]),
+                 .policy_enable_i(i == 1 && policy_enable),
+                 .policy_allow_i(i == 1 && policy_allow),
+                 .policy_abort_i(i == 1 && policy_abort),
+@@ -1223,6 +1318,7 @@ module ariane_peripherals #(
+     // AXI transactions directed to the DMA config port are responded with error.
+     else begin : gen_dma_disabled
+ 
++        assign fullbuffer_jobs = '0;
+ 		// AXI Bus between System Interconnect (Mst) and iDMA Configuration Port (Slv)
+ 		ariane_axi_soc::req_slv_t axi_dma_cfg_req;
+ 		ariane_axi_soc::resp_slv_t axi_dma_cfg_resp;
+@@ -1293,8 +1389,24 @@ module ariane_peripherals #(
+         //--------------
+         // RISC-V IOMMU
+         //--------------
++        // Keep extended 64-byte device contexts compatible with the existing
++        // Linux image. The banked prototype excludes MRIF, not flat MSI.
++        function automatic rv_iommu_cfg::rv_iommu_cfg_t nonblock_cfg();
++            rv_iommu_cfg::rv_iommu_cfg_t cfg = ariane_soc::RVIOMMUCfg;
++            if (IOMMUNonblockMode != 0) cfg.MSITrans = rv_iommu_cfg::MSI_BT_ONLY;
++            return cfg;
++        endfunction
++        initial begin
++            if (IOMMUNonblockMode > 3 ||
++                (IOMMUNonblockMode != 0 && (IOMMUResearchRole != 0 || IOMMULegacyE3Observer)))
++                $fatal(1, "Banked prototype cannot use legacy E3/COST observers");
++        end
+         rv_iommu_top #(
+-            .RVIOMMUCfg   (ariane_soc::RVIOMMUCfg),
++            .RVIOMMUCfg   (nonblock_cfg()),
++            .BankedEnable(IOMMUNonblockMode != 0),
++            .NonblockEnable(IOMMUNonblockMode != 0),
++            .PolicyEnable(IOMMUNonblockMode == 3),
++            .BankIdBit(DmaAxiIdWidth),
+             .E3Enable(InclDMA),
+ 
+             .axi_tr_aw_chan_t       (axi_tr_aw_chan_t),
+@@ -1331,6 +1443,11 @@ module ariane_peripherals #(
+         ) i_riscv_iommu (
+             .clk_i        (clk_i),
+             .rst_ni       (rst_ni),
++            .nonblock_enable_i(IOMMUNonblockMode == 3 ? composition_mode[0] :
++                               IOMMUNonblockMode == 2),
++            .policy_partition_i(IOMMUNonblockMode == 3 && composition_mode[1]),
++            .policy_clear_i(composition_clear), .policy_did_i(composition_did),
++            .policy_quiet_o(composition_iommu_quiet),
+             .tr_req_i     (axi_iommu_tr_req),
+             .tr_resp_o    (axi_iommu_tr_resp),
+             .comp_resp_i  (axi_iommu_comp_resp),
+@@ -1342,7 +1459,12 @@ module ariane_peripherals #(
+             .wsi_wires_o  (irq_sources[(ariane_soc::RVIOMMUCfg.NumIntVec-1)+7:7]),
+             .e3_enable_i(e3_control[0]), .e3_arm_i(e3_control[1]),
+             .e3_active_i(e3_control[3]), .e3_delay128_i(e3_control[7]),
+-            .e3_ctl_o(e3_ctl), .e3_tl_o(e3_tl), .research_o(research)
++            .e3_ctl_o(e3_ctl), .e3_tl_o(e3_tl), .research_o(research),
++            .nonblock_fire_o(nonblock_fire), .trans_accept_o(nonblock_trans_accept),
++            .nonblock_diag_o(nonblock_diag),
++            // Only DMA0/1 in this prototype have the whole-copy buffers.
++            .fullbuffer_jobs_i(IOMMUNonblockMode != 0 ? fullbuffer_jobs[1:0] : 2'b00),
++            .trans_did_o(nonblock_did), .trans_type_o(nonblock_type)
+         );
+ 
+     //----------
+@@ -1355,6 +1477,12 @@ module ariane_peripherals #(
+     end else begin : gen_iommu_disabled
+ 
+         assign research = '0;
++        assign nonblock_fire = 1'b0;
++        assign composition_iommu_quiet = 1'b0;
++        assign nonblock_diag = '0;
++        assign nonblock_trans_accept = 1'b0;
++        assign nonblock_did = '0;
++        assign nonblock_type = '0;
+ 
+         axi_err_slv #(
+             .AxiIdWidth ( ariane_soc::IdWidthSlave   ),
+diff --git a/corev_apu/fpga/src/ariane_xilinx.sv b/corev_apu/fpga/src/ariane_xilinx.sv
+index 3b2b3385bf08e8abfb59740606774b92cec52cc3..3a34ee79d51fd31d7f822c8046e569eb491c2c8b 100644
+--- a/corev_apu/fpga/src/ariane_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_xilinx.sv
+@@ -169,6 +169,7 @@ localparam int unsigned IOMMUDSFixedDelayOutput = 50;
+ localparam int unsigned IOMMULegacyE3Observer = 1;
+ // 0 legacy profiles; 1 E2 v2; 2 method v2. Set by the pinned platform builder.
+ localparam int unsigned IOMMUResearchRole = 0;
++    localparam int unsigned IOMMUNonblockMode = 0;
+ 
+ `AXI_TYPEDEF_ALL(axi_slave,
+                  logic [    AxiAddrWidth-1:0],
+@@ -806,6 +807,7 @@ end
+   logic [3:0] unused_switches = 4'b0000;
+ `endif
+ 
++
+ ariane_peripherals #(
+     .AxiAddrWidth ( AxiAddrWidth     ),
+     .AxiDataWidth ( AxiDataWidth     ),
+@@ -819,6 +821,7 @@ ariane_peripherals #(
+     .IOMMUDSFixedDelayOutput ( IOMMUDSFixedDelayOutput ),
+     .IOMMULegacyE3Observer   ( IOMMULegacyE3Observer   ),
+     .IOMMUResearchRole       ( IOMMUResearchRole       ),
++    .IOMMUNonblockMode       ( IOMMUNonblockMode       ),
+     `ifdef KINTEX7
+     .InclSPI      ( 1'b1         ),
+     .InclEthernet ( 1'b1         )
+diff --git a/corev_apu/riscv-iommu b/corev_apu/riscv-iommu
+index 027583cd564af8ccb0cc05228756afa8a322d017..0b7939445298a23ea3e131ffd4e003cebb15ac59 160000
+--- a/corev_apu/riscv-iommu
++++ b/corev_apu/riscv-iommu
+@@ -1 +1 @@
+-Subproject commit 027583cd564af8ccb0cc05228756afa8a322d017
++Subproject commit 0b7939445298a23ea3e131ffd4e003cebb15ac59

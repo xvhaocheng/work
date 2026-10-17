@@ -1,13 +1,13 @@
-# 当前状态：问题发现完成，替换局限与已承诺读债务已定位
+# 当前状态：源码基线与扩展整理；既有实验保持
 
-2026年10月17日（JST）。用户在具体合同后回复“继续”，DISCOVERY-REUSE-1已实际完成一次局部基座编译、6个基础＋2个触发诊断，1024个parent逐笔与独立原始事件核验通过。**取得新事实，当前归普通优化依据，未立新机制主线。**总入口为[计划](研究计划.md)与[导航](研究导航.md)。
+2026年10月17日（JST）。按用户要求完成[原版／适配基线、功能扩展与历史源码对应整理](iommu-platform/provenance/source-organization-20261017/README.md)。本轮仅静态源码、补丁和恢复核验，没有新构建或实验；原版性能基线尚未运行。既有 DISCOVERY 与 PLRU 消融结果保留，当前归普通优化及刻画证据，未立新机制主线。总入口为[计划](研究计划.md)与[导航](研究导航.md)。
 
 ## 全局安排与本轮裁决
 
 - 两真实iDMA各64次normal4096 COPY，只变A目的再用R1/8/16；普通P/PN共同DS-first/F4，非stock；冷前缀、配置/补发、双方B/DONE与quiet全部保留。
-- R8时A足迹9页却有39次walk。源码推导为masked tree-PLRU热源及不等子树偏置；页级偶数反复miss/奇数仅冷miss精确吻合，内部victim未直接采样。名义14项mask不等于14项有效驻留保证。
+- R8时两设备合计39次walk，其中A为37次。既有[PLRU消融](iommu-platform/out/plru-ablation-20261017/README.md)已直接追踪victim：A热源常驻way8，30次有效逐出集中way2/3、7个允许条目空闲。V1近均衡重排仍有热源偏置；V2精确LRU／空项优先／fill-MRU使总walk降至11。名义14项mask不等于14项有效驻留保证。
 - 4KiB下P/PN同walk数，PN完整时间分别慢0.70%/18.03%/28.39%；R16具体后续PTE在已承诺V载荷后等待461步，DS-first无法改这个前驱。局部排队不当作全部可回收收益；软件供给、读腿、写腿分别报告。
-- 普通A专用池2MiB诊断均完整75797步/3初始walk；P/PN parents记录字节相同，PN仅多2个未接受的物理命中probe。本arena普通组织已足够；普通替换修正仅作未执行的后继校准建议，不自动开发新接口/控制器或补更多case。
+- 普通A专用池2MiB诊断均完整75797步/3初始walk；P/PN parents记录字节相同，PN仅多2个未接受的物理命中probe。既有V2在R8使P/PN完整时间下降12.44%/22.37%，R16各策略仍67次walk且时间不变。消融夹具共同含P/PN、DS-first/F4，非stock；不据此开发新接口或追加case。
 - RECONVERGENCE-1三个具体版本、First-PTE base=M4481/1749及mask0等历史裁决保持。B1/I/D/A5/A2、mapping/p5/D-CS1与MIG暂停不变，原10月15—28日窗口不重启；MIG WNS−0.391ns/598setup/0newloads/debtunknown。
 
 [发现结果](iommu-platform/docs/problem-discovery-results-20261017.md)／[实际输出与复现](iommu-platform/out/problem-discovery-run-20261017/README.md)／[root接受](iommu-platform/out/problem-discovery-run-20261017/acceptance.json)／[冻结合同](iommu-platform/docs/problem-discovery-contract-20261017.md)／[原三个机制裁决](iommu-platform/docs/research-reconvergence-20261016.md)。
@@ -20,7 +20,7 @@
 
 ## 硬件与执行状态
 
-本轮仅新独立测试副本、只读观测、一次局部Verilator编译和8次新仿真；无失败条件、旧实验重跑、生产修改、综合/布线或板测。行为DDR时间非FPGA/原生时间，NO_ERROR_HANDLING缺项不变；已接受原始事件gzip逐字节可恢复。Codex-only；C++请求Sol/xhigh、观察/归约Sol/high，实际独立模型metadata unknown。MIG继续暂停。
+本轮只新增源码组织引用、补丁、bundle与证据索引，原checkout、旧refs、索引和源码保持；无新编译、测试、仿真、综合/布线或板测。此前DISCOVERY的8条件及PLRU的18配置／24次有效运行保持原运行身份，未在新提交重跑。行为DDR时间非FPGA/原生时间，NO_ERROR_HANDLING缺项不变；MIG继续暂停。共享IOMMU整理为Codex-only。
 
 ## 独立工程事项
 

@@ -1,0 +1,463 @@
+From 507ec0819caf288655f7efbccf4e3fe40c4949ee Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:50:16 +0900
+Subject: [PATCH 09/27] Add bounded autonomous copy batches and safe reuse
+ accounting
+
+Source-organization: 2026-10-17; new commit authored at actual current time.
+Feature-ID: CVA6-BATCH
+Original-source: 1be70a4f, 7ed43840
+Validation scope: source/patch identity only; no build, simulation or experiment.
+---
+ .../fpga/src/ariane_peripherals_xilinx.sv     |   5 +-
+ corev_apu/fpga/src/dma_observer.sv            |  45 +++++--
+ .../register_64bit/idma_reg64_frontend.sv     | 121 ++++++++++++++++--
+ .../src/systems/cva6_reg/dma_core_wrap.sv     |  11 +-
+ 4 files changed, 157 insertions(+), 25 deletions(-)
+
+diff --git a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+index 3237b4e6eb74e9517f080196bac59cab1064a8d8..bce263696c8d25ae80e87e95e811170382086981 100644
+--- a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+@@ -895,7 +895,7 @@ module ariane_peripherals #(
+     // DMA Engine
+     //------------
+     if (InclDMA) begin : gen_dma
+-        logic [NumDMADevices-1:0] obs_issue, obs_done, obs_poll;
++        logic [NumDMADevices-1:0] obs_issue, obs_done, obs_poll, batch_active;
+         logic [63:0] obs_issue_id [NumDMADevices], obs_done_id [NumDMADevices], obs_poll_id [NumDMADevices];
+         logic [NumDMADevices-1:0] obs_cfg_valid, obs_cfg_write;
+         logic [6:0] obs_cfg_addr [NumDMADevices];
+@@ -922,6 +922,7 @@ module ariane_peripherals #(
+             .cfg_addr_i(obs_cfg_addr[0]), .cfg_wdata_i(obs_cfg_wdata[0]),
+             .cfg_wstrb_i(obs_cfg_wstrb[0]), .cfg_rdata_o(obs_cfg_rdata),
+             .issue_i(obs_issue), .done_i(obs_done), .poll_i(obs_poll),
++            .batch_active_i(batch_active),
+             .issue_id_i(obs_issue_id), .done_id_i(obs_done_id), .poll_id_i(obs_poll_id),
+             .ar_valid_i(obs_arvalid), .aw_valid_i(obs_awvalid),
+             .ar_ready_i(obs_arready), .aw_ready_i(obs_awready),
+@@ -1012,6 +1013,7 @@ module ariane_peripherals #(
+                 .MEM_SYS_DEPTH      ( 0                        ),
+                 .RAW_COUPLING_AVAIL ( 0                        ),
+                 .IS_TWO_D           ( 0                        ),
++                .BATCH_PORT (1'b1),
+                 .OBSERVER_PORT      ( i == 0                   ),
+ 
+                 .DEVICE_ID          ( 24'(10 + i)              ),
+@@ -1019,6 +1021,7 @@ module ariane_peripherals #(
+                 .AxID               ( '0                       )
+             ) i_dma (
+                 .obs_issue_o(obs_issue[i]), .obs_done_o(obs_done[i]), .obs_poll_o(obs_poll[i]),
++                .batch_active_o(batch_active[i]),
+                 .obs_issue_id_o(obs_issue_id[i]), .obs_done_id_o(obs_done_id[i]), .obs_poll_id_o(obs_poll_id[i]),
+                 .obs_cfg_valid_o(obs_cfg_valid[i]), .obs_cfg_write_o(obs_cfg_write[i]),
+                 .obs_cfg_addr_o(obs_cfg_addr[i]), .obs_cfg_wdata_o(obs_cfg_wdata[i]),
+diff --git a/corev_apu/fpga/src/dma_observer.sv b/corev_apu/fpga/src/dma_observer.sv
+index 3bcf7d2489770accff9398cd95cfeaa7615697ad..20d0ea5282a31cccc84529d23623636e7e02701c 100644
+--- a/corev_apu/fpga/src/dma_observer.sv
++++ b/corev_apu/fpga/src/dma_observer.sv
+@@ -12,6 +12,7 @@ module dma_observer #(
+     input logic [7:0] cfg_wstrb_i,
+     output logic [63:0] cfg_rdata_o,
+     input logic [NumPorts-1:0] issue_i, done_i, poll_i,
++    input logic [NumPorts-1:0] batch_active_i,
+     input logic [63:0] issue_id_i [NumPorts],
+     input logic [63:0] done_id_i [NumPorts],
+     input logic [63:0] poll_id_i [NumPorts],
+@@ -21,9 +22,9 @@ module dma_observer #(
+     input logic shared_ar_ready_i, shared_aw_ready_i
+ );
+     // Low byte is interface version; a missing observer must never look valid.
+-    localparam logic [63:0] Magic = 64'h49444d414f425301; // IDMAOBS, v1
+-    localparam int Count = 34;
+-    typedef enum logic [2:0] {OFF, ARMED, HARDWARE, POLL_WAIT, REFILL, FROZEN} phase_t;
++    localparam logic [63:0] Magic = 64'h49444d414f425302; // IDMAOBS, v2 (v1 legacy mode retained)
++    localparam int Count = 35;
++    typedef enum logic [2:0] {OFF, ARMED, HARDWARE, POLL_WAIT, REFILL, FROZEN, BATCH_READ} phase_t;
+     phase_t phase_q, phase_n;
+     logic [CounterWidth-1:0] count_q [Count], count_n [Count];
+     logic [CounterWidth-1:0] segment_q, segment_n;
+@@ -34,7 +35,9 @@ module dma_observer #(
+     logic [63:0] target_q, target_n, expected_q, expected_n;
+     logic [5:0] index_q, index_n;
+     logic [1:0] victim_q, victim_n, aggressor_q, aggressor_n;
+-    logic has_a_q, has_a_n;
++    logic has_a_q, has_a_n, batch_q, batch_n;
++    logic busy;
++    assign busy = active || phase_q == BATCH_READ;
+     logic active, v_pending, a_pending;
+ 
+     assign active = phase_q == HARDWARE || phase_q == POLL_WAIT || phase_q == REFILL;
+@@ -57,7 +60,7 @@ module dma_observer #(
+             7'h58: cfg_rdata_o = Magic;
+             7'h60: begin
+                 cfg_rdata_o[0] = phase_q == ARMED;
+-                cfg_rdata_o[1] = active;
++                cfg_rdata_o[1] = busy;
+                 cfg_rdata_o[2] = phase_q == FROZEN;
+                 cfg_rdata_o[63:32] = error_q;
+             end
+@@ -79,6 +82,7 @@ module dma_observer #(
+         victim_n = victim_q;
+         aggressor_n = aggressor_q;
+         has_a_n = has_a_q;
++        batch_n = batch_q;
+         track_bad_n = track_bad_q;
+         // Track continuously, including warmup and drain, never reset on ARM.
+         for (int i = 0; i < NumPorts; i++) begin
+@@ -122,6 +126,16 @@ module dma_observer #(
+             if (track_bad_n[victim_q] || (has_a_q && track_bad_n[aggressor_q]))
+                 error_n[3] = 1'b1;
+         end
++        if (batch_q && (active || phase_q == ARMED && issue_i[victim_q]) &&
++            has_a_q && !batch_active_i[aggressor_q]) error_n[5] = 1'b1;
++        if (phase_q == BATCH_READ) begin
++            bump(34, 1'b1);
++            if (issue_i[victim_q] || done_i[victim_q]) error_n[1] = 1'b1;
++            if (poll_i[victim_q] && poll_id_i[victim_q] == expected_q) begin
++                count_n[9] = 1;
++                phase_n = FROZEN;
++            end
++        end
+         if (active) begin
+             bump(0, 1'b1);
+             segment_n = segment_q + 1'b1;
+@@ -150,7 +164,13 @@ module dma_observer #(
+                         bump(8, 1'b1);
+                         if (segment_n > count_q[4]) count_n[4] = segment_n;
+                         segment_n = 0;
+-                        phase_n = POLL_WAIT;
++                        if (batch_q) begin
++                            if (64'(count_n[8]) == target_q) begin
++                                phase_n = BATCH_READ;
++                                count_n[32] = CounterWidth'((CounterWidth'(reads_n[victim_q]) << 16) | CounterWidth'(writes_n[victim_q]));
++                                count_n[33] = has_a_q ? CounterWidth'((CounterWidth'(reads_n[aggressor_q]) << 16) | CounterWidth'(writes_n[aggressor_q])) : '0;
++                            end else phase_n = REFILL;
++                        end else phase_n = POLL_WAIT;
+                     end
+                 end
+                 POLL_WAIT: begin
+@@ -186,21 +206,21 @@ module dma_observer #(
+         if (cfg_valid_i && cfg_write_i) begin
+             if (cfg_wstrb_i != 8'hff) error_n[0] = 1'b1;
+             else case (cfg_addr_i)
+-                7'h68: if (!active && phase_q != ARMED) target_n = cfg_wdata_i;
++                7'h68: if (!busy && phase_q != ARMED) target_n = cfg_wdata_i;
+                          else error_n[0] = 1'b1;
+                 7'h70: if (cfg_wdata_i < 64'(Count)) index_n = cfg_wdata_i[5:0];
+                          else error_n[0] = 1'b1;
+                 7'h60: begin
+                     if (cfg_wdata_i == 2) begin // Abort observation, never DMA.
+-                        if (active || phase_q == ARMED) begin
++                        if (busy || phase_q == ARMED) begin
+                             phase_n = FROZEN;
+                             error_n[4] = 1'b1;
+                         end
+                     end else if (cfg_wdata_i == 4) begin
+-                        if (active || phase_q == ARMED) error_n[0] = 1'b1;
++                        if (busy || phase_q == ARMED) error_n[0] = 1'b1;
+                         else begin phase_n = OFF; error_n = 0; end
+-                    end else if ((cfg_wdata_i & ~64'h0000000001030301) == 0 && cfg_wdata_i[0] &&
+-                                 !active && phase_q != ARMED && target_q != 0 && target_q <= 64'h100000000 &&
++                    end else if ((cfg_wdata_i & ~64'h0000000003030301) == 0 && cfg_wdata_i[0] &&
++                                 !busy && phase_q != ARMED && target_q != 0 && target_q <= 64'h100000000 &&
+                                  int'(cfg_wdata_i[9:8]) < NumPorts && int'(cfg_wdata_i[17:16]) < NumPorts &&
+                                  (!cfg_wdata_i[24] || cfg_wdata_i[9:8] != cfg_wdata_i[17:16])) begin
+                         phase_n = ARMED;
+@@ -208,6 +228,7 @@ module dma_observer #(
+                         victim_n = cfg_wdata_i[9:8];
+                         aggressor_n = cfg_wdata_i[17:16];
+                         has_a_n = cfg_wdata_i[24];
++                        batch_n = cfg_wdata_i[25];
+                         segment_n = 0;
+                         for (int i = 0; i < Count; i++) count_n[i] = 0;
+                     end else error_n[0] = 1'b1;
+@@ -228,6 +249,7 @@ module dma_observer #(
+             victim_q <= 0;
+             aggressor_q <= 0;
+             has_a_q <= 0;
++            batch_q <= 0;
+             track_bad_q <= 0;
+             for (int i = 0; i < Count; i++) count_q[i] <= 0;
+             for (int i = 0; i < NumPorts; i++) begin reads_q[i] <= 0; writes_q[i] <= 0; end
+@@ -241,6 +263,7 @@ module dma_observer #(
+             victim_q <= victim_n;
+             aggressor_q <= aggressor_n;
+             has_a_q <= has_a_n;
++            batch_q <= batch_n;
+             track_bad_q <= track_bad_n;
+             for (int i = 0; i < Count; i++) count_q[i] <= count_n[i];
+             for (int i = 0; i < NumPorts; i++) begin reads_q[i] <= reads_n[i]; writes_q[i] <= writes_n[i]; end
+diff --git a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+index e84979e5bb80ccbfc9f7d3cc6e1577045a004f80..49b2f20fb24fc6eb26ad43db4b5b2d7f64b2562b 100644
+--- a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
++++ b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+@@ -14,6 +14,7 @@ module idma_reg64_frontend #(
+     /// dma burst request type
+     parameter type          burst_req_t      = logic,
+     parameter bit ObserverPort = 1'b0,
++    parameter bit BatchPort = 1'b0,
+     /// Device ID
+     parameter logic [23:0]  DEVICE_ID        = 24'd1,
+     /// Process ID
+@@ -27,6 +28,7 @@ module idma_reg64_frontend #(
+     input  logic          rst_ni,
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
++    output logic batch_active_o,
+     output logic [63:0] obs_issue_id_o, obs_done_id_o, obs_poll_id_o,
+     output logic obs_cfg_valid_o, obs_cfg_write_o,
+     output logic [6:0] obs_cfg_addr_o,
+@@ -79,28 +81,94 @@ module idma_reg64_frontend #(
+     dma_regs_rsp_t dma_ctrl_rsp_tmp;
+     dma_regs_req_t base_req;
+     logic observer_access;
++    logic batch_access, locked_write;
++    logic [7:0] full_addr;
++    logic batch_enable_q, batch_stop_q, batch_stopped_q, batch_error_q;
++    logic [32:0] batch_target_q, batch_issued_q, batch_completed_q;
++    logic [12:0] batch_pages_q;
++    logic [63:0] batch_id_q;
++    logic batch_cfg_ok, batch_task_issue, batch_task_done;
++    assign full_addr = 8'(dma_ctrl_req_i.addr);
++    assign batch_access = BatchPort && dma_ctrl_req_i.valid && full_addr[7];
++    assign batch_active_o = BatchPort && batch_enable_q && state_q != IDLE;
++    assign locked_write = batch_active_o && dma_ctrl_req_i.valid &&
++                          dma_ctrl_req_i.write && !batch_access && !observer_access;
++    assign batch_cfg_ok = !batch_error_q && batch_target_q != 0 && batch_target_q <= 33'h100000000 &&
++                          batch_pages_q != 0 && batch_pages_q <= 4096 &&
++                          dma_reg2hw.num_bytes.q == 4096 &&
++                          dma_reg2hw.conf.ttype.q == idma_pkg::DEFAULT &&
++                          dma_reg2hw.src_addr.q[11:0] == 0 && dma_reg2hw.dst_addr.q[11:0] == 0;
++    assign batch_task_issue = batch_active_o && state_q == COUNT && ready_i;
++    assign batch_task_done = batch_active_o && state_q == WAIT && trans_complete_i;
++
++    // The high 128-byte bank is explicitly decoded; the old register file remains 7-bit.
++    // Configuration is immutable while active. STOP drains the currently offered task.
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            batch_enable_q <= 0; batch_stop_q <= 0; batch_stopped_q <= 0;
++            batch_error_q <= 0; batch_target_q <= 0; batch_pages_q <= 0;
++            batch_issued_q <= 0; batch_completed_q <= 0; batch_id_q <= 0;
++        end else if (BatchPort) begin
++            if (batch_enable_q && issue) begin
++                batch_issued_q <= 0; batch_completed_q <= 0;
++                batch_stop_q <= 0; batch_stopped_q <= 0; batch_id_q <= next_id;
++            end
++            if (batch_task_issue) batch_issued_q <= batch_issued_q + 1'b1;
++            if (batch_task_done) begin
++                batch_completed_q <= batch_completed_q + 1'b1;
++                if (batch_stop_q) batch_stopped_q <= 1;
++            end
++            if (locked_write) batch_error_q <= 1;
++            if (batch_access && dma_ctrl_req_i.write) begin
++                if (dma_ctrl_req_i.wstrb != 8'hff) batch_error_q <= 1;
++                else if (full_addr == 8'h88 && dma_ctrl_req_i.wdata == 2)
++                    batch_stop_q <= 1;
++                else if (state_q != IDLE) batch_error_q <= 1;
++                else case (full_addr)
++                    8'h88: if (dma_ctrl_req_i.wdata <= 1) begin
++                        batch_enable_q <= dma_ctrl_req_i.wdata[0];
++                        batch_stop_q <= 0; batch_stopped_q <= 0;
++                        if (dma_ctrl_req_i.wdata == 0) begin
++                            batch_error_q <= 0;
++                            batch_issued_q <= 0;
++                            batch_completed_q <= 0;
++                        end
++                    end else batch_error_q <= 1;
++                    8'h90: if (dma_ctrl_req_i.wdata > 0 && dma_ctrl_req_i.wdata <= 64'h100000000)
++                        batch_target_q <= dma_ctrl_req_i.wdata[32:0];
++                        else batch_error_q <= 1;
++                    8'h98: if (dma_ctrl_req_i.wdata > 0 && dma_ctrl_req_i.wdata <= 4096)
++                        batch_pages_q <= dma_ctrl_req_i.wdata[12:0];
++                        else batch_error_q <= 1;
++                    default: batch_error_q <= 1;
++                endcase
++            end
++        end
++    end
+ 
+-    assign observer_access = ObserverPort && dma_ctrl_req_i.valid &&
++    assign observer_access = ObserverPort && !batch_access && dma_ctrl_req_i.valid &&
+         (dma_ctrl_req_i.addr[6:0] == 7'h58 || dma_ctrl_req_i.addr[6:0] == 7'h60 ||
+          dma_ctrl_req_i.addr[6:0] == 7'h68 || dma_ctrl_req_i.addr[6:0] == 7'h70 ||
+          dma_ctrl_req_i.addr[6:0] == 7'h78);
+     always_comb begin
+         base_req = dma_ctrl_req_i;
+-        base_req.valid = dma_ctrl_req_i.valid && !observer_access;
++        base_req.valid = dma_ctrl_req_i.valid && !observer_access && !batch_access && !locked_write;
+     end
+     assign obs_cfg_valid_o = observer_access;
+     assign obs_cfg_write_o = dma_ctrl_req_i.write;
+     assign obs_cfg_addr_o = dma_ctrl_req_i.addr[6:0];
+     assign obs_cfg_wdata_o = dma_ctrl_req_i.wdata;
+     assign obs_cfg_wstrb_o = dma_ctrl_req_i.wstrb;
+-    assign obs_issue_o = issue;
+-    assign obs_issue_id_o = next_id;
+-    assign obs_done_o = trans_complete;
++    assign obs_issue_o = batch_enable_q ? batch_task_issue : issue;
++    assign obs_issue_id_o = batch_enable_q ? 64'(batch_issued_q) + 1 : next_id;
++    assign obs_done_o = batch_enable_q ? batch_task_done : trans_complete;
+     // Value the functional ID generator will publish at this retirement edge.
+-    assign obs_done_id_o = (&done_id) ? 64'd2 : done_id + 64'd1;
++    assign obs_done_id_o = batch_enable_q ? 64'(batch_completed_q) + 1 :
++                           ((&done_id) ? 64'd2 : done_id + 64'd1);
+     assign obs_poll_o = dma_ctrl_req_i.valid && !dma_ctrl_req_i.write &&
+-                       dma_ctrl_req_i.addr[6:0] == 7'h30 && dma_ctrl_rsp_o.ready;
+-    assign obs_poll_id_o = dma_ctrl_rsp_o.rdata;
++                       !batch_access && dma_ctrl_req_i.addr[6:0] == 7'h30 && dma_ctrl_rsp_o.ready;
++    assign obs_poll_id_o = batch_enable_q ?
++        ((state_q == IDLE && done_id == batch_id_q) ? 64'(batch_completed_q) : 64'd0) : dma_ctrl_rsp_o.rdata;
+ 
+     /*
+      * DMA registers
+@@ -199,6 +267,27 @@ module idma_reg64_frontend #(
+             dma_ctrl_rsp_o.ready = 1'b1;
+         end
+ 
++        if (locked_write) begin
++            dma_ctrl_rsp_o.ready = 1;
++            dma_ctrl_rsp_o.error = 1;
++        end
++        if (batch_access) begin
++            dma_ctrl_rsp_o.ready = 1;
++            dma_ctrl_rsp_o.error = 0;
++            dma_ctrl_rsp_o.rdata = 0;
++            case (full_addr)
++                8'h80: dma_ctrl_rsp_o.rdata = 64'h49444d4142544301;
++                8'h88: dma_ctrl_rsp_o.rdata = {31'd0, batch_error_q, 28'd0,
++                    (batch_completed_q != 0 && batch_completed_q == batch_target_q && !batch_active_o),
++                    batch_stopped_q, batch_active_o, batch_enable_q};
++                8'h90: dma_ctrl_rsp_o.rdata = 64'(batch_target_q);
++                8'h98: dma_ctrl_rsp_o.rdata = 64'(batch_pages_q);
++                8'ha0: dma_ctrl_rsp_o.rdata = 64'(batch_completed_q);
++                8'ha8: dma_ctrl_rsp_o.rdata = 64'(batch_issued_q);
++                default: dma_ctrl_rsp_o.error = 1;
++            endcase
++        end
++
+         // use full width id from generator
+         dma_hw2reg.done.d = done_id;
+ 
+@@ -220,15 +309,22 @@ module idma_reg64_frontend #(
+             
+                 // start transaction upon next_id read (and having a valid config)
+                 if (dma_reg2hw.next_id.re) begin
+-                    if (dma_reg2hw.num_bytes.q != '0) begin
++                    if (batch_enable_q && !batch_cfg_ok) begin
++                        dma_ctrl_rsp_o.ready = 1;
++                        dma_ctrl_rsp_o.error = 1;
++                    end else if (dma_reg2hw.num_bytes.q != '0) begin
+                         
+                         issue = 1'b1;
+                         dma_hw2reg.next_id.d = next_id;
+                         dma_ctrl_rsp_o.ready = ready_i;
+ 
+-                        transf_counter_n = dma_reg2hw.n_trans.q;
++                        transf_counter_n = batch_enable_q ? 64'(batch_target_q) : dma_reg2hw.n_trans.q;
+                         transf_offset_n  = '0;
+                         state_n          = COUNT;
++                        if (batch_enable_q && !ready_i) begin
++                            issue = 0;
++                            state_n = IDLE;
++                        end
+                     end
+                 end
+             end
+@@ -246,6 +342,8 @@ module idma_reg64_frontend #(
+                     state_n          = WAIT;
+                     transf_counter_n = transf_counter_q - 1;
+                     transf_offset_n  = transf_offset_q + 13'h1000;
++                    if (batch_enable_q && transf_offset_n == (64'(batch_pages_q) << 12))
++                        transf_offset_n = 0;
+                 end
+             end
+ 
+@@ -253,7 +351,8 @@ module idma_reg64_frontend #(
+                 
+                 if (trans_complete_i) begin
+                     if ((transf_counter_q == '0) || 
+-                            (dma_reg2hw.conf.ttype.q == idma_pkg::DEFAULT)) begin
++                            (!batch_enable_q && dma_reg2hw.conf.ttype.q == idma_pkg::DEFAULT) ||
++                            (batch_enable_q && batch_stop_q)) begin
+                         trans_complete = 1'b1;
+                         state_n = IDLE;
+                     end
+diff --git a/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv b/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
+index 477767eadebc39fb09f59a2f58312cc64dfaa384..69a9596e5363436802e43ff691d5e9dbc2790b9d 100644
+--- a/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
++++ b/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
+@@ -27,6 +27,7 @@ module dma_core_wrap #(
+   parameter int unsigned              BufferDepth      = 32'h3, // Default = 3
+   parameter bit                       RAWCouplingAvail = 32'd0,
+   parameter bit                       ObserverPort    = 1'b0,
++  parameter bit BatchPort = 1'b0,
+   parameter bit                       IsTwoD           = 32'd0,
+   parameter type                      axi_mst_req_t    = logic,
+   parameter type                      axi_mst_rsp_t    = logic,
+@@ -41,6 +42,7 @@ module dma_core_wrap #(
+   input  logic          testmode_i,
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
++  output logic batch_active_o,
+     output logic [63:0] obs_issue_id_o, obs_done_id_o, obs_poll_id_o,
+     output logic obs_cfg_valid_o, obs_cfg_write_o,
+     output logic [6:0] obs_cfg_addr_o,
+@@ -124,6 +126,7 @@ module dma_core_wrap #(
+      */
+     idma_reg64_frontend #(
+       .ObserverPort ( ObserverPort ),
++      .BatchPort ( BatchPort ),
+       .dma_regs_req_t  ( dma_regs_req_t ),
+       .dma_regs_rsp_t  ( dma_regs_rsp_t ),
+       .burst_req_t     ( idma_req_t     ),
+@@ -132,7 +135,7 @@ module dma_core_wrap #(
+       .AxiIdWidth      ( AxiIdWidth     ),
+       .AxID            ( AxID           )
+     ) i_dma_frontend (
+-      .obs_issue_o, .obs_done_o, .obs_poll_o,
++      .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o,
+       .obs_issue_id_o, .obs_done_id_o, .obs_poll_id_o,
+       .obs_cfg_valid_o, .obs_cfg_write_o, .obs_cfg_addr_o,
+       .obs_cfg_wdata_o, .obs_cfg_wstrb_o, .obs_cfg_rdata_i,
+@@ -178,6 +181,7 @@ module dma_core_wrap #(
+     assign idma_rsp_ready    = 1'b1;
+ 
+   end else begin : gen_two_d
++    assign batch_active_o = 1'b0;
+     assign obs_issue_o = 1'b0;
+     assign obs_done_o = 1'b0;
+     assign obs_poll_o = 1'b0;
+@@ -331,6 +335,7 @@ module dma_core_wrap_intf #(
+   parameter int unsigned               BUFFER_DEPTH       = 32'h3, // Default = 3
+   parameter bit                        RAW_COUPLING_AVAIL =  1'b0,
+   parameter bit                        OBSERVER_PORT    = 1'b0,
++  parameter bit BATCH_PORT = 1'b0,
+   parameter bit                        IS_TWO_D           =  1'b0,
+ 
+   parameter logic [23:0]               DEVICE_ID          = 24'd1,
+@@ -342,6 +347,7 @@ module dma_core_wrap_intf #(
+   input  logic         testmode_i,
+     // Read-only event taps and optional observer register window.
+     output logic obs_issue_o, obs_done_o, obs_poll_o,
++  output logic batch_active_o,
+     output logic [63:0] obs_issue_id_o, obs_done_id_o, obs_poll_id_o,
+     output logic obs_cfg_valid_o, obs_cfg_write_o,
+     output logic [6:0] obs_cfg_addr_o,
+@@ -389,6 +395,7 @@ module dma_core_wrap_intf #(
+     .RAWCouplingAvail ( RAW_COUPLING_AVAIL ),
+     .IsTwoD           ( IS_TWO_D           ),
+     .ObserverPort     ( OBSERVER_PORT      ),
++    .BatchPort        ( BATCH_PORT         ),
+     .axi_mst_req_t    ( axi_mst_req_t      ),
+     .axi_mst_rsp_t    ( axi_mst_resp_t     ),
+     .axi_slv_req_t    ( axi_slv_req_t      ),
+@@ -397,7 +404,7 @@ module dma_core_wrap_intf #(
+     .PROCESS_ID       ( PROCESS_ID         ),
+     .AxID             ( AxID               )
+   ) i_dma_core_wrap (
+-      .obs_issue_o, .obs_done_o, .obs_poll_o,
++      .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o,
+       .obs_issue_id_o, .obs_done_id_o, .obs_poll_id_o,
+       .obs_cfg_valid_o, .obs_cfg_write_o, .obs_cfg_addr_o,
+       .obs_cfg_wdata_o, .obs_cfg_wstrb_o, .obs_cfg_rdata_i,

@@ -1,0 +1,1454 @@
+--- before/nonblock_actual_dma_test.cpp
++++ tests/nonblock_actual_dma_test.cpp
+@@ -60,6 +60,7 @@
+ 
+ double sc_time_stamp() { return 0; }
+ 
++#include <cerrno>
+ #include <cstdio>
+ #include <cstdint>
+ #include <cstdlib>
+@@ -162,6 +163,19 @@
+     throw TestFailure(buf);
+ }
+ #define CHECK(cond, msg) do { if (!(cond)) fail((msg), __FILE__, __LINE__); } while (0)
++
++#ifdef ACTUAL_DMA_SYSTEM
++// Pure full-batch watchdog decision: it reads NO DUT / harness state, so it
++// can be unit-tested directly with cycle numbers.  Before the channel has
++// issued anything it gets the larger `supply_wait` allowance; afterwards it
++// gets the steady-state `gap`.  Returns true when the channel must be
++// declared stalled.
++static bool full_watchdog_fault(long now, long last_progress, bool issued,
++                                long supply_wait, long gap) {
++    const long elapsed = now - last_progress;
++    return issued ? (elapsed > gap) : (elapsed > supply_wait);
++}
++#endif
+ 
+ // ---------------------------------------------------------------------------
+ class Tb {
+@@ -208,6 +222,23 @@
+     uint32_t v_transfers       = 64;
+     uint32_t warmup            = 256;
+     uint64_t a_target          = 1048576ULL;   // or 0x100000000ULL
++    // ---- full-batch independent mode (SYSTEM; default OFF) --------------
++    bool     full_batch    = false;
++    // Runtime CPU enable.  Drives cpu_enable_i on the SYSTEM top only; the
++    // non-SYSTEM top has no such port and ignores it.
++    bool     cpu_enable    = true;
++    // Billed common delay after the shared t0 and before the first NEXT_ID.
++    uint32_t start_delay   = 0;
++    // Bounded per-channel delays before the corresponding NEXT_ID.
++    uint32_t v_start_delay = 0;
++    uint32_t a_start_delay = 0;
++    // "av" | "va": which channel's NEXT_ID is issued first.
++    std::string launch_order = "av";
++    // Full-batch per-channel progress watchdog (cycles).  Two DISTINCT
++    // bounds are kept: the initial allowance before the lane has issued
++    // anything, and the steady-state no-progress gap after the first issue.
++    long     full_watchdog_cycles    = 200000L;
++    long     full_supply_wait_cycles = 200000L;
+ 
+     long g_cycle        = 0;
+     long scenario_start = 0;
+@@ -402,12 +433,55 @@
+     uint64_t w_ds_latency_sum = 0, w_ds_latency_n = 0, w_ds_latency_max = 0;
+ #endif
+ 
++    // ---------------------------------------------------------------------
++    // FULL-BATCH independent mode state (SYSTEM-only consumers; declared
++    // unconditionally so the non-SYSTEM build still compiles).  Default OFF.
++    // Every count below is accumulated from PRE-EDGE hardware samples.
++    // ---------------------------------------------------------------------
++    bool     full_era          = false;
++    long     full_t0           = 0;
++    long     full_quiet_cycle  = 0;
++    long     full_last_progress[2] = {0, 0};
++    bool     full_started[2]   = {false, false};
++    uint32_t full_issue_n[2]   = {0, 0};
++    uint32_t full_done_n[2]    = {0, 0};
++    bool     full_issue_seen[2]= {false, false};
++    long     full_first_issue[2] = {0, 0};
++    long     full_final_done[2]  = {0, 0};
++    std::vector<long> full_ready_cyc[2];
++    std::vector<long> full_issue_cyc[2];
++    std::vector<long> full_done_cyc[2];
++    uint64_t full_ar_n[2] = {0, 0};
++    uint64_t full_aw_n[2] = {0, 0};
++    uint64_t full_rd_bytes[2] = {0, 0};
++    uint64_t full_wr_bytes[2] = {0, 0};
++    uint64_t full_r_n[2] = {0, 0};
++    uint64_t full_r_return_bytes[2] = {0, 0};
++    uint64_t full_b_n[2] = {0, 0};
++    uint64_t full_err[2] = {0, 0};
++    uint64_t full_reg_issued[2] = {0, 0};
++    uint64_t full_reg_done[2]   = {0, 0};
++    bool     full_reg_complete[2] = {false, false};
++    bool     full_reg_stopped[2]  = {false, false};
++    bool     full_reg_active[2]   = {false, false};
++    bool     full_reg_enable[2]   = {false, false};
++    // full-era raw classifiers (G0 explanation only; raw, not de-biased)
++    uint64_t full_tl_accept = 0, full_tl_resp = 0;
++    uint64_t full_iotlb_lookup = 0, full_iotlb_hit = 0;
++    uint64_t full_ptw_active = 0, full_ptw_r_fire = 0;
++    uint64_t full_fast = 0;
++    uint64_t full_comp_ar = 0, full_comp_aw = 0, full_comp_w = 0;
++    uint64_t full_ddtw_ar = 0, full_ptw_ar = 0;
++    bool     full_trace_ptw_active = false;
++
+     // Debug-only reset baselines.  DONE waits use the NEXT_ID captured by
+     // trigger(), never these values.
+     uint64_t v_done_last = 0, a_done_last = 0;
+ 
+     static const long WATCHDOG_CYCLES = 200000L;   // ~10x a 4 KiB copy + walk
+     static const long CFG_TIMEOUT     = 100000L;
++    // Per-delay cap, enforced by argument validation before simulation.
++    static const long BUDGET_DELAY_CAP = 2000000L;
+ 
+     Tb() : top(new TopT) {}
+     ~Tb() {
+@@ -418,7 +492,11 @@
+     }
+ #ifdef ACTUAL_DMA_SYSTEM
+     void trace_event(const char* event, unsigned tag, uint64_t addr, uint64_t value) {
+-        if (event_trace && win_open)
++        // The legacy trace is a WINDOW-relative timeline.  In full-batch mode
++        // the full trace block emits a t0-relative timeline into the same
++        // file, so the legacy trace is disabled there to keep exactly one time
++        // base per file.
++        if (event_trace && win_open && !full_era)
+             std::fprintf(event_trace, "%ld,%s,%u,%llu,%llu\n",
+                 g_cycle - win_open_cycle, event, tag,
+                 (unsigned long long)addr, (unsigned long long)value);
+@@ -604,7 +682,14 @@
+         // oldest DS request, retaining order within every ID and preserving
+         // a VALID payload held from the prior tick. No DUT arbitration changes.
+         // Each request retains its original latency/beat state after rotation.
+-        if (ds_priority && win_open && !ddr_r_held &&
++        // The priority WINDOW is the legacy first-V-issue window in the legacy
++        // path and the full-era V-completion count in full-batch mode
++        // (v_transfers == 64 in the approved full configuration).  The held-R
++        // guard applies to BOTH: a beat currently held MUST NOT be displaced.
++        const bool ds_window = full_batch
++            ? (full_era && full_done_n[0] < (uint32_t)v_transfers)
++            : win_open;
++        if (ds_priority && !ddr_r_held && ds_window &&
+             ((mem_q.front().id >> 4) & 3) != 3) {
+             auto ds = std::find_if(mem_q.begin(), mem_q.end(), [](const MemRead& r) {
+                 return ((r.id >> 4) & 3) == 3;
+@@ -643,6 +728,8 @@
+         // measurement phase is active.  Buffer size is unchanged.
+         top->owner_only_i       = (owner_only && measurement_phase) ? 1 : 0;
+ #ifdef ACTUAL_DMA_SYSTEM
++        // Runtime CPU enable: a real input, not a CpuIssueInterval==0 fake.
++        top->cpu_enable_i   = cpu_enable ? 1 : 0;
+         top->read_admit_mode_i =
+             (read_admit_measure_only && !measurement_phase) ? 1 : read_admit_mode_val;
+         top->read_budget_i     = read_budget;
+@@ -845,6 +932,124 @@
+             ++n_iotlb_lookup;
+             if (top->dbg_tl_iotlb_hit) ++n_iotlb_hit;
+         }
++
++#ifdef ACTUAL_DMA_SYSTEM
++        // ---- full-batch per-copy recording + raw era counters -----------
++        // All values are PRE-EDGE samples.  DONE is processed before ISSUE so
++        // a back-to-back same-cycle done->issue keeps ready[j] == done[j-1].
++        if (full_era) {
++            const uint32_t fi = (uint32_t)top->dbg_dma_issue & 3u;
++            const uint32_t fd = (uint32_t)top->dbg_dma_done  & 3u;
++            for (int c = 0; c < 2; ++c) {
++                const uint32_t bit    = 1u << c;
++                const uint32_t target = (c == 0) ? v_transfers : (uint32_t)a_target;
++                // DONE is processed BEFORE ISSUE so a back-to-back same-cycle
++                // done->issue keeps ready[j] == done[j-1].
++                if (fd & bit) {
++                    // Every pulse counts.  An extra pulse is a HARD failure:
++                    // saturation would silently hide a duplicate DONE.
++                    CHECK(full_done_n[c] < target,
++                          "full-batch DONE pulse beyond the channel target");
++                    CHECK(full_done_n[c] < full_issue_n[c],
++                          "full-batch DONE pulse without a matching ISSUE");
++                    full_done_cyc[c].push_back(g_cycle);
++                    ++full_done_n[c];
++                    full_final_done[c]      = g_cycle;
++                    full_last_progress[c]   = g_cycle;
++                }
++                if (fi & bit) {
++                    CHECK(full_issue_n[c] < target,
++                          "full-batch ISSUE pulse beyond the channel target");
++                    // Strict single-active: no new job may start while the
++                    // previous job of the same channel is still outstanding.
++                    CHECK(full_issue_n[c] == full_done_n[c],
++                          "full-batch channel issued a second job before DONE");
++                    const long ready = (full_issue_n[c] == 0)
++                        ? full_t0
++                        : full_done_cyc[c].back();
++                    CHECK(ready <= g_cycle,
++                          "full-batch per-copy ready time is after its issue");
++                    full_ready_cyc[c].push_back(ready);
++                    full_issue_cyc[c].push_back(g_cycle);
++                    ++full_issue_n[c];
++                    if (!full_issue_seen[c]) {
++                        full_issue_seen[c]  = true;
++                        full_first_issue[c] = g_cycle;
++                    }
++                    full_last_progress[c] = g_cycle;
++                }
++            }
++            if (top->dbg_tl_req_valid && top->dbg_tl_req_ready) ++full_tl_accept;
++            if (top->dbg_tl_resp_valid && top->dbg_tl_resp_ready) ++full_tl_resp;
++            if (top->dbg_tl_ptw_active) ++full_ptw_active;
++            if (top->dbg_tl_ptw_r_fire) ++full_ptw_r_fire;
++            if (top->dbg_tl_iotlb_lookup) {
++                ++full_iotlb_lookup;
++                if (top->dbg_tl_iotlb_hit) ++full_iotlb_hit;
++            }
++            if (top->dbg_fast_resp_valid && top->dbg_fast_resp_ready) ++full_fast;
++            if (top->dbg_comp_ar_fire) ++full_comp_ar;
++            if (top->dbg_comp_aw_fire) ++full_comp_aw;
++            if (top->dbg_comp_w_fire)  ++full_comp_w;
++            if (top->dbg_ddtw_ar_fire) ++full_ddtw_ar;
++            if (top->dbg_ptw_ar_fire)  ++full_ptw_ar;
++        }
++
++        // ---- full-batch trace (independent of win_open) ----------------
++        // Event-driven only: real hardware issue/done pulses plus the existing
++        // payload / PTW / DDR diagnostics over the WHOLE t0..quiet era, so the
++        // full path is visible even when no legacy measurement window is open.
++        if (full_era && event_trace) {
++            const uint32_t fissue = (uint32_t)top->dbg_dma_issue & 3u;
++            const uint32_t fdone  = (uint32_t)top->dbg_dma_done  & 3u;
++            if (fissue)
++                std::fprintf(event_trace, "%ld,full_dma_issue,%u,0,0\n",
++                             g_cycle - full_t0, fissue);
++            if (fdone)
++                std::fprintf(event_trace, "%ld,full_dma_done,%u,0,0\n",
++                             g_cycle - full_t0, fdone);
++            if (f_ddr_ar)
++                std::fprintf(event_trace, "%ld,full_ddr_ar,%u,%llu,%u\n",
++                             g_cycle - full_t0, s_ddr_ar_i,
++                             (unsigned long long)s_ddr_ar_a, s_ddr_ar_l);
++            if (f_ddr_aw)
++                std::fprintf(event_trace, "%ld,full_ddr_aw,%u,%llu,%u\n",
++                             g_cycle - full_t0, s_ddr_aw_i,
++                             (unsigned long long)s_ddr_aw_a, s_ddr_aw_l);
++            if (f_ddr_w)
++                std::fprintf(event_trace, "%ld,full_ddr_w,%u,%llu,%u\n",
++                             g_cycle - full_t0, (unsigned)s_ddr_w_l,
++                             (unsigned long long)s_ddr_w_d, (unsigned)s_ddr_w_s);
++            if (f_ddr_b)
++                std::fprintf(event_trace, "%ld,full_ddr_b,%u,0,0\n",
++                             g_cycle - full_t0, (unsigned)top->ddr_b_id);
++            if (f_ddr_r && !mem_q.empty()) {
++                const MemRead& r = mem_q.front();
++                std::fprintf(event_trace, "%ld,full_ddr_r,%u,%llu,%u\n",
++                             g_cycle - full_t0, (unsigned)r.id,
++                             (unsigned long long)r.addr, (unsigned)r.beat);
++            }
++            if (top->dbg_tl_ptw_active != full_trace_ptw_active) {
++                std::fprintf(event_trace, "%ld,full_ptw_%s,%u,0,0\n",
++                             g_cycle - full_t0,
++                             top->dbg_tl_ptw_active ? "start" : "end",
++                             (unsigned)top->dbg_main_bank);
++                full_trace_ptw_active = top->dbg_tl_ptw_active;
++            }
++            if (top->dbg_iotlb_fill)
++                std::fprintf(event_trace, "%ld,full_fill,%u,0,0\n",
++                             g_cycle - full_t0, (unsigned)top->dbg_main_bank);
++            if (top->dbg_ptw_ar_fire)
++                std::fprintf(event_trace, "%ld,full_ptw_ar,%u,0,0\n",
++                             g_cycle - full_t0, (unsigned)top->dbg_main_bank);
++            if (top->dbg_tl_ptw_r_fire)
++                std::fprintf(event_trace, "%ld,full_ptw_r,%u,0,0\n",
++                             g_cycle - full_t0, (unsigned)top->dbg_main_bank);
++            if (top->dbg_fast_resp_valid && top->dbg_fast_resp_ready)
++                std::fprintf(event_trace, "%ld,full_fast,%u,0,0\n",
++                             g_cycle - full_t0, (unsigned)top->dbg_fast_resp_bank);
++        }
++#endif
+ 
+         // ================= measurement window (pre-edge) ==================
+         // Gated by win_open; see the counter block in class Tb.  Nothing is
+@@ -1086,6 +1291,13 @@
+         if (f_ddr_ar) {
+             ++n_ddr_ar;
+             ++n_slv_ar[(s_ddr_ar_i >> 4) & 3];
++            // full-batch: real payload read bytes for the completion master
++            // (slave port 2).  DS walk (3) and CPU (0) are excluded.
++            if (full_era && (((s_ddr_ar_i >> 4) & 3u) == 2u)) {
++                const unsigned ch = (unsigned)((s_ddr_ar_i >> 2) & 1u);
++                ++full_ar_n[ch];
++                full_rd_bytes[ch] += ((uint64_t)s_ddr_ar_l + 1ULL) * 8ULL;
++            }
+             MemRead r; r.port = P_DDR; r.addr = s_ddr_ar_a;
+             r.len = (uint8_t)s_ddr_ar_l; r.id = (uint8_t)s_ddr_ar_i;
+             r.beat = 0; r.latency = (int)ptw_latency;
+@@ -1094,6 +1306,28 @@
+         }
+         if (f_ddr_aw) {
+             ++n_ddr_aw;
++            if (full_era) {
++                const unsigned slv = (s_ddr_aw_i >> 4) & 3u;
++                const unsigned chn = (unsigned)((s_ddr_aw_i >> 2) & 1u);
++                if (slv == 2u) {
++                    // Completion write payload.  Classification needs BOTH the
++                    // completion slave port / bank bit AND a legal 4 KiB
++                    // physical payload window (the V measurement destination
++                    // page or an A ring destination page).  A synthetic-CPU
++                    // write to the SAME V address arrives on slave port 0 and
++                    // is therefore excluded.
++                    const uint64_t a0 = s_ddr_aw_a;
++                    const uint64_t a1 = a0 + ((uint64_t)s_ddr_aw_l + 1ULL) * 8ULL - 1ULL;
++                    CHECK((a0 >> 12) == (a1 >> 12),
++                          "full-batch AW payload crosses a 4 KiB page");
++                    const bool in_v = (a0 >= v_measure_dst_pa() && a1 < v_measure_dst_pa() + PAGE_BYTES);
++                    const bool in_a = (a0 >= A_DST_PA_BASE &&
++                                       a1 <  A_DST_PA_BASE + (uint64_t)a_pages * 0x1000ULL);
++                    CHECK(chn == 0 ? in_v : in_a,
++                          "full-batch AW payload outside its channel destination map");
++                    ++full_aw_n[chn];
++                }
++            }
+             CawEnt c; c.id = s_ddr_aw_i; c.addr = s_ddr_aw_a;
+             c.len = (uint8_t)s_ddr_aw_l; c.got = 0;
+             caw_q.push_back(c);
+@@ -1102,6 +1336,15 @@
+             CHECK(!caw_q.empty(), "completion W without a pending completion AW");
+             CawEnt& c = caw_q.front();
+             CHECK(c.got < (uint32_t)c.len + 1, "too many completion W beats");
++            // full-batch: strobe-weighted write payload bytes, attributed by
++            // the pending AW id (slave port 2 only).
++            if (full_era && (((c.id >> 4) & 3u) == 2u)) {
++                const unsigned ch = (unsigned)((c.id >> 2) & 1u);
++                unsigned bits = 0;
++                for (int i = 0; i < 8; ++i)
++                    if (s_ddr_w_s & (uint8_t)(1u << i)) ++bits;
++                full_wr_bytes[ch] += bits;
++            }
+             write_beat(c.addr + (uint64_t)c.got * 8, s_ddr_w_d, s_ddr_w_s);
+             c.got++;
+             if (s_ddr_w_l) {
+@@ -1113,12 +1356,45 @@
+         if (f_ddr_b) {
+             ++n_ddr_b;
+             CHECK(!cb_q.empty(), "completion B handshake with empty cb_q");
++            const uint32_t bq_id = (uint32_t)(uint8_t)cb_q.front();
++            // The driven B must echo the queued completion AW id.
++            CHECK((uint32_t)top->ddr_b_id == bq_id,
++                  "DDR B id does not match the queued completion AW id");
++            // full-batch: B response conservation (slave port 2 only).
++            if (full_era && ((bq_id >> 4) & 3u) == 2u) {
++                const unsigned chn = (unsigned)((bq_id >> 2) & 1u);
++                ++full_b_n[chn];
++                if (top->ddr_b_resp != 0) ++full_err[chn];
++            }
+             cb_q.pop_front();
+         }
+         if (f_ddr_r) {
+             ++n_ddr_r;
++            CHECK(!mem_q.empty(), "R handshake with an empty DDR read queue");
+             MemRead& h = mem_q.front();
+             CHECK(h.port == P_DDR, "R handshake on an unexpected port");
++            // The R payload driven this cycle must match the queue head: the
++            // id is echoed verbatim and LAST marks the burst tail.
++            CHECK((uint32_t)top->ddr_r_id == (uint32_t)h.id &&
++                  ((h.beat == h.len) == (top->ddr_r_last != 0)),
++                  "DDR R id/LAST does not match the queued request head");
++            // full-batch: accepted-AR -> R byte conservation (slave port 2).
++            if (full_era && ((((uint8_t)h.id) >> 4) & 3u) == 2u) {
++                const unsigned chn = (unsigned)((((uint8_t)h.id) >> 2) & 1u);
++                // Payload range: only the completion source pages may count.
++                const uint64_t a1 = h.addr + ((uint64_t)h.len + 1ULL) * 8ULL - 1ULL;
++                CHECK((h.addr >> 12) == (a1 >> 12),
++                      "full-batch AR payload crosses a 4 KiB page");
++                const bool in_v = (h.addr >= V_SRC_PA &&
++                                   a1 <  V_SRC_PA + (uint64_t)PAGE_BYTES);
++                const bool in_a = (h.addr >= A_SRC_PA_BASE &&
++                                   a1 <  A_SRC_PA_BASE + (uint64_t)a_pages * 0x1000ULL);
++                CHECK(chn == 0 ? in_v : in_a,
++                      "full-batch AR payload outside its channel source map");
++                ++full_r_n[chn];
++                full_r_return_bytes[chn] += 8ULL;   // one 64-bit R beat
++                if (top->ddr_r_resp != 0) ++full_err[chn];
++            }
+             if (h.beat == h.len) mem_q.pop_front();
+             else                 h.beat++;
+         }
+@@ -1359,6 +1635,40 @@
+         for (auto& c : w_read_setup_port) c = 0;
+         trace_ptw_active = false;
+         trace_aw_flags = 0;
++        // Full-batch state is (re)initialised by full_measure_begin(); clear
++        // the accumulation flags so repeated scenarios are well defined.
++        full_era = false;
++        full_t0 = 0;
++        full_quiet_cycle = 0;
++        full_last_progress[0] = full_last_progress[1] = g_cycle;
++        full_started[0] = full_started[1] = false;
++        full_issue_n[0] = full_issue_n[1] = 0;
++        full_done_n[0]  = full_done_n[1]  = 0;
++        full_issue_seen[0] = full_issue_seen[1] = false;
++        full_first_issue[0] = full_first_issue[1] = 0;
++        full_final_done[0]  = full_final_done[1]  = 0;
++        full_ready_cyc[0].clear(); full_ready_cyc[1].clear();
++        full_issue_cyc[0].clear(); full_issue_cyc[1].clear();
++        full_done_cyc[0].clear();  full_done_cyc[1].clear();
++        full_ar_n[0] = full_ar_n[1] = 0;
++        full_aw_n[0] = full_aw_n[1] = 0;
++        full_rd_bytes[0] = full_rd_bytes[1] = 0;
++        full_wr_bytes[0] = full_wr_bytes[1] = 0;
++        full_r_n[0] = full_r_n[1] = 0;
++        full_r_return_bytes[0] = full_r_return_bytes[1] = 0;
++        full_b_n[0] = full_b_n[1] = 0;
++        full_err[0] = full_err[1] = 0;
++        full_reg_issued[0] = full_reg_issued[1] = 0;
++        full_reg_done[0]   = full_reg_done[1]   = 0;
++        full_reg_complete[0] = full_reg_complete[1] = false;
++        full_reg_stopped[0]  = full_reg_stopped[1]  = false;
++        full_tl_accept = full_tl_resp = 0;
++        full_iotlb_lookup = full_iotlb_hit = 0;
++        full_ptw_active = full_ptw_r_fire = 0;
++        full_fast = 0;
++        full_comp_ar = full_comp_aw = full_comp_w = 0;
++        full_ddtw_ar = full_ptw_ar = 0;
++        full_trace_ptw_active = false;
+         cpu_progress_cycle = g_cycle;
+         last_cpu_issued    = 0;
+         last_cpu_completed = 0;
+@@ -1400,7 +1710,7 @@
+                 throw TestFailure("watchdog during drain-to-quiet");
+             }
+ #ifdef ACTUAL_DMA_SYSTEM
+-            if (cpu_writes && !top->dbg_cpu_wr_quiet &&
++            if (cpu_enable && cpu_writes && !top->dbg_cpu_wr_quiet &&
+                 (g_cycle - cpu_wr_progress_cycle > cpu_wr_watchdog_cycles)) {
+                 dump_stall(std::string("quiet cpu-wr ") + tag);
+                 throw TestFailure("watchdog: synthetic CPU write/AMO made no progress");
+@@ -1748,9 +2058,22 @@
+         // jobs plus a comparable number of A refills, so the original
+         // two-jobs-per-warmup bound is kept.
+         long warm    = (long)warmup * 2L * per_job;
++        const long wrap = 200000L;   // setup + drain-to-quiet + readback
++        if (full_batch) {
++            // Full-batch budget: warm + V(batch target) + A(batch target) +
++            // the three BOUNDED launch delays + wrap-up.  The A term is
++            // bounded by a_target, NOT by a_pages * 16: the ring page count is
++            // not a work multiplier in full mode.
++            long victim = (long)v_transfers * (per_job + (long)v_gap_cycles);
++            long aggr   = (long)a_target * per_job;
++            long d1 = std::min<long>((long)start_delay,   BUDGET_DELAY_CAP);
++            long d2 = std::min<long>((long)v_start_delay, BUDGET_DELAY_CAP);
++            long d3 = std::min<long>((long)a_start_delay, BUDGET_DELAY_CAP);
++            return wrap + warm + victim + aggr + d1 + d2 + d3;
++        }
+         long victim  = (long)v_transfers * (per_job + (long)v_gap_cycles);
+         long aggr    = (long)a_pages * 16L * per_job;
+-        return 200000L + warm + victim + aggr;
++        return wrap + warm + victim + aggr;
+     }
+ 
+     // ---------------------------------------------------------------------
+@@ -2010,77 +2333,84 @@
+         configure_batch(SEL_V, V_SRC_IOVA, v_measure_dst_iova(),
+                         (uint64_t)v_transfers, 1, v_gap_cycles);
+ 
+-        // ---- 3. A NEXT_ID then V NEXT_ID -------------------------------
+-        win_armed = true;
+-        start_batch(SEL_A);
+-        start_batch(SEL_V);
+-
+-        // ---- 4. wait for V batch completion ----------------------------
+-        {
+-            long t = 0;
+-            bool err, complete, stopped, active, enable_b;
+-            for (;;) {
+-                tick();
+-                if (g_cycle - last_progress_cycle > WATCHDOG_CYCLES) {
+-                    dump_stall("scenario V");
+-                    throw TestFailure("watchdog: no handshake progress while V runs");
++        // ---- 3. launches + run to terminal -----------------------------
++        // Full-batch (independent, default OFF) shares the configure phase
++        // above.  Its common t0 is captured inside run_full_batch() after
++        // BOTH batches are configured and before the first NEXT_ID.
++        if (full_batch) {
++            run_full_batch(name, enable);
++        } else {
++            win_armed = true;
++            start_batch(SEL_A);
++            start_batch(SEL_V);
++
++            // ---- 4. wait for V batch completion ------------------------
++            {
++                long t = 0;
++                bool err, complete, stopped, active, enable_b;
++                for (;;) {
++                    tick();
++                    if (g_cycle - last_progress_cycle > WATCHDOG_CYCLES) {
++                        dump_stall("scenario V");
++                        throw TestFailure("watchdog: no handshake progress while V runs");
++                    }
++                    // V completion progress is tracked independently of A's
++                    // handshakes, so a stalled V is detected even while A runs.
++                    if (g_cycle - v_progress_cycle > v_watchdog_cycles) {
++                        dump_stall("scenario V progress");
++                        throw TestFailure("watchdog: V made no completion progress");
++                    }
++#ifdef ACTUAL_DMA_SYSTEM
++                    if (cpu_enable && (top->dbg_dma_batch_active & 1) &&
++                        (g_cycle - cpu_progress_cycle > cpu_watchdog_cycles)) {
++                        dump_stall("scenario CPU progress");
++                        throw TestFailure("watchdog: synthetic CPU made no progress");
++                    }
++                    if (cpu_enable && cpu_writes && !top->dbg_cpu_wr_quiet &&
++                        (g_cycle - cpu_wr_progress_cycle > cpu_wr_watchdog_cycles)) {
++                        dump_stall("scenario CPU write progress");
++                        throw TestFailure("watchdog: synthetic CPU write/AMO made no progress");
++                    }
++#endif
++                    read_batch_ctl(SEL_V, err, complete, stopped, active, enable_b);
++                    if (complete) break;
++                    if (g_cycle - scenario_start > scenario_budget) {
++                        dump_stall("scenario V budget");
++                        throw TestFailure("scenario budget exceeded while V runs");
++                    }
++                    ++t;
+                 }
+-                // V completion progress is tracked independently of A's
+-                // handshakes, so a stalled V is detected even while A runs.
+-                if (g_cycle - v_progress_cycle > v_watchdog_cycles) {
+-                    dump_stall("scenario V progress");
+-                    throw TestFailure("watchdog: V made no completion progress");
++                (void)t;
++            }
++
++            // tick() already froze the window at the final hardware V done.
++            // Print before drain; final PASS still requires all data checks.
++            report_window(name, enable);
++
++            // ---- 5. STOP A and drain (LEGACY measurement path only) ----
++            stop_batch(SEL_A);
++            {
++                bool err, complete, stopped, active, enable_b;
++                long t = 0;
++                for (;;) {
++                    tick();
++                    if (g_cycle - last_progress_cycle > WATCHDOG_CYCLES) {
++                        dump_stall("scenario A drain");
++                        throw TestFailure("watchdog: no handshake progress while A drains");
++                    }
++                    read_batch_ctl(SEL_A, err, complete, stopped, active, enable_b);
++                    if (!active) break;
++                    if (g_cycle - scenario_start > scenario_budget) {
++                        dump_stall("scenario A drain budget");
++                        throw TestFailure("scenario budget exceeded while A drains");
++                    }
++                    ++t;
+                 }
+-#ifdef ACTUAL_DMA_SYSTEM
+-                if ((top->dbg_dma_batch_active & 1) &&
+-                    (g_cycle - cpu_progress_cycle > cpu_watchdog_cycles)) {
+-                    dump_stall("scenario CPU progress");
+-                    throw TestFailure("watchdog: synthetic CPU made no progress");
+-                }
+-                if (cpu_writes && !top->dbg_cpu_wr_quiet &&
+-                    (g_cycle - cpu_wr_progress_cycle > cpu_wr_watchdog_cycles)) {
+-                    dump_stall("scenario CPU write progress");
+-                    throw TestFailure("watchdog: synthetic CPU write/AMO made no progress");
+-                }
+-#endif
+-                read_batch_ctl(SEL_V, err, complete, stopped, active, enable_b);
+-                if (complete) break;
+-                if (g_cycle - scenario_start > scenario_budget) {
+-                    dump_stall("scenario V budget");
+-                    throw TestFailure("scenario budget exceeded while V runs");
+-                }
+-                ++t;
+-            }
+-            (void)t;
+-        }
+-
+-        // tick() already froze the window at the final hardware V done.
+-        // Print before drain; final PASS still requires all data checks.
+-        report_window(name, enable);
+-
+-        // ---- 5. STOP A and drain ---------------------------------------
+-        stop_batch(SEL_A);
+-        {
+-            bool err, complete, stopped, active, enable_b;
+-            long t = 0;
+-            for (;;) {
+-                tick();
+-                if (g_cycle - last_progress_cycle > WATCHDOG_CYCLES) {
+-                    dump_stall("scenario A drain");
+-                    throw TestFailure("watchdog: no handshake progress while A drains");
+-                }
+-                read_batch_ctl(SEL_A, err, complete, stopped, active, enable_b);
+-                if (!active) break;
+-                if (g_cycle - scenario_start > scenario_budget) {
+-                    dump_stall("scenario A drain budget");
+-                    throw TestFailure("scenario budget exceeded while A drains");
+-                }
+-                ++t;
+-            }
+-            (void)t;
+-        }
+-
+-        check_quiet(name);
++                (void)t;
++            }
++
++            check_quiet(name);
++        }
+ 
+         // ---- 6. exact byte verification of every touched page ----------
+         for (uint32_t i = 0; i < PAGE_BEATS; ++i) {
+@@ -2117,6 +2447,7 @@
+ 
+         // ---- 7. mechanism guards ---------------------------------------
+ #ifdef ACTUAL_DMA_SYSTEM
++        CHECK(top->dbg_cpu_rd_err == 0, "synthetic CPU read error");
+         CHECK(n_ddr_ar > 0, "no shared-DDR reads observed");
+         CHECK(n_ddr_aw > 0, "no shared-DDR writes observed");
+         CHECK(n_ddr_r  > 0, "no shared-DDR R beats observed");
+@@ -2124,12 +2455,19 @@
+         // Walker evidence comes from the underlying harness taps, not from the
+         // (merged-away) external dd/ptw ports.
+         CHECK((n_walk_ddtw + n_walk_ptw) > 0, "no walker reads observed");
+-        // Synthetic CPU must actually run and drain (no false PASS by skipping
+-        // the new branch).
+-        CHECK(top->dbg_cpu_completed > 0, "synthetic CPU completed no reads");
+-        CHECK(top->dbg_cpu_issued == top->dbg_cpu_completed,
+-              "synthetic CPU issued/completed read mismatch at terminal");
+-        CHECK(top->dbg_cpu_quiet, "synthetic CPU not quiet at terminal");
++        // Synthetic CPU assertions are PAIRED: a runtime-disabled CPU is
++        // required to have issued nothing and to be quiet, never to have
++        // completed reads.
++        if (cpu_enable) {
++            CHECK(top->dbg_cpu_completed > 0, "synthetic CPU completed no reads");
++            CHECK(top->dbg_cpu_issued == top->dbg_cpu_completed,
++                  "synthetic CPU issued/completed read mismatch at terminal");
++            CHECK(top->dbg_cpu_quiet, "synthetic CPU not quiet at terminal");
++        } else {
++            CHECK(top->dbg_cpu_issued == 0 && top->dbg_cpu_completed == 0,
++                  "synthetic CPU issued traffic while runtime-disabled");
++            CHECK(top->dbg_cpu_quiet, "synthetic CPU not quiet at terminal");
++        }
+         if (read_admit_mode_val != 0) {
+             CHECK(n_ra_captured == n_ra_ar_fire,
+                   "read-admission proxy captures do not match downstream AR fires");
+@@ -2156,34 +2494,54 @@
+                     (unsigned)top->dbg_ra_total_debt);
+         // ---- optional synthetic CPU write / AMO evidence -------------------
+         if (cpu_writes) {
+-            CHECK(top->dbg_cpu_wr_completed  > 0,
+-                  "synthetic CPU completed no plain writes");
+-            CHECK(top->dbg_cpu_amo_completed > 0,
+-                  "synthetic CPU completed no AMOs");
+-            // issued == completed: every offered AW/W/B/R really retired.
+-            CHECK(top->dbg_cpu_wr_issued  == top->dbg_cpu_wr_completed,
+-                  "synthetic CPU issued/completed write mismatch at terminal");
+-            CHECK(top->dbg_cpu_amo_issued == top->dbg_cpu_amo_completed,
+-                  "synthetic CPU issued/completed AMO mismatch at terminal");
+-            CHECK(top->dbg_cpu_rd_err  == 0,
+-                  "synthetic CPU read received a non-OKAY response");
+-            CHECK(top->dbg_cpu_wr_err  == 0,
+-                  "synthetic CPU write received a non-OKAY response");
+-            CHECK(top->dbg_cpu_amo_err == 0,
+-                  "synthetic CPU AMO received a non-OKAY response");
+-            CHECK(n_cpu_amo_obs == (uint64_t)top->dbg_cpu_amo_completed,
+-                  "AMO R observations do not match completed AMOs");
+-            // Plain write data / strobe actually landed in DDR.
+-            CHECK(read64(CPU_WR_ADDR) == CPU_WR_DAT0,
+-                  "synthetic CPU plain write beat 0 data was not stored");
+-            CHECK(read64(CPU_WR_ADDR + 8) ==
+-                      cpu_apply_strb(CPU_WR_INIT1, CPU_WR_DAT1, CPU_WR_STR1),
+-                  "synthetic CPU plain write beat 1 data/strb was not honoured");
+-            // AMO accumulation reached the expected final DDR value.
+-            CHECK(read64(CPU_AMO_ADDR) ==
+-                      CPU_AMO_INIT +
+-                      (uint64_t)top->dbg_cpu_amo_completed * CPU_AMO_ADD,
+-                  "synthetic CPU AMO final DDR value does not match the addend sum");
++            if (cpu_enable) {
++                CHECK(top->dbg_cpu_wr_completed  > 0,
++                      "synthetic CPU completed no plain writes");
++                CHECK(top->dbg_cpu_amo_completed > 0,
++                      "synthetic CPU completed no AMOs");
++                // issued == completed: every offered AW/W/B/R really retired.
++                CHECK(top->dbg_cpu_wr_issued  == top->dbg_cpu_wr_completed,
++                      "synthetic CPU issued/completed write mismatch at terminal");
++                CHECK(top->dbg_cpu_amo_issued == top->dbg_cpu_amo_completed,
++                      "synthetic CPU issued/completed AMO mismatch at terminal");
++                CHECK(top->dbg_cpu_rd_err  == 0,
++                      "synthetic CPU read received a non-OKAY response");
++                CHECK(top->dbg_cpu_wr_err  == 0,
++                      "synthetic CPU write received a non-OKAY response");
++                CHECK(top->dbg_cpu_amo_err == 0,
++                      "synthetic CPU AMO received a non-OKAY response");
++                CHECK(n_cpu_amo_obs == (uint64_t)top->dbg_cpu_amo_completed,
++                      "AMO R observations do not match completed AMOs");
++                // Plain write data / strobe actually landed in DDR.
++                CHECK(read64(CPU_WR_ADDR) == CPU_WR_DAT0,
++                      "synthetic CPU plain write beat 0 data was not stored");
++                CHECK(read64(CPU_WR_ADDR + 8) ==
++                          cpu_apply_strb(CPU_WR_INIT1, CPU_WR_DAT1, CPU_WR_STR1),
++                      "synthetic CPU plain write beat 1 data/strb was not honoured");
++                // AMO accumulation reached the expected final DDR value.
++                CHECK(read64(CPU_AMO_ADDR) ==
++                          CPU_AMO_INIT +
++                          (uint64_t)top->dbg_cpu_amo_completed * CPU_AMO_ADD,
++                      "synthetic CPU AMO final DDR value does not match the addend sum");
++            } else {
++                // Runtime-disabled synthetic CPU: the write/AMO lane is
++                // required to be PAIREDLY silent -- nothing issued, nothing
++                // completed, no response error, and quiet.  The "completed > 0"
++                // assertions above only hold when the CPU actually runs.
++                CHECK(top->dbg_cpu_wr_issued     == 0 &&
++                      top->dbg_cpu_wr_completed  == 0 &&
++                      top->dbg_cpu_amo_issued    == 0 &&
++                      top->dbg_cpu_amo_completed == 0,
++                      "synthetic CPU write/AMO issued traffic while disabled");
++                CHECK(top->dbg_cpu_rd_err  == 0 &&
++                      top->dbg_cpu_wr_err  == 0 &&
++                      top->dbg_cpu_amo_err == 0,
++                      "synthetic CPU reported a response error while disabled");
++                CHECK(top->dbg_cpu_wr_quiet,
++                      "synthetic CPU write lane not quiet at terminal");
++                CHECK(n_cpu_amo_obs == 0,
++                      "AMO R observed while the synthetic CPU was disabled");
++            }
+             std::printf("SYSTEM cpu-wr wr_issued=%u wr_completed=%u amo_issued=%u "
+                         "amo_completed=%u amo_obs=%llu rd_err=%u wr_err=%u amo_err=%u "
+                         "wr_mem=0x%016llx amo_mem=0x%016llx\n",
+@@ -2390,10 +2748,403 @@
+                     name, (unsigned)e2_mode,
+                     (unsigned)fg_raw, (unsigned)fg_win,
+                     (unsigned)fw_raw, (unsigned)fw_win);
+-    }
++
++#ifdef ACTUAL_DMA_SYSTEM
++        // The full-batch summary is printed ONLY after every terminal check
++        // above has passed.
++        if (full_batch) report_full(name, enable);
++#endif
++    }
++
++#ifdef ACTUAL_DMA_SYSTEM
++    // ---------------------------------------------------------------------
++    // FULL-BATCH independent mode (SYSTEM only).  Default OFF; every legacy
++    // scenario above keeps its original measurement contract.
++    //
++    // Epoch: t0 is captured after BOTH batches are configured and before the
++    // first NEXT_ID.  All per-channel statistics run t0 -> final quiet and
++    // never read win_open. DS priority uses full_era and V completion directly.
++    // ---------------------------------------------------------------------
++    void full_measure_begin() {
++        full_era         = true;
++        full_t0          = g_cycle;
++        full_quiet_cycle = 0;
++        full_supply_wait_cycles = full_watchdog_cycles;
++        for (int c = 0; c < 2; ++c) {
++            full_last_progress[c] = g_cycle;
++            full_started[c]       = false;
++            full_issue_n[c]       = 0;
++            full_done_n[c]        = 0;
++            full_issue_seen[c]    = false;
++            full_first_issue[c]   = 0;
++            full_final_done[c]    = 0;
++            full_ready_cyc[c].clear();
++            full_issue_cyc[c].clear();
++            full_done_cyc[c].clear();
++            full_ar_n[c] = full_aw_n[c] = 0;
++            full_rd_bytes[c] = full_wr_bytes[c] = 0;
++            full_r_n[c] = full_r_return_bytes[c] = 0;
++            full_b_n[c] = full_err[c] = 0;
++            full_reg_issued[c] = full_reg_done[c] = 0;
++            full_reg_complete[c] = full_reg_stopped[c] = false;
++            full_reg_active[c] = full_reg_enable[c] = false;
++        }
++        full_tl_accept = full_tl_resp = 0;
++        full_iotlb_lookup = full_iotlb_hit = 0;
++        full_ptw_active = full_ptw_r_fire = 0;
++        full_fast = 0;
++        full_comp_ar = full_comp_aw = full_comp_w = 0;
++        full_ddtw_ar = full_ptw_ar = 0;
++        full_trace_ptw_active = false;
++        // Arm the PRE-EXISTING measurement window exactly as the legacy path
++        // does: it opens at the first hardware V issue and closes at the final
++        // V done.  The full-batch statistics never read win_open, and the DS
++        // priority uses the full-era completion counter instead, so this
++        // window only feeds the shared observation plumbing.
++        win_open        = false;
++        win_seen        = false;
++        win_armed       = true;
++        win_open_cycle  = 0;
++        win_close_cycle = 0;
++        fg_raw_open = (uint32_t)top->dbg_frontier_grant;
++        fw_raw_open = (uint32_t)top->dbg_frontier_wait;
++    }
++
++    void full_measure_end() { full_era = false; }
++
++    // Independent per-channel progress watchdog.  Closed as soon as the
++    // channel has produced all of its DONE pulses, so it fires even when the
++    // OTHER channel or the synthetic CPU is still active.
++    void full_channel_watchdog(int ch, const char* tag) {
++        const uint32_t target = (ch == 0) ? v_transfers : (uint32_t)a_target;
++        if (full_done_n[ch] >= target) return;   // completed lane: auto-closed
++        if (!full_started[ch])         return;   // lane not launched yet
++        if (full_watchdog_fault(g_cycle, full_last_progress[ch],
++                                full_issue_seen[ch],
++                                full_supply_wait_cycles, full_watchdog_cycles)) {
++            dump_stall(std::string("full watchdog ") + tag);
++            throw TestFailure("watchdog: full-batch channel made no progress");
++        }
++    }
++
++    // Police every lane that has already been launched.  Used inside the
++    // bounded launch-delay loops so a long delay cannot hide a stalled lane.
++    void full_check_started_lanes() {
++        if (full_started[0]) full_channel_watchdog(0, "V");
++        if (full_started[1]) full_channel_watchdog(1, "A");
++    }
++
++    void run_full_batch(const char* name, bool enable) {
++        (void)name;
++        (void)enable;
++        full_measure_begin();
++
++        // Billed common delay after t0 and before the first NEXT_ID.  t0 is
++        // NOT moved by any delay; the delay is only billed into the budget.
++        for (uint32_t i = 0; i < start_delay; ++i) {
++            tick(); full_check_started_lanes();
++        }
++
++        // launch-order av/va selects which channel's NEXT_ID comes first; the
++        // per-channel delays are bounded and purely acceptance.  Every delay
++        // loop still polices every lane that already started, so a long delay
++        // cannot skip the watchdog of a started lane.
++        if (launch_order == "va") {
++            for (uint32_t i = 0; i < v_start_delay; ++i) {
++                tick(); full_check_started_lanes();
++            }
++            start_batch(SEL_V); full_started[0] = true; full_last_progress[0] = g_cycle;
++            for (uint32_t i = 0; i < a_start_delay; ++i) {
++                tick(); full_check_started_lanes();
++            }
++            start_batch(SEL_A); full_started[1] = true; full_last_progress[1] = g_cycle;
++        } else {
++            for (uint32_t i = 0; i < a_start_delay; ++i) {
++                tick(); full_check_started_lanes();
++            }
++            start_batch(SEL_A); full_started[1] = true; full_last_progress[1] = g_cycle;
++            for (uint32_t i = 0; i < v_start_delay; ++i) {
++                tick(); full_check_started_lanes();
++            }
++            start_batch(SEL_V); full_started[0] = true; full_last_progress[0] = g_cycle;
++        }
++
++        bool v_done = false, a_done = false;
++        bool err, complete, stopped, active, enable_b;
++        for (;;) {
++            tick();
++            if (g_cycle - last_progress_cycle > WATCHDOG_CYCLES) {
++                dump_stall("full scenario handshake");
++                throw TestFailure("watchdog: no handshake progress in full-batch");
++            }
++            if (g_cycle - scenario_start > scenario_budget) {
++                dump_stall("full scenario budget");
++                throw TestFailure("scenario budget exhausted in full-batch");
++            }
++            if (!v_done) {
++                full_channel_watchdog(0, "V");
++                read_batch_ctl(SEL_V, err, complete, stopped, active, enable_b);
++                CHECK(!err, "full-batch V batch_ctl error during the run");
++                if (complete) v_done = true;
++            }
++            if (!a_done) {
++                full_channel_watchdog(1, "A");
++                read_batch_ctl(SEL_A, err, complete, stopped, active, enable_b);
++                CHECK(!err, "full-batch A batch_ctl error during the run");
++                if (complete) a_done = true;
++            }
++            if (cpu_enable && (top->dbg_dma_batch_active & 1) &&
++                (g_cycle - cpu_progress_cycle > cpu_watchdog_cycles)) {
++                dump_stall("full scenario CPU progress");
++                throw TestFailure("watchdog: synthetic CPU made no progress");
++            }
++            if (cpu_enable && cpu_writes && !top->dbg_cpu_wr_quiet &&
++                (g_cycle - cpu_wr_progress_cycle > cpu_wr_watchdog_cycles)) {
++                dump_stall("full scenario CPU write progress");
++                throw TestFailure("watchdog: synthetic CPU write/AMO made no progress");
++            }
++            if (v_done && a_done) break;
++        }
++
++        // Both channels completed NATURALLY: STOP is never used on the
++        // measured path in full mode.
++        check_quiet(name);
++        full_quiet_cycle = g_cycle;
++        full_measure_end();
++        full_reg_cross_check();
++    }
++
++    // Read-back cross-check.  Times in the summary come ONLY from the
++    // pre-edge hardware pulses; these registers/flags are counts only.
++    void full_reg_cross_check() {
++        // Register readback is a CROSS-CHECK only.  It happens AFTER the
++        // protocol quiet moment was captured (check_quiet) and its idle
++        // transaction overhead is therefore EXCLUDED from every reported time.
++        bool err, complete, stopped, active, enable_b;
++        read_batch_ctl(SEL_V, err, complete, stopped, active, enable_b);
++        CHECK(!err, "full-batch V batch_ctl reported an error at readback");
++        full_reg_complete[0] = complete; full_reg_stopped[0] = stopped;
++        full_reg_active[0]   = active;   full_reg_enable[0]  = enable_b;
++        full_reg_issued[0]   = cfg_rd(SEL_V, REG_B_ISSUED);
++        full_reg_done[0]     = cfg_rd(SEL_V, REG_B_DONE);
++        read_batch_ctl(SEL_A, err, complete, stopped, active, enable_b);
++        CHECK(!err, "full-batch A batch_ctl reported an error at readback");
++        full_reg_complete[1] = complete; full_reg_stopped[1] = stopped;
++        full_reg_active[1]   = active;   full_reg_enable[1]  = enable_b;
++        full_reg_issued[1]   = cfg_rd(SEL_A, REG_B_ISSUED);
++        full_reg_done[1]     = cfg_rd(SEL_A, REG_B_DONE);
++
++        CHECK(full_reg_issued[0] == (uint64_t)v_transfers &&
++              full_reg_done[0]   == (uint64_t)v_transfers,
++              "full-batch V REG_B_ISSUED/DONE do not match transfers");
++        CHECK(full_reg_issued[1] == a_target && full_reg_done[1] == a_target,
++              "full-batch A REG_B_ISSUED/DONE do not match a_target");
++        CHECK(full_reg_complete[0] && full_reg_complete[1],
++              "full-batch batch_ctl did not report complete on both channels");
++        CHECK(!full_reg_stopped[0] && !full_reg_stopped[1],
++              "full-batch reported STOP on a measured channel");
++        CHECK(!full_reg_active[0] && !full_reg_active[1],
++              "full-batch batch_ctl still active after natural completion");
++        CHECK(full_reg_enable[0] && full_reg_enable[1],
++              "full-batch batch_ctl enable bit was cleared before readback");
++        CHECK(full_issue_n[0] == v_transfers && full_done_n[0] == v_transfers,
++              "full-batch V hardware issue/done pulses != transfers");
++        CHECK(full_issue_n[1] == (uint32_t)a_target &&
++              full_done_n[1] == (uint32_t)a_target,
++              "full-batch A hardware issue/done pulses != a_target");
++    }
++
++    void report_full(const char* name, bool enable) {
++        CHECK(!policy_partition || top->dbg_policy_elaborated,
++              "p/pn require a PolicyEnable=1 elaboration");
++        // ---- per-copy invariants (ALL validated before anything prints) --
++        for (int c = 0; c < 2; ++c) {
++            const uint32_t target = (c == 0) ? v_transfers : (uint32_t)a_target;
++            CHECK(full_issue_n[c] == target && full_done_n[c] == target,
++                  "full-batch hardware issue/done counts != channel target");
++            CHECK(!full_ready_cyc[c].empty(),
++                  "full-batch per-copy readiness array is empty");
++            CHECK(full_ready_cyc[c].size() == (size_t)target,
++                  "full-batch per-copy array length != channel target");
++            CHECK(full_issue_cyc[c].size() == full_ready_cyc[c].size() &&
++                  full_done_cyc[c].size()  == full_ready_cyc[c].size(),
++                  "full-batch ready/issue/done array length mismatch");
++            CHECK(full_ready_cyc[c][0] == full_t0,
++                  "full-batch ready[0] does not equal t0");
++            const size_t n = full_issue_cyc[c].size();
++            for (size_t j = 0; j < n; ++j)
++                CHECK(full_ready_cyc[c][j] <= full_issue_cyc[c][j] &&
++                      full_issue_cyc[c][j] <= full_done_cyc[c][j],
++                      "full-batch ready/issue/done order violated");
++            for (size_t j = 1; j < n; ++j) {
++                CHECK(full_ready_cyc[c][j] == full_done_cyc[c][j - 1],
++                      "full-batch ready[j] != done[j-1]");
++                CHECK(full_issue_cyc[c][j] >= full_done_cyc[c][j - 1],
++                      "full-batch issue[j] precedes done[j-1] (single-active)");
++                CHECK(full_issue_cyc[c][j] > full_issue_cyc[c][j - 1],
++                      "full-batch issue times are not increasing");
++                CHECK(full_done_cyc[c][j] > full_done_cyc[c][j - 1],
++                      "full-batch done times are not increasing");
++            }
++            CHECK(full_done_n[c] <= full_issue_n[c],
++                  "full-batch done pulses exceed issue pulses");
++            CHECK(full_final_done[c] == full_done_cyc[c].back(),
++                  "full-batch final-done marker != last done cycle");
++        }
++        // ---- payload / response conservation at the shared DDR port ---
++        for (int c = 0; c < 2; ++c) {
++            CHECK(full_ar_n[c] > 0 && full_aw_n[c] > 0,
++                  "full-batch completion channel observed no AR/AW traffic");
++            CHECK(full_r_return_bytes[c] == full_rd_bytes[c],
++                  "full-batch read AR->R byte conservation failed");
++            CHECK(full_b_n[c] == full_aw_n[c],
++                  "full-batch AW->B response conservation failed");
++            CHECK(full_rd_bytes[c] == 262144ULL,
++                  "full-batch read payload bytes != 262144");
++            CHECK(full_wr_bytes[c] == 262144ULL,
++                  "full-batch write payload bytes != 262144");
++            CHECK(full_wr_bytes[c] == full_rd_bytes[c],
++                  "full-batch read/write payload bytes differ");
++            CHECK(full_err[c] == 0,
++                  "full-batch completion channel observed an error response");
++        }
++
++        // Every reported time is derived ONLY from pre-edge hardware pulses.
++        // T_return is the cycle at which the protocol was quiet (all TL/DMA
++        // and CPU lanes idle).  The later register readback used only as a
++        // cross-check is NOT included, so its overhead is excluded.
++        const long t_v    = full_final_done[0] - full_t0;
++        const long t_a    = full_final_done[1] - full_t0;
++        const long t_data = std::max(t_v, t_a);
++        const long t_ret  = full_quiet_cycle - full_t0;
++
++        auto arr = [](const std::vector<long>& v) -> std::string {
++            std::string s = "[";
++            for (size_t i = 0; i < v.size(); ++i) {
++                if (i) s += ",";
++                s += std::to_string(v[i]);
++            }
++            s += "]";
++            return s;
++        };
++
++        std::printf("ACTUAL-DMA-FULL-BATCH-JSON {"
++            "\"schema\":\"actual-dma-full-batch-v1\","
++            "\"scenario\":\"%s\",\"enable\":%d,"
++            "\"cpu_enable\":%d,\"ds_priority\":%d,\"launch_order\":\"%s\","
++            "\"a_pages\":%u,\"v_gap\":%u,\"transfers\":%u,\"warmup\":%u,"
++            "\"ptw_latency\":%u,\"a_target\":%llu,"
++            "\"start_delay\":%u,\"v_start_delay\":%u,\"a_start_delay\":%u,"
++            "\"full_watchdog\":%ld,\"scenario_budget\":%ld,"
++            "\"t0\":%ld,\"T_V\":%ld,\"T_A\":%ld,\"T_data\":%ld,\"T_return\":%ld,"
++            "\"quiet\":1,"
++            "\"channels\":["
++            "{\"id\":\"V\",\"bank\":0,\"issue\":%u,\"done\":%u,"
++            "\"first_issue\":%ld,\"final_done\":%ld,"
++            "\"ready\":%s,\"issue_cyc\":%s,\"done_cyc\":%s,"
++            "\"ar\":%llu,\"aw\":%llu,\"rd_bytes\":%llu,\"wr_bytes\":%llu,"
++            "\"r_beats\":%llu,\"r_bytes\":%llu,\"b\":%llu,\"err\":%llu,"
++            "\"reg_issued\":%llu,\"reg_done\":%llu,"
++            "\"batch_complete\":%d,\"batch_stopped\":%d},"
++            "{\"id\":\"A\",\"bank\":1,\"issue\":%u,\"done\":%u,"
++            "\"first_issue\":%ld,\"final_done\":%ld,"
++            "\"ready\":%s,\"issue_cyc\":%s,\"done_cyc\":%s,"
++            "\"ar\":%llu,\"aw\":%llu,\"rd_bytes\":%llu,\"wr_bytes\":%llu,"
++            "\"r_beats\":%llu,\"r_bytes\":%llu,\"b\":%llu,\"err\":%llu,"
++            "\"reg_issued\":%llu,\"reg_done\":%llu,"
++            "\"batch_complete\":%d,\"batch_stopped\":%d}"
++            "],"
++            "\"raw\":{\"tl_accept\":%llu,\"tl_resp\":%llu,"
++            "\"iotlb_lookup\":%llu,\"iotlb_hit\":%llu,"
++            "\"ptw_active_cycles\":%llu,\"ptw_r_fire\":%llu,\"fast\":%llu,"
++            "\"comp_ar\":%llu,\"comp_aw\":%llu,\"comp_w\":%llu,"
++            "\"ddtw_ar\":%llu,\"ptw_ar\":%llu},"
++            "\"attribution\":\"raw pre-edge hardware counters; comp-port payload only; "
++            "no oracle\"}\n",
++            name, (int)enable,
++            (int)cpu_enable, (int)ds_priority, launch_order.c_str(),
++            a_pages, v_gap_cycles, v_transfers, warmup, ptw_latency,
++            (unsigned long long)a_target,
++            start_delay, v_start_delay, a_start_delay, full_watchdog_cycles,
++            scenario_budget,
++            full_t0, t_v, t_a, t_data, t_ret,
++            (unsigned)full_issue_n[0], (unsigned)full_done_n[0],
++            full_first_issue[0], full_final_done[0],
++            arr(full_ready_cyc[0]).c_str(), arr(full_issue_cyc[0]).c_str(),
++            arr(full_done_cyc[0]).c_str(),
++            (unsigned long long)full_ar_n[0], (unsigned long long)full_aw_n[0],
++            (unsigned long long)full_rd_bytes[0], (unsigned long long)full_wr_bytes[0],
++            (unsigned long long)full_r_n[0], (unsigned long long)full_r_return_bytes[0],
++            (unsigned long long)full_b_n[0], (unsigned long long)full_err[0],
++            (unsigned long long)full_reg_issued[0], (unsigned long long)full_reg_done[0],
++            (int)full_reg_complete[0], (int)full_reg_stopped[0],
++            (unsigned)full_issue_n[1], (unsigned)full_done_n[1],
++            full_first_issue[1], full_final_done[1],
++            arr(full_ready_cyc[1]).c_str(), arr(full_issue_cyc[1]).c_str(),
++            arr(full_done_cyc[1]).c_str(),
++            (unsigned long long)full_ar_n[1], (unsigned long long)full_aw_n[1],
++            (unsigned long long)full_rd_bytes[1], (unsigned long long)full_wr_bytes[1],
++            (unsigned long long)full_r_n[1], (unsigned long long)full_r_return_bytes[1],
++            (unsigned long long)full_b_n[1], (unsigned long long)full_err[1],
++            (unsigned long long)full_reg_issued[1], (unsigned long long)full_reg_done[1],
++            (int)full_reg_complete[1], (int)full_reg_stopped[1],
++            (unsigned long long)full_tl_accept, (unsigned long long)full_tl_resp,
++            (unsigned long long)full_iotlb_lookup, (unsigned long long)full_iotlb_hit,
++            (unsigned long long)full_ptw_active, (unsigned long long)full_ptw_r_fire,
++            (unsigned long long)full_fast,
++            (unsigned long long)full_comp_ar, (unsigned long long)full_comp_aw,
++            (unsigned long long)full_comp_w,
++            (unsigned long long)full_ddtw_ar, (unsigned long long)full_ptw_ar);
++    }
++#else
++    void run_full_batch(const char*, bool) {
++        throw TestFailure("full-batch mode requires the SYSTEM build (--system)");
++    }
++#endif
+ };
+ 
+ // ---------------------------------------------------------------------------
++// Strict parsers for the full-batch control plusargs.  They reject empty,
++// sign-wrapped, overflowing and trailing-garbage values, so a typo cannot
++// silently become 0/1 or an unbounded delay.  The pre-existing a-pages /
++// v-gap / transfers / warmup / ptw-latency / a-target parsers are unchanged.
++// ---------------------------------------------------------------------------
++static bool parse_gate01(const char* key, const char* v, bool& out) {
++    if (v == nullptr || *v == '\0') {
++        std::fprintf(stderr, "nonblock_actual_dma_test: +%s requires 0|1\n", key);
++        return false;
++    }
++    errno = 0;
++    char* end = nullptr;
++    const unsigned long long parsed = std::strtoull(v, &end, 0);
++    if (errno != 0 || end == v || *end != '\0' || parsed > 1ULL) {
++        std::fprintf(stderr, "nonblock_actual_dma_test: +%s must be 0|1 (got '%s')\n",
++                     key, v);
++        return false;
++    }
++    out = (parsed != 0);
++    return true;
++}
++
++static bool parse_ulong(const char* key, const char* v, unsigned long long& out,
++                        unsigned long long maxv) {
++    if (v == nullptr || *v == '\0') {
++        std::fprintf(stderr, "nonblock_actual_dma_test: +%s requires a value\n", key);
++        return false;
++    }
++    errno = 0;
++    char* end = nullptr;
++    const unsigned long long parsed = std::strtoull(v, &end, 0);
++    if (errno != 0 || end == v || *end != '\0' || parsed > maxv) {
++        std::fprintf(stderr,
++                     "nonblock_actual_dma_test: invalid +%s='%s' "
++                     "(unsigned, <= %llu)\n", key, v, maxv);
++        return false;
++    }
++    out = parsed;
++    return true;
++}
++
+ int main(int argc, char** argv) {
+     Verilated::commandArgs(argc, argv);
+ 
+@@ -2406,6 +3157,14 @@
+     uint64_t    a_target = 1048576ULL;
+     bool        v_cold_dst = false;
+     bool        owner_only = false;
++    // ---- full-batch independent mode (default OFF) ----------------------
++    bool        full_batch    = false;
++    bool        cpu_enable    = true;
++    uint32_t    start_delay   = 0;
++    uint32_t    v_start_delay = 0;
++    uint32_t    a_start_delay = 0;
++    std::string launch_order  = "av";
++    long        full_watchdog = 200000L;
+ #ifdef ACTUAL_DMA_SYSTEM
+     bool        cpu_writes = false;
+     bool        ds_priority = false;
+@@ -2452,9 +3211,44 @@
+             }
+             owner_only = (parsed != 0);
+         }
+-#ifdef ACTUAL_DMA_SYSTEM
+-        if (const char* v = val("cpu-writes")) cpu_writes = (std::strtoul(v, nullptr, 0) != 0);
+-        if (const char* v = val("ds-priority")) ds_priority = (std::strtoul(v, nullptr, 0) != 0);
++        if (const char* v = val("full-batch")) {
++            if (!parse_gate01("full-batch", v, full_batch)) return 2;
++        }
++        if (const char* v = val("cpu-enable")) {
++            if (!parse_gate01("cpu-enable", v, cpu_enable)) return 2;
++        }
++        if (const char* v = val("start-delay")) {
++            unsigned long long p = 0;
++            if (!parse_ulong("start-delay", v, p, 0xFFFFFFFFULL)) return 2;
++            start_delay = (uint32_t)p;
++        }
++        if (const char* v = val("v-start-delay")) {
++            unsigned long long p = 0;
++            if (!parse_ulong("v-start-delay", v, p, 0xFFFFFFFFULL)) return 2;
++            v_start_delay = (uint32_t)p;
++        }
++        if (const char* v = val("a-start-delay")) {
++            unsigned long long p = 0;
++            if (!parse_ulong("a-start-delay", v, p, 0xFFFFFFFFULL)) return 2;
++            a_start_delay = (uint32_t)p;
++        }
++        if (const char* v = val("full-watchdog")) {
++            unsigned long long p = 0;
++            if (!parse_ulong("full-watchdog", v, p, 0x7FFFFFFFFFFFFFFFULL) || p == 0) {
++                std::fprintf(stderr,
++                    "nonblock_actual_dma_test: +full-watchdog must be > 0\n");
++                return 2;
++            }
++            full_watchdog = (long)p;
++        }
++        if (const char* v = val("launch-order")) launch_order = v;
++#ifdef ACTUAL_DMA_SYSTEM
++        if (const char* v = val("cpu-writes")) {
++            if (!parse_gate01("cpu-writes", v, cpu_writes)) return 2;
++        }
++        if (const char* v = val("ds-priority")) {
++            if (!parse_gate01("ds-priority", v, ds_priority)) return 2;
++        }
+         if (const char* v = val("write-tail-pause")) write_tail_pause = (uint32_t)std::strtoul(v, nullptr, 0);
+         if (const char* v = val("read-latency-model")) {
+             const std::string m = v;
+@@ -2499,6 +3293,50 @@
+         std::fprintf(stderr, "nonblock_actual_dma_test: +ptw-latency must be 31|100\n");
+         return 2;
+     }
++    if (launch_order != "av" && launch_order != "va") {
++        std::fprintf(stderr,
++            "nonblock_actual_dma_test: invalid +launch-order='%s' (expected av|va)\n",
++            launch_order.c_str());
++        return 2;
++    }
++    if (start_delay > 2000000u || v_start_delay > 2000000u || a_start_delay > 2000000u) {
++        std::fprintf(stderr, "launch delays must be <= 2000000 cycles\n");
++        return 2;
++    }
++    if (!full_batch && (start_delay || v_start_delay || a_start_delay || launch_order != "av" || full_watchdog != 200000L)) {
++        std::fprintf(stderr, "launch delays/order/watchdog require full-batch\n");
++        return 2;
++    }
++    if (full_watchdog <= 0) {
++        std::fprintf(stderr, "nonblock_actual_dma_test: +full-watchdog must be > 0\n");
++        return 2;
++    }
++#ifndef ACTUAL_DMA_SYSTEM
++    if (full_batch) {
++        std::fprintf(stderr,
++            "nonblock_actual_dma_test: +full-batch requires the SYSTEM build (--system)\n");
++        return 2;
++    }
++#endif
++#ifdef ACTUAL_DMA_SYSTEM
++    if (full_batch) {
++        if (!(transfers == 64 && a_target == 64ULL && v_gap == 0 &&
++              (a_pages == 1 || a_pages == 8) && warmup == 256 && ptw_lat == 31)) {
++            std::fprintf(stderr,
++                "nonblock_actual_dma_test: +full-batch requires transfers=64 "
++                "a-target=64 v-gap=0 a-pages=1|8 warmup=256 ptw-latency=31\n");
++            return 2;
++        }
++        // Full-batch does not support the completion-AR proxy profiles.  Fail
++        // loudly instead of silently ignoring the request.
++        if (read_admit != "none") {
++            std::fprintf(stderr,
++                "nonblock_actual_dma_test: +full-batch does not support "
++                "+read-admit (got '%s')\n", read_admit.c_str());
++            return 2;
++        }
++    }
++#endif
+ #ifdef ACTUAL_DMA_SYSTEM
+     if (read_admit != "none" && read_admit != "buffer" &&
+         read_admit != "ingress" && read_admit != "period" &&
+@@ -2552,6 +3390,10 @@
+     std::printf("nonblock_actual_dma_test: cpu_writes=%d\n", (int)cpu_writes);
+     std::printf("nonblock_actual_dma_test: read_admit=%s budget=%u period=%u\n",
+                 read_admit.c_str(), read_budget, read_period);
++    std::printf("nonblock_actual_dma_test: full_batch=%d cpu_enable=%d launch_order=%s "
++                "start_delay=%u v_start_delay=%u a_start_delay=%u full_watchdog=%ld\n",
++                (int)full_batch, (int)cpu_enable, launch_order.c_str(),
++                start_delay, v_start_delay, a_start_delay, full_watchdog);
+ #endif
+ 
+     int rc = 0;
+@@ -2565,6 +3407,13 @@
+         tb.a_target        = a_target;
+         tb.v_cold_dst      = v_cold_dst;
+         tb.owner_only      = owner_only;
++        tb.full_batch          = full_batch;
++        tb.cpu_enable          = cpu_enable;
++        tb.start_delay         = start_delay;
++        tb.v_start_delay       = v_start_delay;
++        tb.a_start_delay       = a_start_delay;
++        tb.launch_order        = launch_order;
++        tb.full_watchdog_cycles= full_watchdog;
+ #ifdef ACTUAL_DMA_SYSTEM
+         tb.cpu_writes      = cpu_writes;
+         tb.ds_priority     = ds_priority;
+--- before/nonblock_actual_dma_system_top.sv
++++ tests/nonblock_actual_dma_system_top.sv
+@@ -101,6 +101,10 @@
+     input  logic        nonblock_enable_i,
+     input  logic        policy_partition_i,
+     input  logic        owner_only_i,
++    // Runtime CPU enable.  When low, NO synthetic CPU source (read lane or
++    // write/AMO engine) starts a new offer.  This is a real runtime input,
++    // not a CpuIssueInterval==0 workaround.
++    input  logic        cpu_enable_i,
+ 
+     // Test-only read-admission proxy controls (SYSTEM build only).
+     input  logic [2:0]  read_admit_mode_i,
+@@ -573,7 +577,9 @@
+     localparam logic [31:0] CPU_WR_MAX   = 32'd1048576;
+ 
+     logic        cpu_run;
+-    assign cpu_run = dbg_dma_batch_active[0] | dbg_dma_batch_gap[0];
++    // Runtime CPU enable gates BOTH synthetic CPU lanes (read + write/AMO),
++    // because each lane starts new work only while cpu_run is high.
++    assign cpu_run = cpu_enable_i & (dbg_dma_batch_active[0] | dbg_dma_batch_gap[0]);
+ 
+     localparam logic [5:0] CPU_INTERVAL = 6'(CpuIssueInterval);
+ 
+--- before/test_nonblock_actual_dma.py
++++ tests/test_nonblock_actual_dma.py
+@@ -218,16 +218,49 @@
+                          "build serves both p and pn at run time)")
+     ap.add_argument("--a-pages", type=int, default=8,
+                     help="number of 4 KiB aggressor pages in the A ring")
+-    ap.add_argument("--v-gap", type=int, default=1000,
+-                    help="V inter-job gap cycles inside the V batch")
+-    ap.add_argument("--transfers", type=int, choices=(64, 1024, 4096), default=64,
+-                    help="V victim 4 KiB jobs")
+-    ap.add_argument("--warmup", type=int, default=256,
+-                    help="batch-OFF V transfers issued during warm-up")
+-    ap.add_argument("--ptw-latency", type=int, choices=(31, 100), default=31,
+-                    help="model PTW read latency (DDL/DDR model only; NOT MIG)")
+-    ap.add_argument("--a-target", type=lambda s: int(s, 0), default=1048576,
+-                    help="A autonomous batch target (default 1048576)")
++    ap.add_argument("--v-gap", type=int, default=None,
++                    help="V inter-job gap cycles inside the V batch "
++                         "(legacy default 1000; full-batch requires 0)")
++    ap.add_argument("--transfers", type=int, choices=(64, 1024, 4096), default=None,
++                    help="V victim 4 KiB jobs (legacy default 64; full-batch "
++                         "requires 64)")
++    ap.add_argument("--warmup", type=int, default=None,
++                    help="batch-OFF V transfers issued during warm-up "
++                         "(legacy default 256; full-batch requires 256)")
++    ap.add_argument("--ptw-latency", type=int, choices=(31, 100), default=None,
++                    help="model PTW read latency (DDL/DDR model only; NOT MIG) "
++                         "(legacy default 31; full-batch requires 31)")
++    ap.add_argument("--a-target", type=lambda s: int(s, 0), default=None,
++                    help="A autonomous batch target (legacy default 1048576; "
++                         "full-batch requires 64)")
++    ap.add_argument("--full-batch", action="store_true",
++                    help="independent full-batch double-natural-completion run "
++                         "(SYSTEM only; requires transfers=a-target=64, v-gap=0, "
++                         "warmup=256, ptw-latency=31; a-pages must be 1 or 8). "
++                         "An explicitly conflicting value is REJECTED, never "
++                         "silently overwritten")
++    ap.add_argument("--cpu-enable", type=int, choices=(0, 1), default=1,
++                    help="drive the runtime cpu_enable_i input (SYSTEM only, "
++                         "default 1)")
++    ap.add_argument("--ds-priority", action="store_true",
++                    help="SYSTEM-only model-only DS read priority inside the "
++                         "t0-based window (default off for the CPU-off experiment)")
++    ap.add_argument("--event-trace", default=None,
++                    help="path for the CSV event trace (+event-trace, SYSTEM only)")
++    ap.add_argument("--start-delay", type=int, default=None,
++                    help="billed cycles between the common t0 and the first "
++                         "NEXT_ID (full-batch only)")
++    ap.add_argument("--v-start-delay", type=int, default=None,
++                    help="bounded cycles before V's NEXT_ID (full-batch only)")
++    ap.add_argument("--a-start-delay", type=int, default=None,
++                    help="bounded cycles before A's NEXT_ID (full-batch only)")
++    ap.add_argument("--launch-order", choices=("av", "va"), default=None,
++                    help="which channel's NEXT_ID is issued first (full-batch "
++                         "only; default av)")
++    ap.add_argument("--full-watchdog", type=int, default=None,
++                    help="full-batch per-channel progress watchdog cycles "
++                         "(full-batch only; default 200000, a small value is "
++                         "for negative tests)")
+     ap.add_argument("--system", action="store_true",
+                     help="build the shared-DDR system-integration top "
+                          "(tests/nonblock_actual_dma_system_top.sv) with the "
+@@ -255,6 +288,68 @@
+         opts.system = True
+     if opts.cpu_writes and not opts.system_atomics:
+         ap.error("--cpu-writes requires --system-atomics")
++    if any(v is not None and not 0 <= v <= 2000000 for v in
++           (opts.start_delay, opts.v_start_delay, opts.a_start_delay)):
++        ap.error("launch delays must be 0..2000000")
++    if opts.full_watchdog is not None and opts.full_watchdog <= 0:
++        ap.error("--full-watchdog must be > 0")
++    if opts.full_batch:
++        if not opts.system:
++            ap.error("--full-batch requires --system")
++        if opts.a_pages not in (1, 8):
++            ap.error("--full-batch requires --a-pages 1 or 8")
++        # An EXPLICIT conflicting value is rejected, never silently
++        # overwritten.  Unset (None) knobs take the approved full-batch value.
++        if opts.transfers is not None and opts.transfers != 64:
++            ap.error("--full-batch requires --transfers 64 (got {})".format(opts.transfers))
++        if opts.a_target is not None and opts.a_target != 64:
++            ap.error("--full-batch requires --a-target 64 (got {})".format(opts.a_target))
++        if opts.v_gap is not None and opts.v_gap != 0:
++            ap.error("--full-batch requires --v-gap 0 (got {})".format(opts.v_gap))
++        if opts.warmup is not None and opts.warmup != 256:
++            ap.error("--full-batch requires --warmup 256 (got {})".format(opts.warmup))
++        if opts.ptw_latency is not None and opts.ptw_latency != 31:
++            ap.error("--full-batch requires --ptw-latency 31 (got {})".format(opts.ptw_latency))
++        if opts.read_admit is not None and opts.read_admit != "none":
++            ap.error("--full-batch does not support --read-admit")
++        opts.transfers    = 64
++        opts.a_target     = 64
++        opts.v_gap        = 0
++        opts.warmup       = 256
++        opts.ptw_latency  = 31
++        opts.start_delay   = 0      if opts.start_delay   is None else opts.start_delay
++        opts.v_start_delay = 0      if opts.v_start_delay is None else opts.v_start_delay
++        opts.a_start_delay = 0      if opts.a_start_delay is None else opts.a_start_delay
++        opts.launch_order  = "av"   if opts.launch_order  is None else opts.launch_order
++        opts.full_watchdog = 200000 if opts.full_watchdog is None else opts.full_watchdog
++    else:
++        # Legacy defaults.  Full-batch-only knobs must be left at their
++        # defaults; an explicit non-default value is REJECTED rather than
++        # silently ignored.
++        opts.transfers   = 64      if opts.transfers   is None else opts.transfers
++        opts.a_target    = 1048576 if opts.a_target    is None else opts.a_target
++        opts.v_gap       = 1000    if opts.v_gap       is None else opts.v_gap
++        opts.warmup      = 256     if opts.warmup      is None else opts.warmup
++        opts.ptw_latency = 31      if opts.ptw_latency is None else opts.ptw_latency
++        if (opts.start_delay is not None or opts.v_start_delay is not None or
++                opts.a_start_delay is not None or opts.launch_order is not None or
++                opts.full_watchdog is not None):
++            ap.error("--start-delay/--v-start-delay/--a-start-delay/"
++                     "--launch-order/--full-watchdog require --full-batch")
++        opts.start_delay   = 0
++        opts.v_start_delay = 0
++        opts.a_start_delay = 0
++        opts.launch_order  = "av"
++        opts.full_watchdog = 200000
++
++    if not opts.system:
++        if opts.cpu_enable != 1:
++            ap.error("--cpu-enable requires --system")
++        if (opts.ds_priority or opts.event_trace is not None or
++                opts.start_delay or opts.v_start_delay or opts.a_start_delay or
++                opts.launch_order != "av" or opts.full_watchdog != 200000):
++            ap.error("--ds-priority/--event-trace/--start-delay/--v-start-delay/"
++                     "--a-start-delay/--launch-order/--full-watchdog require --system")
+     if not opts.system:
+         if (opts.read_admit is not None or opts.read_budget is not None or
+                 opts.read_period is not None):
+@@ -367,6 +462,18 @@
+         run_args += ["+system=1"]
+     if opts.cpu_writes:
+         run_args += ["+cpu-writes=1"]
++    run_args += ["+cpu-enable={}".format(opts.cpu_enable)]
++    run_args += ["+start-delay={}".format(opts.start_delay)]
++    run_args += ["+v-start-delay={}".format(opts.v_start_delay)]
++    run_args += ["+a-start-delay={}".format(opts.a_start_delay)]
++    run_args += ["+launch-order={}".format(opts.launch_order)]
++    run_args += ["+full-watchdog={}".format(opts.full_watchdog)]
++    if opts.full_batch:
++        run_args += ["+full-batch=1"]
++    if opts.ds_priority:
++        run_args += ["+ds-priority=1"]
++    if opts.event_trace:
++        run_args += ["+event-trace={}".format(opts.event_trace)]
+     if opts.system and opts.read_admit is not None:
+         run_args += ["+read-admit={}".format(opts.read_admit)]
+     if opts.system and opts.read_budget is not None:
+@@ -378,6 +485,12 @@
+               int(opts.system), int(opts.cpu_writes), top_name, opts.mode,
+               opts.a_pages, opts.v_gap, opts.transfers, opts.warmup,
+               opts.ptw_latency, opts.a_target))
++    print("test_nonblock_actual_dma: full_batch={} cpu_enable={} ds_priority={} "
++          "launch_order={} start_delay={} v_start_delay={} a_start_delay={} "
++          "full_watchdog={} event_trace={}".format(
++              int(opts.full_batch), int(opts.cpu_enable), int(opts.ds_priority),
++              opts.launch_order, opts.start_delay, opts.v_start_delay,
++              opts.a_start_delay, opts.full_watchdog, opts.event_trace))
+     run = subprocess.run(run_args)
+     return run.returncode
+ 

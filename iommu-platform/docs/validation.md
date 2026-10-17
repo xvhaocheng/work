@@ -2881,3 +2881,12 @@ HERO height32四案P/N/H1/H2在执行前冻结，一次调用两个固定普通�
 ## 2026-10-16 公开仓库与持续同步规则
 
 按用户明确要求将 `xvhaocheng/work` 改为公开；GitHub实际返回 `isPrivate=false`、默认分支main。根／平台AGENTS、README及状态／交接记录后续任务完成时增量同步的持续授权；本次为设置及文档变更，检查文档差异和远端提交，不重跑未变的同步工具或研究构建。由Codex直接执行，未使用DeepSeek。
+
+
+## 2026-10-17 源码基线与历史对应静态整理
+
+按用户要求仅整理，未启动构建、主机回归、RTL仿真、性能实验、综合／布线或板测。固定原始上游配对、必要四DMA／接口适配及独立修复基座，研究扩展另列实际提交；Linux／OpenSBI保留软件历史。所有新源码profile均source-fixed-only，原版性能基线尚未运行。
+
+实际检查包括组件补丁逐步应用与commit tree一致、冻结源字节／模式一致、增量bundle在独立bare仓库恢复精确commit、旧组件HEAD／索引／refs／工作树保全，以及复用原archive staging导出的源码身份。历史79条记录、13份核心源清单和16份Git原件版本锁另有哈希回执；缺失源码／隐式依赖／环境闭包仍明确unknown，不声称新提交复现旧运行。
+
+[总入口](../provenance/source-organization-20261017/README.md)／[汇总静态回执](../provenance/source-organization-20261017/verification.json)／[导出身份](../provenance/source-organization-20261017/source-export-verification.json)／[历史索引](../provenance/source-organization-20261017/history/README.md)。原有结果、数据与暂停状态保持，Codex-only。

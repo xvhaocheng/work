@@ -1,0 +1,428 @@
+From 33cb80fd42550bb941299b6c377d76f3a23f3290 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:58:30 +0900
+Subject: [PATCH 4/9] organize: isolate restricted CQ marker certificates and
+ exclusive error history
+
+---
+ drivers/iommu/riscv/iommu.c          | 244 ++++++++++++++++++++++++++-
+ drivers/iommu/riscv/iommu.h          |   7 +
+ include/linux/riscv_iommu_research.h |  63 +++++++
+ 3 files changed, 312 insertions(+), 2 deletions(-)
+ create mode 100644 include/linux/riscv_iommu_research.h
+
+diff --git a/drivers/iommu/riscv/iommu.c b/drivers/iommu/riscv/iommu.c
+index a7bb545d53def1f165539d333e4b75af6a8f67d1..067cb58b0ad92a3f6f5abeebeefad9ebdd943d99 100644
+--- a/drivers/iommu/riscv/iommu.c
++++ b/drivers/iommu/riscv/iommu.c
+@@ -26,6 +26,7 @@
+ #include <linux/irqdomain.h>
+ #include <linux/platform_device.h>
+ #include <linux/dma-map-ops.h>
++#include <linux/riscv_iommu_research.h>
+ #include <asm/page.h>
+ 
+ #include "../dma-iommu.h"
+@@ -77,6 +78,10 @@ MODULE_PARM_DESC(priq_length, "Page request interface queue length.");
+ static const struct iommu_domain_ops riscv_iommu_domain_ops;
+ static const struct iommu_ops riscv_iommu_ops;
+ 
++static bool research;
++module_param(research, bool, 0400);
++MODULE_PARM_DESC(research, "Enable restricted synchronous DID10/11 Sv39 research API");
++
+ /*
+  * Common queue management routines
+  */
+@@ -484,10 +489,17 @@ static bool riscv_iommu_post_sync(struct riscv_iommu_device *iommu,
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&iommu->cq_lock, flags);
++	if (iommu->research_cq_owned || iommu->research_cq_poisoned) {
++		/* An unexpected poster invalidates exclusive-history acceptance. */
++		if (iommu->research_cq_owned)
++			atomic64_inc(&iommu->cq_error_seq);
++		spin_unlock_irqrestore(&iommu->cq_lock, flags);
++		return false;
++	}
+ 	head = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQH) & (iommu->cmdq.cnt - 1);
+ 	tail = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQT) & (iommu->cmdq.cnt - 1);
+ 	last = iommu->cmdq.lui;
+-	if (tail != last) {
++	if (tail != last || iommu->cq_posted == U64_MAX) {
+ 		spin_unlock_irqrestore(&iommu->cq_lock, flags);
+ 		return false;
+ 	}
+@@ -496,6 +508,7 @@ static bool riscv_iommu_post_sync(struct riscv_iommu_device *iommu,
+ 	if (next != head) {
+ 		struct riscv_iommu_command *ptr = iommu->cmdq.base;
+ 		ptr[last] = *cmd;
++		iommu->cq_posted++;
+ 		wmb();
+ 		riscv_iommu_writel(iommu, RISCV_IOMMU_REG_CQT, next);
+ 		iommu->cmdq.lui = next;
+@@ -631,6 +644,14 @@ static irqreturn_t riscv_iommu_cmdq_process(int irq, void *data)
+ 	unsigned ctrl;
+ 
+ 	iommu = container_of(q, struct riscv_iommu_device, cmdq);
++	/* Research owns the complete error/recovery history until certification. */
++	spin_lock_irq(&iommu->cq_lock);
++	if (iommu->research_cq_owned || iommu->research_cq_poisoned) {
++		riscv_iommu_writel(iommu, RISCV_IOMMU_REG_IPSR,
++				 RISCV_IOMMU_IPSR_CIP);
++		spin_unlock_irq(&iommu->cq_lock);
++		return IRQ_HANDLED;
++	}
+ 
+ 	/* Error reporting, clear error reports if any. */
+ 	ctrl = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQCSR);
+@@ -643,7 +664,7 @@ static irqreturn_t riscv_iommu_cmdq_process(int irq, void *data)
+ 		 */
+ 		atomic64_inc(&iommu->cq_error_seq);
+ 		wmb();
+-		riscv_iommu_queue_ctrl(iommu, &iommu->cmdq, ctrl);
++		riscv_iommu_writel(iommu, RISCV_IOMMU_REG_CQCSR, ctrl);
+ 		dev_warn_ratelimited(iommu->dev,
+ 				     "Command queue error: fault: %d tout: %d err: %d\n",
+ 				     !!(ctrl & RISCV_IOMMU_CQCSR_CQMF),
+@@ -653,6 +674,7 @@ static irqreturn_t riscv_iommu_cmdq_process(int irq, void *data)
+ 
+ 	/* Clear fault interrupt pending. */
+ 	riscv_iommu_writel(iommu, RISCV_IOMMU_REG_IPSR, RISCV_IOMMU_IPSR_CIP);
++	spin_unlock_irq(&iommu->cq_lock);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -2053,6 +2075,207 @@ struct riscv_iommu_endpoint *riscv_iommu_hpm_endpoint(struct device *dev)
+ 	return ep;
+ }
+ 
++/* All callers use the opt-in static single-mm current-platform contract. */
++static bool riscv_iommu_research_ep_ok(struct riscv_iommu_endpoint *ep)
++{
++	u64 tc;
++
++	if (!ep || !ep->dc || !ep->iommu || ep->pasid_enabled ||
++	    (ep->devid != 10 && ep->devid != 11))
++		return false;
++	if (!(ep->iommu->cap & RISCV_IOMMU_CAP_S_SV39) ||
++	    READ_ONCE(ep->iommu->research_cq_poisoned))
++		return false;
++	tc = le64_to_cpu(READ_ONCE(ep->dc->tc));
++	return !(tc & (RISCV_IOMMU_DC_TC_EN_ATS | RISCV_IOMMU_DC_TC_EN_PRI |
++		       RISCV_IOMMU_DC_TC_PDTV | RISCV_IOMMU_DC_TC_T2GPA |
++		       RISCV_IOMMU_DC_TC_SXL)) &&
++	       !le64_to_cpu(READ_ONCE(ep->dc->iohgatp));
++}
++
++bool riscv_iommu_research_supported(struct device *dev0, struct device *dev1)
++{
++	struct riscv_iommu_endpoint *ep0, *ep1;
++
++	if (!research || !IS_ENABLED(CONFIG_64BIT) ||
++	    IS_ENABLED(CONFIG_CPU_BIG_ENDIAN) ||
++	    (satp_mode >> 60) != RISCV_IOMMU_DC_FSC_IOSATP_MODE_SV39)
++		return false;
++	ep0 = riscv_iommu_hpm_endpoint(dev0);
++	ep1 = riscv_iommu_hpm_endpoint(dev1);
++	return ep0 && ep1 && ep0 != ep1 && ep0->devid != ep1->devid &&
++	       ep0->iommu == ep1->iommu &&
++	       riscv_iommu_research_ep_ok(ep0) && riscv_iommu_research_ep_ok(ep1);
++}
++EXPORT_SYMBOL_GPL(riscv_iommu_research_supported);
++
++#define RISCV_IOMMU_RESEARCH_CQ_ERRORS (RISCV_IOMMU_CQCSR_CQMF | \
++	RISCV_IOMMU_CQCSR_CMD_TO | RISCV_IOMMU_CQCSR_CMD_ILL)
++#define RISCV_IOMMU_RESEARCH_CQ_ON (RISCV_IOMMU_CQCSR_CQEN | RISCV_IOMMU_CQCSR_CQON)
++
++int riscv_iommu_research_barrier(struct device *dev0, struct device *dev1,
++				void (*sync_cache)(void *), void *sync_arg,
++				struct riscv_iommu_research_certificate *cert)
++{
++	struct riscv_iommu_endpoint *ep0, *ep1, *first, *second;
++	struct riscv_iommu_device *iommu;
++	struct riscv_iommu_command cmd[5], *ring;
++	unsigned long flags;
++	unsigned long fresh_page;
++	cycles_t start;
++	u64 cqb, value, posted;
++	u32 count, mask, head, tail, end, ctrl, token, i;
++	s64 error_seq;
++	int ret = -EIO;
++
++	if (!sync_cache || !cert)
++		return -EINVAL;
++	memset(cert, 0, sizeof(*cert));
++	if (!riscv_iommu_research_supported(dev0, dev1))
++		return -EOPNOTSUPP;
++	/* Allocation before locks; never share the 8-byte cell with another user. */
++	fresh_page = get_zeroed_page(GFP_KERNEL);
++	if (!fresh_page)
++		return -ENOMEM;
++	ep0 = riscv_iommu_hpm_endpoint(dev0);
++	ep1 = riscv_iommu_hpm_endpoint(dev1);
++	iommu = ep0->iommu;
++	first = ep0->devid < ep1->devid ? ep0 : ep1;
++	second = first == ep0 ? ep1 : ep0;
++	mutex_lock(&first->lock);
++	mutex_lock_nested(&second->lock, SINGLE_DEPTH_NESTING);
++	if (!riscv_iommu_research_ep_ok(ep0) ||
++	    !riscv_iommu_research_ep_ok(ep1) || ep1->iommu != iommu)
++		goto unlock_endpoints;
++	/* Core and endpoint identities must agree even on the restored default. */
++	if (!ep0->domain || !ep1->domain ||
++	    iommu_get_domain_for_dev(dev0) != &ep0->domain->domain ||
++	    iommu_get_domain_for_dev(dev1) != &ep1->domain->domain)
++		goto unlock_endpoints;
++
++	spin_lock_irqsave(&iommu->cq_lock, flags);
++	if (iommu->research_cq_owned || iommu->research_cq_poisoned) {
++		ret = -EBUSY;
++		goto unlock_cq;
++	}
++	count = iommu->cmdq.cnt;
++	if (!iommu->cmdq.base || iommu->cmdq.in_iomem || count < 8 ||
++	    !is_power_of_2(count) || iommu->cmdq.lui >= count)
++		goto unlock_cq;
++	mask = count - 1;
++	cqb = riscv_iommu_readq(iommu, RISCV_IOMMU_REG_CQB);
++	if (FIELD_GET(RISCV_IOMMU_QUEUE_SIZE_FIELD, cqb) >= 31 ||
++	    (1ULL << (FIELD_GET(RISCV_IOMMU_QUEUE_SIZE_FIELD, cqb) + 1)) != count ||
++	    ppn_to_phys(cqb) != iommu->cmdq.base_dma)
++		goto unlock_cq;
++	ctrl = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQCSR);
++	if ((ctrl & RISCV_IOMMU_RESEARCH_CQ_ON) != RISCV_IOMMU_RESEARCH_CQ_ON ||
++	    (ctrl & (RISCV_IOMMU_RESEARCH_CQ_ERRORS | RISCV_IOMMU_CQCSR_BUSY)))
++		goto unlock_cq;
++	head = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQH);
++	tail = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQT);
++	if (head >= count || tail != iommu->cmdq.lui ||
++	    (iommu->cq_posted & mask) != tail ||
++	    ((head - tail - 1) & mask) < ARRAY_SIZE(cmd)) {
++		ret = -EBUSY;
++		goto unlock_cq;
++	}
++	if (iommu->research_token == U32_MAX || iommu->research_epoch == U64_MAX ||
++	    iommu->cq_posted > U64_MAX - ARRAY_SIZE(cmd)) {
++		ret = -EOVERFLOW;
++		goto unlock_cq;
++	}
++	if (!iommu->research_marker) {
++		iommu->research_marker = (void *)fresh_page;
++		fresh_page = 0;
++	}
++	token = ++iommu->research_token;
++	error_seq = atomic64_read(&iommu->cq_error_seq);
++	posted = iommu->cq_posted;
++	iommu->research_cq_owned = true;
++	spin_unlock_irqrestore(&iommu->cq_lock, flags);
++
++	riscv_iommu_cmd_iodir_inval_ddt(&cmd[0]);
++	riscv_iommu_cmd_iodir_set_did(&cmd[0], 10);
++	riscv_iommu_cmd_iodir_inval_ddt(&cmd[1]);
++	riscv_iommu_cmd_iodir_set_did(&cmd[1], 11);
++	/* All host first-stage entries, including global entries. */
++	riscv_iommu_cmd_inval_vma(&cmd[2]);
++	riscv_iommu_cmd_iofence_set_av(&cmd[3],
++					virt_to_phys(iommu->research_marker), token);
++	riscv_iommu_cmd_iofence(&cmd[4]);
++	WRITE_ONCE(*(u64 *)iommu->research_marker, cpu_to_le64(~(u64)token));
++	ring = iommu->cmdq.base;
++	for (i = 0; i < ARRAY_SIZE(cmd); i++)
++		ring[(tail + i) & mask] = cmd[i];
++	/* Accepted cache profile must make DC/PTE/commands/marker visible first. */
++	sync_cache(sync_arg);
++	wmb();
++	end = (tail + ARRAY_SIZE(cmd)) & mask;
++	spin_lock_irqsave(&iommu->cq_lock, flags);
++	iommu->cmdq.lui = end;
++	iommu->cq_posted += ARRAY_SIZE(cmd);
++	riscv_iommu_writel(iommu, RISCV_IOMMU_REG_CQT, end);
++	spin_unlock_irqrestore(&iommu->cq_lock, flags);
++
++	start = get_cycles();
++	for (;;) {
++		sync_cache(sync_arg);
++		value = le64_to_cpu(READ_ONCE(*(u64 *)iommu->research_marker));
++		rmb();
++		head = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQH);
++		ctrl = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQCSR);
++		if ((ctrl & RISCV_IOMMU_RESEARCH_CQ_ON) != RISCV_IOMMU_RESEARCH_CQ_ON ||
++		    (ctrl & RISCV_IOMMU_RESEARCH_CQ_ERRORS) ||
++		    atomic64_read(&iommu->cq_error_seq) != error_seq ||
++		    riscv_iommu_readq(iommu, RISCV_IOMMU_REG_CQB) != cqb ||
++		    riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQT) != end) {
++			ret = -EIO;
++			break;
++		}
++		if (value == (u64)token && head == end) {
++			ret = 0;
++			break;
++		}
++		if (get_cycles() - start > RISCV_IOMMU_TIMEOUT) {
++			ret = -ETIMEDOUT;
++			break;
++		}
++		cpu_relax();
++	}
++	spin_lock_irqsave(&iommu->cq_lock, flags);
++	/* Keep error recovery excluded through the last acceptance observation. */
++	ctrl = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQCSR);
++	if (!ret && ((ctrl & RISCV_IOMMU_RESEARCH_CQ_ERRORS) ||
++	    (ctrl & RISCV_IOMMU_RESEARCH_CQ_ON) != RISCV_IOMMU_RESEARCH_CQ_ON ||
++	    atomic64_read(&iommu->cq_error_seq) != error_seq))
++		ret = -EIO;
++	if (ret)
++		iommu->research_cq_poisoned = true;
++	else
++		WRITE_ONCE(iommu->research_epoch, iommu->research_epoch + 1);
++	cert->epoch = iommu->research_epoch;
++	cert->posted = posted;
++	cert->cqb = cqb;
++	cert->marker_phys = virt_to_phys(iommu->research_marker);
++	cert->marker_value = value;
++	cert->token = token;
++	cert->first = tail;
++	cert->head = head;
++	cert->count = count;
++	cert->cqcsr = ctrl;
++	iommu->research_cq_owned = false;
++unlock_cq:
++	spin_unlock_irqrestore(&iommu->cq_lock, flags);
++unlock_endpoints:
++	mutex_unlock(&second->lock);
++	mutex_unlock(&first->lock);
++	if (fresh_page)
++		free_page(fresh_page);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(riscv_iommu_research_barrier);
++
+ /*
+  * Validate one acquire-time target under ep->lock. The acquire snapshot and
+  * the endpoint's own domain must both still be the live "core" domain for
+@@ -2287,6 +2510,10 @@ int riscv_iommu_flush_s1_checked(struct riscv_iommu_device *iommu,
+ 
+ void riscv_iommu_remove(struct riscv_iommu_device *iommu)
+ {
++	/* No teardown/reset is permitted over an uncertain marker write. */
++	if (WARN_ON(READ_ONCE(iommu->research_cq_owned) ||
++		    READ_ONCE(iommu->research_cq_poisoned)))
++		return;
+ 	/* An owner finishes restoring its HPM state before teardown proceeds. */
+ 	mutex_lock(&iommu->hpm_lock);
+ 	WRITE_ONCE(iommu->hpm_ready, false);
+@@ -2297,6 +2524,13 @@ void riscv_iommu_remove(struct riscv_iommu_device *iommu)
+ 	riscv_iommu_queue_free(iommu, &iommu->cmdq);
+ 	riscv_iommu_queue_free(iommu, &iommu->fltq);
+ 	riscv_iommu_queue_free(iommu, &iommu->priq);
++	/* The clean removal path releases the per-IOMMU dedicated marker page. */
++	if (iommu->research_marker &&
++	    !(riscv_iommu_readl(iommu, RISCV_IOMMU_REG_CQCSR) &
++	      (RISCV_IOMMU_CQCSR_CQON | RISCV_IOMMU_CQCSR_BUSY))) {
++		free_page((unsigned long)iommu->research_marker);
++		iommu->research_marker = NULL;
++	}
+ 	iopf_queue_free(iommu->pq_work);
+ }
+ 
+@@ -2309,6 +2543,12 @@ int riscv_iommu_init(struct riscv_iommu_device *iommu)
+ 	mutex_init(&iommu->hpm_lock);
+ 	iommu->hpm_ready = false;
+ 	iommu->eps = RB_ROOT;
++	iommu->research_cq_owned = false;
++	iommu->research_cq_poisoned = false;
++	iommu->research_epoch = 0;
++	iommu->cq_posted = 0;
++	iommu->research_token = 0;
++	iommu->research_marker = NULL;
+ 
+ 	fctl = riscv_iommu_readl(iommu, RISCV_IOMMU_REG_FCTL);
+ 
+diff --git a/drivers/iommu/riscv/iommu.h b/drivers/iommu/riscv/iommu.h
+index 4c6ba53e952ba148e0153b39898c6d180926f543..54d386ca6b1d37700092c7ad6488b17907e46003 100644
+--- a/drivers/iommu/riscv/iommu.h
++++ b/drivers/iommu/riscv/iommu.h
+@@ -108,6 +108,13 @@ struct riscv_iommu_device {
+ 	 * that was already handled and cleared from CQCSR.
+ 	 */
+ 	atomic64_t cq_error_seq;
++	/* Protected by cq_lock; a failed research bundle stays quarantined. */
++	bool research_cq_owned;
++	bool research_cq_poisoned;
++	u64 research_epoch;
++	u64 cq_posted;
++	u32 research_token;
++	void *research_marker;
+ };
+ 
+ struct riscv_iommu_domain {
+diff --git a/include/linux/riscv_iommu_research.h b/include/linux/riscv_iommu_research.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ba16fa6180f1a4bd7b1786787cd00b577efe1aa
+--- /dev/null
++++ b/include/linux/riscv_iommu_research.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_RISCV_IOMMU_RESEARCH_H
++#define _LINUX_RISCV_IOMMU_RESEARCH_H
++
++#include <linux/types.h>
++#include <linux/kconfig.h>
++#include <linux/err.h>
++#include <linux/errno.h>
++
++struct device;
++struct iommu_domain;
++struct mm_struct;
++
++struct riscv_iommu_research_certificate {
++	u64 epoch;
++	u64 posted;
++	u64 cqb;
++	u64 marker_phys;
++	u64 marker_value;
++	u32 token;
++	u32 first;
++	u32 head;
++	u32 count;
++	u32 cqcsr;
++};
++
++#if IS_REACHABLE(CONFIG_RISCV_IOMMU)
++bool riscv_iommu_research_supported(struct device *dev0, struct device *dev1);
++
++/*
++ * Caller already owns DID10/11 exclusively and has proved ALL translation,
++ * PTW/result/spill and R/W/B obligations quiescent; every other source is
++ * stopped. This function does not establish that precondition. sync_cache
++ * must synchronously publish all CPU stores and acquire the complete 8-byte
++ * marker on the accepted single-hart CVA6 cache profile. It runs before tail
++ * publication and before every token read; it must not post CQ commands.
++ * Exclusive CQ posting and error recovery span all five contiguous entries.
++ * A post-publication failure permanently poisons CQ and retains the marker:
++ * caller MUST retain domain/mm/pages/owner and must not unlock borrowed mm
++ * for teardown. A success proves the preceding invalidations and marker B,
++ * not the sentinel's decode, absence of late FQ errors or DMA drain.
++ */
++int riscv_iommu_research_barrier(struct device *dev0, struct device *dev1,
++				void (*sync_cache)(void *), void *sync_arg,
++				struct riscv_iommu_research_certificate *cert);
++
++#else
++static inline bool riscv_iommu_research_supported(struct device *dev0,
++						 struct device *dev1)
++{
++	return false;
++}
++
++static inline int
++riscv_iommu_research_barrier(struct device *dev0, struct device *dev1,
++			   void (*sync_cache)(void *), void *sync_arg,
++			   struct riscv_iommu_research_certificate *cert)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
++#endif

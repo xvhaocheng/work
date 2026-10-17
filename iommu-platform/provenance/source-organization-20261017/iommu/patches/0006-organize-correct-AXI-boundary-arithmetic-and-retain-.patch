@@ -1,0 +1,979 @@
+From 85b157ebe71a623e326e51fff7b7126fe77e8eb9 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 14:48:57 +0900
+Subject: [PATCH 06/12] organize: correct AXI boundary arithmetic and retain
+ existing regression sources
+
+---
+ rtl/transaction_controller/rv_iommu_axi_bc.sv |  43 +-
+ sim/axi_bc/README.md                          |  44 ++
+ sim/axi_bc/axi_bc_tb.sv                       |  40 ++
+ sim/axi_bc/axi_bc_test.cpp                    | 413 ++++++++++++++++++
+ sim/axi_bc/run.py                             | 358 +++++++++++++++
+ 5 files changed, 882 insertions(+), 16 deletions(-)
+ create mode 100644 sim/axi_bc/README.md
+ create mode 100644 sim/axi_bc/axi_bc_tb.sv
+ create mode 100644 sim/axi_bc/axi_bc_test.cpp
+ create mode 100644 sim/axi_bc/run.py
+
+diff --git a/rtl/transaction_controller/rv_iommu_axi_bc.sv b/rtl/transaction_controller/rv_iommu_axi_bc.sv
+index 33210e14fa04a1484c58ec343e3b17c60868165d..26b384f1a948288f55930f8adff08f9920c896cd 100644
+--- a/rtl/transaction_controller/rv_iommu_axi_bc.sv
++++ b/rtl/transaction_controller/rv_iommu_axi_bc.sv
+@@ -37,15 +37,23 @@ module rv_iommu_axi_bc #(
+     output logic                allow_request_o
+ );
+ 
+-    addr_t fixed_faddr;
+-    assign fixed_faddr = (addr_i & 'hfff) + ('h1 << n_bytes_i);
+-
+-    addr_t incr_faddr;
+-    assign incr_faddr = (addr_i & 'hfff) + ((addr_t'(burst_length_i) + 1) << (n_bytes_i - 1));
++    // Keep the page offset plus the largest AXI burst (256 * 128 bytes)
++    // without overflow. AxSIZE is log2(bytes per beat), including size zero.
++    logic [16:0] beat_bytes, burst_bytes, page_offset, aligned_offset;
++    logic [16:0] fixed_faddr, incr_faddr;
++    assign beat_bytes = 17'd1 << n_bytes_i;
++    assign burst_bytes = (17'(burst_length_i) + 17'd1) << n_bytes_i;
++    assign page_offset = {5'b0, addr_i[11:0]};
++    // An unaligned first beat accesses only the remaining bytes of its
++    // aligned beat window; subsequent INCR beats start at aligned addresses.
++    assign aligned_offset = page_offset & ~(beat_bytes - 17'd1);
++    // Compare the last included byte, not the address after the transfer.
++    assign fixed_faddr = aligned_offset + beat_bytes - 17'd1;
++    assign incr_faddr = aligned_offset + burst_bytes - 17'd1;
+ 
+     logic [2:0] log2_len;
+-    addr_t wrap_boundary;
+-    addr_t wrap_faddr;
++    logic [16:0] wrap_boundary;
++    logic [16:0] wrap_faddr;
+     always_comb begin : wrap_bursts
+         
+         // For wrap bursts, N of transfers must be {2, 4, 8, 16}
+@@ -60,10 +68,12 @@ module rv_iommu_axi_bc #(
+ 
+         // The lowest address within a wrapping burst
+         // Wrap_Boundary = (INT(Start_Address / (Burst_Length x Number_Bytes))) x (Burst_Length x Number_Bytes)
+-        wrap_boundary   = (addr_i >> (log2_len + n_bytes_i)) << (log2_len + n_bytes_i);
++        // Legal WRAP lengths make burst_bytes a power of two. Use a wide
++        // mask so adding two 3-bit exponents cannot wrap at 8.
++        wrap_boundary   = page_offset & ~(burst_bytes - 17'd1);
+ 
+-        // Highest addr_i = Wrap_Boundary + (Burst_Length x Number_Bytes)
+-        wrap_faddr      = (wrap_boundary & 'hfff) + ((addr_t'(burst_length_i) + 1) << (n_bytes_i -1));
++        // Last included byte of the complete wrapping window.
++        wrap_faddr      = wrap_boundary + burst_bytes - 17'd1;
+     end
+ 
+     always_comb begin : boundary_check
+@@ -72,23 +82,24 @@ module rv_iommu_axi_bc #(
+ 
+         unique case (burst_type_i)
+ 
+-            // The final address is Start Addr + size
++            // FIXED repeats the same (possibly partial) aligned beat window.
+             axi_pkg::BURST_FIXED: begin
+-                if ((fixed_faddr & ~('hfff)) == '0) begin
++                if (fixed_faddr < 17'd4096) begin
+                     allow_request_o = check_i;
+                 end
+             end
+ 
+-            // The final address is the Wrap Boundary (Lower address) + size of the transfer
++            // WRAP requires a legal length and a beat-aligned start address.
+             axi_pkg::BURST_WRAP: begin
+-                if (!(&log2_len) && ((wrap_faddr & ~('hfff)) == '0)) begin
++                if (!(&log2_len) && page_offset == aligned_offset &&
++                    wrap_faddr < 17'd4096) begin
+                     allow_request_o  = check_i;     // Allow transaction
+                 end
+             end
+ 
+-            // The final address is Start Addr + Burst_Length * Number_Bytes
++            // INCR's complete aligned container must stay within this page.
+             axi_pkg::BURST_INCR: begin
+-                if ((incr_faddr & ~('hfff)) == '0) begin
++                if (incr_faddr < 17'd4096) begin
+                     allow_request_o  = check_i;
+                 end
+             end
+diff --git a/sim/axi_bc/README.md b/sim/axi_bc/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..628e7be77f5b452ef8327658cbf774e1ea41d166
+--- /dev/null
++++ b/sim/axi_bc/README.md
+@@ -0,0 +1,44 @@
++# AXI 4 KiB boundary regression
++
++Run from the IOMMU repository:
++
++```sh
++python3 sim/axi_bc/run.py
++python3 sim/axi_bc/run.py --focus fixed-tail,incr-cross-half
++python3 sim/axi_bc/run.py --source /absolute/path/rv_iommu_axi_bc.before.sv --out /tmp/axi-bc-before
++```
++
++Requires Python 3, a C++ compiler and Verilator (tested with 4.038). Default
++outputs go to a fresh temporary directory; `--out` selects a retained build.
++The runner saves `build.log` and `run.log` and propagates failure status.
++
++The real combinational RTL is wrapped with a 64-bit address. The reference
++walks individual AXI beats and compares the page of each beat's first and
++last accessed bytes. It does not reuse the DUT's end-of-burst calculation.
++The addressing rules follow Arm IHI 0022H sections A3.4.1 and A3.4.2:
++https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/IHI0022H_amba_axi_protocol_spec.pdf
++
++The default 816,064 checks cover every page offset, AxSIZE 0..7, FIXED/INCR/WRAP,
++AxLEN {0,1,3,7,15,31,127,255}, disabled checks, reserved bursts, invalid WRAP
++lengths/alignment, and sampled addresses with bit 40 set. This is boundary
++checking, not a complete AXI protocol validator; FIXED length limits and bus
++width legality are outside its contract. It does not exhaust every AxLEN.
++
++Named cases include the independently reported page-end error: FIXED at
++0xFF8, size 3, length 0 must allow bytes 0xFF8..0xFFF. A distinct INCR case
++at 0xFF0, size 3, length 2 must reject a three-beat burst that crosses the
++page; the old half-length formula incorrectly allows it. A one-byte page-tail
++access and an unaligned first beat must also be accepted.
++
++On 2026-10-12, HEAD 238a39e66a07b27a67fb5749df40691682555027 failed 112,514
++of 816,064 checks, including the two named cases above. The final repair
++passed all 816,064 checks and all five named cases. The repair also avoids
++3-bit exponent-sum overflow for larger WRAP windows. The old RTL passes
++the named one-byte case on this Verilator version; no universal size-zero
++failure is claimed.
++
++These results are standalone boundary-checker simulation, not DMA payload,
++transaction-controller integration, FPGA timing, or board validation.
++DeepSeek authored the initial test proposal and runner revision; Codex
++reviewed/applied them, added the half-length counterexample, authored the
++RTL repair, and executed the tests.
+diff --git a/sim/axi_bc/axi_bc_tb.sv b/sim/axi_bc/axi_bc_tb.sv
+new file mode 100644
+index 0000000000000000000000000000000000000000..989b1dd5721ca41e1451839bbfc72128b6abccf4
+--- /dev/null
++++ b/sim/axi_bc/axi_bc_tb.sv
+@@ -0,0 +1,40 @@
++// Independent Verilator wrapper for rv_iommu_axi_bc.
++//
++// * AXI address is 64 bit wide (the DUT is instantiated with addr_t = logic [63:0]).
++// * The wrapped DUT is purely combinational: the C++ driver only drives the
++//   inputs and calls eval().  There is no clock and there are no timing
++//   constructs, so the test is built with --cc --exe --build only.
++//
++// SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
++
++`default_nettype none
++
++module axi_bc_tb (
++    // AxVALID / gate of the checker
++    input  logic        check_i,
++    // AxADDR
++    input  logic [63:0] addr_i,
++    // AxBURST
++    input  logic [1:0]  burst_type_i,
++    // AxLEN
++    input  logic [7:0]  burst_length_i,
++    // AxSIZE
++    input  logic [2:0]  n_bytes_i,
++    // 1 = request allowed, 0 = request rejected
++    output logic        allow_request_o
++);
++
++    rv_iommu_axi_bc #(
++        .addr_t ( logic [63:0] )
++    ) i_axi_bc (
++        .check_i         ( check_i         ),
++        .addr_i          ( addr_i          ),
++        .burst_type_i    ( burst_type_i    ),
++        .burst_length_i  ( burst_length_i  ),
++        .n_bytes_i       ( n_bytes_i       ),
++        .allow_request_o ( allow_request_o )
++    );
++
++endmodule
++
++`default_nettype wire
+diff --git a/sim/axi_bc/axi_bc_test.cpp b/sim/axi_bc/axi_bc_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8a3e6f2a4c160b93ef43824e4b01dccc327ed73
+--- /dev/null
++++ b/sim/axi_bc/axi_bc_test.cpp
+@@ -0,0 +1,413 @@
++// SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
++//
++// Independent Verilator regression driver for rv_iommu_axi_bc (AXI4 4-kiB
++// boundary checker).
++//
++// The expected result is produced by a golden model that walks the AXI beats
++// of the transaction and applies the AXI4 rule "a burst must never cross a
++// 4-kiB boundary": every beat of the burst must live in the very same 4-kiB
++// page.  The DUT's own end-of-burst arithmetic is deliberately NOT reused.
++//
++// Usage:
++//   axi_bc_test [--focus <name>]... [--max-failures N] [--list-tests]
++//
++// Exit status: 0 = every check matched the golden model, 1 = mismatch(es),
++//              2 = usage error.
++
++#include "verilated.h"
++#include "Vaxi_bc_tb.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <type_traits>
++#include <vector>
++
++namespace {
++
++// ---------------------------------------------------------------------------
++// Constants
++// ---------------------------------------------------------------------------
++const unsigned kPageShift        = 12;          // 4 kiB pages
++const uint64_t kPageSize         = 1ull << kPageShift;
++const unsigned kDefaultMaxPrints = 16;
++
++// AxBURST encodings, as in vendor/axi/src/axi_pkg.sv
++const unsigned BURST_FIXED = 0;
++const unsigned BURST_INCR  = 1;
++const unsigned BURST_WRAP  = 2;
++const unsigned BURST_RSVD  = 3;
++
++const char* burst_name(unsigned burst) {
++    switch (burst) {
++        case BURST_FIXED: return "FIXED";
++        case BURST_INCR:  return "INCR";
++        case BURST_WRAP:  return "WRAP";
++        default:          return "RSVD";
++    }
++}
++
++// ---------------------------------------------------------------------------
++// DUT handle and port access helpers
++// ---------------------------------------------------------------------------
++Vaxi_bc_tb* g_dut = 0;
++
++// Verilator stores a 64-bit port either in a scalar word (QData, uint64_t) or
++// in a wide vector (VlWide<2>), depending on version and options: support both.
++template <typename T>
++typename std::enable_if<std::is_class<T>::value>::type
++write_addr(T& sig, uint64_t v) {
++    sig[0] = static_cast<uint32_t>(v & 0xffffffffull);
++    sig[1] = static_cast<uint32_t>(v >> 32);
++}
++
++template <typename T>
++typename std::enable_if<!std::is_class<T>::value>::type
++write_addr(T& sig, uint64_t v) {
++    sig = v;
++}
++
++// Drive one AXI request into the checker and return allow_request_o.
++bool dut_eval(uint64_t addr, unsigned burst, unsigned len, unsigned size, bool check) {
++    write_addr(g_dut->addr_i, addr);
++    g_dut->check_i        = static_cast<unsigned char>(check ? 1u : 0u);
++    g_dut->burst_type_i   = static_cast<unsigned char>(burst & 0x3u);
++    g_dut->burst_length_i = static_cast<unsigned char>(len & 0xffu);
++    g_dut->n_bytes_i      = static_cast<unsigned char>(size & 0x7u);
++    g_dut->eval();
++    return g_dut->allow_request_o != 0;
++}
++
++// ---------------------------------------------------------------------------
++// Golden reference model
++// ---------------------------------------------------------------------------
++// Beat addresses per AXI4 (compare axi_pkg::beat_addr / axi_pkg::wrap_boundary):
++//   Number_Bytes    = 1 << AxSIZE
++//   Burst_Length    = AxLEN + 1
++//   Aligned_Address = (INT(Start_Address / Number_Bytes)) * Number_Bytes
++//
++//   INCR : beat 0 is Start_Address; beat N (N > 0) is
++//          Aligned_Address + N * Number_Bytes.
++//   FIXED: every beat uses Start_Address; the valid byte lanes end at
++//          Aligned_Address + Number_Bytes - 1 (A3-51 / A3-52).
++//   WRAP : only AxLEN in {1,3,7,15} (2/4/8/16 beats) and a Number_Bytes
++//          aligned start address are legal; beats walk
++//          Aligned_Address + N * Number_Bytes and wrap back to
++//          Wrap_Boundary = INT(Start_Address / Window) * Window with
++//          Window = Number_Bytes * Burst_Length.
++//   AxBURST = 2'b11 is reserved and never a legal transaction.
++//
++// A transaction is allowed iff every beat is fully inside one 4-kiB page and
++// all beats agree on that page (first beat, last beat and every beat between).
++bool golden(uint64_t addr, unsigned burst, unsigned len, unsigned size, bool check) {
++    if (!check) return false;                  // checker disabled / AxVALID low
++    if (burst == BURST_RSVD) return false;     // reserved burst encoding
++
++    const uint64_t nb      = 1ull << (size & 0x7u);        // Number_Bytes
++    const uint64_t nbeats  = static_cast<uint64_t>(len) + 1ull;
++    const uint64_t aligned = addr & ~(nb - 1ull);          // Aligned_Address
++
++    uint64_t ref_page = 0;
++    bool have_ref = false;
++
++    // Register one beat [lo, hi]; hi is the last byte touched by the beat.
++    auto beat_ok = [&](uint64_t lo, uint64_t hi) -> bool {
++        const uint64_t pl = lo >> kPageShift;
++        const uint64_t ph = hi >> kPageShift;
++        if (pl != ph) return false;                        // beat spans two pages
++        if (!have_ref) {
++            have_ref = true;
++            ref_page = pl;
++            return true;
++        }
++        return pl == ref_page;                             // beat in another page
++    };
++
++    switch (burst) {
++        case BURST_FIXED: {
++            for (uint64_t i = 0; i < nbeats; ++i) {
++                if (!beat_ok(addr, aligned + nb - 1ull)) return false;
++            }
++            return true;
++        }
++        case BURST_INCR: {
++            if (!beat_ok(addr, aligned + nb - 1ull)) return false;
++            for (uint64_t i = 1; i < nbeats; ++i) {
++                const uint64_t a = aligned + i * nb;
++                if (!beat_ok(a, a + nb - 1ull)) return false;
++            }
++            return true;
++        }
++        case BURST_WRAP: {
++            if (len != 1 && len != 3 && len != 7 && len != 15) return false;
++            if ((addr & (nb - 1ull)) != 0) return false;   // start not size aligned
++            const uint64_t window = nb * nbeats;
++            const uint64_t wrap_boundary = (addr / window) * window;
++            for (uint64_t i = 0; i < nbeats; ++i) {
++                uint64_t a = addr + i * nb;
++                if (a >= wrap_boundary + window) a -= window;
++                if (!beat_ok(a, a + nb - 1ull)) return false;
++            }
++            return true;
++        }
++        default:
++            return false;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Bookkeeping and reporting
++// ---------------------------------------------------------------------------
++const unsigned G_SWEEP = 0;
++const unsigned G_GATE  = 1;
++const unsigned G_RSVD  = 2;
++const unsigned G_ALIAS = 3;
++const unsigned G_FOCUS = 4;
++const unsigned G_COUNT = 5;
++
++const char* const kGroupTag[G_COUNT] = {
++    "sweep", "gate", "rsvd", "alias", "focus"
++};
++const char* const kGroupDesc[G_COUNT] = {
++    "offset sweep: FIXED/INCR/WRAP x size 0..7 x len {0,1,3,7,15,31,127,255} x offset 0..4095",
++    "check_i = 0 must reject",
++    "reserved AxBURST = 2'b11 must reject",
++    "same page offset at a high address (bit 40)",
++    "named focus cases"
++};
++
++unsigned long long g_checks[G_COUNT] = {0};
++unsigned long long g_fails[G_COUNT]  = {0};
++unsigned g_printed    = 0;
++unsigned g_max_prints = kDefaultMaxPrints;
++
++void report_fail(unsigned group, const char* tag, uint64_t addr, unsigned burst,
++                 unsigned len, unsigned size, bool check, int got, bool expect) {
++    ++g_fails[group];
++    if (g_printed >= g_max_prints) return;
++    ++g_printed;
++    if (got < 0) {
++        std::printf("FAIL [%s:%s] addr=0x%012llx burst=%s len=%u size=%u check=%u : "
++                    "hard-coded expectation disagrees with the golden model\n",
++                    kGroupTag[group], tag, static_cast<unsigned long long>(addr),
++                    burst_name(burst), len, size, check ? 1u : 0u);
++        return;
++    }
++    std::printf("FAIL [%s:%s] addr=0x%012llx burst=%s len=%u size=%u check=%u : "
++                "dut=%s golden=%s\n",
++                kGroupTag[group], tag, static_cast<unsigned long long>(addr),
++                burst_name(burst), len, size, check ? 1u : 0u,
++                got ? "ALLOW" : "REJECT", expect ? "ALLOW" : "REJECT");
++}
++
++// expect_override >= 0 forces a hard-coded expectation (used by the focus
++// cases, which also cross-check the golden model); -1 lets the model decide.
++void check_case(unsigned group, const char* tag, uint64_t addr, unsigned burst,
++                unsigned len, unsigned size, bool check, int expect_override) {
++    ++g_checks[group];
++    const bool expect = golden(addr, burst, len, size, check);
++    if (expect_override >= 0 && expect != (expect_override != 0)) {
++        report_fail(group, tag, addr, burst, len, size, check, -1, expect);
++        return;
++    }
++    const bool got = dut_eval(addr, burst, len, size, check);
++    if (got != expect) {
++        report_fail(group, tag, addr, burst, len, size, check, got ? 1 : 0, expect);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Named focus cases (fixed names, also used by the legacy red tests)
++// ---------------------------------------------------------------------------
++struct FocusCase {
++    const char* name;
++    uint64_t    addr;
++    unsigned    burst;
++    unsigned    len;
++    unsigned    size;
++    bool        check;
++    int         expect;   // >= 0: hard-coded expectation, cross-checked
++};
++
++const FocusCase kFocusCases[] = {
++    // 0xFF8 + 8 bytes - 1 = 0xFFF: the beat window ends on the last
++    // byte of the 4-kiB page -> the burst does not cross the boundary.
++    {"fixed-tail",     0x0ff8ull, BURST_FIXED, 0, 3, true, 1},
++    // 4 beats x 8 bytes from 0xFF0: beat 2 starts at 0x1000 -> crosses.
++    {"incr-cross",     0x0ff0ull, BURST_INCR,  3, 3, true, 0},
++    // Three 8-byte beats cross the page, but a half-length formula misses it.
++    {"incr-cross-half",0x0ff0ull, BURST_INCR,  2, 3, true, 0},
++    // Single 1-byte beat on the last byte of the page -> legal.
++    {"incr-byte-tail", 0x0fffull, BURST_INCR,  0, 0, true, 1},
++    // Unaligned first beat touches 0xFF9..0xFFF of its 8-byte window -> legal.
++    {"incr-unaligned", 0x0ff9ull, BURST_INCR,  0, 3, true, 1}
++};
++const unsigned kNumFocusCases = sizeof(kFocusCases) / sizeof(kFocusCases[0]);
++
++int run_focus(const std::string& name) {
++    for (unsigned i = 0; i < kNumFocusCases; ++i) {
++        if (name == kFocusCases[i].name) {
++            const FocusCase& c = kFocusCases[i];
++            check_case(G_FOCUS, c.name, c.addr, c.burst, c.len, c.size, c.check, c.expect);
++            return 0;
++        }
++    }
++    return -1;
++}
++
++// ---------------------------------------------------------------------------
++// Default suite (816064 checks, i.e. below the 1e6 budget)
++// ---------------------------------------------------------------------------
++void run_full_suite() {
++    const unsigned kBursts[]      = {BURST_FIXED, BURST_INCR, BURST_WRAP};
++    const unsigned kSizes[]       = {0, 1, 2, 3, 4, 5, 6, 7};
++    const unsigned kLens[]        = {0, 1, 3, 7, 15, 31, 127, 255};
++    const uint64_t kGateOffsets[] = {0x0ull, 0x1ull, 0x7ffull, 0x0ff8ull, 0x0fffull};
++
++    // 1) every offset inside a 4-kiB page, every size, the three burst types
++    //    and the requested AxLEN set: 3 * 8 * 8 * 4096 = 786432 checks.
++    for (unsigned b = 0; b < 3; ++b) {
++        for (unsigned s = 0; s < 8; ++s) {
++            for (unsigned l = 0; l < 8; ++l) {
++                for (uint64_t off = 0; off < kPageSize; ++off) {
++                    check_case(G_SWEEP, "offset", off, kBursts[b], kLens[l], kSizes[s], true, -1);
++                }
++            }
++        }
++    }
++
++    // 2) check_i = 0 must always reject: 3 * 8 * 8 * 5 = 960 checks.
++    for (unsigned b = 0; b < 3; ++b) {
++        for (unsigned s = 0; s < 8; ++s) {
++            for (unsigned l = 0; l < 8; ++l) {
++                for (unsigned o = 0; o < 5; ++o) {
++                    check_case(G_GATE, "gate0", kGateOffsets[o], kBursts[b], kLens[l], kSizes[s], false, 0);
++                }
++            }
++        }
++    }
++
++    // 3) reserved burst encoding must always reject (sampled offsets):
++    //    8 * 8 * 256 = 16384 checks.
++    for (unsigned s = 0; s < 8; ++s) {
++        for (unsigned l = 0; l < 8; ++l) {
++            for (uint64_t off = 0; off < kPageSize; off += 16) {
++                check_case(G_RSVD, "reserved", off, BURST_RSVD, kLens[l], kSizes[s], true, 0);
++            }
++        }
++    }
++
++    // 4) the same page offset at a high address (bit 40) must give the same
++    //    verdict: 3 * 8 * 8 * 64 = 12288 checks.
++    for (unsigned b = 0; b < 3; ++b) {
++        for (unsigned s = 0; s < 8; ++s) {
++            for (unsigned l = 0; l < 8; ++l) {
++                for (uint64_t off = 0; off < kPageSize; off += 64) {
++                    check_case(G_ALIAS, "alias", off | (1ull << 40), kBursts[b], kLens[l], kSizes[s], true, -1);
++                }
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// CLI
++// ---------------------------------------------------------------------------
++void usage() {
++    std::printf(
++        "usage: axi_bc_test [--focus <name>]... [--max-failures N] [--list-tests]\n"
++        "  --focus <name>    run one named regression case (repeatable)\n"
++        "  --max-failures N  print at most N failing checks (default 16)\n"
++        "  --list-tests      list the named regression cases and exit\n");
++}
++
++void print_summary() {
++    unsigned long long total = 0;
++    unsigned long long fails = 0;
++    std::printf("\n");
++    std::printf("axi_bc regression summary\n");
++    for (unsigned g = 0; g < G_COUNT; ++g) {
++        if (g_checks[g] == 0) continue;
++        std::printf("  %-6s %-78s : %8llu checks, %llu failures\n",
++                    kGroupTag[g], kGroupDesc[g], g_checks[g], g_fails[g]);
++        total += g_checks[g];
++        fails += g_fails[g];
++    }
++    std::printf("  %-6s %-78s : %8llu checks, %llu failures\n",
++                "TOTAL", "", total, fails);
++    if (g_printed < fails) {
++        std::printf("  (only the first %u failures were printed)\n", g_printed);
++    }
++    std::printf("axi_bc: %s (checks=%llu, failures=%llu)\n",
++                fails ? "FAIL" : "PASS", total, fails);
++    std::fflush(stdout);
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    std::vector<std::string> focus;
++
++    for (int i = 1; i < argc; ++i) {
++        const std::string arg = argv[i];
++        if (arg == "--focus") {
++            if (i + 1 >= argc) {
++                std::fprintf(stderr, "axi_bc_test: --focus needs an argument\n");
++                return 2;
++            }
++            focus.push_back(std::string(argv[++i]));
++        } else if (arg.compare(0, 8, "--focus=") == 0) {
++            focus.push_back(arg.substr(8));
++        } else if (arg == "--max-failures") {
++            if (i + 1 >= argc) {
++                std::fprintf(stderr, "axi_bc_test: --max-failures needs an argument\n");
++                return 2;
++            }
++            g_max_prints = static_cast<unsigned>(std::atoi(argv[++i]));
++        } else if (arg == "--list-tests") {
++            for (unsigned k = 0; k < kNumFocusCases; ++k) {
++                std::printf("%s\n", kFocusCases[k].name);
++            }
++            return 0;
++        } else if (arg == "--help" || arg == "-h") {
++            usage();
++            return 0;
++        } else {
++            std::fprintf(stderr, "axi_bc_test: unknown option '%s'\n", arg.c_str());
++            usage();
++            return 2;
++        }
++    }
++
++    g_dut = new Vaxi_bc_tb;
++
++    if (!focus.empty()) {
++        for (std::size_t i = 0; i < focus.size(); ++i) {
++            if (run_focus(focus[i]) != 0) {
++                std::fprintf(stderr, "axi_bc_test: unknown focus case '%s'\n",
++                             focus[i].c_str());
++                std::fprintf(stderr, "known cases:");
++                for (unsigned k = 0; k < kNumFocusCases; ++k) {
++                    std::fprintf(stderr, " %s", kFocusCases[k].name);
++                }
++                std::fprintf(stderr, "\n");
++                g_dut->final();
++                delete g_dut;
++                return 2;
++            }
++        }
++    } else {
++        run_full_suite();
++    }
++
++    print_summary();
++
++    g_dut->final();
++    delete g_dut;
++
++    unsigned long long fails = 0;
++    for (unsigned g = 0; g < G_COUNT; ++g) fails += g_fails[g];
++    return fails ? 1 : 0;
++}
+diff --git a/sim/axi_bc/run.py b/sim/axi_bc/run.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..00514e1dceff44d59d640a08c567ad4023226495
+--- /dev/null
++++ b/sim/axi_bc/run.py
+@@ -0,0 +1,358 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
++'''Independent Verilator runner for the rv_iommu_axi_bc regression test.
++
++Layout
++------
++The repository root is always <script>/../.. (sim/axi_bc/run.py -> <root>).
++There is no way to move it: the testbench sim/axi_bc/axi_bc_tb.sv, the C++
++driver sim/axi_bc/axi_bc_test.cpp and the vendor/ packages are always read
++from the repository root.
++
++--source is NOT a repository root.  It names a single DUT .sv file that is
++compiled instead of the default rtl/transaction_controller/rv_iommu_axi_bc.sv,
++so an archived copy of an older revision can be used to reproduce before
++behaviour without touching the working tree.
++
++Build model
++-----------
++The build is verilator --cc --exe --build -Wall -Wno-fatal (classic object
++flow; no --binary, no --timing).  -Wall keeps every warning visible, WIDTH
++included, and -Wno-fatal lets the build finish, so nothing is silenced into a
++green run.  --build-jobs is deliberately not passed because Verilator 4.038 is
++the supported floor.  Elaboration order matters: cf_math_pkg.sv must be given
++before axi_pkg.sv, then the DUT, the testbench and the C++ driver.
++
++The executable is expected exactly at <out>/axi_bc_test.  There is no
++executable scanning, no build-directory cleanup and no automatic removal of
++anything on disk.
++
++Outputs
++-------
++<out>/build.log holds the Verilator output, <out>/run.log holds the test
++executable output, and a short summary is printed.  Without --out the build
++directory is a fresh mkdtemp outside the repository, so a plain
++python3 sim/axi_bc/run.py never writes into the working tree.
++
++Accounting
++----------
++The default (no --focus) suite is exactly 816064 cases.  That is the sweep the
++driver enumerates today; it is not a claim that every AXI LEN value is
++exhausted.  The legacy cross-page case incr-cross (ff0, len3, size3) is
++rejected by the pre-fix DUT as well, so on its own it does not pin down the
++half-length crossing defect; incr-cross-half (ff0, len2, size3, cross-page,
++expected reject) is registered here and in sim/axi_bc/axi_bc_test.cpp.
++
++Usage
++-----
++  python3 sim/axi_bc/run.py                        # full default suite
++  python3 sim/axi_bc/run.py --focus fixed-tail     # one named legacy test
++  python3 sim/axi_bc/run.py --out /tmp/ab_build    # explicit build directory
++  python3 sim/axi_bc/run.py --source /tmp/before/rv_iommu_axi_bc.sv
++'''
++
++import argparse
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++# Named cases the C++ driver exposes through --focus; keep in sync with
++# sim/axi_bc/axi_bc_test.cpp.
++FOCUS_TESTS = (
++    'fixed-tail',
++    'incr-cross',
++    'incr-cross-half',
++    'incr-byte-tail',
++    'incr-unaligned',
++)
++
++# Informational only: number of sweep cases the default (no --focus) run
++# enumerates.  Not an exhaustiveness statement about AXI LEN.
++DEFAULT_SUITE_CASES = 816064
++
++EXE_NAME = 'axi_bc_test'
++DUT_DEFAULT = 'rtl/transaction_controller/rv_iommu_axi_bc.sv'
++
++TB_SV = 'sim/axi_bc/axi_bc_tb.sv'
++TEST_CPP = 'sim/axi_bc/axi_bc_test.cpp'
++CF_MATH_PKG = 'vendor/common_cells/src/cf_math_pkg.sv'
++AXI_PKG = 'vendor/axi/src/axi_pkg.sv'
++
++# Everything that still comes from the repository root (the DUT does not).
++ROOT_FILES = (TB_SV, TEST_CPP, CF_MATH_PKG, AXI_PKG)
++
++INCLUDE_DIRS = (
++    'vendor/common_cells/src',
++    'vendor/axi/src',
++    'rtl/transaction_controller',
++)
++
++# -Wall keeps WIDTH and the other lint warnings visible; -Wno-fatal lets the
++# build continue.  No --build-jobs: Verilator 4.038 compatibility.
++VERILATOR_ARGS = (
++    '--cc',
++    '--exe',
++    '--build',
++    '-sv',
++    '--top-module',
++    'axi_bc_tb',
++    '-o',
++    EXE_NAME,
++    '-Wall',
++    '-Wno-fatal',
++)
++
++
++def repo_root():
++    '''<root>/sim/axi_bc/run.py -> <root>.'''
++    return Path(__file__).resolve().parents[2]
++
++
++def resolve_path(value):
++    '''Absolute form of *value*, interpreted relative to the cwd.'''
++    path = Path(value).expanduser()
++    if not path.is_absolute():
++        path = Path.cwd() / path
++    return path.resolve()
++
++
++def resolve_verilator(name):
++    '''Return an executable path for *name*, or None when it cannot be found.'''
++    found = shutil.which(name)
++    if found is None and os.path.sep in name and os.access(name, os.X_OK):
++        found = name
++    return found
++
++
++def run_logged(cmd, log_path, cwd=None):
++    '''Run *cmd* with stdout+stderr captured into *log_path*.
++
++    Returns (returncode, elapsed_seconds).  Raises OSError when *cmd* cannot be
++    started at all.
++    '''
++    start = time.time()
++    with open(str(log_path), 'w') as log:
++        log.write('$ ' + ' '.join(cmd) + '\n')
++        log.flush()
++        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=cwd)
++    return proc.returncode, time.time() - start
++
++
++def tail_lines(path, count):
++    '''Last *count* non-blank lines of *path* (empty list when unreadable).'''
++    try:
++        with open(str(path), 'r', errors='replace') as handle:
++            lines = [line.rstrip() for line in handle]
++    except OSError:
++        return []
++    return [line for line in lines if line][-count:]
++
++
++def build_command(root, dut, out_dir, verilator):
++    '''Verilator command line for one build.'''
++    cmd = [verilator]
++    cmd.extend(VERILATOR_ARGS)
++    cmd.extend(['--Mdir', str(out_dir)])
++    cmd.append('-I' + str(dut.parent))
++    for rel in INCLUDE_DIRS:
++        cmd.append('-I' + str(root / rel))
++    # cf_math_pkg before axi_pkg (axi_pkg imports it), then DUT, TB, driver.
++    cmd.append(str(root / CF_MATH_PKG))
++    cmd.append(str(root / AXI_PKG))
++    cmd.append(str(dut))
++    cmd.append(str(root / TB_SV))
++    cmd.append(str(root / TEST_CPP))
++    return cmd
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(
++        prog='run.py',
++        description='Verilator regression runner for rv_iommu_axi_bc',
++    )
++    parser.add_argument(
++        '--source',
++        default=None,
++        metavar='DUT.sv',
++        help='DUT SystemVerilog file to compile (default: <root>/' + DUT_DEFAULT +
++             '); point it at an archived copy to reproduce a before revision',
++    )
++    parser.add_argument(
++        '--out',
++        default=None,
++        metavar='DIR',
++        help='build directory (default: a fresh unique temp directory outside '
++             'the repository)',
++    )
++    parser.add_argument(
++        '--focus',
++        action='append',
++        default=[],
++        metavar='NAME',
++        help='run only this named case; repeatable or comma separated (' +
++             ', '.join(FOCUS_TESTS) + ')',
++    )
++    parser.add_argument(
++        '--max-failures',
++        type=int,
++        default=16,
++        help='printed failures (default 16)',
++    )
++    parser.add_argument(
++        '--no-build',
++        action='store_true',
++        help='reuse an existing <out>/' + EXE_NAME,
++    )
++    parser.add_argument(
++        '--list-tests',
++        action='store_true',
++        help='print the named cases and exit',
++    )
++    parser.add_argument(
++        '--verilator',
++        default=os.environ.get('VERILATOR', 'verilator'),
++        help='verilator executable (default: $VERILATOR or verilator)',
++    )
++    args = parser.parse_args(argv)
++
++    if args.list_tests:
++        sys.stdout.write('\n'.join(FOCUS_TESTS) + '\n')
++        return 0
++
++    root = repo_root()
++
++    focus = []
++    for item in args.focus:
++        for name in str(item).split(','):
++            name = name.strip()
++            if not name:
++                continue
++            if name not in FOCUS_TESTS:
++                sys.stderr.write('run.py: unknown focus test ' + repr(name) +
++                                 ' (known: ' + ', '.join(FOCUS_TESTS) + ')\n')
++                return 2
++            if name not in focus:
++                focus.append(name)
++
++    dut = resolve_path(args.source) if args.source else root / DUT_DEFAULT
++    if not dut.is_file():
++        sys.stderr.write('run.py: DUT source file not found: ' + str(dut) + '\n')
++        return 2
++    if dut.suffix.lower() != '.sv':
++        sys.stderr.write('run.py: --source must be a .sv file: ' + str(dut) + '\n')
++        return 2
++
++    missing = [str(root / rel) for rel in ROOT_FILES if not (root / rel).is_file()]
++    if missing:
++        sys.stderr.write('run.py: missing repository files:\n  ' +
++                         '\n  '.join(missing) + '\n')
++        return 2
++
++    if args.out:
++        out_dir = resolve_path(args.out)
++    else:
++        out_dir = Path(tempfile.mkdtemp(prefix='axi_bc_build_'))
++    out_dir.mkdir(parents=True, exist_ok=True)
++    try:
++        out_dir.relative_to(root)
++    except ValueError:
++        pass
++    else:
++        sys.stderr.write('run.py: warning: build dir is inside the repository: ' +
++                         str(out_dir) + '\n')
++
++    build_log = out_dir / 'build.log'
++    run_log = out_dir / 'run.log'
++    exe = out_dir / EXE_NAME
++
++    build_seconds = None
++    if not args.no_build:
++        verilator = resolve_verilator(args.verilator)
++        if verilator is None:
++            sys.stderr.write('run.py: verilator executable not found: ' +
++                             args.verilator + '\n')
++            return 2
++        try:
++            ver = subprocess.run(
++                [verilator, '--version'],
++                stdout=subprocess.PIPE,
++                stderr=subprocess.STDOUT,
++                universal_newlines=True,
++            )
++        except OSError as exc:
++            sys.stderr.write('run.py: cannot run verilator: ' + str(exc) + '\n')
++            return 2
++        if ver.stdout:
++            sys.stderr.write('run.py: ' + ver.stdout.strip() + '\n')
++        sys.stderr.write('run.py: build dir ' + str(out_dir) + '\n')
++        sys.stderr.write('run.py: DUT ' + str(dut) + '\n')
++
++        try:
++            rc, build_seconds = run_logged(build_command(root, dut, out_dir, verilator),
++                                           build_log)
++        except OSError as exc:
++            sys.stderr.write('run.py: cannot start verilator: ' + str(exc) + '\n')
++            return 2
++        if rc != 0:
++            sys.stderr.write('run.py: verilator build failed (rc={}); see {}\n'.format(
++                rc, build_log))
++            for line in tail_lines(build_log, 40):
++                sys.stderr.write('  | ' + line + '\n')
++            return rc
++
++    if not exe.is_file():
++        sys.stderr.write('run.py: expected executable not found: ' + str(exe) + '\n')
++        if args.no_build:
++            sys.stderr.write('run.py: --no-build needs a previous successful build '
++                             'in ' + str(out_dir) + '\n')
++        return 2
++
++    run_cmd = [str(exe), '--max-failures', str(args.max_failures)]
++    for name in focus:
++        run_cmd.extend(['--focus', name])
++
++    try:
++        rc, run_seconds = run_logged(run_cmd, run_log)
++    except OSError as exc:
++        sys.stderr.write('run.py: cannot run ' + str(exe) + ': ' + str(exc) + '\n')
++        return 2
++
++    if focus:
++        focus_text = ', '.join(focus)
++    else:
++        focus_text = 'default suite ({} cases)'.format(DEFAULT_SUITE_CASES)
++
++    timing = 'run {:.1f}s'.format(run_seconds)
++    if build_seconds is not None:
++        timing = 'build {:.1f}s, '.format(build_seconds) + timing
++
++    summary = [
++        'run.py: summary',
++        '  dut       : ' + str(dut),
++        '  exe       : ' + str(exe),
++        '  focus     : ' + focus_text,
++        '  exit code : ' + str(rc),
++        '  elapsed   : ' + timing,
++        '  build log : ' + str(build_log),
++        '  run log   : ' + str(run_log),
++    ]
++    last = tail_lines(run_log, 1)
++    if last:
++        summary.append('  last line : ' + last[0][:160])
++    sys.stdout.write('\n'.join(summary) + '\n')
++
++    if rc != 0:
++        tail = tail_lines(run_log, 20)
++        if tail:
++            sys.stderr.write('run.py: last lines of run.log:\n')
++            for line in tail:
++                sys.stderr.write('  | ' + line + '\n')
++    return rc
++
++
++if __name__ == '__main__':
++    sys.exit(main())
