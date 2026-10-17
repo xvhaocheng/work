@@ -1,0 +1,1232 @@
+diff --git a/Bender.yml b/Bender.yml
+index bfd4c83..6ba7540 100644
+--- a/Bender.yml
++++ b/Bender.yml
+@@ -67,6 +67,7 @@ sources:
+   - rtl/transaction_controller/rv_iommu_ign_slv.sv
+   - rtl/transaction_controller/rv_iommu_mrif_handler.sv
+   - rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
++  - rtl/transaction_controller/rv_iommu_banked_ctl.sv
+ 
+   - rtl/software_interface/regmap/rv_iommu_field_arb.sv
+   - rtl/software_interface/regmap/rv_iommu_field.sv
+@@ -85,6 +86,7 @@ sources:
+   - rtl/translation_logic/rv_iommu_ddtc.sv
+   - rtl/translation_logic/rv_iommu_ddtw.sv
+   - rtl/translation_logic/rv_iommu_iotlb.sv
++  - rtl/translation_logic/rv_iommu_nonblock_hit.sv
+   - rtl/translation_logic/rv_iommu_mrifc.sv
+   - rtl/translation_logic/rv_iommu_msiptw.sv
+   - rtl/translation_logic/rv_iommu_pdtc.sv
+diff --git a/rtl/transaction_controller/rv_iommu_banked_ctl.sv b/rtl/transaction_controller/rv_iommu_banked_ctl.sv
+new file mode 100644
+index 0000000..1a6d57d
+--- /dev/null
++++ b/rtl/transaction_controller/rv_iommu_banked_ctl.sv
+@@ -0,0 +1,615 @@
++// Copyright © 2025 Manuel Rodríguez & Zero-Day Labs, Lda.
++// SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
++//
++// Licensed under the Solderpad Hardware License v 2.1 (the “License”);
++// you may not use this file except in compliance with the License,
++// or, at your option, the Apache License version 2.0.
++// You may obtain a copy of the License at https://solderpad.org/SHL-2.1/.
++// Unless required by applicable law or agreed to in writing, any work distributed
++// under the License is distributed on an “AS IS” BASIS, WITHOUT WARRANTIES OR
++// CONDITIONS OF ANY KIND, either express or implied. See the License for the
++// specific language governing permissions and limitations under the License.
++//
++// Description: RISC-V IOMMU *banked* (two-lane) transaction controller wrapper.
++//
++//   This module wires two `rv_iommu_trans_ctl_wrap` instances with read admission
++//   ("banks") behind an incoming AXI4 demultiplexer and in front of an outgoing
++//   AXI4 multiplexer.  The bank of a transaction is selected by the immutable
++//   ORIGINAL AXI ID bit `BankIdBit` (never by the device/stream id):
++//
++//     upstream  --axi_demux(2, sel=id[BankIdBit])--> bank0 / bank1
++//               --axi_mux(2, high bank bit)--------> completion interface
++//
++//   Design notes / assumptions
++//   --------------------------
++//   * AXI IDs INSIDE each bank keep the ORIGINAL width.  The outgoing `axi_mux`
++//     prepends exactly one bank bit as the MOST SIGNIFICANT ID bit.  That bit is
++//     redundant with `id[BankIdBit]` (the incoming demux selected the bank with
++//     that same bit), so it is stripped again for AW/AR.  For B/R the redundant
++//     MSB is reconstructed from the ORIGINAL `id[BankIdBit]`, because the
++//     external completion interface only ever carries ORIGINAL IDs.
++//     ⇒ This assumes the external completion slave echoes AW/AR IDs unchanged.
++//   * The two banks keep their own AW/AR/W FIFOs, their own AW-before-AR / W
++//     gating and their own permission-error slave (each bank instantiates its
++//     own `axi_err_slv`).  A wrapper admission guard delays new non-owner reads to avoid DMA
++//     R-to-W dependency cycles. The legacy controller default is unchanged.
++//   * Private banks have no MRIF handler. With RestrictedNormalOnly, the global
++//     configuration may retain MSI_BT_MRIF, but the paired TL must reject MSI
++//     requests through its ordinary fault/error path before replying here.
++//   * The downstream translation engine must echo the `bank` field it received
++//     in `trans_req_data_o` back in `trans_resp_data_i`.  At most one
++//     translation is in flight per bank, which makes `bank` an unambiguous
++//     lifecycle tag and guarantees the full bank-local header (retained at the
++//     head of the bank AW/AR FIFO until COMPLETE) belongs to that tag.
++
++`include "axi/typedef.svh"
++
++module rv_iommu_banked_ctl #(
++    /// RISC-V IOMMU configuration struct (global capacities, see RVIOMMUCfgBank)
++    parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
++    /// Only the bounded normal-copy N branch may narrow its private banks.
++    /// Shared TL/capabilities and the original S/P branch retain MSI_BT_MRIF.
++    /// The paired TL must reject MSI requests through its normal fault path.
++    parameter bit RestrictedNormalOnly = 1'b0,
++
++    /// ORIGINAL AXI ID bit used to select the bank. MUST be < RVIOMMUCfg.AxiIdWidth.
++    parameter int BankIdBit = 0,
++
++    /// Address data type
++    parameter type addr_t = logic,
++    /// Physical address data type
++    parameter type paddr_t = logic,
++
++    /// Translation request data type (must contain a `logic bank` field)
++    parameter type trans_req_data_t = logic,
++    /// Translation response data type (must contain a `logic bank` field)
++    parameter type trans_resp_data_t = logic,
++    /// Fault data type
++    parameter type fault_data_t = logic,
++
++    // Translation Request Interface data types
++    parameter type axi_tr_aw_chan_t = logic,
++    parameter type axi_tr_w_chan_t = logic,
++    parameter type axi_tr_b_chan_t = logic,
++    parameter type axi_tr_r_chan_t = logic,
++    parameter type axi_tr_ar_chan_t = logic,
++    parameter type axi_tr_req_t = logic,
++    parameter type axi_tr_resp_t = logic,
++
++    // Completion Interface data types (ORIGINAL ID width)
++    parameter type axi_comp_aw_chan_t = logic,
++    parameter type axi_comp_w_chan_t = logic,
++    parameter type axi_comp_b_chan_t = logic,
++    parameter type axi_comp_ar_chan_t = logic,
++    parameter type axi_comp_r_chan_t = logic,
++    parameter type axi_comp_req_t = logic,
++    parameter type axi_comp_resp_t = logic,
++
++    // Data Structures Interface data types
++    parameter type axi_ds_req_t = logic,
++    parameter type axi_ds_resp_t = logic
++) (
++    input  logic clk_i,
++    input  logic rst_ni,
++
++    input logic [1:0] fullbuffer_jobs_i,
++
++    // AXI Translation Request Interface
++    input  axi_tr_req_t    tr_axi_req_i,
++    output axi_tr_resp_t   tr_axi_resp_o,
++
++    // AXI Translation Completion Interface
++    input  axi_comp_resp_t comp_axi_resp_i,
++    output axi_comp_req_t  comp_axi_req_o,
++
++    // MRIF Handler AXI IF (disabled / tied to zero)
++    output axi_ds_req_t    mrif_axi_req_o,
++    input  axi_ds_resp_t   mrif_axi_resp_i,
++
++    // Translation engine request port
++    output trans_req_data_t     trans_req_data_o,
++    output logic                trans_req_valid_o,
++    input  logic                trans_req_ready_i,
++
++    // Translation engine response port
++    input  trans_resp_data_t    trans_resp_data_i,
++    input  logic                trans_resp_valid_i,
++    output logic                trans_resp_ready_o,
++
++    // MRIF Handler fault reporting port (disabled / tied to zero)
++    output fault_data_t         mrif_fault_data_o,
++    output logic                mrif_fault_valid_o,
++    input  logic                mrif_fault_ready_i,
++
++    output logic in_flight_o
++);
++
++    //=========================================================================
++    // Parameter validation
++    //=========================================================================
++    // Immediate, Verilator-safe fatal checks.  `BankIdBit < AxiIdWidth` is the
++    // "unknown bank bit" assertion required by the architecture.
++    initial begin : validate_params
++        if (RVIOMMUCfg.AxiIdWidth < 1) begin
++            $fatal(1, "rv_iommu_banked_ctl: AxiIdWidth must be >= 1");
++        end
++        if ((BankIdBit < 0) || (BankIdBit >= RVIOMMUCfg.AxiIdWidth)) begin
++            $fatal(1, "rv_iommu_banked_ctl: BankIdBit (%0d) must be < AxiIdWidth (%0d)",
++                   BankIdBit, RVIOMMUCfg.AxiIdWidth);
++        end
++        if (RVIOMMUCfg.MSITrans == rv_iommu_cfg::MSI_BT_MRIF && !RestrictedNormalOnly) begin
++            $fatal(1, "rv_iommu_banked_ctl: MRIF is unsupported");
++        end
++        if (RVIOMMUCfg.InclATS) begin
++            $fatal(1, "rv_iommu_banked_ctl: InclATS must be disabled");
++        end
++        if ((RVIOMMUCfg.NumOutstandingTrans < 2) || ((RVIOMMUCfg.NumOutstandingTrans % 2) != 0)) begin
++            $fatal(1, "rv_iommu_banked_ctl: NumOutstandingTrans must be even and >= 2");
++        end
++        if ((RVIOMMUCfg.WFifoDepth < 2) || ((RVIOMMUCfg.WFifoDepth % 2) != 0)) begin
++            $fatal(1, "rv_iommu_banked_ctl: WFifoDepth must be even and >= 2");
++        end
++    end
++
++    //=========================================================================
++    // Per-bank configuration: NumOutstandingTrans and WFifoDepth are SPLIT,
++    // everything else (caches, fault/MRIF FIFOs, widths, ...) is unchanged.
++    // MSITrans is preserved (no MRIF); InclATS is forced low.
++    //=========================================================================
++    localparam rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfgBank = rv_iommu_cfg::rv_iommu_cfg_t'{
++        NumOutstandingTrans : RVIOMMUCfg.NumOutstandingTrans / 2,
++        WFifoDepth          : RVIOMMUCfg.WFifoDepth / 2,
++        MrifFifoDepth       : RVIOMMUCfg.MrifFifoDepth,
++        FaultFifoDepth      : RVIOMMUCfg.FaultFifoDepth,
++        NumIotlbEntries     : RVIOMMUCfg.NumIotlbEntries,
++        NumDdtcEntries      : RVIOMMUCfg.NumDdtcEntries,
++        NumPdtcEntries      : RVIOMMUCfg.NumPdtcEntries,
++        NumMrifcEntries     : RVIOMMUCfg.NumMrifcEntries,
++        InclPC              : RVIOMMUCfg.InclPC,
++        InclAxiBC           : RVIOMMUCfg.InclAxiBC,
++        InclDbg             : RVIOMMUCfg.InclDbg,
++        InclATS             : 1'b0,
++        MSITrans            : RestrictedNormalOnly &&
++                              RVIOMMUCfg.MSITrans == rv_iommu_cfg::MSI_BT_MRIF ?
++                              rv_iommu_cfg::MSI_BT_ONLY : RVIOMMUCfg.MSITrans,
++        IGS                 : RVIOMMUCfg.IGS,
++        NumIntVec           : RVIOMMUCfg.NumIntVec,
++        NumHpmCounters      : RVIOMMUCfg.NumHpmCounters,
++        PAddrWidth          : RVIOMMUCfg.PAddrWidth,
++        AxiAddrWidth        : RVIOMMUCfg.AxiAddrWidth,
++        AxiDataWidth        : RVIOMMUCfg.AxiDataWidth,
++        AxiIdWidth          : RVIOMMUCfg.AxiIdWidth,
++        AxiProgIdWidth      : RVIOMMUCfg.AxiProgIdWidth,
++        AxiUserWidth        : RVIOMMUCfg.AxiUserWidth,
++        AxiProIdWidth       : RVIOMMUCfg.AxiProIdWidth,
++        AxiDevIdWidth       : RVIOMMUCfg.AxiDevIdWidth,
++        AxisDataWidth       : RVIOMMUCfg.AxisDataWidth,
++        AxisDestWidth       : RVIOMMUCfg.AxisDestWidth,
++        AxisUserWidth       : RVIOMMUCfg.AxisUserWidth,
++        AxisStrbWidth       : RVIOMMUCfg.AxisStrbWidth,
++        AxisKeepWidth       : RVIOMMUCfg.AxisKeepWidth,
++        AxisIdWidth         : RVIOMMUCfg.AxisIdWidth,
++        Freq                : RVIOMMUCfg.Freq
++    };
++
++    //=========================================================================
++    // Internal (ORIGINAL_ID_WIDTH + 1) completion channel types for the mux
++    // master port.  Only the ID field differs from the external completion
++    // types; the bank bit is appended as the MSB by `axi_mux`/`axi_id_prepend`.
++    //=========================================================================
++    typedef logic [RVIOMMUCfg.AxiIdWidth:0]       comp_id_wide_t;
++    typedef logic [RVIOMMUCfg.AxiAddrWidth-1:0]   comp_addr_t;
++    typedef logic [RVIOMMUCfg.AxiDataWidth-1:0]   comp_data_t;
++    typedef logic [RVIOMMUCfg.AxiDataWidth/8-1:0] comp_strb_t;
++    typedef logic [RVIOMMUCfg.AxiUserWidth-1:0]   comp_user_t;
++
++    `AXI_TYPEDEF_AW_CHAN_T(comp_aw_chan_wide_t, comp_addr_t, comp_id_wide_t, comp_user_t)
++    `AXI_TYPEDEF_W_CHAN_T (comp_w_chan_t,        comp_data_t, comp_strb_t,    comp_user_t)
++    `AXI_TYPEDEF_B_CHAN_T (comp_b_chan_wide_t,   comp_id_wide_t, comp_user_t)
++    `AXI_TYPEDEF_AR_CHAN_T(comp_ar_chan_wide_t,  comp_addr_t, comp_id_wide_t, comp_user_t)
++    `AXI_TYPEDEF_R_CHAN_T (comp_r_chan_wide_t,   comp_data_t, comp_id_wide_t, comp_user_t)
++    `AXI_TYPEDEF_REQ_T (comp_req_wide_t,  comp_aw_chan_wide_t, comp_w_chan_t, comp_ar_chan_wide_t)
++    `AXI_TYPEDEF_RESP_T(comp_resp_wide_t, comp_b_chan_wide_t, comp_r_chan_wide_t)
++
++    //=========================================================================
++    // Cross-bank wiring
++    //=========================================================================
++    axi_tr_req_t    [1:0] bank_tr_req;
++    axi_tr_resp_t   [1:0] bank_tr_resp;
++
++    axi_comp_req_t  [1:0] bank_comp_req;
++    axi_comp_resp_t [1:0] bank_comp_resp;
++
++    trans_req_data_t  [1:0] bank_trans_req_data;
++    logic             [1:0] bank_trans_req_valid;
++    logic             [1:0] bank_trans_req_ready;
++
++    trans_resp_data_t [1:0] bank_trans_resp_data;
++    logic             [1:0] bank_trans_resp_valid;
++    logic             [1:0] bank_trans_resp_ready;
++
++    logic             [1:0] bank_busy;
++
++    //=========================================================================
++    // Incoming bank select demux
++    //   * select is the IMMUTABLE ORIGINAL AXI ID bit BankIdBit (AW / AR)
++    //   * no extra spills, no ID modification (IDs stay ORIGINAL width)
++    //   * MaxTrans = original NumOutstandingTrans*2  (documented tracker
++    //     capacity for the two banks together), UniqueIds = 0
++    //=========================================================================
++    logic aw_sel;
++    logic ar_sel;
++    assign aw_sel = tr_axi_req_i.aw.id[BankIdBit];
++    assign ar_sel = tr_axi_req_i.ar.id[BankIdBit];
++
++    // The input demux keeps W ownership until LAST. A source read from the
++    // other bank can otherwise fill its DMA's small R->W FIFO while its AW
++    // cannot enter that demux. The shared memory R channel then cannot return
++    // the current owner's source data or page-table reads: a circular wait.
++    // Delay SELECTING such reads, rather than withdrawing an AXI/TL VALID.
++    // Writes and already-selected transactions retain their original protocol.
++    // A visible new AW also reserves admission before its input handshake.
++    // W may legally finish before a stalled AW is accepted, hence the signed
++    // balance (minimum -1 for that reserved head), rather than an unsigned
++    // AW-minus-LAST counter that could underflow.
++    logic signed [31:0] w_unfilled_q;
++    logic w_owner_q, read_owner, restrict_reads;
++    logic [1:0] bank_read_admit;
++    assign restrict_reads = (w_unfilled_q > 0) || tr_axi_req_i.aw_valid;
++    assign read_owner = (w_unfilled_q > 0) ? w_owner_q : aw_sel;
++    // If a new AW enters this bank on this edge, its FIFO head only becomes
++    // visible on the next cycle. Do not select an older queued AR one cycle
++    // ahead of that AW. When the AW FIFO is full (no AW handshake), allow the
++    // current owner to read and drain already-prepared writes instead.
++    assign bank_read_admit[0] = ((w_unfilled_q > 0) ? !read_owner : !restrict_reads)
++                                && !(aw_accept && !aw_sel);
++    assign bank_read_admit[1] = ((w_unfilled_q > 0) ?  read_owner : !restrict_reads)
++                                && !(aw_accept &&  aw_sel);
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            w_unfilled_q <= '0;
++            w_owner_q <= 1'b0;
++        end else begin
++            w_unfilled_q <= w_unfilled_q + (aw_accept ? 32'sd1 : 32'sd0)
++                                           - (w_last_accept ? 32'sd1 : 32'sd0);
++            if (aw_accept && w_unfilled_q <= 0) w_owner_q <= aw_sel;
++        end
++    end
++
++    axi_demux #(
++        .AxiIdWidth     (RVIOMMUCfg.AxiIdWidth),
++        .AtopSupport    (1'b1),
++        .aw_chan_t      (axi_tr_aw_chan_t),
++        .w_chan_t       (axi_tr_w_chan_t),
++        .b_chan_t       (axi_tr_b_chan_t),
++        .ar_chan_t      (axi_tr_ar_chan_t),
++        .r_chan_t       (axi_tr_r_chan_t),
++        .axi_req_t      (axi_tr_req_t),
++        .axi_resp_t     (axi_tr_resp_t),
++        .NoMstPorts     (32'd2),
++        .MaxTrans       (RVIOMMUCfg.NumOutstandingTrans * 2),
++        .AxiLookBits    (RVIOMMUCfg.AxiIdWidth),
++        .UniqueIds      (1'b0),
++        .SpillAw        (1'b0),
++        .SpillW         (1'b0),
++        .SpillB         (1'b0),
++        .SpillAr        (1'b0),
++        .SpillR         (1'b0)
++    ) i_in_axi_demux (
++        .clk_i,
++        .rst_ni,
++        .test_i          (1'b0),
++        .slv_req_i       (tr_axi_req_i),
++        .slv_aw_select_i (aw_sel),
++        .slv_ar_select_i (ar_sel),
++        .slv_resp_o      (tr_axi_resp_o),
++        .mst_reqs_o      (bank_tr_req),
++        .mst_resps_i     (bank_tr_resp)
++    );
++
++    //=========================================================================
++    // Two transaction controller banks with shared read admission
++    //=========================================================================
++    for (genvar b = 0; b < 2; b++) begin : gen_bank
++        rv_iommu_trans_ctl_wrap #(
++            .RVIOMMUCfg         (RVIOMMUCfgBank),
++            .ReadAdmissionEnable(1'b1),
++            .FullBufferDID      (24'(10 + b)),
++            .addr_t             (addr_t),
++            .paddr_t            (paddr_t),
++            .trans_req_data_t   (trans_req_data_t),
++            .trans_resp_data_t  (trans_resp_data_t),
++            .fault_data_t       (fault_data_t),
++            .axi_tr_aw_chan_t   (axi_tr_aw_chan_t),
++            .axi_tr_w_chan_t    (axi_tr_w_chan_t),
++            .axi_tr_ar_chan_t   (axi_tr_ar_chan_t),
++            .axi_tr_req_t       (axi_tr_req_t),
++            .axi_tr_resp_t      (axi_tr_resp_t),
++            .axi_comp_aw_chan_t (axi_comp_aw_chan_t),
++            .axi_comp_w_chan_t  (axi_comp_w_chan_t),
++            .axi_comp_b_chan_t  (axi_comp_b_chan_t),
++            .axi_comp_ar_chan_t (axi_comp_ar_chan_t),
++            .axi_comp_r_chan_t  (axi_comp_r_chan_t),
++            .axi_comp_req_t     (axi_comp_req_t),
++            .axi_comp_resp_t    (axi_comp_resp_t),
++            .axi_ds_req_t       (axi_ds_req_t),
++            .axi_ds_resp_t      (axi_ds_resp_t)
++        ) i_bank (
++            .clk_i,
++            .rst_ni,
++            .read_admit_i       (bank_read_admit[b]),
++            .fullbuffer_job_i   (fullbuffer_jobs_i[b]),
++            .tr_axi_req_i       (bank_tr_req[b]),
++            .tr_axi_resp_o      (bank_tr_resp[b]),
++            .comp_axi_resp_i    (bank_comp_resp[b]),
++            .comp_axi_req_o     (bank_comp_req[b]),
++            .mrif_axi_resp_i    (mrif_axi_resp_i),
++            .trans_req_data_o   (bank_trans_req_data[b]),
++            .trans_req_valid_o  (bank_trans_req_valid[b]),
++            .trans_req_ready_i  (bank_trans_req_ready[b]),
++            .trans_resp_data_i  (bank_trans_resp_data[b]),
++            .trans_resp_valid_i (bank_trans_resp_valid[b]),
++            .trans_resp_ready_o (bank_trans_resp_ready[b]),
++            .mrif_fault_ready_i (mrif_fault_ready_i),
++            .in_flight_o        (bank_busy[b])
++        );
++    end
++
++    // MRIF is disabled: the single wrapper MRIF port is tied to zero.
++    assign mrif_axi_req_o     = '0;
++    assign mrif_fault_data_o  = '0;
++    assign mrif_fault_valid_o = 1'b0;
++
++    //=========================================================================
++    // Translation request merge (round-robin, stable while valid)
++    //   The bank-local request is copied and ONLY `.bank` is overwritten, so
++    //   every other header field (iova/did/pid/ttype/...) is preserved bit-exact.
++    //=========================================================================
++    trans_req_data_t [1:0] bank_req_data;
++
++    always_comb begin : bank_req_tag
++        bank_req_data[0]       = bank_trans_req_data[0];
++        bank_req_data[0].bank  = 1'b0;
++        bank_req_data[1]       = bank_trans_req_data[1];
++        bank_req_data[1].bank  = 1'b1;
++    end
++
++    stream_arbiter #(
++        .DATA_T  (trans_req_data_t),
++        .N_INP   (2),
++        .ARBITER ("rr")
++    ) i_trans_req_arb (
++        .clk_i,
++        .rst_ni,
++        .inp_data_i  (bank_req_data),
++        .inp_valid_i (bank_trans_req_valid),
++        .inp_ready_o (bank_trans_req_ready),
++        .oup_data_o  (trans_req_data_o),
++        .oup_valid_o (trans_req_valid_o),
++        .oup_ready_i (trans_req_ready_i)
++    );
++
++    //=========================================================================
++    // Translation response routing by `.bank`
++    //   Both banks see the same response payload (the existing controller
++    //   ignores the bank field); only the matching bank sees `valid`.
++    //   `trans_resp_ready_o` is the ready of that same bank.
++    //=========================================================================
++    always_comb begin : bank_resp_route
++        bank_trans_resp_data[0] = trans_resp_data_i;
++        bank_trans_resp_data[1] = trans_resp_data_i;
++        bank_trans_resp_valid[0] = trans_resp_valid_i && (trans_resp_data_i.bank == 1'b0);
++        bank_trans_resp_valid[1] = trans_resp_valid_i && (trans_resp_data_i.bank == 1'b1);
++    end
++
++    assign trans_resp_ready_o = trans_resp_data_i.bank ? bank_trans_resp_ready[1]
++                                                       : bank_trans_resp_ready[0];
++
++    //=========================================================================
++    // Outgoing completion mux
++    //   slave ports: ORIGINAL completion types / ORIGINAL ID width
++    //   master port: ORIGINAL_ID_WIDTH + 1 (bank bit prepended as MSB)
++    //=========================================================================
++    comp_req_wide_t  mux_mst_req;
++    comp_resp_wide_t mux_mst_resp;
++
++    axi_mux #(
++        .SlvAxiIDWidth (RVIOMMUCfg.AxiIdWidth),
++        .slv_aw_chan_t (axi_comp_aw_chan_t),
++        .mst_aw_chan_t (comp_aw_chan_wide_t),
++        .w_chan_t      (axi_comp_w_chan_t),
++        .slv_b_chan_t  (axi_comp_b_chan_t),
++        .mst_b_chan_t  (comp_b_chan_wide_t),
++        .slv_ar_chan_t (axi_comp_ar_chan_t),
++        .mst_ar_chan_t (comp_ar_chan_wide_t),
++        .slv_r_chan_t  (axi_comp_r_chan_t),
++        .mst_r_chan_t  (comp_r_chan_wide_t),
++        .slv_req_t     (axi_comp_req_t),
++        .slv_resp_t    (axi_comp_resp_t),
++        .mst_req_t     (comp_req_wide_t),
++        .mst_resp_t    (comp_resp_wide_t),
++        .NoSlvPorts    (32'd2),
++        .MaxWTrans     (RVIOMMUCfg.NumOutstandingTrans),
++        .FallThrough   (1'b0),
++        .SpillAw       (1'b0),
++        .SpillW        (1'b0),
++        .SpillB        (1'b0),
++        .SpillAr       (1'b0),
++        .SpillR        (1'b0)
++    ) i_out_axi_mux (
++        .clk_i,
++        .rst_ni,
++        .test_i      (1'b0),
++        .slv_reqs_i  (bank_comp_req),
++        .slv_resps_o (bank_comp_resp),
++        .mst_req_o   (mux_mst_req),
++        .mst_resp_i  (mux_mst_resp)
++    );
++
++    //-------------------------------------------------------------------------
++    // Master -> external request conversion.
++    //   Explicit PER-FIELD conversion.  AW/AR drop the redundant MSB bank bit;
++    //   every other header/user field is transferred field by field (no struct
++    //   cast between different widths, no implicit truncation).
++    //-------------------------------------------------------------------------
++    always_comb begin : out_req_convert
++        comp_axi_req_o = '0;
++
++        comp_axi_req_o.aw_valid  = mux_mst_req.aw_valid;
++        comp_axi_req_o.aw.id     = mux_mst_req.aw.id[RVIOMMUCfg.AxiIdWidth-1:0];
++        comp_axi_req_o.aw.addr   = mux_mst_req.aw.addr;
++        comp_axi_req_o.aw.len    = mux_mst_req.aw.len;
++        comp_axi_req_o.aw.size   = mux_mst_req.aw.size;
++        comp_axi_req_o.aw.burst  = mux_mst_req.aw.burst;
++        comp_axi_req_o.aw.lock   = mux_mst_req.aw.lock;
++        comp_axi_req_o.aw.cache  = mux_mst_req.aw.cache;
++        comp_axi_req_o.aw.prot   = mux_mst_req.aw.prot;
++        comp_axi_req_o.aw.qos    = mux_mst_req.aw.qos;
++        comp_axi_req_o.aw.region = mux_mst_req.aw.region;
++        comp_axi_req_o.aw.atop   = mux_mst_req.aw.atop;
++        comp_axi_req_o.aw.user   = mux_mst_req.aw.user;
++
++        comp_axi_req_o.w_valid   = mux_mst_req.w_valid;
++        comp_axi_req_o.w.data    = mux_mst_req.w.data;
++        comp_axi_req_o.w.strb    = mux_mst_req.w.strb;
++        comp_axi_req_o.w.last    = mux_mst_req.w.last;
++        comp_axi_req_o.w.user    = mux_mst_req.w.user;
++
++        comp_axi_req_o.b_ready   = mux_mst_req.b_ready;
++
++        comp_axi_req_o.ar_valid  = mux_mst_req.ar_valid;
++        comp_axi_req_o.ar.id     = mux_mst_req.ar.id[RVIOMMUCfg.AxiIdWidth-1:0];
++        comp_axi_req_o.ar.addr   = mux_mst_req.ar.addr;
++        comp_axi_req_o.ar.len    = mux_mst_req.ar.len;
++        comp_axi_req_o.ar.size   = mux_mst_req.ar.size;
++        comp_axi_req_o.ar.burst  = mux_mst_req.ar.burst;
++        comp_axi_req_o.ar.lock   = mux_mst_req.ar.lock;
++        comp_axi_req_o.ar.cache  = mux_mst_req.ar.cache;
++        comp_axi_req_o.ar.prot   = mux_mst_req.ar.prot;
++        comp_axi_req_o.ar.qos    = mux_mst_req.ar.qos;
++        comp_axi_req_o.ar.region = mux_mst_req.ar.region;
++        comp_axi_req_o.ar.user   = mux_mst_req.ar.user;
++
++        comp_axi_req_o.r_ready   = mux_mst_req.r_ready;
++    end
++
++    //-------------------------------------------------------------------------
++    // External -> master response conversion.
++    //   B/R reconstruct the redundant MSB bank bit from the ORIGINAL
++    //   `id[BankIdBit]`; every other field is transferred field by field.
++    //-------------------------------------------------------------------------
++    always_comb begin : in_resp_convert
++        mux_mst_resp = '0;
++
++        mux_mst_resp.aw_ready = comp_axi_resp_i.aw_ready;
++        mux_mst_resp.ar_ready = comp_axi_resp_i.ar_ready;
++        mux_mst_resp.w_ready  = comp_axi_resp_i.w_ready;
++
++        mux_mst_resp.b_valid  = comp_axi_resp_i.b_valid;
++        mux_mst_resp.b.id     = {comp_axi_resp_i.b.id[BankIdBit], comp_axi_resp_i.b.id};
++        mux_mst_resp.b.resp   = comp_axi_resp_i.b.resp;
++        mux_mst_resp.b.user   = comp_axi_resp_i.b.user;
++
++        mux_mst_resp.r_valid  = comp_axi_resp_i.r_valid;
++        mux_mst_resp.r.id     = {comp_axi_resp_i.r.id[BankIdBit], comp_axi_resp_i.r.id};
++        mux_mst_resp.r.data   = comp_axi_resp_i.r.data;
++        mux_mst_resp.r.resp   = comp_axi_resp_i.r.resp;
++        mux_mst_resp.r.last   = comp_axi_resp_i.r.last;
++        mux_mst_resp.r.user   = comp_axi_resp_i.r.user;
++    end
++
++    //=========================================================================
++    // in_flight_o
++    //   Aggregates, over both banks:
++    //     * AW accepted at the upstream input until the upstream B handshake
++    //       (covers the whole write, including completion AW/AR accepted by the
++    //       output and held downstream, i.e. "accepted output pressure")
++    //     * AR accepted until the upstream R-LAST handshake
++    //     * W-LAST bursts accepted at the upstream input until the upstream B
++    //       handshake.  A write is counted by its LAST beat and is NOT tracked
++    //       by downstream forwarding: a write rejected by a bank (translation
++    //       error) is consumed internally by that bank's error slave and
++    //       answered with an upstream B, but it is NEVER forwarded to the
++    //       completion port.  A forward-based W counter would therefore never
++    //       decrement for those beats and in_flight_o would stay stuck high
++    //       forever (phantom non-quiet).
++    //     * w_partial_q: set when a W burst has started (a non-LAST beat was
++    //       accepted upstream) and cleared when its LAST beat is accepted;
++    //       covers the window between the first beat of a burst and its LAST.
++    //     * both bank controller states (bank in_flight_o = state != IDLE)
++    //   32-bit counters, asserted bounded / no underflow.  Increment and
++    //   decrement on the same cycle are netted, so they can never produce a
++    //   false underflow or a spurious overflow report.
++    //=========================================================================
++    logic aw_accept, ar_accept, w_accept, w_nonlast_accept, w_last_accept,
++          b_return, r_last_return;
++
++    assign aw_accept        = tr_axi_req_i.aw_valid && tr_axi_resp_o.aw_ready;
++    assign ar_accept        = tr_axi_req_i.ar_valid && tr_axi_resp_o.ar_ready;
++    assign w_accept         = tr_axi_req_i.w_valid  && tr_axi_resp_o.w_ready;
++    assign w_nonlast_accept = w_accept && !tr_axi_req_i.w.last;
++    assign w_last_accept    = w_accept &&  tr_axi_req_i.w.last;
++    assign b_return         = tr_axi_resp_o.b_valid && tr_axi_req_i.b_ready;
++    assign r_last_return    = tr_axi_resp_o.r_valid && tr_axi_req_i.r_ready && tr_axi_resp_o.r.last;
++
++    logic [31:0] inflight_aw_q, inflight_ar_q, inflight_w_q;
++    logic        w_partial_q;
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin : inflight_counters
++        if (!rst_ni) begin
++            inflight_aw_q <= 32'd0;
++            inflight_ar_q <= 32'd0;
++            inflight_w_q  <= 32'd0;
++            w_partial_q   <= 1'b0;
++        end else begin
++            inflight_aw_q <= inflight_aw_q
++                           + (aw_accept     ? 32'd1 : 32'd0)
++                           - (b_return      ? 32'd1 : 32'd0);
++            inflight_ar_q <= inflight_ar_q
++                           + (ar_accept     ? 32'd1 : 32'd0)
++                           - (r_last_return ? 32'd1 : 32'd0);
++            inflight_w_q  <= inflight_w_q
++                           + (w_last_accept ? 32'd1 : 32'd0)
++                           - (b_return      ? 32'd1 : 32'd0);
++            w_partial_q   <= w_last_accept    ? 1'b0 :
++                             w_nonlast_accept ? 1'b1 :
++                             w_partial_q;
++        end
++    end
++
++    assign in_flight_o = (inflight_aw_q != 32'd0) ||
++                         (inflight_ar_q != 32'd0) ||
++                         (inflight_w_q  != 32'd0) ||
++                         w_partial_q ||
++                         bank_busy[0] || bank_busy[1];
++
++    // Bounded / no-underflow checks on the 32-bit in-flight counters.
++    // A decrement is only a real underflow when there is no matching increment
++    // in the same cycle; an increment only overflows when it is not cancelled
++    // by a decrement in the same cycle.
++    `ifndef SYNTHESIS
++    always_ff @(posedge clk_i) begin : inflight_bounds
++        if (rst_ni) begin
++            if ((inflight_ar_q == 32'd0) && r_last_return && !ar_accept) begin
++                $error("rv_iommu_banked_ctl: inflight_ar underflow");
++            end
++            if ((inflight_aw_q == 32'd0) && b_return && !aw_accept) begin
++                $error("rv_iommu_banked_ctl: inflight_aw underflow");
++            end
++            if ((inflight_w_q == 32'd0) && b_return && !w_last_accept) begin
++                $error("rv_iommu_banked_ctl: inflight_w underflow");
++            end
++            if ((inflight_aw_q == 32'hFFFF_FFFF) && aw_accept && !b_return) begin
++                $error("rv_iommu_banked_ctl: inflight_aw counter overflow");
++            end
++            if ((inflight_ar_q == 32'hFFFF_FFFF) && ar_accept && !r_last_return) begin
++                $error("rv_iommu_banked_ctl: inflight_ar counter overflow");
++            end
++            if ((inflight_w_q == 32'hFFFF_FFFF) && w_last_accept && !b_return) begin
++                $error("rv_iommu_banked_ctl: inflight_w counter overflow");
++            end
++        end
++    end
++    `endif
++
++endmodule
+diff --git a/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv b/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
+index cd59deb..291bc5c 100644
+--- a/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
++++ b/rtl/transaction_controller/rv_iommu_trans_ctl_wrap.sv
+@@ -19,6 +19,7 @@
+ module rv_iommu_trans_ctl_wrap #(
+     /// RISC-V IOMMU configuration struct
+     parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
++    parameter bit ReadAdmissionEnable = 1'b0,
+ 
+     /// Address data type
+     parameter type addr_t = logic,
+@@ -50,10 +51,13 @@ module rv_iommu_trans_ctl_wrap #(
+ 
+     // Data Structures Interface data types
+     parameter type axi_ds_req_t = logic,
+-    parameter type axi_ds_resp_t = logic
++    parameter type axi_ds_resp_t = logic,
++    parameter logic [23:0] FullBufferDID = 24'd0
+ ) (
+     input  logic clk_i,
+     input  logic rst_ni,
++    input  logic read_admit_i = 1'b1,
++    input  logic fullbuffer_job_i = 1'b0,
+ 
+     // AXI Translation Request Interface
+     input  axi_tr_req_t    tr_axi_req_i,
+@@ -597,7 +601,8 @@ module rv_iommu_trans_ctl_wrap #(
+                 end
+ 
+                 // Read request received
+-                else if (ar_valid) begin
++                else if (ar_valid && (!ReadAdmissionEnable || read_admit_i ||
++                         (fullbuffer_job_i && ar_data.stream_id == FullBufferDID))) begin
+                     // Tags
+                     trans_req_data_n.iova       = ar_data.addr;
+                     trans_req_data_n.did        = ar_data.stream_id;
+diff --git a/rtl/translation_logic/rv_iommu_ddtc.sv b/rtl/translation_logic/rv_iommu_ddtc.sv
+index 042b227..64e4347 100644
+--- a/rtl/translation_logic/rv_iommu_ddtc.sv
++++ b/rtl/translation_logic/rv_iommu_ddtc.sv
+@@ -20,6 +20,7 @@
+ module rv_iommu_ddtc #(
+     /// RISC-V IOMMU configuration struct
+     parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
++    parameter bit TouchEnable = 0,
+ 
+     /// Device Context type
+     parameter type dc_t = logic,
+@@ -37,6 +38,7 @@ module rv_iommu_ddtc #(
+ 
+     // Lookup
+     input  logic                    lookup_i,
++    input  logic                    touch_i,
+     input  rv_iommu::device_id_t    lu_did_i,
+     output dc_t                     lu_content_o,
+     output logic                    lu_hit_o
+@@ -136,7 +138,7 @@ module rv_iommu_ddtc #(
+             shift       = 0;
+             new_index   = 0;
+ 
+-            if (lu_hit[i]) begin
++            if (lu_hit[i] && (!TouchEnable || touch_i)) begin
+                 for (int unsigned lvl = 0; lvl < $clog2(RVIOMMUCfg.NumDdtcEntries); lvl++) begin 
+                     idx_base = $unsigned((2**lvl)-1);
+                     shift = $clog2(RVIOMMUCfg.NumDdtcEntries) - lvl;
+@@ -179,4 +181,4 @@ module rv_iommu_ddtc #(
+         end
+     end
+ 
+-endmodule
+\ No newline at end of file
++endmodule
+diff --git a/rtl/translation_logic/rv_iommu_iotlb.sv b/rtl/translation_logic/rv_iommu_iotlb.sv
+index fdb6350..6da0604 100644
+--- a/rtl/translation_logic/rv_iommu_iotlb.sv
++++ b/rtl/translation_logic/rv_iommu_iotlb.sv
+@@ -24,6 +24,7 @@ module rv_iommu_iotlb #(
+     /// RISC-V IOMMU configuration struct
+     parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
+     parameter bit PolicyEnable = 0,
++    parameter bit TouchEnable = 0,
+     parameter bit PartitionLocalHistory = 0
+ )(
+     input  logic                        clk_i,
+@@ -39,6 +40,7 @@ module rv_iommu_iotlb #(
+ 
+     // Lookup
+     input  logic                            lookup_i,
++    input  logic                            touch_i,
+     input  logic [rv_iommu::GPPNW39-1:0]    lu_vpn_i,
+     input  rv_iommu::pscid_t                lu_pscid_i,
+     input  rv_iommu::gscid_t                lu_gscid_i,
+@@ -375,7 +377,7 @@ module rv_iommu_iotlb #(
+             shift       = 0;
+             new_index   = 0;
+ 
+-            if (lu_hit[i]) begin
++            if (lu_hit[i] && (!TouchEnable || touch_i)) begin
+                 for (int unsigned lvl = 0; lvl < $clog2(RVIOMMUCfg.NumIotlbEntries); lvl++) begin
+                     idx_base = $unsigned((2**lvl)-1);
+                     shift = $clog2(RVIOMMUCfg.NumIotlbEntries) - lvl;
+diff --git a/rtl/translation_logic/rv_iommu_nonblock_hit.sv b/rtl/translation_logic/rv_iommu_nonblock_hit.sv
+new file mode 100644
+index 0000000..54eaa4d
+--- /dev/null
++++ b/rtl/translation_logic/rv_iommu_nonblock_hit.sv
+@@ -0,0 +1,155 @@
++// SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
++// Finite two-bank, S1/Sv39/4KiB hit path. Misses and unsupported requests are
++// left unaccepted and subsequently use the normal translation/fault path.
++// The DDTC and IOTLB ports below are time-shared with the original walker.
++module rv_iommu_nonblock_hit
++  import rv_iommu::*;
++#(
++  parameter int unsigned PAddrWidth = 56,
++  parameter bit HasMsiContext = 0,
++  parameter type dc_t = logic,
++  parameter type req_t = logic,
++  parameter type resp_t = logic,
++  parameter type ddtp_t = logic
++)(
++  input logic clk_i, rst_ni,
++  input logic enable_i, window_i,
++  input req_t candidate_i,
++  input logic candidate_valid_i, normal_fire_i,
++  input logic invalidate_i,
++  input ddtp_t ddtp_i,
++  output logic intercept_o, accept_o, busy_o,
++  output logic ddtc_lookup_o, ddtc_touch_o,
++  output device_id_t ddtc_did_o,
++  input logic ddtc_hit_i,
++  input dc_t ddtc_dc_i,
++  output logic iotlb_lookup_o, iotlb_touch_o,
++  output logic [GPPNW39-1:0] iotlb_vpn_o,
++  output pscid_t iotlb_pscid_o,
++  input logic iotlb_hit_i,
++  input iotlb_content_t iotlb_content_i,
++  output resp_t response_o,
++  output logic response_valid_o,
++  input logic response_ready_i
++);
++  typedef enum logic [2:0] {IDLE, DC, LEAF, OUT, REJECT} state_t;
++  state_t state_q;
++  req_t req_q;
++  dc_t dc_q;
++  ddtp_t ddtp_q;
++  resp_t resp_q;
++  logic start, dc_ok, leaf_ok, msi_safe, msi_leaf_safe;
++  logic probe_stable;
++  logic is_write, is_read, canonical;
++  localparam int unsigned PPNW = PAddrWidth - 12;
++
++  assign start = state_q == IDLE && enable_i && window_i &&
++                 candidate_valid_i && !invalidate_i;
++  assign busy_o = state_q != IDLE && state_q != REJECT;
++  assign intercept_o = start || busy_o;
++  assign ddtc_lookup_o = state_q == DC || state_q == LEAF;
++  assign ddtc_did_o = req_q.did;
++  assign iotlb_lookup_o = state_q == LEAF;
++  assign iotlb_vpn_o = req_q.iova[GPLEN39-1:12];
++  assign iotlb_pscid_o = dc_q.ta.pscid;
++  assign is_write = req_q.ttype == UNTRANSLATED_W;
++  assign is_read = req_q.ttype == UNTRANSLATED_R;
++  assign canonical = req_q.iova[63:39] == {25{req_q.iova[38]}};
++
++  // The actual cached DC belongs to this request. No active-walker context
++  // or saved inferred PSCID is used. All excluded cases fall through.
++  if (HasMsiContext) begin : gen_msi_guard
++    // Flat MSI can coexist with ordinary S1 copies. Exclude both the input
++    // range and the cached S1 GPA range, using the normal TL/PTW match widths.
++    // Reads are conservatively excluded too; MSI/reserved modes fall through.
++    logic input_is_msi, leaf_is_msi;
++    assign input_is_msi =
++        (req_q.iova[VLEN39-1:12] & ~ddtc_dc_i.msi_addr_mask.mask[VPNW39-1:0]) ==
++        (ddtc_dc_i.msi_addr_pattern.pattern[VPNW39-1:0] &
++         ~ddtc_dc_i.msi_addr_mask.mask[VPNW39-1:0]);
++    assign leaf_is_msi =
++        (iotlb_content_i.content_1S.ppn[GPPNW39-1:0] &
++         ~dc_q.msi_addr_mask.mask[GPPNW39-1:0]) ==
++        (dc_q.msi_addr_pattern.pattern[GPPNW39-1:0] &
++         ~dc_q.msi_addr_mask.mask[GPPNW39-1:0]);
++    assign msi_safe = ddtc_dc_i.msiptp.mode == 0 ||
++                     (ddtc_dc_i.msiptp.mode == 1 && !input_is_msi);
++    assign msi_leaf_safe = dc_q.msiptp.mode == 0 ||
++                          (dc_q.msiptp.mode == 1 && !leaf_is_msi);
++  end else begin : gen_no_msi
++    assign msi_safe = 1'b1;
++    assign msi_leaf_safe = 1'b1;
++  end
++  assign dc_ok = msi_safe && ddtc_hit_i && ddtc_dc_i.tc.v &&
++      !ddtc_dc_i.tc.pdtv && !ddtc_dc_i.tc.sxl &&
++      !ddtc_dc_i.tc.t2gpa && !ddtc_dc_i.tc.en_ats &&
++      !ddtc_dc_i.tc.en_pri && !req_q.pid_valid && !req_q.priv &&
++      !req_q.is_debug && (is_write || is_read) && canonical &&
++      ddtc_dc_i.fsc.mode == ModeSv39 &&
++      ddtc_dc_i.iohgatp.mode == ModeBare &&
++      ((ddtp_i.iommu_mode.q == 2 && req_q.did[23:6] == 0) ||
++       (ddtp_i.iommu_mode.q == 3 && req_q.did[23:15] == 0) ||
++       ddtp_i.iommu_mode.q == 4);
++  assign leaf_ok = msi_leaf_safe && iotlb_hit_i && iotlb_content_i.content_1S.v &&
++      iotlb_content_i.content_1S.u &&
++      !iotlb_content_i.content_1S.is_1G &&
++      !iotlb_content_i.content_1S.is_2M &&
++      (is_write ? iotlb_content_i.content_1S.w :
++                  iotlb_content_i.content_1S.r);
++  assign accept_o = state_q == LEAF && enable_i &&
++      candidate_valid_i && candidate_i == req_q &&
++      !invalidate_i && ddtp_i == ddtp_q && dc_ok &&
++      ddtc_dc_i == dc_q && leaf_ok;
++  // Probes do not change replacement state; only an actually accepted hit
++  // touches both real caches, exactly once.
++  assign ddtc_touch_o = accept_o;
++  assign iotlb_touch_o = accept_o;
++  assign response_o = resp_q;
++  assign response_valid_o = state_q == OUT;
++
++  assign probe_stable = enable_i && candidate_valid_i && candidate_i == req_q &&
++                        !invalidate_i && ddtp_i == ddtp_q;
++  always_ff @(posedge clk_i or negedge rst_ni) begin
++    if (!rst_ni) begin
++      state_q <= IDLE;
++      req_q <= '0;
++      dc_q <= '0;
++      ddtp_q <= '0;
++      resp_q <= '0;
++    end else begin
++      case (state_q)
++        IDLE: if (start) begin
++          req_q <= candidate_i;
++          ddtp_q <= ddtp_i;
++          state_q <= DC;
++        end
++        DC: begin
++          if (!enable_i || invalidate_i || ddtp_i != ddtp_q ||
++              !dc_ok || !candidate_valid_i || candidate_i != req_q)
++            state_q <= REJECT;
++          else begin
++            dc_q <= ddtc_dc_i;
++            state_q <= LEAF;
++          end
++        end
++        LEAF: begin
++          if (accept_o) begin
++            resp_q <= '0;
++            resp_q.bank <= req_q.bank;
++            resp_q.spaddr <= {iotlb_content_i.content_1S.ppn[PPNW-1:0],
++                              req_q.iova[11:0]};
++            resp_q.r <= iotlb_content_i.content_1S.r;
++            resp_q.w <= iotlb_content_i.content_1S.w;
++            resp_q.x <= iotlb_content_i.content_1S.x;
++            resp_q.u <= iotlb_content_i.content_1S.u;
++            resp_q.g <= iotlb_content_i.content_1S.g;
++            state_q <= OUT;
++          end else state_q <= REJECT;
++        end
++        OUT: if (response_ready_i) state_q <= IDLE;
++        REJECT: if (normal_fire_i || !candidate_valid_i) state_q <= IDLE;
++        default: state_q <= IDLE;
++      endcase
++    end
++  end
++endmodule
+diff --git a/rtl/translation_logic/rv_iommu_tl_wrap.sv b/rtl/translation_logic/rv_iommu_tl_wrap.sv
+index 621789a..1801fa3 100644
+--- a/rtl/translation_logic/rv_iommu_tl_wrap.sv
++++ b/rtl/translation_logic/rv_iommu_tl_wrap.sv
+@@ -26,6 +26,7 @@ module rv_iommu_tl_wrap
+     /// RISC-V IOMMU configuration struct
+     parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
+     parameter bit PolicyEnable = 0,
++    parameter bit NonblockEnable = 0,
+ 
+     /// Address data type
+     parameter type addr_t = logic,
+@@ -57,6 +58,14 @@ module rv_iommu_tl_wrap
+     // Defaults keep existing callers on the original full-mask path.
+     input  logic    policy_partition_i = 1'b0,
+     input  logic    policy_clear_i = 1'b0,
++    input  logic    nonblock_enable_i = 1'b0,
++    // Only the paired restricted normal-copy bank may assert this. Global
++    // capabilities and the original S/P MRIF path are not narrowed.
++    input  logic    restricted_bank_i = 1'b0,
++    output logic    nonblock_fire_o,
++    output logic    nonblock_busy_o,
++    output rv_iommu::device_id_t nonblock_did_o,
++    output logic    policy_quiet_o,
+ 
+     // Transaction controller request port
+     input  trans_req_data_t     trans_req_data_i,
+@@ -143,6 +152,15 @@ module rv_iommu_tl_wrap
+     //-----------------
+     // Request Arbiter
+     //-----------------
++    trans_resp_data_t slow_resp_data, fast_resp_data;
++    logic slow_resp_valid, slow_resp_ready, fast_resp_valid, fast_resp_ready;
++    logic normal_trans_ready, normal_gate, n_intercept, n_accept, n_busy;
++    logic n_window, n_ddtc_lu, n_ddtc_touch, n_iotlb_lu, n_iotlb_touch;
++    device_id_t n_ddtc_did;
++    logic [GPPNW39-1:0] n_iotlb_vpn;
++    pscid_t n_iotlb_pscid;
++    logic cache_ddtc_hit, cache_iotlb_hit, cache_iotlb_en1, cache_iotlb_en2;
++    logic ptw_active, restricted_msi;
+     trans_req_data_t    arb_req_data;
+     logic               arb_req_valid;
+     logic               arb_req_ready;
+@@ -150,7 +168,7 @@ module rv_iommu_tl_wrap
+     logic               req_valid;
+     logic               req_ready;
+     assign req_ready = (debug_resp_valid_o & debug_resp_ready_i) |
+-                       (trans_resp_valid_o & trans_resp_ready_i) |
++                       (slow_resp_valid & slow_resp_ready) |
+                        (ats_trans_resp_valid_o & ats_trans_resp_ready_i) ;
+ 
+     // Priority is given to normal transactions
+@@ -165,8 +183,10 @@ module rv_iommu_tl_wrap
+         .rst_ni         (rst_ni),
+ 
+         .inp_data_i     ({ats_trans_req_data_i,     debug_req_data_i,     trans_req_data_i }),
+-        .inp_valid_i    ({ats_trans_req_valid_i,    debug_req_valid_i,    trans_req_valid_i}),
+-        .inp_ready_o    ({ats_trans_req_ready_o,    debug_req_ready_o,    trans_req_ready_o}),
++        .inp_valid_i    ({ats_trans_req_valid_i && normal_gate,
++                          debug_req_valid_i && normal_gate,
++                          trans_req_valid_i && normal_gate}),
++        .inp_ready_o    ({ats_trans_req_ready_o,    debug_req_ready_o,    normal_trans_ready}),
+ 
+         .oup_data_o     (arb_req_data),
+         .oup_valid_o    (arb_req_valid),
+@@ -222,8 +242,10 @@ module rv_iommu_tl_wrap
+     logic                    ddtc_lu_hit;
+     dc_t                     ddtc_dc;
+     ddtc_up_t                ddtc_update;
+-    assign ddtc_lu          = (state_q == DDT) | ats_ddtc_valid_i;
+-    assign ddtc_lu_did      = ats_ddtc_valid_i ? ats_ddtc_did_i : req_data.did;
++    assign ddtc_lu          = (state_q == DDT) | ats_ddtc_valid_i | n_ddtc_lu;
++    assign ddtc_lu_did      = n_ddtc_lu ? n_ddtc_did :
++                             ats_ddtc_valid_i ? ats_ddtc_did_i : req_data.did;
++    assign ddtc_lu_hit      = cache_ddtc_hit && !n_ddtc_lu;
+     assign ats_ddtc_ready_o = ~ddtc_lu_hit;
+     assign ats_ddtc_tc_o.en_pri = dc_q.tc.en_pri;
+     assign ats_ddtc_tc_o.en_ats = dc_q.tc.en_ats;
+@@ -241,20 +263,104 @@ module rv_iommu_tl_wrap
+     rv_iommu::iotlb_content_t       iotlb_lu_content;
+     rv_iommu::iotlb_up_t            ptw_iotlb_update, msi_iotlb_update;
+     rv_iommu::iotlb_up_t            iotlb_update;
+-    assign iotlb_lu         = (state_q == PT) | (state_q == MSI);
+-    assign iotlb_lu_vpn     = req_data.iova[rv_iommu::GPLEN39-1:12];
+-    assign iotlb_lu_pscid   = pscid_q;
+-    assign iotlb_lu_gscid   = gscid_q;
++    assign iotlb_lu         = (state_q == PT) | (state_q == MSI) | n_iotlb_lu;
++    assign iotlb_lu_vpn     = n_iotlb_lu ? n_iotlb_vpn : req_data.iova[rv_iommu::GPLEN39-1:12];
++    assign iotlb_lu_pscid   = n_iotlb_lu ? n_iotlb_pscid : pscid_q;
++    assign iotlb_lu_gscid   = n_iotlb_lu ? '0 : gscid_q;
++    assign cache_iotlb_en1  = n_iotlb_lu ? 1'b1 : en_1S_q;
++    assign cache_iotlb_en2  = n_iotlb_lu ? 1'b0 : en_2S_q;
++    assign iotlb_lu_hit     = cache_iotlb_hit && !n_iotlb_lu;
+     assign iotlb_update     = (msi_iotlb_update.update) ?
+                               (msi_iotlb_update) :
+                               (ptw_iotlb_update);
+ 
++    // Runtime N=0 restores the original normal gate as well as the response
++    // path. Compiling the optional helper must not serialize the S path.
++    assign normal_gate = !NonblockEnable || !nonblock_enable_i ||
++                         (state_q == IDLE && !req_valid && !n_intercept);
++    assign trans_req_ready_o = n_intercept ? n_accept : (normal_trans_ready && normal_gate);
++    assign nonblock_fire_o = n_accept;
++    assign nonblock_did_o = trans_req_data_i.did;
++    assign nonblock_busy_o = n_busy;
++    assign restricted_msi = NonblockEnable && nonblock_enable_i && restricted_bank_i;
++    assign policy_quiet_o = state_q == IDLE && !req_valid && !arb_req_valid &&
++        !trans_req_valid_i && !ats_trans_req_valid_i && !debug_req_valid_i &&
++        !ats_ddtc_valid_i && !n_busy && !n_intercept && !n_accept &&
++        !fast_resp_valid && !slow_resp_valid && !ats_trans_resp_valid_o &&
++        !debug_resp_valid_o && !fault_valid_o && !ptw_active &&
++        !ddtw_axi_req_o.ar_valid && !pdtw_axi_req_o.ar_valid &&
++        !ptw_axi_req_o.ar_valid && !msiptw_axi_req_o.ar_valid &&
++        !ddtw_axi_resp_i.r_valid && !pdtw_axi_resp_i.r_valid &&
++        !ptw_axi_resp_i.r_valid && !msiptw_axi_resp_i.r_valid &&
++        !iotlb_update.update && !ddtc_update.update &&
++        !iotinval_i.inval_vma && !iotinval_i.inval_gvma &&
++        !iodirinval_i.inval_ddtc && !iodirinval_i.inval_pdtc;
++    if (NonblockEnable) begin : gen_nonblock_hit
++        assign n_window = state_q == PT && ptw_active && en_1S_q &&
++            !en_2S_q && !ddt_imp_trans_q && !pdt_imp_trans_q &&
++            !req_data.is_debug && trans_req_data_i.bank != req_data.bank &&
++            !ats_ddtc_valid_i && !debug_req_valid_i && !ats_trans_req_valid_i;
++        rv_iommu_nonblock_hit #(
++            .PAddrWidth(PLEN),
++            .HasMsiContext(RVIOMMUCfg.MSITrans != rv_iommu_cfg::MSI_DISABLED),
++            .dc_t(dc_t), .req_t(trans_req_data_t),
++            .resp_t(trans_resp_data_t), .ddtp_t(iommu_reg2hw_ddtp_reg_t)
++        ) i_hit (
++            .clk_i, .rst_ni, .enable_i(nonblock_enable_i), .window_i(n_window),
++            .candidate_i(trans_req_data_i), .candidate_valid_i(trans_req_valid_i),
++            .normal_fire_i(trans_req_valid_i && normal_trans_ready && normal_gate),
++            .invalidate_i(iotinval_i.inval_vma || iotinval_i.inval_gvma ||
++                          iodirinval_i.inval_ddtc || iodirinval_i.inval_pdtc),
++            .ddtp_i(ddtp_i), .intercept_o(n_intercept), .accept_o(n_accept),
++            .busy_o(n_busy), .ddtc_lookup_o(n_ddtc_lu), .ddtc_touch_o(n_ddtc_touch),
++            .ddtc_did_o(n_ddtc_did), .ddtc_hit_i(cache_ddtc_hit), .ddtc_dc_i(ddtc_dc),
++            .iotlb_lookup_o(n_iotlb_lu), .iotlb_touch_o(n_iotlb_touch),
++            .iotlb_vpn_o(n_iotlb_vpn), .iotlb_pscid_o(n_iotlb_pscid),
++            .iotlb_hit_i(cache_iotlb_hit), .iotlb_content_i(iotlb_lu_content),
++            .response_o(fast_resp_data), .response_valid_o(fast_resp_valid),
++            .response_ready_i(fast_resp_ready)
++        );
++        assign slow_resp_data.bank = req_data.bank;
++        trans_resp_data_t merged_resp_data;
++        logic merged_resp_valid, merged_slow_ready;
++        stream_arbiter #(.DATA_T(trans_resp_data_t), .N_INP(2), .ARBITER("rr"))
++            i_nonblock_response_arbiter (
++                .clk_i, .rst_ni, .inp_data_i({fast_resp_data, slow_resp_data}),
++                .inp_valid_i({fast_resp_valid && nonblock_enable_i,
++                              slow_resp_valid && nonblock_enable_i}),
++                .inp_ready_o({fast_resp_ready, merged_slow_ready}),
++                .oup_data_o(merged_resp_data), .oup_valid_o(merged_resp_valid),
++                .oup_ready_i(trans_resp_ready_i && nonblock_enable_i)
++            );
++        assign slow_resp_ready = nonblock_enable_i ? merged_slow_ready : trans_resp_ready_i;
++        assign trans_resp_data_o = nonblock_enable_i ? merged_resp_data : slow_resp_data;
++        assign trans_resp_valid_o = nonblock_enable_i ? merged_resp_valid : slow_resp_valid;
++    end else begin : gen_no_nonblock_hit
++        assign n_window = 0;
++        assign n_intercept = 0;
++        assign n_accept = 0;
++        assign n_busy = 0;
++        assign n_ddtc_lu = 0;
++        assign n_ddtc_touch = 0;
++        assign n_ddtc_did = '0;
++        assign n_iotlb_lu = 0;
++        assign n_iotlb_touch = 0;
++        assign n_iotlb_vpn = '0;
++        assign n_iotlb_pscid = '0;
++        assign fast_resp_data = '0;
++        assign fast_resp_valid = 0;
++        assign fast_resp_ready = 0;
++        assign slow_resp_ready = trans_resp_ready_i;
++        assign trans_resp_data_o = slow_resp_data;
++        assign trans_resp_valid_o = slow_resp_valid;
++    end
++
+     //-----------------
+     // Walkers Control
+     //-----------------
+     // DDTW
+     logic ddtw_init;
+-    assign ddtw_init = ddtc_lu & ~ddtc_lu_hit;
++    assign ddtw_init = ((state_q == DDT) | ats_ddtc_valid_i) & ~ddtc_lu_hit;
+     logic ddtw_error;
+     rv_iommu::cause_t ddtw_cause;
+     logic ddtw_imp_init;
+@@ -356,21 +462,21 @@ module rv_iommu_tl_wrap
+     logic ignore_q, ignore_n;
+     logic is_mrif_q, is_mrif_n;
+     rv_iommu::mrifc_content_t mrif_q, mrif_n;
+-    assign trans_resp_data_o.error      = error_q;
+-    assign trans_resp_data_o.ignore     = ignore_q;
+-    assign trans_resp_data_o.spaddr     = spaddr_q;
+-    assign trans_resp_data_o.is_mrif    = is_mrif_q;
+-    assign trans_resp_data_o.mrif_data  = mrif_q;
+-    assign trans_resp_data_o.range      = range_q;
+-    assign trans_resp_data_o.bypass     = bypass_q;
+-    assign trans_resp_data_o.fault_code = error_code_q;
+-    assign trans_resp_data_o.w          = w_q;
+-    assign trans_resp_data_o.r          = r_q;
+-    assign trans_resp_data_o.x          = x_q;
+-    assign trans_resp_data_o.sum        = sum_q;
+-    assign trans_resp_data_o.g          = g_q;
+-    assign trans_resp_data_o.u          = u_q;
+-    assign trans_resp_data_o.t2gpa      = t2gpa_q;
++    assign slow_resp_data.error      = error_q;
++    assign slow_resp_data.ignore     = ignore_q;
++    assign slow_resp_data.spaddr     = spaddr_q;
++    assign slow_resp_data.is_mrif    = is_mrif_q;
++    assign slow_resp_data.mrif_data  = mrif_q;
++    assign slow_resp_data.range      = range_q;
++    assign slow_resp_data.bypass     = bypass_q;
++    assign slow_resp_data.fault_code = error_code_q;
++    assign slow_resp_data.w          = w_q;
++    assign slow_resp_data.r          = r_q;
++    assign slow_resp_data.x          = x_q;
++    assign slow_resp_data.sum        = sum_q;
++    assign slow_resp_data.g          = g_q;
++    assign slow_resp_data.u          = u_q;
++    assign slow_resp_data.t2gpa      = t2gpa_q;
+ 
+     //----------------------
+     // ATS Translation response
+@@ -395,6 +501,7 @@ module rv_iommu_tl_wrap
+     // Device Directory Table Cache
+     //------------------------------
+     rv_iommu_ddtc #(
++        .TouchEnable    (NonblockEnable),
+         .RVIOMMUCfg     (RVIOMMUCfg),
+         .dc_t           (dc_t),
+         .ddtc_up_t      (ddtc_up_t)
+@@ -407,9 +514,10 @@ module rv_iommu_tl_wrap
+         .update_i       (ddtc_update),
+ 
+         .lookup_i       (ddtc_lu),
++        .touch_i        (!n_ddtc_lu || n_ddtc_touch),
+         .lu_did_i       (ddtc_lu_did),
+         .lu_content_o   (ddtc_dc),
+-        .lu_hit_o       (ddtc_lu_hit)
++        .lu_hit_o       (cache_ddtc_hit)
+     );
+ 
+     //-------------------------------
+@@ -548,6 +656,7 @@ module rv_iommu_tl_wrap
+     // IO Translation Look-aside Buffer
+     //----------------------------------
+     rv_iommu_iotlb #(
++        .TouchEnable   (NonblockEnable),
+         .PolicyEnable  (PolicyEnable),
+         .PartitionLocalHistory(PolicyEnable),
+         .RVIOMMUCfg     (RVIOMMUCfg)
+@@ -566,12 +675,13 @@ module rv_iommu_tl_wrap
+         .update_i       (iotlb_update),
+ 
+         .lookup_i       (iotlb_lu),
++        .touch_i        (!n_iotlb_lu || n_iotlb_touch),
+         .lu_vpn_i       (iotlb_lu_vpn),
+         .lu_pscid_i     (iotlb_lu_pscid),
+         .lu_gscid_i     (iotlb_lu_gscid),
+-        .en_1S_i        (en_1S_q),
+-        .en_2S_i        (en_2S_q),
+-        .lu_hit_o       (iotlb_lu_hit),
++        .en_1S_i        (cache_iotlb_en1),
++        .en_2S_i        (cache_iotlb_en2),
++        .lu_hit_o       (cache_iotlb_hit),
+         .lu_content_o   (iotlb_lu_content)
+     );
+ 
+@@ -590,7 +700,7 @@ module rv_iommu_tl_wrap
+ 
+         .init_ptw_i         (ptw_init),
+ 
+-        .active_o           ( ),
++        .active_o           (ptw_active),
+         .error_o            (ptw_error),
+         .error_2S_o         (ptw_error_2S),
+         .error_2S_int_o     (ptw_error_2S_int),
+@@ -648,7 +758,7 @@ module rv_iommu_tl_wrap
+             assign msiptp_ppn = dc_q.msiptp.ppn;
+ 
+             logic msi_ptw_init;
+-            assign msi_ptw_init = (state_q == MSI) & ~iotlb_lu_hit & ~mrifc_lu_hit;
++            assign msi_ptw_init = !restricted_msi && (state_q == MSI) && !iotlb_lu_hit && !mrifc_lu_hit;
+ 
+             rv_iommu::mrifc_up_t mrifc_update;
+ 
+@@ -772,7 +882,7 @@ module rv_iommu_tl_wrap
+ 
+         // Default values
+         debug_resp_valid_o     = 1'b0;
+-        trans_resp_valid_o     = 1'b0;
++        slow_resp_valid       = 1'b0;
+         ats_trans_resp_valid_o = 1'b0;
+         fault_valid_o          = 1'b0;
+ 
+@@ -1282,8 +1392,18 @@ module rv_iommu_tl_wrap
+             // IOTLB/MRIFC lookup and PTW Walk
+             MSI: begin
+ 
++                // The bounded N bank has no MRIF handler. Reject through the
++                // original fault/error path, never as a normal payload success.
++                // S/P and all global MSI capabilities keep the original logic.
++                if (restricted_msi) begin
++                    error_code_n = rv_iommu::TRANS_TYPE_DISALLOWED;
++                    error_n = 1'b1;
++                    is_mrif_n = 1'b0;
++                    ignore_n = 1'b0;
++                    state_n = dc_q.tc.dtf ? COMPLETE : ERROR;
++                end
+                 // MSI Translation supported
+-                if (RVIOMMUCfg.MSITrans != rv_iommu_cfg::MSI_DISABLED) begin
++                else if (RVIOMMUCfg.MSITrans != rv_iommu_cfg::MSI_DISABLED) begin
+ 
+                     // default
+                     error_code_n    = rv_iommu::TRANS_TYPE_DISALLOWED;
+@@ -1381,8 +1501,8 @@ module rv_iommu_tl_wrap
+                 end
+                 // Normal translation
+                 else begin
+-                    trans_resp_valid_o  = 1'b1;
+-                    if (trans_resp_ready_i) begin
++                    slow_resp_valid  = 1'b1;
++                    if (slow_resp_ready) begin
+                         state_n = IDLE;
+                     end
+                 end
