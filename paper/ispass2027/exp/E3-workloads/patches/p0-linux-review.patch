@@ -1,0 +1,337 @@
+diff --git a/drivers/misc/idma.c b/drivers/misc/idma.c
+index 2d09932d250d..8ccac9604b81 100644
+--- a/drivers/misc/idma.c
++++ b/drivers/misc/idma.c
+@@ -12,6 +12,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of_platform.h>
++#include <linux/overflow.h>
+ #include <linux/platform_device.h>
+ #include <linux/riscv_iommu_hpm.h>
+ #include <linux/sched/signal.h>
+@@ -20,6 +21,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/vmalloc.h>
+ #include <uapi/linux/idma.h>
++#include <uapi/linux/idma_p0.h>
+ #include <asm/cacheflush.h>
+ 
+ MODULE_DESCRIPTION("CVA6 iDMA versioned two-device experiment driver");
+@@ -517,11 +519,18 @@ static int idma_verify(struct idma_stream *s)
+ }
+ 
+ /* Batch mode still uses DEFAULT read/write copies. STOP never cancels AXI. */
+-static int idma_batch_configure(struct idma_stream *s, u64 count)
++static bool idma_batch_supported(struct idma_device *idma, bool p0)
++{
++	u64 magic = readq(idma->reg + IDMA_BATCH_MAGIC_OFFSET);
++
++	return magic == IDMA_P0_BATCH_MAGIC || (!p0 && magic == IDMA_BATCH_MAGIC);
++}
++
++static int idma_batch_configure(struct idma_stream *s, u64 count, bool p0)
+ {
+ 	void __iomem *base = s->idma->reg;
+ 
+-	if (readq(base + IDMA_BATCH_MAGIC_OFFSET) != IDMA_BATCH_MAGIC)
++	if (!idma_batch_supported(s->idma, p0))
+ 		return -EOPNOTSUPP;
+ 	if (readq(base + IDMA_BATCH_CONTROL_OFFSET) & 2)
+ 		return -EBUSY;
+@@ -542,7 +551,7 @@ static void idma_batch_stop(struct idma_stream *s)
+ 
+ static int idma_batch_collect(struct idma_stream *s)
+ {
+-	u64 status, issued, completed;
++	u64 status, issued, completed, bytes;
+ 
+ 	if (!s || !s->batch_configured)
+ 		return 0;
+@@ -558,11 +567,13 @@ static int idma_batch_collect(struct idma_stream *s)
+ 		completed = readq(s->idma->reg + IDMA_BATCH_COMPLETED_OFFSET);
+ 		s->stats->submitted = issued;
+ 		s->stats->completed = completed;
+-		s->stats->completed_bytes = completed * PAGE_SIZE;
+-		s->touched_end = max(s->touched_end,
+-			(size_t)min(completed, (u64)(s->size / PAGE_SIZE)) * PAGE_SIZE);
+ 		if (issued != completed || issued > IDMA_EXPERIMENT_MAX_TRANSFERS)
+ 			return -EIO;
++		if (check_mul_overflow(completed, (u64)s->chunk, &bytes))
++			return -EOVERFLOW;
++		s->stats->completed_bytes = bytes;
++		/* Packed-ring lengths divide PAGE_SIZE. Keep the union with warmup. */
++		s->touched_end = max(s->touched_end, (size_t)min(bytes, (u64)s->size));
+ 	}
+ 	return status >> 32 ? -EIO : 0;
+ }
+@@ -840,10 +851,13 @@ static int idma_observation_finish(struct idma_observation *o,
+ 	return valid ? 0 : -EIO;
+ }
+ 
+-static long idma_run_experiment_mode(struct idma_device *victim,
+-			       struct idma_experiment __user *uarg, bool batch)
++/* Both ABIs share all mappings, cache handling, locks, stop/drain and validation.
++ * ABI adaptation is outside this core; chunk_bytes is V's actual length.
++ */
++static long idma_run_experiment_core(struct idma_device *victim,
++		struct idma_experiment *request, bool batch, u32 aggressor_chunk, bool p0)
+ {
+-	struct idma_experiment e;
++	struct idma_experiment e = *request;
+ 	struct idma_stream streams[2] = {};
+ 	struct idma_observation observation = { .batch = batch };
+ 	struct idma_stream *v = &streams[0], *a = NULL;
+@@ -854,13 +868,11 @@ static long idma_run_experiment_mode(struct idma_device *victim,
+ 	u64 start, end = 0, deadline, stamp;
+ 	int ret, drain_ret, verify_ret, observation_ret;
+ 
+-	if (copy_from_user(&e, uarg, sizeof(e)))
+-		return -EFAULT;
+ 	memset(&e.status, 0, sizeof(e) - offsetof(struct idma_experiment, status));
+ 	e.victim_did = victim->did;
+ 	e.aggressor_did = IDMA_EXPERIMENT_NO_AGGRESSOR;
+ 	ret = idma_validate(&e);
+-	if (!ret && batch && (e.chunk_bytes != PAGE_SIZE ||
++	if (!ret && batch && ((!p0 && e.chunk_bytes != PAGE_SIZE) ||
+ 			      e.victim_transfers > IDMA_BATCH_MAX_TRANSFERS))
+ 		ret = -EINVAL;
+ 	if (ret)
+@@ -888,8 +900,8 @@ static long idma_run_experiment_mode(struct idma_device *victim,
+ 	ret = idma_observation_prepare(&observation, batch || READ_ONCE(idma_observe));
+ 	if (ret)
+ 		goto out_put;
+-	if (batch && (readq(victim->reg + IDMA_BATCH_MAGIC_OFFSET) != IDMA_BATCH_MAGIC ||
+-	    (aggressor && readq(aggressor->reg + IDMA_BATCH_MAGIC_OFFSET) != IDMA_BATCH_MAGIC))) {
++	if (batch && (!idma_batch_supported(victim, p0) ||
++	    (aggressor && !idma_batch_supported(aggressor, p0)))) {
+ 		ret = -EOPNOTSUPP;
+ 		goto out_put;
+ 	}
+@@ -903,7 +915,7 @@ static long idma_run_experiment_mode(struct idma_device *victim,
+ 		goto out_cleanup;
+ 	if (a) {
+ 		ret = idma_stream_prepare(a, aggressor, e.aggressor_pages,
+-					  e.chunk_bytes, &e.aggressor);
++					  aggressor_chunk, &e.aggressor);
+ 		if (ret)
+ 			goto out_cleanup;
+ 	}
+@@ -938,9 +950,9 @@ static long idma_run_experiment_mode(struct idma_device *victim,
+ 			if (ret)
+ 				goto out_drain;
+ 		}
+-		ret = idma_batch_configure(v, e.victim_transfers);
++		ret = idma_batch_configure(v, e.victim_transfers, p0);
+ 		if (!ret && a)
+-			ret = idma_batch_configure(a, IDMA_EXPERIMENT_MAX_TRANSFERS);
++			ret = idma_batch_configure(a, IDMA_EXPERIMENT_MAX_TRANSFERS, p0);
+ 		if (ret)
+ 			goto out_drain;
+ 	}
+@@ -1030,11 +1042,118 @@ static long idma_run_experiment_mode(struct idma_device *victim,
+ 	mutex_unlock(&idma_experiment_lock);
+  out_copy:
+ 	e.status = ret;
++	*request = e;
++	return ret;
++}
++
++static long idma_run_experiment_mode(struct idma_device *victim,
++			       struct idma_experiment __user *uarg, bool batch)
++{
++	struct idma_experiment e;
++	long ret;
++
++	if (copy_from_user(&e, uarg, sizeof(e)))
++		return -EFAULT;
++	ret = idma_run_experiment_core(victim, &e, batch, e.chunk_bytes, false);
+ 	if (copy_to_user(uarg, &e, sizeof(e)))
+ 		return -EFAULT;
+ 	return ret;
+ }
+ 
++static int idma_validate_p0(struct idma_device *victim,
++			    const struct idma_p0_experiment *e)
++{
++	if (e->abi_version != IDMA_P0_ABI || e->struct_size != sizeof(*e))
++		return -EPROTO;
++	if (PAGE_SIZE != SZ_4K || victim->id != 0 || victim->did != 10)
++		return -EOPNOTSUPP;
++	if (e->flags || memchr_inv(e->reserved, 0, sizeof(e->reserved)))
++		return -EINVAL;
++	/* Deliberately bounded to the approved P0 matrix, rather than a general ABI. */
++	if (e->geometry != IDMA_P0_GEOMETRY_PACKED_RING || e->victim_pages != 1 ||
++	    (e->aggressor_id != IDMA_EXPERIMENT_NO_AGGRESSOR && e->aggressor_id != 1) ||
++	    (e->aggressor_pages != 1 && e->aggressor_pages != 8) ||
++	    (e->aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR && e->aggressor_pages != 1) ||
++	    (e->victim_chunk_bytes != 64 && e->victim_chunk_bytes != 1024 &&
++	     e->victim_chunk_bytes != 4096) || e->aggressor_chunk_bytes != 4096 ||
++	    e->victim_transfers != 4096 || e->warmup_transfers != 256 ||
++	    !e->run_timeout_ms || e->run_timeout_ms > IDMA_MAX_RUN_TIMEOUT_MS)
++		return -EINVAL;
++	/* Sizes are <=8 pages, V bytes <=2^24, and even A's target*len <=2^44.
++	 * Per-stream collection nevertheless checks multiplication before use.
++	 */
++	return 0;
++}
++
++static long idma_run_p0(struct idma_device *victim,
++			struct idma_p0_experiment __user *uarg)
++{
++	struct idma_p0_experiment p;
++	struct idma_experiment e = {};
++	long ret;
++
++	if (copy_from_user(&p, uarg, sizeof(p)))
++		return -EFAULT;
++	memset(&p.status, 0, sizeof(p) - offsetof(struct idma_p0_experiment, status));
++	p.victim_did = victim->did;
++	p.aggressor_did = IDMA_EXPERIMENT_NO_AGGRESSOR;
++	ret = idma_validate_p0(victim, &p);
++	if (ret)
++		goto out;
++	/* Translate inputs to the unchanged internal ABI1-shaped request. */
++	e.abi_version = IDMA_EXPERIMENT_ABI;
++	e.struct_size = sizeof(e);
++	e.aggressor_id = p.aggressor_id;
++	e.victim_pages = p.victim_pages;
++	e.aggressor_pages = p.aggressor_pages;
++	e.chunk_bytes = p.victim_chunk_bytes;
++	e.run_timeout_ms = p.run_timeout_ms;
++	e.victim_transfers = p.victim_transfers;
++	e.warmup_transfers = p.warmup_transfers;
++	ret = idma_run_experiment_core(victim, &e, true, p.aggressor_chunk_bytes, true);
++	/* Named copies avoid relying on equal struct sizes to alias ABI layouts. */
++	p.victim_did = e.victim_did;
++	p.aggressor_did = e.aggressor_did;
++	p.hpm_configured = e.hpm_configured;
++	p.measurement_started = e.measurement_started;
++	p.measurement_complete = e.measurement_complete;
++	p.victim_elapsed_ns = e.victim_elapsed_ns;
++	p.snapshot_before_ns = e.snapshot_before_ns;
++	p.snapshot_after_ns = e.snapshot_after_ns;
++	p.drain_ns = e.drain_ns;
++	p.victim = e.victim;
++	p.aggressor = e.aggressor;
++ out:
++	p.status = ret;
++	if (copy_to_user(uarg, &p, sizeof(p)))
++		return -EFAULT;
++	return ret;
++}
++
++static long idma_caps_p0(struct idma_device *victim, void __user *uarg)
++{
++	struct idma_p0_caps caps = {
++		.abi_version = IDMA_P0_ABI,
++		.struct_size = sizeof(caps),
++		.capabilities = IDMA_EXPERIMENT_CAP_HW_BATCH,
++		.device_id = victim->id,
++		.did = victim->did,
++		.max_pages = IDMA_MAX_PAGES,
++		.page_bytes = PAGE_SIZE,
++		.max_run_timeout_ms = IDMA_MAX_RUN_TIMEOUT_MS,
++		.batch_magic = IDMA_P0_BATCH_MAGIC,
++		.victim_length_mask = IDMA_P0_LENGTH_64 | IDMA_P0_LENGTH_1024 | IDMA_P0_LENGTH_4096,
++		.aggressor_length_mask = IDMA_P0_LENGTH_4096,
++		.geometry_mask = IDMA_P0_GEOMETRY_MASK_PACKED_RING,
++	};
++
++	if (victim->id != 0 || victim->did != 10 || !idma_batch_supported(victim, true))
++		return -EOPNOTSUPP;
++	if (riscv_iommu_hpm_supported(victim->miscdev.parent))
++		caps.capabilities |= IDMA_EXPERIMENT_CAP_DID_HPM;
++	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
++}
++
+ static long idma_run_experiment(struct idma_device *victim,
+ 			       struct idma_experiment __user *uarg)
+ {
+@@ -1056,6 +1175,10 @@ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ 	};
+ 
+ 	switch (cmd) {
++	case IDMA_IOC_CAPS_P0:
++		return idma_caps_p0(idma, (void __user *)arg);
++	case IDMA_IOC_RUN_BATCH_P0:
++		return idma_run_p0(idma, (struct idma_p0_experiment __user *)arg);
+ 	case IDMA_IOC_EXPERIMENT_CAPS:
+ 		if (riscv_iommu_hpm_supported(idma->miscdev.parent))
+ 			caps.capabilities |= IDMA_EXPERIMENT_CAP_DID_HPM;
+diff --git a/include/uapi/linux/idma_p0.h b/include/uapi/linux/idma_p0.h
+new file mode 100644
+index 000000000000..cd27e8519ce4
+--- /dev/null
++++ b/include/uapi/linux/idma_p0.h
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_LINUX_IDMA_P0_H
++#define _UAPI_LINUX_IDMA_P0_H
++
++#include <linux/idma.h>
++
++/* Separate ABI/commands; linux/idma.h ABI 1 layout and operations are unchanged.
++ * P0 is V0, optional A1, V one page, A one/eight pages, packed ring, 4096 tasks
++ * after 256 software-warmup tasks. V length is 64/1024/4096; A length is 4096.
++ * Every input flags/reserved word must be zero. No fallback to software refill.
++ */
++#define IDMA_P0_ABI 2U
++#define IDMA_P0_BATCH_MAGIC 0x49444d4142544302ULL
++#define IDMA_P0_GEOMETRY_PACKED_RING 1U
++#define IDMA_P0_GEOMETRY_MASK_PACKED_RING (1U << 0)
++#define IDMA_P0_LENGTH_64 (1U << 0)
++#define IDMA_P0_LENGTH_1024 (1U << 1)
++#define IDMA_P0_LENGTH_4096 (1U << 2)
++
++struct idma_p0_caps {
++	__u32 abi_version;
++	__u32 struct_size;
++	__u32 capabilities; /* Existing DID_HPM/HW_BATCH bit definitions. */
++	__u32 device_id;
++	__u32 did;
++	__u32 max_pages; /* Allocation limit; P0's stricter geometry applies. */
++	__u32 page_bytes;
++	__u32 max_run_timeout_ms;
++	__u64 batch_magic;
++	__u32 victim_length_mask;
++	__u32 aggressor_length_mask;
++	__u32 geometry_mask;
++	__u32 reserved[3];
++};
++
++struct idma_p0_experiment {
++	__u32 abi_version;
++	__u32 struct_size;
++	__u32 flags;
++	__u32 aggressor_id;
++	__u32 victim_pages;
++	__u32 aggressor_pages;
++	__u32 victim_chunk_bytes;
++	__u32 aggressor_chunk_bytes;
++	__u32 run_timeout_ms;
++	__u32 geometry;
++	__u64 victim_transfers;
++	__u64 warmup_transfers;
++	__u32 reserved[6];
++	/* Same output meanings as ABI 1, with per-lane completed_bytes = count*len.
++	 * HPM is still a non-atomic software bracket. A counts include startup/drain.
++	 */
++	__s32 status;
++	__u32 victim_did;
++	__u32 aggressor_did;
++	__u32 hpm_configured;
++	__u32 measurement_started;
++	__u32 measurement_complete;
++	__u64 victim_elapsed_ns;
++	__u64 snapshot_before_ns;
++	__u64 snapshot_after_ns;
++	__u64 drain_ns;
++	struct idma_experiment_stats victim;
++	struct idma_experiment_stats aggressor;
++};
++
++#define IDMA_IOC_CAPS_P0 _IOR('i', 0x09, struct idma_p0_caps)
++#define IDMA_IOC_RUN_BATCH_P0 _IOWR('i', 0x0a, struct idma_p0_experiment)
++
++#endif

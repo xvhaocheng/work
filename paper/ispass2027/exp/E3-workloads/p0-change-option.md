@@ -1,5 +1,8 @@
 # E3 P0 限定修改選項：保留批量供給的獨立 V/A 長度
 
+> 此原提案已獲使用者批准；下文保留提案時的狀態與接受合同。
+> 實際實作／驗證／構建狀態見[p0-implementation.md](p0-implementation.md)，不是將有限測試當成已上板。
+
 ## Material Passport
 
 - Origin Skill: academic-research-suite / experiment-agent（run 準備階段）

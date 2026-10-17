@@ -1,5 +1,8 @@
 # E3 負載形態：條件矩陣與待執行包
 
+> 此頁保留最初完整矩陣設計與原pathv3限制。後續僅P0修改、構建和45點已獲批准，
+> 新實作／採集入口與當前實際狀態見 [p0-implementation.md](p0-implementation.md)。其餘矩陣仍僅規劃。
+
 ## Material Passport
 
 - Origin Skill: academic-research-suite / experiment-agent

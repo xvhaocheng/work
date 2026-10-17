@@ -1,0 +1,302 @@
+diff --git a/bench/idma_p0.c b/bench/idma_p0.c
+new file mode 100644
+index 0000000..63578b4
+--- /dev/null
++++ b/bench/idma_p0.c
+@@ -0,0 +1,276 @@
++// SPDX-License-Identifier: GPL-2.0
++/* One bounded P0 trial; original idma_experiment and ABI1 remain separate. */
++#define _POSIX_C_SOURCE 200809L
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <linux/idma_p0.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++struct options {
++	const char *device;
++	int caps_only;
++	struct idma_p0_experiment request;
++};
++
++static void usage(void)
++{
++	puts("Usage: idma_p0 [--victim-chunk 64|1024|4096] [--aggressor none|1]\n"
++	     "  --aggressor-pages 1|8  Each A source/destination buffer (Solo requires 1)\n"
++	     "  --aggressor-chunk 4096  Explicit independent A length (fixed in P0)\n"
++	     "  --device /dev/idma0     Fixed P0 victim\n"
++	     "  --timeout-ms N         Positive, at most 300000 (default 60000)\n"
++	     "  --caps                 Query P0 capabilities without executing DMA\n"
++	     "  --help                 Show this help\n"
++	     "Fixed packed ring: V=1 page, 4096 measured descriptors, warmup=256.\n"
++	     "Requires P0 ABI2 kernel and BTC2 BIT. Never falls back to software refill.");
++}
++
++static int decimal(const char *s, uint32_t *value)
++{
++	uint64_t n = 0;
++	const unsigned char *p = (const unsigned char *)s;
++
++	if (!*p)
++		return -1;
++	for (; *p; p++) {
++		if (*p < '0' || *p > '9')
++			return -1;
++		n = n * 10 + *p - '0';
++		if (n > UINT32_MAX)
++			return -1;
++	}
++	*value = (uint32_t)n;
++	return 0;
++}
++
++static int parse(int argc, char **argv, struct options *o, char *error, size_t size)
++{
++	static const char *const names[] = {"--device", "--aggressor", "--victim-chunk",
++		"--aggressor-chunk", "--aggressor-pages", "--timeout-ms", "--caps", "--help"};
++	unsigned int seen = 0;
++	int i;
++
++	for (i = 1; i < argc; i++) {
++		unsigned int k;
++		uint32_t n = 0;
++		const char *value;
++
++		for (k = 0; k < sizeof(names) / sizeof(names[0]); k++)
++			if (!strcmp(argv[i], names[k]))
++				break;
++		if (k == sizeof(names) / sizeof(names[0]) || (seen & (1U << k))) {
++			snprintf(error, size, "unknown or duplicate argument: %s", argv[i]);
++			return -1;
++		}
++		seen |= 1U << k;
++		if (k == 6) {
++			o->caps_only = 1;
++			continue;
++		}
++		if (k == 7) {
++			usage();
++			return 1;
++		}
++		if (++i == argc) {
++			snprintf(error, size, "missing value for %s", names[k]);
++			return -1;
++		}
++		value = argv[i];
++		if (k == 0) {
++			o->device = value;
++			continue;
++		}
++		if (k == 1 && !strcmp(value, "none")) {
++			o->request.aggressor_id = IDMA_EXPERIMENT_NO_AGGRESSOR;
++			continue;
++		}
++		if (decimal(value, &n) || (k == 1 && n != 1)) {
++			snprintf(error, size, "invalid unsigned decimal for %s", names[k]);
++			return -1;
++		}
++		switch (k) {
++		case 1: o->request.aggressor_id = n; break;
++		case 2: o->request.victim_chunk_bytes = n; break;
++		case 3: o->request.aggressor_chunk_bytes = n; break;
++		case 4: o->request.aggressor_pages = n; break;
++		case 5: o->request.run_timeout_ms = n; break;
++		}
++	}
++	if (strcmp(o->device, "/dev/idma0") ||
++	    (o->request.aggressor_id != IDMA_EXPERIMENT_NO_AGGRESSOR && o->request.aggressor_id != 1) ||
++	    (o->request.aggressor_pages != 1 && o->request.aggressor_pages != 8) ||
++	    (o->request.aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR && o->request.aggressor_pages != 1) ||
++	    (o->request.victim_chunk_bytes != 64 && o->request.victim_chunk_bytes != 1024 &&
++	     o->request.victim_chunk_bytes != 4096) || o->request.aggressor_chunk_bytes != 4096 ||
++	    !o->request.run_timeout_ms || o->request.run_timeout_ms > 300000) {
++		snprintf(error, size, "arguments exceed the fixed P0 matrix");
++		return -1;
++	}
++	return 0;
++}
++
++static void string(const char *s)
++{
++	const unsigned char *p = (const unsigned char *)s;
++	putchar('"');
++	for (; *p; p++) {
++		if (*p == '"' || *p == '\\')
++			printf("\\%c", *p);
++		else if (*p < 0x20)
++			printf("\\u%04x", *p);
++		else
++			putchar(*p);
++	}
++	putchar('"');
++}
++
++static void number(const char *key, uint64_t value)
++{
++	printf("\"%s\":%" PRIu64, key, value);
++}
++
++static void stats(const struct idma_experiment_stats *s, int started, int hpm)
++{
++	putchar('{');
++#define STAT(name) do { number(#name, s->name); } while (0)
++	if (started) {
++		STAT(submitted); putchar(','); STAT(completed); putchar(','); STAT(completed_bytes);
++		putchar(','); STAT(active_cycles);
++	} else {
++		printf("\"submitted\":null,\"completed\":null,\"completed_bytes\":null,\"active_cycles\":null");
++	}
++	if (started && hpm) {
++		putchar(','); STAT(iotlb_miss); putchar(','); STAT(s1_ptw); putchar(','); STAT(s2_ptw);
++	} else {
++		printf(",\"iotlb_miss\":null,\"s1_ptw\":null,\"s2_ptw\":null");
++	}
++	printf(",\"refill_gap_ns_sum\":null,\"refill_gap_ns_max\":null,\"refill_gap_samples\":null,"
++	       "\"in_flight_at_start\":null,\"in_flight_at_end\":null,");
++	STAT(data_errors); putchar(','); STAT(quarantined); putchar('}');
++#undef STAT
++}
++
++static void print_result(const struct idma_p0_experiment *r)
++{
++	printf("{\"abi_version\":%u,\"struct_size\":%u,\"status\":%d,\"victim_did\":%u,\"aggressor_did\":",
++	       r->abi_version, r->struct_size, r->status, r->victim_did);
++	if (r->aggressor_did == IDMA_EXPERIMENT_NO_AGGRESSOR) printf("null");
++	else printf("%u", r->aggressor_did);
++	printf(",\"hpm_configured\":%u,\"measurement_started\":%u,\"measurement_complete\":%u,",
++	       r->hpm_configured, r->measurement_started, r->measurement_complete);
++#define RESULT(name) do { number(#name, r->name); putchar(','); } while (0)
++	RESULT(victim_elapsed_ns); RESULT(snapshot_before_ns); RESULT(snapshot_after_ns); RESULT(drain_ns);
++#undef RESULT
++	printf("\"victim\":"); stats(&r->victim, r->measurement_started, r->hpm_configured);
++	printf(",\"aggressor\":");
++	if (r->aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR) printf("null");
++	else stats(&r->aggressor, r->measurement_started, r->hpm_configured);
++	putchar('}');
++}
++
++static int validate_caps(const struct idma_p0_caps *c, const struct options *o)
++{
++	unsigned int i;
++	uint32_t required = IDMA_EXPERIMENT_CAP_DID_HPM | IDMA_EXPERIMENT_CAP_HW_BATCH;
++	if (c->abi_version != 2 || c->struct_size != sizeof(*c) || c->device_id != 0 || c->did != 10 ||
++	    c->batch_magic != IDMA_P0_BATCH_MAGIC || c->page_bytes != 4096 || c->max_pages < 8 ||
++	    (c->capabilities & required) != required || c->victim_length_mask != 7 ||
++	    c->aggressor_length_mask != IDMA_P0_LENGTH_4096 ||
++	    c->geometry_mask != IDMA_P0_GEOMETRY_MASK_PACKED_RING ||
++	    c->max_run_timeout_ms < o->request.run_timeout_ms)
++		return -1;
++	for (i = 0; i < sizeof(c->reserved) / sizeof(c->reserved[0]); i++)
++		if (c->reserved[i]) return -1;
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	struct options o = {.device = "/dev/idma0", .request = {
++		.abi_version = IDMA_P0_ABI, .struct_size = sizeof(struct idma_p0_experiment),
++		.aggressor_id = IDMA_EXPERIMENT_NO_AGGRESSOR, .victim_pages = 1, .aggressor_pages = 1,
++		.victim_chunk_bytes = 4096, .aggressor_chunk_bytes = 4096,
++		.run_timeout_ms = 60000, .geometry = IDMA_P0_GEOMETRY_PACKED_RING,
++		.victim_transfers = 4096, .warmup_transfers = 256}};
++	struct idma_p0_experiment r = {0};
++	struct idma_p0_caps c = {0};
++	const char *stage = "arguments";
++	char error[256] = "";
++	int fd = -1, rc, saved_errno = 0, success = 0, have_caps = 0, have_result = 0, attempted = 0, i;
++
++	rc = parse(argc, argv, &o, error, sizeof(error));
++	if (rc > 0) return EXIT_SUCCESS;
++	if (rc < 0) goto done;
++	stage = "open";
++	fd = open(o.device, O_RDWR | O_CLOEXEC);
++	if (fd < 0) goto syscall_error;
++	stage = "capabilities";
++	rc = ioctl(fd, IDMA_IOC_CAPS_P0, &c);
++	if (rc < 0) goto syscall_error;
++	have_caps = 1;
++	if (rc || validate_caps(&c, &o)) {
++		snprintf(error, sizeof(error), "P0 capabilities/version/BTC2 mismatch"); goto done;
++	}
++	if (o.caps_only) { success = 1; goto done; }
++	stage = "run"; r = o.request; attempted = 1;
++	/* A negative return may already have issued DMA. Never retry on EINTR. */
++	rc = ioctl(fd, IDMA_IOC_RUN_BATCH_P0, &r);
++	saved_errno = rc < 0 ? errno : 0;
++	have_result = rc >= 0 || r.status < 0;
++	if (rc < 0) {
++		snprintf(error, sizeof(error), "P0 run ioctl: %s", strerror(saved_errno)); goto done;
++	}
++	if (rc || r.abi_version != 2 || r.struct_size != sizeof(r) || r.status ||
++	    memcmp(&r, &o.request, offsetof(struct idma_p0_experiment, status)) ||
++	    r.victim.data_errors || r.victim.quarantined || r.aggressor.data_errors || r.aggressor.quarantined ||
++	    r.hpm_configured != 1 || r.measurement_started != 1 || r.measurement_complete != 1 ||
++	    !r.victim_elapsed_ns || r.victim_did != c.did || r.victim.completed != 4096 ||
++	    r.victim.submitted != 4096 || r.victim.completed_bytes != 4096ULL * o.request.victim_chunk_bytes ||
++	    (o.request.aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR ?
++	     r.aggressor_did != IDMA_EXPERIMENT_NO_AGGRESSOR :
++	     (r.aggressor_did != 11 || !r.aggressor.completed || r.aggressor.completed != r.aggressor.submitted ||
++	      r.aggressor.completed > UINT64_MAX / 4096 || r.aggressor.completed_bytes != r.aggressor.completed * 4096))) {
++		snprintf(error, sizeof(error), "P0 result ABI/status/data/drain/work mismatch"); goto done;
++	}
++	success = 1; goto done;
++syscall_error:
++	saved_errno = errno;
++	snprintf(error, sizeof(error), "%s: %s", stage, strerror(saved_errno));
++done:
++	if (fd >= 0 && close(fd) < 0 && success) {
++		saved_errno = errno; success = 0; snprintf(error, sizeof(error), "close: %s", strerror(saved_errno));
++	}
++	printf("{\"schema\":\"idma.batch.p0.v2\",\"success\":%s,\"stage\":", success ? "true" : "false");
++	string(stage); printf(",\"errno\":%d,\"error\":", saved_errno);
++	if (*error) string(error); else printf("null");
++	printf(",\"run_attempted\":%s,\"argv\":[", attempted ? "true" : "false");
++	for (i = 0; i < argc; i++) { if (i) putchar(','); string(argv[i]); }
++	printf("],\"input\":{\"device\":"); string(o.device);
++	printf(",\"caps_only\":%s,\"abi_version\":2,\"struct_size\":%zu,\"flags\":0,\"aggressor_id\":",
++	       o.caps_only ? "true" : "false", sizeof(o.request));
++	if (o.request.aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR) printf("null"); else printf("%u", o.request.aggressor_id);
++	printf(",\"victim_pages\":1,\"aggressor_pages\":%u,\"victim_chunk_bytes\":%u,"
++	       "\"aggressor_chunk_bytes\":%u,\"run_timeout_ms\":%u,\"geometry\":1,\"victim_transfers\":4096,"
++	       "\"warmup_transfers\":256,\"reserved\":[0,0,0,0,0,0]},\"capabilities\":",
++	       o.request.aggressor_pages, o.request.victim_chunk_bytes, o.request.aggressor_chunk_bytes, o.request.run_timeout_ms);
++	if (!have_caps) printf("null");
++	else printf("{\"abi_version\":%u,\"struct_size\":%u,\"flags\":%u,\"device_id\":%u,\"did\":%u,"
++		    "\"batch_magic\":%llu,\"page_bytes\":%u,\"max_pages\":%u,\"max_run_timeout_ms\":%u,"
++		    "\"victim_length_mask\":%u,\"aggressor_length_mask\":%u,\"geometry_mask\":%u,\"reserved\":[%u,%u,%u]}",
++		    c.abi_version,c.struct_size,c.capabilities,c.device_id,c.did,
++		    (unsigned long long)c.batch_magic,c.page_bytes,c.max_pages,c.max_run_timeout_ms,
++		    c.victim_length_mask,c.aggressor_length_mask,c.geometry_mask,c.reserved[0],c.reserved[1],c.reserved[2]);
++	printf(",\"result\":"); if (have_result) print_result(&r); else printf("null");
++	printf(",\"semantics\":{\"supply\":\"hardware batch; packed ring with independent lane length\","
++	       "\"counter_window\":\"non-atomic HPM software brackets\","
++	       "\"aggressor_completed\":\"whole A batch including startup/final drain, not V-window throughput\","
++	       "\"hardware_time\":\"matched observer, not victim_elapsed_ns\",\"refill_gap_ns\":\"not sampled\"}}\n");
++	return success ? EXIT_SUCCESS : EXIT_FAILURE;
++}
+diff --git a/cva6 b/cva6
+index 8aac3fc..8aeb9ac 160000
+--- a/cva6
++++ b/cva6
+@@ -1 +1 @@
+-Subproject commit 8aac3fcd345af7686a55af1867783fd6b91a0069
++Subproject commit 8aeb9ac9b3aea82a975cc789cb47633fb29bf5c8
+diff --git a/sources.lock.json b/sources.lock.json
+index 927f0b0..355ca33 100644
+--- a/sources.lock.json
++++ b/sources.lock.json
+@@ -3,7 +3,7 @@
+   "components": [
+     {
+       "path": "cva6",
+-      "commit": "8aac3fcd345af7686a55af1867783fd6b91a0069",
++      "commit": "8aeb9ac9b3aea82a975cc789cb47633fb29bf5c8",
+       "upstream": "https://github.com/zero-day-labs/cva6.git",
+       "legacy_head": "3e409badcca73d786b510319ef09444fbdf3a731"
+     },

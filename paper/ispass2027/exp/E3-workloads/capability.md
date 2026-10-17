@@ -1,5 +1,8 @@
 # E3 三类流量：实际 pathv3 接口能力核查
 
+> 此页核查原pathv3，不把后来P0能力倒填旧版本。后续用户已批准仅P0最小driver/RTL修改与45点；
+> 当前实现、有限验证与构建状态见 [p0-implementation.md](p0-implementation.md)，新板测仍未完成。
+
 ## Material Passport
 
 - 类型：代码能力核查与主机参数验证；不是实验结果或性能测量。

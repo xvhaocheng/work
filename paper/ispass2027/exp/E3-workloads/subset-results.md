@@ -1,4 +1,4 @@
-# E3 DS0 小子集：依修改邊界停止，未產生新測量
+# E3 DS0 小子集：P0已批准並準備中，未產生新測量
 
 ## Material Passport
 
@@ -8,8 +8,9 @@
 - Verification Status: UNVERIFIED
 - Version Label: E3-subset-blocked-v1
 
-**一句話初判：目前無法判斷原始DS0硬體上小傳輸的翻譯干擾是否明顯大於4KiB，
-因為既有batch CLI、driver與RTL均限制4KiB，且V/A共用chunk，指定的64B/1KiB對4KiB條件沒有執行。**
+**一句話初判：目前仍無法判斷DS0小傳輸的干擾是否大於4KiB，45點尚未執行。**
+原pathv3確受4096B與共享chunk限制；後續已批准的P0改動及有限主機／RTL驗證已完成小批，
+正在構建獨立BIT並等待最終共同Linux，見[p0-implementation.md](p0-implementation.md)。
 
 | 指定V descriptor | Solo | A1（4KiB） | A8（4KiB） |
 | --- | --- | --- | --- |
@@ -18,8 +19,8 @@
 | 4KiB | 未執行，0/5 | 未執行，0/5 | 未執行，0/5 |
 
 本輪新板測0次；沒有為了湊子集而單獨重跑可用4KiB點。未觸碰UART、JTAG、SD，
-未改動driver或RTL，也未把軟體供給模式當batch模式。
-停止依據是使用者原文：「只改測試程序，不改內核驅動和RTL，確需修改時寫change-request.md並停下」。
+最初階段未改動driver或RTL，後續P0最小修改已有明確授權；始終未把軟體供給模式當batch模式。
+最初停止依據是使用者原文：「只改測試程序，不改內核驅動和RTL，確需修改時寫change-request.md並停下」。
 見 [能力證據](capability.md) 與 [具體變更請求](change-request.md)。
 Root可審查的P0最小修改選項已補在 [p0-change-option.md](p0-change-option.md)；
 方案不是已實作能力，也沒有解除本輪未測狀態。
