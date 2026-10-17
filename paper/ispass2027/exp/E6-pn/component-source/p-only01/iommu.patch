@@ -1,0 +1,182 @@
+From d2a813d67bcfd0295d8934c3cc027d24d3195d63 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sun, 18 Oct 2026 02:34:27 +0900
+Subject: [PATCH] Add optional fixed two-way IOTLB partition and local PLRU
+ history
+
+---
+ rtl/translation_logic/rv_iommu_iotlb.sv   | 71 +++++++++++++++++++----
+ rtl/translation_logic/rv_iommu_tl_wrap.sv | 14 +++++
+ 2 files changed, 75 insertions(+), 10 deletions(-)
+
+diff --git a/rtl/translation_logic/rv_iommu_iotlb.sv b/rtl/translation_logic/rv_iommu_iotlb.sv
+index 9cd819a..fdb6350 100644
+--- a/rtl/translation_logic/rv_iommu_iotlb.sv
++++ b/rtl/translation_logic/rv_iommu_iotlb.sv
+@@ -22,13 +22,17 @@
+ 
+ module rv_iommu_iotlb #(
+     /// RISC-V IOMMU configuration struct
+-    parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg
++    parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
++    parameter bit PolicyEnable = 0,
++    parameter bit PartitionLocalHistory = 0
+ )(
+     input  logic                        clk_i,
+     input  logic                        rst_ni,
+ 
+     // Flush
+     input  rv_iommu::iotlb_inval_t      inval_i,
++    input  logic                        policy_clear_i,
++    input  logic [RVIOMMUCfg.NumIotlbEntries-1:0] policy_mask_i,
+ 
+     // Update
+     input  rv_iommu::iotlb_up_t         update_i,
+@@ -201,7 +205,10 @@ module rv_iommu_iotlb #(
+                 |1 |1 |0   |    Invalidate all entries corresponding to the IOVA in ADDR field, associated to the VM identified by GSCID, including those with G=1
+                 |1 |1 |1   |    Invalidate all entries corresponding to the IOVA in ADDR field, for the VM address space identified by GSCID and PSCID.
+             */
+-            if(inval_i.inval_vma) begin
++            if (PolicyEnable && policy_clear_i) begin
++                tags_n[i].valid = 1'b0;
++            end
++            else if(inval_i.inval_vma) begin
+                 unique case ({inval_i.gv, inval_i.av, inval_i.pscv})
+                     3'b000: begin
+                         // all host address space entries are flushed
+@@ -325,6 +332,40 @@ module rv_iommu_iotlb #(
+     //-----------------------------------------------
+     logic[(RVIOMMUCfg.NumIotlbEntries-2):0] plru_tree_q, plru_tree_n;
+ 
++    function automatic logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] history_nodes(
++        input logic [RVIOMMUCfg.NumIotlbEntries-1:0] owners
++    );
++        logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] nodes;
++        nodes = '0;
++        for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++)
++            nodes[RVIOMMUCfg.NumIotlbEntries-1+i] = owners[i];
++        for (int i = RVIOMMUCfg.NumIotlbEntries-2; i >= 0; i--)
++            nodes[i] = nodes[2*i+1] | nodes[2*i+2];
++        return nodes;
++    endfunction
++
++    localparam logic [RVIOMMUCfg.NumIotlbEntries-1:0] ProtectedWays =
++        RVIOMMUCfg.NumIotlbEntries'(16'h0003);
++    localparam logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] ProtectedNodes =
++        history_nodes(ProtectedWays);
++    localparam logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] BackgroundNodes =
++        history_nodes(~ProtectedWays);
++    logic partition_local_active;
++    assign partition_local_active = PartitionLocalHistory && PolicyEnable &&
++        RVIOMMUCfg.NumIotlbEntries == 16 &&
++        ((policy_mask_i == ProtectedWays) || (policy_mask_i == ~ProtectedWays));
++
++    logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] eligible_nodes;
++    logic [RVIOMMUCfg.NumIotlbEntries-1:0] allocation_mask;
++    assign allocation_mask = PolicyEnable ? policy_mask_i : '1;
++    always_comb begin
++        eligible_nodes = '0;
++        for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++)
++            eligible_nodes[RVIOMMUCfg.NumIotlbEntries-1+i] = allocation_mask[i];
++        for (int i = RVIOMMUCfg.NumIotlbEntries-2; i >= 0; i--)
++            eligible_nodes[i] = eligible_nodes[2*i+1] | eligible_nodes[2*i+2];
++    end
++
+     always_comb begin : plru_replacement
+         plru_tree_n = plru_tree_q;
+         
+@@ -339,13 +380,21 @@ module rv_iommu_iotlb #(
+                     idx_base = $unsigned((2**lvl)-1);
+                     shift = $clog2(RVIOMMUCfg.NumIotlbEntries) - lvl;
+                     new_index =  ~((i >> (shift-1)) & 32'b1);
+-                    plru_tree_n[idx_base + (i >> shift)] = new_index[0];
++                    // A hit owns the history of its resident way, independent
++                    // of the main request's current fill mask.
++                    if (!partition_local_active ||
++                        (i < 2 ?
++                         (ProtectedNodes[2*(idx_base + (i >> shift))+1] &&
++                          ProtectedNodes[2*(idx_base + (i >> shift))+2]) :
++                         (BackgroundNodes[2*(idx_base + (i >> shift))+1] &&
++                          BackgroundNodes[2*(idx_base + (i >> shift))+2])))
++                        plru_tree_n[idx_base + (i >> shift)] = new_index[0];
+                 end
+             end
+         end
+ 
+         for (int unsigned i = 0; i < RVIOMMUCfg.NumIotlbEntries; i += 1) begin
+-            automatic logic en;
++            automatic logic en, choose_right;
+             automatic int unsigned idx_base, shift, new_index;
+             en = 1'b1;
+ 
+@@ -353,14 +402,16 @@ module rv_iommu_iotlb #(
+                 idx_base = $unsigned((2**lvl)-1);
+                 shift = $clog2(RVIOMMUCfg.NumIotlbEntries) - lvl;
+                 new_index =  (i >> (shift-1)) & 32'b1;
+-                if (new_index[0]) begin
+-                    en &= plru_tree_q[idx_base + (i>>shift)];
+-                end else begin
+-                    en &= ~plru_tree_q[idx_base + (i>>shift)];
+-                end
++                // Full mask follows exactly the original tree-PLRU bits.
++                choose_right = eligible_nodes[2*(idx_base + (i>>shift))+2] &&
++                    (!eligible_nodes[2*(idx_base + (i>>shift))+1] ||
++                     plru_tree_q[idx_base + (i>>shift)]);
++                if (new_index[0]) en &= choose_right;
++                else en &= ~choose_right;
+             end
+-            replace_en[i] = en;
++            replace_en[i] = en && allocation_mask[i];
+         end
++        if (PolicyEnable && policy_clear_i) plru_tree_n = '0;
+     end
+ 
+     // sequential process
+diff --git a/rtl/translation_logic/rv_iommu_tl_wrap.sv b/rtl/translation_logic/rv_iommu_tl_wrap.sv
+index 41be6e1..621789a 100644
+--- a/rtl/translation_logic/rv_iommu_tl_wrap.sv
++++ b/rtl/translation_logic/rv_iommu_tl_wrap.sv
+@@ -25,6 +25,7 @@ module rv_iommu_tl_wrap
+ #(
+     /// RISC-V IOMMU configuration struct
+     parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
++    parameter bit PolicyEnable = 0,
+ 
+     /// Address data type
+     parameter type addr_t = logic,
+@@ -52,6 +53,11 @@ module rv_iommu_tl_wrap
+     input  logic    clk_i,
+     input  logic    rst_ni,
+ 
++    // E6-PN P only: the wrapper must apply these controls at full quiet.
++    // Defaults keep existing callers on the original full-mask path.
++    input  logic    policy_partition_i = 1'b0,
++    input  logic    policy_clear_i = 1'b0,
++
+     // Transaction controller request port
+     input  trans_req_data_t     trans_req_data_i,
+     input  logic                trans_req_valid_i,
+@@ -542,12 +548,20 @@ module rv_iommu_tl_wrap
+     // IO Translation Look-aside Buffer
+     //----------------------------------
+     rv_iommu_iotlb #(
++        .PolicyEnable  (PolicyEnable),
++        .PartitionLocalHistory(PolicyEnable),
+         .RVIOMMUCfg     (RVIOMMUCfg)
+     ) i_rv_iommu_iotlb (
+         .clk_i          (clk_i),
+         .rst_ni         (rst_ni),
+ 
+         .inval_i        (iotinval_i),
++        .policy_clear_i (PolicyEnable && policy_clear_i),
++        // The stable main PTW/MSI request owns the fill, never a probe.
++        .policy_mask_i  (PolicyEnable && policy_partition_i ?
++            (req_data.did == 24'd10 ?
++             RVIOMMUCfg.NumIotlbEntries'(16'h0003) :
++             RVIOMMUCfg.NumIotlbEntries'(16'hfffc)) : '1),
+ 
+         .update_i       (iotlb_update),
+ 
+-- 
+2.34.1
+

@@ -1,0 +1,70 @@
+{
+  "scope": "finite real IOTLB DUT only; no TL/backend/FPGA/board evidence",
+  "gold_commit": "85b157ebe71a623e326e51fff7b7126fe77e8eb9",
+  "gold_original_sha256": "1e9cb1ba68c39a0a47b1ffd2b7cb2da3a7161237dc73997be0d8d4b8fcd3e209",
+  "gold_transform": "module declaration identifier only: rv_iommu_iotlb -> rv_iommu_iotlb_gold",
+  "candidate_head": "85b157ebe71a623e326e51fff7b7126fe77e8eb9",
+  "candidate_dirty_diff": "diff --git a/rtl/translation_logic/rv_iommu_iotlb.sv b/rtl/translation_logic/rv_iommu_iotlb.sv\nindex 9cd819a..fdb6350 100644\n--- a/rtl/translation_logic/rv_iommu_iotlb.sv\n+++ b/rtl/translation_logic/rv_iommu_iotlb.sv\n@@ -22,13 +22,17 @@\n \n module rv_iommu_iotlb #(\n     /// RISC-V IOMMU configuration struct\n-    parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg\n+    parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,\n+    parameter bit PolicyEnable = 0,\n+    parameter bit PartitionLocalHistory = 0\n )(\n     input  logic                        clk_i,\n     input  logic                        rst_ni,\n \n     // Flush\n     input  rv_iommu::iotlb_inval_t      inval_i,\n+    input  logic                        policy_clear_i,\n+    input  logic [RVIOMMUCfg.NumIotlbEntries-1:0] policy_mask_i,\n \n     // Update\n     input  rv_iommu::iotlb_up_t         update_i,\n@@ -201,7 +205,10 @@ module rv_iommu_iotlb #(\n                 |1 |1 |0   |    Invalidate all entries corresponding to the IOVA in ADDR field, associated to the VM identified by GSCID, including those with G=1\n                 |1 |1 |1   |    Invalidate all entries corresponding to the IOVA in ADDR field, for the VM address space identified by GSCID and PSCID.\n             */\n-            if(inval_i.inval_vma) begin\n+            if (PolicyEnable && policy_clear_i) begin\n+                tags_n[i].valid = 1'b0;\n+            end\n+            else if(inval_i.inval_vma) begin\n                 unique case ({inval_i.gv, inval_i.av, inval_i.pscv})\n                     3'b000: begin\n                         // all host address space entries are flushed\n@@ -325,6 +332,40 @@ module rv_iommu_iotlb #(\n     //-----------------------------------------------\n     logic[(RVIOMMUCfg.NumIotlbEntries-2):0] plru_tree_q, plru_tree_n;\n \n+    function automatic logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] history_nodes(\n+        input logic [RVIOMMUCfg.NumIotlbEntries-1:0] owners\n+    );\n+        logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] nodes;\n+        nodes = '0;\n+        for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++)\n+            nodes[RVIOMMUCfg.NumIotlbEntries-1+i] = owners[i];\n+        for (int i = RVIOMMUCfg.NumIotlbEntries-2; i >= 0; i--)\n+            nodes[i] = nodes[2*i+1] | nodes[2*i+2];\n+        return nodes;\n+    endfunction\n+\n+    localparam logic [RVIOMMUCfg.NumIotlbEntries-1:0] ProtectedWays =\n+        RVIOMMUCfg.NumIotlbEntries'(16'h0003);\n+    localparam logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] ProtectedNodes =\n+        history_nodes(ProtectedWays);\n+    localparam logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] BackgroundNodes =\n+        history_nodes(~ProtectedWays);\n+    logic partition_local_active;\n+    assign partition_local_active = PartitionLocalHistory && PolicyEnable &&\n+        RVIOMMUCfg.NumIotlbEntries == 16 &&\n+        ((policy_mask_i == ProtectedWays) || (policy_mask_i == ~ProtectedWays));\n+\n+    logic [2*RVIOMMUCfg.NumIotlbEntries-2:0] eligible_nodes;\n+    logic [RVIOMMUCfg.NumIotlbEntries-1:0] allocation_mask;\n+    assign allocation_mask = PolicyEnable ? policy_mask_i : '1;\n+    always_comb begin\n+        eligible_nodes = '0;\n+        for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++)\n+            eligible_nodes[RVIOMMUCfg.NumIotlbEntries-1+i] = allocation_mask[i];\n+        for (int i = RVIOMMUCfg.NumIotlbEntries-2; i >= 0; i--)\n+            eligible_nodes[i] = eligible_nodes[2*i+1] | eligible_nodes[2*i+2];\n+    end\n+\n     always_comb begin : plru_replacement\n         plru_tree_n = plru_tree_q;\n         \n@@ -339,13 +380,21 @@ module rv_iommu_iotlb #(\n                     idx_base = $unsigned((2**lvl)-1);\n                     shift = $clog2(RVIOMMUCfg.NumIotlbEntries) - lvl;\n                     new_index =  ~((i >> (shift-1)) & 32'b1);\n-                    plru_tree_n[idx_base + (i >> shift)] = new_index[0];\n+                    // A hit owns the history of its resident way, independent\n+                    // of the main request's current fill mask.\n+                    if (!partition_local_active ||\n+                        (i < 2 ?\n+                         (ProtectedNodes[2*(idx_base + (i >> shift))+1] &&\n+                          ProtectedNodes[2*(idx_base + (i >> shift))+2]) :\n+                         (BackgroundNodes[2*(idx_base + (i >> shift))+1] &&\n+                          BackgroundNodes[2*(idx_base + (i >> shift))+2])))\n+                        plru_tree_n[idx_base + (i >> shift)] = new_index[0];\n                 end\n             end\n         end\n \n         for (int unsigned i = 0; i < RVIOMMUCfg.NumIotlbEntries; i += 1) begin\n-            automatic logic en;\n+            automatic logic en, choose_right;\n             automatic int unsigned idx_base, shift, new_index;\n             en = 1'b1;\n \n@@ -353,14 +402,16 @@ module rv_iommu_iotlb #(\n                 idx_base = $unsigned((2**lvl)-1);\n                 shift = $clog2(RVIOMMUCfg.NumIotlbEntries) - lvl;\n                 new_index =  (i >> (shift-1)) & 32'b1;\n-                if (new_index[0]) begin\n-                    en &= plru_tree_q[idx_base + (i>>shift)];\n-                end else begin\n-                    en &= ~plru_tree_q[idx_base + (i>>shift)];\n-                end\n+                // Full mask follows exactly the original tree-PLRU bits.\n+                choose_right = eligible_nodes[2*(idx_base + (i>>shift))+2] &&\n+                    (!eligible_nodes[2*(idx_base + (i>>shift))+1] ||\n+                     plru_tree_q[idx_base + (i>>shift)]);\n+                if (new_index[0]) en &= choose_right;\n+                else en &= ~choose_right;\n             end\n-            replace_en[i] = en;\n+            replace_en[i] = en && allocation_mask[i];\n         end\n+        if (PolicyEnable && policy_clear_i) plru_tree_n = '0;\n     end\n \n     // sequential process\ndiff --git a/rtl/translation_logic/rv_iommu_tl_wrap.sv b/rtl/translation_logic/rv_iommu_tl_wrap.sv\nindex 41be6e1..621789a 100644\n--- a/rtl/translation_logic/rv_iommu_tl_wrap.sv\n+++ b/rtl/translation_logic/rv_iommu_tl_wrap.sv\n@@ -25,6 +25,7 @@ module rv_iommu_tl_wrap\n #(\n     /// RISC-V IOMMU configuration struct\n     parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,\n+    parameter bit PolicyEnable = 0,\n \n     /// Address data type\n     parameter type addr_t = logic,\n@@ -52,6 +53,11 @@ module rv_iommu_tl_wrap\n     input  logic    clk_i,\n     input  logic    rst_ni,\n \n+    // E6-PN P only: the wrapper must apply these controls at full quiet.\n+    // Defaults keep existing callers on the original full-mask path.\n+    input  logic    policy_partition_i = 1'b0,\n+    input  logic    policy_clear_i = 1'b0,\n+\n     // Transaction controller request port\n     input  trans_req_data_t     trans_req_data_i,\n     input  logic                trans_req_valid_i,\n@@ -542,12 +548,20 @@ module rv_iommu_tl_wrap\n     // IO Translation Look-aside Buffer\n     //----------------------------------\n     rv_iommu_iotlb #(\n+        .PolicyEnable  (PolicyEnable),\n+        .PartitionLocalHistory(PolicyEnable),\n         .RVIOMMUCfg     (RVIOMMUCfg)\n     ) i_rv_iommu_iotlb (\n         .clk_i          (clk_i),\n         .rst_ni         (rst_ni),\n \n         .inval_i        (iotinval_i),\n+        .policy_clear_i (PolicyEnable && policy_clear_i),\n+        // The stable main PTW/MSI request owns the fill, never a probe.\n+        .policy_mask_i  (PolicyEnable && policy_partition_i ?\n+            (req_data.did == 24'd10 ?\n+             RVIOMMUCfg.NumIotlbEntries'(16'h0003) :\n+             RVIOMMUCfg.NumIotlbEntries'(16'hfffc)) : '1),\n \n         .update_i       (iotlb_update),\n \n",
+  "command": [
+    "/home/xvhaocheng/work/iommu-platform/out/stage117-real-cache-handoff-20261013/implementation/toolchain/verilator-5.040/bin/verilator",
+    "--cc",
+    "--exe",
+    "--build",
+    "-j",
+    "2",
+    "-Wall",
+    "-Wno-fatal",
+    "--top-module",
+    "p_iotlb_top",
+    "--Mdir",
+    "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/obj",
+    "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/rv_iommu_reg_pkg.sv",
+    "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/rv_iommu_cfg_pkg.sv",
+    "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/rv_iommu_pkg.sv",
+    "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/rv_iommu_iotlb.sv",
+    "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/rv_iommu_iotlb_gold.sv",
+    "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/p_iotlb_top.sv",
+    "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/p_iotlb_test.cpp"
+  ],
+  "version": "Verilator 5.040 2025-08-30 rev UNKNOWN.REV (mod)",
+  "inputs": [
+    {
+      "path": "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/rv_iommu_reg_pkg.sv",
+      "sha256": "2221745f2bd214db1d100edede18737a044125c59a83c318de72db8664c5bb43"
+    },
+    {
+      "path": "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/rv_iommu_cfg_pkg.sv",
+      "sha256": "03602d3860afc93c3e9bd434660184a571f07425f51f62a53cd224ffda8b6776"
+    },
+    {
+      "path": "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/rv_iommu_pkg.sv",
+      "sha256": "25f41642ab1d6322e8b9c52c09a0e770a4bfad28bb8c684f148bf1dc03c6b1d2"
+    },
+    {
+      "path": "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/rv_iommu_iotlb.sv",
+      "sha256": "ce4cb18c6cae36eaf81595eb90728978649651032c34ed9165f818eff12e660e"
+    },
+    {
+      "path": "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/rv_iommu_iotlb_gold.sv",
+      "sha256": "22dc2d9effd8abac39aa20089d493c5c824be34618f3c2f128807537bb1a1be5"
+    },
+    {
+      "path": "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/p_iotlb_top.sv",
+      "sha256": "c26c6fec8c81cb47a2223c6720fca03c4e70a5543c613a8fd2fe4d3b5e5a5c07"
+    },
+    {
+      "path": "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/source/p_iotlb_test.cpp",
+      "sha256": "7b4008b526f3f8ab06d252008e4c66d52bbfe63e3bb4656ca0d436ea00c4b88f"
+    }
+  ],
+  "build_timeout_s": 180,
+  "run_timeout_s": 30,
+  "build_exit": 1,
+  "status": "failed_build",
+  "elapsed_s": 0.0638797739520669,
+  "build.log": {
+    "path": "/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/p-iotlb01/build.log",
+    "bytes": 3376,
+    "sha256": "68cc26936073143b8322741bf835837387836fdbc8c5de427ae825aaa7aa69a2"
+  }
+}
