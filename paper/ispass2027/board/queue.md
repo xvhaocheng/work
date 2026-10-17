@@ -12,13 +12,15 @@
 
 ## 当前资源与顺序
 
-板卡已通过本轮 UART 身份命令确认仍为 DS50 + `6.5.0-rc2-ispass2027-pathv3`，boot `b1eaa85f-01d7-4976-9dac-b57cc8af49b7`、taint=0，四个 DMA 节点齐全；原始回执见 `runs/root-a-current-identity01/`。最后有效 load 为主工作区 `board/runs/baseline100-20261017-01/ds50-last-load/load.json`；未切换 BIT。两个已有 DS 构建均由原调度进程继续运行，Root A 接续，不重复启动。
+DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”在12:53:13Z已启动同身份DS25→DS100，共100次；当前DS25正在启动旧pathv3。Root本地12:56:37Z启动被UART锁在触硬件前拒绝，失败目录原样保留，不再启动替代任务。用户已明确授权联系该会话并统一排程，协调消息已送达：原campaign继续两档100次，随后保持DS100交还板卡，不自行写SD或加测。
+
+唯一活动campaign为 `/home/xvhaocheng/work/paper/ispass2027/board/runs/ds-sweep-20261017-01/`，launch为同级`ds-sweep-20261017-01-launch/`；Root只读其稳定records冻结本任务快照。Root被锁拒绝的记录在本worktree `runs/ds-sweep-campaign-launch01/`及`runs/ds-sweep-20261017-01/`，不计为已加载或性能试次。
 
 | 原优先级 | 任务 | 状态 | 采集规模 | 预计板时 / 条件 |
 | --- | --- | --- | --- | --- |
 | 1 | E3 DS0 小子集 | 用户已批准仅 P0 最小 driver/RTL、构建与45点；A2 分批实施 | 3 个 V 大小 × Solo/A1/A8 × 5 = 45 次 | 约45分钟采集，另需新构建；packed-ring，不扩三类完整形态 |
-| 2 | E1b DS25 | 构建运行中，A1 接续验收 | Solo/A1/A8/A16/A64 各 10 次 = 50 次 | 约 20–30 分钟，须 50MHz、WNS≥0、违例端点和 routing errors 全零 |
-| 3 | E1b DS100 | 构建运行中，A1 接续验收 | 同上 50 次 | 约 20–30 分钟，同一档集中完成；两档仅换 BIT，复用已写 pathv3 |
+| 2 | E1b DS25 | 验收通过；现有外部campaign在Root排程下运行 | Solo/A1/A8/A16/A64 各 10 次 = 50 次 | 约 20–30 分钟，须 50MHz、WNS≥0、违例端点和 routing errors 全零 |
+| 3 | E1b DS100 | 验收通过；等待DS25全50点完成后自动切换 | 同上 50 次 | 约 20–30 分钟，同一档集中完成；两档仅换 BIT，复用已写 pathv3 |
 | 4 | E2 DS0 设备数 | 四设备 HPM 软件批已审核通过；multi driver 分批接入 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
 | 5 | E3 DS0 论文子集 | A2 设计，运行包待能力核查 | 六种大小及三类流量组合的论文子集 | 用户上限 6 小时；以实际软件采集总时长估算 |
 | 6 | E4 DS0 页大小 | 已确认实验driver固定4KiB建图；change-request 待决定 | 4KiB 对 2MiB，各点 10 次，未测 | 需显式软件建图与实际leaf证据；本轮未实施 |

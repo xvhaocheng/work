@@ -13,8 +13,8 @@
 - 已创建独立 worktree `/home/xvhaocheng/work-root-a`，分支 `ispass/root-a`，起点 main `01f981a9c603fa909fdb2fb22450aa7c5197271f`。未切主目录分支，未改共享汇总文件。
 - 已分派 A1 接续 DS25/DS100 构建与 E1b 运行包、A2 准备 E3、A3 核查 E2/E5/E4/E6。子席按用户指定的 gpt-6.1-sol / ultra 启动；主会话保持当前模型，不切配置，遵守共享 IOMMU Codex-only；子 agent 不操作板。
 - 已审核并将三席的第一批准备分支合入 `ispass/root-a`：E1b 构建/采集/任务内长表，E3 原始能力证据与 P0 方案，E6 DS0 角色互换采集器。Root 工作树的17项调度/采集接口、6项独立长表、15项历史分析拒绝检查、14项角色采集协议检查实际通过；均为主机检查，不记为新板测。
-- 已发现并接续原有两个运行中的 DS 构建，输出在主工作区 `iommu-platform/out/ispass2027-20261017-ds25-01`、`...-ds100-01`；不重复构建、不改变其输入。验收尚未完成。
-- 已建立[唯一板测队列](../board/queue.md)。UART 身份回执确认板仍为 DS50/pathv3，boot `b1eaa85f-01d7-4976-9dac-b57cc8af49b7`、taint=0，四 DMA 节点齐全；未切 BIT、未执行新增性能测量。
+- 已发现并接续原有两个运行中的 DS 构建，输出在主工作区 `iommu-platform/out/ispass2027-20261017-ds25-01`、`...-ds100-01`；不重复构建、不改变其输入。现已验收通过：WNS均+0.177ns，WHS为+0.048/+0.045ns，WPWS均+0.062ns，setup/hold/pulse失败端点与routing errors均0，CPU 50MHz；delayer单元120/145。原始报告与binary清单已合入任务分支。
+- 已建立[唯一板测队列](../board/queue.md)。UART 身份回执确认板仍为 DS50/pathv3，boot `b1eaa85f-01d7-4976-9dac-b57cc8af49b7`、taint=0，四 DMA 节点齐全；该初始回执仅代表当时身份；随后发现独立DS会话在12:53:13Z已加载DS25启动旧pathv3。用户已授权联系该会话，由Root统一排程并接续其两档100次结果。本worktree12:56:37Z重复启动被UART锁在触硬件前拒绝，失败原样保留，不重启替代；任何时刻仍仅一个实际板任务。
 - 已整理历史统一100次的论文可用 PATH 数据：[逐试次阶段CSV](../exp/E5-latency/baseline100/trial-stages.csv)共1600行、160组，每组10试次。Root 从原始records重算，JSON和CSV完全一致；保留 count/sum/max、boot/sequence、配置和原始命令入口，不生成请求分位数。DS0 A8 的 V读stage1跨试次均值中位数为142.504517周期，最大观察值795周期；这是阶段统计，不是新板测或请求p99。
 
 ## 关键数字
@@ -41,4 +41,4 @@ P0 前端三处RTL变更已直接审查，79项有限真实frontend验证通过�
 
 最终仅推送任务分支。共享结果表的新增行由实验目录 CSV 提供，README/CURRENT_STATUS 更新建议在最终交接中列明；本会话不直接编辑这些共享文件，也不自行合 main。
 
-用户已明确允许实验途中持续同步**已采集、论文可用的数据**；逐试次数据、任务内统一CSV和阶段统计在有真实样本后分批提交，明确n及未完成条件，不等整轮结束。日志保留作追溯，不以推送日志冒充同步论文数据。准备分支已推送 `origin/ispass/root-a`；BIT/payload 留在本机。
+用户已明确允许实验途中持续同步**已采集、论文可用的数据**；逐试次数据、任务内统一CSV和阶段统计在有真实样本后分批提交，明确n及未完成条件，不等整轮结束。日志保留作追溯，不以推送日志冒充同步论文数据。准备分支已推送 `origin/ispass/root-a`；BIT/payload 留在本机。当前唯一活动DS campaign在主工作区`board/runs/ds-sweep-20261017-01/`，Root不改其活动文件，只在稳定边界冻结本任务CSV；原会话两档结束后保持DS100并交还板卡。
