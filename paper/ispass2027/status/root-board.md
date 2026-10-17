@@ -74,3 +74,5 @@ Linux65b427相对46df只改multi轮询合作点：N2/N3/N4每未完成轮请求c
 2026-10-17T15:27:48.209584+00:00：完整E3 collector修订afaa3ca已由Root接收，实跑30项实际入口模拟串口与独立self-consistent seq-gap拒绝通过；当前采集器SHA dc2802d0ff240dd0801a0db6f49bb7372ee4d71e45f43040b28f78ac4a3c7fcc冻结，均synthetic/0新板测。G Linux首批889f75b已审，Root实跑329项通过并直接核RV64异常表/单次ld/fence证据；独立RUN生命周期小批已放行准备，未编G Image。
 
 2026-10-17T15:33:13.632922+00:00：E3 P0图已完成，见exp/E3-workloads/figures/p0-main01（2张PDF/SVG/PNG，15配对/10对比；Root视觉检查和独立paper.csv/Fraction复算通过，9个输出字节相同重现）。45个原试次再利用、新增0；原producer脚本/图/manifest保留，当前plotter只许新output防覆盖。full-E3 exporter warmup_only标签修订已收，Root最新26项真实host入口检查passed，全synthetic/0新板测。
+
+2026-10-17T15:53:15.877878+00:00：Root已接收G RUN69d8小批并实跑1176 G/329 CAPS及旧38/57/97/416+6回归，MMIO与nonmulti yield摘要均保持；尚未编G Image，A1只准备严格CLI/builder下一批。E2 irq-diagnosis只读证据2cac260已由Root直接审关键源码和vmlinux EPC、独立重算40源/7样本及calculations原字节一致；确认timer重试/再入现象，AXI根因未证。后续仅默认off的原生counter诊断小批准备，未编诊断Image/未跑新E2。

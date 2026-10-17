@@ -88,3 +88,5 @@ full-E3 DS0唯一构建已于14:10:50Z启动，`exp/E3-workloads/artifacts/full-
 2026-10-17T15:33:13.633116+00:00：共同payload的唯一SD写入已成功（session.exit_code0）；同一部署正在加载原DS0/新内核，未开始90点。既定E2→E4/E5依赖队列保持，勿重复操作。P045两张离线论文图已验，原45不另计。full-E3 collector/exporter主机验收完成，FPGA尚未通过不能排实测。
 
 2026-10-17T15:48:04.863602+00:00：以上“当前资源与顺序”为最新，以下时间记录只保留历史；新旧E2部分样本不得当成完成90点。
+
+2026-10-17T15:53:15.877878+00:00：Root已接收G RUN69d8小批并实跑1176 G/329 CAPS及旧38/57/97/416+6回归，MMIO与nonmulti yield摘要均保持；尚未编G Image，A1只准备严格CLI/builder下一批。E2 irq-diagnosis只读证据2cac260已由Root直接审关键源码和vmlinux EPC、独立重算40源/7样本及calculations原字节一致；确认timer重试/再入现象，AXI根因未证。后续仅默认off的原生counter诊断小批准备，未编诊断Image/未跑新E2。
