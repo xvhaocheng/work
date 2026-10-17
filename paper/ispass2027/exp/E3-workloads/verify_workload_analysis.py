@@ -27,7 +27,7 @@ def main():
     assert result['source_cases']==150 and result['source_board_cases']==0 and not result['campaign_complete']
     assert result['fixture_plan_complete'] and len(result['rows'])==30 and {x['n'] for x in result['rows']}=={5}
     assert len(result['paired_comparisons'])==27 and {x['n'] for x in result['paired_comparisons']}=={5}
-    assert len(result['frozen_tools'])==4 and all(Path(v['path']) in observed for v in result['frozen_tools'].values())
+    assert len(result['frozen_tools'])==5 and all(Path(v['path']) in observed for v in result['frozen_tools'].values())
     checks.append('complete150 synthetic internally parsed from exact retained raw; 30 cells n5, 27 paired, zero board cases')
     csv_rows=analysis.long_rows(result,a.output/'not-published.json','internal-fixture')
     stream=io.StringIO(analysis.tables.csv_text(csv_rows));reader=csv.DictReader(stream);rows=list(reader)
@@ -58,8 +58,8 @@ def main():
     assert {x['n'] for x in partial['rows']}=={1} and partial['runtime_forecast']['estimated150_collection_seconds'] is not None
     index=json.loads((a.output/'internal-pilot-inputs/index.json').read_text())
     assert all(hashlib.sha256(Path(x['snapshot_path']).read_bytes()).hexdigest()==x['sha256']==hashlib.sha256(Path(x['original_path']).read_bytes()).hexdigest() for x in index)
-    assert len(index)==45 # manifest, records, six sources, 30 raw, four frozen tools, three analyzer sources
-    checks.append('actual internal entry snapshots exact30 prefix and all45 input/tool files; no input changes')
+    assert len(index)==46 # manifest, records, six sources, 30 raw, five frozen tools, three analyzer sources
+    checks.append('actual internal entry snapshots exact30 prefix and all46 input/tool files; no input changes')
     manifest=json.loads((continued/'manifest.json').read_text());records=json.loads((continued/'records.json').read_text())
     bound=manifest['sources'];backend=backend_evidence(*(bound[k]['path'] for k in ('p0_backend','long_backend','packet_backend')))
     one=copy.deepcopy(manifest);one.update(recorded_cases=1,status='partial_budget')
@@ -105,7 +105,7 @@ def main():
             assert message in str(e),str(e)
         else:raise AssertionError('accepted tamper: '+name)
         checks.append('read-only raw exporter rejects '+name)
-    for field in ('script_sha256','parser_sha256','geometry_model_sha256','hist_helper_sha256'):
+    for field in ('script_sha256','parser_sha256','geometry_model_sha256','hist_helper_sha256','software_profile_helper_sha256'):
         _,m,r=changed_case(field);m[field]='0'*64;reject(field,m,r,'frozen collector/parser/model/hist helper')
     for name in ('load','fpga','software','p0_backend','long_backend','packet_backend'):
         target,m,r=changed_case('source-'+name);path=target/'source.json';value=json.loads(Path(m['sources'][name]['path']).read_text())

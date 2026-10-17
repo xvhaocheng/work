@@ -16,10 +16,11 @@ HERE=Path(__file__).resolve().parent
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--CLI-report',type=Path,required=True)
-    p.add_argument('--p0-backend',type=Path,required=True);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
+    p.add_argument('--p0-backend',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--software-manifest',type=Path,default=HERE/'artifacts/full-e3-software01/build-manifest.json');a=p.parse_args()
     a.output.mkdir(parents=True,exist_ok=False);inputs=a.output/'inputs';inputs.mkdir()
     sources=a.output/'sources';sources.mkdir()
-    for name in ['collect_workload.py','workload_records.py','verify_workload_collector.py']:
+    for name in ['collect_workload.py','workload_records.py','workload_software_profiles.py','verify_workload_collector.py']:
         shutil.copyfile(HERE/name,sources/name)
     cli=json.loads(a.CLI_report.read_text());templates={}
     for x in cli['cases']:
@@ -28,11 +29,14 @@ def main():
             templates[key]=x['record']
     fpga=json.loads((HERE/'artifacts/full-e3-ds0-build01/build-manifest.json').read_text())
     fpga.update(status='passed',fixture_only=True,artifacts={'fixture.bit':'fixture-bit-only'})
-    software=json.loads((HERE/'artifacts/full-e3-software01/build-manifest.json').read_text());software['fixture_only']=True
-    loaded={'status':'boot_identity_verified','fixture_only':True,'kernel_release':collect.RELEASE,'boot_id':fixtures.BOOT,'bit_sha256':'fixture-bit-only'}
+    software_bytes=a.software_manifest.read_bytes();software=json.loads(software_bytes)
+    loaded={'status':'boot_identity_verified','fixture_only':True,'kernel_release':software['kernel_release'],'boot_id':fixtures.BOOT,'bit_sha256':'fixture-bit-only'}
     for name,d in [('fpga',fpga),('software',software),('load',loaded)]:
         (inputs/(name+'.json')).write_text(json.dumps(d)+'\n')
-    fixtures.KERNEL=collect.RELEASE
+    # G profile locks complete passed-manifest bytes: synthetic tagging stays in
+    # the load/FPGA/run, never mutates that real software manifest.
+    (inputs/'software.json').write_bytes(software_bytes)
+    fixtures.KERNEL=software['kernel_release']
     state={'next':0,'calls':0,'closed':False,'fail_at':None,'command_at':None,'jump_at':None}
     class Console:
         def __init__(self,port,output):
@@ -144,6 +148,7 @@ def main():
         assert state['calls']==0 and not target.exists();checks.append('production entry rejects '+name+' before UART/output')
     report={'status':'passed','fixture_only':True,'new_board_measurements':0,'checks':checks,
             'collector_sha256':hashlib.sha256((HERE/'collect_workload.py').read_bytes()).hexdigest(),
+            'software_profile_helper_sha256':hashlib.sha256((HERE/'workload_software_profiles.py').read_bytes()).hexdigest(),
             'parser_sha256':hashlib.sha256((HERE/'workload_records.py').read_bytes()).hexdigest()}
     (a.output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps({'status':'passed','checks':len(checks),'output':str(a.output)}))
