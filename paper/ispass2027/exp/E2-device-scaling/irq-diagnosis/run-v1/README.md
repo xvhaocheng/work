@@ -57,15 +57,28 @@ host 超时、非零、缺少结束标记、taint、STOP/drain/data、probe 控�
 
 ## 读数边界与下一判断
 
-handler count/sum/max 测量 `event_handler`，rearm count/sum/max 测量原 `sbi_set_timer`；cycle/instret 包含其间 M-mode 指令。每类第64个事件或新 cycle max 才进入最后64条固定环，属于有偏选择，**不是CDF或随机样本**；较早 max 对应记录可能被覆盖，aggregate max 仍保留。`cycle_start+cycles` 是本地测量终点，`sample_cycle → SIP → SIE`是稍后有限指令边界的 pending 观察，不能视为 SBI 返回同一时刻，更不能以 STIP=1 单独判 bug。
+handler count/sum/max 对应包围 `event_handler` 的受测区段，rearm count/sum/max 对应包围原 `sbi_set_timer` 的受测区段；均包含边界 CSR 读/调用等插桩成本，cycle/instret 也包含其间 M-mode 指令。每类第64个事件或新 cycle max 才进入最后64条固定环，属于有偏选择，**不是CDF或随机样本**；较早 max 对应记录可能被覆盖，aggregate max 仍保留。`cycle_start+cycles` 是本地测量终点，`sample_cycle → SIP → SIE`是稍后有限指令边界的 pending 观察，不能视为 SBI 返回同一时刻，更不能以 STIP=1 单独判 bug。
 
 探针自身扰动未测：每个有效事件一般新增5次原生 CSR 读，选中样本8次；启用/首次冻结各1次cycle。还有 active flag、聚合及有时的 ring stores。自身 aggregate/ring 工作位于其本地计时终点后；handler 时间包括嵌套 rearm 及其探针成本，两类 sum 不可相加。normal off 也保留 flag/branch，不能称零成本。前后 proc/snapshot 均在 off 读取；CLI 原 JSON 输出和 freeze 调度尾部仍在 active 窗口。没有本版本额外 off 重复点来实测成本，单次低压控制不能给出扰动上限。
 
 Root 可据这一次有限数据决定下一代码设计，接受/否决范围如下；不增加新的实验性能门：
 
-- **SBI rearm 本体耗尽已请求间隔：** 固定 CPU/timebase=2 的合同成立时，kind2若 `delta>0` 且 `cycles >= 2*delta`，说明被包住的 SBI 区段本身已至少消耗该请求间隔；它发生在已有 raw_now 之后，因此足以定位一类迟编程。若小很多，只否定该条区段本体单独耗尽间隔；不能排除此前 emulated rdtime/取数延迟、未保留事件或其他迟延。不能据此归因为 AXI。
+- **rearm 受测区段消耗请求间隔：** 固定 CPU/timebase=2 的合同成立时，kind2若 `delta>0` 且 `cycles >= 2*delta`，只能说明该受测区段（包含边界 CSR/调用等插桩）经历至少该请求间隔。不能据此认定未插桩 SBI 本体单独耗尽间隔、实际 mtimecmp 写入必迟，或它一定造成原故障。若小很多，也只限制当条受测区段的耗时；不能排除此前 emulated rdtime/取数延迟、未保留事件或其他迟延。开销未实测，不能据此归因为 AXI。
 - **handler 大量占用CPU：** 用 `handler.cycles_sum/(stop_cycle-start_cycle)`、count/原生cycle窗口和 instret 描述观测；同一 handler 包含嵌套 rearm成本。较高占用支持受测 handler 区域消耗CPU时间，较低只限制该受测区域。tickless/highres 下 IRQ rate 不必等于HZ250，单凭IRQ频率或 __do_softirq 栈不判周期错误。
 - **CPU/AXI根因：** 长cycle、低instret/cycle可支持这些区段退休进展少，不能区分CPU/缓存/CLINT访问/AXI仲裁等原因。本包没有独立AXI进展测量，不能接受AXI单因结论；小rearm成本也不能排除计时读陷入/其他CPU路径。
 - **复现与控制：** 低压控制失败则停止并保留，诊断未定；N4不复现也不能声称修复。恢复窗口正常tick只描述恢复窗口，proc计数多为累计值且Linux now与rdtime链相关；不能反推故障时正常，也不能仅据累计 hang 把全部归到N4。
 
 counter权限原件、完整源码和 off 路径证据见 [probe-v1](../probe-v1/README.md)。Runtime错误码、per-open生命周期、实际开销/扰动、两个诊断点及恢复候选在本批均未执行。[23项主机检查](validation/host-checks.json)只检查阶段顺序、计时预算、shell语法和原错误停止；其中成功/损坏CLI夹具显式复用旧N2输出并替换 synthetic header/命令绑定，不是新 Image、probe 或板测数据。
+
+## 本机传输产物，尚未上传
+
+[transfer-package.json](transfer-package.json)关联实际 passed build manifest 与两个本机压缩产物，均在本任务 ignored `artifacts/probe-transfer01/`；不重编源、不上传、不写SD、不加载BIT/UART：
+
+| 文件 | 字节 | 用途 |
+| --- | --- | --- |
+| `e2-timer-probe-v1-fw_payload.bin.gz` | 11,065,227 | 运输原29,363,656-byte `fw_payload.bin`；新 gzip SHA `cd7ff7e6a1460ea803f91c228ffcb55d237e20ee9b2b2d510403000b53f957ed` |
+| `e2-timer-probe-v1-spi-recovery.tar.gz` | 9,313 | 两个 probe release 匹配 `.ko` 和 `probe-spi.json`；SHA `ea65e0cda32c14aee4d1e6e67f02040a4beac477f541452173b29f119865ce86` |
+
+gzip level9、header filename空/mtime0；SPI tar为USTAR，uid/gid/mtime0、mode0644。归档内两模块 bytes/hash与已通过构建清单一致；原payload SHA复用已完成的本机产物验证，没有再哈希原镜像。压缩二进制只保存在本机，Git保存元数据。
+
+首次从当前 G boot 部署 probe，须先完成 G 固定40队列，再由 Root 使用**当时运行内核**配套的既有 A1 `g-software01` / `g-v1` SPI交付。这里的 probe 模块不能加载到 G 内核；它们只供之后已启动精确 probe release 时再次软件更新，正常诊断期间不加载。UART传输gzip至新的普通 `/tmp` 文件后，须先解出原始 `fw_payload.bin`，再由既有 `platform-sd-update` 写原始镜像，不能把压缩 bytes 交给 updater。Root另择队列执行，包内没有自动部署/加载/collector。
