@@ -1,3 +1,5 @@
+> 当前执行更新（2026-10-17 14:38Z）：P0 45/45全部通过，每cell n=5；[最终论文数据与判断](checkpoints/p0-final01/README.md)包含全部早期9点，不与其叠计。Root已切入原DS0 BIT加载以采E2；下文早期状态和旧协议均为历史。
+
 > 当前执行更新（2026-10-17 14:27Z）：P0已在Root独占板启动，首区组9/45通过并冻结为[真实partial论文包](checkpoints/p0-progress01/README.md)。完整三形态另按[full-bounded-design](full-bounded-design.md)准备；下文最初停止状态和16MiB旧设计为历史，当前以本更新及subset-results为准。
 
 # E3 負載形態：條件矩陣與待執行包

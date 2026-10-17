@@ -1,3 +1,15 @@
+# 当前续接（2026-10-17 14:40Z）
+
+P0正式45/45已于14:37:05Z passed，最终包E3/checkpoints/p0-final01（4506行17列CSV、51份来源），subset-results已更新。首9点包只作历史，不叠计。
+
+唯一板任务为e2-ds0-load01-launch（14:38:06Z），加载原DS0+同一p0-multi内核。先前纯host等待session27823已exit143，未启动硬件，不要再等它。E2尚无collector dispatch；Root在本次load result=0且load.json boot_identity_verified后，执行E2 collect_multi.py90点，使用Root E3/p0-common-software-delivery-manifest.json、Root baseline100 source.json与本次load.json，输出runs/e2-device-scaling-20261017-01（new）。所有source_root可限Root工作树。
+
+E2数据途中用已审snapshot_prefix.py与export_prefix.py，完整90点默认出口不放宽；Root实际44有限checks已过。完成后A3准备的六项同block配对报告另审。然后一次更新E4/E5共同软件、加载E5 passedBIT，共采E420+附加hist；包在Root board/packages/e4-e5-20261017，本次当前p0-multi内核只能加载其自身matching SPI模块，不能提前加载e4-e5模块。E4正式software/fpga manifest均使用Root副本。
+
+A2唯一full-E3 DS0 FPGA构建（Depth64，1d587/dfebcc）仍running；ABI5 adapter46df97c已冻结、416新+旧38/57/97有限回归通过，Root已读实际diff/调用链，等最终原件+RV64对象，未编全软件。A1G frontend2c7已接受，Root锁定G observer精确error/control合同，769 reserved0，不加generation；正实施observer/wrapper小批，未授权直接构建BIT。M保持设计。
+
+RootHEAD/远端随当前实质工作同步；主目录与共享汇总文件均不编辑。完整状态与证据入口见status/root-board.md及board/queue.md。下方旧续接只保留历史，以此节为准。
+
 # Root A integration handoff (live)
 
 Status: preparation and builds in progress; this file is updated with actual collection packets as they become available. The final E1b packet contains all 100 new DS25/DS100 trials plus the explicit historical 100 (200 total; n=10 per cell). All Root edits are on `ispass/root-a` in `/home/xvhaocheng/work-root-a`.

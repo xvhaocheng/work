@@ -1,52 +1,50 @@
-# E3 DS0 小子集：采集中，已同步首区组9/45
-
-## Material Passport
+# E3 DS0 小子集完成：45/45
 
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
-- Origin Date: 2026-10-17 JST
-- Verification Status: PARTIAL（首区组各cell n=1）
-- Version Label: E3-subset-P0-progress01
+- Verification Status: VERIFIED（P0限定DS0、每cell n=5）
 
-**一句话初判：首区组64B/1KiB的A8相对A1增幅约14%，4KiB约10.4%；每格仅n=1，等待全部45点再作最终判断。**
+**一句话判断：原始DS0上小传输更敏感，但A8相对A1的额外时间增幅由4KiB的10.40%增至64B/1KiB的14.25%/13.88%，属于约3–4个百分点的增加。**
 
-实际P0 DS0 BIT与共同内核已启动验证通过：release `6.5.0-rc2-ispass2027-p0-multi-v1`，
-boot `088d7493-26d3-4254-b49e-2e1e8f66e910`，taint=0。Root为唯一板操作者，
-已冻结的[首区组数据](checkpoints/p0-progress01/README.md)含9个真实接受试次、17列CSV与原字节来源。
-实际活动campaign仍在继续，其余点不补齐；累计前缀与最终包不得重复计样。
+3个V大小×Solo/A1/A8×5区组全部通过，每格n=5；无失败、替换或补点。实际采集14:25:47Z–14:37:05Z，共678.18秒。
 
-| V descriptor | Solo（ms，n=1） | A1（ms，n=1） | A8（ms，n=1） | 配对A8/A1额外慢化 |
+| V大小 | 条件 | n | V硬件ms中位数 | V MiB/s中位数 | V miss中位数 | A miss中位数 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64B | Solo | 5 | 6.45190 | 38.748 | 0 | N/A |
+| 64B | A1 | 5 | 59.16598 | 4.225 | 0 | 0 |
+| 64B | A8 | 5 | 67.56286 | 3.700 | 2 | 5141 |
+| 1024B | Solo | 5 | 16.58716 | 241.150 | 0 | N/A |
+| 1024B | A1 | 5 | 68.94882 | 58.014 | 0 | 0 |
+| 1024B | A8 | 5 | 78.54620 | 50.925 | 2 | 5141 |
+| 4096B | Solo | 5 | 56.47914 | 283.290 | 0 | N/A |
+| 4096B | A1 | 5 | 107.04572 | 149.469 | 0 | 0 |
+| 4096B | A8 | 5 | 118.16248 | 135.407 | 2 | 5141 |
+
+## 同区组A8/A1比较
+
+| V大小 | 配对n | 额外时间中位数 | Q1–Q3 | 吞吐损失中位数 |
 | --- | --- | --- | --- | --- |
-| 64B | 6.42780 | 59.12696 | 67.55024 | 14.2461% |
-| 1KiB | 16.59726 | 68.93826 | 78.50768 | 13.8811% |
-| 4KiB | 56.49434 | 107.03206 | 118.16248 | 10.3991% |
+| 64B | 5 | 14.2461% | 14.1921%–14.2633% | 12.4697% |
+| 1024B | 5 | 13.8811% | 13.8760%–13.9157% | 12.1892% |
+| 4096B | 5 | 10.4000% | 10.3991%–10.4506% | 9.4203% |
 
-每点V固定4096个descriptor，不同大小的有效工作不同；只在同大小内计算慢化。
-A保持既有4KiB背景供给至V结束，A1/A8仅改变其映射足迹，A完整完成量另记。
-上述为DS0实测共跑差异，不作纯翻译归因；完整三形态采用另一等16MiB协议，不与本45点混池。
+表中时间增幅与吞吐损失逐配对换算后各自取中位；不混用二者，也不以组中位数比替代配对比。Q1/Q3/IQR为Type7描述分位，不是置信区间。
 
-## 已有4KiB參考（不是本輪E3結果）
+同区组进一步与4KiB配对的时间增幅差中位数为：64B 3.8469个百分点（n=5）；1024B 3.5157个百分点（n=5）。全部逐block值和case定位见[size-effects.json](checkpoints/p0-final01/size-effects.json)。
 
-以下僅重新計算已完成的統一100次基線之DS0中段，各條件n=10、同一boot；
-絕不重標為本輪每點5次。原始 [records](../../board/runs/baseline100-20261017-01/ds0-middle/records.json)
-與 [manifest](../../board/runs/baseline100-20261017-01/ds0-middle/manifest.json)
-均保留，離線回算見 [historical-ds0-analysis.json](historical-ds0-analysis.json)。
-新版含全部sample與PATH/AXI守恆重檢的回算為
-[historical-ds0-analysis-v2.json](historical-ds0-analysis-v2.json)，數值與舊版一致。
+## 身份与解释范围
 
-| 舊V=4KiB | n | V MiB/s中位 | 硬體ms中位 | V miss中位 | A miss中位 | 時間/Solo | 時間/A1 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Solo | 10 | 282.992 | 56.53868 | 0 | N/A | 1.0000× | 0.5280× |
-| A1 | 10 | 149.407 | 107.09009 | 0 | 0 | 1.8941× | 1.0000× |
-| A8 | 10 | 135.336 | 118.22441 | 2 | 5141 | 2.0910× | 1.1040× |
+- BIT `1056d7795ffc5673b1aaab29b09ad3e1654a299b481457bf0b8067d18f23afa7`；内核 `6.5.0-rc2-ispass2027-p0-multi-v1`；boot `088d7493-26d3-4254-b49e-2e1e8f66e910`；taint0。
+- P0限定packed-ring：V source/destination各1页，每点4096个V descriptor、256 warmup；A为4KiB单页/八页环背景流，V结束后STOP并排空。
+- V有效工作分别为256KiB、4MiB、16MiB；不同size的原始总时间不能直接作干扰比较。A1本身含带宽/仲裁与共享路径供给代价；A8/A1也不是纯翻译成本。
+- HPM是非原子软件区间；A完整完成量含启动/排空，不能冒充精确V窗内A工作。PATH按实际窗口保留count/sum/max，P0没有逐请求hist。
+- 单boot每cell5次，支持本配置的描述性趋势；不作统计显著性、其他平台或16B传输断言。完整三形态采用等16MiB新协议，另存结果。
 
-吞吐按每次16MiB有效payload除以硬體時間後取中位；表中時間比是時間中位數比。
-HPM miss來自軟體前後非原子快照，不能當硬體窗口精確miss。
-舊4KiB A1本身已慢約89.4%，A8比A1再慢約10.4%；這是既有共跑觀察，
-無法據此補出64B/1KiB，也不能把全部共跑下降稱為純翻譯成本。
+## 论文出口
 
-## 余下工作
+- [paper.csv](checkpoints/p0-final01/paper.csv)：统一17列、4506行，含逐试次与有真实n的描述统计/配对比，原始byte/cycle重算。
+- [summary.json](checkpoints/p0-final01/summary.json)：完整45点、同区组配对、Type7、构建/加载/软件/原命令绑定。
+- sources/保存逐字节原输入与51份来源索引；全部hash已核对。
+- 此包已包含p0-progress01的前9点，不能与旧累计快照相加；按实际boot+observer sequence及原命令hash识别同一试次。
 
-继续完成同一boot的45点固定矩阵，每cell目标5次；技术失败保留原始记录并停止，不重试替换。
-完成后从原始命令重算中位数、Q1/Q3/IQR及同区组A8/A1配对比较，更新一句话判断。
-完整三形态的BTC3/OBS5/Depth64硬件正在独立编译，ABI5软件分批审查；其结果另建实验包。
+以上相对路径均位于[完整结果包](checkpoints/p0-final01/README.md)。历史4KiB基线仍在historical-ds0-analysis-v2.json，仅作独立参考，不计入本45点。

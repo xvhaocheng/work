@@ -14,11 +14,12 @@
 
 DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”的两档100次已全部完成；Root只读复核并冻结最终200试次包（含历史100）。用户授权协调后已统一排程。Root本地12:56:37Z重复启动被UART锁在触硬件前拒绝，失败原样保留，不计试次。
 
-已完成DS campaign为 `/home/xvhaocheng/work/paper/ispass2027/board/runs/ds-sweep-20261017-01/`，launch回执returncode=0。原DS0+旧pathv3加载和角色互换30次均已完成通过，结果为`exp/E6-mitigation/paper/e6-role-swap-ds0/`。共同软件SD更新于14:17:50Z成功，P0新DS0 BIT及`6.5.0-rc2-ispass2027-p0-multi-v1`于14:25:44Z验证启动，taint0。当前唯一板任务为`runs/p0-ds0-subset-20261017-01/`，已冻结首区组9/45、各cell n=1的真实论文数据。整轮45点通过后再换原DS0 BIT采90点E2。Root被锁拒绝的记录在本worktree `runs/ds-sweep-campaign-launch01/`及`runs/ds-sweep-20261017-01/`，不计为已加载或性能试次。
+已完成DS campaign为 `/home/xvhaocheng/work/paper/ispass2027/board/runs/ds-sweep-20261017-01/`，launch回执returncode=0。角色互换30/30及P0小子集45/45也全部完成。P0实际boot为088d7493-26d3-4254-b49e-2e1e8f66e910、taint0，45点在14:37:05Z完成；最终论文包`exp/E3-workloads/checkpoints/p0-final01/`每cell n=5。当前唯一板任务为14:38:06Z启动的`runs/e2-ds0-load01/`：原DS0 BIT，复用共同p0-multi内核；boot通过后Root启动E2 90点。
+
 
 | 原优先级 | 任务 | 状态 | 采集规模 | 预计板时 / 条件 |
 | --- | --- | --- | --- | --- |
-| 1 | E3 DS0 小子集 | 采集中；首区组9/45已冻结，所有cell n=1 | 3 个 V 大小 × Solo/A1/A8 × 5 = 45 次 | packed-ring；本轮结束才下最终判断 |
+| 1 | E3 DS0 小子集 | 完成45/45，最终包每cell n=5 | 3 个 V 大小 × Solo/A1/A8 × 5 = 45 次 | 已完成；小传输A8/A1增幅约14%，4KiB约10.4% |
 | 2 | E1b DS25 | 完成50/50，五条件各10，全部接受；阶段CSV已冻结 | Solo/A1/A8/A16/A64 各 10 次 = 50 次 | 约 20–30 分钟，须 50MHz、WNS≥0、违例端点和 routing errors 全零 |
 | 3 | E1b DS100 | 完成50/50，五条件各10，全部接受；最终四档200试次包已冻结 | 同上 50 次 | 已完成；两档仅换 BIT，复用已写 pathv3 |
 | 4 | E2 DS0 设备数 | 多设备驱动/CLI/90点collector已审核，共用软件delivery已通过 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
@@ -61,3 +62,5 @@ full-E3 DS0唯一构建已于14:10:50Z启动，`exp/E3-workloads/artifacts/full-
 14:22Z更新：SD updater成功返回0后，Root有限续接已在14:17:52Z启动P0 BIT加载；另一个有限续接只在boot身份成功后启动45点collector，无第二上板任务。E4/E5只读运行包已复制元数据并硬链接冻结产物到`board/packages/e4-e5-20261017/`，没有启动硬件或重复hash。E2 immutable-prefix两个纯host出口已交A3实施，完整90点出口仍严格；E6只先准备G(P4M)最小批，P/N/PN的M移植未启动。
 
 首区组论文数据见`exp/E3-workloads/checkpoints/p0-progress01/`：V64/1024/4096B的同区组A8/A1额外慢化分别14.2461%/13.8811%/10.3991%，各n=1、running/partial；不将其当完整45点结果，不与最终包相加。Root有限续接session27823只在P0正式passed且45/45后才加载原DS0、验证同内核并启动E2；任一步失败即停，无自动替代试次。
+
+14:40Z更新：P0 45/45全部通过，最终包含首9点，不叠计。纯host续接27823以143结束、未启动E2，原因未建立；Root确认P0成功后已于14:38:06Z手动dispatch唯一E2加载。先前“自动续接E2”的描述已失效，后续由Root在启动验证后执行collector。软件formal delivery原字节已复制到Root E3/p0-common-software-delivery-manifest.json，E2将用此副本，便于source_root限定Root工作树。
