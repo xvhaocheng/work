@@ -96,3 +96,5 @@ Linux65b427相对46df只改multi轮询合作点：N2/N3/N4每未完成轮请求c
 E6-PN首轮DS0已于19:27:11Z实际启动（PID2229246，source SHA b91327ec）；CVA109b/IOMMU86c2，真实顶层/外围elab已通过，功能有限检查并行。构建本机入口见`exp/E6-pn/build/dispatch-reference01.json`；不轮询中间日志，等待完成/失败事件。E8原DS0采集继续占唯一板，PN无板点。
 
 E8首50点已于19:36:23Z完整通过：A2/4的V miss/S1PTW均0；A12/14/32均2，分别n10一致。旧baseline另boot的A8已有2，不能把本轮A12称全局阈值。论文数据位于独立ispass/e8-e2-e9的`exp/E8-footprint/paper/e8-ds0-a-scan01/`，50新增点、17122长表标量行，不上传UART日志。原DS0同boot的V2/4/8×Solo/A1/A8/A64共60已于19:37:38Z开始，PID2235534；E6物理构建继续，真实外围有限检查已全部通过。
+
+2026-10-17T20:02Z：E8 原DS0新增110/110已于19:58:32Z完成，同boot04afe602、原pathv3、逐点taint0。V2/4在Solo/A1时自身miss/S1PTW为0，A8/A64为4/8；V8的Solo为0，A1为7168、A8/A64为8192（各n5固定）。V8_A1中A自身miss/S1PTW仍为0，保留真实数据供Root B界定模型适用域，不补造因果分解。两份独立50+60论文包均已提交，未叠加旧baseline。19:59Z起唯一板动作是现有DS100一次JTAG加载；成功后采剩余25点，E6合格BIT就绪即在安全边界优先。E6唯一DS0物理构建仍运行，全部必要有限功能检查已通过，无新增构建或重复trace验证。

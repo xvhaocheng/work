@@ -1,3 +1,9 @@
+# 最新续接 2026-10-17T20:02Z
+
+E8 原DS0新增110/110已于19:58:32Z完成，同boot04afe602、原pathv3、逐点taint0。V2/4在Solo/A1时自身miss/S1PTW为0，A8/A64为4/8；V8的Solo为0，A1为7168、A8/A64为8192（各n5固定）。V8_A1中A自身miss/S1PTW仍为0，保留真实数据供Root B界定模型适用域，不补造因果分解。两份独立50+60论文包均已提交，未叠加旧baseline。19:59Z起唯一板动作是现有DS100一次JTAG加载；成功后采剩余25点，E6合格BIT就绪即在安全边界优先。E6唯一DS0物理构建仍运行，全部必要有限功能检查已通过，无新增构建或重复trace验证。
+
+DS100 load receipt：`/home/xvhaocheng/work-e8-e2-e9/paper/ispass2027/board/runs/e8-ds100-load01-launch/result.json`。E6 build receipt：`/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/build/dispatch01/result.json`。两者未完成时只等最终事件；不读中间log。E9每次启动的矩阵仍缺原文，未运行。
+
 # 最新续接：2026-10-17T19:37:14.501204+00:00
 
 用户最新要求：更激进简化、不重复日志/同源验证/归档，E6-PN未完成持续推进，不以阶段交付结束。既有时序/S15硬停止仍保留。
