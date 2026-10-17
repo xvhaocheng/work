@@ -36,6 +36,13 @@ def main():
     assert all(analysis.tables.locate(result,x['source_locator'])==x['value'] for x in csv_rows)
     assert next(x for x in rows if x['metric']=='command_wall_seconds')['unit']=='seconds'
     checks.append('17-column common CSV; every source JSON pointer resolves; all rows synthetic, seconds unit explicit')
+    warmup=[x for x in rows if '_warmup_' in x['metric']]
+    assert {x['metric'] for x in warmup}=={r+'_warmup_'+m for r in ('victim','aggressor') for m in ('descriptors','bytes','distinct_pages')}
+    assert all(';window=warmup_only' in x['condition'] for x in warmup)
+    assert 'warmup_only' in result['window_definitions']
+    assert all(';window=whole_stream_verification_union' in x['condition'] for x in rows if x['metric'].endswith('verified_union_bytes'))
+    assert all(';window=whole_A_including_startup_drain' in x['condition'] for x in rows if x['metric']=='aggressor_completed_bytes')
+    checks.append('both lanes warmup metrics tagged warmup_only before ARM; verification union and actual A completion windows remain separate')
     output=a.output/'publication.json';snapshot=a.output/'publication-inputs';table=a.output/'publication.csv'
     cmd=[sys.executable,str(HERE/'analyze_workload.py'),'--records',str(continued/'records.json'),'--manifest',str(continued/'manifest.json'),
          '--output',str(output),'--long-table',str(table),'--snapshot-dir',str(snapshot)]

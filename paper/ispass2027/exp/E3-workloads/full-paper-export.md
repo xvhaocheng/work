@@ -43,6 +43,7 @@ failed run不由本入口发表；原失败尾与成功前缀保留供Root独立
 A工作包括startup和STOP/drain完整前缀，不能按V有效16MiB或逻辑tile整块取整。
 
 硬件时间/AXI/PATH/hist为完整V batch active窗；HPM为非原子软件括号；V软件耗时与host整条命令耗时各自保留。
+两条lane的warmup_descriptors/bytes/distinct_pages统一标 `warmup_only`，表示实际软件预热前缀，发生在observer ARM之前。
 验证足迹是warmup与measurement的地址集合并集。PATH每次试验mean/max、shared-vs-private诊断差均保留；
 真正shared守恒仍由PATH0 leave而非private AR/AW和核对。
 
@@ -77,10 +78,10 @@ python3 /home/xvhaocheng/work-a2-workloads/paper/ispass2027/exp/E3-workloads/ana
 ## 有限验证
 
 `verify_workload_analysis.py`在实际collector的合成150/pilot30原raw上执行，完全没有板操作。
-回执另存 `test-results/workload-analysis04-report.json`，25项均通过，包括默认CLI拒绝fixture且不产生文件、
+回执另存 `test-results/workload-analysis05-report.json`，26项均通过，包括默认CLI拒绝fixture且不产生文件、
 四工具SHA和六source字节篡改、exact command/cache/boot/seq/plan反例、递归fixture三类反例、
 partial n0/N/A、完整17列指针、Type7、配对比与中位数比不同的定向例子、桶区间、完整输入快照不改原件。
-01/02/03中间通过回执及as-tested源码保留，最终验收以04绑定的源SHA为准。
+01/02/03/04原通过回执及as-tested源码保留，05修正预热窗口标签并加定向CSV断言；数值统计不变，最终验收以05绑定的源SHA为准。
 
 ```bash
 python3 /home/xvhaocheng/work-a2-workloads/paper/ispass2027/exp/E3-workloads/verify_workload_analysis.py \

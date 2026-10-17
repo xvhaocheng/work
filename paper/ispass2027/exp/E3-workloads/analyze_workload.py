@@ -136,6 +136,7 @@ def summarize(records,manifest,backend,allow_partial=False,board_overhead_second
                 'whole_A_including_startup_drain':'actual A completed prefix through STOP/drain; not restricted to V-active window',
                 'non_atomic_HPM_software_bracket':'per-role HPM snapshots around software bracket, non-atomic',
                 'whole_stream_verification_union':'measured and warmup address-set union verified after drain',
+                'warmup_only':'each lane actual software warmup prefix before observer ARM; outside hardware V batch',
                 'software_task':'returned victim elapsed time or host complete command wall time',
                 'post_hardware_completion':'V hardware DONE to software read'},
             'record_identity_key_fields':['kernel_release','bit_sha256','boot_id','sequence'],
@@ -202,7 +203,7 @@ def long_rows(result,summary_path,sample_set):
         label=f"{row['family']}.V{row['victim_shape']}{row['victim_size']}.{row['condition']}"
         condition=';'.join(f'{k}={row[k]}' for k in KEYS)+';protocol='+result['protocol']+';campaign_status='+result['collection_status']
         for metric,stats in row['statistics'].items():
-            window='whole_stream_verification_union' if metric.endswith('verified_union_bytes') else 'whole_A_including_startup_drain' if metric.startswith('aggressor_') and ('bytes' in metric or 'rows' in metric or 'warmup' in metric or 'pages' in metric) else 'non_atomic_HPM_software_bracket' if metric.endswith(('iotlb_miss','s1_ptw','s2_ptw')) else 'software_task' if metric in ('software_ms','command_wall_seconds') else 'post_hardware_completion' if metric=='done_to_read_cycles' else 'hardware_V_batch'
+            window='whole_stream_verification_union' if metric.endswith('verified_union_bytes') else 'warmup_only' if '_warmup_' in metric else 'whole_A_including_startup_drain' if metric.startswith('aggressor_') and ('bytes' in metric or 'rows' in metric or 'pages' in metric) else 'non_atomic_HPM_software_bracket' if metric.endswith(('iotlb_miss','s1_ptw','s2_ptw')) else 'software_task' if metric in ('software_ms','command_wall_seconds') else 'post_hardware_completion' if metric=='done_to_read_cycles' else 'hardware_V_batch'
             cond=condition+';window='+window
             for si,sample in enumerate(row['samples']):add(label+f'.case{sample["case"]}.'+metric+'.sample',cond+f';block={sample["block"]}',metric,'sample',sample[metric],int(sample[metric] is not None),'rows',ri,'samples',si,metric)
             for statistic in tables.STATS:add(label+'.'+metric+'.'+statistic,cond,metric,statistic,stats[statistic],stats['n'],'rows',ri,'statistics',metric,statistic)
