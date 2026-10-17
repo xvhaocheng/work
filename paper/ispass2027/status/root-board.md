@@ -3,11 +3,13 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Verification Status: PARTIAL（E1b、E3 P0、E6角色已完成；E2/E4/E5/完整E3/G按队列继续）
-- Updated: 2026-10-17T15:21:42.110277+00:00 / 2026-10-18 JST
+- Updated: 2026-10-17T15:48:04.863602+00:00 / 2026-10-18 JST
 
-新共同payload写SD已成功返回0；当前唯一板动作是加载原DS0、启动并验证新共用内核。11,068,218B gzip于15:20:40Z上传成功/bytesACK，未重复写SD。新E2 90点、随后E4/E5 20点已按依赖串行排队，等待时不占UART。G与完整E3 FPGA在隔离树并行构建，A4离线制图。
+新E2轮 `e2-device-scaling-20261018-02` 于15:41:06Z失败：Linux65b427/full-e3-v1、原DS0，前5点taint0接受；第6点N4_A8再次softlockup并host timeout。调度候选不足以修复。新5点和原失败尾已独立冻结 `E2-device-scaling/checkpoints/e2-prefix-failed02-{snapshot,paper}`（5841行17列，partial、各已测cell n=1），不与旧5点或后续轮混合。旧E4依赖job随E2失败停止，未加载硬件。
 
-E2旧轮第6点N4_A8 softlockup后停止：5个taint0试次已独立冻结为partial，失败尾taint16384保留；全部lane已排空，该boot不再正式采。multi合作候选65b427已通过Root源码审核和回归，共同Image/transport已passed，新实验必须新boot/source/run，旧5点不混入新90。
+Root在旧命令结束后一次CTRL-C观察到shell prompt，仅做两组只读/proc诊断，exit0；timer_list显示nr_hangs10836、nr_retries32547，短恢复窗口不再增长，尚不证明DMA quiet或根因。原字节在board/runs/e2-softlockup-console02。当前唯一板动作 `e4-e5-common-v2-load02-launch`：JTAG重载已合格E5 d934 BIT并启动同一full-e3-v1内核；先验新boot/taint0，再独立E420+E5 hist。无需再次写SD。E2暂停性能采集，独立Codex席只读诊断timer/CSR/SBI路径。
+
+完整E3原build01以143终止、sender未知，原manifest stale running保持原字节；非时序通过或失败。Root已审实际runner/TCL及原约束/route命令并接受5f7a306，唯一检查点续编于15:46:07Z detached启动，out=A2/E3/artifacts/full-e3-ds0-resume01，PID2083297、6小时界限；原physopt DCP只读、原RTL/XDC/RuntimeOptimized不变，不重综合/布局、不重试。最终所有门通过前没有合格完整E3 BIT。G唯一BIT仍离线构建；G RUN候选69d8接受审查中、未编G Image。
 
 ## 已完成的论文数据
 
@@ -35,9 +37,9 @@ DS口径始终是IOMMU数据结构访存的附加延迟，DS0为主结果，DS25
 
 | 任务 | 实际状态 | 下一步 |
 | --- | --- | --- |
-| E2 设备数 | 原轮failed：5接受/90，第6点N4_A8 softlockup拒绝；已冻结5点partial和失败尾。Root已实跑prefix44及配对34检查通过。 | 调度候选已审；共用软件构建passed；更新SD后验证taint0新boot；原轮不恢复/替换，后续独立90点。 |
+| E2 设备数 | 两个版本各接受5点，第6点N4_A8均失败；新65b轮host timeout，独立partial包不混池。 | 暂停采集，核timer/SBI原始证据；不关闭watchdog/taint门，不原样重试。 |
 | E4 页大小+E5分布 | 新共同软件65b/ec996已passed、Root新包22检查通过；旧da6包保留。E5 BIT于14:06:29Z passed。 | 计划与E2共用新内核，仅切E5 BIT，共采20点；E5附加采集，不另跑50点。 |
-| 完整E3 | CVA6 1d587/platform dfebcc，Depth64的唯一DS0构建14:10:50Z开始，仍running；ABI5 helper682a2ca/adapter46df97c已审，含multi候选的新65b427共用软件15:03:30Z已passed。 | CLI 167项Root实跑通过；collector准备与完整软件构建；自身时序/资源验收后再排≤6小时子集。 |
+| 完整E3 | CVA6 1d587/platform dfebcc，Depth64的原DS0构建14:10:50Z开始后exit143；唯一physopt续编15:46:07Z启动；ABI5 helper682a2ca/adapter46df97c已审，含multi候选的新65b427共用软件15:03:30Z已passed。 | CLI 167项Root实跑通过；collector准备与完整软件构建；自身时序/资源验收后再排≤6小时子集。 |
 | E6 P4M G | 从E5 6c5基座独立准备；frontend2c7、observer0f0403与上层cfb9已审；G唯一BIT15:08:57Z开始构建。 | 原约束/策略验收，失败停止；Linux ABI6只读caps/helper批审查中，RUN另批；G固定V/A各4096×4KiB自然完成。 |
 | E6 P/N/PN M | 完成历史来源/容量/接口设计与负结果追溯，未启动移植。 | 维持最后优先级，不恢复机制探索。 |
 

@@ -1,3 +1,13 @@
+# 当前续接 2026-10-17T15:48:04.863602+00:00
+
+新E2轮 `e2-device-scaling-20261018-02` 于15:41:06Z失败：Linux65b427/full-e3-v1、原DS0，前5点taint0接受；第6点N4_A8再次softlockup并host timeout。调度候选不足以修复。新5点和原失败尾已独立冻结 `E2-device-scaling/checkpoints/e2-prefix-failed02-{snapshot,paper}`（5841行17列，partial、各已测cell n=1），不与旧5点或后续轮混合。旧E4依赖job随E2失败停止，未加载硬件。
+
+Root在旧命令结束后一次CTRL-C观察到shell prompt，仅做两组只读/proc诊断，exit0；timer_list显示nr_hangs10836、nr_retries32547，短恢复窗口不再增长，尚不证明DMA quiet或根因。原字节在board/runs/e2-softlockup-console02。当前唯一板动作 `e4-e5-common-v2-load02-launch`：JTAG重载已合格E5 d934 BIT并启动同一full-e3-v1内核；先验新boot/taint0，再独立E420+E5 hist。无需再次写SD。E2暂停性能采集，独立Codex席只读诊断timer/CSR/SBI路径。
+
+完整E3原build01以143终止、sender未知，原manifest stale running保持原字节；非时序通过或失败。Root已审实际runner/TCL及原约束/route命令并接受5f7a306，唯一检查点续编于15:46:07Z detached启动，out=A2/E3/artifacts/full-e3-ds0-resume01，PID2083297、6小时界限；原physopt DCP只读、原RTL/XDC/RuntimeOptimized不变，不重综合/布局、不重试。最终所有门通过前没有合格完整E3 BIT。G唯一BIT仍离线构建；G RUN候选69d8接受审查中、未编G Image。
+
+以下为历史，以顶部为准。
+
 # 当前续接 2026-10-17T15:33:13.633050+00:00
 
 SD common-v2-software-write01已成功return0；同一部署job正加载原DS0/新共用full-e3-v1内核，load.json尚programming，部署result仍pending。不要重复SD/加载。e2-common-v2-collect01-launch和e4-e5-common-v2-collect01-launch依赖等待均有效；先新boot新90，只有成功才切E5采20+hist。若任何失败，后续停。

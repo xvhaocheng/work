@@ -14,7 +14,11 @@
 
 DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”的两档100次已全部完成；Root只读复核并冻结最终200试次包（含历史100）。用户授权协调后已统一排程。Root本地12:56:37Z重复启动被UART锁在触硬件前拒绝，失败原样保留，不计试次。
 
-E1b新增100点、E3 P0 45点、E6角色30点均完成通过。E2首轮于14:48:46Z停止：原DS0/acece内核，第6点N4_A8触发softlockup与taint16384，5个合格试次已冻结为partial论文包，失败尾不接受、不替换。旧tainted boot已排空且不再采；新共同软件已passed，上传15:20:40Z完成，当前唯一板动作common-v2-software-write01。Root已接受multi合作调度候选65b427，再按E2→E4/E5→完整E3串行；未知新软件profile不提前放行。
+新E2轮 `e2-device-scaling-20261018-02` 于15:41:06Z失败：Linux65b427/full-e3-v1、原DS0，前5点taint0接受；第6点N4_A8再次softlockup并host timeout。调度候选不足以修复。新5点和原失败尾已独立冻结 `E2-device-scaling/checkpoints/e2-prefix-failed02-{snapshot,paper}`（5841行17列，partial、各已测cell n=1），不与旧5点或后续轮混合。旧E4依赖job随E2失败停止，未加载硬件。
+
+Root在旧命令结束后一次CTRL-C观察到shell prompt，仅做两组只读/proc诊断，exit0；timer_list显示nr_hangs10836、nr_retries32547，短恢复窗口不再增长，尚不证明DMA quiet或根因。原字节在board/runs/e2-softlockup-console02。当前唯一板动作 `e4-e5-common-v2-load02-launch`：JTAG重载已合格E5 d934 BIT并启动同一full-e3-v1内核；先验新boot/taint0，再独立E420+E5 hist。无需再次写SD。E2暂停性能采集，独立Codex席只读诊断timer/CSR/SBI路径。
+
+完整E3原build01以143终止、sender未知，原manifest stale running保持原字节；非时序通过或失败。Root已审实际runner/TCL及原约束/route命令并接受5f7a306，唯一检查点续编于15:46:07Z detached启动，out=A2/E3/artifacts/full-e3-ds0-resume01，PID2083297、6小时界限；原physopt DCP只读、原RTL/XDC/RuntimeOptimized不变，不重综合/布局、不重试。最终所有门通过前没有合格完整E3 BIT。G唯一BIT仍离线构建；G RUN候选69d8接受审查中、未编G Image。
 
 
 | 原优先级 | 任务 | 状态 | 采集规模 | 预计板时 / 条件 |
@@ -22,9 +26,9 @@ E1b新增100点、E3 P0 45点、E6角色30点均完成通过。E2首轮于14:48:
 | 1 | E3 DS0 小子集 | 完成45/45，最终包每cell n=5 | 3 个 V 大小 × Solo/A1/A8 × 5 = 45 次 | 已完成；小传输A8/A1增幅约14%，4KiB约10.4% |
 | 2 | E1b DS25 | 完成50/50，五条件各10，全部接受；阶段CSV已冻结 | Solo/A1/A8/A16/A64 各 10 次 = 50 次 | 约 20–30 分钟，须 50MHz、WNS≥0、违例端点和 routing errors 全零 |
 | 3 | E1b DS100 | 完成50/50，五条件各10，全部接受；最终四档200试次包已冻结 | 同上 50 次 | 已完成；两档仅换 BIT，复用已写 pathv3 |
-| 4 | E2 DS0 设备数 | 旧轮failed5/90；新共用软件passed/SD更新中，新90已排队 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
-| 5 | E3 DS0 论文子集 | BTC3/Depth64已审，14:10:50Z启动独立DS0构建；ABI5驱动分批审查 | 六种大小及三类流量组合；新协议等16MiB有效字节 | 用户上限6小时；先30点pilot按实际用时定稿，不与P045混池 |
-| 6 | E4 DS0 页大小 | E4/E5共同软件首次完整构建通过；20点collector已审并通过Root38+14+11主机检查 | 4KiB 对2MiB，各点10次，未测 | 不混当前稳定软件；与已审E5 Linux后续共同编译 |
+| 4 | E2 DS0 设备数 | 两轮各接受5/90；N4_A8均失败，暂停采集、独立诊断 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
+| 5 | E3 DS0 论文子集 | BTC3/Depth64已审，原构建exit143，15:46:07Z唯一physopt续编；collector/exporter已审 | 六种大小及三类流量组合；新协议等16MiB有效字节 | 用户上限6小时；先30点pilot按实际用时定稿，不与P045混池 |
+| 6 | E4 DS0 页大小 | 共同软件与E5 BIT通过，Root正在load02恢复；新boot后采20点 | 4KiB 对2MiB，各点10次，未测 | 不混当前稳定软件；与已审E5 Linux后续共同编译 |
 | 7 | E6 DS0 角色互换 | 完成30/30，Solo/A1/A8各10；原DS0 BIT及旧pathv3 | V=DMA1、A=DMA0；Solo/A1/A8各10次 | 已完成；同boot/区组A8/A1中位数1.10434084，旧payload不再加测 |
 | 附加 | E5 延迟分布 | 被动直方图RTL/Linux已审，独立DS0 BIT最终通过，等待与E4共同采集 | 16阶段×32桶；当前尚无新直方图板测 | 保留carry/overflow/最终有效性，量化分位所在桶区间 |
 | 最后准备 | E6 P/N/PN/P4M 缓解 | 原始来源和设计已审，先分配P4M G前端小批；M保持设计 | G候选40点，未测 | G采用两lane各固定4096个4KiB任务；接口/验证后再编译入队 |
@@ -82,3 +86,5 @@ full-E3 DS0唯一构建已于14:10:50Z启动，`exp/E3-workloads/artifacts/full-
 2026-10-17T15:27:48.209584+00:00：完整E3 collector修订afaa3ca已由Root接收，实跑30项实际入口模拟串口与独立self-consistent seq-gap拒绝通过；当前采集器SHA dc2802d0ff240dd0801a0db6f49bb7372ee4d71e45f43040b28f78ac4a3c7fcc冻结，均synthetic/0新板测。G Linux首批889f75b已审，Root实跑329项通过并直接核RV64异常表/单次ld/fence证据；独立RUN生命周期小批已放行准备，未编G Image。
 
 2026-10-17T15:33:13.633116+00:00：共同payload的唯一SD写入已成功（session.exit_code0）；同一部署正在加载原DS0/新内核，未开始90点。既定E2→E4/E5依赖队列保持，勿重复操作。P045两张离线论文图已验，原45不另计。full-E3 collector/exporter主机验收完成，FPGA尚未通过不能排实测。
+
+2026-10-17T15:48:04.863602+00:00：以上“当前资源与顺序”为最新，以下时间记录只保留历史；新旧E2部分样本不得当成完成90点。

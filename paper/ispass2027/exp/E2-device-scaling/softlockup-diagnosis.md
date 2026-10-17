@@ -21,3 +21,12 @@ V硬件13105262 cycles=262.10524ms，软件victim_elapsed23.01355944s，硬件do
 A2先提交实际driver小差异和finite+RV64证据，Root审后才编新共同软件；
 若只读证据明确否定其作用应先报告。新板轮须新源码/boot/manifest，原5个合格点与失败尾保留为旧版本独立证据。
 正式新实验仍要求taint前后0和所有原检查，不为继续矩阵关闭检测或删除慢点。
+
+## 第二轮候选实测失败（2026-10-17T15:48:04.863602+00:00）
+
+新E2轮 `e2-device-scaling-20261018-02` 于15:41:06Z失败：Linux65b427/full-e3-v1、原DS0，前5点taint0接受；第6点N4_A8再次softlockup并host timeout。调度候选不足以修复。新5点和原失败尾已独立冻结 `E2-device-scaling/checkpoints/e2-prefix-failed02-{snapshot,paper}`（5841行17列，partial、各已测cell n=1），不与旧5点或后续轮混合。旧E4依赖job随E2失败停止，未加载硬件。
+
+Root在旧命令结束后一次CTRL-C观察到shell prompt，仅做两组只读/proc诊断，exit0；timer_list显示nr_hangs10836、nr_retries32547，短恢复窗口不再增长，尚不证明DMA quiet或根因。原字节在board/runs/e2-softlockup-console02。当前唯一板动作 `e4-e5-common-v2-load02-launch`：JTAG重载已合格E5 d934 BIT并启动同一full-e3-v1内核；先验新boot/taint0，再独立E420+E5 hist。无需再次写SD。E2暂停性能采集，独立Codex席只读诊断timer/CSR/SBI路径。
+
+
+新轮命令exit_code=null/error=timeout；collector AssertionError: host command status。第6点不接受，不以硬件时间替代失败试次。新partial包含5个实际试次，不是完成矩阵。只读诊断值是故障后的累计证据，不能还原每次handler耗时或确定AXI拥塞根因。后续原因判断由独立irq-diagnosis证据报告和Root直接源码审查给出。
