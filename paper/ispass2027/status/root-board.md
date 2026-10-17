@@ -64,3 +64,11 @@ P0真实固定backend的13个有限case/87个descriptor通过：合法64/1024/40
 DS25全部50/50点通过，Solo/A1/A8/A16/A64各10。最新任务内CSV及Q1/Q3/IQR见`exp/E1b-ds-sweep/checkpoints/ds25-stage-50/`；含历史引用后共150试次，四档仍partial。V硬件时间中位数依次56.50850/107.13621/133.18369/140.80433/146.57918ms，吞吐中位数283.143/149.343/120.135/113.633/109.156MiB/s。以同boot、同区组A1为分母，A8/A16/A64额外慢化中位数24.3199%/31.4304%/36.8189%，各10配对；它们是DS25敏感性数据，不替代DS0主结果。原campaign已切入DS100加载，未写SD。
 
 P0新DS0 BIT已最终通过：WNS+0.177ns、WHS+0.035ns、WPWS+0.062ns，setup/hold/pulse失败端点均0，257848条可布线net全部布线、routing errors0，CPU周期20ns。Root直接核原始timing/route与routed边界：direct DS wire、delay cells0、forbidden research cells0。BIT SHA为`1056d7795ffc5673b1aaab29b09ad3e1654a299b481457bf0b8067d18f23afa7`；软件仍固定acece3/52c5，正式delivery passed。E2/P0均已具备排队产物，未提前使用板卡。
+
+## E4/E5首批接受（2026-10-17 13:25Z）
+
+E4只读真实leaf查询内部提交`e61315397bd2bc925f74d76f7b8173f2b3256943`已接受，Root直接审完整代码、实际生产函数模型与final sourcehash。65有限case/7232 query（non-PIE ASan+UBSan）和RV64三个对象通过；普通PIE ASan启动异常仍记failed，原始错误与压缩log入口保留，根因未定。旧allocator/map/unmap/fetch未改；同IOVA两leaf交替的既有空表保留行为已记录，不将no-leaf当全部页表内存已回收。第二批将接有界映射/checked清理与ABI4；正式E4尚未上板。
+
+E5首批被动RTL内部提交`6c5c666d45979d3a03fb98cff89ba7ad095f6125`已接受，Root核3文件完整diff、真实full事件、桶编码/MMIO/饱和粘错与状态传播。923拍HistEnable0与基座的35旧计数+128旧PATH字段逐拍相同；HistEnable1有限场景与192段桶/full守恒、98年龄边界、carry/clear/abort/timer/容量通过。首BIT改为共享已验收P0基座CVA6 8aeb、Linux acece，DS0，Depth4；16段×32桶×32bit，observer v4，P0 frontend字节不变。Root已授权先固定完整platform pins后立即构建DS0，不等Linux后批。新RTL从不驱动DMA/AXI ready/valid，实际面积/时序和板测仍待完成，不把有限模型当硬件结果。
+
+完整E3的真实长descriptor探针已确认旧Depth4在16/64KiB下可能overflow（64KiB实测AW库存9，不能直接当8）；A2正在给源级上界和实际工作集设计，不降低当前P0的检查。当前DS100已启动原pathv3，boot `5cc1560a-b07e-4956-b1f2-e95e3cced13b`，首次快照见15个成功试次，整档继续。
