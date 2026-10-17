@@ -1,5 +1,7 @@
 # E4 software profile compatibility: host-only preparation
 
+This page records the initial `fa945ec` framework stage. The accepted common-software follow-up and new independent package are recorded in [common-software-package.md](common-software-package.md); the original stage evidence below is retained.
+
 ## Material Passport
 
 - Stage: bounded experiment-tool maintenance and host reproducibility checks.

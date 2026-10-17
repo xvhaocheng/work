@@ -30,11 +30,17 @@ def main():
     fpga=json.loads(a.fpga_manifest.read_text());fpga['fixture_only']=True
     bit=next(v for k,v in fpga['artifacts'].items() if Path(k).name=='ariane_xilinx.bit')
     software=json.loads(a.software_manifest.read_text());software['fixture_only']=True
-    delivery={'fixture_only':True,'status':'ready_for_collection','kernel_release':analysis.collector.KERNEL,
+    kernel=software['kernel_release']
+    delivery={'fixture_only':True,'status':'ready_for_collection','kernel_release':kernel,
         'source_record':'source.json','artifacts':{'ds0_bit':{'file':'host.bit','sha256':bit}}}
-    source={'fixture_only':True,'actual_commits':{'platform':analysis.collector.PLATFORM,'linux':analysis.collector.LINUX,
+    source={'fixture_only':True,'actual_commits':{'platform':software['selected_platform'],'linux':software['selected_linux'],
         'cva6':identity.CVA6,'iommu':fpga['selected_iommu'],'opensbi':software['selected_opensbi']}}
-    load={'fixture_only':True,'status':'boot_identity_verified','kernel_release':analysis.collector.KERNEL,'boot_id':boot,'bit_sha256':bit}
+    source.update(software_profile=analysis.collector.validate_software(software,kernel),
+        software_build_reference={**{key:software[key] for key in analysis.collector.profiles.PROFILE_FIELDS},
+                                  'cva6_role':analysis.collector.profiles.SOFTWARE_CVA6_ROLE},
+        fpga_build_reference={**{key:fpga[key] for key in ('selected_platform','selected_cva6','selected_iommu','source_manifest','source_manifest_sha256')},
+                              'linux_role':analysis.collector.profiles.FPGA_LINUX_ROLE})
+    load={'fixture_only':True,'status':'boot_identity_verified','kernel_release':kernel,'boot_id':boot,'bit_sha256':bit}
     def save(path,value):path.write_text(analysis.encoded(value))
     paths={'delivery':package/'manifest.json','source':package/'source.json','load':evidence/'load.json',
            'fpga':evidence/'fpga.json','software':evidence/'software.json'}
@@ -44,7 +50,7 @@ def main():
             line,n=re.subn(r'\b'+key+r'=(0x[0-9a-fA-F]+|\d+)',key+'='+str(value),line);assert n==1
         return line
     def trial(point,index,scale):
-        value=copy.deepcopy(templates[point['condition']]);text=value['stdout']
+        value=copy.deepcopy(templates[point['condition']]);text=value['stdout'].replace('KERNEL='+analysis.collector.KERNEL+'\n','KERNEL='+kernel+'\n')
         text=text.replace(f' seq={sequence} ',f' seq={sequence+index} ').replace(f'PRE_SEQ={sequence-1}',f'PRE_SEQ={sequence+index-1}')
         start=re.search(r'\{\s*"schema"\s*:\s*"idma\.pages\.run\.v1"',text).start()
         cli,end=json.JSONDecoder().raw_decode(text[start:]);cli['result']['observer_sequence']=sequence+index
@@ -61,7 +67,7 @@ def main():
         block=point['block'];small=[1,100,2,100,3,100,4,100,5,100][block-1]
         scale=small if point['condition']=='leaf4k' else 2*small if block%2 else small
         raw=trial(point,index,scale);path=Path(raw['raw_path']);save(path,raw);raw_paths.append(path)
-        item=analysis.collector.bind(raw,point,index,analysis.collector.KERNEL,boot,records[-1]['sequence'] if records else None,histogram)
+        item=analysis.collector.bind(raw,point,index,kernel,boot,records[-1]['sequence'] if records else None,histogram)
         item['fixture_only']=True;records.append(item)
     def bind_manifest():
         bound=identity.identity(package,paths['load'],paths['fpga'])
@@ -70,7 +76,7 @@ def main():
             'planned_cases':analysis.collector.plan(),'recorded_cases':20,**bound,'e5_identity':bound,
             'software_manifest':str(paths['software']),'software_manifest_sha256':analysis.sha(paths['software'].read_bytes()),
             'selected_software':json.loads(paths['software'].read_text()),'script_sha256':analysis.sha(Path(analysis.collector.__file__).read_bytes()),
-            'software_profile':analysis.collector.validate_software(software,analysis.collector.KERNEL),
+            'software_profile':analysis.collector.validate_software(software,kernel),
             'software_profile_helper_sha256':analysis.sha(Path(analysis.collector.profiles.__file__).read_bytes()),
             'histogram_validator_sha256':analysis.sha((a.e5_dir/'hist_records.py').read_bytes()),
             'e5_identity_helper_sha256':analysis.sha((a.e5_dir/'collect_e5.py').read_bytes())}
