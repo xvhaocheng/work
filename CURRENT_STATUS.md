@@ -12,7 +12,7 @@
 - **E1b DS四点曲线已完成**：新增DS25→DS100共100次通过，两次boot，每档五条件各10次，无失败/补采；两BIT均50MHz、WNS +0.177ns，违例与routing errors均0，delayer单元数120/145。[四档中位数/IQR及曲线](paper/ispass2027/data/ds-sweep-summary.md)。A64近线性，A8/A16高延迟段增幅趋缓，未见平台式饱和；仅支持附加DS敏感性。
 
 - 实板长表27544个标量行＝历史4096＋G1 828＋统一100次12480＋E1b新增100次10140；行数不是重复次数。来源和确定性重建见[数据目录](paper/ispass2027/data/README.md)和[validation](paper/ispass2027/data/validation.json)。失效仿真980行独立成表，不计入实板。
-- [前作/G2报告](paper/ispass2027/related/prior-work.md)已覆盖Bermuda、ETH全文及Rodríguez2024同平台硕论、HERO/Kurth前史等近邻；Procedia2025与Hur/Ro2025全文仍未取得，G2待补核，不宣称首次或无前作。[十图大纲与待补项](paper/ispass2027/outline.md)保持，尚未测的扩展不填结果。
+- [前作/G2报告](paper/ispass2027/related/prior-work.md)已覆盖Bermuda、ETH全文及Rodríguez2024同平台硕论、HERO/Kurth前史等近邻；Procedia2025与Hur/Ro2025已取得并全文核读，属直接重叠前作；G2为限于具名实现级证据差项的有条件通过，不等于创新充分，不宣称首次或无前作。[十图大纲与待补项](paper/ispass2027/outline.md)保持，尚未测的扩展不填结果。
 - [G1配套包](paper/ispass2027/board/packages/g1-20261017/README.md)保存9次结果、失败/恢复链及历史dirty身份缺项；[baseline100配套包](paper/ispass2027/board/packages/baseline100-20261017/README.md)对应实际源码、同一payload和DS0/DS50 BIT。本次固定commit见[source.json](paper/ispass2027/board/packages/baseline100-20261017/source.json)，不以活动研究checkout替代实际输入。
 
 ## 后续执行方式与边界
@@ -22,6 +22,8 @@
 - 暂停新机制探索、新判别门及旧停止审查；设备数、负载/传输大小、页大小、延迟分布和缓解统一复测仅列待补。旧负结果、MIG及其他暂停分支不恢复。DS变化仍只说明附加延迟敏感性，不是纯PTW成本；行为DDR失效结果仍为仿真。
 
 ## 历史
+
+2026-10-18仅整理：[逐实验总账](docs/experiment-ledger/README.md)已关联历史轮次、运行/构建/验收入口及[后续修正](docs/experiment-ledger/corrections.md)。E3 v6的127–130周期属于未闭合时序的存档构成；PLRU直接victim/LRU消融、死条目28配置及IOFENCE归因/模型边界更正均已接入，不以旧摘要代替后继。无新实验、构建、科学归约或板操作；早期身份与八月记录缺口保留。
 
 切换前完整状态（含各机制裁决、独立上游贡献、GitHub同步和工程事项）保存在[原文快照](paper/ispass2027/provenance/current-status-before-submission-mode.md)，未改变历史结论或已执行身份。旧总计划不再调度当前任务。
 

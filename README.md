@@ -7,7 +7,7 @@
 1. [当前状态](CURRENT_STATUS.md)：现在推进什么、已有结论和执行边界。
 2. [完整研究导航](研究导航.md)：5–10分钟阅读路线，以及按任务找代码、成果、原文的方法。
 3. [版本与分支导航](iommu-platform/docs/versions.md)：当前开发工作树、原版/修复基线、研究扩展，以及实验实际选用版本。
-4. [唯一总计划](研究计划.md)：本次工作范围；[AGENTS](AGENTS.md)与[执行约定](docs/agent-policy.md)规定如何开展和交付。
+4. [逐实验总账](docs/experiment-ledger/README.md)：查已有轮次、原始证据、后续修正和遗漏范围；[投稿目录](paper/ispass2027/README.md)规定当前交付，[旧研究计划](研究计划.md)只作历史。执行规则见[AGENTS](AGENTS.md)与[执行约定](docs/agent-policy.md)。
 
 ## 按需要进入
 
@@ -15,7 +15,7 @@
 | --- | --- | --- |
 | 仓库结构与代码 | [仓库结构](docs/repository-layout.md) | 平台、组件、测试、脚本、产物和历史副本的职责 |
 | 选分支与记录实验版本 | [版本导航](iommu-platform/docs/versions.md) · [实验身份记录](docs/agent-policy.md#实验身份记录) | 按任务选源码，核对组件配对；分支、commit、差异和实际编译源分别留存 |
-| 已做工作与结果 | [研究成果索引](docs/research-results.md) | 各方向的问题、实际结果、证据类型、停止范围及原报告 |
+| 已做工作与结果 | [逐实验总账](docs/experiment-ledger/README.md) · [主题成果索引](docs/research-results.md) | 轮次、结果、证据、失败/未执行边界及后续修正；保留原报告 |
 | 历史过程 | [研究历史](docs/research-history/README.md) · [阶段交接](HANDOFF.md) | 时间线、逐日证据和阶段决策；按题目查阅 |
 | 论文与技术资料 | [根文献库](references/README.md) · [结构化目录](references/catalog.json) | 原文、逐项总结、核查状态及研究关联 |
 | 平台使用 | [平台README](iommu-platform/README.md) · [构建说明](iommu-platform/docs/build.md) | 版本、profile、构建和恢复；阅读入口不要求运行构建 |
@@ -25,9 +25,11 @@
 
 ```text
 AGENTS.md / docs/agent-policy.md   稳定工作规则
-CURRENT_STATUS.md / 研究计划.md   当前状态与唯一总计划
+CURRENT_STATUS.md               当前状态；paper/ispass2027/ 当前交付
+研究计划.md                      投稿切换前的历史总计划
 研究导航.md                      完整上手与按任务导航
 references/                      文献目录、总结和原文入口
+docs/experiment-ledger/           逐轮总账、覆盖清单与后续修正
 docs/research-results.md          按主题维护的成果索引
 docs/repository-layout.md         代码与资料职责地图
 docs/research-history/           历史时间线与证据

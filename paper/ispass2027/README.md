@@ -6,10 +6,12 @@
 
 ## 交付入口
 
+历史实验先查[逐实验总账](../../docs/experiment-ledger/README.md)与[修正关系](../../docs/experiment-ledger/corrections.md)。本目录只选入投稿相关材料，不代表全部历史；E3 v6的定量配对须附[未闭合时序限制](../../docs/research-history/evidence/daily-2026-10-16-resumed-2026-10-17/e3-timing-correction.md)。
+
 | 交付 | 文件 | 当前状态 |
 | --- | --- | --- |
 | 实板总表与口径 | [board_results.csv](data/board_results.csv)、[数据说明](data/README.md) | 历史、G1与正式100次分别追源；失效仿真另表 |
-| 前作对比 | [prior-work.md](related/prior-work.md) | 两篇全文与有界检索完成，未核项明列 |
+| 前作对比 | [prior-work.md](related/prior-work.md) | 包括Procedia2025、Hur/Ro2025全文；直接重叠前作及实现级有条件差项已明确，未核项保留 |
 | G1及统一基线 | [G1配套包](board/packages/g1-20261017/README.md)、[baseline100配套包](board/packages/baseline100-20261017/README.md)、[运行说明](board/g1-reproduce.md) | G1九次通过；统一100次全部完成，三个实际启动 |
 | E1b DS四点曲线 | [四档五条件统计/IQR](data/ds-sweep-summary.md)、[执行报告](board/ds-sweep.md)、[实验包](board/packages/ds-sweep-20261017/README.md) | DS25/DS100新增100次通过，复用旧DS0/DS50；200次形成四点曲线 |
 | 统一100次离线补充分析 | [三个问题与表格](analysis/baseline100-extra.md)、[复现脚本](../../analysis/scripts/baseline100_extra.py) | 合计吞吐及跨窗界限、DS0读写四阶段、分boot与合并离散度/10000次bootstrap CI；原始数据只读 |

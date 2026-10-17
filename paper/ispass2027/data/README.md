@@ -4,6 +4,8 @@
 
 ## 文件与重建
 
+本目录是论文选入数据，完整历史轮次与后续修正查[实验总账](../../../docs/experiment-ledger/README.md)。E3 v6保留历史数值，但必须同时使用[时序证据更正](../../../docs/research-history/evidence/daily-2026-10-16-resumed-2026-10-17/e3-timing-correction.md)，不能把已入表等同完成时序验证。
+
 | 文件 | 用途 |
 | --- | --- |
 | [board_results.csv](board_results.csv) | 板测长表27544行：历史4096＋G1 828＋统一100点12480＋E1b新增100点10140；行数不是实验重复次数 |
