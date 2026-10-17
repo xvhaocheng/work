@@ -25,6 +25,7 @@ Root审实际frontend diff后才进入下一小批；E4、完整E3优先。
 - `cli-validation/README.md`：独立ABI6静态CLI四固定条件、507项实际main假syscall/UBSan、原始错误保留及RV64 ELF。
 - `software-source/README.md`：新platform6491/Linux69d绑定、唯一正式软件builder、9项rootfs/拒绝门检查，以及已passed Image/payload/匹配SPI与transport。
 - `collector-source/README.md`：严格40点G collector/parser候选、100项有限fixture与独立whole/window分析计划；未跑板。
+- `analysis-source/README.md`：完整40点重解析、只读输入快照、统一17列CSV与区组统计候选；41项finite fixture，正式0板点。
 - `source-map.md`：可导航的实际组件commit、文件行号、历史执行输入与新组织commit的区别。
 - `evidence/index.json`：34份只读Git源码/原报告的路径、blob/SHA256、来源角色。
 - `evidence/isolated-source-comparison.json`：7份IOMMU关键源码与历史isolated实际构建副本逐字节相同。
