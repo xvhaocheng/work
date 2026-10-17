@@ -1,3 +1,9 @@
+# 2026年10月17日 DISCOVERY-REUSE-1：1次局部编译、8条件实际完成
+
+[结果](problem-discovery-results-20261017.md)／[准确source/命令](../out/problem-discovery-run-20261017/build01/build-manifest.json)／[root接受](../out/problem-discovery-run-20261017/acceptance.json)：6基础＋2按实际必要目的翻译链触发的2MiB诊断，同一elaboration；每条件首次退出0/quiet、每路64parent/262144B读写/128AR-AW-B/32768R-W beat/0错误，逐W数据与bytecoverage、exact NEXT/DONE通过，保留held稳定检查与独立watchdog。独立归约核128parents/条件、AW/W/B/R身份及逐笔数据，全部1024parents有效；未独立复跑，不作完整协议证明或原生结论。
+
+冻结source/C++哈希仍匹配manifest；原始8份events.csv保留本机并以gzip发布，全部解压字节/哈希一致。root直核R16 Aj16写翻译链与具体已承诺payload前驱、IOTLB替换逻辑；所有旧原文/生产源码保留，CURRENT分支和独立工程段不变。本轮无生产改动、旧实验重跑、综合/板测，MIG继续暂停。以下旧验证全文保留，其“尚未运行”描述仅指前一准备轮。
+
 # 2026年10月17日 DISCOVERY-REUSE-1：准备检查，无新实验
 
 [问题发现合同](problem-discovery-contract-20261017.md)与[源码可行性](../out/problem-discovery-plan-20261017/fixture-feasibility.md)/[已查覆盖](../out/problem-discovery-plan-20261017/existing-coverage.md)为计划/静态证据，不是RTL执行结果。6个P/PN基础条件、最多2个普通大页诊断；旧paired需新增补发与只读观察，当前没有新可执行命令。用户材料明确未授权新实验，故本轮仿真/构建/生产修改/旧实验重跑/板测均0。

@@ -10,7 +10,7 @@
 - **RTL/有限系统模型**只支持实际实例与环境；行为 DDR、真实 cache 端口、源语义代理和原生应用分别标注。
 - **来源核查/条件构造**支持接口能力、必要条件和条件盈亏，不把未知费用置零，不当作原生收益。
 - “停止”只限具名版本、动作、费用与证据覆盖范围。普通程序在同新增付费接口上复现策略，不单独证明接口已发表、所有实现等成本或整个思想族无价值。
-- 问题发现不要求先有论文机制；机制增量不足与问题尚未证实分开。2026-10-17的[有界发现合同](../iommu-platform/docs/problem-discovery-contract-20261017.md)已准备，只有源码可行性与覆盖核查，尚未授权实施/运行，不作为新实验结果。
+- 问题发现不要求先有论文机制；机制增量不足与问题尚未证实分开。2026-10-17的[有界发现合同](../iommu-platform/docs/problem-discovery-contract-20261017.md)经用户继续后已实际执行，结果见[发现报告](../iommu-platform/docs/problem-discovery-results-20261017.md)；发现新事实与形成论文机制分别判断。
 - M（占用计费候选）、M0（完整任务测量合同）、首 PTE 的 M-ID（具体接口候选）不是同一个对象；P 是容量分区，N 是命中旁路，PN 是组合。V/A 通常指受保护前台/后台干扰者，角色和分母须按各轮合同核对。
 
 ## 测量平台与局部因果证据
@@ -82,6 +82,7 @@
 | 首PTE接口与legalizer成对设计 | M-ID f1的时序/身份/资格与O-local/O-prepared的真实接线落定；强O复用TC保持，1个完成sticky，无新header FIFO | 结束票据天然少状态/便宜的理由；原2060/2058只属旧模型。当时保留局部实现提案；后继实际结果见下行 | [六段报告](../iommu-platform/docs/first-pte-interface-cost-20261016.md)、[接受](../iommu-platform/out/first-pte-interface-cost-20261016/root/root-result-acceptance.json)、[唯一后继](../iommu-platform/out/first-pte-interface-cost-20261016/root/next-minimal-contract.json) |
 | 首PTE局部RTL/成本判别 | M与普通不分段base完整quiet4481/1749且已记录事务逐行相同；强O-prepared实际4519/1794并验证提前翻译/TC保持 | 结束固定正常COPY/PN/cold-hot收益版本：合格V写walk时A数据已回完，M实际mask0。保留实现，未扩O-local/job性能或相位搜索，不外推整个接口族 | [六段结果](../iommu-platform/docs/first-pte-paired-local-20261016.md)、[原始分析](../iommu-platform/out/first-pte-paired-local-20261016/root/paired-analysis.json)、[接受](../iommu-platform/out/first-pte-paired-local-20261016/root/root-result-acceptance.json) |
 | 重新立题RECONVERGENCE-1 | 原始失败机制复核；TC借用续行、译后分段/返回预约、范围旧代回收三个具体设计与最近原文比较 | 前两版无具体残余能力/成本差项；第三缺匹配正常残余。均不立项，不强选主线或排等价实验；不是新性能结果或全方向否决 | [七段报告](../iommu-platform/docs/research-reconvergence-20261016.md)、[原始核查](../iommu-platform/out/research-reconvergence-20261016/failure-evidence.md)、[接受](../iommu-platform/out/research-reconvergence-20261016/root-result-acceptance.json) |
+| 10月17日DISCOVERY-REUSE-1 | 真实DMA/IOMMU局部RTL＋行为DDR：64parents/路，目的R1/8/16×P/PN及两普通2MiB诊断；8条件/1024parents核验通过。R8足迹9仍39walk；PN与P同walk但完整时间更慢；后续PTE的已承诺payload前驱已定位 | 源码推导masked tree-PLRU热源/子树偏置，未直接采victim；本专用arena普通2MiB使双方完整75797步/3初始walk。归发现与普通优化依据，未立新机制、不恢复M或MIG，不外推4KiB受限部署 | [中文结果](../iommu-platform/docs/problem-discovery-results-20261017.md)、[原始输出/归约](../iommu-platform/out/problem-discovery-run-20261017/README.md)、[接受](../iommu-platform/out/problem-discovery-run-20261017/acceptance.json) |
 
 资源归因始终分开源池本来持有、B 关联实际延后、复制目标新增及退休占用，按物理并集去重；策略改变分配/回收时各自推导再用序列。CPU、物理内存、PTE/IOVA、带宽与有效完成分别报告。相同工作/服务下 CPU 或不可回收内存的改善可以是主要价值，无需强造时间独占收益。
 

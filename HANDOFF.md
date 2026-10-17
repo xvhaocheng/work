@@ -1,3 +1,11 @@
+# 2026年10月17日 DISCOVERY-REUSE-1：有界发现已执行，保留两项新系统事实
+
+用户在具体合同后回复“继续”，一次局部编译＋6基础/2普通大页诊断实际完成，全部8条件/1024parents通过逐笔数据/身份/守恒及独立原始事件归约。[中文结果](iommu-platform/docs/problem-discovery-results-20261017.md)／[完整输出](iommu-platform/out/problem-discovery-run-20261017/README.md)／[接受](iommu-platform/out/problem-discovery-run-20261017/acceptance.json)。无旧实验重跑/生产修改/综合/板测，所有条件首次通过。
+
+A源固定且目的R8时footprint9<mask14仍39walk：masked tree-PLRU热源/2与4项子树偏置的源码推导，精确吻合偶数目的反复miss/奇数仅冷miss；未直接测victim。P/PN同walk但R16完整101334/130104步；PN后续PTE明确排在已接受Vj16两payload后，队列等待461步有具体ID/occurrence，不由重叠算可回收时间。普通2MiB叶使P/PN完整均75797、3初始walk，parents字节一致、PN多2个未接受probe。
+
+本arena归普通组织可解/替换实现局限，未形成新机制，不自动恢复M、追加case或系统开发；普通替换校准仅作未执行建议，不是新论文方向。CPU/RAM未实测，行为DDR/局部RTL非原生；B1/I/D/A5/A2及MIG暂停、原窗口保持。旧计划的“未授权/未运行”是此前快照，已被本段实际执行取代；以下全文保留。
+
 # 2026年10月17日 DISCOVERY-REUSE-1：问题发现合同准备完成，未运行
 
 纠正准入顺序：[三道门槛](docs/agent-policy.md#问题发现机制原型与论文贡献)分别判断问题发现、机制原型与论文贡献；三个当前版本不立项，不等于没有值得取得的新事实，也不是三次新机制实验失败。目标仍是方法/机制论文。
