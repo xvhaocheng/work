@@ -38,6 +38,7 @@ def main():
         result = collector.parse(raw, kernel, 'A8')
         assert result['record']['result']['victim_did'] == 11
         checks.append({'name': name, 'passed': True, 'expected': 'accept'})
+        return result
 
     def reject(name, raw):
         try:
@@ -58,6 +59,25 @@ def main():
     reject('taint', fixture().replace('TAINT_AFTER=0', 'TAINT_AFTER=4096'))
     reject('missing_PATH', re.sub(r'^.*idma_path_obs[^\n]*\n?', '', fixture(), flags=re.M))
     reject('stale_sequence', fixture().replace('PRE_SEQ=', 'PRE_SEQ=9'))
+    # A first offer is privately accepted into the mux spill but does not
+    # leave stage0/shared until after close. Preserve each stock/flow and stage
+    # chain equation; no unproved relation between offer and private accepts.
+    sequence = int(re.search(r'^PRE_SEQ=(\d+)$', text, re.M)[1]) + 1
+    def change_fields(line, changes):
+        for key, amount in changes.items():
+            line, count = re.subn(r'\b' + key + r'=(0x[0-9a-fA-F]+|\d+)',
+                                 lambda m: key + '=' + str(int(m[1], 0) + amount), line)
+            assert count == 1
+        return line
+    spill = re.sub(r'idma_batch_obs seq=' + str(sequence) + r' part=axi_a [^\n]+',
+                   lambda m: change_fields(m[0], {'ar': 1, 'end': 65536}), fixture())
+    spill = re.sub(r'idma_path_obs seq=' + str(sequence) + r' role=a channel=r stage=0 [^\n]+',
+                   lambda m: change_fields(m[0], {'entered': 1, 'end': 1, 'area': 1}), spill)
+    item = accept('closing_read_spill_one_all_conservation_preserved', spill)
+    assert item['metrics']['private_ar_signed_difference'] == -1
+    bad_shared = re.sub(r'idma_batch_obs seq=' + str(sequence) + r' part=axi_a [^\n]+',
+                        lambda m: change_fields(m[0], {'shared_ar': 1}), spill)
+    reject('tampered_shared_count_after_closing_spill', bad_shared)
     assert len(collector.plan()) == 30
     assert all(sum(c == name for _, c in collector.plan()) == 10
                for name in collector.CONDITIONS)

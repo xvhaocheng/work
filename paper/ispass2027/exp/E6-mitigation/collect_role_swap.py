@@ -91,7 +91,6 @@ def parse(output, expected_kernel, condition, expected_n=4096, expected_warmup=2
     for lane in (v, a):
         assert (lane['start'] >> 16)+lane['ar'] == lane['rlast']+(lane['end'] >> 16)
         assert (lane['start'] & 65535)+lane['aw'] == lane['b']+(lane['end'] & 65535)
-    assert a['shared_ar'] == v['ar']+a['ar'] and a['shared_aw'] == v['aw']+a['aw']
     if result['aggressor']:
         assert a['ar'] > 0 and a['aw'] > 0 and v['both'] > 0
     else:
@@ -120,11 +119,18 @@ def parse(output, expected_kernel, condition, expected_n=4096, expected_warmup=2
                 assert p['area'] == p['sum']
             elif result['aggressor'] is None:
                 assert all(p[k] == 0 for k in ['entered','full','carry','sum','max','start','end','area'])
+        # Stage0 leaves are same-window shared handshakes. Private accepts can
+        # cross the window in the mux spill registers; do not equate those taps.
+        shared_reads = sum(paths[key]['full'] + paths[key]['carry'] for key in ['vr0', 'ar0'])
+        shared_writes = sum(paths[key]['full'] + paths[key]['carry'] for key in ['vw0', 'aw0'])
+        assert a['shared_ar'] == shared_reads and a['shared_aw'] == shared_writes, 'same-window shared handshakes'
     metrics = {'hardware_ms': t['cycles']/50000,
                'hardware_MiB_s': (n*4096/1048576)/(t['cycles']/50e6),
                'hardware_cycles': t['cycles'], 'h_cycles': t['h'], 'gap_cycles': t['gap'],
                'overlap_percent': v['both']*100/t['cycles'],
                'software_ms': result['victim_elapsed_ns']/1e6}
+    metrics['private_ar_signed_difference'] = a['shared_ar'] - v['ar'] - a['ar']
+    metrics['private_aw_signed_difference'] = a['shared_aw'] - v['aw'] - a['aw']
     for label in ['victim', 'aggressor']:
         for metric in ['iotlb_miss', 's1_ptw', 's2_ptw']:
             metrics[label+'_'+metric] = result[label][metric] if result[label] else None
