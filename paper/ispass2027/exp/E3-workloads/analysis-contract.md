@@ -4,6 +4,10 @@
 [analyze_p0.py](analyze_p0.py)預設只接受status=passed的完整45點，重新解析每個已接受raw命令，
 檢查同boot／獨立sequence、固定輪換plan、真實bytes/cycles、PATH與AXI守恆，並核對四份build/load/backend來源hash。
 不使用records中快取的metrics；不修改採集檔案。
+正式主CLI拒絕collection、load、FPGA、software或任何保留raw命令的`fixture_only`；
+backend fixture也始終拒絕。拒絕發生在任何snapshot／analysis／CSV輸出建立之前。
+沒有公開CLI參數繞過此限制。內部有限測試必須顯式使用`_fixture_mode=True`，
+結果傳播`fixture_only`並標`source_board_cases=0`；CSV的experiment、evidence_level與sample_set均明確synthetic。
 
 長表的18列欄位與E1b完全相同：
 `row_id,experiment,condition,metric,statistic,value,unit,n,bitstream_id,kernel_id,raw_path,source_locator,evidence_level,value_status,identity_status,boot_id,sample_set`。
@@ -46,7 +50,10 @@ python3 paper/ispass2027/exp/E3-workloads/analyze_p0.py \
 snapshot保留原collection_status；running或failed的成功前綴始終標partial，不能作為完整45點。
 原failed命令不加入統計，也不重試；完整錯誤記錄仍由採集器保留。
 
-[verify_p0_analysis.py](verify_p0_analysis.py)的18項有限檢查包含實際CLI的部分快照、
+[verify_p0_analysis.py](verify_p0_analysis.py)的24項有限檢查包含主CLI拒絕fixture發布、
+五個來源邊界各自獨立拒絕與synthetic證據傳播、內部顯式test模式的部分快照、
 來源逐byte不變、候選檔不讀、來源hash與raw重新解析拒錯、空prefix、未配對block、
-分位數與兩種比值反例；[原始回執](test-results/p0-analysis02.json)明示fixture_only與新板測0。
+分位數與兩種比值反例；[原始回執](test-results/p0-analysis04.json)明示fixture_only與新板測0。
 合成UART與CSV只在ignored artifacts測試目錄，不作論文資料。
+較早analysis01/02回執和本機fixture保留為歷史；其中的測試輸出不具備目前的fixture發布邊界，
+不能作板測長表。新24項回執驗證了修正後的明確拒絕與synthetic標記。

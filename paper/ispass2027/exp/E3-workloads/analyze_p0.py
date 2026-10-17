@@ -44,6 +44,17 @@ def describe(values):
                 q1=q1, q3=q3, iqr=q3-q1)
 
 
+def mark_fixtures(result, sources):
+    result['fixture_only'] = bool(sources)
+    result['fixture_sources'] = sorted(set(sources))
+    result['evidence_level'] = 'synthetic_protocol_fixture' if sources else 'fpga_board'
+    if sources:
+        result['fixture_plan_complete'] = result['campaign_complete']
+        result.update(status='analysis_of_synthetic_P0_fixture', campaign_complete=False, source_board_cases=0,
+                      identity_status='synthetic_protocol_fixture')
+    return result
+
+
 def summarize(records, manifest, bursts, allow_partial=False):
     require(manifest['schema'] == 'ispass2027-p0-collection-v1'
             and manifest['ds'] == '0/0' and manifest['clock_hz'] == 50000000, 'requires P0 DS0 collection')
@@ -106,9 +117,9 @@ def summarize(records, manifest, bursts, allow_partial=False):
                        'unmatched_A8_blocks': sorted(set(by_condition['A8'])-set(blocks)),
                        'unmatched_A1_blocks': sorted(set(by_condition['A1'])-set(blocks)),
                        'statistics': describe(x['time_ratio_A8_over_A1'] for x in pairs), 'pairs': pairs})
-    return {'status': 'analysis_of_complete_P0' if complete else 'analysis_of_partial_P0_successful_prefix',
+    result = {'status': 'analysis_of_complete_P0' if complete else 'analysis_of_partial_P0_successful_prefix',
             'collection_status': manifest['status'], 'campaign_complete': complete,
-            'source_board_cases': len(records), 'planned_cases': 45, 'clock_hz': 50000000,
+            'source_cases': len(records), 'source_board_cases': len(records), 'planned_cases': 45, 'clock_hz': 50000000,
             'rows': rows, 'paired_comparisons': paired, 'quantile_method': QUANTILE_METHOD,
             'boot_id': manifest['boot_id'], 'bit_sha256': manifest['bit_sha256'], 'kernel_release': manifest['kernel_release'],
             'identity_status': 'collector_load_receipt_hash_boot_bound',
@@ -116,6 +127,10 @@ def summarize(records, manifest, bursts, allow_partial=False):
             'interpretation': 'cell ratios of medians and within-block paired A8/A1 time ratios reported separately; '
                               'descriptive statistics only, no significance or pure-translation claim',
             'shared_boundary': 'shared AR/AW matched to PATH0 leave; private difference is signed diagnostic only'}
+    fixtures = ['collection'] if manifest.get('fixture_only', False) else []
+    fixtures += [f'record:{item["case"]}' for item in records
+                 if item.get('fixture_only', False) or item['record'].get('fixture_only', False)]
+    return mark_fixtures(result, fixtures)
 
 
 def window(metric):
@@ -126,20 +141,23 @@ def window(metric):
 
 def long_rows(result, summary_path, sample_set):
     rows = []
-    stem = 'board_p0.'+tables.slug(sample_set)
+    synthetic = result.get('fixture_only', False)
+    experiment = 'synthetic_p0_protocol' if synthetic else 'board_p0'
+    stem = experiment+'.'+tables.slug(sample_set)
 
     def add(suffix, condition, metric, statistic, value, n, *ptr, applicable=True):
-        rows.append(dict(zip(tables.FIELDS, [stem+'.'+suffix, 'board_p0', condition, metric, statistic, value,
+        rows.append(dict(zip(tables.FIELDS, [stem+'.'+suffix, experiment, condition, metric, statistic, value,
             tables.unit(metric), n, 'program_file_sha256:'+result['bit_sha256'], result['kernel_release'],
-            str(summary_path.resolve()), tables.pointer(*ptr), 'fpga_board',
+            str(summary_path.resolve()), tables.pointer(*ptr), 'synthetic_protocol_fixture' if synthetic else 'fpga_board',
             ('derived' if statistic != 'sample' else 'observed_or_derived') if value is not None else
             ('unknown' if applicable else 'not_applicable'), result['identity_status'], result['boot_id'],
-            'p0:'+('complete:accepted' if result['campaign_complete'] else 'partial:accepted_prefix')+':'+sample_set])))
+            'p0:'+('synthetic_fixture' if synthetic else 'complete:accepted' if result['campaign_complete']
+                   else 'partial:accepted_prefix')+':'+sample_set])))
 
     def condition_text(row, metric):
         return (f"role=V0-A1;ds=0/0;V_bytes={row['victim_chunk_bytes']};A_bytes=4096;mode={row['condition']};"
                 f"campaign_status={result['collection_status']};campaign_complete={int(result['campaign_complete'])};"
-                f"trials_observed={result['source_board_cases']};window={window(metric)}")
+                f"trials_observed={result['source_cases']};window={window(metric)}")
 
     for ri, row in enumerate(result['rows']):
         cell = f"V{row['victim_chunk_bytes']}.{row['condition']}"
@@ -176,7 +194,7 @@ def long_rows(result, summary_path, sample_set):
     return rows
 
 
-def read_collection(records_path, manifest_path, backend_path, allow_partial=False):
+def read_collection(records_path, manifest_path, backend_path, allow_partial=False, *, _fixture_mode=False):
     """Read sources once, retain exact bytes, and reparse only retained commands."""
     observed = {}
 
@@ -224,10 +242,21 @@ def read_collection(records_path, manifest_path, backend_path, allow_partial=Fal
     result['analyzer_sources'] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                                  for p in (Path(__file__), HERE/'p0_records.py', HERE/'table_schema.py')}
     result['bound_collection_sources'] = manifest['sources']
+    fixtures = list(result['fixture_sources'])
+    for source_path, body in observed.items():
+        value = json.loads(body)
+        if isinstance(value, dict) and value.get('fixture_only', False):
+            fixtures.append(str(source_path))
+    if fixtures:
+        # Internal test calls are explicit; the main CLI exposes no fixture bypass.
+        was_complete = manifest['status'] == 'passed' and len(records) == 45
+        mark_fixtures(result, fixtures)
+        result['fixture_plan_complete'] = was_complete
+        require(_fixture_mode, 'fixture_only input cannot publish P0 paper analysis')
     return result, observed
 
 
-def main():
+def main(*, _fixture_mode=False):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--records', required=True, type=Path)
     p.add_argument('--manifest', required=True, type=Path)
@@ -243,7 +272,8 @@ def main():
     require(len({x.resolve() for x in outputs}) == len(outputs), 'analysis output paths collide')
     require(all(not x.exists() for x in outputs) and (not a.snapshot_dir or not a.snapshot_dir.exists()),
             'analysis outputs must be new; no overwrite')
-    result, observed = read_collection(a.records, a.manifest, a.backend_evidence, a.allow_partial)
+    result, observed = read_collection(a.records, a.manifest, a.backend_evidence, a.allow_partial,
+                                       _fixture_mode=_fixture_mode)
     if a.snapshot_dir:
         snapshot = a.snapshot_dir.resolve()
         result['snapshot'] = {'directory': str(snapshot), 'scope': 'observed manifest, retained records, bound sources and their raw commands',
