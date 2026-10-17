@@ -90,7 +90,7 @@ P 的 fill mask 由**稳定主 PTW/MSI 请求** DID 决定，不能取当前 fas
 
 N 原样限定两 lifecycle tag，每 bank 一笔翻译、一个 normal walker。窗口是**另一 bank 的 S1 PTW 活跃**、S2 Bare；只接受真实 DDTC+IOTLB 命中、Sv39 4KiB、canonical IOVA、普通 untranslated R/W、合法 DC/权限及 MSI 范围排除。ATS/PRI/PID/priv/debug、大页、miss、变化的候选/上下文/invalidation 都不被 fast path 接受，走原合法慢/故障路径。请求探测不 touch；真实 `accept_o` 才一次 touch 两 cache。response 反压时保持完整 payload/tag 直到握手，不因模式切换、flush 或软件 STOP 取消。
 
-完整 buffer 证书只来自实际 frontend→backend job handshake 与 backend retire，normal aligned4096、容量>=4096B、一个未退役 job；重叠/错误退休使许可粘性失效直到 reset。不得由 Linux 传一个“已缓存”标志替代，也不能把假定页对齐当证书。
+完整buffer证书只来自真实**frontend→job FIFO** handshake（wrap中的`be_valid_d && be_ready_d`）与selected backend retire（`idma_rsp_valid && idma_rsp_ready`），不是后端reqfire或Linux flag；normal aligned4096、容量>=4096B、一个未退役job。Root已直接核原件；新双backend接线必须保留accepted-job/retire序列匹配、同拍replace口径及异常重叠许可粘性撤销直到reset。不得由Linux传一个“已缓存”标志替代，也不能把假定页对齐当证书。
 
 ## 4. 模式接口、切换、flush、计数与最小cooldown（具体布局待 Root 锁定）
 
@@ -196,3 +196,5 @@ cooldown阶段从未offer下一task，STOP优先于到期：结束批次但不�
 ## 9. 本批结论与下一步
 
 P/N历史来源与真实accept/容量依赖已定位；Root已选同BIT双支路、normal flat-context受限域、必要cooldown/accept计数，用户批准最小A/union被动捕获，矩阵严格205。Root指定下一实施批只做P IOTLB+TL必要mask/flush/localhistory及原gold真实DUT有限检查；N受限输入实际拒绝方案后续独立小批。不构建完整BIT直到Root接受实际diff/有限回执。当前无可上板PN产物、无新性能结果，也没有“PN已复现”或“S等价已通过”的主张。
+
+后继小批回执：[P-only实际diff/有限检查](p-validation/README.md)，IOMMU `d2a813d67bcfd0295d8934c3cc027d24d3195d63`直接接85b；该小批不改变本计划的205板点/完整构建硬门。cooldown前端已由Root另分A2独立`ispass/e6-pn-gap`从8aac实施，A1不重复写该文件，接受后再由A1连接仅DMA0使能。

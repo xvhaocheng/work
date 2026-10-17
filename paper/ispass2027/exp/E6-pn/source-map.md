@@ -6,6 +6,7 @@
 - 计划见 [port-plan.md](port-plan.md)。行号区间针对本页明确指定的原字节；活动HEAD不替代固定commit。绝对路径可供本机Root直接读；恢复时用下列repository-relative path与完整commit。
 - 本批Codex直接核关键原文、RTL及七文件逐字节比较；没有DeepSeek/Claude/Astra调用。实际运行模型/原生窗口元数据不可见，保持所请求Sol/ultra而不伪造验收。
 - [只读核查原始回执](source-check01.json)保存实际四组件HEAD/clean状态、lock/gitlink输出、七份donor原字节比较与报告hash；`passed`只限该只读来源范围，不是功能/构建/板测通过。
+- 本页基座/clean指的是方案首批冻结时刻；后继P-only组件与实际有限证据另见 [p-validation/README.md](p-validation/README.md)，未改写首批receipt或旧执行身份。
 
 ## 1. 新独立工作树与固定基座
 
