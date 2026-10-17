@@ -14,16 +14,18 @@ from pathlib import Path
 import re
 import statistics
 import sys
+import software_profiles as profiles
 
 if not __debug__:
     raise RuntimeError('Run without Python -O: collection checks require assertions')
 HERE = Path(__file__).resolve().parent
 BOARD = HERE.parents[1] / 'board'
 E5 = HERE.parent / 'E5-latency'
-LINUX = 'da6b69fc007ad5e671dc288dd8038d02e3ebe43d'
-PLATFORM = 'a68603f0fc668771bc0c9e3a86fcefe289bfa17b'
-CLI_SHA256 = '264e75c6dc20d597e97831038c15b87b9d8274440661dbfb75505c9cedbe5314'
-KERNEL = '6.5.0-rc2-ispass2027-e4-e5-v1'
+# Compatibility aliases for the original frozen fixtures, never profile defaults.
+LINUX = profiles.PROFILES['e4-e5-v1']['selected_linux']
+PLATFORM = profiles.PROFILES['e4-e5-v1']['selected_platform']
+CLI_SHA256 = profiles.CLI_SHA256
+KERNEL = profiles.PROFILES['e4-e5-v1']['kernel_release']
 CONDITIONS = {'leaf4k':4096,'leaf2m':2097152}
 
 
@@ -241,13 +243,7 @@ def parse(output,expected_kernel,condition,histogram):
 
 
 def validate_software(software,expected_kernel):
-    assert software['status']=='passed' and software['kernel_release']==expected_kernel==KERNEL
-    assert software['selected_linux']==LINUX and software['selected_platform']==PLATFORM
-    assert software['selected_cva6']=='6c5c666d45979d3a03fb98cff89ba7ad095f6125'
-    assert software['handwritten_inputs']['bench/idma_pages.c']==CLI_SHA256
-    assert all('bin/'+name in software['artifacts'] for name in
-               ['idma_experiment','platform-timeout','platform-sd-update','idma_p0','idma_scaling','idma_pages'])
-    assert software['recovery']['kernel_release']==expected_kernel
+    return profiles.validate_software(software,expected_kernel)
 
 
 def review(records):
@@ -285,7 +281,8 @@ def recover_prefix(directory,manifest,histogram):
     for key in ['schema','planned_cases','ds','boot_id','kernel_release','bit_sha256',
                 'load_manifest_sha256','source_record_sha256','software_manifest_sha256',
                 'fpga_manifest_sha256','package_manifest_sha256','script_sha256',
-                'histogram_validator_sha256','e5_identity_helper_sha256']:
+                'histogram_validator_sha256','e5_identity_helper_sha256',
+                'software_profile','software_profile_helper_sha256']:
         assert old[key]==manifest[key], 'recovery identity: '+key
     paths={p.resolve() for p in (directory/'uart').glob('command-*.json')}
     paths.update(Path(p).resolve() for p in old.get('recovered_raw_commands',[]))
@@ -329,11 +326,12 @@ def main():
     e5_identity,histogram=e5_modules(args.e5_dir)
     bound=e5_identity.identity(args.package.resolve(),args.load_manifest.resolve(),args.fpga_manifest.resolve())
     software=json.loads(args.software_manifest.read_text())
-    validate_software(software,bound['kernel_release'])
-    assert bound['actual_commits']['linux']==LINUX and bound['actual_commits']['platform']==PLATFORM
+    source=json.loads(Path(bound['source_record']).read_text())
+    fpga=json.loads(args.fpga_manifest.read_text())
+    profile=profiles.validate_bound_software(bound,software,source,fpga)
     bound['workload']='E4: V0/A1, perbuffer2MiB/total8MiB, COPY4096,N4096,W256,4Kvs2M leaves,20trials'
     if args.check_only:
-        print(json.dumps(bound,indent=2));return
+        print(json.dumps(dict(bound,software_profile=profile),indent=2));return
     for path in [args.package/'manifest.json',Path(bound['source_record']),args.load_manifest,args.fpga_manifest,args.software_manifest]:
         markers=synthetic_markers(json.loads(path.read_text()),str(path))
         assert not markers, 'host fixtures cannot start collection: '+str(markers[:1])
@@ -342,6 +340,7 @@ def main():
               'started_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
               **bound,'e5_identity':bound,'histogram_required':True,
               'software_manifest':str(args.software_manifest.resolve()),'software_manifest_sha256':sha(args.software_manifest),
+              'software_profile':profile,'software_profile_helper_sha256':sha(profiles.__file__),
               'selected_software':software,'ds':'0/0','planned_cases':planned,
               'script_sha256':sha(__file__),'histogram_validator_sha256':sha(args.e5_dir/'hist_records.py'),
               'e5_identity_helper_sha256':sha(args.e5_dir/'collect_e5.py')}

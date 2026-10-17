@@ -70,6 +70,8 @@ def main():
             'planned_cases':analysis.collector.plan(),'recorded_cases':20,**bound,'e5_identity':bound,
             'software_manifest':str(paths['software']),'software_manifest_sha256':analysis.sha(paths['software'].read_bytes()),
             'selected_software':json.loads(paths['software'].read_text()),'script_sha256':analysis.sha(Path(analysis.collector.__file__).read_bytes()),
+            'software_profile':analysis.collector.validate_software(software,analysis.collector.KERNEL),
+            'software_profile_helper_sha256':analysis.sha(Path(analysis.collector.profiles.__file__).read_bytes()),
             'histogram_validator_sha256':analysis.sha((a.e5_dir/'hist_records.py').read_bytes()),
             'e5_identity_helper_sha256':analysis.sha((a.e5_dir/'collect_e5.py').read_bytes())}
     manifest=bind_manifest();save(run/'manifest.json',manifest);save(run/'records.json',records);save(run/'review.json',analysis.collector.review(records))
@@ -125,6 +127,8 @@ def main():
         checks.append({'name':'public_CLI_refuses_fixture_before_output_directory','passed':True})
         mutate('partial19_rejected',run/'manifest.json',lambda x:x.update(recorded_cases=19))
         mutate('running_status_rejected',run/'manifest.json',lambda x:x.update(status='running'))
+        mutate('software_profile_relabel_rejected',run/'manifest.json',lambda x:x.update(software_profile='unknown'))
+        mutate('profile_helper_changed_rejected',run/'manifest.json',lambda x:x.update(software_profile_helper_sha256='0'*64))
         mutate('plan_reordered_rejected',run/'manifest.json',lambda x:x['planned_cases'].reverse())
         mutate('mapping_condition_relabel_rejected',run/'records.json',lambda x:x[0].update(mapping_page_bytes=2097152))
         mutate('case_order_rejected',run/'records.json',lambda x:x[1].update(case=1))

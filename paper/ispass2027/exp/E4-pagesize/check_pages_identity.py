@@ -28,15 +28,15 @@ def main():
     with tempfile.TemporaryDirectory(prefix='e4-host-identity-') as temp:
         root=Path(temp);package=root/'package';package.mkdir();(package/'fixture.bit').write_text('SYNTHETIC HOST; NO BIT')
         delivery={'fixture_only':True,'status':'ready_for_collection','kernel_release':c.KERNEL,
-                  'source_record':'source.json','artifacts':{'ds0_bit':{'file':'fixture.bit','sha256':'b'*64}}}
-        source={'fixture_only':True,'actual_commits':{'platform':c.PLATFORM,'linux':c.LINUX,'cva6':identity.CVA6,'iommu':'c'*40,'opensbi':'e'*40}}
-        load={'fixture_only':True,'status':'boot_identity_verified','kernel_release':c.KERNEL,'boot_id':'HOST-FIXTURE-NO-BOARD','bit_sha256':'b'*64}
-        fpga={'fixture_only':True,'status':'passed','selected_cva6':identity.CVA6,'selected_iommu':'c'*40,
+                  'source_record':'source.json','artifacts':{'ds0_bit':{'file':'fixture.bit','sha256':c.profiles.BIT_SHA256}}}
+        source={'fixture_only':True,'actual_commits':{'platform':c.PLATFORM,'linux':c.LINUX,'cva6':identity.CVA6,'iommu':c.profiles.HARDWARE_IOMMU,'opensbi':software['selected_opensbi']}}
+        load={'fixture_only':True,'status':'boot_identity_verified','kernel_release':c.KERNEL,'boot_id':'HOST-FIXTURE-NO-BOARD','bit_sha256':c.profiles.BIT_SHA256}
+        fpga={'fixture_only':True,'status':'passed','selected_cva6':identity.CVA6,'selected_iommu':c.profiles.HARDWARE_IOMMU,
               'parameters':{'observer_version':4,'PathDepth':4,'histogram_stages':16,'histogram_bins':32,
                             'histogram_counter_bits':32,'histogram_scheme':1,'ds_delay_enable':False,'ds_cycles':[0,0],'clock_hz':50000000},
               'timing':{'wns_ns':.1,'setup_failing':0,'hold_failing':0,'pulse_failing':0},'routing_errors':0,
               'routed_boundary':{'passed':True,'cpu_period_ns':20,'expected_delay_enable':0,'delay_cell_count':0,'forbidden_research_cell_count':0},
-              'artifacts':{'fixture/ariane_xilinx.bit':'b'*64}}
+              'artifacts':{'fixture/ariane_xilinx.bit':c.profiles.BIT_SHA256}}
         def write():
             for path,obj in [(package/'manifest.json',delivery),(package/'source.json',source),(root/'load.json',load),(root/'fpga.json',fpga)]:
                 path.write_text(json.dumps(obj)+'\n')
