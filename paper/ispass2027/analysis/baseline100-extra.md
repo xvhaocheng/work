@@ -2,15 +2,21 @@
 
 ## Material Passport
 
-Origin Skill: academic-research-suite / experiment-agent；Mode: validate；Date: 2026-10-17（JST）；Verification Status: VERIFIED（仅离线重算，不表示重跑硬件）；Version Label: baseline100_extra_v1。
+Origin Skill: academic-research-suite / experiment-agent；Mode: validate；Date: 2026-10-17（JST）；Verification Status: VERIFIED（仅离线重算，不表示重跑硬件）；Version Label: baseline100_extra_v2。
 
 仅使用本轮100个已接受试次；G1、旧板测、仿真均未混入。DS0 是原始直连硬件的论文主结果，DS50 是额外50/50延迟敏感性；两者均沿用本轮固定的原版加必要修复、批量供给与被动观测配置。
+
+100是完整矩阵的试次数，不是每条件的n：每DS×条件实际n=10。DS0来自一个boot；DS50前、后boot每条件各n=5，另显式报告合并n=10。[机器可读结果](baseline100-extra.json)的`statistics`含每格的稳定`result_id`、`contributing_sample_ids`与`formula_id`；`samples`保存逐操作数原始文件、JSON pointer、精确行号及已有标量行ID。所有统计在逐试次派生量上计算；不得用标量表行数作为n。
+
+硬件时间与绝对吞吐沿用采集器声明的50MHz时钟；原始语义标注calibration=unverified，本次离线分析没有追加物理时钟校准。
 
 ## 1. 双方合计吞吐
 
 80个共跑试次的 A 在 V 硬件窗口内均完成8192个写响应，按固定2048字节突发记账为16 MiB；严格同窗 W 有效字节只能给出16 MiB ±4096字节的边界区间，不能把 A 整批排空后的字节数当成同窗量。DS0 A1 的 V 保留 Solo 的52.790%，比理想50%高2.790个百分点，相对半份带宽高5.579%，因此没有超出平分的额外损失；合计约298.814 MiB/s、为同区组Solo的105.579%，是接近平分且总量略增，并非严格守恒。DS0 A8/A16/A64合计为Solo的95.665%/92.897%/90.766%，此时才出现低于Solo的总吞吐损失；DS50的相应损失更大，但不解释为纯PTW成本。
 
 以下均为逐试次计算后的中位数，COPY字节只记一次，不把读流量与写流量再相加；A与合计列是按响应完成量折算的近似吞吐（proxy）。“合计/Solo”先与同phase、同block的Solo配对，再取中位，故可能与两列中位数相除略有差异；“边界区间”是该配对比值下界/上界各自的中位数，不是置信区间。
+
+A1的16 MiB完成记账与V相同，所以双方在该记账口径下各占共跑总量约一半。这支持“基本平分”的有限描述；没有逐beat数据来证明物理DDR带宽公平分配。A8/A16/A64的相对Solo合计损失分别为DS0 4.335%/7.103%/9.234%，DS50 26.979%/30.529%/32.927%。
 
 | 配置 | 条件 | n | A响应记账 MiB | V MiB/s | A MiB/s ≈ | 合计 MiB/s ≈ | 合计/Solo % | 边界区间 % |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -124,7 +130,7 @@ DS0五条件硬件时间IQR为0.03469–0.27602 ms，DS50合并为0.09186–0.15
 
 ### DS50 合并依据与方法
 
-前后两个boot使用相同BIT声明、同一pathv3 payload、相同负载参数与条件轮转，每条件各5次；合并是对这两个已观察boot的等权描述，不以“不显著”作为等价证明。下表完整显示偏移；两boot以外的温度、运行顺序等混杂因素未被排除。
+前后两个boot记录相同BIT哈希、相同pathv3 kernel release，实验包声明共用一个payload；源码与负载参数相同、每条件各5次，沿用同一轮转方案；本分析不追加加载验证或倒填SD字节证明。合并是对这两个已观察boot的等权描述，不以“不显著”作为等价证明。下表完整显示偏移；两boot以外的温度、运行顺序等混杂因素未被排除。
 
 | 条件 | 前boot中位 ms | 后boot中位 ms | 后−前 ms | 相对变化 % |
 | --- | --- | --- | --- | --- |
@@ -142,13 +148,15 @@ DS0五条件硬件时间IQR为0.03469–0.27602 ms，DS50合并为0.09186–0.15
 
 IQR=Q3−Q1，采用Type 7线性插值。每个分组/指标做10000次有放回重采样，固定基础种子20261017，分组种子为SHA256(基础种子:scope:condition)的前8字节大端整数；同组各指标共用重采样索引。分boot组各抽原样本数，DS50合并组每次在前/后boot内各抽5次再合并10次，取bootstrap中位数分布的2.5%和97.5%分位；不对两个boot再做总体重启重采样。
 
-相对Solo的指标按完整区组配对后重采样；区间均为逐指标pointwise percentile CI，不是多指标同时区间。n=5时区间常覆盖完整观察范围，这是小样本离散bootstrap的正常现象；未声称正态性、跨试次独立性或已消除串行相关，区间条件于组内试次可交换这一近似。路径、A记账量、合计吞吐、配对比值及HPM计数的中位数/Q1/Q3/IQR/min/max/95% CI全部在[statistics CSV](baseline100-extra-statistics.csv)，不只保留上表两项。
+相对Solo的指标按完整区组配对后重采样；区间均为逐指标pointwise percentile CI，不是多指标同时区间。n=5时区间常覆盖完整观察范围，这是小样本离散bootstrap的正常现象；未声称正态性、跨试次独立性或已消除串行相关，区间条件于组内试次可交换这一近似。路径、A记账量、合计吞吐、配对比值及HPM计数的中位数/Q1/Q3/IQR/min/max/95% CI全部在[JSON的statistics数组](baseline100-extra.json)，不只保留上表两项。
 
 ## 口径不确定性与可确认边界
 
 ### A 的跨窗口事务
 
 1. 窗口从V首个任务issue之后开始，包含第4096个任务最终完成边沿，软件poll的done_to_read不在窗内；`record.result.aggressor.completed_bytes`是A启动至最后排空的整批完成量，包含V窗口前后的工作，不能除以V时间。本分析只采用相同observer序列的`axi_a.b`，读RLAST用于交叉核对；80个共跑样本均为ar=aw=rlast=b=8192，A开/关窗的已接受未响应读写突发各为2，V均为0。
+
+A不是预定4096次后停下的有限批：驱动给A设定的目标为`IDMA_EXPERIMENT_MAX_TRANSFERS=2**32`，V完成后由软件STOP并排空；本轮A整批完成4105–5623次，全部大于4096。observer还在整个V活动窗口检查A的batch_active，异常会使记录失效。这支持全窗保持自主批量供给，但不保证每周期都有可服务请求或资源饱和，也不据此声称全窗公平。开闭边界均有2个未响应写burst，不能用AW/B守恒把W字节误差化为零。
 
 2. 固定配置为4KiB COPY、64位AXI、最长256 beat且不deburst，故每COPY分为两个2048字节突发；`C_A=2048×B_A=16777216 bytes`是按响应完成的名义COPY字节记账。跨窗前已发起而窗内响应的突发计入C，窗内发起但窗后响应的不计入；它不是“整个COPY从发起到完成都落在窗口内”的字节数。
 
@@ -158,16 +166,16 @@ IQR=Q3−Q1，采用Type 7线性插值。每个分组/指标做10000次有放回
 
 ### 路径、HPM与因果限制
 
-V路径阶段均完整覆盖，A跨窗不污染V的sum/full中位数。HPM来自非原子软件窗口，DS0 A8/A16/A64的V miss中位2仍保留在CSV，不能据此定位其发生于V硬件窗口；DS50−DS0也不等于纯PTW费用。总吞吐低于Solo是描述性损失，当前计数不足以把它全部归到IOMMU内部某一阶段或某个具体带宽瓶颈。
+V路径阶段均完整覆盖，A跨窗不污染V的sum/full中位数。HPM来自非原子软件窗口，DS0 A8/A16/A64的V miss中位2仍保留在JSON，不能据此定位其发生于V硬件窗口；DS50−DS0也不等于纯PTW费用。总吞吐低于Solo是描述性损失，当前计数不足以把它全部归到IOMMU内部某一阶段或某个具体带宽瓶颈。
 
 ## 原始证据与实际源码
 
-原始输入仅为三段`records.json`、对应`manifest.json`与[固定执行身份](../board/packages/baseline100-20261017/source.json)；逐试次CSV提供raw_path、JSON pointer和同block Solo pointer。源码口径按实际执行commit读取，不以当前研究checkout替代：
+输入为三段`records.json`、对应`manifest.json`和`*-load/load.json`、只读标量长表与[固定执行身份](../board/packages/baseline100-20261017/source.json)；另保存[固定源码摘录](inputs/baseline100-source-audit.json)，其12个源码文件按当时commit读取。逐试次JSON提供raw_path、JSON pointer、精确原始行与同block Solo pointer。源码口径按实际执行commit读取，不以当前研究checkout替代：
 
 - CVA6 `8aac3fcd345af7686a55af1867783fd6b91a0069`，下列路径均相对该仓库：`corev_apu/fpga/src/dma_observer.sv:53–74,148–204`为共享活动窗口、开闭沿和AXI累计；`corev_apu/fpga/src/dma_path_observer.sv:27–44,62–85,132–142`为完整阶段/跨窗计数；`corev_apu/fpga/src/ariane_peripherals_xilinx.sv:912–946`为私有接口RLAST/B与路径实际接线。
 - 同一CVA6 commit的`corev_apu/fpga/src/ariane_xilinx.sv:158–159`定义64位data；`corev_apu/iDMA/src/idma_pkg.sv:107–110`与`corev_apu/iDMA/src/idma_legalizer.sv:75–85,143–178,235–267,335–359`推得每burst2048字节；`corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv:96–102,332–363`限定4KiB且COUNT→WAIT直至完成才发下一任务。
 - 单任务完成链为同一CVA6 commit的`corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv:180–181,283–286`→`corev_apu/iDMA/src/idma_backend.sv:519–532,643–648`→`corev_apu/iDMA/src/idma_axi_transport_layer.sv:447–455`，即最后burst的B触发任务完成、NO_ERROR_HANDLING不检查BRESP；transport同文件:354–360的WVALID不要求AW已握手。
-- Linux `45bf76b15e36cf608dff95013d91f8bedb7b1b8e` 的`drivers/misc/idma.c:341–346`写CONF=0；同文件:556–565,590–615,963–998给出A先启动、STOP/drain后才读取整批completed_bytes。实际软件platform输入`a2e847539bb638662f98dc920de0e8fd63d046e3`的`bench/idma_experiment.c:323–331`也在record.semantics中明示整批与软件窗口。
+- Linux `45bf76b15e36cf608dff95013d91f8bedb7b1b8e` 的`drivers/misc/idma.c:341–346`写CONF=0；同文件:556–565,590–615,963–998给出A先启动、STOP/drain后才读取整批completed_bytes。同文件:941–943与`include/uapi/linux/idma.h:9`给A设置2**32目标。同文件:952–970把非原子HPM快照与软件窗口绑定；原始record.semantics也明示整批与软件窗口。
 
 例如可只读核查：
 
@@ -180,20 +188,21 @@ git -C iommu-platform/linux show 45bf76b15e36cf608dff95013d91f8bedb7b1b8e:driver
 
 ## 统计验证与复现
 
-统计谬误检查覆盖11/11：分boot报告检查聚合掩盖（Simpson）；单位固定为试次避免生态推断；100条全保留、无筛选/丢失避免选择与幸存偏差；未按结果分层调整以避免collider；不涉及诊断基率或极值选组再测；不做多重显著性筛选；固定全部条件、指标、分位算法和种子，明确这是事后描述分析；不把关联解释为已定位因果，也不反推因果方向。小样本、试次可交换性及跨boot推广仍为CAUTION，不将CI当等价检验。
+统计谬误检查覆盖11/11：分boot报告检查聚合掩盖（Simpson）；单位固定为试次，不作个体请求生态推断；Berkson选择偏差与survivorship：100条全保留，但范围仍限于这一个平台、固定负载与已观察boot；collider：未按结果或后果变量作额外调整；base-rate：不涉及诊断概率；regression-to-mean：未按极端结果选组重测；look-elsewhere：不筛选显著指标；forking-paths：固定全部条件、指标、分位算法和种子，明确这是事后描述分析；不把关联解释为已定位因果，也不反推因果方向。小样本、试次可交换性及跨boot推广仍为CAUTION，不将CI当等价检验。
 
 ```sh
-python3 analysis/scripts/baseline100_extra.py
-python3 analysis/scripts/baseline100_extra.py --check
+python3 paper/ispass2027/analysis/scripts/baseline_extra.py
+python3 paper/ispass2027/analysis/scripts/baseline_extra.py --check
+python3 paper/ispass2027/analysis/scripts/baseline_extra.py --self-test
 ```
 
 第一条只生成本分析目录的文件；第二条只读重算并逐字节比较全部输出。每次都比较读取前/后的输入SHA256，任何输入或输出不一致即失败；未运行采集器、构建、仿真或板测。
 
+逐试次重算已交叉核对长表1000个hardware/path标量；负向测试只改临时副本，确认A响应不守恒、V阶段不完整、试次数不足与BIT声明不符均被拒绝，并检查转义JSON的原始行映射。
+
 | 输出 | 用途 |
 | --- | --- |
-| [samples CSV](baseline100-extra-samples.csv) | 100试次的原始定位、配对、边界计数和派生指标 |
-| [statistics CSV](baseline100-extra-statistics.csv) | 20组×全部指标；未知/不适用显式标记 |
-| [throughput CSV](baseline100-extra-throughput.csv) | 四种分组口径的吞吐与平分比较中位数 |
-| [path CSV](baseline100-extra-path.csv) | 四种分组口径的读写四阶段中位数 |
-| [boots CSV](baseline100-extra-boots.csv) | DS50前后boot偏移 |
-| [inputs JSON](baseline100-extra-inputs.json) | 输入与本分析输出SHA256、固定seed及重采样次数 |
+| [完整JSON](baseline100-extra.json) | samples、statistics、throughput、path、boot_comparison、formulas及输入SHA256 |
+| [计数器源码摘录](inputs/baseline100-source-audit.json) | 实际commit、原文件行号、摘录与完整源文件SHA256 |
+
+稳定结果ID为`baseline100-extra.<scope>.<condition>.<metric>`；scope取`ds0-middle`、`ds50-first`、`ds50-last`或`ds50-pooled`。例如DS0 A8读内部中位数位于`baseline100-extra.ds0-middle.A8.vr1_trial_mean_cycles`的`median`；同一对象给出IQR、min/max和CI，按contributing_sample_ids追到每一个`/path/vr1/{sum,full}`的原始行。吞吐表metric对应`aggressor_response_bytes`、`victim_MiB_s`、`aggressor_MiB_s_proxy`、`total_MiB_s_proxy`及`total_over_solo_percent`；所有单元均由JSON中同名formula_id计算。
