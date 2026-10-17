@@ -33,4 +33,22 @@ as-executed绘图脚本、原输入SHA、十对boot/sequence/case/raw-SHA与数�
 脚本固定三份输入SHA，拒绝fixture/incomplete/不同tuple的输入；重算Type7、逐值核17列CSV来源指针，
 并保存20条唯一boot/sequence引用及10个真实配对。它不再访问UART或重新解析/采集硬件数据。
 
-E5 stage1附图仅有真实数据基础上的方案，见 `e5-stage1-proposal.md`，尚未绘制或pool请求。
+E5 stage1附图的原真实数据方案见 `e5-stage1-proposal.md`。
+Root接受后实施的图包为 `e5-stage1-final01/e5-stage1-intervals.{pdf,svg,png}`，PDF/PNG同样仅本机保存。
+两panel分别V read/write；纵轴为base2对数cycles（1cycle20ns），每种leaf在p50/p95/p99画原桶闭区间。
+没有中点、精确p99、精确CDF或请求pooling。12条显示区间各代表10个逐trial完全相同的原区间，
+图中明确写10/10 trial intervals identical、n是trial数、线段宽度不是trial CI。
+40条原trial-stage/120个原分位区间、三个完整原出口字节/输入SHA与全部boot/seq/raw引用保存在图包。
+Stage1是TR握手至IOMMU首次输出请求呈现的路径驻留，不解释成纯PTW成本或DMA descriptor latency。
+
+E5图注候选：
+
+> Per-trial p50, p95 and p99 bucket intervals for V read/write bursts in PATH stage 1 under 4 KiB and 2 MiB IOMMU leaves. Vertical axes use a base-2 logarithmic scale in cycles (20 ns per cycle at 50 MHz). Every displayed closed interval is identical across all ten trials of that condition; the spans are histogram quantization bounds, not confidence intervals. No requests are pooled across trials, and no within-bucket point estimate is inferred. Stage 1 measures residence from translation-input handshake to first output-request presentation, including internal processing.
+
+复跑用同一隔离绘图环境和全新输出：
+
+```bash
+/tmp/ispass-ds-sweep-plot-venv/bin/python \
+  /home/xvhaocheng/work-a2-workloads/paper/ispass2027/exp/E4-pagesize/figures/plot_stage1_intervals.py \
+  --output /home/xvhaocheng/work-a2-workloads/paper/ispass2027/exp/E4-pagesize/figures/e5-stage1-review-new
+```
