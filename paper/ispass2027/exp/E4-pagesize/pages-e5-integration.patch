@@ -1,0 +1,127 @@
+diff --git a/drivers/misc/idma.c b/drivers/misc/idma.c
+index d65706548791..d7751fc3c3f4 100644
+--- a/drivers/misc/idma.c
++++ b/drivers/misc/idma.c
+@@ -48,6 +48,7 @@ MODULE_LICENSE("GPL v2");
+ #define IDMA_OBS_MAGIC 0x49444d414f425301ULL
+ #define IDMA_OBS_MAGIC_V2 0x49444d414f425302ULL
+ #define IDMA_OBS_MAGIC_V3 0x49444d414f425303ULL
++#define IDMA_OBS_MAGIC_V4 0x49444d414f425304ULL
+ #define IDMA_OBS_VALUES 34
+ #define IDMA_BATCH_MAGIC_OFFSET 0x80
+ #define IDMA_BATCH_CONTROL_OFFSET 0x88
+@@ -1050,16 +1051,21 @@ module_param_named(observe, idma_observe, bool, 0644);
+ MODULE_PARM_DESC(observe, "Collect passive E4 hardware timing (requires observation BIT)");
+ static bool idma_path_observe = true;
+ module_param_named(path_observe, idma_path_observe, bool, 0644);
+-MODULE_PARM_DESC(path_observe, "Require v3 per-transaction path timing in batch experiments");
++MODULE_PARM_DESC(path_observe, "Require v3/v4 per-transaction path timing in batch experiments");
+ 
+ struct idma_observation {
+ 	struct idma_device *control;
+ 	u64 sequence;
+-	bool armed, batch, path;
++	bool armed, batch, path, hist;
+ };
+ 
+ static u64 idma_observation_sequence;
+ 
++static bool idma_observer_has_path(u64 magic)
++{
++	return magic == IDMA_OBS_MAGIC_V3 || magic == IDMA_OBS_MAGIC_V4;
++}
++
+ /* Called with the experiment lock, before preparing or submitting any DMA. */
+ static int idma_observation_prepare(struct idma_observation *o, bool enabled)
+ {
+@@ -1073,8 +1079,9 @@ static int idma_observation_prepare(struct idma_observation *o, bool enabled)
+ 		return -ENODEV;
+ 	magic = readq(o->control->reg + IDMA_OBS_MAGIC_OFFSET);
+ 	o->path = o->batch && READ_ONCE(idma_path_observe);
++	o->hist = o->path && magic == IDMA_OBS_MAGIC_V4;
+ 	if (o->control->did != 10 ||
+-	    (magic != IDMA_OBS_MAGIC_V3 &&
++	    (!idma_observer_has_path(magic) &&
+ 	     (o->path || (magic != IDMA_OBS_MAGIC_V2 && (o->batch || magic != IDMA_OBS_MAGIC)))))
+ 		return -EOPNOTSUPP;
+ 	/* Clear previous frozen results; never take ownership of an active session. */
+@@ -1103,6 +1110,52 @@ static int idma_observation_arm(struct idma_observation *o,
+ 	return readq(o->control->reg + IDMA_OBS_CONTROL_OFFSET) == 1 ? 0 : -EIO;
+ }
+ 
++/* Frozen, bounded, one-pass reads. No histogram buffer enters a timed window. */
++static noinline bool idma_observation_hist_finish(struct idma_observation *o,
++						void __iomem *base,
++						const u64 path[16][8], bool valid)
++{
++	char counts[32 * 21]; /* Also retain corrupt 64-bit MMIO values in invalid logs. */
++	u64 info;
++	u32 overflow;
++	int i, bin;
++
++	writeq(192, base + IDMA_OBS_INDEX_OFFSET);
++	info = readq(base + IDMA_OBS_DATA_OFFSET);
++	overflow = (info >> 32) & 0xffff;
++	valid = valid && (info & 0xffffffffULL) == 0x20202001ULL &&
++		!(info >> 48) && !overflow;
++	dev_info(o->control->miscdev.parent,
++		 "idma_hist_info seq=%llu valid=%u version=4 schema=%u bins=%u count_bits=%u time_bits=%u overflow=%#x raw=%#llx\n",
++		 o->sequence, valid, (u32)(info & 0xff), (u32)((info >> 8) & 0xff),
++		 (u32)((info >> 16) & 0xff), (u32)((info >> 24) & 0xff), overflow, info);
++	for (i = 0; i < 16; i++) {
++		u64 total = 0;
++		size_t used = 0;
++		bool stage_valid = valid;
++
++		for (bin = 0; bin < 32; bin++) {
++			u64 value;
++
++			writeq(256 + i * 32 + bin, base + IDMA_OBS_INDEX_OFFSET);
++			value = readq(base + IDMA_OBS_DATA_OFFSET);
++			if (value > U32_MAX)
++				stage_valid = false;
++			else
++				total += value;
++			used += scnprintf(counts + used, sizeof(counts) - used,
++					  "%s%llu", bin ? "," : "", value);
++		}
++		stage_valid = stage_valid && total == path[i][1];
++		dev_info(o->control->miscdev.parent,
++			 "idma_path_hist seq=%llu role=%c channel=%c stage=%u valid=%u schema=1 bins=32 full=%llu total=%llu overflow=%u counts=%s\n",
++			 o->sequence, i < 8 ? 'v' : 'a', (i / 4) % 2 ? 'w' : 'r',
++			 i % 4, stage_valid, path[i][1], total, (overflow >> i) & 1, counts);
++		valid = valid && stage_valid;
++	}
++	return valid;
++}
++
+ /* Drain/verify first. Frozen reads and logging are outside all timed windows. */
+ static int idma_observation_finish(struct idma_observation *o,
+ 				   const struct idma_experiment *e, int run_error)
+@@ -1168,6 +1221,8 @@ static int idma_observation_finish(struct idma_observation *o,
+ 		}
+ 		if (!values[14] || !values[15])
+ 			valid = false;
++		if (o->hist)
++			valid = idma_observation_hist_finish(o, base, path, valid);
+ 	}
+ 	if (o->batch) {
+ 		u64 read_delay;
+@@ -1829,7 +1884,7 @@ static long idma_caps_multi(struct idma_device *victim, void __user *uarg)
+ 		caps.capabilities |= IDMA_MULTI_CAP_HW_BATCH;
+ 	if (riscv_iommu_hpm_supported(victim->miscdev.parent))
+ 		caps.capabilities |= IDMA_MULTI_CAP_ALL_DID_HPM;
+-	if (readq(victim->reg + IDMA_OBS_MAGIC_OFFSET) == IDMA_OBS_MAGIC_V3)
++	if (idma_observer_has_path(readq(victim->reg + IDMA_OBS_MAGIC_OFFSET)))
+ 		caps.capabilities |= IDMA_MULTI_CAP_SELECTED_PATH;
+ 	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
+ }
+@@ -1912,7 +1967,7 @@ static long idma_caps_pages(struct idma_device *victim, void __user *uarg)
+ 		caps.capabilities |= IDMA_PAGES_CAP_BATCH;
+ 	if (riscv_iommu_hpm_supported(victim->miscdev.parent))
+ 		caps.capabilities |= IDMA_PAGES_CAP_HPM;
+-	if (readq(victim->reg + IDMA_OBS_MAGIC_OFFSET) == IDMA_OBS_MAGIC_V3)
++	if (idma_observer_has_path(readq(victim->reg + IDMA_OBS_MAGIC_OFFSET)))
+ 		caps.capabilities |= IDMA_PAGES_CAP_PATH;
+ 	if (IS_REACHABLE(CONFIG_RISCV_IOMMU) && IS_ENABLED(CONFIG_64BIT))
+ 		caps.capabilities |= IDMA_PAGES_CAP_LEAF_API;

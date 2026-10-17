@@ -198,7 +198,16 @@ static int riscv_iommu_hpm_acquire(struct device *v,struct device *a,struct risc
     (void)v;(void)a;static struct riscv_iommu_hpm_session s;*p=hpm_failure?NULL:&s;return hpm_failure;}
 static void riscv_iommu_hpm_release(struct riscv_iommu_hpm_session *p){(void)p;}
 static void riscv_iommu_hpm_read(struct riscv_iommu_hpm_session *p,struct riscv_iommu_hpm_sample *s){(void)p;memset(s,0,sizeof(*s));}
-static int idma_observation_prepare(struct idma_observation *o,bool enabled){(void)enabled;observer_calls++;o->path=!path_disabled;o->sequence=1;return observe_failure;}
+#ifdef IDMA_OBS_MAGIC_V4
+static bool idma_observer_has_path(u64 magic);
+#endif
+static int idma_observation_prepare(struct idma_observation *o,bool enabled){(void)enabled;observer_calls++;
+    o->path=!path_disabled;
+#ifdef IDMA_OBS_MAGIC_V4
+    o->path=o->path&&idma_observer_has_path(hw[0].regs[IDMA_OBS_MAGIC_OFFSET/8]);
+    o->hist=o->path&&hw[0].regs[IDMA_OBS_MAGIC_OFFSET/8]==IDMA_OBS_MAGIC_V4;
+#endif
+    o->sequence=1;return observe_failure;}
 static int idma_observation_arm(struct idma_observation *o,struct idma_device *v,struct idma_device *a,u64 n){(void)n;o->armed=true;assert(v->id==0&&(!a||a->id==1));return arm_failure;}
 static int idma_observation_finish(struct idma_observation *o,const struct idma_experiment *e,int error){(void)o;(void)e;(void)error;return 0;}
 static int riscv_iommu_hpm_acquire_multi(struct device *const d[],unsigned nr,struct riscv_iommu_hpm_session **p){
@@ -395,8 +404,18 @@ static struct idma_pages_experiment pages_request(unsigned pg){return (struct id
 static void pages_released(void){assert(contexts==context_frees&&!lock_depth&&allocs==frees);
     for(unsigned i=0;i<map_count;i++)assert(!maps[i].active);}
 static unsigned pages_cases(void){unsigned checks=0;struct idma_pages_experiment p;
-    for(unsigned magic=1;magic<=2;magic++)for(unsigned pg=SZ_4K;pg<=SZ_2M;pg*=512){
-        reset(magic==1?IDMA_BATCH_MAGIC:IDMA_P0_BATCH_MAGIC);p=pages_request(pg);
+    for(unsigned obs=3;obs<=
+#ifdef IDMA_OBS_MAGIC_V4
+        4
+#else
+        3
+#endif
+        ;obs++)for(unsigned magic=1;magic<=2;magic++)for(unsigned pg=SZ_4K;pg<=SZ_2M;pg*=512){
+        reset(magic==1?IDMA_BATCH_MAGIC:IDMA_P0_BATCH_MAGIC);
+#ifdef IDMA_OBS_MAGIC_V4
+        if(obs==4)hw[0].regs[IDMA_OBS_MAGIC_OFFSET/8]=IDMA_OBS_MAGIC_V4;
+#endif
+        p=pages_request(pg);
         assert(idma_run_pages(&idmas[0],&p)==0&&p.status==0);
         assert(p.prepared_lane_mask==3&&p.verified_before_mask==15&&p.verified_after_mask==15);
         assert(p.quiet_lane_mask==3&&p.unmapped_buffer_mask==15&&p.freed_buffer_mask==15&&!p.retained_lane_mask);
@@ -519,6 +538,15 @@ static unsigned pages_cases(void){unsigned checks=0;struct idma_pages_experiment
     reset(IDMA_BATCH_MAGIC);struct idma_pages_caps caps;
     assert(idma_caps_pages(&idmas[0],&caps)==0&&caps.abi_version==4&&caps.capabilities==15&&caps.mapping_page_mask==3);
     assert(idma_caps_pages(&idmas[1],&caps)==-EOPNOTSUPP);checks++;
+#ifdef IDMA_OBS_MAGIC_V4
+    for(unsigned version=1;version<=4;version++){
+        reset(IDMA_BATCH_MAGIC);hw[0].regs[IDMA_OBS_MAGIC_OFFSET/8]=IDMA_OBS_MAGIC+version-1;
+        assert(idma_caps_pages(&idmas[0],&caps)==0);
+        assert(!!(caps.capabilities&IDMA_PAGES_CAP_PATH)==(version>=3));
+        if(version<3){p=pages_request(SZ_2M);assert(idma_run_pages(&idmas[0],&p)==-EOPNOTSUPP&&!allocs);}
+        pages_released();checks++;
+    }
+#endif
     printf("PASS %u E4 finite lifecycle/ABI/mapping/proof/retention actual-function scenarios; no hardware claim\n",checks);
     reset(IDMA_BATCH_MAGIC);return checks;
 }
