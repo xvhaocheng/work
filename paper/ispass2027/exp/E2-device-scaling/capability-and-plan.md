@@ -4,7 +4,7 @@
 
 - 2026-10-17；Codex-only；原始源码审读与运行准备，无E2板测。
 - 固定实际基座：CVA6 `8aac3fcd345af7686a55af1867783fd6b91a0069`、IOMMU `85b157ebe71a623e326e51fff7b7126fe77e8eb9`、Linux `45bf76b15e36cf608dff95013d91f8bedb7b1b8e`，不使用活动研究树替代。
-- 当前接口仅V+A一对。**既有DS0 BIT具备四路硬件，E2可采用有界软件扩展**；多A驱动部分待Root在A2 P0稳定后整合。HPM独立小批已由Root授权，状态和结果另见本目录交付。
+- 原始接口仅V+A一对。**既有DS0 BIT具备四路硬件，E2采用有界软件扩展**。HPM和多A驱动已分批获Root审查接受并实现，最新实际提交、CLI、有限验证及对象编译见 [multi-driver-batch.md](multi-driver-batch.md)；尚无E2板测。
 - 使用既有 [baseline100源码清单](../../board/packages/baseline100-20261017/source.json)和实际DS0 load receipt；不新增硬件变更或身份体系。
 
 源码前缀：`HW=/home/xvhaocheng/work/iommu-platform/out/ispass2027-20261017-ds0-01/`；`SW=/home/xvhaocheng/work/iommu-platform/out/ispass2027-20261017-software01/`。关键原文与hash在 [source-evidence.json](source-evidence.json)。
@@ -26,9 +26,9 @@ V固定DMA0，源/目的各1页；4096B COPY×4096，预热256；A为DMA1、DMA1
 
 设备数和映射足迹两条轴分开；同总映射足迹仍不保证相同到达率、活跃并发或实际总压力，需同时报告各A进度。十个区组轮转九条件，同DS0集中测完。暂未用这份计划运行硬件。
 
-## 新ABI的具体候选（Root裁定后实施）
+## 新ABI（已实现，运行未执行）
 
-保持旧`struct idma_experiment`及旧ioctl不变。Root已与A2对齐命令布局：P0的CAPS/RUN为0x09/0x0a；E2预留`CAPS_MULTI=0x0b`、`RUN_MULTI_BATCH=0x0c`，独立multi ABI version3（本包暂不写UAPI）。CLI独立`idma_scaling`，不能将多A塞进旧JSON。
+保持旧`struct idma_experiment`及旧ioctl不变。Root已与A2对齐命令布局：P0的CAPS/RUN为0x09/0x0a；E2预留`CAPS_MULTI=0x0b`、`RUN_MULTI_BATCH=0x0c`，独立multi ABI version3（实际UAPI已提交）。CLI独立`idma_scaling`，不能将多A塞进旧JSON。
 
 - 输入：`abi_version/struct_size/flags=0/nr_devices(2..4)`；`device_id[4]`、`pages[4]`、`path_aggressor_index`；`chunk_bytes=4096/run_timeout_ms/victim_transfers/warmup_transfers`；所有reserved及未使用数组槽为0。`device_id[0]`须等于打开的victim设备，本轮固定0；A为其后元素，设备和DID都唯一；path索引本轮固定1。
 - 输出：status、nr_devices、did[4]、measurement_started/complete、非原子snapshot前后范围、软件V时间/排空时间；`idma_experiment_stats stats[4]`逐路保留submitted/completed/bytes/active/miss/S1/S2/errors/quarantined；每A启动/STOP发出/排空完成的**软件**时间及停止前batch控制状态。硬件observer仍原有3条batch+16条PATH并记录同sequence，增加JSON角色映射及shared残差标签。
@@ -52,17 +52,17 @@ void riscv_iommu_hpm_read_multi(struct riscv_iommu_hpm_session *session,
 
 multi允许1..4设备，slot `3*d+{0,1,2}`分别为该设备的TLB miss/S1 PTW/S2 PTW；最多0..11，inhibit bits1..12。共享内部helper/session动态保存数量，验证唯一DID、同IOMMU、同task持锁。先inhibit并保存所有owned selector/counter，再逐个selector精确DID readback/清零检查/启用；失败恢复**全部已保存槽**和原inhibit。release恢复所有owned槽，不动其他槽；cycles不清零，保留其原inhibit状态恢复。仍非原子快照，不把软件差分说成与V硬件边界完全重合。32bit桥读取沿用high-low-high。
 
-## 多A安全调用链（下一批，不在HPM批实施）
+## 多A安全调用链（独立第二批实现）
 
 1. 在同一`idma_experiment_lock`下取得全部device引用，检查所有quarantine、每路batch magic/空闲，逐路`idma_stream_prepare`；共用当前映射、缓存交接与校验机制。
 2. acquire_multi后一次缓存交接。推广当前`idma_run_window:392–449`为有限软件warmup：先启动各A，V每次完成后补交，轮询/补交每名A；完整保留超时/信号和每路quarantine。预热后停止软件补交并逐路drain，再配置所有batch；V的next_offset复位0，A沿用现有warmup后的明示状态。
-3. V batch目标4096；每A沿用既有长目标`IDMA_EXPERIMENT_MAX_TRANSFERS=2^32`，在V之前依次启动。ARM仍只编码V与selected A；仅在所有A已成功启动后启动V。V发出前/结束后记录每A控制状态；启动顺序/软件时间照实输出，不声称同时起跑。
+3. V batch目标4096；每A沿用既有长目标`IDMA_EXPERIMENT_MAX_TRANSFERS=2^32`，在V之前依次启动。ARM仍只编码V与selected A；仅在所有A已成功启动后启动V。V发出前记录启动顺序/软件时间，V结束后、STOP前顺序读取每A控制状态；不声称同时起跑或原子状态快照。
 4. 热循环只轮询V，保留`idma_batch_window:601–615`的截止时间、信号和V首次观测完成时刻。硬件window依旧由V首issue至第4096个done自动冻结，源码`dma_observer.sv:148–154,199–203`。A全部自主batch；每A长目标不会正常提前用尽。任一路启动失败时不启动V，停止已启动A并排空。
 5. V完成后先对所有A发STOP（不取消AXI），再取HPM/active后快照，逐路drain→batch_collect→byte/count检查；无错误时一次缓存重新交接并逐路verify。STOP前须验证所有A仍处active且目标未耗尽；否则保留试次并标为不满足持续A合同，不能补采替换。原错误优先，无法排空的lane保留缓冲与quarantine，不能cleanup释放。
-6. 冻结observer保留V/selected A的所有旧守恒；主机记录shared_ar/aw总量及`shared - (V+selectedA)`非负残差。残差只标**未选中流量的总量口径/边界差额**，不拆为每A的PATH或精确窗口COPY进度。neither/v_only/a_only/both只相对V与selected A，不能称全体设备的重叠。所有A的最终完成数/bytes与HPM分别输出。
+6. 冻结observer保留V/selected A的所有私有stock/flow和PATH守恒。**Root补正：mux默认SpillAr/SpillAw=1，私有受理和shared受理有库存边界，不能要求shared≥V私有+selectedA私有。** 私有残差保留signed，仅作边界差额。精确未选中端口shared接受数应为`shared_ar - (vr0.full+vr0.carry+ar0.full+ar0.carry)`，AW相应使用vw0/aw0：PATH stage0的leave恰是同active窗、按ID匹配的shared握手。两设备时必须0，三/四设备时必须非负；该值只表示未选中端口的合计shared接受数，不拆成每A的PATH或精确窗口COPY进度。neither/v_only/a_only/both只相对V与selected A，不能称全体设备的重叠。所有A的最终完成数/bytes与HPM分别输出。
 
 被动硬件无法给DMA2/3各自的PATH或精确V窗口COPY完成数；若图表要求这些新增字段，须另提RTL请求，不能靠软件采样伪造。当前软件方案接受范围是V精确硬件窗口、全部A持续及最终正确完成、逐DID HPM、selected A PATH、shared总量。
 
 ## 验证与整合边界
 
-HPM先做真实C函数MMIO桩测试1..4路、重复DID/跨IOMMU/busy、selector失败完整恢复、旧pair/Solo回归及实际kernel对象编译；结果/patch单独交付。multi driver只能在Root直接审查HPM及A2 P0接口稳定后开下一批，不并发大改idma.c，不构建新BIT。新软件最终与A2 P0合成同一payload，兼容原DS0 BIT与P0 BIT，具体由Root整合和上板。
+HPM先做真实C函数MMIO桩测试1..4路、重复DID/跨IOMMU/busy、selector失败完整恢复、旧pair/Solo回归及实际kernel对象编译；结果/patch单独交付。multi parser须有synthetic closing-spill协议例：selected A私有已接受、窗口结束时尚未从spill发到shared，私有残差可为负但PATH0同窗差额仍合法，不能误拒。multi driver已在Root直接审查HPM及A2 P0接口稳定后独立实现，基于共同base M；未与A2并发大改idma.c，未构建新BIT。新软件最终与A2 P0合成同一payload，兼容原DS0 BIT与P0 BIT，具体由Root整合和上板。

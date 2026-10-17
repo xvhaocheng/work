@@ -1,0 +1,474 @@
+diff --git a/drivers/misc/idma.c b/drivers/misc/idma.c
+index 8ccac9604b81..8596b0c13077 100644
+--- a/drivers/misc/idma.c
++++ b/drivers/misc/idma.c
+@@ -22,6 +22,7 @@
+ #include <linux/vmalloc.h>
+ #include <uapi/linux/idma.h>
+ #include <uapi/linux/idma_p0.h>
++#include <uapi/linux/idma_multi.h>
+ #include <asm/cacheflush.h>
+ 
+ MODULE_DESCRIPTION("CVA6 iDMA versioned two-device experiment driver");
+@@ -391,11 +392,14 @@ static int idma_poll(struct idma_stream *s, bool measured)
+ 	return 1;
+ }
+ 
+-static int idma_run_window(struct idma_stream *v, struct idma_stream *a,
+-			   u64 count, u64 deadline, bool measured, u64 *end_ns)
++static int idma_run_window_many(struct idma_stream *v,
++				struct idma_stream *const aggressors[],
++				unsigned int nr_aggressors, u64 count,
++				u64 deadline, bool measured, u64 *end_ns)
+ {
+ 	u64 completed = 0;
+ 	u32 spins = 0;
++	unsigned int i;
+ 	int ret;
+ 
+ 	if (!count)
+@@ -433,7 +437,9 @@ static int idma_run_window(struct idma_stream *v, struct idma_stream *a,
+ 			if (ret)
+ 				break;
+ 		}
+-		if (a) {
++		for (i = 0; i < nr_aggressors; i++) {
++			struct idma_stream *a = aggressors[i];
++
+ 			ret = idma_poll(a, measured);
+ 			if (ret < 0)
+ 				break;
+@@ -443,6 +449,8 @@ static int idma_run_window(struct idma_stream *v, struct idma_stream *a,
+ 					break;
+ 			}
+ 		}
++		if (ret < 0)
++			break;
+ 		if (!(++spins & 1023))
+ 			cond_resched();
+ 		cpu_relax();
+@@ -452,6 +460,15 @@ static int idma_run_window(struct idma_stream *v, struct idma_stream *a,
+ 	return ret;
+ }
+ 
++static int idma_run_window(struct idma_stream *v, struct idma_stream *a,
++                           u64 count, u64 deadline, bool measured, u64 *end_ns)
++{
++    struct idma_stream *aggressors[] = { a };
++
++    return idma_run_window_many(v, aggressors, a ? 1 : 0, count,
++                                deadline, measured, end_ns);
++}
++
+ static int idma_drain(struct idma_stream *s)
+ {
+ 	u64 done;
+@@ -584,10 +601,13 @@ static void idma_batch_disable(struct idma_stream *s)
+ 		writeq(0, s->idma->reg + IDMA_BATCH_CONTROL_OFFSET);
+ }
+ 
+-static int idma_batch_window(struct idma_stream *v, struct idma_stream *a,
+-			     u64 deadline, u64 *end_ns)
++static int idma_batch_window_many(struct idma_stream *v,
++				  struct idma_stream *const aggressors[],
++				  unsigned int nr_aggressors, u64 deadline,
++				  u64 *end_ns, struct idma_multi_experiment *multi)
+ {
+ 	u32 spins = 0;
++	unsigned int i;
+ 	int ret;
+ 
+ 	if (ktime_get_ns() >= deadline) {
+@@ -598,12 +618,38 @@ static int idma_batch_window(struct idma_stream *v, struct idma_stream *a,
+ 		ret = -EINTR;
+ 		goto out;
+ 	}
+-	if (a) {
++	for (i = 0; i < nr_aggressors; i++) {
++		struct idma_stream *a = aggressors[i];
++
++		if (multi) {
++			if (ktime_get_ns() >= deadline) {
++				ret = -ETIMEDOUT;
++				goto out;
++			}
++			if (signal_pending(current)) {
++				ret = -EINTR;
++				goto out;
++			}
++			multi->start_attempted_mask |= BIT(i + 1);
++			multi->start_ns[i + 1] = ktime_get_ns();
++		}
+ 		a->batch_started = true;
+ 		ret = idma_submit(a, false);
+ 		if (ret)
+ 			goto out;
+ 	}
++	if (multi) {
++		if (ktime_get_ns() >= deadline) {
++			ret = -ETIMEDOUT;
++			goto out;
++		}
++		if (signal_pending(current)) {
++			ret = -EINTR;
++			goto out;
++		}
++		multi->start_attempted_mask |= BIT(0);
++		multi->start_ns[0] = ktime_get_ns();
++	}
+ 	v->batch_started = true;
+ 	ret = idma_submit(v, false);
+ 	if (ret)
+@@ -634,6 +680,86 @@ static int idma_batch_window(struct idma_stream *v, struct idma_stream *a,
+ 	return ret;
+ }
+ 
++static int idma_batch_window(struct idma_stream *v, struct idma_stream *a,
++                             u64 deadline, u64 *end_ns)
++{
++    struct idma_stream *aggressors[] = { a };
++
++    return idma_batch_window_many(v, aggressors, a ? 1 : 0,
++                                  deadline, end_ns, NULL);
++}
++
++/* New multi-only cleanup building blocks. The RUN orchestrator is a later hunk. */
++static int idma_multi_stop(struct idma_stream streams[], unsigned int nr,
++                           struct idma_multi_experiment *multi, bool check_running)
++{
++    unsigned int i;
++    int ret = 0;
++
++    /* Snapshot every live A before issuing any STOP; V's HW window is frozen. */
++    if (check_running) {
++        for (i = 1; i < nr; i++) {
++            struct idma_stream *s = &streams[i];
++            u64 status, issued;
++
++            if (!s->batch_started || s->retain) {
++                ret = -EIO;
++                continue;
++            }
++            status = readq(s->idma->reg + IDMA_BATCH_CONTROL_OFFSET);
++            issued = readq(s->idma->reg + IDMA_BATCH_ISSUED_OFFSET);
++            multi->pre_stop_status[i] = status;
++            multi->pre_stop_issued[i] = issued;
++            multi->stop_status_valid_mask |= BIT(i);
++            if (!(status & 2) || status >> 32 || issued >= IDMA_EXPERIMENT_MAX_TRANSFERS)
++                ret = -EIO;
++        }
++    }
++    for (i = 0; i < nr; i++) {
++        struct idma_stream *s = &streams[i];
++
++        if (!s->batch_configured || !s->batch_started || (multi->stopped_mask & BIT(i)))
++            continue;
++        multi->stop_ns[i] = ktime_get_ns();
++        idma_batch_stop(s); /* STOP never cancels AXI or releases buffers. */
++        multi->stopped_mask |= BIT(i);
++    }
++    return ret;
++}
++
++static int idma_multi_drain_collect(struct idma_stream streams[], unsigned int nr,
++                                    struct idma_multi_experiment *multi)
++{
++    u64 stamp = ktime_get_ns();
++    unsigned int i;
++    int ret = 0, next;
++
++    for (i = 0; i < nr; i++) {
++        struct idma_stream *s = &streams[i];
++
++        if (!s->dev)
++            continue;
++        next = idma_drain(s); /* Existing timeout -> quarantine + retain. */
++        multi->drain_end_ns[i] = ktime_get_ns();
++        if (!next)
++            multi->drained_mask |= BIT(i);
++        else if (!ret)
++            ret = next;
++    }
++    multi->drain_ns = ktime_get_ns() - stamp;
++    for (i = 0; i < nr; i++) {
++        struct idma_stream *s = &streams[i];
++
++        next = idma_batch_collect(s); /* Existing error/issued=completed checks. */
++        if (!next && s->batch_started &&
++            s->stats->completed_bytes != s->stats->completed * 4096ULL)
++            next = -EIO;
++        if (next && !ret)
++            ret = next;
++    }
++    return ret;
++}
++
+ static void idma_snapshot(struct riscv_iommu_hpm_session *hpm,
+ 			  struct idma_stream *v, struct idma_stream *a,
+ 			  struct riscv_iommu_hpm_sample *sample, u64 active[2])
+@@ -1160,6 +1286,254 @@ static long idma_run_experiment(struct idma_device *victim,
+ 	return idma_run_experiment_mode(victim, uarg, false);
+ }
+ 
++struct idma_multi_context {
++	struct idma_stream streams[IDMA_MULTI_MAX_DEVICES];
++	struct idma_device *devices[IDMA_MULTI_MAX_DEVICES];
++	struct idma_stream *aggressors[IDMA_MULTI_MAX_DEVICES - 1];
++	struct idma_observation observation;
++	struct riscv_iommu_hpm_multi_sample before, after;
++	u64 active_before[IDMA_MULTI_MAX_DEVICES], active_after[IDMA_MULTI_MAX_DEVICES];
++};
++
++static int idma_multi_validate(struct idma_device *victim,
++			       const struct idma_multi_experiment *multi)
++{
++	u32 pages, same_total;
++	unsigned int i;
++
++	if (PAGE_SIZE != SZ_4K || victim->id != 0 || victim->did != 10)
++		return -EOPNOTSUPP;
++	if (multi->abi_version != IDMA_MULTI_ABI || multi->struct_size != sizeof(*multi) ||
++	    multi->flags || multi->reserved0 || multi->nr_devices < 2 ||
++	    multi->nr_devices > IDMA_MULTI_MAX_DEVICES || multi->path_aggressor_index != 1 ||
++	    multi->chunk_bytes != SZ_4K || multi->victim_transfers != 4096 ||
++	    multi->warmup_transfers != 256 || !multi->run_timeout_ms ||
++	    multi->run_timeout_ms > IDMA_MAX_RUN_TIMEOUT_MS || multi->pages[0] != 1)
++		return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(multi->reserved); i++)
++		if (multi->reserved[i])
++			return -EINVAL;
++	pages = multi->pages[1];
++	same_total = 6 / (multi->nr_devices - 1);
++	if (pages != 1 && pages != 8 && pages != same_total)
++		return -EINVAL;
++	for (i = 0; i < IDMA_MULTI_MAX_DEVICES; i++) {
++		if (i < multi->nr_devices) {
++			if (multi->device_id[i] != i || (i && multi->pages[i] != pages))
++				return -EINVAL;
++		} else if (multi->device_id[i] || multi->pages[i]) {
++			return -EINVAL;
++		}
++	}
++	return 0;
++}
++
++static void idma_multi_snapshot(struct riscv_iommu_hpm_session *hpm,
++				struct idma_multi_context *context,
++				struct riscv_iommu_hpm_multi_sample *sample,
++				u64 active[], unsigned int nr)
++{
++	unsigned int i;
++
++	riscv_iommu_hpm_read_multi(hpm, sample);
++	for (i = 0; i < nr; i++)
++		active[i] = readq(context->devices[i]->reg + IDMA_ACTIVE_CYCLES_REG_OFFSET);
++}
++
++static long idma_run_multi(struct idma_device *victim,
++			  struct idma_multi_experiment __user *uarg)
++{
++	struct idma_multi_experiment multi;
++	struct idma_multi_context *context;
++	struct riscv_iommu_hpm_session *hpm = NULL;
++	struct idma_experiment observed = {};
++	u64 start, end = 0, stamp, deadline;
++	unsigned int i, nr;
++	int ret, next;
++
++	if (copy_from_user(&multi, uarg, sizeof(multi)))
++		return -EFAULT;
++	memset(&multi.status, 0, sizeof(multi) - offsetof(struct idma_multi_experiment, status));
++	ret = idma_multi_validate(victim, &multi);
++	if (ret)
++		goto out_copy;
++	nr = multi.nr_devices;
++	context = kzalloc(sizeof(*context), GFP_KERNEL);
++	if (!context) {
++		ret = -ENOMEM;
++		goto out_copy;
++	}
++	context->observation.batch = true;
++	context->devices[0] = victim;
++	ret = mutex_lock_interruptible(&idma_experiment_lock);
++	if (ret)
++		goto out_free;
++	if (idma_any_quarantined()) {
++		ret = -EIO;
++		goto out_put;
++	}
++	for (i = 0; i < nr; i++) {
++		struct idma_device *device;
++
++		if (i)
++			context->devices[i] = idma_get_instance(multi.device_id[i]);
++		device = context->devices[i];
++		if (!device) {
++			ret = -ENODEV;
++			goto out_put;
++		}
++		multi.did[i] = device->did;
++		if (device->did != 10U + i || !idma_batch_supported(device, false)) {
++			ret = -EOPNOTSUPP;
++			goto out_put;
++		}
++		if (readq(device->reg + IDMA_BATCH_CONTROL_OFFSET) & 2) {
++			ret = -EBUSY;
++			goto out_put;
++		}
++		if (i)
++			context->aggressors[i - 1] = &context->streams[i];
++	}
++	ret = idma_observation_prepare(&context->observation, true);
++	if (ret)
++		goto out_put;
++	if (!context->observation.path) {
++		ret = -EOPNOTSUPP;
++		goto out_put;
++	}
++	multi.observer_sequence = context->observation.sequence;
++	for (i = 0; i < nr; i++) {
++		ret = idma_stream_prepare(&context->streams[i], context->devices[i],
++					  multi.pages[i], SZ_4K, &multi.stats[i]);
++		if (ret)
++			goto out_cleanup;
++		multi.prepared_mask |= BIT(i);
++	}
++	ret = riscv_iommu_hpm_acquire_multi((struct device *const []) {
++		context->streams[0].dev, context->streams[1].dev,
++		context->streams[2].dev, context->streams[3].dev }, nr, &hpm);
++	if (ret)
++		goto out_cleanup;
++	multi.hpm_configured = 1;
++	local_flush_icache_all();
++	deadline = ktime_get_ns() + (u64)multi.run_timeout_ms * NSEC_PER_MSEC;
++	for (i = 1; i < nr; i++) {
++		ret = idma_submit(&context->streams[i], false);
++		if (ret)
++			goto out_drain;
++	}
++	ret = idma_run_window_many(&context->streams[0], context->aggressors, nr - 1,
++				   multi.warmup_transfers, deadline, false, &end);
++	if (ret)
++		goto out_drain;
++	for (i = 0; i < nr; i++) {
++		ret = idma_drain(&context->streams[i]);
++		if (ret)
++			goto out_drain;
++		context->streams[i].last_complete_ns = 0;
++	}
++	context->streams[0].next_offset = 0;
++	for (i = 0; i < nr; i++) {
++		ret = idma_batch_configure(&context->streams[i],
++					   i ? IDMA_EXPERIMENT_MAX_TRANSFERS : multi.victim_transfers,
++					   false);
++		if (ret)
++			goto out_drain;
++	}
++	ret = idma_observation_arm(&context->observation, victim, context->devices[1],
++				   multi.victim_transfers);
++	if (ret)
++		goto out_drain;
++	stamp = ktime_get_ns();
++	idma_multi_snapshot(hpm, context, &context->before, context->active_before, nr);
++	start = ktime_get_ns();
++	multi.snapshot_before_ns = start - stamp;
++	multi.measurement_started = 1;
++	ret = idma_batch_window_many(&context->streams[0], context->aggressors, nr - 1,
++				     deadline, &end, &multi);
++	multi.victim_elapsed_ns = end - start;
++	multi.measurement_complete = !ret;
++	next = idma_multi_stop(context->streams, nr, &multi, !ret);
++	if (next && !ret)
++		ret = next;
++	idma_multi_snapshot(hpm, context, &context->after, context->active_after, nr);
++	multi.snapshot_after_ns = ktime_get_ns() - end;
++	for (i = 0; i < nr; i++) {
++		multi.stats[i].active_cycles = context->active_after[i] - context->active_before[i];
++		multi.stats[i].iotlb_miss = context->after.iotlb_miss[i] - context->before.iotlb_miss[i];
++		multi.stats[i].s1_ptw = context->after.s1_ptw[i] - context->before.s1_ptw[i];
++		multi.stats[i].s2_ptw = context->after.s2_ptw[i] - context->before.s2_ptw[i];
++	}
++out_drain:
++	/* Cover every started lane even after a partial warmup/start or V error. */
++	idma_multi_stop(context->streams, nr, &multi, false);
++	next = idma_multi_drain_collect(context->streams, nr, &multi);
++	if (next && !ret)
++		ret = next;
++	if (!ret && multi.stats[0].completed != multi.victim_transfers)
++		ret = -EIO;
++	riscv_iommu_hpm_release(hpm);
++	hpm = NULL;
++	if (!ret) {
++		local_flush_icache_all();
++		for (i = 0; i < nr; i++) {
++			next = idma_verify(&context->streams[i]);
++			if (!next)
++				multi.verified_mask |= BIT(i);
++			else if (!ret)
++				ret = next;
++		}
++	}
++out_cleanup:
++	riscv_iommu_hpm_release(hpm);
++	observed.victim_transfers = multi.victim_transfers;
++	observed.victim_did = multi.did[0];
++	observed.aggressor_did = multi.did[1];
++	next = idma_observation_finish(&context->observation, &observed, ret);
++	if (next && !ret)
++		ret = next;
++	for (i = nr; i > 0; i--) {
++		idma_batch_disable(&context->streams[i - 1]);
++		idma_stream_cleanup(&context->streams[i - 1]);
++	}
++out_put:
++	idma_put_instance(context->observation.control);
++	for (i = 1; i < nr; i++)
++		idma_put_instance(context->devices[i]);
++	mutex_unlock(&idma_experiment_lock);
++out_free:
++	kfree(context);
++out_copy:
++	multi.status = ret;
++	if (copy_to_user(uarg, &multi, sizeof(multi)))
++		return -EFAULT;
++	return ret;
++}
++
++static long idma_caps_multi(struct idma_device *victim, void __user *uarg)
++{
++	struct idma_multi_caps caps = {
++		.abi_version = IDMA_MULTI_ABI,
++		.struct_size = sizeof(caps),
++		.device_id = victim->id,
++		.did = victim->did,
++		.max_devices = IDMA_MULTI_MAX_DEVICES,
++		.max_pages = IDMA_MULTI_MAX_PAGES,
++		.page_bytes = PAGE_SIZE,
++		.max_run_timeout_ms = IDMA_MAX_RUN_TIMEOUT_MS,
++	};
++
++	if (victim->id != 0 || victim->did != 10 || PAGE_SIZE != SZ_4K)
++		return -EOPNOTSUPP;
++	if (idma_batch_supported(victim, false))
++		caps.capabilities |= IDMA_MULTI_CAP_HW_BATCH;
++	if (riscv_iommu_hpm_supported(victim->miscdev.parent))
++		caps.capabilities |= IDMA_MULTI_CAP_ALL_DID_HPM;
++	if (readq(victim->reg + IDMA_OBS_MAGIC_OFFSET) == IDMA_OBS_MAGIC_V3)
++		caps.capabilities |= IDMA_MULTI_CAP_SELECTED_PATH;
++	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
++}
++
+ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ {
+ 	struct idma_device *idma = fp->private_data;
+@@ -1175,6 +1549,10 @@ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ 	};
+ 
+ 	switch (cmd) {
++	case IDMA_IOC_CAPS_MULTI:
++		return idma_caps_multi(idma, (void __user *)arg);
++	case IDMA_IOC_RUN_MULTI_BATCH:
++		return idma_run_multi(idma, (struct idma_multi_experiment __user *)arg);
+ 	case IDMA_IOC_CAPS_P0:
+ 		return idma_caps_p0(idma, (void __user *)arg);
+ 	case IDMA_IOC_RUN_BATCH_P0:
