@@ -9,13 +9,12 @@ from pathlib import Path
 import re
 import statistics
 import sys
+import e2_software_profiles as profiles
 
 if not __debug__:
     raise RuntimeError('Run without Python -O: collection checks require assertions')
 
 BOARD = Path(__file__).resolve().parents[2] / 'board'
-sys.path.insert(0, str(BOARD))
-from uart import Console, DEFAULT_PORT
 
 CONDITION_GEOMETRY = {f'N{nr}_A{pages}': (nr, pages)
                       for pages_kind in ('one', 'eight', 'total6') for nr in (2, 3, 4)
@@ -219,23 +218,29 @@ def validate_receipt(loaded, expected_kernel):
 
 
 def validate_software(software, expected_kernel):
-    assert software['status'] == 'passed', 'completed existing software build manifest required'
-    assert software['selected_linux'] == LINUX_COMMIT, 'bounded ABI3 source'
-    assert software['kernel_release'] == expected_kernel, 'software kernel identity'
-    assert software['handwritten_inputs']['bench/idma_scaling.c'] == CLI_SHA256, 'frozen CLI input'
-    assert 'bin/idma_scaling' in software['artifacts'], 'CLI included in completed build'
+    return profiles.validate_software(software,expected_kernel)
+
+
+def validate_recovery(old,manifest):
+    assert old['schema']==manifest['schema'] and old['planned_cases']==[list(x) for x in manifest['planned_cases']]
+    for key in ['ds','bit_sha256','boot_id','kernel_release','load_manifest_sha256',
+                'source_record_sha256','software_manifest_sha256','selected_source','selected_software',
+                'script_sha256','software_profile','software_profile_helper_sha256',
+                'runtime_commits','software_build_reference','source_roles']:
+        assert old[key]==manifest[key],'recovery identity mismatch: '+key
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan-only', action='store_true')
+    parser.add_argument('--check-only', action='store_true')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--expected-kernel', default='6.5.0-rc2-ispass2027-p0-multi-v1')
     parser.add_argument('--load-manifest', type=Path)
     parser.add_argument('--source-record', type=Path, help='Existing baseline100 DS0 source identity')
     parser.add_argument('--software-manifest', type=Path, help='Passed common P0/multi delivery manifest')
     parser.add_argument('--ds', choices=['0/0'])
-    parser.add_argument('--port', default=DEFAULT_PORT)
+    parser.add_argument('--port')
     parser.add_argument('--recover-run', type=Path,
                         help='Parse a complete saved UART prefix, then run only remaining points')
     args = parser.parse_args()
@@ -246,26 +251,31 @@ def main():
                                      'command': command(condition)}
                                     for i, (block, condition) in enumerate(planned)]}, indent=2))
         return
-    if any(value is None for value in [args.output, args.load_manifest, args.source_record, args.software_manifest, args.ds]):
+    if any(value is None for value in [args.load_manifest, args.source_record, args.software_manifest, args.ds]) or (args.output is None and not args.check_only):
         parser.error('--output, --load-manifest, --source-record, --software-manifest and --ds are required to collect')
     loaded = json.loads(args.load_manifest.read_text())
     validate_receipt(loaded, args.expected_kernel)
     source = json.loads(args.source_record.read_text())
     software = json.loads(args.software_manifest.read_text())
-    validate_software(software, args.expected_kernel)
-    assert source['actual_commits']['linux'] == '45bf76b15e36cf608dff95013d91f8bedb7b1b8e', 'pathv3 source'
-    assert source['actual_commits']['cva6'] == '8aac3fcd345af7686a55af1867783fd6b91a0069', 'baseline source'
+    identity=profiles.bind_identity(software,args.expected_kernel,source,loaded)
+    if args.check_only:
+        print(json.dumps(identity,indent=2));return
+    from prefix_common import synthetic_markers
+    assert not any(synthetic_markers(value) for value in (loaded,source,software)), 'host fixtures cannot start collection'
     args.output.mkdir(parents=True, exist_ok=False)
     manifest = {'schema': 'ispass2027.e2_multi.run.v1',
                 'started_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 'load_manifest': str(args.load_manifest.resolve()),
                 'load_manifest_sha256': hashlib.sha256(args.load_manifest.read_bytes()).hexdigest(),
                 'source_record': str(args.source_record.resolve()), 'selected_source': source,
+                'source_record_sha256': hashlib.sha256(args.source_record.read_bytes()).hexdigest(),
                 'bit_sha256': loaded['bit_sha256'], 'boot_id': loaded['boot_id'],
                 'kernel_release': args.expected_kernel, 'ds': args.ds,
                 'planned_cases': planned, 'victim_dma': 0, 'selected_aggressor_dma': 1,
                 'software_manifest': str(args.software_manifest.resolve()),
+                'software_manifest_sha256': hashlib.sha256(args.software_manifest.read_bytes()).hexdigest(),
                 'selected_software': software,
+                **identity,
                 'script_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 'parser_parent': PARSER_PARENT, 'status': 'running'}
     records = []
@@ -274,9 +284,7 @@ def main():
     try:
         if args.recover_run:
             old = json.loads((args.recover_run / 'manifest.json').read_text())
-            assert old['schema'] == manifest['schema'] and old['planned_cases'] == [list(x) for x in planned]
-            for key in ['ds', 'bit_sha256', 'boot_id', 'load_manifest_sha256', 'selected_source', 'selected_software']:
-                assert old[key] == manifest[key], 'recovery identity mismatch: ' + key
+            validate_recovery(old,manifest)
             paths = {path.resolve() for path in (args.recover_run / 'uart').glob('command-*.json')}
             paths.update(Path(path) for path in old.get('recovered_raw_commands', []))
             raw_commands = []
@@ -302,7 +310,9 @@ def main():
             save(args.output / 'records.json', records)
             save(args.output / 'manifest.json', manifest)
         if len(records) < len(planned):
-            console = Console(args.port, args.output / 'uart')
+            sys.path.insert(0,str(BOARD))
+            from uart import Console,DEFAULT_PORT
+            console = Console(args.port or DEFAULT_PORT, args.output / 'uart')
         for index in range(len(records), len(planned)):
             block, condition = planned[index]
             raw = console.command(command(condition), 180)

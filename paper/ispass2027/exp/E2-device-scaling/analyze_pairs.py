@@ -101,6 +101,7 @@ def read_collection(run,*,_internal_fixture=False):
     full.require(validated['collector_recorded_script_sha256']==validated['parser_source']['sha256'],'recorded collector differs from actual parser')
     result=pair_results(validated,synthetic=bool(markers) or _internal_fixture)
     result.update(source_run=str(Path(run).resolve()),source_files=validated['sources'],observed_synthetic_markers=markers,
+        **{key:validated[key] for key in ('software_profile','software_profile_helper_sha256','runtime_commits','software_build_reference','source_roles')},
         parser_source=validated['parser_source'],full_exporter_sha256=sha(Path(full.__file__).read_bytes()),
         script_sha256=sha(Path(__file__).read_bytes()),
         synthetic_guard_sha256=sha((HERE/'prefix_common.py').read_bytes()),schema_source=full.SCHEMA_SOURCE)

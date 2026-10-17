@@ -17,6 +17,7 @@ import analyze_pairs as pairs
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--software-profile',choices=tuple(pairs.full.profiles.PROFILES),default='p0-multi-v1')
     a=parser.parse_args();a.output=a.output.resolve()
     assert a.output.is_relative_to(pairs.HERE)
     a.output.mkdir(parents=True,exist_ok=False);build=a.output/'build';build.mkdir()
@@ -25,7 +26,7 @@ def main():
     fixture_path=pairs.HERE/'multi-collector-fixtures.json';cli_path=pairs.HERE/'multi-cli-cases.json'
     sample=json.loads(fixture_path.read_text())['closing_spill_two_devices']
     sequence=int(re.search(r'^PRE_SEQ=(\d+)$',sample,re.M)[1])+1
-    boot=re.search(r'^BOOT=(.+)$',sample,re.M)[1];kernel='6.5.0-rc2-ispass2027-p0-multi-v1'
+    boot=re.search(r'^BOOT=(.+)$',sample,re.M)[1];kernel=pairs.full.profiles.PROFILES[a.software_profile]['kernel_release']
     observation='\n'.join(dict.fromkeys(re.findall(r'idma_(?:batch|path)_obs seq='+str(sequence)+r'\b[^\n]+',sample.split('\nCASE_EXIT=0\n',1)[1].split('\nTAINT_AFTER=',1)[0])))
     templates={(r['output']['input']['nr_devices'],r['output']['input']['pages'][1]):r['output'] for r in json.loads(cli_path.read_text()) if r['name']=='success'}
     def save(path,value):path.write_text(pairs.full.encoded(value))
@@ -35,8 +36,8 @@ def main():
         else:raise AssertionError(name+' accepted')
     def make(name):
         run=build/name;(run/'uart').mkdir(parents=True)
-        source={'fixture_only':True,'actual_commits':{'linux':'45bf76b15e36cf608dff95013d91f8bedb7b1b8e','cva6':'8aac3fcd345af7686a55af1867783fd6b91a0069'}}
-        software={'fixture_only':True,'status':'passed','selected_linux':p['LINUX_COMMIT'],'kernel_release':kernel,'handwritten_inputs':{'bench/idma_scaling.c':p['CLI_SHA256']},'artifacts':{'bin/idma_scaling':'fixture'}}
+        source={'fixture_only':True,'actual_commits':dict(pairs.full.profiles.BASELINE_COMMITS)}
+        software={**pairs.full.profiles.PROFILES[a.software_profile],'fixture_only':True,'status':'passed','handwritten_inputs':{'bench/idma_scaling.c':p['CLI_SHA256']},'artifacts':{'bin/idma_scaling':'fixture'}}
         load={'fixture_only':True,'status':'boot_identity_verified','kernel_release':kernel,'boot_id':boot,'bit_sha256':p['DS0_BIT_SHA256']}
         for label,value in [('source',source),('software',software),('load',load)]:save(run/(label+'.json'),value)
         records=[]
@@ -64,6 +65,9 @@ def main():
             'recorded_cases':90,'load_manifest':str(run/'load.json'),'load_manifest_sha256':pairs.sha((run/'load.json').read_bytes()),
             'source_record':str(run/'source.json'),'selected_source':source,'software_manifest':str(run/'software.json'),'selected_software':software,
             'kernel_release':kernel,'boot_id':boot,'bit_sha256':p['DS0_BIT_SHA256'],'script_sha256':p['source']['sha256']}
+        manifest.update(pairs.full.profiles.bind_identity(software,kernel,source,load),
+            source_record_sha256=pairs.sha((run/'source.json').read_bytes()),
+            software_manifest_sha256=pairs.sha((run/'software.json').read_bytes()))
         save(run/'manifest.json',manifest);save(run/'records.json',records);save(run/'review.json',p['review'](records))
         return run,records,manifest
     run,records,manifest=make('complete90');before={path:path.read_bytes() for path in run.rglob('*.json')}
@@ -111,7 +115,8 @@ def main():
         elif kind=='geometry':bad['groups'][0]['total_A_pages_per_direction']+=1
         else:bad['groups'][0]['samples'][0]['metrics']['hardware_ms']=0 if kind=='zero_time' else float('inf')
         reject(kind+'_rejected',lambda:pairs.pair_results(bad,synthetic=True))
-    for kind in ('n89','running','missing_block','load','source','software','command','data','bytes','cached_record','boot','sequence','plan','review','collector','derived_snapshot'):
+    for kind in ('n89','running','missing_block','load','source','software','command','data','bytes','cached_record','boot','sequence','plan','review','collector','derived_snapshot',
+                 'software_profile','software_profile_helper_sha256','runtime_commits','source_record_sha256','software_manifest_sha256'):
         run,records,manifest=make('bad-'+kind)
         if kind in ('n89','missing_block'):
             records.pop();save(run/'records.json',records)
@@ -133,6 +138,7 @@ def main():
         elif kind=='plan':manifest['planned_cases'].reverse()
         elif kind=='review':save(run/'review.json',{'changed':True})
         elif kind=='collector':manifest['script_sha256']='wrong'
+        elif kind in ('software_profile','software_profile_helper_sha256','runtime_commits','source_record_sha256','software_manifest_sha256'):manifest[kind]='changed'
         else:manifest['derived_snapshot']=True
         save(run/'manifest.json',manifest);target=build/('no-output-'+kind)
         reject('original_'+kind+'_rejected_before_output',lambda:pairs.export(run,target,'forbidden',_internal_fixture=True))
@@ -154,6 +160,7 @@ def main():
         raw['stdout']=raw['stdout'][:opening]+json.dumps(untag(row))+raw['stdout'][opening+length:];save(path,raw)
     records=json.loads((run/'records.json').read_text())
     manifest=json.loads((run/'manifest.json').read_text());manifest['load_manifest_sha256']=pairs.sha((run/'load.json').read_bytes());manifest['selected_source']=json.loads((run/'source.json').read_text());manifest['selected_software']=json.loads((run/'software.json').read_text());save(run/'manifest.json',manifest)
+    manifest.update(source_record_sha256=pairs.sha((run/'source.json').read_bytes()),software_manifest_sha256=pairs.sha((run/'software.json').read_bytes()));save(run/'manifest.json',manifest)
     for kind in ('metadata','decoded_cli'):
         if kind=='metadata':
             saved=(run/'manifest.json').read_bytes();value=json.loads(saved);value['nested']=[{'is_fixture':True}];save(run/'manifest.json',value)
