@@ -1,6 +1,6 @@
 # Root A integration handoff (live)
 
-Status: preparation and builds in progress; this file is updated with actual collection packets as they become available. The first immutable snapshot now contains 16 actual new DS25 trials, with explicit n and incomplete-matrix status. All Root edits are on `ispass/root-a` in `/home/xvhaocheng/work-root-a`.
+Status: preparation and builds in progress; this file is updated with actual collection packets as they become available. The latest immutable DS25 snapshot contains all 50 actual new trials (n=10 per condition); DS100 is in progress. All Root edits are on `ispass/root-a` in `/home/xvhaocheng/work-root-a`.
 
 ## Board ownership
 
@@ -26,3 +26,5 @@ Internal source commits are retained on the task-named component branches. CVA6/
 ## Newly authorized follow-on preparation
 
 E4 requires explicit 2MiB mapping support and actual leaf-size proof. E5 requires a versioned passive histogram extension for request distributions. E6 P/N/PN/P4M and the full three workload shapes require the documented changes. The user subsequently authorized necessary RTL/Linux changes for the existing experiment list in isolated branches, followed by validation, compilation and serial board scheduling. These items are now preparation work (E4/A3, E5/A1, remaining E3/A2); historical E6 mitigation is last. None has yet been implemented or run. Freeze the current P0/Multi kernel before this follow-on work, and do not resume unrelated mechanism exploration.
+
+Latest data packet: `exp/E1b-ds-sweep/checkpoints/ds25-stage-50/` contains DS25 50 plus explicit historical 100 =150 trials. It supersedes the 16-trial progress packet for cumulative import. No DS100 data has yet been frozen. The P0 new DS0 BIT is timing-qualified and the common E2/P0 software delivery has passed; use the full FPGA build manifest and the software `delivery-manifest.json`, not the short pointer or the retained failed initial software build manifest.

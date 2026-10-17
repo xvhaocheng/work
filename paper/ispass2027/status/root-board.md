@@ -5,7 +5,7 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Origin Date: 2026-10-17 JST
-- Verification Status: PARTIAL（DS25前16个新增试次已冻结并逐原始命令检核，整轮未完）
+- Verification Status: PARTIAL（DS25全50个新增试次已冻结并逐原始命令检核，DS100未完）
 - Version Label: root-a-status-v1
 
 ## 今日进展
@@ -58,3 +58,9 @@ Root已直接审查E2 multi最终驱动/ABI/CLI、未知静默状态不标draine
 共用内核/Image/payload已编译完成。初次构建在最后SPI模块link前因缺少`scripts/module.lds`失败；A2按现有恢复流程补`modules_prepare`，只编模块，原failed build-manifest/log保持不变，修复后新delivery-manifest为passed，正式release匹配。payload为29,363,656字节、32MiB分区余4,190,776字节；Root已用实际delivery通过E2 collector的纯主机版本/冻结CLI验证。E2采集器已整合，Root29项协议检查和90点合成矩阵通过，非板数据。
 
 P0真实固定backend的13个有限case/87个descriptor通过：合法64/1024/4096B在规定对齐环中每descriptor为1/1/2个AR和AW，实际字节/目的内容/越界guards/已接收请求排空一致。Root直接核实际SV/C++与生产调用参数，并将13个summary逐字段核对原始events。额外零长负向probe发现既有backend响应在backpressure下消失，run02明确failed并原样保留；P0的CLI、driver和batch RTL三层实际代码均拒0，故仅接受限定合法域，不声称整个backend通过，不改生产backend。NO_ERROR_HANDLING下SLVERR测试仅证明模拟响应下守恒和排空，不证明错误会上传软件。
+
+## DS25整档论文数据（2026-10-17 13:14Z）
+
+DS25全部50/50点通过，Solo/A1/A8/A16/A64各10。最新任务内CSV及Q1/Q3/IQR见`exp/E1b-ds-sweep/checkpoints/ds25-stage-50/`；含历史引用后共150试次，四档仍partial。V硬件时间中位数依次56.50850/107.13621/133.18369/140.80433/146.57918ms，吞吐中位数283.143/149.343/120.135/113.633/109.156MiB/s。以同boot、同区组A1为分母，A8/A16/A64额外慢化中位数24.3199%/31.4304%/36.8189%，各10配对；它们是DS25敏感性数据，不替代DS0主结果。原campaign已切入DS100加载，未写SD。
+
+P0新DS0 BIT已最终通过：WNS+0.177ns、WHS+0.035ns、WPWS+0.062ns，setup/hold/pulse失败端点均0，257848条可布线net全部布线、routing errors0，CPU周期20ns。Root直接核原始timing/route与routed边界：direct DS wire、delay cells0、forbidden research cells0。BIT SHA为`1056d7795ffc5673b1aaab29b09ad3e1654a299b481457bf0b8067d18f23afa7`；软件仍固定acece3/52c5，正式delivery passed。E2/P0均已具备排队产物，未提前使用板卡。
