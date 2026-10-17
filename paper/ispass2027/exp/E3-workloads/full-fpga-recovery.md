@@ -55,3 +55,12 @@ python3 /home/xvhaocheng/work-a2-workloads/paper/ispass2027/exp/E3-workloads/res
 01的jobs Tcl list空格规范化预期错误原样保存；改断言后02通过，后续03补绑定原子进程环境后同样9项通过。
 生产TCL未因该测试空格问题修改。
 截至本文件小批准备时，未prepare或launch实际续编。
+
+## 已接受的唯一续编启动
+
+Root直接审查接受5f7a306后，2026-10-17T15:46:07.579994Z启动唯一resume01，
+detached worker PID2083297，worker_start=15:46:07.690845Z。
+实际out为本E3 `artifacts/full-e3-ds0-resume01/`，dispatch.json / build-manifest.json / build.log为持续状态入口。
+`test-results/full-resume01-dispatch.json`与`full-resume01-manifest.as-launched.json`保存启动时原件。
+执行源commit固定5f7a30611d6d84e513a781cc42b8951570a37c3d，后续归档commit不冒充该执行源。
+启动时确认checkpoint hardlink与原physopt同inode；原manifest不改。当前尚无最终timing/routing/BIT资格。
