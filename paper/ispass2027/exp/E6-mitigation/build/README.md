@@ -5,11 +5,12 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Origin Date: 2026-10-18 JST
-- Verification Status: PARTIAL（source检查通过；BIT构建中，未验收）
+- Verification Status: PARTIAL（source及真实合成结构门通过；BIT实现中，未最终验收）
 - Version Label: e6-g-build01
 
 Root已直接审阅最小顶层diff、平台pins/profile、完整builder及合成检查，并授权冻结后立即启动唯一构建。
-前端与observer已接受的有限验证没有重跑，未声称全SoC elaboration通过。
+前端与observer已接受的有限验证没有重跑。后续这一次真实FPGA构建已完成SoC synthesis并通过结构门，
+实际回执及完整primitive inventory见`synth-stage01/`，不沿用有限wrapper测试作为全系统证据。
 
 | 对象 | 精确身份及范围 |
 | --- | --- |
@@ -19,6 +20,12 @@ Root已直接审阅最小顶层diff、平台pins/profile、完整builder及合�
 | Linux | `65b427946152e3aca27babab0a437821729805d4`只作reference；未构建或实现G软件，`g_linux_present=false` |
 | 结构 | Depth4、BTC2、OBS4、16×32桶/32bit hist；不合BTC3/OBS5/M/P/N/PN |
 | 构建 | 2026-10-17T15:08:57.646218Z实际启动；session43138，尚无BIT验收 |
+
+`synth-stage01/partial-stage.json`为该同一构建的只读阶段快照：实际fileset generic=1，
+G observer1、OBS observer1、PATH stage16，CPU20ns，DS delayer及禁止研究cell均0；
+每stage head/tail各2FF、stamps128FF/4slot、hist1024FF/32bins，全16stage通过。
+原完整4.7MiB register inventory保存，实际输入/约束/策略没有修改或重试。
+当前仅实现阶段进行中；尚未通过最终placement/routing/时序/面积，不是BIT验收或板测。
 
 `g-fpga-source.json`冻结所有递归组件及top-generic/synth-verifier overlay哈希。
 `build-entry.json`冻结本批代码、恢复材料哈希与未执行边界；其`source_checked_no_build`是启动前记录。

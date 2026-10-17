@@ -1,0 +1,748 @@
+diff --git a/drivers/misc/idma.c b/drivers/misc/idma.c
+index 43e1e6985d4c..1a6a8b47e141 100644
+--- a/drivers/misc/idma.c
++++ b/drivers/misc/idma.c
+@@ -69,6 +69,7 @@ MODULE_LICENSE("GPL v2");
+ #define IDMA_BATCH_COLUMNS_OFFSET 0xd0
+ #define IDMA_BATCH_MAGIC 0x49444d4142544301ULL
+ #define IDMA_GAP_CAP_OFFSET 0xe8
++#define IDMA_GAP_CYCLES_OFFSET 0xe0
+ #define IDMA_XFER_TIMEOUT_US 2000000
+ #define IDMA_MAX_DEVS 8
+ #define IDMA_MAX_PAGES 4096U
+@@ -118,6 +119,13 @@ struct idma_pages_context {
+ 	bool iova_assigned[2];
+ };
+ 
++struct idma_g_context {
++	struct idma_g_experiment request;
++	u64 start_ns;
++	bool abort_sent, stop_sent;
++};
++
++
+ static DEFINE_MUTEX(idma_devices_lock);
+ static struct idma_device *idma_devices[IDMA_MAX_DEVS];
+ /* All experiment preparation, IOVA mappings and DMA execution are serialized. */
+@@ -984,6 +992,150 @@ static int idma_batch_window(struct idma_stream *v, struct idma_stream *a,
+ 				     deadline, end_ns, NULL);
+ }
+ 
++/* Independent G warmup: exactly256 software COPY completions per lane. No
++ * autonomous batch or configured gap is active, and no measured counter moves.
++ */
++static int idma_g_warmup(struct idma_stream *v, struct idma_stream *a,
++			 u64 deadline, struct idma_g_context *g)
++{
++	struct idma_stream *lanes[] = { v, a };
++	unsigned int lane, nr = a ? 2 : 1;
++	int ret;
++
++	for (lane = 0; lane < nr; lane++) {
++		writeq(0, lanes[lane]->idma->reg + IDMA_BATCH_CONTROL_OFFSET);
++		if (readq(lanes[lane]->idma->reg + IDMA_BATCH_CONTROL_OFFSET) ||
++		    readq(lanes[lane]->idma->reg + IDMA_GAP_CYCLES_OFFSET))
++			return -EIO;
++	}
++	for (lane = 0; lane < nr; lane++) {
++		if (ktime_get_ns() >= deadline)
++			return -ETIMEDOUT;
++		if (signal_pending(current))
++			return -EINTR;
++		ret = idma_submit(lanes[lane], false);
++		if (ret)
++			return ret;
++	}
++	for (;;) {
++		if (ktime_get_ns() >= deadline)
++			return -ETIMEDOUT;
++		if (signal_pending(current))
++			return -EINTR;
++		for (lane = 0; lane < nr; lane++) {
++			if (g->request.warmup_completed[lane] == IDMA_G_WARMUP_TRANSFERS)
++				continue;
++			ret = idma_poll(lanes[lane], false);
++			if (ret < 0)
++				return ret;
++			if (ret == 1) {
++				g->request.warmup_completed[lane]++;
++				g->request.warmup_bytes[lane] += IDMA_G_CHUNK_BYTES;
++				if (g->request.warmup_completed[lane] < IDMA_G_WARMUP_TRANSFERS) {
++					ret = idma_submit(lanes[lane], false);
++					if (ret)
++						return ret;
++				}
++			}
++		}
++		if (g->request.warmup_completed[0] == IDMA_G_WARMUP_TRANSFERS &&
++		    (!a || g->request.warmup_completed[1] == IDMA_G_WARMUP_TRANSFERS))
++			return 0;
++		cond_resched();
++		cpu_relax();
++	}
++}
++
++/* Preserve A-before-V launch and V-first observation. Only G's new loop uses
++ * an unconditional cooperative scheduling point while V is unfinished.
++ */
++static int idma_g_batch_window(struct idma_stream *v, struct idma_stream *a,
++			 u64 deadline, u64 *end_ns, struct idma_g_context *g)
++{
++	struct idma_stream *lanes[] = { a, v };
++	unsigned int lane;
++	int ret;
++
++	g->start_ns = ktime_get_ns();
++	for (lane = a ? 0 : 1; lane < 2; lane++) {
++		if (ktime_get_ns() >= deadline) { ret = -ETIMEDOUT; goto out; }
++		if (signal_pending(current)) { ret = -EINTR; goto out; }
++		lanes[lane]->batch_started = true;
++		ret = idma_submit(lanes[lane], false);
++		if (ret)
++			goto out;
++		lanes[lane]->deadline_ns = deadline;
++	}
++	for (;;) {
++		if (ktime_get_ns() >= deadline) { ret = -ETIMEDOUT; break; }
++		if (signal_pending(current)) { ret = -EINTR; break; }
++		ret = idma_poll(v, false);
++		if (ret < 0)
++			break;
++		if (ret == 1) {
++			*end_ns = v->last_complete_ns;
++			return 0;
++		}
++		cond_resched();
++		cpu_relax();
++	}
++out:
++	*end_ns = ktime_get_ns();
++	return ret;
++}
++
++static int idma_g_wait_a(struct idma_stream *a, u64 deadline)
++{
++	int ret;
++
++	if (!a)
++		return 0;
++	for (;;) {
++		if (ktime_get_ns() >= deadline)
++			return -ETIMEDOUT;
++		if (signal_pending(current))
++			return -EINTR;
++		ret = idma_poll(a, false);
++		if (ret)
++			return ret == 1 ? 0 : ret;
++		cond_resched();
++		cpu_relax();
++	}
++}
++
++/* Called after the actual drain and collection. An inconsistent live/issued
++ * inventory cannot establish quiet and therefore retains the lane buffers.
++ * An early but fully drained STOP may be quiet; it still cannot be valid G.
++ */
++static int idma_g_check_lanes(struct idma_stream *v, struct idma_stream *a,
++			    struct idma_g_context *g)
++{
++	struct idma_stream *lanes[] = { v, a };
++	unsigned int lane, nr = a ? 2 : 1;
++	int ret = 0;
++
++	for (lane = 0; lane < nr; lane++) {
++		struct idma_stream *s = lanes[lane];
++		u64 control = s->batch_configured ?
++			readq(s->idma->reg + IDMA_BATCH_CONTROL_OFFSET) : 0;
++
++		if (s->retain || s->in_flight || (control & 2) ||
++		    s->stats->submitted != s->stats->completed) {
++			if (!s->retain)
++				idma_quarantine(s);
++			g->request.retained_lane_mask |= BIT(lane);
++			ret = -EIO;
++			continue;
++		}
++		g->request.quiet_lane_mask |= BIT(lane);
++		if (control != 9 || s->stats->submitted != IDMA_G_TRANSFERS ||
++		    s->stats->completed != IDMA_G_TRANSFERS ||
++		    s->stats->completed_bytes != (u64)IDMA_G_TRANSFERS * IDMA_G_CHUNK_BYTES)
++			ret = -EIO;
++	}
++	return ret;
++}
++
+ /* STOP/drain every started lane before any buffer can be released. */
+ static int idma_multi_stop(struct idma_stream streams[], unsigned int nr,
+ 			   struct idma_multi_experiment *multi, bool check_running)
+@@ -1129,6 +1281,61 @@ static bool idma_observer_has_path(u64 magic)
+ 	return magic == IDMA_OBS_MAGIC_V3 || magic == IDMA_OBS_MAGIC_V4 || magic == IDMA_OBS_MAGIC_V5;
+ }
+ 
++/* G-disabled BTC2 keeps e8 reserved and may return an AXI read error. On this
++ * RV64 platform the aligned nofault copy is one exception-protected u64 load.
++ * Preserve the ordering and little-endian conversion of the normal readq.
++ * This capability probe has no clear, ARM, sequence or DMA side effect.
++ */
++static int idma_g_read_gap_cap(struct idma_device *idma, u64 *value)
++{
++	u64 raw = 0;
++	long ret;
++
++	__io_br();
++	ret = get_kernel_nofault(raw, (const u64 __force *)(idma->reg + IDMA_GAP_CAP_OFFSET));
++	__io_ar(raw);
++	if (ret)
++		return -EOPNOTSUPP;
++	*value = le64_to_cpu((__force __le64)raw);
++	return 0;
++}
++
++/* Caller holds experiment_lock. RUN supplies only its selected lanes; CAPS
++ * supplies both lanes to report the complete fixed V0/A1 contract.
++ */
++static int idma_g_probe_locked(struct idma_device *victim,
++		struct idma_device *aggressor, struct idma_g_caps *caps)
++{
++	u64 a_gap, info;
++	int ret;
++
++	if (!IS_REACHABLE(CONFIG_RISCV_IOMMU) || !IS_ENABLED(CONFIG_64BIT) ||
++	    PAGE_SIZE != SZ_4K || victim->id != 0 || victim->did != 10 ||
++	    (aggressor && (aggressor->id != 1 || aggressor->did != 11)) ||
++	    readq(victim->reg + IDMA_BATCH_MAGIC_OFFSET) != IDMA_G_BATCH_MAGIC ||
++	    (aggressor && readq(aggressor->reg + IDMA_BATCH_MAGIC_OFFSET) != IDMA_G_BATCH_MAGIC) ||
++	    readq(victim->reg + IDMA_OBS_MAGIC_OFFSET) != IDMA_G_OBSERVER_MAGIC)
++		return -EOPNOTSUPP;
++	ret = idma_g_read_gap_cap(victim, &caps->gap_magic);
++	if (!ret && aggressor)
++		ret = idma_g_read_gap_cap(aggressor, &a_gap);
++	if (ret)
++		return ret;
++	if (caps->gap_magic != IDMA_G_GAP_MAGIC || (aggressor && a_gap != IDMA_G_GAP_MAGIC))
++		return -EOPNOTSUPP;
++	writeq(IDMA_G_BANK_FIRST, victim->reg + IDMA_OBS_INDEX_OFFSET);
++	caps->bank_magic = readq(victim->reg + IDMA_OBS_DATA_OFFSET);
++	writeq(192, victim->reg + IDMA_OBS_INDEX_OFFSET);
++	info = readq(victim->reg + IDMA_OBS_DATA_OFFSET);
++	if (caps->bank_magic != IDMA_G_BANK_MAGIC || (info & 0xffffffffULL) != 0x20202001ULL || info >> 48)
++		return -EOPNOTSUPP;
++	caps->capabilities = IDMA_G_CAP_BATCH | IDMA_G_CAP_GAP | IDMA_G_CAP_WHOLE |
++		IDMA_G_CAP_HIST | IDMA_G_CAP_RUN_READY;
++	if (riscv_iommu_hpm_supported(victim->miscdev.parent))
++		caps->capabilities |= IDMA_G_CAP_HPM;
++	return 0;
++}
++
+ /* Called with the experiment lock, before preparing or submitting any DMA. */
+ static int idma_observation_prepare(struct idma_observation *o, bool enabled)
+ {
+@@ -1174,6 +1381,25 @@ static int idma_observation_arm(struct idma_observation *o,
+ 	return readq(o->control->reg + IDMA_OBS_CONTROL_OFFSET) == 1 ? 0 : -EIO;
+ }
+ 
++/* Error cleanup only. Abort observation before STOP; neither action cancels
++ * DMA/AXI. Preserve actual counters and later establish quiet by real drain.
++ */
++static void idma_g_fail(struct idma_g_context *g, struct idma_observation *o,
++		       struct idma_stream *v, struct idma_stream *a)
++{
++	if (!g)
++		return;
++	if (o->control && o->armed && !g->abort_sent) {
++		writeq(2, o->control->reg + IDMA_OBS_CONTROL_OFFSET);
++		g->abort_sent = true;
++	}
++	if (!g->stop_sent) {
++		idma_batch_stop(v);
++		idma_batch_stop(a);
++		g->stop_sent = true;
++	}
++}
++
+ /* Frozen, bounded, one-pass reads. No histogram buffer enters a timed window. */
+ static noinline bool idma_observation_hist_finish(struct idma_observation *o,
+ 						void __iomem *base,
+@@ -1232,7 +1458,8 @@ static noinline bool idma_observation_hist_finish(struct idma_observation *o,
+ 
+ /* Drain/verify first. Frozen reads and logging are outside all timed windows. */
+ static int idma_observation_finish(struct idma_observation *o,
+-				   const struct idma_experiment *e, int run_error)
++				   const struct idma_experiment *e, int run_error,
++				   struct idma_g_context *g)
+ {
+ 	u64 values[IDMA_OBS_VALUES], path[16][8], status;
+ 	void __iomem *base;
+@@ -1243,8 +1470,12 @@ static int idma_observation_finish(struct idma_observation *o,
+ 		return 0;
+ 	base = o->control->reg;
+ 	status = readq(base + IDMA_OBS_CONTROL_OFFSET);
++	if (g)
++		g->request.old_observer_status = status;
+ 	if (status & 3) {
+ 		writeq(2, base + IDMA_OBS_CONTROL_OFFSET);
++		if (g)
++			g->abort_sent = true;
+ 		status = readq(base + IDMA_OBS_CONTROL_OFFSET);
+ 	}
+ 	for (i = 0; i < IDMA_OBS_VALUES; i++) {
+@@ -1256,6 +1487,28 @@ static int idma_observation_finish(struct idma_observation *o,
+ 		values[9] == (o->batch ? 1 : values[7]) &&
+ 		values[0] == values[1] + values[2] + values[3] &&
+ 		values[0] == values[10] + values[11] + values[12] + values[13];
++	if (g) {
++		struct idma_g_experiment *p = &g->request;
++		u32 mask = e->aggressor_did == IDMA_EXPERIMENT_NO_AGGRESSOR ? 1 : 3;
++
++		for (i = 0; i < (int)IDMA_G_BANK_WORDS; i++) {
++			writeq(IDMA_G_BANK_FIRST + i, base + IDMA_OBS_INDEX_OFFSET);
++			p->words[i] = readq(base + IDMA_OBS_DATA_OFFSET);
++		}
++		p->observer_validation_errors = idma_g_validate_snapshot(p->words,
++				mask == 3, p->aggressor_gap_cycles, values[0]);
++		valid = valid && !p->observer_validation_errors && e->measurement_complete &&
++			p->prepared_lane_mask == mask && p->quiet_lane_mask == mask &&
++			p->verified_lane_mask == mask && !p->retained_lane_mask &&
++			p->warmup_completed[0] == IDMA_G_WARMUP_TRANSFERS &&
++			p->warmup_bytes[0] == (u64)IDMA_G_WARMUP_TRANSFERS * IDMA_G_CHUNK_BYTES &&
++			p->warmup_completed[1] == (mask == 3 ? IDMA_G_WARMUP_TRANSFERS : 0) &&
++			p->warmup_bytes[1] == (mask == 3 ? (u64)IDMA_G_WARMUP_TRANSFERS * IDMA_G_CHUNK_BYTES : 0) &&
++			e->victim.completed == IDMA_G_TRANSFERS &&
++			e->victim.completed_bytes == (u64)IDMA_G_TRANSFERS * IDMA_G_CHUNK_BYTES &&
++			e->aggressor.completed == (mask == 3 ? IDMA_G_TRANSFERS : 0) &&
++			e->aggressor.completed_bytes == (mask == 3 ? (u64)IDMA_G_TRANSFERS * IDMA_G_CHUNK_BYTES : 0);
++	}
+ 	/* Opening stock + accepted requests must equal returns + closing stock. */
+ 	for (i = 0; i < 2; i++) {
+ 		u64 opening = values[30 + i], closing = values[32 + i];
+@@ -1335,6 +1588,16 @@ static int idma_observation_finish(struct idma_observation *o,
+ 				 o->sequence, i < 8 ? 'v' : 'a', (i / 4) % 2 ? 'w' : 'r',
+ 				 i % 4, valid, path[i][0], path[i][1], path[i][2],
+ 				 path[i][3], path[i][4], path[i][5], path[i][6], path[i][7]);
++	if (g) {
++		dev_info(o->control->miscdev.parent,
++			 "idma_g_obs seq=%llu valid=%u status=%#llx validation_errors=%#x hw_errors=%#llx\n",
++			 o->sequence, valid, g->request.old_observer_status,
++			 g->request.observer_validation_errors, g->request.words[3]);
++		for (i = 0; i < (int)IDMA_G_BANK_WORDS; i++)
++			dev_info(o->control->miscdev.parent,
++				 "idma_g_word seq=%llu index=%u raw=%#llx\n",
++				 o->sequence, IDMA_G_BANK_FIRST + i, g->request.words[i]);
++	}
+ 	return valid ? 0 : -EIO;
+ }
+ 
+@@ -1343,7 +1606,8 @@ static int idma_observation_finish(struct idma_observation *o,
+  */
+ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 		struct idma_experiment *request, bool batch, u32 aggressor_chunk, bool p0,
+-		struct idma_pages_context *pages, struct idma_workload_context *workload)
++		struct idma_pages_context *pages, struct idma_workload_context *workload,
++		struct idma_g_context *g)
+ {
+ 	struct idma_experiment e = *request;
+ 	struct idma_stream streams[2] = {};
+@@ -1367,6 +1631,10 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 		ret = -EINVAL;
+ 	if (ret)
+ 		goto out_copy;
++	if (g && (pages || workload || !batch || p0)) {
++		ret = -EINVAL;
++		goto out_copy;
++	}
+ 	ret = mutex_lock_interruptible(&idma_experiment_lock);
+ 	if (ret)
+ 		goto out_copy;
+@@ -1391,9 +1659,22 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 			goto out_put;
+ 		}
+ 	}
++	if (g) {
++		struct idma_g_caps caps = {};
++
++		ret = idma_g_probe_locked(victim, aggressor, &caps);
++		if (ret)
++			goto out_put;
++	}
+ 	ret = idma_observation_prepare(&observation, batch || READ_ONCE(idma_observe));
++	if (g)
++		g->request.observer_sequence = observation.sequence;
+ 	if (ret)
+ 		goto out_put;
++	if (g && (!observation.path || !observation.hist || observation.hist_v5)) {
++		ret = -EOPNOTSUPP;
++		goto out_put;
++	}
+ 	if (pages) {
+ 		if (!observation.path) {
+ 			ret = -EOPNOTSUPP;
+@@ -1437,12 +1718,16 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 		idma_stream_prepare(v, victim, e.victim_pages, e.chunk_bytes, &e.victim);
+ 	if (ret)
+ 		goto out_cleanup;
++	if (g)
++		g->request.prepared_lane_mask |= 1;
+ 	if (a) {
+ 		ret = pages ? idma_pages_prepare(a, aggressor, &e.aggressor, pages, 1) :
+ 			idma_stream_prepare(a, aggressor, e.aggressor_pages,
+ 					      aggressor_chunk, &e.aggressor);
+ 		if (ret)
+ 			goto out_cleanup;
++		if (g)
++			g->request.prepared_lane_mask |= 2;
+ 	}
+ 	ret = riscv_iommu_hpm_acquire(v->dev, a ? a->dev : NULL, &hpm);
+ 	if (ret)
+@@ -1455,14 +1740,20 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 	 */
+ 	local_flush_icache_all();
+ 	deadline = ktime_get_ns() + (u64)e.run_timeout_ms * NSEC_PER_MSEC;
+-	if (a && (!batch || e.warmup_transfers)) {
+-		ret = idma_submit(a, false);
++	if (g) {
++		ret = idma_g_warmup(v, a, deadline, g);
++		if (ret)
++			goto out_drain;
++	} else {
++		if (a && (!batch || e.warmup_transfers)) {
++			ret = idma_submit(a, false);
++			if (ret)
++				goto out_drain;
++		}
++		ret = idma_run_window(v, a, e.warmup_transfers, deadline, false, &end);
+ 		if (ret)
+ 			goto out_drain;
+ 	}
+-	ret = idma_run_window(v, a, e.warmup_transfers, deadline, false, &end);
+-	if (ret)
+-		goto out_drain;
+ 	/* Every measured V task starts at the same address after warmup. */
+ 	v->next_offset = 0;
+ 	v->last_complete_ns = 0;
+@@ -1477,9 +1768,23 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 		}
+ 		ret = idma_batch_configure(v, e.victim_transfers, p0);
+ 		if (!ret && a)
+-			ret = idma_batch_configure(a, IDMA_EXPERIMENT_MAX_TRANSFERS, p0);
++			ret = idma_batch_configure(a, g ? IDMA_G_TRANSFERS : IDMA_EXPERIMENT_MAX_TRANSFERS, p0);
+ 		if (ret)
+ 			goto out_drain;
++		if (g) {
++			writeq(0, victim->reg + IDMA_GAP_CYCLES_OFFSET);
++			if (a)
++				writeq(g->request.aggressor_gap_cycles, aggressor->reg + IDMA_GAP_CYCLES_OFFSET);
++			if (readq(victim->reg + IDMA_GAP_CYCLES_OFFSET) ||
++			    readq(victim->reg + IDMA_BATCH_TARGET_OFFSET) != IDMA_G_TRANSFERS ||
++			    readq(victim->reg + IDMA_BATCH_CONTROL_OFFSET) != 1 ||
++			    (a && (readq(aggressor->reg + IDMA_GAP_CYCLES_OFFSET) != g->request.aggressor_gap_cycles ||
++				readq(aggressor->reg + IDMA_BATCH_TARGET_OFFSET) != IDMA_G_TRANSFERS ||
++				readq(aggressor->reg + IDMA_BATCH_CONTROL_OFFSET) != 1))) {
++				ret = -EIO;
++				goto out_drain;
++			}
++		}
+ 	}
+ 	e.victim.in_flight_at_start = v->in_flight;
+ 	e.aggressor.in_flight_at_start = a && a->in_flight;
+@@ -1491,7 +1796,8 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 	start = ktime_get_ns();
+ 	e.snapshot_before_ns = start - stamp;
+ 	e.measurement_started = 1;
+-	ret = batch ? idma_batch_window(v, a, deadline, &end) :
++	ret = g ? idma_g_batch_window(v, a, deadline, &end, g) :
++		batch ? idma_batch_window(v, a, deadline, &end) :
+ 		idma_run_window(v, a, e.victim_transfers, deadline, true, &end);
+ 	e.victim_elapsed_ns = end - start;
+ 	e.measurement_complete = !ret;
+@@ -1511,7 +1817,7 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 			ret = -EIO;
+ 	}
+ 	/* Stop autonomous A after V observation; hardware window is already frozen. */
+-	if (batch) {
++	if (batch && !g) {
+ 		idma_batch_stop(a);
+ 		if (ret)
+ 			idma_batch_stop(v);
+@@ -1524,17 +1830,44 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 	if (a)
+ 		idma_snapshot_delta(&e.aggressor, 1, &before, &after,
+ 				    active_before[1], active_after[1]);
++	if (g) {
++		if (!ret)
++			ret = idma_g_wait_a(a, deadline);
++		e.measurement_complete = !ret;
++		g->request.whole_software_elapsed_ns = ktime_get_ns() - g->start_ns;
++	}
+  out_drain:
+ 	if (batch) {
+-		idma_batch_stop(v);
+-		idma_batch_stop(a);
++		if (g) {
++			if (ret)
++				idma_g_fail(g, &observation, v, a);
++		} else {
++			idma_batch_stop(v);
++			idma_batch_stop(a);
++		}
+ 	}
+ 	stamp = ktime_get_ns();
+-	drain_ret = idma_drain(v);
++	if (g && !v->batch_configured && v->in_flight) {
++		drain_ret = idma_drain(v);
++		if (!drain_ret) {
++			g->request.warmup_completed[0]++;
++			g->request.warmup_bytes[0] += IDMA_G_CHUNK_BYTES;
++		}
++	} else {
++		drain_ret = idma_drain(v);
++	}
+ 	if (drain_ret && !ret)
+ 		ret = drain_ret;
+ 	if (a) {
+-		drain_ret = idma_drain(a);
++		if (g && !a->batch_configured && a->in_flight) {
++			drain_ret = idma_drain(a);
++			if (!drain_ret) {
++				g->request.warmup_completed[1]++;
++				g->request.warmup_bytes[1] += IDMA_G_CHUNK_BYTES;
++			}
++		} else {
++			drain_ret = idma_drain(a);
++		}
+ 		if (drain_ret && !ret)
+ 			ret = drain_ret;
+ 	}
+@@ -1549,6 +1882,13 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 		if (!ret && e.victim.completed != e.victim_transfers)
+ 			ret = -EIO;
+ 	}
++	if (g) {
++		drain_ret = idma_g_check_lanes(v, a, g);
++		if (drain_ret && !ret)
++			ret = drain_ret;
++		if (ret)
++			idma_g_fail(g, &observation, v, a);
++	}
+ 	riscv_iommu_hpm_release(hpm);
+ 	if (workload)
+ 		for (lane = 0; lane < (a ? 2 : 1); lane++) {
+@@ -1556,18 +1896,25 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 
+ 			idma_workload_prefix_bitmap(w->warmup, w->geometry, w->warmup_completed);
+ 		}
+-	if (!ret) {
++	if (!ret || (g && g->request.quiet_lane_mask == (a ? 3 : 1) &&
++		     !g->request.retained_lane_mask)) {
+ 		/* Both lanes are drained: reacquire CPU visibility before any check. */
+ 		local_flush_icache_all();
+ 		verify_ret = idma_verify(v);
+-		if (verify_ret)
++		if (g && !verify_ret)
++			g->request.verified_lane_mask |= 1;
++		if (verify_ret && !ret)
+ 			ret = verify_ret;
+ 		if (a) {
+ 			verify_ret = idma_verify(a);
++			if (g && !verify_ret)
++				g->request.verified_lane_mask |= 2;
+ 			if (verify_ret && !ret)
+ 				ret = verify_ret;
+ 		}
+ 	}
++	if (g && ret)
++		idma_g_fail(g, &observation, v, a);
+  out_cleanup:
+ 	if (workload)
+ 		for (lane = 0; lane < (a ? 2 : 1); lane++) {
+@@ -1621,9 +1968,11 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 			}
+ 		}
+ 	}
+-	observation_ret = idma_observation_finish(&observation, &e, ret);
++	observation_ret = idma_observation_finish(&observation, &e, ret, g);
+ 	if (observation_ret && !ret)
+ 		ret = observation_ret;
++	if (g && ret)
++		idma_g_fail(g, &observation, v, a);
+ 	if (batch) {
+ 		idma_batch_disable(v);
+ 		idma_batch_disable(a);
+@@ -1656,7 +2005,7 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ static long idma_run_experiment_core(struct idma_device *victim,
+ 		struct idma_experiment *request, bool batch, u32 aggressor_chunk, bool p0)
+ {
+-	return idma_run_experiment_mapped(victim, request, batch, aggressor_chunk, p0, NULL, NULL);
++	return idma_run_experiment_mapped(victim, request, batch, aggressor_chunk, p0, NULL, NULL, NULL);
+ }
+ 
+ static long idma_run_experiment_mode(struct idma_device *victim,
+@@ -1981,7 +2330,7 @@ static long idma_run_multi(struct idma_device *victim,
+ 	observed.victim_transfers = multi.victim_transfers;
+ 	observed.victim_did = multi.did[0];
+ 	observed.aggressor_did = multi.did[1];
+-	next = idma_observation_finish(&context->observation, &observed, ret);
++	next = idma_observation_finish(&context->observation, &observed, ret, NULL);
+ 	if (next && !ret)
+ 		ret = next;
+ 	for (i = nr; i > 0; i--) {
+@@ -2074,7 +2423,7 @@ static long idma_run_pages(struct idma_device *victim,
+ 	e->run_timeout_ms = p->run_timeout_ms;
+ 	e->victim_transfers = p->victim_transfers;
+ 	e->warmup_transfers = p->warmup_transfers;
+-	ret = idma_run_experiment_mapped(victim, e, true, SZ_4K, false, context, NULL);
++	ret = idma_run_experiment_mapped(victim, e, true, SZ_4K, false, context, NULL, NULL);
+ out_copy:
+ 	p->status = ret;
+ 	if (copy_to_user(uarg, p, sizeof(*p)))
+@@ -2195,7 +2544,7 @@ static long idma_run_workload(struct idma_device *victim,
+ 	e.warmup_transfers = warmup;
+ 	ret = idma_run_experiment_mapped(victim, &e, true,
+ 		p->aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR ? SZ_4K :
+-		p->aggressor_geometry.row_bytes, false, NULL, context);
++		p->aggressor_geometry.row_bytes, false, NULL, context, NULL);
+ 	/* Keep ABI layouts independent; completion counts are actual row COPYs. */
+ 	p->victim_did = e.victim_did;
+ 	p->aggressor_did = e.aggressor_did;
+@@ -2251,25 +2600,6 @@ static long idma_caps_workload(struct idma_device *victim, void __user *uarg)
+ 	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
+ }
+ 
+-/* G-disabled BTC2 keeps e8 reserved and may return an AXI read error. On this
+- * RV64 platform the aligned nofault copy is one exception-protected u64 load.
+- * Preserve the ordering and little-endian conversion of the normal readq.
+- * This capability probe has no clear, ARM, sequence or DMA side effect.
+- */
+-static int idma_g_read_gap_cap(struct idma_device *idma, u64 *value)
+-{
+-	u64 raw = 0;
+-	long ret;
+-
+-	__io_br();
+-	ret = get_kernel_nofault(raw, (const u64 __force *)(idma->reg + IDMA_GAP_CAP_OFFSET));
+-	__io_ar(raw);
+-	if (ret)
+-		return -EOPNOTSUPP;
+-	*value = le64_to_cpu((__force __le64)raw);
+-	return 0;
+-}
+-
+ /* Indexed reads are serialized by the same experiment lock as prepare/ARM/
+  * finish. No sequence is incremented, and previous frozen data is retained.
+  */
+@@ -2287,7 +2617,6 @@ static long idma_caps_g(struct idma_device *victim, void __user *uarg)
+ 		.bank_first = IDMA_G_BANK_FIRST, .bank_words = IDMA_G_BANK_WORDS,
+ 	};
+ 	struct idma_device *aggressor;
+-	u64 a_gap, info;
+ 	long ret;
+ 
+ 	if (!IS_REACHABLE(CONFIG_RISCV_IOMMU) || !IS_ENABLED(CONFIG_64BIT) ||
+@@ -2297,36 +2626,7 @@ static long idma_caps_g(struct idma_device *victim, void __user *uarg)
+ 	if (ret)
+ 		return ret;
+ 	aggressor = idma_get_instance(1);
+-	if (!aggressor || aggressor->did != 11 ||
+-	    readq(victim->reg + IDMA_BATCH_MAGIC_OFFSET) != IDMA_G_BATCH_MAGIC ||
+-	    readq(aggressor->reg + IDMA_BATCH_MAGIC_OFFSET) != IDMA_G_BATCH_MAGIC ||
+-	    readq(victim->reg + IDMA_OBS_MAGIC_OFFSET) != IDMA_G_OBSERVER_MAGIC) {
+-		ret = -EOPNOTSUPP;
+-		goto out;
+-	}
+-	ret = idma_g_read_gap_cap(victim, &caps.gap_magic);
+-	if (!ret)
+-		ret = idma_g_read_gap_cap(aggressor, &a_gap);
+-	if (ret)
+-		goto out;
+-	if (caps.gap_magic != IDMA_G_GAP_MAGIC || a_gap != IDMA_G_GAP_MAGIC) {
+-		ret = -EOPNOTSUPP;
+-		goto out;
+-	}
+-	writeq(IDMA_G_BANK_FIRST, victim->reg + IDMA_OBS_INDEX_OFFSET);
+-	caps.bank_magic = readq(victim->reg + IDMA_OBS_DATA_OFFSET);
+-	writeq(192, victim->reg + IDMA_OBS_INDEX_OFFSET);
+-	info = readq(victim->reg + IDMA_OBS_DATA_OFFSET);
+-	if (caps.bank_magic != IDMA_G_BANK_MAGIC || (info & 0xffffffffULL) != 0x20202001ULL ||
+-	    info >> 48) {
+-		ret = -EOPNOTSUPP;
+-		goto out;
+-	}
+-	caps.capabilities = IDMA_G_CAP_BATCH | IDMA_G_CAP_GAP | IDMA_G_CAP_WHOLE | IDMA_G_CAP_HIST;
+-	if (riscv_iommu_hpm_supported(victim->miscdev.parent))
+-		caps.capabilities |= IDMA_G_CAP_HPM;
+-	/* RUN_READY stays clear until the separate DMA lifecycle batch is wired. */
+-out:
++	ret = aggressor ? idma_g_probe_locked(victim, aggressor, &caps) : -EOPNOTSUPP;
+ 	idma_put_instance(aggressor);
+ 	mutex_unlock(&idma_experiment_lock);
+ 	if (ret)
+@@ -2334,6 +2634,61 @@ static long idma_caps_g(struct idma_device *victim, void __user *uarg)
+ 	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
+ }
+ 
++static long idma_run_g(struct idma_device *victim,
++		      struct idma_g_experiment __user *uarg)
++{
++	struct idma_g_context *g;
++	struct idma_g_experiment *p;
++	struct idma_experiment e = {};
++	long ret;
++
++	g = kzalloc(sizeof(*g), GFP_KERNEL);
++	if (!g)
++		return -ENOMEM;
++	p = &g->request;
++	if (copy_from_user(p, uarg, sizeof(*p))) {
++		ret = -EFAULT;
++		goto out_free;
++	}
++	memset(&p->status, 0, sizeof(*p) - offsetof(struct idma_g_experiment, status));
++	p->victim_did = victim->did;
++	p->aggressor_did = IDMA_EXPERIMENT_NO_AGGRESSOR;
++	ret = idma_g_validate_input(p);
++	if (!ret && (victim->id != 0 || victim->did != 10 || PAGE_SIZE != SZ_4K))
++		ret = -EOPNOTSUPP;
++	if (ret)
++		goto out_copy;
++	e.abi_version = IDMA_EXPERIMENT_ABI;
++	e.struct_size = sizeof(e);
++	e.aggressor_id = p->aggressor_id;
++	e.victim_pages = p->victim_pages;
++	e.aggressor_pages = p->aggressor_pages ? p->aggressor_pages : 1;
++	e.chunk_bytes = p->chunk_bytes;
++	e.run_timeout_ms = p->run_timeout_ms;
++	e.victim_transfers = p->victim_transfers;
++	e.warmup_transfers = p->warmup_transfers;
++	ret = idma_run_experiment_mapped(victim, &e, true, IDMA_G_CHUNK_BYTES,
++					false, NULL, NULL, g);
++	p->victim_did = e.victim_did;
++	p->aggressor_did = e.aggressor_did;
++	p->hpm_configured = e.hpm_configured;
++	p->measurement_started = e.measurement_started;
++	p->measurement_complete = e.measurement_complete;
++	p->victim_elapsed_ns = e.victim_elapsed_ns;
++	p->snapshot_before_ns = e.snapshot_before_ns;
++	p->snapshot_after_ns = e.snapshot_after_ns;
++	p->drain_ns = e.drain_ns;
++	p->victim = e.victim;
++	p->aggressor = e.aggressor;
++out_copy:
++	p->status = ret;
++	if (copy_to_user(uarg, p, sizeof(*p)))
++		ret = -EFAULT;
++out_free:
++	kfree(g);
++	return ret;
++}
++
+ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ {
+ 	struct idma_device *idma = fp->private_data;
+@@ -2351,6 +2706,8 @@ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ 	switch (cmd) {
+ 	case IDMA_IOC_CAPS_G:
+ 		return idma_caps_g(idma, (void __user *)arg);
++	case IDMA_IOC_RUN_G:
++		return idma_run_g(idma, (struct idma_g_experiment __user *)arg);
+ 	case IDMA_IOC_CAPS_WORKLOAD:
+ 		return idma_caps_workload(idma, (void __user *)arg);
+ 	case IDMA_IOC_RUN_WORKLOAD:

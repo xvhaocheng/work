@@ -9,6 +9,8 @@
 - Version Label: e6-g-linux-design-v1
 
 Root已锁定独立ABI6，CAPS0x11/RUN0x12，和G独立warmup合同。
+后继RUN设计已实现为独立待审小批69d8b9d4，实际代码/有限证据见`../linux-validation/g-run/README.md`；
+本页保留原设计与65b来源定位，不作为BIT/正式软件或板测已完成的证明。
 首批实际实现见`../linux-validation/README.md`；本页后半的DMA调用链是下一小批设计，不是已实现功能。
 基础是共同Linux `65b427946152e3aca27babab0a437821729805d4`（已含multi合作调度）；
 独占worktree `/home/xvhaocheng/work-a1-e6-linux`、分支`ispass/e6-mitigation`，不改A2树。

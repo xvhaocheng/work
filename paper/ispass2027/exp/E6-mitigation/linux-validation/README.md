@@ -1,5 +1,8 @@
 # G Linux首批：UAPI、只读CAPS与纯decode
 
+后继RUN候选已另小批实现并有限通过，见`g-run/README.md`与`run-component.json`。
+下文保持已接受首批889f的事实；RUN候选尚待Root审，不将首批回执改写为RUN或板测证明。
+
 Root已审首批实际3文件diff，并要求将G独立timeout收敛到60000ms。
 冻结tip `889f75b02f845f622ff5c45dff437aab1870d756`，直接来源共同65b；
 `b2586bfc`首批实现、`889f75b0`仅timeout修订。内部branch不推第三方上游，增量bundle保留。
