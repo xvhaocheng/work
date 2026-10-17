@@ -709,3 +709,5 @@ site:yonsei.ac.kr "Cache Policy Impacts"
 **既有投稿口径附记。** 摘要2026-12-11 AoE、全文12-18 AoE，正文9页、IEEE双栏、双盲；AoE转JST分别为12-12、12-19的20:59。按[投稿页](https://ispass.org/2027/submission/)、[日期页](https://ispass.org/2027/dates/)、[CFP](https://ispass.org/2027/cfp/)最终要求执行。关联前作正常第三人称引用，实质AI使用按实际纳入内容披露；本文是含内部路径的工作笔记，不能原样充当匿名稿。
 
 G2b增量核查：[翻译优化反馈、替换状态与供给测量](prior-work-g2b.md)。
+
+G2c增量核查：[附加延迟、失效范围与合计吞吐](prior-work-g2c.md)。
