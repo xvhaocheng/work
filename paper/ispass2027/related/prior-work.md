@@ -1,4 +1,4 @@
-**有部分重叠需要讨论（截至2026-10-17，JST）**：已核实Procedia2025的RISC-V IOMMU多IOATC共享IOATS并行性能评价（§2、§5.3），以及Hur/Ro2025的RISC-V处理器配置＋SMMU模型多客户端并发与缓存策略评价（§III–IV）；两篇均是直接性能前作。已读原文没有完整覆盖本文的固定共跑基线、零miss邻居等待传播及缓解组合证据，差异见§5.3、§7；不能主张首次研究RISC-V系统中的多客户端共享翻译性能／干扰。
+**有部分重叠需要讨论（截至2026-10-17，JST）**：已核实Procedia2025的RISC-V IOMMU多IOATC共享IOATS并行性能评价（§2、§5.3），以及Hur/Ro2025的RISC-V处理器配置＋SMMU模型多客户端并发与缓存策略评价（§III–IV）；两篇均是直接性能前作。这两篇所报告评估未完整覆盖本文的固定共跑基线、零miss邻居等待传播及缓解组合证据，差异见§5.3、§7；不能主张首次研究RISC-V系统中的多客户端共享翻译性能／干扰。
 
 # G2：ISPASS 2027 前作新颖性判别
 
@@ -39,6 +39,18 @@
 **自含版本记录。** Bermuda arXiv2508.19670v1，SHA256 d85ffeaa949a3ad5f17e950871a2f85c49b61bf237e70fca813a2535bb8a51f8；SVA arXiv2502.17398v1，SHA256 4610cbf0fc9eec49e41618c3dad28c4ba609c4f596efc26d19ec6548cd98c319。正式出版正文未与作者稿逐字等同。新增PDF初检因pypdf缺失为UNAVAILABLE，临时独立依赖环境复查后，Rodríguez硕论115页（SHA256 b364a5d4d1d3a222bfbed5d56c2e0ff7d91ee92a3039788d56e5b3f77b1a41c8）、IEICE6页、ShareMMU18页、MASK16页、Kurth2018九页、Hao2017十二页均PASS；原UNAVAILABLE记录未覆盖。HERO2017、DATE海报／slides等新预检也PASS；ANDARE2018 HERO有xref覆盖告警，仍UNAVAILABLE，后文仅用章节锚。新阅读／预检记录与旧引用卡分开，不新增用户“全文已读”标记。
 
 
+<a id="new-fulltext-coverage"></a>
+### 新取得两篇：实际全文覆盖与身份
+
+2026-10-17用户提供出版社PDF后，**取得全文**替代了此前的**公开渠道未取得**状态；§8.5保留早先真实获取记录，§8.6记录本次核读。没有把PDF上传外部模型或重新发布。原文身份以DOI、版本、页数和下列SHA256固定；附件是阅读来源，公开题录链接用于查找原件。
+
+| 文献 | 正文、图表及参考文献覆盖 | 原件身份与结构预检 |
+|---|---|---|
+| [Procedia2025出版社版](https://doi.org/10.1016/j.procs.2025.08.115) | 摘要及对应作者脚注PDF1／印刷923；§1 PDF1–2；§2 PDF2–4；§3 PDF4–5；§4 PDF5–7；§5.1–5.2 PDF8–9；§5.3 PDF9；随后未编号的Walk Cache评价PDF10–11；§5.5 PDF11；§6及References PDF12–13：正文全文及参考列表已读。Fig.1–14和Table 1/2图注均读；已目视核Fig.2–14，主会话直接核Fig.2/4、7–14及两表。未见印出的§5.4标题，不补造章节号；引用的外部原作未逐篇重读 | 13页，印刷923–935；SHA256 **c28c8504783f2e3c5265e6c66592ba2b513906f35269e488c2440a8151974129**；ARS 13/13/13、PASS，无告警 |
+| [Hur/Ro ICEIC2025出版社版](https://ieeexplore.ieee.org/document/10879735) | 摘要、§I PDF1；§II PDF1–2；§III PDF2–3；§IV PDF3–4；§V、VI及References PDF4：正文全文及17条参考列表已读。Fig.1–5、Table I/II均逐页渲染查看；未见编号脚注。主会话直接读完四页；引用的外部原作未逐篇重读 | 4页，无印刷页码，按PDF1–4定位；SHA256 **05af455583149381544271946c6071a6ce9f21084bb569a786331fd0a477a076**；ARS 4/4/4、PASS，无告警；PDF原题为**SoCs**，元数据SaCs保留为检索别名 |
+
+以上是Codex的阅读与结构记录，不是用户本人已读标记；结构PASS不证明科学结论，图文矛盾见§5.3。这里只更新本报告，不改catalog、用户已读标记或原件。
+
 <a id="paper-matrix"></a>
 ## 2. 前作对比表
 
@@ -57,8 +69,8 @@
 | **Kurth等，Scalable and Efficient Virtual Memory Sharing in Heterogeneous SoCs with TLB Prefetching and MMU-Aware DMA Engine，ICCD2018**（局部、窗口外；[v1](https://arxiv.org/pdf/1808.09751v1)） | Zynq7045，ARM A9 host＋multi-cluster PMCA | hybrid/shared IOMMU、软件PTW；L1 32/L2 256（§V-A） | 指针追踪／stream；实验8笔在途、burst≤2 KiB（§V-B/D） | 实系统运行时间、walk／buffer成本 | **明确miss满会阻塞hit**；锁定限制多cluster DMA（§II(b)、§IV-C） | 预取、并行walk、DMA retry | 机制前史极近；本文只能主张固定标准实现的实板定量与诊断增量 |
 | **Hao等，Supporting Address Translation for Accelerator-Centric Architectures，HPCA2017**（局部；[作者稿](https://www.sfu.ca/~zhenman/files/C10-HPCA2017-ARA-Addr-Translation.pdf)） | x86 PARADE／多加速器DMA（§III） | 32项IOTLB基线及私有／共享TLB | tiling／double buffering、4 KiB页、64 outstanding/accelerator（§III） | 全系统仿真／理想翻译对照 | 私有和共享TLB已支持hit-under-miss（§IV-B/C） | 两级TLB、host MMU复用 | 非RISC-V FPGA；hit旁路不是新机制 |
 | **MASK，ASPLOS2018**（局部；[作者稿](https://ghose.cs.illinois.edu/papers/18asplos_mask.pdf)） | 多应用GPU，Mosaic/GPGPU-Sim（§6） | 共享TLB／PTW层级 | GPU kernels，非DMA COPY | 翻译／数据争用及模拟消融（§4–7） | 翻译与数据服务相互影响（§4.2/4.3） | fill tokens、cache bypass、PTE优先和应用感知DRAM调度（§5.2–5.4） | 控制点不同；资源控制与协同思路不属本文首创 |
-| **Zhao等，Performance optimization and research of data center-level IOMMU based on RISC-V，Procedia2025**（**仅摘要**；[出版社](https://www.sciencedirect.com/science/article/pii/S1877050925024263)） | 摘要：UVM、BC-Linux／Panshi DPU4.0 | distributed IOATC、Walk Cache IOATS（摘要） | 独立设备数、并发供给及干扰对照未核；索引中的IOATC数量表不是已核正文（§5.3） | 摘要称仿真／网络测试；续查仍未取得正文 | 不以摘要／索引数值作正式对照 | 摘要称结构优化，细节未核 | **最高优先级全文风险**；开放许可已核不等于全文已取得，不能按分布式缓存排除同题，DOI10.1016/j.procs.2025.08.115 |
-| **Hur、Ro，Enhancing IOMMU Efficiency in Heterogeneous SaCs: A Study on Cache Policy Impacts，ICEIC2025**（**仅摘要**；[机构](https://yonsei.elsevierpure.com/en/publications/enhancing-iommu-efficiency-in-heterogeneous-sacs-a-study-on-cache/)；作者列表写SoCs，§5.3） | ISA／仿真或实机未核 | 机构Abstract明确多devices共享TLB | 独立DMA数、实际并发／工作集／大小未核 | 全文未得；作者公开列表没有该条PDF链接 | 机构Abstract讨论TLB／walk-cache替换与性能 | Abstract称adaptive policy，细节未核 | **高优先级未决**；不能由引用Arm／gem5等推定平台并排除，DOI10.1109/ICEIC64972.2025.10879735 |
+| **Zhao等，Performance optimization and research of data center-level IOMMU based on RISC-V，Procedia2025**（**全文**；[出版社](https://www.sciencedirect.com/science/article/pii/S1877050925024263)） | UVM 500MHz；四VU19P FPGA、BC-Linux、PCIe5.0／Panshi DPU4.0的网络验证（§5.1、5.3、5.5／PDF8–12） | 基于RISC-V v1.0.0的自研分布式IOATC，各有uTLB／MTLB，经DTI共享单IOATS／Walk Cache（§2–4／PDF3–7） | IOATC_NUM=1/2/4；容量4KB、12KB、128KB、512KB、1MB；4KB页、每端256bit、VIP读100ns／写40ns。独立DMA实例、每端／合计字节分配及单笔burst未报告（§5.3／PDF9）。网络为ping比较（Fig.14） | UVM波形、搬运耗时Table 1／Fig.9（ns），网络ping RTT；未报告每端miss／等待分解（§5／PDF8–12） | 模块增加时搬运时间近反比，作者称并行服务无额外延迟；网络RTT 33.889→13.068ms（§5.3、5.5）；不是本文V受干扰慢化 | 实评分布式扩展、Walk Cache及网络直通方案；未给P/PN或失效范围干扰矩阵（§5） | **标准RISC-V共享翻译的直接多端性能前作，部分重叠。** 未报告本文固定控制器／固定V的零miss共跑控制、他人PTW→V hit等待干预；独立DMA与工作量核账细节unknown，不能断言其无并发 |
+| **Hur、Ro，Enhancing IOMMU Efficiency in Heterogeneous SoCs: A Study on Cache Policy Impacts，ICEIC2025**（**全文**；[IEEE](https://ieeexplore.ieee.org/document/10879735)；元数据别名SaCs） | ChampSim四发射OoO＋DRAMSim3，CPU按RISC-V配置；IOMMU取gem5 v24.0 SMMU模型（§III／PDF2） | 共享IOTLB，main 2048项4-way、micro 32项；16 PTW slots，S1/S2 Walk Cache（Table II／PDF2），未报告标准RISC-V IOMMU RTL | 1/2/4/8 clients实际并发混合GraphBig／GUPS／XSBench；每段500M指令，全部DRAM访问经IOMMU。单笔DMA传输大小／DMA engine未报告；16B是端口宽度（§III–IV、Table II／PDF2–3） | client IPC相对non-IOMMU归一化、总访存次数、混合负载箱线图（Fig.2–5／PDF3–4） | 共享client数量／访问模式与策略改变IPC及访存；Fig.2 IPC为无IOMMU的66.8%–99.6%，不是纯共跑慢化比例（§IV） | LRU／FIFO／LFU／SIEVE与作者称ARC的在线策略；partition＋adaptive留作未来（§IV／PDF3–4） | **多客户端共享翻译并发／策略的直接前作，部分重叠。** RISC-V CPU配置与SMMU模型须分别注明；未报告真实多DMA FPGA、零miss共跑基线、PTW响应干预、P/PN／CQ范围矩阵（§III–V） |
 | **王镇道等，基于RISC-V的IOMMU设计，2024**（**仅摘要**；[出版社](https://cjournal.hep.com.cn/1674-2974/CN/10.16339/j.cnki.hdxbzkb.2024238)） | RISC-V，具体平台未核 | 摘要为I/O虚拟化IP | 未核 | 全文登录／验证码，未得 | 仅确认设计／效率主题 | 未核 | Procedia所引近邻，未排除并发评估；51(6):187–194 |
 | **Kumar等，Rethinking IOMMU for Future IO Devices，YArch2025**（**仅摘要／题录**；[机构](https://infoscience.epfl.ch/entities/publication/6366166d-7142-457b-b340-8df795675d9f)） | ISA／实验未核 | 摘要提出VMA粒度集中式IOVLB | 未核 | 机构PDF429/405 | 只确认覆盖率／安全设计提案 | 未核 | 机制近邻，不能把索引局部正文当全文实验结论 |
 | **Han、Ro，FBI: Framework for Efficient Batching of IOMMU TLB Invalidations，ICEIC2025议程**（**仅题录**；[公开议程](https://lab.hanbat.ac.kr/powervision/conferences/document/3118/download)） | 未核 | 未核 | 未核 | Jan21 PS5/03，PDF27/印刷94 | 题名不能补造结果 | 未核 | 合批失效已有具名条目；未见摘要／正文，不能认定已覆盖本文矩阵 |
@@ -171,31 +183,42 @@ Kurth2018 §II(b)明确描述outstanding-miss／数据缓冲满时，后续即�
 ANDARE2018 HERO是同族另一篇文章；其§4.1实际评估ARM A9 host＋单8核cluster，L1 32／L2 1024项hybrid MMU，不与2017多cluster或ICCD2018的L2 256项混写。正式PDF结构预检有xref覆盖告警，状态UNAVAILABLE，仅采用章节锚。[机构原文§2、§3.4、§4.1–4.2](https://www.research-collection.ethz.ch/server/api/core/bitstreams/f62fdb50-8f38-4ee9-bd84-ead60430dd70/content)
 
 <a id="procedia-hur-followup"></a>
-### 5.3 Procedia与Hur/Ro：定向续查后的具体未决项
+### 5.3 Procedia与Hur/Ro：两项全文未决已解除，均须正面讨论
 
-**本轮未取得两篇可逐页核读的全文，不作“已排除同题”判断。** 2026-10-17新增检索覆盖作者、机构、会议材料、公开工件及原生OA位置；合法公开入口的获取结果详见§8.5。开放获取元数据、搜索索引正文片段、另一份讲稿和完整论文是不同层次的证据。
+两篇现已按用户提供的出版社PDF全文核读，身份与覆盖见§1；早先公开渠道未取得全文的记录仍保留在§8.5。这里的“未报告”是已核原文的信息边界，不能改写成该实现不支持并发或作者没有做过其他运行。以下比较承认共享翻译和并发性能的实质重叠，不以仿真、分布式结构或V/A命名差异排除前作。
 
-| 同题判定所需内容 | Procedia2025 | Hur/Ro2025 |
+#### Procedia2025：RISC-V共享IOATS的多端并行性能前作
+
+**原文已确认的架构。** 多个IOATC各有uTLB／MTLB，经DTI连接单个IOATS；命中从本地IOATC输出IOPA，miss进入共享IOATS的requester FIFO／req slot，再使用Config Cache、Walk Cache与PTW。作者给出PLRU、不同AXI ID写数据旁路、inv／sync及PMU结构。共享服务与局部命中路径已经是设计内容，不能称本文首次想到分离翻译服务、缓存或内部观测。[§2–4，PDF3–7／印刷925–929，Fig.2–6](https://doi.org/10.1016/j.procs.2025.08.115)
+
+| 所核实验 | 原文条件与结果 | 与本文同条件干扰证据的差别 |
 |---|---|---|
-| RISC-V IOMMU及共享翻译结构 | 出版社Abstract确认RISC-V、distributed IOATC与Walk Cache IOATS；共享组织的原图／配置未核 | 机构Abstract确认多设备共享TLB；ISA与具体翻译结构未报告于摘要 |
-| 多个独立DMA流实际同时供给 | 未核。IOATC数量不自动等于独立DMA数，接线支持并发也不自动等于实验并发 | 未核。摘要的multiple devices是问题背景，不能据此补出实际并发设备数 |
-| 并发共享相对基线的争用影响 | 未核。须辨别固定总工作量的分摊／扩展效率、每流服务时间和共享IOATS排队 | 未核。须取得负载混合、替换策略比较及独立设备的指标／对照 |
-| 可直接比较的干扰或缓解结果 | 摘要不能回答零miss邻居、他人PTW、数据访存竞争控制和失效范围 | 摘要称自适应缓存策略可缓解性能下降；未核其覆盖哪种竞争与缓解 |
-| 全文／关键图表阅读状态 | **仅摘要**；未取得原PDF，未给原论文SHA或声称结构PASS | **仅摘要**；未取得原PDF，未给原论文SHA或声称结构PASS |
+| hit／miss路径波形 | §5.1：500MHz UVM，a→b地址翻译段372ns，c→d响应段3694ns；§5.2称同页uTLB命中4周期／8ns | 已有内部波形及翻译成本诊断；没有在这些波形中给出“指定A的PTW响应延长→另一端首次hit的V等待”干预。两个时间段也不能互换为同一种PTW或完整DMA成本（PDF8–9／930–931，Fig.7/8） |
+| 多IOATC并行扩展 | §5.3：1/2/4 IOATC，500MHz，VIP Slave读100ns／写40ns，每端256bit、4KB页；容量4KB、12KB、128KB、512KB、1MB。4KB行时间19370／10104／5273；Table 1未标单位，Fig.9纵轴明确为ns | **接受其多端并行性能评估**，不能再说只测单设备。正文未报告独立DMA engine数、供给时间线、每端／合计工作量划分、地址复用、hit/miss率或每端等待；无法补成固定V／A的受干扰矩阵（PDF9／931，Table 1、Fig.9） |
+| Walk Cache优化 | PDF10未编号评价段：比较同一2MB内不同4KB地址；每次访存1周期假设下，Table 2列SV39为3→2、SV48为4→2、两级模式15→4或24→5；Fig.12轴为访问次数 | 是页表缓存效率／访存次数比较，不是多设备争用归因；不能用这些数字直接当完整DMA吞吐改善（PDF10–11／932–933，Fig.10–12、Table 2） |
+| FPGA网络验证 | §5.5：四VU19P、BC-Linux、PCIe5.0／Panshi DPU4.0，Guest直通NIC1；Fig.14是ping，显示56 data bytes／64-byte回复，平均RTT 33.889→13.068ms，作者报2.6倍 | 软件Virtio-Net与硬件直通的网络路径比较；没有固定邻居翻译压力扫描、每DMA吞吐／miss／等待矩阵。ping字节数不等于底层DMA单笔大小（PDF11–12／933–934，Fig.13/14） |
 
-表内摘要事实分别来自[Procedia出版社Abstract](https://www.sciencedirect.com/science/article/pii/S1877050925024263)、[Yonsei机构Abstract](https://yonsei.elsevierpure.com/en/publications/enhancing-iommu-efficiency-in-heterogeneous-sacs-a-study-on-cache/)，其余单元格是本次核查状态，不是论文不存在相应实验的结论。
+上表原文事实均定位于[§5，PDF8–12／印刷930–934](https://doi.org/10.1016/j.procs.2025.08.115)。Fig.4中存在PMU不代表§5已用其给出每DMA统计；正文没有报告这一组计数。
 
-**Procedia的新增线索及边界。** 出版商API的`coredata`明确标开放获取及CC-BY-NC-ND 4.0，但本次取得的1951字节XML没有正文；`view=FULL`返回401。OpenAlex该DOI记录仅有DOI落地页、`pdf_url=null`，这是索引状态，不能扩大为全网无全文。[出版商元数据](https://api.elsevier.com/content/article/pii/S1877050925024263)、[OpenAlex位置字段](https://api.openalex.org/works/https://doi.org/10.1016/j.procs.2025.08.115)
+**“并行无额外延迟”的适用范围。** §5.3将搬运时间随IOATC数近反比解释为IOATS可并行服务而不引入额外延迟；本报告保留这一具名实验结论。由设置可进一步推断：扩展数量时，私有缓存实例和名义端口能力也一起变化（每端256bit）；所以时间下降不能单独归因于共享IOATS消除了竞争，更不能推出任意miss压力下固定邻居无干扰。论文没有交代容量行是总工作量还是每端工作量，也没有用PTW服务压力与数据竞争的对照来检验这个更强命题。**这不否定其并行实验，也不把缺少复现细节当成“无并发”的证据。**[§5.3，PDF9／931，Table 1、Fig.9](https://doi.org/10.1016/j.procs.2025.08.115)
 
-Scribd搜索索引露出自称§5.3／Table 1的IOATC_NUM=1/2/4及并行服务描述；**这是未核镜像的索引提示，不是已核原文实验**。正常页面只取得描述、13页占位及订阅入口，没有取得可逐页核验的表图。本笔记不采纳其中时间、大小、时钟或“无额外延迟”作为正式比较值，也不由片段推定该文只有单设备。[公开索引入口](https://www.scribd.com/document/1046293233/基於RISC-V的資料中心級IOMMU性能優化及研究)
+**图文／计时口径须保留。** §5.2正文写4周期／8ns，但Fig.8的a→b仍标372ns，不能默改原图或把“近50倍”作为无争议硬件测量。PDF10正文新地址为0x7_fff0_1000，Fig.11气泡仍为0x7_fff0_0000。Table 2在“每访存一周期”假设下列周期，Fig.12纵轴是访问次数，caption的“Increases”又与柱图减少方向不协调；摘要约30%的表述不能直接替代这些口径。§5.5的2.6倍来自ping RTT；这些都不是本文共跑吞吐的同口径比值。[摘要PDF1、§5.1–5.3 PDF8–9、Walk Cache段及§5.5 PDF10–12](https://doi.org/10.1016/j.procs.2025.08.115)
 
-作者报告追查找到赵顺通的openEuler官方活动回顾及其材料仓库线索；相关RVSC2024公开材料另取得郑律的X100讲稿。**该讲稿不是Procedia论文**：其PDF13页可见DMA／PCIe端经DTI连接IOATS，IOATC的数据地址走System Bus；只核该图，不能把其配置或实验移植给Procedia。[openEuler回顾“赵顺通”段及材料入口](https://www.openeuler.org/zh/news/openEuler/20241220-meetuop/20241220-meetuop.html)、[X100讲稿PDF第13页](https://github.com/cnrv/RVSC2024/blob/main/slides/0822A/029-%E9%83%91%E5%BE%8B.pdf)
+**分类：直接部分重叠，不能作为已排除的“无多端前作”。** 已有标准RISC-V IOMMU族的共享IOATS多端扩展与RTL仿真波形；但所读§5没有本文固定硬件／固定V下的零miss共跑基线、V首次hit受他人PTW影响的受控局部证据或P/PN组合代价。本文的增量由这些具体观测和控制支撑，不由更换FPGA或“是否开源”字样支撑。[§2–5，尤其§5.1–5.3](https://doi.org/10.1016/j.procs.2025.08.115)
 
-**Hur/Ro的新增线索及边界。** 作者实验室公开列表的ICEIC2025条目写作“Enhancing IOMMU Efficiency in Heterogeneous **SoCs**”；Crossref／Yonsei题录为“**SaCs**”，按同作者、同会场、同题名其余部分合并检索，保留拼写差异。该作者条目未附有效PDF／slides链接，机构“Access to Document”只有DOI。[作者列表2025条目](http://escal.yonsei.ac.kr/publications.html)、[机构题录及Abstract](https://yonsei.elsevierpure.com/en/publications/enhancing-iommu-efficiency-in-heterogeneous-sacs-a-study-on-cache/)
+#### Hur/Ro2025：多客户端并发、共享IOTLB和策略评价已有实证
 
-Crossref参考文献元数据包含Arm MMU-700／SMMUv3、ChampSim、gem5、XSBench等线索；**引用不能证明被测ISA、模拟器或并发负载**，不能据此判成Arm而排除RISC-V。[Crossref该DOI的`reference`字段](https://api.crossref.org/works/10.1109/ICEIC64972.2025.10879735)
+**平台已能从原文确定。** §III使用ChampSim的四发射OoO、DRAMSim3，并说处理器采用参考[6]的RISC-V配置；IOMMU使用gem5 v24.0提供的SMMU模型。Table II列main TLB 2048项／4-way、micro TLB 32项、16 PTW slots及S1/S2 Walk Cache。这里不是“从参考文献猜ISA”：正文确有RISC-V配置和SMMU模型两项陈述；也没有报告标准RISC-V IOMMU RTL或zero-day-labs实现。因此不能归为纯Arm而忽略，更不能称已完成标准RISC-V IOMMU的多DMA FPGA实验。[§III、Table I/II，PDF2](https://ieeexplore.ieee.org/document/10879735)
 
-**对最终裁决的影响。** 私有IOATC不排除共享IOATS／PTW竞争，PCIe等设备的独立请求流也不因未用iDMA而排除；不要求论文使用victim/aggressor名称。若全文证实实际并发共享翻译资源并评价争用影响，即按同题／实质重叠重新比较，不能靠分布式结构、仿真或平台不同规避。若原文只评价缓存命中成本或模块数量扩展，则该结果仍是性能前作，是否覆盖本文干扰问题须由供给、工作量和指标决定。**现阶段两种情况均未被全文裁定，故G2保持待补核；候选新意1与3尤须保留这两篇的覆盖风险，不能保证其未做候选新意2的内部诊断。**
+**实际并发已被确认。** 每段500M指令，GraphBig的BFS／DC／DFS／SSSP／PR／CC、GUPS与XSBench组成1/2/4/8-client配置；作者假设全部DRAM访问经IOMMU。§IV明确同时运行的混合负载；Fig.4的索引1为单client、2–9为两client、10–11为四client、12–13为八client。正文称覆盖各种组合，但没有逐个列出四／八client混合及供给的完整对应表；也未报告真实DMA engine、DMA descriptor或COPY任务的传输字节数。**16B是Table II端口宽度，不能当作16B DMA payload。**[§III–IV，PDF2–3，Fig.2/4](https://ieeexplore.ieee.org/document/10879735)
+
+**它量了什么。** Fig.2／5为client IPC相对non-IOMMU模型归一化的箱线图；Fig.3／4为相对non-IOMMU的总访存次数。Fig.2标min 66.8%、max 99.6%，正文说部分工作负载中位IPC降约13%、DFS最大约34%；这些比较包含IOMMU开销及不同组合，不能改成“单client到八client纯干扰下降34%”。该文已把client数量、并发访问模式和共享IOTLB性能联系起来，不能说它只有单client平均性能或只提出问题没有并发评估。[§IV，PDF3–4，Fig.2–5](https://ieeexplore.ieee.org/document/10879735)
+
+**缓解评价已存在。** 作者实评LRU、FIFO、LFU、SIEVE，并用IOTLB miss rate监控在LRU／FIFO／SIEVE间选择的策略（文中称ARC）改善IPC分布，同时承认这种竞赛式实现的可行性问题。将adaptive策略与client间IOTLB partitioning组合是§IV结尾的future work；不能把这句话写成已实评分区组合，也不能反过来声称它未评任何缓解。[§IV，PDF3–4，Fig.3–5](https://ieeexplore.ieee.org/document/10879735)
+
+**具体差项与分类。** 所读§III–V未给本文的固定V／A工作集与零miss共跑基线，没有分段反压／等待计数或对一个A侧PTW响应施加有界延长的波形干预，也没有P与PN、限速对A侧代价或CQ失效范围矩阵。它是多client共享翻译并发／缓存策略的**直接部分重叠前作**；模型与板测的差异是证据性质，真正可主张的增量仍是本文具体控制和诊断链，而非把仿真研究从同题范围删掉。[§III–V，PDF2–4](https://ieeexplore.ieee.org/document/10879735)
+
+**两篇对G2的共同约束。** 不能再写“未发现RISC-V系统多客户端共享翻译性能研究”；也不能把“公开检索没取得”留作它们的当前状态。更窄的问题——固定开源标准实现上，多真实DMA的零miss邻居为何受他人PTW拖慢，以及具体缓解组合／失效范围的代价——在这两篇所读原文中没有本文同类证据链。因此§7保留四项限定贡献，并将G2改为有条件通过；其他摘要级候选、运行身份未知及统计／仿真边界继续明列，不作领域级首次保证。
 
 <a id="comparison"></a>
 ## 6. 本文可成立的具体差异及当前证据边界
@@ -230,26 +253,28 @@ Solo→A1中双方miss为0，V已明显变慢；Solo→A64的全部损失因此�
 <a id="novelty-claims"></a>
 ## 7. 可以合法主张的新意与不能主张的点
 
-以下四项是**限定范围的候选贡献表述**，有已核原文差项和本项目证据支撑；尚未取得全文的近邻不在已排除集合内。不使用领域级首次，也不把待统一复测的数据写成已完成。
+两篇新增全文现在均纳入最近前作比较，而非排除集合。以下四项是**相对已核原文、限定实现和负载的具体刻画增量**；成立依据是控制与观测的差项，不是更换ISA／FPGA或首次发现共享翻译。其他仅摘要近邻仍保留风险，不使用领域级首次，不把待统一复测的数据写成完成。
 
 | 可写的具体增量 | 最近前作的具体缺项／已有内容 | 本文证据与条件 |
 |---|---|---|
-| 1. 固定标准开源IOMMU中，持续并发4 KiB批量DMA的总慢化、零miss共跑基线与翻译压力增量的定量刻画 | 硕论§6.3.2为缓存／平均latency、关联bench逐笔等待；Bermuda§IV-C的4 KiB近汇合；DATE§IV为应用及host噪声。已核评估没有本文这组同条件数据链 | 批量＋路径报告；不能把总损失全归PTW，也不能认领“首次分离翻译与内存竞争”；仍待§5.3两项全文核实；不能保证它们未覆盖此增量 |
-| 2. 本控制器中A的具名S1 PTW响应延长如何传导到一个随后首次命中的V read的局部实板证据 | Bermuda§III–V、DATE§III–IV未采用此有界逐请求响应干预；但HERO§3.4／Kurth§II(b)已知可见性和hit-under-miss／阻塞，故不是新现象 | E3§3–5，64 B、cold互补对n=4，A剩余服务与V剩余等待增量127–130周期；不解释全部宏观慢化或构成通用HOL定理 |
-| 3. 同一硬件路径普通缓解的条件性取舍：等A miss计数下PN仍比P慢，并记录保护V的A侧代价 | Bermuda§V-C未实验评价其候选；DATE§IV评LLC与DMA数据绕cache；MASK§5已有翻译／数据协同，故不认领组合思想或“组合会冲突”的普遍认识 | P/PN§3–4与P4M§6；PN n=3为描述性负结果，两套试验不能拼成统一完整矩阵，唯一根因未定 |
-| 4. 特定RISC-V失效范围／驱动行为下，邻居miss与双方完整时间代价的量化 | Bermuda§IV、DATE§IV未评这类CQ失效范围矩阵；IEICE§5.5明确将global invalidation pressure置于范围外；FBI及其他失效近邻未全文排除 | 失效28配置仿真；相对M0/M1、同／异域分别报walk与双方时间，不能认领收窄／合批方法首创，不能冒充Linux实板 |
+| 1. 固定控制器与V任务，持续并发4KiB批量DMA下，量化零miss共跑损失与额外翻译压力增量 | **Procedia§5.3／PDF9**改变IOATC数量，未定义每端／合计工作量，未给固定邻居压力对照；**Hur/Ro§III–IV／PDF2–3**有1/2/4/8-client混合及non-IOMMU基线，未给本项目的A零miss共跑控制；Bermuda§IV-C已分离开关翻译并测payload，不能认领首次分离翻译／内存竞争 | 批量＋路径报告：同硬件同V任务，Solo→A1→A8/A64；总损失不全是PTW，A1→A8也不能完整拆成纯PTW占比。贡献是这组有边界的数据链与适用条件 |
+| 2. 在本控制器中，对一个A侧S1 PTW响应作有界延长，关联其与随后首次hit的V read等待增量 | **Procedia§5.1–5.2／Fig.7/8**已有单请求hit/miss内部波形，未做跨源具名响应干预；**Hur/Ro§IV／Fig.2–5**量IPC／访存分布，未报告这种内部因果链；Bermuda／DATE所核评估也无该干预；HERO／Kurth已知可见性、hit-under-miss及阻塞 | E3§3–5：64B、cold互补对n=4，A剩余服务与V剩余等待增量同为127–130周期；是局部实板诊断，不能解释全部宏观慢化或声称新HOL现象 |
+| 3. 同一路径普通缓解的具体取舍：记录保护V的A侧代价，以及等A miss计数下PN仍比P慢的组合负结果 | **Procedia§5**评结构扩展／Walk Cache／网络直通，未给该组合对照；**Hur/Ro§IV／PDF3–4**已评自适应策略，但与IOTLB分区组合明确为future work，未评本文P/PN与限速代价；MASK已有翻译／数据协同，Bermuda§V-C讨论候选 | P/PN§3–4与P4M§6：PN慢12.67%–12.79%、n=3；等miss不等服务，唯一根因未定；P4M与P/PN不能拼成同一完整矩阵。只主张本实例负结果与双方代价，不认领组合思想首创 |
+| 4. 特定RISC-V CQ失效范围下，量化邻居miss与双方完整时间的代价 | **Procedia§3–4／PDF5–6**已有inv／sync结构，但§5未评范围干扰；**Hur/Ro§II／PDF2**讨论失效背景，但§IV未给CQ范围矩阵；Bermuda／DATE未评本文矩阵，IEICE§5.5明确置global invalidation pressure于范围外；FBI等失效近邻未全文排除 | 失效28配置仿真，分别报同／异域及双方时间；不能认领收窄或合批方法首创，不能冒充Linux板测，不能泛化到当前主线驱动 |
+
+表中新增前作定位对应[Procedia全文§3–5](https://doi.org/10.1016/j.procs.2025.08.115)、[Hur/Ro全文§II–IV](https://ieeexplore.ieee.org/document/10879735)。本文原始证据入口及限制见§6；本轮没有运行实验。
 
 **不能主张：**
 
-1. 首次RISC-V FPGA IOMMU集成、多iDMA或翻译性能评价：硕论§6、DATE§III–IV、DMAAUTH§6.1／§7.2、IEICE§3–5已有相应证据。
-2. 首次发现多设备共享翻译干扰、hit可能被他人miss拖住：Bermuda§IV、硕论§7.1、Kurth2018§II(b)、HERO2017§3.4均有直接边界。
-3. 首创分区、限速、hit-under-miss、PTE优先或翻译／数据协同：Bermuda§V-C已有候选，Hao2017§IV-B/C有hit-under-miss，MASK§5.2–5.4有资源控制与调度。本文N和DATE的数据绕LLC也不是同一种bypass。
-4. 首次多加速器共享翻译／隔离性能研究：ShareMMU§V–VII构成明确反例；只能继续比较具体实现、条件、观测和代价。
-5. “4 KiB可摊薄一切翻译干扰”、证明Bermuda错误、或RISC-V架构必然HOL：均超出两边已核配置。
-6. DS优先级改善纯PTW成本44.7%→10.5%、等miss即等服务、失效仿真即Linux板测、保护V无A代价：均超出现有原始报告。
+1. 首次RISC-V FPGA IOMMU集成、多iDMA或翻译性能评价：硕论§6、DATE§III–IV、DMAAUTH§6.1／§7.2、IEICE§3–5及Procedia§5.5已有相应证据。
+2. 首次研究RISC-V系统多客户端共享翻译性能／干扰，或首个多端共享翻译服务器评价：Procedia§2／§5.3已有标准RISC-V共享IOATS并行评价；Hur/Ro§III–IV已有RISC-V CPU配置＋SMMU模型的多client并发与策略实验。不能把“仿真”或没有iDMA命名当成排除理由。
+3. 首次发现共享翻译干扰或hit受他人miss拖慢，首次内部波形：Bermuda§IV、硕论§7.1、Kurth2018§II(b)、HERO2017§3.4，以及Procedia§5.1–5.2已给相应问题、机制或观测前史；本项目只补固定实现中的具名依赖链。
+4. 首创分区、限速、hit-under-miss、PTE优先、翻译／数据协同或IOMMU自适应缓存缓解：Bermuda§V-C、Hao2017§IV-B/C、MASK§5.2–5.4、Hur/Ro§IV已有相应内容。DATE的数据绕LLC、Procedia的写数据旁路也不能直接认成本文N。
+5. 首次多加速器共享翻译／隔离性能研究：ShareMMU§V–VII已构成明确反例；只能比较具体实现、控制、观测和代价。
+6. “4KiB可摊薄一切翻译干扰”、推翻Bermuda、推翻Procedia的所有并行结果、或RISC-V架构必然HOL：均超出已核配置。Procedia“无额外延迟”也不能扩大为其评估之外的普遍保证。
+7. DS优先级改善纯PTW成本44.7%→10.5%、等miss即等服务、失效仿真即Linux板测、保护V无A代价：均超出现有原始报告。
 
-**建议定位句：** 本文在一个固定、公开的RISC-V IOMMU实现上，对持续并发DMA进行FPGA刻画；结合零miss共跑基线、分段观测与具名请求干预，说明翻译活动怎样影响邻居命中请求，并报告普通缓解组合及失效范围的条件性取舍。贡献是经验证的新实测认识与适用边界，不是新IOMMU或新的通用隔离机制。
-
+**建议定位句：** 本文在固定、公开的RISC-V IOMMU实现上，对持续并发DMA作FPGA刻画；以零miss共跑基线、分段观测和具名请求干预，量化翻译活动对邻居命中请求的影响，并报告普通缓解组合及失效范围的条件性代价。与既有多端扩展／多client策略研究相比，增量是可追溯的控制、局部因果证据及本实现的量化适用边界。
 
 <a id="search-record"></a>
 ## 8. 检索记录
@@ -542,9 +567,9 @@ site:dac.com IOMMU RISC-V 2024 2025 2026
 "IOMMU" "Real-Time and Embedded Technology and Applications" contention
 ~~~
 
-### 8.5 本次定向续查：公开全文获取记录（2026-10-17，JST）
+### 8.5 全文取得前的定向续查记录（2026-10-17，JST；历史）
 
-本次只续查Procedia与Hur/Ro的正文及可确定其并发方法的公开材料。新增66条外部网页索引查询（Procedia28、Hur/Ro28、主会话10，重复保留），不是66次数据库站内检索，也不重写§8.4的既有记录。中文／韩文人名变体仅为检索字符串，不据猜测确认身份。所有新来源均按实际取得内容降级；没有取得这两篇的正文、原始PDF或可核实验工件，没有新增“全文已读”标记。
+**本节保留用户提供PDF之前的真实获取状态；当前全文覆盖与裁决以§1、§5.3、§8.6为准。** 当时只续查Procedia与Hur/Ro的正文及可确定其并发方法的公开材料。新增66条外部网页索引查询（Procedia28、Hur/Ro28、主会话10，重复保留），不是66次数据库站内检索，也不重写§8.4的既有记录。中文／韩文人名变体仅为检索字符串，不据猜测确认身份。这些渠道当时没有取得两篇正文、原始PDF或可核实验工件，当时没有新增“全文已读”标记；后来的用户附件和核读没有倒改早先访问结果。
 
 | 实际公开渠道／入口 | 本次获取结果与阅读范围 | 可用于本次裁决的边界 |
 |---|---|---|
@@ -644,16 +669,32 @@ site:yonsei.ac.kr "Cache Policy Impacts"
 "Performance optimization and research of data center-level IOMMU" "5.2."
 ~~~
 
+### 8.6 用户提供全文后的核读与裁决更新（2026-10-17，JST）
+
+**实际来源改变：** 用户在本会话提供两份出版社PDF，文件名分别为1-s2.0-S1877050925024263-main.pdf及Enhancing_IOMMU_Efficiency_in_Heterogeneous_SaCs_A_Study_on_Cache_Policy_Impacts.pdf。读取的是附件本身，不是搜索索引、辅助讲稿或相似题名论文。本次没有新增网络检索；原检索截止日与覆盖边界不扩大，全文获取方式新增“用户提供”。原PDF没有复制到公开仓库，本文保留DOI、精确页序、哈希与所采用事实，方便以后定位同版。
+
+| 项目 | 本次实际执行 | 当前接受状态 |
+|---|---|---|
+| 结构与身份 | 两份原件先做ARS结构预检：Procedia 13/13/13、Hur/Ro 4/4/4，均PASS且无告警；SHA256完整值见§1 | 可使用各自PDF页锚；不借用旧稿、讲稿或另一篇的预检 |
+| Procedia全文 | 子任务读完13页所有正文／脚注／参考列表，逐图查看Fig.1–14及两表；主会话也直接读完正文，核架构、波形、Table 1／Fig.9、Walk Cache及网络图（读域细表见§1） | §5.3多IOATC并行评价确认；独立DMA数、供给／字节划分与固定邻居干扰控制未报告，归为直接部分重叠 |
+| Hur/Ro全文 | 主会话读完4页全部正文及17项参考列表，逐页渲染核Fig.1–5、Table I/II | RISC-V CPU配置、gem5 v24.0 SMMU模型、实际多client并发、策略实验及partition组合future work确认；归为直接部分重叠 |
+| 数字／版本纠正 | Procedia时间单位由Fig.9核为ns，保留Fig.8的372ns与正文8ns冲突；Hur/Ro正文题名确为SoCs，SaCs保留作元数据检索别名 | 只采用定位清楚且口径注明的数值；不默改图，不把端口宽度当DMA大小，不把IPC或ping RTT换成本文吞吐 |
+| G2裁决 | 对两篇原文的实验自变量、观测与本文§6的控制／干预逐项比较，重写§7 | 由缺全文待核转为**有条件通过**；通过依赖具体刻画增量，不依赖“未搜到同题”或“只换FPGA” |
+
+新阅读没有给用户本人增加已读标记，也没有把两篇参考列表的浏览升级成外部原作逐篇全文核查。全文所未报告的复现参数继续写unknown／未报告，区别于已经解除的“我们尚无全文”。
+
+**证据接受后的变化。** 保留§8.5的访问失败收据，当前§1、§2、§5.3、§7、§9均使用完整原文状态；两篇不再列作“仅摘要”或“待取得全文”。其他摘要级候选、Bermuda／DATE版本口径和本项目历史运行／仿真限制原样保留。核读与文档完成不启动新实验或改变其他任务。
+
 <a id="open-items"></a>
 ## 9. 未决项与裁决适用范围
 
-1. **本轮续查后仍未决：** Procedia2025的独立DMA流、共享IOATS细部、实际并发供给与争用对照；Hur/Ro2025的ISA、独立设备／供给及缓存策略实验矩阵（§5.3）。新增渠道没有取得两篇正文，不能写成已全文排除；G2保持待补核，不给无条件通过。解除这两项未决需可核原文的方法与结果，不能由访问失败、他文结构或参考文献代替。中文2024设计、YArch提案仍缺可验全文；这些是具名缺口，不是无限新增文献门槛。
+1. **两项高优先全文缺口已解除：** Procedia与Hur/Ro已全文核读并列为直接部分重叠前作（§5.3）。Procedia的独立DMA数、供给重叠及字节分配，Hur/Ro的真实DMA供给与混合完整对应表仍属原文未报告，不再称“全文未得”。中文2024设计、YArch提案等仍缺可验全文，继续保留风险；不把它们默认为已排除，也不将有条件通过扩大为领域级首次。
 2. 硕论Fig.6.31/32实际源码／配置unknown；公开bench串行有代码依据，不能替代论文所有运行。其同平台性能评价和共享争用认识必须引用。
 3. Bermuda Fig.8单位／频率／timer／重复数与出版版差异未解；DATE正式正文是否修复<2%及表格冲突未解。只引用实际读过的版本及一致结果。
 4. Wheel、HeroSDK、Penguin／2024验证talk等按阅读级别保留；缺全文不是排除依据。数据库访问限制尤其限制负面检索结论。
 5. G2只涵盖本次查询与原文；不保证投稿前无新稿，不替代数据验收或构成录用预测。新统一基线按它自己的证据判断，本任务不恢复机制门或新增实验。
-6. 本轮只核读论文／公开固定源码、检查历史报告并整理本文；无构建、仿真、上板或前作工件重跑，未修改其他仓库文件／历史原件。
+6. 本轮只核读论文／用户附件／公开固定源码、检查历史报告并整理本文；无构建、仿真、上板或前作工件重跑，只修改本报告，不修改其他仓库文件／历史原件。
 
-**AI辅助说明。** 本轮检索、核读、比较与整理由Codex主会话及有界Codex子任务完成；主会话直接核决定性原文、关键公开源码与引用的历史结果报告，负责接受判断和文档检查。未调用DeepSeek或Claude。历史实验作者／执行归因保留在各原报告；不将模型一致或用户已读标记当正确性证明。
+**AI辅助说明。** 本轮检索、核读、比较与整理由Codex主会话及有界Codex子任务完成；新增Procedia全文由子任务完整取证，主会话也直接阅读全文及决定性图表；Hur/Ro由主会话全文核读。主会话直接核决定性原文、关键公开源码与引用的历史结果报告，负责接受判断和文档检查。未调用DeepSeek或Claude。历史实验作者／执行归因保留在各原报告；不将模型一致或用户已读标记当正确性证明。
 
 **既有投稿口径附记。** 摘要2026-12-11 AoE、全文12-18 AoE，正文9页、IEEE双栏、双盲；AoE转JST分别为12-12、12-19的20:59。按[投稿页](https://ispass.org/2027/submission/)、[日期页](https://ispass.org/2027/dates/)、[CFP](https://ispass.org/2027/cfp/)最终要求执行。关联前作正常第三人称引用，实质AI使用按实际纳入内容披露；本文是含内部路径的工作笔记，不能原样充当匿名稿。
