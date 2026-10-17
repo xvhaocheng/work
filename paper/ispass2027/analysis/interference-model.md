@@ -175,3 +175,57 @@ python3 paper/ispass2027/analysis/scripts/interference_model_report.py
 稀疏 worktree 中 observer/RTL 核查可加 `--source-root /home/xvhaocheng/work` 读取原始保存副本；模型脚本默认读取自身所属 worktree 的 CSV。RTL 原冻结目录不随小型分析包复制，缺失时 verifier 会报缺失，不据此宣称原文已重新核验。上述依赖的实际版本、输入 SHA、固定随机数参数和输出 SHA 在 results.json 中记录；数值输出可复现，绝对路径/运行时版本字段可能随环境变化。
 
 [validation.json](interference-model-validation.json) 记录本轮接受检查：真实数值原始 pointer 回查、独立高精度闭式 OLS、bootstrap 数值对照、整格/整 DS 训练泄漏与身份负例、输入未改、实际 PDF 字体/尺寸核查。它是本轮检查记录，不是额外板测。源码证据的全量复核由 rtl_verify 脚本执行；完整 HPM/path 边界算术由 observer 脚本重建。所有论文可用数字及分析结果单独保存，没有改历史数据或报告。
+
+<!-- INTERFERENCE_MODEL_APPENDICES -->
+
+## 10. 追加审计：现有 observer 能否提供同硬件窗的遍历次数
+
+2026-10-18，ARS experiment-agent / validate；Verification Status: ANALYZED。**结论：主模型所用统一 DS0/25/50/100 的 200 次试次，没有采集 V 硬件窗内的 DS AR 握手计数，也没有采集按 A 归属的 S1/PTW 启动计数。** `shared_ar`、`shared_ar_wait`、`a_ar`、`a_aw` 和 path 计数均不能替换 Nsw。因此本轮没有硬件窗分母的新拟合、bootstrap 或留出结果；主模型与 d+2 修正模型的原有结果保留。
+
+本节只追加，不改动上文。审计从[逐实验总账的统一基线和 DS 扩展](../../../docs/experiment-ledger/README.md)定位实际 source/build manifest，再重新核读冻结 RTL 与字段导出链；不是从名字或旧摘要推断。完整路径、行号、原文、源 SHA256、全部字段库存与读取验证见 [observer 审计证据](interference-model-observer-audit.json)。结论限于这 200 个同基座试次；全表另有历史 `a_miss/a_lookup` 等字段，在本矩阵没有逐试次值，不能跨 BIT/版本补成四档模型的分母。
+
+### 10.1 真实接线与计数单位
+
+以实际冻结目录 `iommu-platform/out/ispass2027-20261017-ds0-01/src/cva6/corev_apu/fpga/src/` 为下表路径前缀。三份关键文件（peripherals、observer、path observer）在四档构建中共 12 项逐字节核对，均匹配相应真实 build manifest 的 `sources` 与固定 source overlay。
+
+| CSV / 原始字段 | 槽位与真实 RTL 定义 | 为何不能作为 DS/PTE 或遍历次数 |
+| --- | --- | --- |
+| `a_ar`、`a_aw` | slot20/21；`active && axi_dma_tr[aggressor].ARVALID && ARREADY`，AW 同理；peripherals:912–917，dma_observer.sv:178–179 | DMA mux **之前**的 A 数据请求握手；命中和 miss 都经过，不是 PTE 读/写 |
+| `a_ar_wait`、`a_aw_wait` | slot24/25；同一私有口 `active && VALID && !READY`；observer:182–183 | 逐周期入口反压；一个请求可贡献多个周期，不是事件次数 |
+| `shared_ar`、`shared_aw` | slot26/27；`active && axi_iommu_tr_req.ar_valid && axi_iommu_tr_resp.ar_ready`；peripherals:936–939，observer:186–187 | DMA mux **之后**、IOMMU **未翻译 TR 入口**的合并握手，包含 V 和 A；DS 端口不在此处 |
+| `shared_ar_wait`、`shared_aw_wait` | slot28/29；同一 TR 口 `active && VALID && !READY`；observer:188–189 | TR 入口停顿周期，不是 DS AR 接受数，也不是 PTW 启动 |
+| `a_rlast/a_b`、`v_rlast/v_b`，`a_start/a_end` 等 | 数据通路响应及各私有 TR 口在途库存；observer:123–145、175–188、201–202 | 描述数据 burst 的完成/跨窗状态，不能给出 PTW 的启动或跨窗库存 |
+| path stage0–3 的 `entered/full/carry/start/end/sum/area` 与 CSV 派生 mean/max | 私有 TR 首 VALID → 合并 TR 握手 → COMP 首 VALID → COMP 握手 → COMP RLAST/B；peripherals:940–946，dma_path_observer.sv:132–136 | 全链只看 TR/COMP 数据请求；内部阶段时长可受翻译影响，但没有暴露 PTW 启动点或 PTE AR 事件 |
+
+真正的 `axi_iommu_ds_req/resp` 在 peripherals:1093–1128 独立连接 DS delayer/直连分支，在 :1178–1179 接 IOMMU DS 口；observer 实例 :924–947 没有连接该信号，也没有 PTW/HPM 事件输入。核查了完整 observer/path 端口列表与所有基础计数槽，不存在未被 CSV 名字显露的 DS 计数。
+
+导出链也没有将 DS 数藏在 `shared` 中：冻结驱动 `drivers/misc/idma.c:754–756` 依槽读寄存器，:828–832 将 slot20–29 打印在同一 `part=axi_a` 行；collector 将其保存为 `/i/observer/axi_a/shared_ar` 等。因此 raw JSON 的 `axi_a` 对象中含共享 TR 字段，**不代表这些共享字段只统计 A，或统计了 DS**。对 200 份既有命令输出的纯解析函数离线重放，与保存的 record/observer/path/metrics 一致；未打开 UART 或触发硬件。
+
+### 10.2 同窗是必要条件，信号语义也必须相同
+
+这些基础计数确实与 `hardware_cycles` 同门控：`active=(phase_q==HARDWARE || POLL_WAIT || REFILL)`；开窗首个 V issue 边沿旧状态为 ARMED，不加这些计数，目标最终 done 边沿仍 active，先计数再进入 BATCH_READ。端点为 **(首 issue，最终 done]**，包含批次内补给间隔，排除之后的软件完成发现时间。证据：observer:70、148–154、171–201。path 同样使用 active；它另保留跨窗 scoreboard，不能把其 carry 当作 PTW carry。
+
+逐试次事实与源码定义一致：全部 160 次共跑 `a_ar=a_aw=8192`、`shared_ar=shared_aw=16384`；40 次 Solo 的对应值分别为 0 和 8192；上述 private/shared 的 AR/AW wait 在 200 次中均为 0。DS0/A1 的 10 次 A S1 软件计数全部为 0，但其 `a_ar` 仍为 8192、`shared_ar` 仍为 16384。一个具体可追溯例子为 `board_baseline100.baseline100-20261017-01.ds0-middle-69005cc2.case0002`：`/1/record/result/aggressor/s1_ptw=0`，`/1/observer/axi_a/ar=8192`，`/1/observer/axi_a/shared_ar=16384`。不能把这些数据请求数除以 L=3，制造硬件窗遍历数。
+
+即使未来只新增整个 DS 口的 AR 计数，也不能无条件 `/3`：DS 读仲裁器还合并 DDTW、PDTW、CQ、PQ、MSIPTW、MRIF 等客户端（`rv_iommu_ds_if.sv:77–110`）；未带 owner DID 的 PTW AR 还混合 V 与 A。即便已过滤为 A 的成功三层 PTE 读，窗口仍可能切开三次读：`R_HW = 3×N_start,HW + B_pre − B_post`，其中 B_pre 是窗前启动、在窗内发出的 PTE 读，B_post 是窗内启动、在窗后发出的 PTE 读。原 observer 的 start/end 是 **DMA 数据请求**库存，无法求这两个 PTW 边界项。
+
+### 10.3 重拟合可用性与原结果对照
+
+下表只是上文结果的引用，**不是新拟合**；误差口径仍为“合并模型整档 DS 留出”的最大逐试次 ΔT 相对误差。硬件窗分母缺失，无法比较替代后参数的变化，也不能断言修正后的 k 或 η 必然增大或减小。
+
+| 模型 | 原 Nsw 的 t0 | 原 Nsw 的 k | 原 η_app | 原整 DS 留出最大误差 | 换成 N_HW 的结果 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 主模型 | 105.021857 | 5.560939 | 0.926823 | 26.69% | N/A：未观测 |
+| d+2 修正模型 | 100.933488 | 5.470568 | 0.911761 | 14.36% | N/A：未观测 |
+
+### 10.4 最小计数器方案（仅方案，未实施）
+
+缺少的首选信号是 **A 的 S1 walk 实际接受启动脉冲，以及该 walk 的 owner DID**。`ptw_init=(state_q==PT)&&!iotlb_lu_hit` 在等待中保持为高，不能每拍累加；应取 PTW 的真实接受条件 `state_q==IDLE && init_ptw_i && !edge_trigger_q`，并限定 `en_1S_i && !imp_init_i`。源码位置：`rv_iommu_ptw.sv:149–155/313–325`；owner 来自 TL 的 `req_data.did`（`rv_iommu_tl_wrap.sv:766`），在启动接受时锁定/关联。本负载 A 为 DID11，不能用 DS ARID0 代替 DID。
+
+最小主量是一只 64 位 `a_s1_start_in_v` 计数器：ARM 清零；`active && accepted_s1_start && owner_did==armed_A_DID` 时加一；使用与现有周期计数相同的窗口边沿，在最终 done 边沿计完后冻结。复用 sticky overflow/error、冻结后读回和明确升级的 observer 版本/字段有效性；旧 v3 的缺字段必须保持缺失，不能读作零。实际启动周期与 HPM 注册增量周期有流水差，应选前者并写明，不把两个时刻混用。
+
+为保留最低限度的边界诊断，再保存开窗/关窗时 A S1 walk 在途标志及 owner；这些状态需持续跟踪，**不因 ARM/open 重置启动边沿跟踪器**。若需要区分边界部分遍历的服务量，可另存当时层级；可选增加 V 的同窗启动计数，以判断当前 V 软件计数为 2 的试次在硬件窗内是否实际启动过遍历。可选的 PTW 专用 AR 计数须指定 delayer 前/后取点、过滤客户端并沿握手携带 owner，作为读数核账；它不是最小启动计数的替代品。
+
+这只会改善分母与硬件窗对齐；V 窗持续时间与 A walk 数的内生关系、边界残余服务和重叠仍需建模，不能预先保证 η 变成真实阻塞概率。以上仅为未来的被动计数接口方案：本轮没有实施 RTL/驱动、构建 BIT、仿真或上板，也没有把缺失事件反推为新数据。上文 11/11 方法谬误检查保持；本节未新增显著性检验或选择性模型比较。
+
+原 CSV、已有数值 JSON/CSV、图与源码取证文件保持原字节；原报告前 19727 字节 SHA256 为 `73fb8ffdf6443644bfd15a2fffe1726556eba7aa970c21d6b970c7c9645d609b`。报告生成器仅增加保留此追加节的逻辑，避免日后重建 §1–9 时丢失审计；没有改变拟合算法或旧数值。

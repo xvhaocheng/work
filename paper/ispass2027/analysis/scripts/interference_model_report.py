@@ -201,8 +201,14 @@ python3 paper/ispass2027/analysis/scripts/interference_model_report.py
 
 [validation.json](interference-model-validation.json) 记录本轮接受检查：真实数值原始 pointer 回查、独立高精度闭式 OLS、bootstrap 数值对照、整格/整 DS 训练泄漏与身份负例、输入未改、实际 PDF 字体/尺寸核查。它是本轮检查记录，不是额外板测。源码证据的全量复核由 rtl_verify 脚本执行；完整 HPM/path 边界算术由 observer 脚本重建。所有论文可用数字及分析结果单独保存，没有改历史数据或报告。
 """)
-    (ROOT / "interference-model.md").write_text("".join(parts))
-    print(ROOT / "interference-model.md")
+    report = ROOT / "interference-model.md"
+    # Later source audits are appended without replacing the original analysis.
+    # Preserve them when rebuilding the generated numerical sections above.
+    marker = "\n<!-- INTERFERENCE_MODEL_APPENDICES -->\n"
+    existing = report.read_text() if report.exists() else ""
+    appendix = marker + existing.split(marker, 1)[1] if marker in existing else ""
+    report.write_text("".join(parts) + appendix)
+    print(report)
 
 
 if __name__ == "__main__":
