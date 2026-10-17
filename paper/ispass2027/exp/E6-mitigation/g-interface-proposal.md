@@ -33,7 +33,7 @@ bank capability建议`0x49444d4150344d02`（IDMAP4M，version2），明确区别
 | 索引 | 64bit读值 |
 | --- | --- |
 | 768 | 独立P4M2 capability magic |
-| 769 | 由同次ARM锁存的既有observer sequence |
+| 769 | reserved0；现有sequence只在软件，硬件不回显 |
 | 770 | flags：bit0 armed，1 V-window active，2 V-window closed，3 V whole done，4 A whole done，5 has-A；其余0 |
 | 771 | sticky error mask；具体bit分配在observer小批前另锁，至少含非法issue/done/ID、非4096预算、溢出、abort |
 | 772/773 | V/A目标，固定4096；Solo A目标0 |
@@ -58,9 +58,11 @@ bank capability建议`0x49444d4150344d02`（IDMAP4M，version2），明确区别
 A whole允许在V窗前/窗内/窗后完成，必须继续保留到两lane完成后读快照；不在V关窗强制STOP。
 全部whole/时间累计采用64bit饱和+sticky error，溢出不绕回；原hist32bit/Depth4及错误门原样保留。
 
-新旁路模块端口只读输入：clk/reset、同ARM/clear/abort/sequence/selected roles/has-A、
+新旁路模块端口只读输入：clk/reset、同ARM/clear/abort/selected roles/has-A、
 各lane真实issue/done和ID、`batch_active`、新`batch_gap_active`、gap配置回读快照及V open/close；
 输出只读bank data、sticky error，不参与AXI/DMA握手。若采用独立模块需在ARM锁存配置，禁止运行中变化。
+Root已修订锁定769为reserved0：由既有experiment_lock下单一prepare→ARM→finish的software sequence绑定日志，
+不增加ARM generation或新身份计数，不声称硬件回显sequence。
 
 ### 已发现的有限A兼容点
 
