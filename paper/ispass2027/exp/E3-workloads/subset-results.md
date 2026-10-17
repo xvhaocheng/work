@@ -1,16 +1,17 @@
-# E3 DS0 小子集：P0已批准並準備中，未產生新測量
+# E3 DS0 小子集：P0產物就緒，未產生新測量
 
 ## Material Passport
 
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Origin Date: 2026-10-17 JST
-- Verification Status: UNVERIFIED
-- Version Label: E3-subset-blocked-v1
+- Verification Status: ARTIFACTS_VERIFIED / BOARD_UNMEASURED
+- Version Label: E3-subset-P0-ready-v2
 
 **一句話初判：目前仍無法判斷DS0小傳輸的干擾是否大於4KiB，45點尚未執行。**
 原pathv3確受4096B與共享chunk限制；後續已批准的P0改動及有限主機／RTL驗證已完成小批，
-正在構建獨立BIT並等待最終共同Linux，見[p0-implementation.md](p0-implementation.md)。
+獨立DS0 BIT時序／routing與共同P0+HPM+multi Linux產物已實際完成，
+見[p0-artifact-package.md](p0-artifact-package.md)；等待Root完成既有板排程後採集。
 
 | 指定V descriptor | Solo | A1（4KiB） | A8（4KiB） |
 | --- | --- | --- | --- |
@@ -23,7 +24,7 @@
 最初停止依據是使用者原文：「只改測試程序，不改內核驅動和RTL，確需修改時寫change-request.md並停下」。
 見 [能力證據](capability.md) 與 [具體變更請求](change-request.md)。
 Root可審查的P0最小修改選項已補在 [p0-change-option.md](p0-change-option.md)；
-方案不是已實作能力，也沒有解除本輪未測狀態。
+該P0限定方案現已實作並構建；仍沒有解除本輪未測狀態。
 
 ## 已有4KiB參考（不是本輪E3結果）
 
@@ -50,6 +51,6 @@ HPM miss來自軟體前後非原子快照，不能當硬體窗口精確miss。
 已完成能力核查、主機參數拒絕驗證、完整矩陣/板時設計與舊數據離線分析。
 本席另完成21項可復現parser/caps檢查、15項分析完整性與拒絕檢查，及原CLI靜態交叉編譯；
 見 [host-validation.json](host-validation.json) 與 [analysis-validation-v2.json](analysis-validation-v2.json)。
-三類實際流量實作、45次新採集及其V吞吐/硬體時間/V與A miss/慢化表均未完成，
-依change-request停止。後續若改動範圍獲准，先完成新版本與採集器，再在板子空閒時
-只跑P0；完整矩陣和150次候選子集仍只作規劃。
+P0限定packed-ring的driver／RTL／CLI／collector及獨立產物已完成，
+45次新採集與其V吞吐/硬體時間/V與A miss/慢化表仍未完成。
+完整三形態、六種size矩陣和150次候選子集仍為後續設計，沒有拿P0合成測試補值。
