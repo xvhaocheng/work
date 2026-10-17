@@ -168,6 +168,7 @@ def main():
             for name in ['spi-bitbang.c', 'spi-xilinx.c']:
                 shutil.copyfile(linux/'drivers/spi'/name, modules/name)
             (modules/'Makefile').write_text('obj-m += spi-bitbang.o\nobj-m += spi-xilinx.o\n')
+            base.run(common+['KERNELRELEASE='+release, '-j'+str(a.jobs), 'modules_prepare'], out, log, manifest, path)
             shutil.copyfile(kernel/'vmlinux.symvers', kernel/'Module.symvers')
             base.run(common+['KERNELRELEASE='+release, '-j'+str(a.jobs), 'M='+str(modules), 'modules'], out, log, manifest, path)
             artifacts = [out/'fw_payload.bin', image, dtb, out/'rootfs.cpio', *list((out/'bin').iterdir()),

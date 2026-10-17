@@ -4,7 +4,7 @@
 
 - 日期：2026-10-17 JST；ARS experiment-agent／run。
 - 使用者已批准「僅P0最小改動、構建和45點板測」；Root唯一執行板操作。
-- 狀態：`FRONTEND_DRIVER_CLI_HOST_CHECKS_PASSED / FPGA_BUILD_RUNNING / MULTI_KERNEL_PENDING`。
+- 狀態：`FRONTEND_DRIVER_CLI_HOST_CHECKS_PASSED / FPGA_BUILD_RUNNING / COMMON_SOFTWARE_DELIVERED`。
 - 新P0實板結果仍為0/45，沒有把有限RTL、主機模型或協議fixture當作板測。
 - 目前完整身份與恢復入口見 [source.json](source.json)、[patches](patches/)。
 
@@ -27,6 +27,11 @@
 
 所有真實內部變更都在獨立`ispass/a2-workloads`工作樹，不改活動研究checkout或既有build輸入。
 平台先更新CVA6 gitlink與source lock；最終Linux+multi凍結後再更新Linux指標／鎖。
+最終共同Linux已凍結為`acece3a3ab7d72ba1f936c1984b82a4a55f28d46`，
+是P0+HPM合併點`f81c82c`的直接後代；A3原HPM與multi提交均保留。
+實際平台`52c5fdd028bbf3b07deaf1d0f7e13e3a271b29d0`的Linux gitlink與source lock已同步，
+CVA6仍為`8aeb9ac`。新恢復包為`p0-linux-multi.incremental.bundle`（前提M）與
+`p0-platform-final.incremental.bundle`（前提`885ed0a`）；均已實際git bundle verify通過。
 CVA6/Linux只有上游remote，平台無remote；沒有推上游或新建remote。
 最小增量bundle／patch隨work任務分支推送，不能稱為已推組件遠端。
 
@@ -58,6 +63,20 @@ release為`6.5.0-rc2-ispass2027-p0-multi-v1`（最終以實際kernel.release為�
 從舊pathv3寫入新image時仍使用既有baseline100包的pathv3恢復模組；
 新模組只供以後軟體更新，正式測量boot不載入外部模組。
 沒有因prepare或build更新SD，也沒有額外hash/SD回讀或獨立板測關口。
+
+共同軟體已從上述固定提交實際構建一次，包含新`idma_scaling`，原三個工具逐byte保留。
+正式release為`6.5.0-rc2-ispass2027-p0-multi-v1`；rootfs 6,857,728 bytes，
+payload 29,363,656 bytes，32MiB餘4,190,776 bytes。
+正式交付manifest為本機`artifacts/p0-software01/delivery-manifest.json`，
+完整回執副本見[software-final01](test-results/p0-software-final01.json)。
+Image／lloader／OpenSBI先成功；最後恢復模組因缺`linux-build/scripts/module.lds`失敗。
+原[failed manifest](test-results/p0-software-build01.failed.json)與[原log](test-results/p0-software-build01.failed.log)不改寫。
+[repair_p0_software.py](repair_p0_software.py)依既有board recovery流程補`modules_prepare`，
+正常modpost／link生成兩個匹配正式release的SPI模組；沒有降低符號／版本檢查。
+[repair原始回執](test-results/p0-software-repair01.json)記錄Image/payload/rootfs/config/關鍵源碼與
+原失敗manifest/log前後hash完全一致；沒有重編Image或payload。
+prepare與finalize實際執行版builder分別保存於`source/build_p0_software.prepare01.py`與
+`source/build_p0_software.finalize01.py`；目前builder只補未來新構建所需的`modules_prepare`。
 
 ## 守恒與採集入口
 
