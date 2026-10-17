@@ -1,10 +1,23 @@
 # 研究结果与可复用资产索引
 
-本页按问题索引历史成果，回答“已经做过什么、结论到哪里、还能复用什么”。**不安排新实验，不恢复暂停分支，不重新选择论文主线。** 当前工作与下一步只查[CURRENT_STATUS](../CURRENT_STATUS.md)，执行安排查[唯一总计划](../研究计划.md)。最近一次索引整理：2026-10-17。
+本页按问题索引历史成果，回答“已经做过什么、结论到哪里、还能复用什么”。**不安排新实验，不恢复暂停分支。** 当前按根规则的ISPASS 2027投稿模式执行，工作与下一步查[CURRENT_STATUS](../CURRENT_STATUS.md)，交付和执行合同查[投稿目录](../paper/ispass2027/README.md)；[研究计划](../研究计划.md)中的旧排期仅作历史。最近一次索引整理：2026-10-17。
 
 每行给出结果、证据类型、停止范围与原文入口。链接先到可读报告或轮次 README，再到其冻结合同、来源 manifest、原始事件/数据和 root 接受记录；导航摘要不代替原始证据。旧报告中的“下一步”已可能被后续轮次取代。
 
 查结果对应的分支、commit 与实际源码，见[历史版本身份补填](../iommu-platform/provenance/source-organization-20261017/history/README.md#历史版本身份补填)。当时 checkout、固定来源、dirty／测试副本和后来归档分别列出；未记录的身份明确保留未知，不用当前分支追认旧运行。
+
+## ISPASS 2027投稿材料与当前边界
+
+当前目标是多个DMA共享RISC-V IOMMU的**FPGA实测刻画论文**。新机制探索、新判别门和旧停止审查暂停；只推进论文图表清单需要的工作，历史负结果和MIG暂停均保留。
+
+| 本次材料 | 已完成与适用范围 | 入口 |
+| --- | --- | --- |
+| 板测数据归集 | 实板17404个标量行（历史4096＋G1 828＋正式100次12480）已入表；正式100次接受100、失败0、重复0，跨3个boot。窗口、角色、版本和原始定位保留；失效仿真980行独立成表 | [数据说明](../paper/ispass2027/data/README.md)、[板测长表](../paper/ispass2027/data/board_results.csv)、[来源清单](../paper/ispass2027/data/source_manifest.json)、[验证回执](../paper/ispass2027/data/validation.json) |
+| 前作全文与差异 | 当前G2报告除Bermuda、ETH全文外，已纳入Rodríguez2024同平台四iDMA缓存/延迟实测、HERO/Kurth更早的共享翻译与miss阻塞hit前史，以及IEICE等近邻；Procedia2025与Hur/Ro2025全文仍未取得，不计入已排除集合。G2保持待补核，不宣称首次或无前作，也不据此新增机制门或补测 | [G2前作报告](../paper/ispass2027/related/prior-work.md)、[全文覆盖](../paper/ispass2027/related/prior-work.md#fulltext-coverage)、[同平台来源](../paper/ispass2027/related/prior-work.md#closest-origin)、[两篇全文未决](../paper/ispass2027/related/prior-work.md#procedia-hur-followup) |
+| 大纲与十图清单 | 已形成九页结构、证据边界及稳定row_id到当前CSV行的映射；待补图不以示意值填充 | [outline](../paper/ispass2027/outline.md)、[图表取数](../paper/ispass2027/figure-rows.csv) |
+| G1与统一100次新基线 | G1独立九次已通过；正式100次已全部执行，DS50/DS0/DS50为25/50/25、3个boot，每DS五条件各10次。源码、BIT、payload及实际结果按实验包对应，数据归集状态见上行；不把本次执行顺序改写成后续默认流程 | [执行合同](../paper/ispass2027/README.md)、[配套包](../paper/ispass2027/board/packages/README.md)、[固定源码](../paper/ispass2027/board/packages/baseline100-20261017/source.json)、[上板skill](../paper/ispass2027/board/skill/genesys2-iommu-board/SKILL.md) |
+
+历史batch“约三分之一”对应A64/Solo约0.3352，A8/Solo约0.3649；Solo→A1双方零miss仍有损失，不能把全部共跑下降叫纯翻译成本。[精确口径与限制](../paper/ispass2027/related/prior-work.md#one-third)。未来默认AB50/50、同配置测完再切，匹配任务可复用有效当前DS50 load；快速流程不重复hash/SD回读/独立确认。当前板保留末次DS50＋pathv3 Linux，恢复模块未进入正式boot；待补实验及旧暂停状态不变。
 
 ## 如何读结论
 

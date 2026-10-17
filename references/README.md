@@ -1,11 +1,12 @@
 # 项目参考文献与资料库
 
-2026-10-16整理。这里集中项目**已经引用或核查过**的论文、规范、RFC/公开补丁、专利披露和技术资料，供新agent复用。共 **445 条资料记录、138 个本地PDF索引**；这不是同样数量的独立论文，也不是一次新的系统查新。
+2026-10-16资料归档，2026-10-17补ISPASS投稿核读入口。这里集中项目**已经引用或核查过**的论文、规范、RFC/公开补丁、专利披露和技术资料，供新agent复用。归档共 **445 条资料记录、138 个本地PDF索引**；这不是同样数量的独立论文，也不是一次新的系统查新。以下目录数量与阅读等级保留10月16日归档口径，10月17日全文核读和有界检索增量另列，不用导航修改冒充机器目录已经更新。
 
 [逐条摘要总表](summaries/README.md) · [机器目录](catalog.json) · [本地原件](papers/README.md) · [未读与缺原件](reading-gaps.md) · [覆盖与维护规则](COVERAGE.md) · [验证结果](verification.json)
 
 ## 从当前问题开始
 
+- **ISPASS 2027 FPGA实测刻画论文（当前模式）**：先读[投稿目录](../paper/ispass2027/README.md)与当前[G2前作报告](../paper/ispass2027/related/prior-work.md)。Bermuda、ETH全文核读之外，报告已纳入[Rodríguez2024同平台硕论与HERO/Kurth前史](../paper/ispass2027/related/prior-work.md#closest-origin)、IEICE关联前作及更广近邻；各条阅读范围按[对比表](../paper/ispass2027/related/prior-work.md#paper-matrix)区分。**Procedia2025和Hur/Ro2025全文均未取得，G2仍待补核**，不写成已排除或“无前作/首次”。历史、G1与统一100次已归集为17404个实板标量行，失效仿真980行独立；最终归集状态见[数据目录](../paper/ispass2027/data/README.md)。[十图outline](../paper/ispass2027/outline.md)及待补实验不变，旧机制探索、判别门及MIG暂停不因本导航恢复；此次不重开检索或判别。
 - **2026-10-16重新立题核读增量**：[GPUMMU/Neighborhood、服务分段与回收近邻的原文位置](research-reconvergence-20261016.md)。明确新增核读/既有复用、覆盖与未核边界；不以文献库收录或模型一致代替新意证据。
 - **M0首PTE票据／接口实现成本**：先读 [MASK](summaries/mask2018.md) → [AXI-REALM](summaries/axi_realm2025.md) → [iDMA](summaries/idma_tc2024.md)。MASK已联合考虑PTE/data与配额，REALM已有合法分段/预算；这些前史限定当前增量。当前模型和接口成本问题见[当前状态](../CURRENT_STATUS.md)，不是文献库选择了论文主线。 本轮[源码/前作成对比较](../iommu-platform/docs/first-pte-interface-cost-20261016.md#5-论文贡献判断)定向核到MASK §5.4、AXI-REALM §III-A/IV-B、iDMA §II-C；保留原阅读等级，不升级为全面查新。
 - **映射组织、持续授权、回收／CPU与内存成本**：[DAMN](summaries/damn2018.md) → [rIOMMU](summaries/riommu2015.md) → [Utilizing the IOMMU Scalably](summaries/iommu_scalable2015.md) → [IOTLB Wall](summaries/iotlb_wall2023.md) → [F&S](summaries/fastsafe2024.md) → [DMA_PMD RFC](summaries/dma_pmd_rfc2026.md)。明确区分来源已实现能力、公开补丁和普通适配。
@@ -65,6 +66,6 @@
 
 受控扫描 **1581 份项目叙述文档**，规范化 **697 个外部URL**；其中 575 个已归入条目，122 个保留导航/操作排除标记，详见[url-inventory.json](url-inventory.json)。原共享翻译 **123项全部保留**，STAR不同版本仍归一项；后来AXI/RTAS、映射/RFC、缓存/数据流、KV/LLM和形式化近邻另行补入。
 
-仅按精确DOI、arXiv编号、已确认镜像/工作身份归并；未完成身份核对的题录记录保留为待整理，**条目数不能用于独立工作计数**。没有穷尽历史源树、PDF参考文献表、原始HTTP日志或未带链接的每个名称；这些潜在遗漏明确留在[COVERAGE.md](COVERAGE.md)。本轮没有新联网检索、论文复现实验、RTL/Linux修改、构建、硬件操作或研究状态恢复。
+仅按精确DOI、arXiv编号、已确认镜像/工作身份归并；未完成身份核对的题录记录保留为待整理，**条目数不能用于独立工作计数**。没有穷尽历史源树、PDF参考文献表、原始HTTP日志或未带链接的每个名称；这些潜在遗漏明确留在[COVERAGE.md](COVERAGE.md)。2026-10-16的资料归档没有新联网检索、论文复现实验、RTL/Linux修改、构建、硬件操作或研究状态恢复；10月17日投稿增量已另做两篇正文核读与有界检索，范围见上方入口，不包括前作工件复现。
 
-本轮由Codex整理并核验文件链接/原件哈希；历史目录中的DeepSeek全文证据提取归属继续保留，不将其改写成Codex本轮重读。
+10月16日归档由Codex整理并核验文件链接/原件哈希；历史目录中的DeepSeek全文证据提取归属继续保留，不将其改写成Codex当轮重读。10月17日两篇原文的新增Codex阅读记录单独保存，共享IOMMU投稿工作保持Codex-only。

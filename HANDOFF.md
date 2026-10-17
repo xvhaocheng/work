@@ -3938,3 +3938,35 @@ IOMMU与CVA6分别拆成12／27个功能提交，实际补丁顺序与语义依�
 [17项静态检查](iommu-platform/provenance/source-organization-20261017/history/identity-verification.json)实际通过：1390引用文件、7255JSON pointer、行号／CSV关联／字段缺项原因、历史元数据副本与106去重源字节保全、114冻结文件与Git commit/path/blob吻合、28case与build03/binary身份一致。旧inventory中的活动docs/build.md在上一轮导航维护已变，历史副本保持；本轮未改该文件或旧回执。内部平台先归档本次补填，组件源码／HEAD／gitlink与锁不变；公开work按普通文件及既有增量恢复流程同步。无新构建、实验、数据归约、综合、板测或goal恢复，Codex-only。
 
 内部平台提交为 `21430b531b0b2bc60c5fb6fd5933b078d68ddc2c`；[641590B增量及恢复核对](repository-recovery/internal-integration-20261017/platform-history-identities-delta.json)以前一导航提交6451764为prerequisite，与前三包在全新bare仓库按序导入、HEAD/tree及完整对象检查通过。四主体子仓库保持原HEAD且干净，原bundle／回执未覆盖；根导航、CURRENT与成果索引已链接同一历史身份入口。
+
+
+## 2026-10-17 ISPASS 2027投稿模式与材料归集（G1/100进行中）
+
+用户将当前目标明确为多个DMA共享RISC-V IOMMU的FPGA实测刻画论文，根规则已增加投稿模式，当前交付与执行入口为[paper/ispass2027](paper/ispass2027/README.md)。摘要2026-12-11 AoE、全文12-18 AoE，正文9页、IEEE双栏、双盲；[官方政策及来源回执](paper/ispass2027/related/evidence/source-receipt.json)另核AI实质使用披露等要求。暂停新机制探索、新判别门和旧停止审查，只做论文图表清单需要的工作；旧负结果与原始证据保留，MIG及其他旧机制分支不因模式切换恢复。
+
+已完成[历史数据交付](paper/ispass2027/data/README.md)：从原始及已验收JSON确定性提取E1、batch/DS/path、E2/E3、P4M、组合结果，保留窗口、角色、采集段、运行身份缺项和精确源定位；[板测长表](paper/ispass2027/data/board_results.csv)与[失效仿真表](paper/ispass2027/data/invalidation_sim_results.csv)分开，[source manifest](paper/ispass2027/data/source_manifest.json)和[验证回执](paper/ispass2027/data/validation.json)保存实际核对。新板测需经显式增量入口导入，历史结果不预填成新运行。历史A64/Solo约0.3352、A8/Solo约0.3649；“约三分之一”具体绑定A64，零miss的A1也有明显损失，不把全部共跑下降归为纯翻译成本。
+
+[前作对比](paper/ispass2027/related/prior-work.md)完成Bermuda v1与ETH/DATE2025 v1全文正文、图表、脚注及定位相关引文核读，[逐节覆盖](paper/ispass2027/related/prior-work.md#fulltext-coverage)区分Codex实际阅读、用户已读标记和外部参考文献核验。Bermuda已测Arm多DMA共享IOMMU干扰，其16 B约降32%、1 KiB约降10%、4 KiB近汇合；KB/s单位疑点和Fig.8频率未知保留。ETH已有RISC-V FPGA及host内存干扰评估，作者稿“全部低于2%”与图中例外等冲突明列。后继G2报告已展开[Rodríguez2024同平台四iDMA缓存/延迟评价及HERO/Kurth共享翻译前史](paper/ispass2027/related/prior-work.md#closest-origin)，不能把同平台性能评价或miss阻塞hit认领为首次；IEICE现已局部核读全文并明确作者/实验室关联，不再写成仅摘要或关系unknown。**Procedia2025与Hur/Ro2025全文仍未取得，均不计入已排除集合，当前G2裁决为待补核**；有界未核实完全同题评估不等于无前作。各近邻和未决项以[现有对比表](paper/ispass2027/related/prior-work.md#paper-matrix)及[续查记录](paper/ispass2027/related/prior-work.md#procedia-hur-followup)为准，本次导航纠正不重开检索、判别或实验。
+
+[九页outline与十图清单](paper/ispass2027/outline.md)及[图表取数映射](paper/ispass2027/figure-rows.csv)已形成，依稳定row_id回到当前CSV与原始JSON。历史硬件慢化、局部因果、容量替换、双方缓解取舍、组合负结果和独立失效仿真分层叙述；待补图保持缺口，不用行为模型代替FPGA数据，也不将E3的64 B局部干预外推为全部4 KiB自然慢化归因。
+
+用户已明确授权Codex构建、加载并执行历史G1和统一100次基线，替代最初“上板由用户执行”的限制；合同及实际在途进度见[G1流程](paper/ispass2027/board/g1-reproduce.md)、[执行状态](paper/ispass2027/board/execution-state.json)。**本条写入时，历史G1与新100次矩阵流程仍在进行，尚未完成验收，不记为通过。** 历史G1复用合格镜像；统一基线独立构建原版加必要修复并明示批量供给/被动观测，DS0直连与DS50附加延迟诊断分开。恢复/连接预检、构建产物出现或旧数据相符都不代替本轮实际采集与验收。设备数、负载类别、大页、延迟分布等其他扩展仍只列待补，不自行启动。
+
+本次导航同步只修改成果索引、文献入口和本交接段，写前重读并保留既有历史；未触板、未扩检索、未修改旧实验输出。上述投稿材料由Codex完成，共享IOMMU当前工作未使用DeepSeek；历史worker署名与归属保持。CURRENT、主入口及后续新运行的最终验收由当前主会话维护，不由本段预报。
+
+
+## 2026-10-17 ISPASS G1及正式100次执行完成终态
+
+**独立G1九次已通过，正式100次基线已全部实际执行。** 本次既定顺序为DS50前25次→DS0中间50次→DS50后25次，共3个boot；每个DS下Solo/A1/A8/A16/A64各10次。G1的九次不计入正式100次，不把25/50/25或多boot改写成后续默认执行方式。[投稿入口](paper/ispass2027/README.md)、[本次campaign](paper/ispass2027/board/runs/baseline100-20261017-01/campaign.json)、[成套实验包](paper/ispass2027/board/packages/README.md)关联实际结果、命令及启动材料。
+
+历史实板4096行与G1新增828个标量行已进入[板测表](paper/ispass2027/data/board_results.csv)；正式100次的数据席正在完成最终增量入表，本段不预填新增标量数或把采集完成等同于所有派生表已定稿。最终行数、来源及归集状态由[数据说明](paper/ispass2027/data/README.md)、[source manifest](paper/ispass2027/data/source_manifest.json)和[validation](paper/ispass2027/data/validation.json)维护；失效仿真980行单独保留，不计入FPGA样本。
+
+本次固定源码见[baseline100/source.json](paper/ispass2027/board/packages/baseline100-20261017/source.json)：平台`885ed0a7ea90ed42dae2b7a2dadfdd0acba15273`、CVA6 `8aac3fcd345af7686a55af1867783fd6b91a0069`、IOMMU `85b157ebe71a623e326e51fff7b7126fe77e8eb9`、Linux `45bf76b15e36cf608dff95013d91f8bedb7b1b8e`、OpenSBI `e8d21bfdc2dd753314627968e496c3a1188f6dfb`。两BIT共用pathv3 payload，DS0直连与DS50附加延迟诊断分开；包内manifest把结果、commit、image、BIT及源码恢复材料对应起来。本机`artifacts/`二进制不随Git推送；历史G1完整dirty执行树的单一commit仍为unknown，不以当前固定新基线替填。
+
+当前板保留最后DS50＋pathv3 Linux；恢复模块未装入正式测量boot。用户后续偏好是**默认AB50/50，同配置测完再切**；任务匹配时可直接复用有效当前DS50 load，避免首轮重复加载。沿[可复用上板skill](paper/ispass2027/board/skill/genesys2-iommu-board/SKILL.md)直接传输、更新、启动和采集，不增加重复hash、SD回读或独立确认。这是后续流程偏好，不改写本次已经完成的三阶段实际历史。
+
+[G2前作报告](paper/ispass2027/related/prior-work.md)继续承认Bermuda、ETH、Rodríguez2024同平台硕论及HERO/Kurth前史等重叠；Procedia2025、Hur/Ro2025全文仍未取得，G2待补核，不因100次完成而升级成无条件通过。[九页十图outline](paper/ispass2027/outline.md)、设备数/负载/大小/页/分布/统一缓解复测等待补清单保持；不因此自动追加实验、新机制或恢复MIG。历史局部因果与负结果的适用范围保持。
+
+本段只记录实际完成与最终数据归集的分界，没有触板、新检查或新检索；旧交接段保留为当时状态。共享IOMMU本轮保持Codex-only；提交、推送及发现链接由主会话收尾，本段不记录为已推送。
+
+正式数据归集已完成：实板17404个标量行＝历史4096＋G1 828＋统一100次12480，仿真980行独立。正式100次接受100、失败0、重复0、3个boot；来源重建与确定性检查通过，关键值/稳定ID见[统一基线简表](paper/ispass2027/data/baseline100-summary.md)。图2/3已映射新统一数据，未重复n=5分段；DS0 A8/A16/A64的V HPM miss中位2如实保留，不推定发生于硬件窗口。
