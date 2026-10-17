@@ -1,8 +1,9 @@
 # 完整E3：有界接口與觀測容量提案
 
-Material Passport：2026-10-17，ARS experiment-agent/plan；Codex-only；`DESIGN_ACCEPTED_NOT_IMPLEMENTED`。
+Material Passport：2026-10-17，ARS experiment-agent/plan/run；Codex-only；`FRONTEND_FINITE_PASSED_REVIEW_PENDING`。
 使用者已授權論文負載的必要RTL/Linux獨立分支改動與構建，Root要求接口先審、再分批凍結。
-本頁沒有實作ABI5／BTC3／observer5，沒有改已完成P0共同包，也沒有新板測。
+BTC3 frontend首批實作與206項有限證據見[獨立記錄](btc3-frontend.md)；尚未實作ABI5／observer5。
+沒有改已完成P0共同包，也沒有新板測或新BIT。
 P0仍是原V64/1024/4096、A4096、V1頁、A1/8頁、4096+256，45點不改。
 
 ## 固定來源與新觀測證據
