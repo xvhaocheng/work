@@ -4,7 +4,7 @@
 
 - 2026-10-17；状态：仅源码核查/变更请求，**4KiB/2MiB对照未测**。
 - 固定基座：baseline100 Linux `45bf76b15e36cf608dff95013d91f8bedb7b1b8e`、CVA6 `8aac3fcd345af7686a55af1867783fd6b91a0069`、IOMMU `85b157ebe71a623e326e51fff7b7126fe77e8eb9`。
-- 未改内核/driver/RTL；本项需要软件变更，由用户/Root决定是否继续；不因其他获准批次顺带实施。
+- 未改内核/driver/RTL；用户随后已授权独立软件准备，Root要求先审有界设计再改低层mapping，见 [mapping-design.md](mapping-design.md)。本旧报告保留原能力核查，尚无E4板测。
 
 前缀沿用 [E2定义](../E2-device-scaling/capability-and-plan.md)，原文见 [source-evidence.json](source-evidence.json)。
 
