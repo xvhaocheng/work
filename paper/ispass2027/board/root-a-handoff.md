@@ -1,3 +1,11 @@
+# 当前续接 2026-10-17T18:43:36.100043+00:00
+
+原pathv3/原DS0部署实际全部成功，18:39:20Z return0；kernel6.5.0-rc2-ispass2027-pathv3、boot04afe602-3051-410f-996f-778edb2fb94c、TAINT=0。板空闲，不再打开UART或添加基线/E2点。原恢复/upload/SD/boot串行链已结束，未来PN只切合格BIT并保留原Linux。
+
+E6-PN仍无完整BIT/板点。Root已接受history开关留首构、真实backend9befa（109726原raw+85源绑定）、tap e361、独立control ad56、readonly helper共享历史244项、DS9713（168906复核）等有限小批。实际Root回执在E6-pn/root-validation/，不可当整栈或时序通过。A1下一TC/banked/vendor quiet先提精确接口；A2实施已接受九文件SW/program只读idle；A3实施已接受单文件旧observer embedding。均无硬件权限，独立树/分支，Root审后才整合。完整PN DS0首构先于E3-lite；DS50必须实际S15≤0.5%各格通过后再编。MODE合法0/1/2/3/6，235独立点，显著风险首构前放弃history switch则205，不改约束或追加策略搜索。
+
+以下保留历史，以本段和实际result为准。
+
 # 实际板资源 2026-10-17T17:22:17+00:00
 
 G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。E2 probe上传已于17:16:45Z成功（bytesACK，无额外回读）；SD已于17:28:52Z return0；原DS0/probe加载已于17:36:47Z验证新boot e96e8ccc-aa05-42ce-83f8-714b8a17060d、taint0；当前唯一板动作e2-probe-preflight01，只读检查探针初态/proc，诊断点尚未运行。完整E3唯一resume仍在原设置route，未qualified；不打断。真实G论文图/报告已验收：figures/g-ds0-final01及figures/g-results.md，Root独立重放数值/CSV/PDF/PNG一致。E2两点诊断须新boot及逐阶段Root接受，不能自动连跑。

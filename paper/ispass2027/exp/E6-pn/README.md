@@ -1,12 +1,12 @@
 # E6-PN：统一基座上的翻译与整体性能
 
 - Origin Skill/Mode：ARS-Codex / experiment-agent / plan；2026-10-18 JST。
-- Status：准备中，P、原前端 gap、S15 门和只读 helper 已接受；N 核心与被动时长模块已通过 Root 有限组件审查。尚无完整 PN BIT 或板测结果。历史结果仅为动机。
+- Status：准备中，P/N/history、原前端gap、S15离线门、只读helper、被动时长/tap、独立MODE控制、真实双backend与DS保护已通过Root有限审查。尚无完整 PN BIT 或板测结果。历史结果仅为动机。
 - 主分支 `ispass/e6-pn`，独立工作树 `/home/xvhaocheng/work-e6-pn`；Root 在 `ispass/root-a` 审查、保存验收与排板。工具席独占 `ispass/e6-pn-tools`；gap 席独占 `ispass/e6-pn-gap` 的原前端小批，经 Root 接受后集成，不并改组件树。
 
 要回答三个问题：原始 DS0 下 PN 是否仍比 P 慢；V 与 A 是否同时变慢；差额是否随 V 供给间隔变化。历史 DS50 研究 BIT 的约 12.7% 退化不能替代本次验证，也不能据仿真直接认定真实 MIG 的根因。
 
-固定基座为 [统一原版清单](../../board/baseline-source.json)：platform `885ed0a7ea90ed42dae2b7a2dadfdd0acba15273`、CVA6 `8aac3fcd345af7686a55af1867783fd6b91a0069`、IOMMU `85b157ebe71a623e326e51fff7b7126fe77e8eb9`、Linux `45bf76b15e36cf608dff95013d91f8bedb7b1b8e`，原 pathv3/BTC1/OBS3，50MHz。一个 BIT 运行时选 S/N/P/PN；仅移植 P 的 2/14 容量分区及分区局部 PLRU touch、已有 N 命中旁路及其必要依赖和控制。保留 S/P 的原控制器和原 3-beat backend；N/PN 的历史 banked/full-buffer 支路单独隔离。实际接口与有限验证由子席方案交 Root 审查，不能把旧研究树 mode0 称为原版。
+固定基座为 [统一原版清单](../../board/baseline-source.json)：platform `885ed0a7ea90ed42dae2b7a2dadfdd0acba15273`、CVA6 `8aac3fcd345af7686a55af1867783fd6b91a0069`、IOMMU `85b157ebe71a623e326e51fff7b7126fe77e8eb9`、Linux `45bf76b15e36cf608dff95013d91f8bedb7b1b8e`，原 pathv3/BTC1/OBS3，50MHz。一个BIT运行时选S/N/P隔离/PN/P共享历史（raw0/1/2/3/6）；仅移植 P 的 2/14 容量分区及分区局部 PLRU touch、已有 N 命中旁路及其必要依赖和控制。保留 S/P 的原控制器和原 3-beat backend；N/PN 的历史 banked/full-buffer 支路单独隔离。实际接口与有限验证由子席方案交 Root 审查，不能把旧研究树 mode0 称为原版。
 
 用户已批准最小 V batch cooldown 以落实 gap1000/4000，并于本轮明确批准约 256 个计数触发器加少量标志的被动 A/双方共同硬件时长捕获。该观测不控制数据通路，不携旧拥塞诊断 observer、事件 FIFO 或新增页表 AR→R 逻辑；现有 observer 无法提供的页表读延迟累计跳过。资源数只是设计估计，须用真实综合验收。
 
@@ -25,4 +25,13 @@
 
 通过检查的中途论文数据可提交推送；二进制留本机，失败和未完成证据保留但不冒称完整论文样本。Root 不合并 main，最终合并步骤与重叠点维护于 [合并说明](../../board/root-a-merge.md)。
 
-当前已审设计入口：[最小移植与硬门](port-plan.md)、[固定来源调用链](source-map.md)、[测量合同](measurement-contract.md)、[原软件与采集计划](software-plan.md)、[Root设计接受](root-validation/plan01.json)。P IOTLB/TL小批已通过[Root源码/gold/逐拍证据核对](root-validation/p-only01.json)，S15工具已通过[Root实际51项主机检查](root-validation/s15-accepted01.json)。原前端 gap 已通过[Root真实事件核对](root-validation/gap-accepted01.json)，只读 helper 已实际通过137项主机检查并交叉编译。历史开关已通过[Root 27938项实际原件核验与风险审查](root-validation/history01.json)，纳入首构计划；[运行时接口增补](runtime-contract-v1.md)固定合法值及235点矩阵。A1勘查双TC及IOMMU完整quiet；A2准备双backend与真实容量证书；A3准备observer/frontend被动事实tap。E3-lite单文件存储已有限接受，待PN首构后才综合。均须实际源码与有限验证接受后再集成，尚无完整PN构建或板点。
+当前已接受小批与复核入口：
+
+- P/N/history：[P原件](root-validation/p-only01.json)、[N原件](root-validation/n-core01.json)、[历史开关27938项与首构风险决定](root-validation/history01.json)；历史开关未增加IOTLB状态，物理时序尚未测。
+- 原前端gap：[事件及兼容性](root-validation/gap-accepted01.json)。S15离线门：[Root实际51项](root-validation/s15-accepted01.json)；真实S15仍0点。
+- 被动模块与原事实：[capture](root-validation/observer01.json)、[tap](root-validation/taps-accepted01.json)、[独立MODE控制](root-validation/control-accepted01.json)；新bank与旧observer整合实施中。
+- 只读工具：[P共享历史适配244项/71情境](root-validation/pn-control-shared-accepted01.json)，原S15/source-map不变，无MODE/GAP写操作或板执行。
+- 双backend：[接受回执](root-validation/backend-accepted01.json)、[Root109726项真实原raw复核](root-validation/backend-raw01.json)。N实际4096B容量、自然退休与证书撤销通过；不是整栈或物理RAM/时序证明。
+- DS：[只读保护与真实MSIPTW尾拍](ds-validation/README.md)、[Root168906项复核](root-validation/ds-accepted01.json)。只新增17FF transport guard，不加论文诊断观测。
+
+Root已接受[旧observer内bank/capture接线方案](observer/integration-plan/bank-embedding-v1.md)及SW/program独立quiet提案；A1准备TC/vendor库存出口，A2实施SW，A3实施observer embedding。后续仍需全栈接线/真实有限gold、受限writer和采集脚本、源锁与DS0构建；这些小批回执不代表整栈或时序已过。E3-lite有限接受，综合排在PN首构之后。原pathv3/原DS0已于18:39:20Z启动核验成功，板空闲，等候合格PN BIT。

@@ -18,11 +18,13 @@ E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PT
 
 G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。
 
-E2 timer probe 已完成唯一 N2_A1 诊断对照，原 CLI/数据/排空/taint0 门通过；探针记录182次 handler、21条选取记录，时窗50,192,459周期。N4_A8 于17:53:23Z达到180秒主机超时，持续 softlockup；一次 Ctrl-C 和20秒只读监听均未恢复 shell，未发送 freeze/read，N4探针计数不可取得，不能据 N2 证明根因。原两轮各5点性能 partial 仍分开。原DS0恢复已于18:08:06Z成功，新boot517379a7-7f70-4a1d-a2d4-e9c18ddafc70、probe内核/taint0已核。原pathv3上传已于18:22:42Z成功且bytesACK；当前唯一UART动作为pn-original-deploy01中的原软件SD写入，成功后才加载原DS0验证pathv3启动，不采实验、不加E2重试。
+E2 timer probe 已完成唯一 N2_A1 诊断对照，原 CLI/数据/排空/taint0 门通过；探针记录182次 handler、21条选取记录，时窗50,192,459周期。N4_A8 于17:53:23Z达到180秒主机超时，持续 softlockup；一次 Ctrl-C 和20秒只读监听均未恢复 shell，未发送 freeze/read，N4探针计数不可取得，不能据 N2 证明根因。原两轮各5点性能 partial 仍分开。原pathv3部署已于18:39:20Z全部成功：SD写入返回0，原DS0 BIT加载/启动验证返回0，kernel6.5.0-rc2-ispass2027-pathv3、boot04afe602-3051-410f-996f-778edb2fb94c、TAINT=0。板卡空闲，无采集/后续硬件动作；等待合格PN BIT。未增加原基线点或E2重试。
 
 完整 E3 的唯一原设置续编已于17:45:03Z硬失败：WNS−2.646ns，setup失败3413，hold/pulse失败0，routing errors50014；RTSTAT-13禁止bitgen，无BIT。原route checkpoint/报告/DRC/失败manifest保留，不重试、不改约束。E3-lite只准备单文件时间戳存储写进程拆分和有限gold验证，实际RAM推断/fit/timing未知，任何Vivado任务排在E6-PN首构之后；完整E3正式板点仍0。
 
-E6-PN：P d2a813d、gap dd1a97e、S15 51项以及只读 helper 137项实际主机检查已接受；N 755cd723与独立被动 observer c913dd1已通过Root直接源码与有限证据审查（N原件5291项、observer绑定/端点39项），均非整栈或板测。最新用户追加 P（不隔离替换历史），保持2/14分区不变；DS0主矩阵150点，加S15 15、独立gap补充30、DS50原四模式40，合计235。先评估开关风险，显著增险则完整构建前关闭并退回205；原约束/一次历史物理优化/失败即停及S15每格≤0.5%门不变。DS50仍须真实S15通过才构建。A1准备history小批，A2准备E3-lite，A3勘查observer接线；三席无硬件权限。
+E6-PN：五种合法配置S/N/P隔离/PN/P共享历史的合同已冻结（raw MODE0/1/2/3/6）。Root直接源码与实际原件核验已接受P/N/history、原前端gap、S15离线门、被动时长、原事实tap、新独立MODE控制、真实双backend及DS transport保护小批。真实N backend在WREADY0/AW可走时接收完整4096B；Root原raw重放109726项，另源绑定85项通过。只读helper已适配P共享历史且实际244项/71情境通过，无MODE/GAP写操作。真实MSIPTW首拍后24拍指定尾响应空窗始终nonquiet；Root实际重放168906项通过，默认关闭不实例17FF tracker。各结果仅有限组件证据，尚无完整PN构建/板点。
+
+历史开关只有现有local-touch输入门，无新增IOTLB状态；目前未见显著增险证据，纳入首DS0构建计划，物理风险仍待原设置构建。DS0主150+S15 15+独立gap30+DS50原四模式40，共235；如首构前发现显著时序风险，退回205且说明。原时序硬门/最多一次历史route后物理优化/S15每格≤0.5%不变，DS50只在实际S15过后构建。当前三席并行：A1准备TC/banked/vendor只读quiet，A2实施SW/program只读quiet，A3实施旧observer内MODE/capture接线；三席不触硬件，均须Root实际审查后整栈集成。
 
 E2两轮各接受5/90后在N4_A8失败，性能采集暂停，独立诊断；不会原样重试、换版本混池或放宽taint门。
 
