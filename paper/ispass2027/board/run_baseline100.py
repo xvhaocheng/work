@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect 50 points per configuration, optionally reusing the current DS50 boot."""
+"""Collect 50 points per named configuration, preserving every attempt."""
 import argparse
 import datetime
 import json
@@ -18,30 +18,43 @@ def now():
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--package', type=Path, default=BOARD/'packages/baseline100-20261017')
+    p.add_argument('--phases', nargs='+', choices=['ds50-all', 'ds0-all', 'ds25-all', 'ds100-all'],
+                   default=list(PHASES))
     p.add_argument('--credential-helper', type=Path, required=True)
     p.add_argument('--software-write', type=Path, required=True,
                    help='Existing successful UART command receipt for this payload write')
     p.add_argument('--initial-load-manifest', type=Path,
-                   help='Reuse an existing DS50 load receipt while the board remains on that boot')
+                   help='Reuse a receipt matching the first phase while the board remains on that boot')
     a = p.parse_args()
     software_write = a.software_write.resolve()
     if json.loads(software_write.read_text())['exit_code'] != 0:
         p.error('software write did not succeed')
-    package = BOARD/'packages/baseline100-20261017'
+    if len(a.phases) != len(set(a.phases)):
+        p.error('phases must be unique; automatic repeat collection is not allowed')
+    package = a.package.resolve()
     delivery = json.loads((package/'manifest.json').read_text())
+    if delivery.get('status') not in {'ready_for_collection', 'completed'}:
+        p.error('package is not ready for collection')
+    for phase in a.phases:
+        bit = delivery['artifacts'][phase.split('-')[0]+'_bit']
+        if not (package/bit['file']).is_file():
+            p.error('missing BIT for '+phase)
     initial_load = a.initial_load_manifest.resolve() if a.initial_load_manifest else None
     if initial_load is not None:
         receipt = json.loads(initial_load.read_text())
         for field, expected in [('status', 'boot_identity_verified'),
                                 ('kernel_release', delivery['kernel_release']),
-                                ('bit_sha256', delivery['artifacts']['ds50_bit']['sha256'])]:
+                                ('bit_sha256', delivery['artifacts'][a.phases[0].split('-')[0]+'_bit']['sha256'])]:
             if receipt.get(field) != expected:
-                p.error('initial load receipt '+field+' does not match DS50 package')
+                p.error('initial load receipt '+field+' does not match first-phase package')
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     state = {'status': 'running', 'started_utc': now(),
              'package': str(package), 'software_write_receipt': str(software_write),
              'software_payload': delivery['artifacts']['sd_payload'],
+             'source_record': json.loads((package/'source.json').read_text()),
+             'requested_phases': a.phases,
              'phases': [], 'automatic_retries': 0}
     if initial_load is not None:
         state['initial_load_manifest'] = str(initial_load)
@@ -59,8 +72,8 @@ def main():
 
     save()
     try:
-        for phase_index, phase in enumerate(PHASES):
-            bit = delivery['artifacts']['ds0_bit' if phase in {'ds0-middle', 'ds0-all'} else 'ds50_bit']
+        for phase_index, phase in enumerate(a.phases):
+            bit = delivery['artifacts'][phase.split('-')[0]+'_bit']
             load_dir, run_dir = output/(phase+'-load'), output/phase
             record = {'phase': phase, 'load_directory': str(load_dir),
                       'run_directory': str(run_dir), 'load': {}, 'collection': {}}
@@ -79,7 +92,8 @@ def main():
                      '--credential-helper', a.credential_helper.resolve(), '--output', load_dir], record['load'])
             run([sys.executable, BOARD/'collect.py', '--phase', phase, '--output', run_dir,
                  '--expected-kernel', delivery['kernel_release'],
-                 '--load-manifest', load_manifest], record['collection'])
+                 '--load-manifest', load_manifest,
+                 '--source-record', package/'source.json'], record['collection'])
         state['status'] = 'completed'
     except BaseException as error:
         state.update(status='failed', error=type(error).__name__+': '+str(error))
