@@ -73,3 +73,16 @@ The original CLI independently accepts V/A page counts (`idma_experiment.c:124�
 8aac frontend`:96–100,344–346` supports arbitrary1..4096-page rings, including
 12/14; allocation and existing correctness/drain/HPM/PATH checks still apply.
 E2 multiple-A is unavailable in original45bf and is outside this collector.
+
+`export_e8.py --run /finished/run [--run /another/finished/run] --output /new/out`
+reads only records/manifest, rejects running/fixture input and overlapping
+boot/sequence prefixes, then writes unified17-column paper.csv and summary.json.
+All original lane miss/S1/S2, hardware cycles/ms/throughput and PATH fields stay.
+Condition statistics are n/median/Q1/Q3/IQR with Type7 quartiles; absent cells are
+not invented. Vcycles/A-S1PTW is a cross-window normalization. Within the same
+run/boot/block, adjacent A sizes additionally give ΔVcycles/Δpages and
+ΔVcycles/ΔA-S1PTW (zero denominator N/A; signed values retained). The largest
+positive median adjacent per-page slope is only a descriptive breakpoint
+candidate, not a fitted threshold or causal per-PTW latency. V hardware and
+broader non-atomic HPM snapshot windows stay distinct; no CI. Old baseline200
+is referenced separately and never duplicated into the new sample set.
