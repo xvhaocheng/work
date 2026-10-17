@@ -14,7 +14,7 @@
 
 DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”的两档100次已全部完成；Root只读复核并冻结最终200试次包（含历史100）。用户授权协调后已统一排程。Root本地12:56:37Z重复启动被UART锁在触硬件前拒绝，失败原样保留，不计试次。
 
-E1b新增100点、E3 P0 45点、E6角色30点均完成通过。E2首轮于14:48:46Z停止：原DS0/acece内核，第6点N4_A8触发softlockup与taint16384，5个合格试次已冻结为partial论文包，失败尾不接受、不替换。当前无活动板任务，已排空tainted boot只做只读诊断。Root已接受multi合作调度候选65b427，A2正在编新共同软件，再按E2→E4/E5→完整E3串行；未知新软件profile不提前放行。
+E1b新增100点、E3 P0 45点、E6角色30点均完成通过。E2首轮于14:48:46Z停止：原DS0/acece内核，第6点N4_A8触发softlockup与taint16384，5个合格试次已冻结为partial论文包，失败尾不接受、不替换。旧tainted boot已排空且不再采；新共同软件已passed，上传15:20:40Z完成，当前唯一板动作common-v2-software-write01。Root已接受multi合作调度候选65b427，再按E2→E4/E5→完整E3串行；未知新软件profile不提前放行。
 
 
 | 原优先级 | 任务 | 状态 | 采集规模 | 预计板时 / 条件 |
@@ -22,8 +22,8 @@ E1b新增100点、E3 P0 45点、E6角色30点均完成通过。E2首轮于14:48:
 | 1 | E3 DS0 小子集 | 完成45/45，最终包每cell n=5 | 3 个 V 大小 × Solo/A1/A8 × 5 = 45 次 | 已完成；小传输A8/A1增幅约14%，4KiB约10.4% |
 | 2 | E1b DS25 | 完成50/50，五条件各10，全部接受；阶段CSV已冻结 | Solo/A1/A8/A16/A64 各 10 次 = 50 次 | 约 20–30 分钟，须 50MHz、WNS≥0、违例端点和 routing errors 全零 |
 | 3 | E1b DS100 | 完成50/50，五条件各10，全部接受；最终四档200试次包已冻结 | 同上 50 次 | 已完成；两档仅换 BIT，复用已写 pathv3 |
-| 4 | E2 DS0 设备数 | 旧轮failed5/90；修正已审，新共用软件编译中 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
-| 5 | E3 DS0 论文子集 | BTC3/Depth64已审，14:10:50Z启动独立DS0构建；ABI5驱动分批审查 | 六种大小及三类流量组合；新协议等16MiB有效字节 | 用户上限6小时；候选150新点按实际用时定稿，不与P045混池 |
+| 4 | E2 DS0 设备数 | 旧轮failed5/90；新共用软件passed/SD更新中，新90已排队 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
+| 5 | E3 DS0 论文子集 | BTC3/Depth64已审，14:10:50Z启动独立DS0构建；ABI5驱动分批审查 | 六种大小及三类流量组合；新协议等16MiB有效字节 | 用户上限6小时；先30点pilot按实际用时定稿，不与P045混池 |
 | 6 | E4 DS0 页大小 | E4/E5共同软件首次完整构建通过；20点collector已审并通过Root38+14+11主机检查 | 4KiB 对2MiB，各点10次，未测 | 不混当前稳定软件；与已审E5 Linux后续共同编译 |
 | 7 | E6 DS0 角色互换 | 完成30/30，Solo/A1/A8各10；原DS0 BIT及旧pathv3 | V=DMA1、A=DMA0；Solo/A1/A8各10次 | 已完成；同boot/区组A8/A1中位数1.10434084，旧payload不再加测 |
 | 附加 | E5 延迟分布 | 被动直方图RTL/Linux已审，独立DS0 BIT最终通过，等待与E4共同采集 | 16阶段×32桶；当前尚无新直方图板测 | 保留carry/overflow/最终有效性，量化分位所在桶区间 |
@@ -76,3 +76,5 @@ full-E3 DS0唯一构建已于14:10:50Z启动，`exp/E3-workloads/artifacts/full-
 15:12Z准备更新：E2新旧精确软件profile小批88218a9已由Root审全production diff并实跑identity42通过；新90点有限续接e2-common-v2-collect01-launch已排队，仅在common-v2-deploy01-launch result=0、新boot及check-only通过后启动，输出e2-device-scaling-20261018-02；目前仍等待上传/部署，没有提前占UART或执行试次。G独立BIT已于15:08:57.646218Z启动（cfb9a0a8/d5cc448，A1/E6/artifacts/g-ds0-build01），原约束/策略且失败即停，Linux65b仅reference。G Linux下一批固定双方W256自然预热后各4096测量，新协议只与自身gap0对照。完整E3 collector首批因续接源码/命令及递归fixture身份边界要求聚焦修订，未放行上板。
 
 2026-10-17T15:19:03.830410+00:00：Root已审并接收5a61c68共用软件E4包，实跑22项检查全过，正式新包board/packages/e4-e5-common-v2-20261018由Root准备并固定manifest/source hash，元数据原字节复制、二进制仅硬链接。有限后续e4-e5-common-v2-collect01-launch已排队，仅在新E2完整90点passed后加载E5 BIT并采20点+直方图；E2若失败则此后续也停止，不自动继续。当前仍上传新payload，未开始新试次。
+
+2026-10-17T15:21:42.110277+00:00实际资源：唯一上板操作为common-v2-software-write01；upload已成功。有限部署→新E2→E4/E5严格依赖各自result0；Root不再手工重复这些动作。G BIT和完整E3 BIT仅离线构建；E3 P045点图由A4离线准备，不新增试次。

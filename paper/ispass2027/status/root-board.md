@@ -3,9 +3,11 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Verification Status: PARTIAL（E1b、E3 P0、E6角色已完成；E2/E4/E5/完整E3/G按队列继续）
-- Updated: 2026-10-17 15:03 UTC / 2026-10-18 00:03 JST
+- Updated: 2026-10-17T15:21:42.110277+00:00 / 2026-10-18 JST
 
-E2已因第6点N4_A8触发内核softlockup停止；当前无活动板任务。原90点轮仅5个taint0试次接受，已冻结为独立partial论文包；失败尾taint16384原样保留。板上原DS0+acece内核处于tainted且已排空状态，只做只读诊断。multi合作调度候选65b427已通过Root源码审核和实际回归，共用Image已通过编译；新软件验证后再开展新轮，旧失败和5点不替换混池。子agent不接触JTAG/UART/SD。
+当前唯一板动作是新共同payload写SD：11,068,218B gzip已于15:20:40Z上传成功/bytesACK；有限部署正在执行一次更新，成功后加载原DS0并验证新内核。新E2 90点、随后E4/E5 20点已按依赖串行排队，等待时不占UART。G与完整E3 FPGA在隔离树并行构建，A4离线制图。
+
+E2旧轮第6点N4_A8 softlockup后停止：5个taint0试次已独立冻结为partial，失败尾taint16384保留；全部lane已排空，该boot不再正式采。multi合作候选65b427已通过Root源码审核和回归，共同Image/transport已passed，新实验必须新boot/source/run，旧5点不混入新90。
 
 ## 已完成的论文数据
 
@@ -34,9 +36,9 @@ DS口径始终是IOMMU数据结构访存的附加延迟，DS0为主结果，DS25
 | 任务 | 实际状态 | 下一步 |
 | --- | --- | --- |
 | E2 设备数 | 原轮failed：5接受/90，第6点N4_A8 softlockup拒绝；已冻结5点partial和失败尾。Root已实跑prefix44及配对34检查通过。 | 调度候选已审；共用软件构建passed；更新SD后验证taint0新boot；原轮不恢复/替换，后续独立90点。 |
-| E4 页大小+E5分布 | 共同软件首次完整构建passed，Linux da6b69f/platform a68603f；release e4-e5-v1，payload29,363,656B。E5 BIT于14:06:29Z passed。 | 计划与E2共用新内核，仅切E5 BIT，共采20点；E5附加采集，不另跑50点。 |
-| 完整E3 | CVA6 1d587/platform dfebcc，Depth64的唯一DS0构建14:10:50Z开始，仍running；ABI5 helper682a2ca/adapter46df97c已审，含multi候选的新65b427共用软件15:01:52Z开始编译。 | CLI 167项Root实跑通过；collector准备与完整软件构建；自身时序/资源验收后再排≤6小时子集。 |
-| E6 P4M G | 从E5 6c5基座独立准备；frontend2c7c68f已审，39情境/207332周期，与真实旧P0默认关闭/启用gap0逐拍比较。 | observer0f0403已审（19场景、17逐拍对照、18 hist、真实wrapper69检查）；准备最小上层启用/build入口；G固定V/A各4096×4KiB自然完成。 |
+| E4 页大小+E5分布 | 新共同软件65b/ec996已passed、Root新包22检查通过；旧da6包保留。E5 BIT于14:06:29Z passed。 | 计划与E2共用新内核，仅切E5 BIT，共采20点；E5附加采集，不另跑50点。 |
+| 完整E3 | CVA6 1d587/platform dfebcc，Depth64的唯一DS0构建14:10:50Z开始，仍running；ABI5 helper682a2ca/adapter46df97c已审，含multi候选的新65b427共用软件15:03:30Z已passed。 | CLI 167项Root实跑通过；collector准备与完整软件构建；自身时序/资源验收后再排≤6小时子集。 |
+| E6 P4M G | 从E5 6c5基座独立准备；frontend2c7、observer0f0403与上层cfb9已审；G唯一BIT15:08:57Z开始构建。 | 原约束/策略验收，失败停止；Linux ABI6只读caps/helper批审查中，RUN另批；G固定V/A各4096×4KiB自然完成。 |
 | E6 P/N/PN M | 完成历史来源/容量/接口设计与负结果追溯，未启动移植。 | 维持最后优先级，不恢复机制探索。 |
 
 E4/E5冻结包在`board/packages/e4-e5-20261017/`：小型元数据原字节复制，BIT/Image/payload/SPI模块仅本机硬链接，不进Git。E5最终BIT SHA d934846ecb7f2fd80bcb7d2f18889ae0fd8c9bbd28a0f5fef8e949614139221c，50MHz，WNS+0.126/WHS+0.047/WPWS+0.062ns，失败端点与routing errors均0，290520/290520 routable nets全完成。Slice50581/50950（99.28%）；LUT166334、regs142751、BRAM50、DSP27。完整E3和G必须各自验收，不能沿用E5通过结论。

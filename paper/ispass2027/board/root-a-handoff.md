@@ -1,3 +1,13 @@
+# 当前续接 2026-10-17T15:21:42.110277+00:00
+
+唯一板动作：common-v2-software-write01（Root有限common-v2-deploy01-launch已在upload15:20:40Z结果0/bytesACK后自动开始）。不要再手工写SD或重复加载！部署脚本成功后会加载原DS0、验证full-e3-v1新boot；有限e2-common-v2-collect01-launch已等待其result0，自动独立采新90到runs/e2-device-scaling-20261018-02；有限e4-e5-common-v2-collect01-launch已等待新E2完整passed90/结果0，再加载E5d934+同kernel采20+hist到e4-pagesize-20261018-01。所有等待不占UART、任一步失败停，无自动替代。4份dispatcher command/result与board/manifests/*common-v2*是实际入口。旧E2 failed5+尾永久分开，当前旧boot2f31 taint16384只是更新不再采。
+
+Root已收e6d软件、88218E2 profiles、5a61E4package、d0e2Gbuilder。Root E4 known新包board/packages/e4-e5-common-v2-20261018元数据copy与binary硬链，22项Root实跑通过；E2 profiles42 Root实跑通过。Root还未接A2 9b1b9ce collector，要求源码/command/seq/nestedfixture续接修订正返回；new Image不受该host变更影响。
+
+G build15:08:57Z，A1后继a1_g_build在原E6worktree，CVA6cfb9/platformd5cc，原策略/约束，Linux65b仅ref；只读G Linuxb258初批因timeout从原pair300000收敛本协议60000产生新final，等RV64 ex-table/ld/fence证据。RUN未实现，不能提前编G软件。A4 p0_figures新独立main worktree制作已验45点图，不新增数据或改Root结果页。full-E3 FPGA1d587/dfeb仍placement running，不搜索约束。
+
+下方为历史。
+
 # 当前续接（2026-10-17 15:03Z / 10-18 00:03 JST）
 
 板卡仍原DS0/acece boot2f31b9f4、taint16384，已排空，无活动板任务。旧E2 failed5+未接受第6点已冻结，禁止恢复旧轮或混入新90。Root实际复跑multi合作候选65b427全部回归通过（旧38/57/97、416新、6政策、原MMIO和nonmulti yield一致），CLI167通过，E4profile20通过，receipt均在各任务root-validation。A2已获准一次共用Image构建，Linux65b427/platform ec996/CVA6reference1d587/OpenSBI e8d/release6.5.0-rc2-ispass2027-full-e3-v1；out=A2/E3/artifacts/full-e3-software01，等status passed+transport后更新SD。必须用当前acece匹配SPI模块更新，不能先加载新内核模块。新软件供E2原BIT→E4/E5 d934 BIT→full-E3 BIT，仅切BIT。
