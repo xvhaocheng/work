@@ -33,6 +33,8 @@ PAGES = ('idma_stream_allocate','idma_pages_verify_buffer','idma_pages_contiguou
 
 def unit(text, harness, new):
     names = OLD + NEW + (PAGES if new else ())
+    if new and "static bool idma_observer_has_path" in text:
+        names += ("idma_observer_has_path",)
     types = '\n'.join(re.findall(r'^#define IDMA_.*$', text, re.M)) + '\n'
     for name in ('idma_device','idma_stream','idma_observation','idma_multi_context') + (('idma_pages_context',) if new else ()):
         types += extract(text, rf'^struct {name} \{{.*?^\}};') + '\n'
