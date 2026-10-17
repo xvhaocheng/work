@@ -4,7 +4,7 @@
 
 - 日期：2026-10-17 JST；ARS experiment-agent／run。
 - 使用者已批准「僅P0最小改動、構建和45點板測」；Root唯一執行板操作。
-- 狀態：`FRONTEND_DRIVER_CLI_HOST_CHECKS_PASSED / FPGA_BUILD_RUNNING / COMMON_SOFTWARE_DELIVERED`。
+- 狀態：`FRONTEND_DRIVER_CLI_HOST_CHECKS_PASSED / FPGA_BUILD_PASSED / COMMON_SOFTWARE_DELIVERED / BOARD_0_OF_45`。
 - 新P0實板結果仍為0/45，沒有把有限RTL、主機模型或協議fixture當作板測。
 - 目前完整身份與恢復入口見 [source.json](source.json)、[patches](patches/)。
 
@@ -49,7 +49,9 @@ finalize入口在執行前將ref解析為完整commit。這些補記不冒充原
 
 [build_p0_fpga.py](build_p0_fpga.py) 使用保存的原baseline builder流程，
 不更改main的baseline pins或約束，僅DS0、50MHz；WNS<0、任一setup/hold/pulse失敗或routing error都停止。
-本機輸出：`artifacts/p0-ds0-build01/`；目前構建中，未宣布時序通過。
+本機輸出：`artifacts/p0-ds0-build01/`；原流程已passed：50MHz、WNS +0.177ns、
+setup/hold/pulse failing均0、routing errors0；routed CPU period20ns、delay/research cell0。
+實際BIT／完整manifest／原始報告與Root執行入口見[p0-artifact-package](p0-artifact-package.md)。
 
 [build_p0_software.py](build_p0_software.py) 已實際完成prepare：
 新rootfs 6,349,312 bytes，包含原rootfs的原版`idma_experiment`、`platform-timeout`、
