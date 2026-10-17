@@ -234,17 +234,17 @@ def long_rows(result,summary_path,sample_set):
                 add(label+'.'+prefix+'.full.'+name,label,prefix+'_trial_full',name,hist['trial_full_range'][name],hist['trial_n'],'rows',ri,'histograms',stage,'trial_full_range',name)
             for ti,trial in enumerate(hist['trials']):
                 condition=label+f';block={trial["block"]};histogram_sample=one_trial'
-                stem=label+'.'+prefix+f'.block{trial["block"]}'
+                trial_label=label+'.'+prefix+f'.block{trial["block"]}'
                 for name in ['full','mean_cycles','full_transaction_weight']:
                     metric=prefix+('_full_transaction_weight_ratio' if name=='full_transaction_weight' else '_'+name)
                     value=trial[name];n=1 if name=='full' else int(value is not None)
-                    add(stem+'.'+name,condition,metric,'trial_value',value,n,'rows',ri,'histograms',stage,'trials',ti,name)
+                    add(trial_label+'.'+name,condition,metric,'trial_value',value,n,'rows',ri,'histograms',stage,'trials',ti,name)
                 for bi,count in enumerate(trial['counts']):
-                    metric=prefix+f'_bin{bi}_count';add(stem+f'.bin{bi}',condition,metric,'trial_bin_count',count,1,'rows',ri,'histograms',stage,'trials',ti,'counts',bi)
+                    metric=prefix+f'_bin{bi}_count';add(trial_label+f'.bin{bi}',condition,metric,'trial_bin_count',count,1,'rows',ri,'histograms',stage,'trials',ti,'counts',bi)
                 for q,interval in trial['quantile_intervals'].items():
                     for bound in ['cycle_lo','cycle_hi']:
                         metric=prefix+'_trial_'+q+'_'+bound
-                        add(stem+'.'+q+'.'+bound,condition,metric,'trial_bucket_interval_bound',interval[bound] if interval else None,trial['valid_latency_trial_n'],
+                        add(trial_label+'.'+q+'.'+bound,condition,metric,'trial_bucket_interval_bound',interval[bound] if interval else None,trial['valid_latency_trial_n'],
                             'rows',ri,'histograms',stage,'trials',ti,'quantile_intervals',q,*([bound] if interval else []))
             pooled=hist['auxiliary_pooled_full_transactions']
             condition=label+f';auxiliary_pooled=true;trial_n={hist["trial_n"]};valid_latency_trial_n={hist["valid_latency_trial_n"]};weighting=trial_full_over_all_full'
