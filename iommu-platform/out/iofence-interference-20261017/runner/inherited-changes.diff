@@ -1,0 +1,804 @@
+--- previous/runner/invalidation_dma.cpp
++++ runner/invalidation_dma.cpp
+@@ -48,7 +48,9 @@
+ struct Options {
+     std::string out,mode="m1",domain="different",map_policy="full-api",case_id;
+     unsigned b_pages=4,a_jobs=64,b_jobs=256;
+-    bool smoke=false;
++    bool smoke=false,a_alone=false;
++    bool mainline()const{return mode=="ml-strict"||mode=="ml-fq"||mode=="oracle";}
++    bool fq()const{return mode=="ml-fq"||mode=="oracle";}
+     unsigned pscid_a()const{return B_PSCID+(domain=="different");}
+     unsigned batch()const{return mode=="m4-16"?16:mode=="m4-64"?64:0;}
+ };
+@@ -57,12 +59,34 @@
+     Options o;
+     std::unique_ptr<Vinvalidation_dma_top> t{new Vinvalidation_dma_top};
+     FILE *jsonl=nullptr,*csv=nullptr,*jobs_file=nullptr;
++    FILE *dead_file=nullptr,*latency_file=nullptr;
+     long cycle=0,t0=-1,measure_end=-1,final_a=-1,last_done[2]={-1,-1};
+     std::string era="initial",failure;
+     bool measured=false,passed=false,data_ok=false,quiet_ok=false,commands_ok=false;
+     bool warm_resident=false,warm_no_walk=false;
+     using Key=std::pair<unsigned,U64>;
+     std::set<Key> seen,removed;
++    std::set<Key> dead,reserved_iovas;
++    std::deque<Key> fq_entries;
++    static constexpr long FQ_TIMEOUT_CYCLES=500000; // 10ms at declared 50MHz, HZ=1000 equivalence.
++    static constexpr unsigned FQ_CAPACITY=255;
++    long fq_due=-1,fq_drain_end=-1;
++    bool flush_fq=false,fq_waiting_enqueue=false;
++    Key waiting_enqueue;
++    U64 fq_flushes=0,fq_peak=0,fq_reclaimed=0,fq_timer_flushes=0,fq_full_flushes=0;
++    U64 dead_slot_cycles=0,dead_sample_cycles=0,dead_valid_cycles=0,dead_peak=0;
++    U64 dead_replacements=0,live_replacements=0,empty_fills=0;
++    unsigned previous_dead_mask=~0u,previous_valid_mask=~0u;
++    bool oracle_pending=false;
++    U64 wall_host=0,wall_flush=0,wall_copy_pte=0,wall_copy_payload_wait=0,wall_copy_other=0;
++    U64 flush_cq_fetch=0,flush_cq_decode=0,flush_cq_fence=0,flush_other=0;
++    U64 comp_reads=0,comp_writes=0,payload_reads_done=0,payload_writes_done=0;
++    U64 fence_read_goal=0,fence_write_goal=0,prpw_fences=0,prpw_wait_cycles=0;
++    bool prpw_active=false;
++    U64 pte_a_pending=0;
++    struct CmdLatency {long submit=-1,decode=-1,inval=-1;U64 cq_fetch=0,cq_decode=0,cq_fence=0,other=0;};
++    std::deque<CmdLatency> cmd_latency;
++    U64 command_latency_count=0,command_latency_sum=0,command_latency_min=~U64(0),command_latency_max=0;
+     struct Counters {U64 hits=0,misses=0,walks=0,inval=0,cold=0,replacement=0,pte_bytes=0;};
+     Counters stats[2];
+     U64 all_walks=0,all_marker_b=0;
+@@ -123,12 +147,16 @@
+         jsonl=std::fopen((o.out+"/events.jsonl").c_str(),"wx");
+         csv=std::fopen((o.out+"/events.csv").c_str(),"wx");
+         jobs_file=std::fopen((o.out+"/jobs.csv").c_str(),"wx");
+-        REQUIRE(jsonl&&csv&&jobs_file,"raw output already exists or cannot be opened");
++        dead_file=std::fopen((o.out+"/dead-trace.csv").c_str(),"wx");
++        latency_file=std::fopen((o.out+"/command-latency.csv").c_str(),"wx");
++        REQUIRE(jsonl&&csv&&jobs_file&&dead_file&&latency_file,"raw output already exists or cannot be opened");
++        std::fprintf(dead_file,"cycle,event,valid_mask,dead_mask,victim_way,victim_dead,victim_valid,victim_pscid,victim_vpn\n");
++        std::fprintf(latency_file,"command,submit,inval_decode,inval_pulse,first_fence_complete,submit_to_fence,cq_fetch_register,cq_decode,cq_fence,other\n");
+         std::fprintf(csv,"cycle,era,event,lane,job,address,value,aux\n");
+         std::fprintf(jobs_file,"era,lane,job,src_iova,dst_iova,src_pa,dst_pa,next_id,issue_cycle,done_cycle,poll_done_cycle,ar,aw,r_beats,w_beats,b\n");
+         lane[0].lane=0;lane[1].lane=1;
+     }
+-    ~Tb(){t->final();if(jsonl)std::fclose(jsonl);if(csv)std::fclose(csv);if(jobs_file)std::fclose(jobs_file);}
++    ~Tb(){t->final();if(jsonl)std::fclose(jsonl);if(csv)std::fclose(csv);if(jobs_file)std::fclose(jobs_file);if(dead_file)std::fclose(dead_file);if(latency_file)std::fclose(latency_file);}
+     void event(const char* name,int l=-1,int j=-1,U64 address=0,U64 value=0,U64 aux=0) {
+         std::fprintf(jsonl,"{\"cycle\":%ld,\"era\":%s,\"event\":%s,\"lane\":%d,\"job\":%d,\"address\":%llu,\"value\":%llu,\"aux\":%llu}\n",
+             cycle,quoted(era).c_str(),quoted(name).c_str(),l,j,(unsigned long long)address,(unsigned long long)value,(unsigned long long)aux);
+@@ -205,6 +233,11 @@
+         event("invalidation",-1,-1,U64(t->dbg_inval_vpn)<<12,t->dbg_inval_pscid,
+               unsigned(t->dbg_inval_av)|(unsigned(t->dbg_inval_pscv)<<1)|(unsigned(t->dbg_inval_gv)<<2));
+         REQUIRE(!t->dbg_inval_gv,"experiment requires S2 Bare/GV0");
++        for(auto it=dead.begin();it!=dead.end();){
++            if((!t->dbg_inval_pscv||it->first==t->dbg_inval_pscid)&&
++               (!t->dbg_inval_av||it->second==t->dbg_inval_vpn))it=dead.erase(it);else ++it;
++        }
++        if(!cmd_latency.empty())cmd_latency.front().inval=cycle;
+         std::set<Key> unique;
+         for(unsigned i=0;i<16;++i){
+             const U64 vpn=bits(t->dbg_tags_vpn,i*27,27);const unsigned ps=bits(t->dbg_tags_pscid,i*20,20);
+@@ -219,9 +252,64 @@
+             if(unique.insert(key).second)event("inval_removed_key",vpn>=(B_IOVA>>12)&&vpn<((B_IOVA>>12)+o.b_pages)?0:1,-1,vpn<<12,ps);
+         }
+     }
++    bool work_window()const {
++        return measured&&(final_a<0||measured_done[0]<o.b_jobs);
++    }
++    unsigned dead_mask()const {
++        unsigned mask=0;
++        for(unsigned i=0;i<16;++i)if((t->dbg_tags_valid>>i)&1){
++            Key key{unsigned(bits(t->dbg_tags_pscid,i*20,20)),bits(t->dbg_tags_vpn,i*27,27)};
++            if(dead.count(key))mask|=1u<<i;
++        }
++        return mask;
++    }
++    void observe_dead_and_time() {
++        const unsigned mask=dead_mask(),valid=t->dbg_tags_valid;
++        const unsigned n=__builtin_popcount(mask),nv=__builtin_popcount(valid);
++        if(work_window()){
++            dead_slot_cycles+=n;++dead_sample_cycles;dead_valid_cycles+=nv;dead_peak=std::max(dead_peak,U64(n));
++            if(mask!=previous_dead_mask||valid!=previous_valid_mask)
++                std::fprintf(dead_file,"%ld,occupancy,%u,%u,-1,-1,-1,0,0\n",cycle,valid,mask);
++        }
++        previous_dead_mask=mask;previous_valid_mask=valid;
++        if(t->dbg_iotlb_fill){
++            unsigned victims=t->dbg_iotlb_replace_en;
++            REQUIRE(__builtin_popcount(victims)==1,"IOTLB update must select exactly one victim");
++            unsigned way=__builtin_ctz(victims);bool is_valid=(valid>>way)&1,is_dead=(mask>>way)&1;
++            if(work_window()){if(!is_valid)++empty_fills;else if(is_dead)++dead_replacements;else ++live_replacements;}
++            std::fprintf(dead_file,"%ld,replacement,%u,%u,%u,%u,%u,%llu,%llu\n",cycle,valid,mask,way,is_dead,is_valid,
++                (unsigned long long)bits(t->dbg_tags_pscid,way*20,20),(unsigned long long)bits(t->dbg_tags_vpn,way*27,27));
++            event("victim",-1,int(way),bits(t->dbg_tags_vpn,way*27,27)<<12,is_dead,is_valid);
++        }
++        if(t->dbg_ptw_start)pte_a_pending=t->dbg_walk_did==11;
++        else if(t->dbg_ptw_state==0)pte_a_pending=0;
++        if(measured&&final_a<0){
++            if(flush.busy){
++                ++wall_flush;
++                if(t->dbg_cq_state==1||t->dbg_cq_state==2)++flush_cq_fetch;
++                else if(t->dbg_cq_decode&&t->dbg_cq_opcode==1)++flush_cq_decode;
++                else if((t->dbg_cq_decode&&t->dbg_cq_opcode==2)||t->dbg_iofence_wait)++flush_cq_fence;
++                else ++flush_other;
++            }else if(active[1]&&active[1]->issue>=0&&active[1]->done<0){
++                bool a_read_pending=false;
++                for(const Read& q:readq)if(q.job&&q.job->lane==1){a_read_pending=true;break;}
++                bool a_getting_r=!readq.empty()&&readq.front().job&&readq.front().job->lane==1&&t->mem_r_valid&&t->mem_r_ready;
++                if(pte_a_pending)++wall_copy_pte;
++                else if(a_read_pending&&!a_getting_r)++wall_copy_payload_wait;
++                else ++wall_copy_other;
++            }else ++wall_host;
++        }
++        for(CmdLatency& c:cmd_latency){
++            if(t->dbg_cq_state==1||t->dbg_cq_state==2)++c.cq_fetch;
++            else if(t->dbg_cq_decode&&t->dbg_cq_opcode==1)++c.cq_decode;
++            else if((t->dbg_cq_decode&&t->dbg_cq_opcode==2)||t->dbg_iofence_wait)++c.cq_fence;
++            else ++c.other;
++        }
++    }
+     void observe() {
+         if(!t->rst_ni)return;
+         REQUIRE(!t->dbg_fault,"IOMMU/CQ fault asserted; cause="+std::to_string(t->dbg_fault_cause));
++        observe_dead_and_time();
+         state("cq_state",t->dbg_cq_state);state("tl_state",t->dbg_tl_state);
+         state("ptw_state",t->dbg_ptw_state);
+         state("ptw_control",unsigned(t->dbg_ptw_init)|(unsigned(t->dbg_ptw_edge_trigger)<<1));
+@@ -249,11 +337,24 @@
+             event("cq_decode",-1,-1,t->dbg_cq_head,t->dbg_cq_opcode,t->dbg_cq_func3);
+             if(measured){++decode_count;if(t->dbg_cq_opcode==1)++inv_count;else if(t->dbg_cq_opcode==2)++fence_count;else REQUIRE(false,"unexpected measured CQ opcode");}
+             last_fence_decode=t->dbg_cq_opcode==2;
++            if(t->dbg_cq_opcode==1&&!cmd_latency.empty())cmd_latency.front().decode=cycle;
+             last_fence_av=(read64(CQ_BASE+U64((t->dbg_cq_head+CQ_ENTRIES-1)%CQ_ENTRIES)*16)>>10)&1;
++            // PR/PW test overlay holds CQH at the fence until completion.
++            if(o.mainline()&&t->dbg_cq_opcode==2)last_fence_av=0;
+         }
+         if(previous_cq_state!=0&&t->dbg_cq_state==0&&last_fence_decode){
+             event("cq_fence_complete",-1,-1,0,last_fence_av,t->dbg_cq_head);last_fence_decode=false;
+             if(measured)++fence_completed;
++            if(measured&&!cmd_latency.empty()){
++                CmdLatency c=cmd_latency.front();cmd_latency.pop_front();
++                REQUIRE(c.other>0,"missing terminal idle timing sample");--c.other;
++                U64 dt=cycle-c.submit;++command_latency_count;command_latency_sum+=dt;
++                REQUIRE(c.cq_fetch+c.cq_decode+c.cq_fence+c.other==dt,"command latency partition does not sum");
++                command_latency_min=std::min(command_latency_min,dt);command_latency_max=std::max(command_latency_max,dt);
++                std::fprintf(latency_file,"%llu,%ld,%ld,%ld,%ld,%llu,%llu,%llu,%llu,%llu\n",
++                    (unsigned long long)command_latency_count,c.submit,c.decode,c.inval,cycle,(unsigned long long)dt,
++                    (unsigned long long)c.cq_fetch,(unsigned long long)c.cq_decode,(unsigned long long)c.cq_fence,(unsigned long long)c.other);
++            }
+         }
+         previous_cq_state=t->dbg_cq_state;
+         if(t->dbg_cq_write_b_fire){++all_marker_b;event("cq_marker_b",-1,-1,MARKER,read64(MARKER));}
+@@ -276,14 +377,42 @@
+     }
+     void tick() {
+         REQUIRE(cycle<CYCLE_LIMIT,"configuration cycle watchdog");
+-        REQUIRE(cycle-last_progress<STALL_LIMIT,"no-progress watchdog (see watchdog.json/recent events)");
++        REQUIRE(cycle-last_progress<STALL_LIMIT||(o.fq()&&!fq_entries.empty()&&fq_due>=0&&cycle<=fq_due+STALL_LIMIT),"no-progress watchdog (see watchdog.json/recent events)");
+         t->cfg_valid=bool(cfg);t->cfg_target=cfg?cfg->target:0;t->cfg_write=cfg?cfg->write:0;
+         t->cfg_addr=cfg?cfg->addr:0;t->cfg_wdata=cfg?cfg->data:0;t->cfg_wstrb=cfg?cfg->strb:0;t->cfg_size=cfg?cfg->size:3;
+         pending_inval_ways=0;
++        t->oracle_remove_i=oracle_pending;
++        t->sim_fence_read_done_i=!prpw_active||payload_reads_done>=fence_read_goal;
++        t->sim_fence_write_done_i=!prpw_active||payload_writes_done>=fence_write_goal;
+         t->clk_i=0;drive_memory();t->eval();
++        if(t->rst_ni&&t->dbg_iofence_decode&&(t->dbg_iofence_pr||t->dbg_iofence_pw)&&!prpw_active){
++            REQUIRE(o.mainline(),"unexpected PR/PW command outside mainline mode");
++            prpw_active=true;
++            fence_read_goal=comp_reads+((t->dbg_comp_bus&3)==3);
++            fence_write_goal=comp_writes+((t->dbg_comp_bus&(3u<<5))==(3u<<5));
++            if(measured)++prpw_fences;
++            event("prpw_begin",-1,-1,0,fence_read_goal,fence_write_goal);
++        }
++        if(prpw_active){
++            t->sim_fence_read_done_i=payload_reads_done>=fence_read_goal;
++            t->sim_fence_write_done_i=payload_writes_done>=fence_write_goal;
++            t->eval();
++        }
++        const bool prpw_complete=t->rst_ni&&t->dbg_iofence_complete&&prpw_active;
++        if(prpw_complete){
++            REQUIRE(payload_reads_done>=fence_read_goal&&payload_writes_done>=fence_write_goal,"fence completed before prior payload cohort");
++            event("prpw_complete",-1,-1,0,payload_reads_done,payload_writes_done);
++        }
++        if(t->rst_ni&&t->dbg_iofence_wait&&measured)++prpw_wait_cycles;
++        if(t->rst_ni){
++            if((t->dbg_comp_bus&3)==3)++comp_reads;
++            if((t->dbg_comp_bus&(3u<<5))==(3u<<5))++comp_writes;
++        }
+         const bool ar=t->mem_ar_valid&&t->mem_ar_ready,aw=t->mem_aw_valid&&t->mem_aw_ready;
+         const bool w=t->mem_w_valid&&t->mem_w_ready,b=t->mem_b_valid&&t->mem_b_ready,r=t->mem_r_valid&&t->mem_r_ready;
+         const bool sampled_inval=t->rst_ni&&t->dbg_inval;
++        if(oracle_pending&&t->dbg_iotlb_fill)
++            REQUIRE(t->dbg_iotlb_update_pscid!=t->oracle_pscid_i||t->dbg_iotlb_update_vpn!=t->oracle_vpn_i,"ORACLE unmap overlaps fill of same key");
+         const U64 wd=t->mem_w_data;const unsigned ws=t->mem_w_strb;const bool wl=t->mem_w_last;
+         Read nr;Write nw;
+         if(t->rst_ni){
+@@ -323,6 +452,12 @@
+             observe_done();
+         }
+         t->clk_i=1;t->eval();
++        if(prpw_complete)prpw_active=false;
++        if(oracle_pending){
++            REQUIRE(!tags_contain(o.pscid_a(),t->oracle_vpn_i),"ORACLE left unmapped tag valid after edge");
++            event("oracle_remove",1,int(a_index),U64(t->oracle_vpn_i)<<12,o.pscid_a());
++            oracle_pending=false;t->oracle_remove_i=0;
++        }
+         if(sampled_inval){
+             REQUIRE((t->dbg_tags_valid&pending_inval_ways)==0,"invalidation predicted way remained valid after rising edge");
+             unsigned n=0;for(unsigned i=0;i<16;++i)n+=(pending_inval_ways>>i)&1;
+@@ -332,8 +467,9 @@
+         if(ar)readq.push_back(nr);if(aw)writeq.push_back(nw);
+         if(w){REQUIRE(!writeq.empty(),"model W queue empty");Write& h=writeq.front();write64(h.addr+U64(h.beat)*8,wd,ws);++h.beat;
+             if(wl){bq.push_back(B{h.id,h.job});writeq.pop_front();}}
+-        if(b)bq.pop_front();
+-        if(r){if(readq.front().beat==readq.front().len)readq.pop_front();else ++readq.front().beat;}
++        if(b){if(bq.front().job)++payload_writes_done;bq.pop_front();}
++        if(r){if(readq.front().beat==readq.front().len){if(readq.front().job)++payload_reads_done;readq.pop_front();}else ++readq.front().beat;}
++        REQUIRE(payload_reads_done<=comp_reads&&payload_writes_done<=comp_writes,"global completions precede processed IOMMU requests");
+         t->clk_i=0;t->eval();++cycle;
+     }
+     bool owner_pending(unsigned owner)const {
+@@ -420,17 +556,58 @@
+         const unsigned head=t->dbg_cq_head;REQUIRE((tail+1)%CQ_ENTRIES!=head,"command queue overflow");
+         const U64 addr=CQ_BASE+U64(tail)*16;write64(addr,lo);write64(addr+8,hi);
+         event("cq_submit",-1,-1,addr,lo&127,(lo>>7)&7);if(measured)++submit_count;tail=(tail+1)%CQ_ENTRIES;
++        if(measured&&(lo&127)==1){CmdLatency c;c.submit=cycle;cmd_latency.push_back(c);}
+     }
+     void start_flush(U64 iova,bool force_wide=false) {
+         REQUIRE(!flush.busy,"overlapping A flush groups");flush=Flush{};flush.busy=true;flush.iova=iova;flush.wide=force_wide;
+         flush.begin=cycle;flush.id=unsigned(rounds);if(measured)++rounds;
+-        bool scoped=!force_wide&&(o.mode=="m2"||o.mode=="m3"),av=scoped&&o.mode=="m3";
++        bool scoped=o.mainline()||(!force_wide&&(o.mode=="m2"||o.mode=="m3"));
++        bool av=!force_wide&&(o.mode=="m3"||o.mode=="ml-strict");
+         U64 lo=1|(U64(av)<<10)|(scoped?(U64(o.pscid_a())<<12)|(1ULL<<32):0);
+-        put_command(lo,av?(iova>>2):0);put_command(2,0);flush.first_goal=tail;
++        put_command(lo,av?(iova>>2):0);if(!o.mainline())put_command(2,0);flush.first_goal=tail;
+         event("cq_round_begin",1,int(a_index),iova,flush.id,scoped|(unsigned(av)<<1));
++    }
++    void enqueue_fq(Key key) {
++        REQUIRE(fq_entries.size()<FQ_CAPACITY,"FQ capacity violated");fq_entries.push_back(key);
++        fq_peak=std::max(fq_peak,U64(fq_entries.size()));
++        if(fq_due<0)fq_due=cycle+FQ_TIMEOUT_CYCLES;
++        event("fq_enqueue",1,int(a_index),key.second<<12,fq_entries.size(),fq_due);
++    }
++    void complete_flush() {
++        event("cq_round_complete",1,int(a_index),flush.iova,flush.id,cycle-flush.begin);
++        if(measured)total_waiting+=cycle-flush.begin;
++        if(flush_fq){
++            for(Key key:fq_entries){REQUIRE(reserved_iovas.erase(key)==1,"FQ releases an unreserved IOVA");++fq_reclaimed;event("fq_release",1,-1,key.second<<12,key.first);}
++            fq_entries.clear();++fq_flushes;flush_fq=false;
++            if(fq_waiting_enqueue){enqueue_fq(waiting_enqueue);fq_waiting_enqueue=false;}
++            if(fq_entries.empty())fq_drain_end=cycle;
++        }else if(o.mode=="ml-strict"){
++            REQUIRE(reserved_iovas.erase(Key{o.pscid_a(),flush.iova>>12})==1,"strict releases an unreserved IOVA");
++        }
++        flush.busy=false;
+     }
+     void service_flush() {
+         if(!flush.busy||flush.cfg_busy)return;flush.cfg_busy=true;
++        if(o.mainline()){
++            if(flush.stage==0){
++                request(2,true,0x24,tail,2,[this](U64){
++                    flush.cfg_busy=false;if(measured)++doorbells;
++                    event("cq_doorbell",1,int(a_index),0,tail,1);
++                    put_command(2|(1ULL<<12)|(1ULL<<13),0);flush.last_goal=tail;flush.stage=2;
++                });
++            }else if(flush.stage==2){
++                request(2,true,0x24,tail,2,[this](U64){flush.cfg_busy=false;if(measured)++doorbells;
++                    event("cq_doorbell",1,int(a_index),0,tail,1);flush.stage=3;});
++            }else{
++                request(2,false,0x20,0,2,[this](U64 head){flush.cfg_busy=false;
++                    event("cq_head_poll",1,int(a_index),0,head,flush.last_goal);
++                    if(head!=flush.last_goal)return;
++                    REQUIRE(cmd_latency.empty(),"CQH poll returned before actual IOFENCE completion");
++                    complete_flush();
++                });
++            }
++            return;
++        }
+         if(flush.stage==0||flush.stage==2){
+             const unsigned count=flush.stage==0?2:1;
+             request(2,true,0x24,tail,2,[this,count](U64){flush.cfg_busy=false;event("cq_doorbell",1,int(a_index),0,tail,count);if(measured)++doorbells;++flush.stage;});
+@@ -439,19 +616,34 @@
+                 event("cq_head_poll",1,int(a_index),0,head,flush.stage==1?flush.first_goal:flush.last_goal);
+                 const unsigned goal=flush.stage==1?flush.first_goal:flush.last_goal;if(head!=goal)return;
+                 if(flush.stage==1){event("cq_first_head_seen",1,int(a_index),flush.iova,flush.id,head);put_command(2,0);flush.last_goal=tail;flush.stage=2;}
+-                else {event("cq_round_complete",1,int(a_index),flush.iova,flush.id,cycle-flush.begin);if(measured)total_waiting+=cycle-flush.begin;flush.busy=false;}
++                else complete_flush();
+             });
+         }
+     }
+     void map_region(bool src) {
+         U64 va=src?a_src(a_index):a_dst(a_index),pa=src?a_src_pa(a_index):a_dst_pa(a_index);
++        if(o.mainline())REQUIRE(reserved_iovas.insert(Key{o.pscid_a(),va>>12}).second,"IOVA allocated before prior FQ flush completed");
+         write64(pte_addr(va,true),pte(pa));++map_regions;event("map_region",1,int(a_index),va,pa,PAGE);
+-        if(o.map_policy=="full-api")start_flush(va,o.mode=="m4-16"||o.mode=="m4-64");
++        if(!o.mainline()&&o.map_policy=="full-api")start_flush(va,o.mode=="m4-16"||o.mode=="m4-64");
+     }
+     void unmap_region(bool src) {
+         U64 va=src?a_src(a_index):a_dst(a_index),pa=src?a_src_pa(a_index):a_dst_pa(a_index);
+         write64(pte_addr(va,true),0);++unmap_regions;++pending_regions;event("unmap_region",1,int(a_index),va,pa,PAGE);
+-        if(!o.batch())start_flush(va);
++        Key key{o.pscid_a(),va>>12};dead.insert(key);
++        if(o.mode=="oracle"){
++            REQUIRE(!oracle_pending,"overlapping ORACLE pulse");oracle_pending=true;
++            t->oracle_pscid_i=o.pscid_a();t->oracle_vpn_i=va>>12;
++        }
++        if(o.fq()){
++            if(fq_entries.size()==FQ_CAPACITY){
++                fq_waiting_enqueue=true;waiting_enqueue=key;flush_fq=true;++fq_full_flushes;start_flush(0,true);
++            }else enqueue_fq(key);
++        }else if(!o.batch())start_flush(va);
++    }
++    void service_fq() {
++        if(o.fq()&&!flush.busy&&!fq_entries.empty()&&fq_due>=0&&cycle>=fq_due){
++            fq_due=-1;last_progress=cycle;flush_fq=true;++fq_timer_flushes;event("fq_timer_expire",1,-1,0,fq_entries.size());start_flush(0,true);
++        }
+     }
+     void service_a() {
+         if(flush.busy){service_flush();return;}
+@@ -488,22 +680,31 @@
+         REQUIRE(measured_done[0]==o.b_jobs&&measured_done[1]==o.a_jobs,"measured COPY count mismatch");
+         REQUIRE(measured_issue[0]==o.b_jobs&&measured_issue[1]==o.a_jobs,"measured ISSUE count mismatch");
+         U64 expected_rounds=0;if(o.mode!="m0"){
+-            const U64 maps=o.map_policy=="full-api"?2*o.a_jobs:0;
++            const U64 maps=!o.mainline()&&o.map_policy=="full-api"?2*o.a_jobs:0;
+             const U64 unmaps=o.batch()?(2*o.a_jobs+o.batch()-1)/o.batch():2*o.a_jobs;
+-            expected_rounds=maps+unmaps;
++            expected_rounds=o.fq()?fq_timer_flushes+fq_full_flushes:maps+unmaps;
+             REQUIRE(map_regions==2*o.a_jobs&&unmap_regions==2*o.a_jobs,"map/unmap region count mismatch");
+         }else REQUIRE(!map_regions&&!unmap_regions,"M0 persistent mapping changed during measurement");
+-        REQUIRE(rounds==expected_rounds&&inv_count==expected_rounds&&fence_count==2*expected_rounds&&fence_completed==2*expected_rounds,"CQ opcode/completion counts mismatch");
+-        REQUIRE(submit_count==3*expected_rounds&&decode_count==submit_count&&doorbells==2*expected_rounds,"CQ submit/decode/doorbell conservation");
++        const U64 fences=(o.mainline()?1:2)*expected_rounds;
++        REQUIRE(rounds==expected_rounds&&inv_count==expected_rounds&&fence_count==fences&&fence_completed==fences,"CQ opcode/completion counts mismatch");
++        REQUIRE(submit_count==expected_rounds+fences&&decode_count==submit_count&&doorbells==2*expected_rounds,"CQ submit/decode/doorbell conservation");
+         REQUIRE(inval_verified_events==expected_rounds,"invalidation pulse/post-edge verification conservation");
++        REQUIRE(command_latency_count==expected_rounds&&cmd_latency.empty(),"per-command timing conservation");
++        REQUIRE(!prpw_active&&payload_reads_done==comp_reads&&payload_writes_done==comp_writes,"payload/fence cohort not drained");
++        REQUIRE(prpw_fences==(o.mainline()?expected_rounds:0),"PR/PW fence count mismatch");
++        REQUIRE(wall_host+wall_flush+wall_copy_pte+wall_copy_payload_wait+wall_copy_other==U64(final_a-t0),"A wall-time partition does not sum");
++        REQUIRE(flush_cq_fetch+flush_cq_decode+flush_cq_fence+flush_other==wall_flush,"flush partition does not sum");
++        if(o.mainline())REQUIRE(reserved_iovas.empty(),"unreclaimed IOVA after full drain");
++        if(o.fq())REQUIRE(fq_reclaimed==2*o.a_jobs&&fq_entries.empty(),"FQ page retirement mismatch");
+         for(unsigned l=0;l<2;++l)REQUIRE(stats[l].misses==stats[l].inval+stats[l].cold+stats[l].replacement,"miss attribution partition");
+         commands_ok=true;
+     }
+     void run() {
+-        setup_memory();reset_and_program();drain();if(o.smoke)smoke_marker();warm();
++        setup_memory();reset_and_program();drain();if(o.smoke)smoke_marker();
++        if(!o.a_alone)warm();else{warm_resident=true;warm_no_walk=true;}
+         era="measure";t0=cycle;measured=true;last_progress=cycle;event("measure_begin");
+         init_lane(0,o.b_jobs);lane[1].enabled=false;
+-        while(!lane[0].finished||a_state!=AState::FINISH){service_lane(0);service_a();step();}
++        while(!lane[0].finished||a_state!=AState::FINISH||!fq_entries.empty()||flush.busy){service_lane(0);service_fq();service_a();step();}
+         drain();const U64 csr=blocking(2,false,0x48,0,2);
+         REQUIRE((csr&0xF00)==0,"CQCSR error status after all work");
+         REQUIRE(blocking(2,false,0x20,0,2)==tail,"final CQH/CQT mismatch");drain();
+@@ -524,7 +725,19 @@
+             quoted(o.case_id).c_str(),quoted(o.domain).c_str(),o.b_pages,quoted(o.mode).c_str(),quoted(o.map_policy).c_str(),o.a_jobs,o.b_jobs,quoted(base).c_str(),o.smoke?"true":"false",t0,measure_end);
+         bool first=true;auto m=[&](const char* name,long long value){std::fprintf(f,"%s%s:%lld",first?"":",",quoted(name).c_str(),value);first=false;};
+         m("T_A",last_done[1]<0?-1:last_done[1]-t0);m("T_B",last_done[0]<0?-1:last_done[0]-t0);
+-        m("A_final_flush_end",final_a<0?-1:final_a-t0);m("T_end",final_a<0||last_done[0]<0?-1:std::max(final_a,last_done[0])-t0);
++        m("A_final_flush_end",final_a<0?-1:final_a-t0);m("T_end",final_a<0?-1:std::max(final_a,last_done[0])-t0);
++        m("fq_drain_end",fq_drain_end<0?-1:fq_drain_end-t0);m("fq_timeout_cycles",FQ_TIMEOUT_CYCLES);m("fq_capacity",FQ_CAPACITY);
++        m("fq_peak",fq_peak);m("fq_flushes",fq_flushes);m("fq_timer_flushes",fq_timer_flushes);m("fq_full_flushes",fq_full_flushes);m("fq_reclaimed",fq_reclaimed);
++        m("dead_slot_cycles",dead_slot_cycles);m("dead_sample_cycles",dead_sample_cycles);m("dead_valid_cycles",dead_valid_cycles);m("dead_peak",dead_peak);
++        m("dead_replacements",dead_replacements);m("live_replacements",live_replacements);m("empty_fills",empty_fills);
++        m("A_wall_host",wall_host);m("A_wall_flush",wall_flush);m("A_wall_copy_pte",wall_copy_pte);
++        m("A_wall_copy_payload_wait",wall_copy_payload_wait);m("A_wall_copy_other",wall_copy_other);
++        m("A_flush_cq_fetch",flush_cq_fetch);m("A_flush_cq_decode",flush_cq_decode);m("A_flush_cq_fence",flush_cq_fence);m("A_flush_other",flush_other);
++        m("command_latency_count",command_latency_count);m("command_latency_sum",command_latency_sum);
++        m("command_latency_min",command_latency_count?command_latency_min:0);m("command_latency_max",command_latency_max);
++        m("prpw_fences",prpw_fences);m("prpw_wait_cycles",prpw_wait_cycles);
++        m("comp_read_requests",comp_reads);m("comp_write_requests",comp_writes);
++        m("payload_read_completed",payload_reads_done);m("payload_write_completed",payload_writes_done);
+         for(unsigned l=0;l<2;++l){std::string p=l?"A_":"B_";const Counters&s=stats[l];
+             m((p+"hits").c_str(),s.hits);m((p+"misses").c_str(),s.misses);m((p+"walks").c_str(),s.walks);
+             m((p+"invalidation_attributed_misses").c_str(),s.inval);m((p+"cold_misses").c_str(),s.cold);m((p+"replacement_misses").c_str(),s.replacement);
+@@ -533,7 +746,7 @@
+         m("cq_fence_completed",fence_completed);m("inval_post_edge_verified_events",inval_verified_events);m("inval_post_edge_verified_ways",inval_verified_ways);
+         m("cq_doorbells",doorbells);m("cq_peak",cq_peak);m("cq_entry_cycles",cq_entry_cycles);m("cq_rounds",rounds);m("cq_total_waiting",total_waiting);
+         m("map_regions",map_regions);m("unmap_regions",unmap_regions);
+-        std::fprintf(f,"},\"checks\":{\"passed\":%s,\"data\":%s,\"quiet\":%s,\"commands\":%s,\"warm_resident\":%s,\"warm_no_extra_walks\":%s},\"failure\":%s,\"limitations\":[\"Host PTE writes are direct model memory writes; CPU cost is not counted.\",\"Fixed F5 legacy RTL with disclosed functional repairs; not an unchanged stock execution.\",\"Legal two-level 32-byte DDT with DID10/11 below64; common extra root read avoids original one-level 64-byte stride defect without changing RTL.\",\"M4 models delayed unmap; no claim that Linux C provides this FQ policy.\",\"DDR startup16 at FIFO head, one 64-bit beat per cycle, no read reordering.\"]}\n",
++        std::fprintf(f,"},\"checks\":{\"passed\":%s,\"data\":%s,\"quiet\":%s,\"commands\":%s,\"warm_resident\":%s,\"warm_no_extra_walks\":%s},\"failure\":%s,\"limitations\":[\"Host PTE writes are direct model memory writes; CPU cost is not counted.\",\"Fixed F5 legacy RTL with disclosed functional repairs; no CPU/Linux execution.\",\"Mainline modes model enabled DMA-IOMMU, leaf-only 4KiB unmaps, one CPU FQ, successful commands.\",\"ML commands use one PR/PW=1 fence. Test-only CQ overlay waits for the previously processed device cohort at modeled DDR RLAST/B; production RTL omits PR/PW.\",\"ORACLE test-only ports clear valid on the first clock edge after unmap, no command or wait.\",\"FQ timeout=10ms at declared 50MHz/HZ1000 equivalence, 500000 cycles. A API completion and deferred drain are separate.\",\"Dead occupancy window ends at both A API completion and B COPYDONE; it excludes later idle timer drain.\",\"A wall partitions are mutually exclusive state occupancy, not individually causal wait savings.\",\"DDR startup16 at FIFO head, one 64-bit beat per cycle, no read reordering.\"]}\n",
+             passed?"true":"false",data_ok?"true":"false",quiet_ok?"true":"false",commands_ok?"true":"false",warm_resident?"true":"false",warm_no_walk?"true":"false",failure.empty()?"null":quoted(failure).c_str());std::fclose(f);
+     }
+ };
+@@ -542,11 +755,14 @@
+     for(int i=1;i<argc;++i){std::string k=argv[i];auto val=[&](){REQUIRE(i+1<argc,"missing argument value");return std::string(argv[++i]);};
+         if(k=="--out")o.out=val();else if(k=="--mode")o.mode=val();else if(k=="--domain")o.domain=val();
+         else if(k=="--b-pages")o.b_pages=std::stoul(val());else if(k=="--map-policy")o.map_policy=val();
++        else if(k=="--a-jobs")o.a_jobs=std::stoul(val());else if(k=="--b-jobs")o.b_jobs=std::stoul(val());else if(k=="--a-alone")o.a_alone=true;
+         else if(k=="--case-id")o.case_id=val();else if(k=="--smoke")o.smoke=true;else throw Failure("unknown option: "+k);}
+     REQUIRE(!o.out.empty(),"--out required");REQUIRE(o.domain=="same"||o.domain=="different","domain");
+     REQUIRE(o.b_pages==4||o.b_pages==8,"B footprint");REQUIRE(o.map_policy=="full-api"||o.map_policy=="unmap-only","map policy");
+-    REQUIRE(o.mode=="m0"||o.mode=="m1"||o.mode=="m2"||o.mode=="m3"||o.mode=="m4-16"||o.mode=="m4-64","mode");
++    REQUIRE(o.mode=="m0"||o.mode=="m1"||o.mode=="m2"||o.mode=="m3"||o.mode=="ml-strict"||o.mode=="ml-fq"||o.mode=="oracle","mode");
+     if(o.smoke){o.a_jobs=1;o.b_jobs=8;}
++    if(o.a_alone)o.b_jobs=0;
++    REQUIRE(o.a_jobs>0&&o.a_jobs<=256,"A jobs must fit frozen L0 page");
+     if(o.case_id.empty())o.case_id=o.domain+"-b"+std::to_string(o.b_pages)+"-"+o.mode+"-"+o.map_policy;
+     Tb tb(o);try{tb.run();}catch(const std::exception&e){tb.failure=e.what();tb.event("failure",-1,-1,0,0);tb.dump_failure();}
+     tb.summary();std::printf("RESULT %s cycle=%ld failure=%s\n",tb.passed?"PASS":"FAIL",tb.cycle,tb.failure.c_str());return tb.passed?0:1;
+--- previous/runner/invalidation_dma_top.sv
++++ runner/invalidation_dma_top.sv
+@@ -5,6 +5,18 @@
+ module invalidation_dma_top (
+     input logic clk_i,
+     input logic rst_ni,
++`ifndef SYNTHESIS
++    input logic sim_fence_read_done_i,
++    input logic sim_fence_write_done_i,
++`endif
++
++`ifndef SYNTHESIS
++    // Simulation-only ORACLE: omniscient immediate removal, no software interface.
++    input logic oracle_remove_i,
++    input logic [19:0] oracle_pscid_i,
++    input logic [26:0] oracle_vpn_i,
++`endif
++
+     input logic cfg_valid,
+     input logic cfg_write,
+     input logic [1:0] cfg_target,
+@@ -101,7 +113,50 @@
+     output logic [2:0] dbg_tl_state,
+     output logic [1:0] dbg_ptw_state,
+     output logic dbg_ptw_init,
+-    output logic dbg_ptw_edge_trigger
++    output logic dbg_ptw_edge_trigger,
++    // AXI mask bits: ARV,ARR,RV,RR,RL,AWV,AWR,WV,WR,BV,BR (bit0 first).
++    output logic [2:0] dbg_cq_next_state,
++    output logic [1:0] dbg_cq_wr_state,
++    output logic dbg_cq_cmd_complete,
++    output logic dbg_iofence_wait,
++    output logic dbg_iofence_decode,
++    output logic dbg_iofence_complete,
++    output logic dbg_iofence_av,
++    output logic dbg_iofence_pr,
++    output logic dbg_iofence_pw,
++    output logic dbg_tl_active,
++    output logic [23:0] dbg_tl_active_did,
++    output logic [63:0] dbg_tl_active_iova,
++    output logic [3:0] dbg_tl_active_ttype,
++    output logic [2:0] dbg_tl_next_state,
++    output logic dbg_tl_resp_valid,
++    output logic dbg_tl_resp_ready,
++    output logic [10:0] dbg_cq_bus,
++    output logic [10:0] dbg_ptw_bus,
++    output logic [10:0] dbg_ddtw_bus,
++    output logic [10:0] dbg_ds_bus,
++    output logic [10:0] dbg_comp_bus,
++    output logic [10:0] dbg_dma0_bus,
++    output logic [10:0] dbg_dma1_bus,
++    output logic [63:0] dbg_cq_ar_addr,
++    output logic [63:0] dbg_ptw_ar_addr,
++    output logic [63:0] dbg_ddtw_ar_addr,
++    output logic [63:0] dbg_ds_ar_addr,
++    output logic [63:0] dbg_comp_ar_addr,
++    output logic [63:0] dbg_comp_aw_addr,
++    output logic [3:0] dbg_ds_ar_id,
++    output logic [3:0] dbg_ds_r_id,
++    output logic [3:0] dbg_comp_ar_id,
++    output logic [3:0] dbg_comp_aw_id,
++    output logic [3:0] dbg_comp_r_id,
++    output logic [3:0] dbg_comp_b_id,
++    output logic dbg_iotlb_update,
++    output logic dbg_iotlb_fill,
++    output logic [26:0] dbg_iotlb_update_vpn,
++    output logic [19:0] dbg_iotlb_update_pscid,
++    output logic [15:0] dbg_iotlb_replace_en,
++    output logic [15:0] dbg_iotlb_lu_hit_vec,
++    output logic [14:0] dbg_iotlb_plru
+ );
+   typedef logic [63:0] addr_t;
+   typedef logic [63:0] data_t;
+@@ -177,7 +232,12 @@
+     .axi_ds_ar_chan_t(bus_ar_chan_t),.axi_ds_r_chan_t(bus_r_chan_t),.axi_ds_req_t(bus_req_t),.axi_ds_resp_t(bus_resp_t),
+     .axi_prog_aw_chan_t(cfg_aw_chan_t),.axi_prog_w_chan_t(cfg_w_chan_t),.axi_prog_b_chan_t(cfg_b_chan_t),
+     .axi_prog_ar_chan_t(cfg_ar_chan_t),.axi_prog_r_chan_t(cfg_r_chan_t),.axi_prog_req_t(cfg_req_t),.axi_prog_resp_t(cfg_resp_t)
+-  ) i_iommu(.clk_i,.rst_ni,.tr_req_i(tr_req),.tr_resp_o(tr_rsp),
++  ) i_iommu(.clk_i,.rst_ni,
++`ifndef SYNTHESIS
++    .oracle_remove_i,.oracle_pscid_i,.oracle_vpn_i,
++    .sim_fence_read_done_i,.sim_fence_write_done_i,
++`endif
++    .tr_req_i(tr_req),.tr_resp_o(tr_rsp),
+     .comp_resp_i(comp_rsp),.comp_req_o(comp_req),.ds_resp_i(ds_rsp),.ds_req_o(ds_req),
+     .prog_req_i(cfg_req[2]),.prog_resp_o(cfg_rsp[2]),
+     .ats_upstream_req_o(),.ats_upstream_resp_i(1'b0),.ats_downstream_req_i(1'b0),.ats_downstream_resp_o(),.wsi_wires_o());
+@@ -358,6 +418,51 @@
+     assign dbg_tags_vpn[way*27+:27]={`IOTLB.tags_q[way].vpn2[8:0],`IOTLB.tags_q[way].vpn1,`IOTLB.tags_q[way].vpn0};
+     assign dbg_tags_pscid[way*20+:20]=`IOTLB.tags_q[way].pscid;
+   end
++  // These signals only leave this independent simulation wrapper.
++  assign dbg_cq_next_state=`CQ.state_n;
++  assign dbg_cq_wr_state=`CQ.wr_state_q;
++  assign dbg_cq_cmd_complete=((`CQ.state_q==3)||(`CQ.state_q==4)||(`CQ.state_q==6))&&(`CQ.state_n==0);
++  assign dbg_iofence_wait=(`CQ.state_q==6);
++  assign dbg_iofence_decode=(`CQ.state_q==3)&&(`CQ.cmd_q[6:0]==7'd2);
++  assign dbg_iofence_complete=dbg_cq_cmd_complete&&(`CQ.cmd_q[6:0]==7'd2);
++  assign dbg_iofence_av=`CQ.cmd_iofence.av;
++  assign dbg_iofence_pr=`CQ.cmd_iofence.pr;
++  assign dbg_iofence_pw=`CQ.cmd_iofence.pw;
++  assign dbg_tl_active=`TL.req_valid;
++  assign dbg_tl_active_did=`TL.req_data.did;
++  assign dbg_tl_active_iova=`TL.req_data.iova;
++  assign dbg_tl_active_ttype=`TL.req_data.ttype;
++  assign dbg_tl_next_state=`TL.state_n;
++  assign dbg_tl_resp_valid=i_iommu.trans_resp_valid;
++  assign dbg_tl_resp_ready=i_iommu.trans_resp_ready;
++`define OBS_AXI_MASK(req,rsp) {req.b_ready,rsp.b_valid,rsp.w_ready,req.w_valid,rsp.aw_ready,req.aw_valid,rsp.r.last,req.r_ready,rsp.r_valid,rsp.ar_ready,req.ar_valid}
++  assign dbg_cq_bus=`OBS_AXI_MASK(i_iommu.cq_axi_req,i_iommu.cq_axi_resp);
++  assign dbg_ptw_bus=`OBS_AXI_MASK(i_iommu.ptw_axi_req,i_iommu.ptw_axi_resp);
++  assign dbg_ddtw_bus=`OBS_AXI_MASK(i_iommu.ddtw_axi_req,i_iommu.ddtw_axi_resp);
++  assign dbg_ds_bus=`OBS_AXI_MASK(ds_req,ds_rsp);
++  assign dbg_comp_bus=`OBS_AXI_MASK(comp_req,comp_rsp);
++  assign dbg_dma0_bus=`OBS_AXI_MASK(dma_req[0],dma_rsp[0]);
++  assign dbg_dma1_bus=`OBS_AXI_MASK(dma_req[1],dma_rsp[1]);
++`undef OBS_AXI_MASK
++  assign dbg_cq_ar_addr=i_iommu.cq_axi_req.ar.addr;
++  assign dbg_ptw_ar_addr=i_iommu.ptw_axi_req.ar.addr;
++  assign dbg_ddtw_ar_addr=i_iommu.ddtw_axi_req.ar.addr;
++  assign dbg_ds_ar_addr=ds_req.ar.addr;
++  assign dbg_comp_ar_addr=comp_req.ar.addr;
++  assign dbg_comp_aw_addr=comp_req.aw.addr;
++  assign dbg_ds_ar_id=ds_req.ar.id;
++  assign dbg_ds_r_id=ds_rsp.r.id;
++  assign dbg_comp_ar_id=comp_req.ar.id;
++  assign dbg_comp_aw_id=comp_req.aw.id;
++  assign dbg_comp_r_id=comp_rsp.r.id;
++  assign dbg_comp_b_id=comp_rsp.b.id;
++  assign dbg_iotlb_update=`IOTLB.update_i.update;
++  assign dbg_iotlb_fill=`IOTLB.update_i.update&&!`IOTLB.inval_i.inval_vma&&!`IOTLB.inval_i.inval_gvma;
++  assign dbg_iotlb_update_vpn=`IOTLB.update_i.vpn[26:0];
++  assign dbg_iotlb_update_pscid=`IOTLB.update_i.pscid;
++  assign dbg_iotlb_replace_en=`IOTLB.replace_en;
++  assign dbg_iotlb_lu_hit_vec=`IOTLB.lu_hit;
++  assign dbg_iotlb_plru=`IOTLB.plru_tree_q;
+ `undef TL
+ `undef PTW
+ `undef IOTLB
+--- frozen/cva6/corev_apu/riscv-iommu/rtl/rv_iommu_top.sv
++++ rtl-overlay/cva6/corev_apu/riscv-iommu/rtl/rv_iommu_top.sv
+@@ -70,6 +70,20 @@
+ ) (
+     input  logic clk_i,
+     input  logic rst_ni,
++
++
++`ifndef SYNTHESIS
++    // Simulation-only ORACLE: omniscient immediate removal, no software interface.
++    input logic oracle_remove_i,
++    input logic [19:0] oracle_pscid_i,
++    input logic [26:0] oracle_vpn_i,
++`endif
++
++
++`ifndef SYNTHESIS
++    input logic sim_fence_read_done_i,
++    input logic sim_fence_write_done_i,
++`endif
+ 
+     // Translation Request Interface (Slave)
+     input  axi_tr_req_t    tr_req_i,
+@@ -392,6 +406,12 @@
+             .axi_req_t          (axi_ds_req_t),
+             .axi_resp_t         (axi_ds_resp_t)
+         ) i_rv_iommu_tl_wrap (
++`ifndef SYNTHESIS
++            .oracle_remove_i (oracle_remove_i),
++            .oracle_pscid_i (oracle_pscid_i),
++            .oracle_vpn_i (oracle_vpn_i),
++`endif
++
+             .clk_i                  (clk_i),
+             .rst_ni                 (rst_ni),
+ 
+@@ -463,6 +483,12 @@
+             .axi_req_t          (axi_ds_req_t),
+             .axi_resp_t         (axi_ds_resp_t)
+         ) i_rv_iommu_tl_wrap (
++`ifndef SYNTHESIS
++            .oracle_remove_i (oracle_remove_i),
++            .oracle_pscid_i (oracle_pscid_i),
++            .oracle_vpn_i (oracle_vpn_i),
++`endif
++
+             .clk_i                  (clk_i),
+             .rst_ni                 (rst_ni),
+ 
+@@ -537,6 +563,11 @@
+         .iommu_reg_req_t   (iommu_reg_req_t),
+         .iommu_reg_rsp_t   (iommu_reg_rsp_t)
+     ) i_rv_iommu_sw_if_wrap (
++`ifndef SYNTHESIS
++        .sim_fence_read_done_i (sim_fence_read_done_i),
++        .sim_fence_write_done_i (sim_fence_write_done_i),
++`endif
++
+         .clk_i             (clk_i),
+         .rst_ni            (rst_ni),
+ 
+--- frozen/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_cq_handler.sv
++++ rtl-overlay/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_cq_handler.sv
+@@ -35,6 +35,12 @@
+ ) (
+     input  logic clk_i,
+     input  logic rst_ni,
++
++
++`ifndef SYNTHESIS
++    input logic sim_fence_read_done_i,
++    input logic sim_fence_write_done_i,
++`endif
+ 
+     // cqb
+     input  rv_iommu::ppn_t              cqb_ppn_i,
+@@ -113,6 +119,9 @@
+         DECODE,         // 011
+         WRITE,          // 100
+         ERROR           // 101
++`ifndef SYNTHESIS
++        , WAIT_PRPW      // 110: model cohort has not reached the global point
++`endif
+     }   state_q, state_n;
+ 
+     // Write FSM states
+@@ -279,6 +288,12 @@
+                     if (mem_resp_i.r.last) begin
+                         cmd_n[127:64]   = mem_resp_i.r.data[((64*1) &
+                                                 (RVIOMMUCfg.AxiDataWidth-1))+:64];
++`ifndef SYNTHESIS
++                        // Low 64b was latched on the first R beat. Defer only
++                        // PR/PW IOFENCE completion visibility; legacy PR=PW=0
++                        // retains the original REGISTER CQH advance.
++                        if (!(cmd_q[6:0] == rv_iommu::IOFENCE && (cmd_q[12] || cmd_q[13])))
++`endif
+                         cq_head_o       = (cq_head_i + 1) & idx_mask;
+                         state_n         = DECODE;
+                     end
+@@ -360,6 +375,11 @@
+                         else begin
+ 
+                             // TODO: Add IOFENCE support with PR and PW using R/W counters
++`ifndef SYNTHESIS
++                            // The independent test model supplies the completion
++                            // of a fixed pre-fence device-request cohort.
++                            // AV=1 + PR/PW and ATS are outside this test hook.
++`endif
+ 
+                             // From Spec:
+                             // If AV=1, the IOMMU writes DATA to memory at a 4-byte aligned address ADDR[63:2] * 4
+@@ -390,6 +410,21 @@
+                                   state_n = DECODE;
+                                end
+                             end
++`ifndef SYNTHESIS
++                            if (cmd_iofence.pr || cmd_iofence.pw) begin
++                                if (cmd_iofence.av || atsinval_inflight_i) begin
++                                    cqcsr_ill_o = 1'b1;
++                                    cqcsr_ill_wen_o = 1'b1;
++                                    state_n = ERROR;
++                                end else if ((cmd_iofence.pr && !sim_fence_read_done_i) ||
++                                             (cmd_iofence.pw && !sim_fence_write_done_i)) begin
++                                    state_n = WAIT_PRPW;
++                                end else begin
++                                    cq_head_o = (cq_head_i + 1) & idx_mask;
++                                    state_n = IDLE;
++                                end
++                            end
++`endif
+ 
+                         end
+                     end
+@@ -494,6 +529,17 @@
+                 endcase
+             end
+ 
++`ifndef SYNTHESIS
++            // DECODE runs once; only cohort completion is polled here.
++            WAIT_PRPW: begin
++                if ((!cmd_iofence.pr || sim_fence_read_done_i) &&
++                    (!cmd_iofence.pw || sim_fence_write_done_i)) begin
++                    cq_head_o = (cq_head_i + 1) & idx_mask;
++                    state_n = IDLE;
++                end
++            end
++`endif
++
+             // When an error occurs, the CQ stops processing commands until SW clear all error bits
+             // If CQ IE is set, the cip bit in the ipsr must be set
+             ERROR: begin
+--- frozen/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_sw_if_wrap.sv
++++ rtl-overlay/cva6/corev_apu/riscv-iommu/rtl/software_interface/rv_iommu_sw_if_wrap.sv
+@@ -46,6 +46,12 @@
+     input  logic clk_i,
+     input  logic rst_ni,
+ 
++
++`ifndef SYNTHESIS
++    input logic sim_fence_read_done_i,
++    input logic sim_fence_write_done_i,
++`endif
++
+     // From Prog IF
+     input  iommu_reg_req_t regmap_req_i,
+     output iommu_reg_rsp_t regmap_resp_o,
+@@ -177,6 +183,11 @@
+         .axi_req_t           (axi_req_t),
+         .axi_resp_t          (axi_resp_t)
+     ) i_rv_iommu_cq_handler (
++`ifndef SYNTHESIS
++        .sim_fence_read_done_i (sim_fence_read_done_i),
++        .sim_fence_write_done_i (sim_fence_write_done_i),
++`endif
++
+         .clk_i               (clk_i),
+         .rst_ni              (rst_ni),
+ 
+--- frozen/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_iotlb.sv
++++ rtl-overlay/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_iotlb.sv
+@@ -26,6 +26,14 @@
+ )(
+     input  logic                        clk_i,
+     input  logic                        rst_ni,
++
++
++`ifndef SYNTHESIS
++    // Simulation-only ORACLE: omniscient immediate removal, no software interface.
++    input logic oracle_remove_i,
++    input logic [19:0] oracle_pscid_i,
++    input logic [26:0] oracle_vpn_i,
++`endif
+ 
+     // Flush
+     input  rv_iommu::iotlb_inval_t      inval_i,
+@@ -318,6 +326,18 @@
+                 content_n[i] = update_i.content;
+             end
+         end
++`ifndef SYNTHESIS
++        // Last assignment wins, including a same-edge fill of this exact key.
++        // This is deliberately not an architected IOTINVAL/CQ implementation.
++        if (oracle_remove_i) begin
++            for (int unsigned i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++) begin
++                if (tags_n[i].valid && tags_n[i].en_1S && !tags_n[i].en_2S &&
++                    tags_n[i].pscid == oracle_pscid_i &&
++                    {tags_n[i].vpn2[8:0], tags_n[i].vpn1, tags_n[i].vpn0} == oracle_vpn_i)
++                    tags_n[i].valid = 1'b0;
++            end
++        end
++`endif
+     end
+ 
+     //-----------------------------------------------
+--- frozen/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv
++++ rtl-overlay/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_tl_wrap.sv
+@@ -51,6 +51,14 @@
+ ) (
+     input  logic    clk_i,
+     input  logic    rst_ni,
++
++
++`ifndef SYNTHESIS
++    // Simulation-only ORACLE: omniscient immediate removal, no software interface.
++    input logic oracle_remove_i,
++    input logic [19:0] oracle_pscid_i,
++    input logic [26:0] oracle_vpn_i,
++`endif
+ 
+     // Transaction controller request port
+     input  trans_req_data_t     trans_req_data_i,
+@@ -544,6 +552,12 @@
+     rv_iommu_iotlb #(
+         .RVIOMMUCfg     (RVIOMMUCfg)
+     ) i_rv_iommu_iotlb (
++`ifndef SYNTHESIS
++            .oracle_remove_i (oracle_remove_i),
++            .oracle_pscid_i (oracle_pscid_i),
++            .oracle_vpn_i (oracle_vpn_i),
++`endif
++
+         .clk_i          (clk_i),
+         .rst_ni         (rst_ni),
+ 

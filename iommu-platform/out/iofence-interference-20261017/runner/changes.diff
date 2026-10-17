@@ -1,0 +1,467 @@
+--- dead-translation-20261017/runner/invalidation_dma.cpp
++++ iofence-interference-20261017/runner/invalidation_dma.cpp
+@@ -46,9 +46,9 @@
+     return value;
+ }
+ struct Options {
+-    std::string out,mode="m1",domain="different",map_policy="full-api",case_id;
+-    unsigned b_pages=4,a_jobs=64,b_jobs=256;
+-    bool smoke=false,a_alone=false;
++    std::string out,mode="ml-strict",domain="different",map_policy="unmap-only",case_id,fence_policy="global";
++    unsigned b_pages=4,a_jobs=64,b_jobs=0,b_bytes=4096,b_gap=0;
++    bool smoke=false,a_alone=false,b_background=false;
+     bool mainline()const{return mode=="ml-strict"||mode=="ml-fq"||mode=="oracle";}
+     bool fq()const{return mode=="ml-fq"||mode=="oracle";}
+     unsigned pscid_a()const{return B_PSCID+(domain=="different");}
+@@ -59,7 +59,7 @@
+     Options o;
+     std::unique_ptr<Vinvalidation_dma_top> t{new Vinvalidation_dma_top};
+     FILE *jsonl=nullptr,*csv=nullptr,*jobs_file=nullptr;
+-    FILE *dead_file=nullptr,*latency_file=nullptr;
++    FILE *dead_file=nullptr,*latency_file=nullptr,*fences_file=nullptr;
+     long cycle=0,t0=-1,measure_end=-1,final_a=-1,last_done[2]={-1,-1};
+     std::string era="initial",failure;
+     bool measured=false,passed=false,data_ok=false,quiet_ok=false,commands_ok=false;
+@@ -84,6 +84,23 @@
+     U64 fence_read_goal=0,fence_write_goal=0,prpw_fences=0,prpw_wait_cycles=0;
+     bool prpw_active=false;
+     U64 pte_a_pending=0;
++    U64 comp_lane[2][2]={{0,0},{0,0}},done_lane[2][2]={{0,0},{0,0}};
++    U64 goals[2][2]={{0,0},{0,0}},done_now[2][2]={{0,0},{0,0}};
++    U64 work_comp_base[2][2]={{0,0},{0,0}},work_done_base[2][2]={{0,0},{0,0}};
++    U64 b_offered=0,b_overlap_busy=0,b_window_read_bytes=0,b_window_write_bytes=0;
++    U64 completed_bytes[2]={0,0},completed_rbeats[2]={0,0},completed_wbeats[2]={0,0};
++    U64 completed_ar[2]={0,0},completed_aw[2]={0,0},completed_b[2]={0,0};
++    U64 prpw_blocked_cycles=0,cohort_wait[2]={0,0};
++    long b_next_offer=0,b_stop=-1;
++    struct FenceTrace {
++        long submit=-1,inval_decode=-1,inval=-1,fence_submit=-1,decode=-1,complete=-1,idle=-1;
++        U64 fetch=0,reg=0,decode_cycles=0,wait=0,blocked=0,other=0,host_samples=0;
++        U64 pending[2]={0,0},goal[2][2]={{0,0},{0,0}},snapshot_done[2][2]={{0,0},{0,0}};
++        U64 same_ar[2]={0,0},same_aw[2]={0,0},same_rlast[2]={0,0},same_b[2]={0,0};
++        U64 inval_lo=0,inval_hi=0,fence_lo=0,fence_hi=0;
++        unsigned head_at_decode=0,head_at_idle=0;
++    } fence_trace;
++    bool trace_open=false;
+     struct CmdLatency {long submit=-1,decode=-1,inval=-1;U64 cq_fetch=0,cq_decode=0,cq_fence=0,other=0;};
+     std::deque<CmdLatency> cmd_latency;
+     U64 command_latency_count=0,command_latency_sum=0,command_latency_min=~U64(0),command_latency_max=0;
+@@ -102,7 +119,7 @@
+     using Page=std::array<uint8_t,PAGE>;
+     std::unordered_map<U64,Page> memory;
+     struct Job {
+-        unsigned lane=0,index=0,pattern_page=0;
++        unsigned lane=0,index=0,pattern_page=0,bytes=PAGE;
+         U64 src=0,dst=0,src_pa=0,dst_pa=0,next_id=0;
+         long issue=-1,done=-1,poll_done=-1;
+         U64 ar=0,aw=0,r=0,w=0,b=0;
+@@ -149,14 +166,18 @@
+         jobs_file=std::fopen((o.out+"/jobs.csv").c_str(),"wx");
+         dead_file=std::fopen((o.out+"/dead-trace.csv").c_str(),"wx");
+         latency_file=std::fopen((o.out+"/command-latency.csv").c_str(),"wx");
++        fences_file=std::fopen((o.out+"/fences.csv").c_str(),"wx");
++        REQUIRE(fences_file,"fences output already exists or cannot be opened");
++        std::fprintf(fences_file,"fence,iova,inval_lo,inval_hi,fence_lo,fence_hi,submit,inval_decode,inval_pulse,fence_submit,fence_decode,fence_complete_edge,fence_complete_idle,host_return,fetch_cycles,register_cycles,decode_cycles,wait_prpw_cycles,prpw_blocked_cycles,other_cycles,host_samples,A_pending_cycles,B_pending_cycles,B_read_goal,B_read_done_snapshot,B_write_goal,B_write_done_snapshot,A_read_goal,A_read_done_snapshot,A_write_goal,A_write_done_snapshot,B_same_ar,B_same_aw,B_same_rlast,B_same_b,A_same_ar,A_same_aw,A_same_rlast,A_same_b,head_decode,head_idle,head_host
++");
+         REQUIRE(jsonl&&csv&&jobs_file&&dead_file&&latency_file,"raw output already exists or cannot be opened");
+         std::fprintf(dead_file,"cycle,event,valid_mask,dead_mask,victim_way,victim_dead,victim_valid,victim_pscid,victim_vpn\n");
+         std::fprintf(latency_file,"command,submit,inval_decode,inval_pulse,first_fence_complete,submit_to_fence,cq_fetch_register,cq_decode,cq_fence,other\n");
+         std::fprintf(csv,"cycle,era,event,lane,job,address,value,aux\n");
+-        std::fprintf(jobs_file,"era,lane,job,src_iova,dst_iova,src_pa,dst_pa,next_id,issue_cycle,done_cycle,poll_done_cycle,ar,aw,r_beats,w_beats,b\n");
++        std::fprintf(jobs_file,"era,lane,job,src_iova,dst_iova,src_pa,dst_pa,next_id,issue_cycle,done_cycle,poll_done_cycle,ar,aw,r_beats,w_beats,b,bytes\n");
+         lane[0].lane=0;lane[1].lane=1;
+     }
+-    ~Tb(){t->final();if(jsonl)std::fclose(jsonl);if(csv)std::fclose(csv);if(jobs_file)std::fclose(jobs_file);if(dead_file)std::fclose(dead_file);if(latency_file)std::fclose(latency_file);}
++    ~Tb(){t->final();if(jsonl)std::fclose(jsonl);if(csv)std::fclose(csv);if(jobs_file)std::fclose(jobs_file);if(dead_file)std::fclose(dead_file);if(latency_file)std::fclose(latency_file);if(fences_file)std::fclose(fences_file);}
+     void event(const char* name,int l=-1,int j=-1,U64 address=0,U64 value=0,U64 aux=0) {
+         std::fprintf(jsonl,"{\"cycle\":%ld,\"era\":%s,\"event\":%s,\"lane\":%d,\"job\":%d,\"address\":%llu,\"value\":%llu,\"aux\":%llu}\n",
+             cycle,quoted(era).c_str(),quoted(name).c_str(),l,j,(unsigned long long)address,(unsigned long long)value,(unsigned long long)aux);
+@@ -253,7 +274,7 @@
+         }
+     }
+     bool work_window()const {
+-        return measured&&(final_a<0||measured_done[0]<o.b_jobs);
++        return measured&&final_a<0;
+     }
+     unsigned dead_mask()const {
+         unsigned mask=0;
+@@ -332,12 +353,26 @@
+             const int l=did_lane(t->dbg_walk_did);if(measured)stats[l].pte_bytes+=8;
+             event("ptw_read",l,active[l]?int(active[l]->index):-1,0,8);
+         }
+-        if(t->dbg_inval)snapshot_inval();
++        if(t->dbg_inval){snapshot_inval();if(trace_open)fence_trace.inval=cycle;}
++        if(trace_open){
++            ++fence_trace.host_samples;
++            if(t->dbg_cq_state==1)++fence_trace.fetch;
++            else if(t->dbg_cq_state==2)++fence_trace.reg;
++            else if(t->dbg_cq_state==3)++fence_trace.decode_cycles;
++            else if(t->dbg_cq_state==6)++fence_trace.wait;
++            else ++fence_trace.other;
++        }
++        if(measured&&final_a<0&&active[0]&&active[0]->issue>=0&&active[0]->done<0)++b_overlap_busy;
+         if(t->dbg_cq_decode){
+             event("cq_decode",-1,-1,t->dbg_cq_head,t->dbg_cq_opcode,t->dbg_cq_func3);
+             if(measured){++decode_count;if(t->dbg_cq_opcode==1)++inv_count;else if(t->dbg_cq_opcode==2)++fence_count;else REQUIRE(false,"unexpected measured CQ opcode");}
+             last_fence_decode=t->dbg_cq_opcode==2;
+             if(t->dbg_cq_opcode==1&&!cmd_latency.empty())cmd_latency.front().decode=cycle;
++            if(trace_open&&t->dbg_cq_opcode==1)fence_trace.inval_decode=cycle;
++            if(trace_open&&t->dbg_cq_opcode==2){
++                REQUIRE(fence_trace.decode<0,"duplicate fence decode");fence_trace.decode=cycle;
++                fence_trace.head_at_decode=t->dbg_cq_head;
++            }
+             last_fence_av=(read64(CQ_BASE+U64((t->dbg_cq_head+CQ_ENTRIES-1)%CQ_ENTRIES)*16)>>10)&1;
+             // PR/PW test overlay holds CQH at the fence until completion.
+             if(o.mainline()&&t->dbg_cq_opcode==2)last_fence_av=0;
+@@ -345,6 +380,7 @@
+         if(previous_cq_state!=0&&t->dbg_cq_state==0&&last_fence_decode){
+             event("cq_fence_complete",-1,-1,0,last_fence_av,t->dbg_cq_head);last_fence_decode=false;
+             if(measured)++fence_completed;
++            if(trace_open){fence_trace.idle=cycle;fence_trace.head_at_idle=t->dbg_cq_head;}
+             if(measured&&!cmd_latency.empty()){
+                 CmdLatency c=cmd_latency.front();cmd_latency.pop_front();
+                 REQUIRE(c.other>0,"missing terminal idle timing sample");--c.other;
+@@ -370,8 +406,11 @@
+     void observe_done() {
+         for(unsigned l=0;l<2;++l)if(t->dbg_dma_done&(1u<<l)){
+             Job* p=active[l];REQUIRE(p&&p->issue>=0&&p->done<0,"DMA DONE identity/duplicate");
+-            REQUIRE(p->r==512&&p->w==512&&p->b==2,"COPYDONE without full payload/B completion");
+-            p->done=cycle;if(measured){++measured_done[l];last_done[l]=cycle;}
++            const unsigned bursts=(p->bytes+2047)/2048;
++            REQUIRE(p->r==p->bytes/8&&p->w==p->bytes/8&&p->b==bursts,"COPYDONE without full payload/B completion");
++            p->done=cycle;if(measured){++measured_done[l];last_done[l]=cycle;
++                completed_bytes[l]+=p->bytes;completed_rbeats[l]+=p->r;completed_wbeats[l]+=p->w;
++                completed_ar[l]+=p->ar;completed_aw[l]+=p->aw;completed_b[l]+=p->b;}
+             event("copy_done",l,p->index,p->dst,p->next_id);last_progress=cycle;
+         }
+     }
+@@ -385,31 +424,59 @@
+         t->sim_fence_read_done_i=!prpw_active||payload_reads_done>=fence_read_goal;
+         t->sim_fence_write_done_i=!prpw_active||payload_writes_done>=fence_write_goal;
+         t->clk_i=0;drive_memory();t->eval();
+-        if(t->rst_ni&&t->dbg_iofence_decode&&(t->dbg_iofence_pr||t->dbg_iofence_pw)&&!prpw_active){
+-            REQUIRE(o.mainline(),"unexpected PR/PW command outside mainline mode");
+-            prpw_active=true;
+-            fence_read_goal=comp_reads+((t->dbg_comp_bus&3)==3);
+-            fence_write_goal=comp_writes+((t->dbg_comp_bus&(3u<<5))==(3u<<5));
+-            if(measured)++prpw_fences;
+-            event("prpw_begin",-1,-1,0,fence_read_goal,fence_write_goal);
+-        }
+-        if(prpw_active){
+-            t->sim_fence_read_done_i=payload_reads_done>=fence_read_goal;
+-            t->sim_fence_write_done_i=payload_writes_done>=fence_write_goal;
+-            t->eval();
+-        }
+-        const bool prpw_complete=t->rst_ni&&t->dbg_iofence_complete&&prpw_active;
+-        if(prpw_complete){
+-            REQUIRE(payload_reads_done>=fence_read_goal&&payload_writes_done>=fence_write_goal,"fence completed before prior payload cohort");
+-            event("prpw_complete",-1,-1,0,payload_reads_done,payload_writes_done);
+-        }
+-        if(t->rst_ni&&t->dbg_iofence_wait&&measured)++prpw_wait_cycles;
+-        if(t->rst_ni){
+-            if((t->dbg_comp_bus&3)==3)++comp_reads;
+-            if((t->dbg_comp_bus&(3u<<5))==(3u<<5))++comp_writes;
+-        }
+         const bool ar=t->mem_ar_valid&&t->mem_ar_ready,aw=t->mem_aw_valid&&t->mem_aw_ready;
+         const bool w=t->mem_w_valid&&t->mem_w_ready,b=t->mem_b_valid&&t->mem_b_ready,r=t->mem_r_valid&&t->mem_r_ready;
++        U64 same_ar[2]={0,0},same_aw[2]={0,0},same_rlast[2]={0,0},same_b[2]={0,0};
++        if(t->rst_ni){
++            if((t->dbg_comp_bus&3)==3)++same_ar[(t->dbg_comp_ar_id>>2)&1];
++            if((t->dbg_comp_bus&(3u<<5))==(3u<<5))++same_aw[(t->dbg_comp_aw_id>>2)&1];
++            if(r&&t->mem_r_last){int l=payload_lane(t->mem_r_id);if(l>=0)++same_rlast[l];}
++            if(b){int l=payload_lane(t->mem_b_id);if(l>=0)++same_b[l];}
++        }
++        for(unsigned l=0;l<2;++l){done_now[l][0]=done_lane[l][0]+same_rlast[l];done_now[l][1]=done_lane[l][1]+same_b[l];}
++        if(t->rst_ni&&t->dbg_iofence_decode){
++            REQUIRE(trace_open,"fence decoded without host trace");
++            for(unsigned l=0;l<2;++l){
++                goals[l][0]=comp_lane[l][0]+same_ar[l];goals[l][1]=comp_lane[l][1]+same_aw[l];
++                fence_trace.same_ar[l]=same_ar[l];fence_trace.same_aw[l]=same_aw[l];
++                fence_trace.same_rlast[l]=same_rlast[l];fence_trace.same_b[l]=same_b[l];
++                for(unsigned k=0;k<2;++k){fence_trace.goal[l][k]=goals[l][k];fence_trace.snapshot_done[l][k]=done_now[l][k];}
++                event("fence_cohort_read",l,-1,goals[l][0],done_now[l][0],same_ar[l]|(same_rlast[l]<<1));
++                event("fence_cohort_write",l,-1,goals[l][1],done_now[l][1],same_aw[l]|(same_b[l]<<1));
++            }
++            REQUIRE(done_now[1][0]>=goals[1][0]&&done_now[1][1]>=goals[1][1],"A has pending pre-fence payload after A DONE");
++            const bool global=o.fence_policy=="global";
++            REQUIRE(bool(t->dbg_iofence_pr)==global&&bool(t->dbg_iofence_pw)==global,"actual fence PR/PW differ from selected policy");
++            if(global){
++                REQUIRE(!prpw_active,"overlapping fixed fence cohorts");prpw_active=true;
++                fence_read_goal=goals[0][0]+goals[1][0];fence_write_goal=goals[0][1]+goals[1][1];
++                if(measured)++prpw_fences;event("prpw_begin",-1,-1,0,fence_read_goal,fence_write_goal);
++            }
++        }
++        if(prpw_active){
++            t->sim_fence_read_done_i=done_now[0][0]>=goals[0][0]&&done_now[1][0]>=goals[1][0];
++            t->sim_fence_write_done_i=done_now[0][1]>=goals[0][1]&&done_now[1][1]>=goals[1][1];
++            t->eval();
++            bool blocked=false;
++            for(unsigned l=0;l<2;++l)if(done_now[l][0]<goals[l][0]||done_now[l][1]<goals[l][1]){
++                blocked=true;if(measured){++cohort_wait[l];++fence_trace.pending[l];}
++            }
++            if(blocked&&measured){++prpw_blocked_cycles;++fence_trace.blocked;}
++        }
++        const bool prpw_complete=t->rst_ni&&t->dbg_iofence_complete&&prpw_active;
++        if(t->rst_ni&&t->dbg_iofence_complete){
++            REQUIRE(trace_open,"fence completion without trace");fence_trace.complete=cycle;
++            if(prpw_active){
++                REQUIRE(t->sim_fence_read_done_i&&t->sim_fence_write_done_i,"fence completed before prior payload cohort");
++                event("prpw_complete",-1,-1,0,done_now[0][0]+done_now[1][0],done_now[0][1]+done_now[1][1]);
++            }
++            event("iofence_complete_edge",-1,-1,0,t->dbg_cq_head,t->dbg_cq_next_state);
++        }
++        if(t->rst_ni&&t->dbg_iofence_wait&&measured)++prpw_wait_cycles;
++        if(t->rst_ni)for(unsigned l=0;l<2;++l){
++            if(same_ar[l]){++comp_reads;++comp_lane[l][0];event("comp_ar",l,-1,t->dbg_comp_ar_addr,comp_lane[l][0],t->dbg_comp_ar_id);}
++            if(same_aw[l]){++comp_writes;++comp_lane[l][1];event("comp_aw",l,-1,t->dbg_comp_aw_addr,comp_lane[l][1],t->dbg_comp_aw_id);}
++        }
+         const bool sampled_inval=t->rst_ni&&t->dbg_inval;
+         if(oracle_pending&&t->dbg_iotlb_fill)
+             REQUIRE(t->dbg_iotlb_update_pscid!=t->oracle_pscid_i||t->dbg_iotlb_update_vpn!=t->oracle_vpn_i,"ORACLE unmap overlaps fill of same key");
+@@ -433,18 +500,20 @@
+                 REQUIRE(!writeq.empty()||aw,"W without AW");const Write& h=writeq.empty()?nw:writeq.front();
+                 REQUIRE(wl==(h.beat==h.len),"WLAST/burst mismatch");
+                 if(h.job){Job& p=*h.job;const U64 a=h.addr+U64(h.beat)*8;
+-                    REQUIRE(a>=p.dst_pa&&a+8<=p.dst_pa+PAGE&&ws==255,"COPY W address/strobes");
++                    REQUIRE(a>=p.dst_pa&&a+8<=p.dst_pa+p.bytes&&ws==255,"COPY W address/strobes");
+                     const unsigned off=a-p.dst_pa;REQUIRE(wd==pattern(p.pattern_page,off/8),"COPY W data corruption");
+                     for(unsigned i=0;i<8;++i)REQUIRE(++p.w_seen[off+i]==1,"duplicate destination byte");++p.w;
++                    if(measured&&p.lane==0&&final_a<0)b_window_write_bytes+=8;
+                 }
+                 if(h.beat==0||wl)event("ddr_w_edge",h.job?int(h.job->lane):-1,h.job?int(h.job->index):-1,h.addr+U64(h.beat)*8,wd,ws);
+             }
+             if(r){
+                 REQUIRE(!readq.empty(),"R without AR");const Read& h=readq.front();
+                 if(h.job){Job& p=*h.job;const U64 a=h.addr+U64(h.beat)*8;
+-                    REQUIRE(a>=p.src_pa&&a+8<=p.src_pa+PAGE,"COPY R outside source");const unsigned off=a-p.src_pa;
++                    REQUIRE(a>=p.src_pa&&a+8<=p.src_pa+p.bytes,"COPY R outside source");const unsigned off=a-p.src_pa;
+                     REQUIRE(t->mem_r_data==pattern(p.pattern_page,off/8),"COPY R data corruption");
+                     for(unsigned i=0;i<8;++i)REQUIRE(++p.r_seen[off+i]==1,"duplicate source byte");++p.r;
++                    if(measured&&p.lane==0&&final_a<0)b_window_read_bytes+=8;
+                 }
+             }
+             if(b){REQUIRE(!bq.empty(),"B without AW/W");if(bq.front().job)++bq.front().job->b;
+@@ -467,9 +536,10 @@
+         if(ar)readq.push_back(nr);if(aw)writeq.push_back(nw);
+         if(w){REQUIRE(!writeq.empty(),"model W queue empty");Write& h=writeq.front();write64(h.addr+U64(h.beat)*8,wd,ws);++h.beat;
+             if(wl){bq.push_back(B{h.id,h.job});writeq.pop_front();}}
+-        if(b){if(bq.front().job)++payload_writes_done;bq.pop_front();}
+-        if(r){if(readq.front().beat==readq.front().len){if(readq.front().job)++payload_reads_done;readq.pop_front();}else ++readq.front().beat;}
++        if(b){if(bq.front().job){++payload_writes_done;unsigned l=bq.front().job->lane;++done_lane[l][1];event("ddr_b_complete",l,-1,0,done_lane[l][1]);}bq.pop_front();}
++        if(r){if(readq.front().beat==readq.front().len){if(readq.front().job){++payload_reads_done;unsigned l=readq.front().job->lane;++done_lane[l][0];event("ddr_rlast_complete",l,-1,0,done_lane[l][0]);}readq.pop_front();}else ++readq.front().beat;}
+         REQUIRE(payload_reads_done<=comp_reads&&payload_writes_done<=comp_writes,"global completions precede processed IOMMU requests");
++        for(unsigned l=0;l<2;++l)for(unsigned k=0;k<2;++k)REQUIRE(done_lane[l][k]<=comp_lane[l][k],"lane completions precede processed requests");
+         t->clk_i=0;t->eval();++cycle;
+     }
+     bool owner_pending(unsigned owner)const {
+@@ -510,7 +580,7 @@
+     bool quiet()const{return t->dbg_dma_quiet==3&&!t->dbg_iommu_in_flight&&t->dbg_cq_state==0&&readq.empty()&&writeq.empty()&&bq.empty();}
+     void drain(){for(unsigned i=0;i<100000;++i){step();if(quiet()&&!cfg&&cfgq[0].empty()&&cfgq[1].empty()&&cfgq[2].empty()&&!cfg_release)return;}REQUIRE(false,"quiet watchdog");}
+     Job* make_job(unsigned l,unsigned j) {
+-        auto p=std::make_unique<Job>();p->lane=l;p->index=j;
++        auto p=std::make_unique<Job>();p->lane=l;p->index=j;p->bytes=(!l&&measured)?o.b_bytes:PAGE;
+         if(l){p->src=a_src(j);p->dst=a_dst(j);p->src_pa=a_src_pa(j);p->dst_pa=a_dst_pa(j);p->pattern_page=j+1;}
+         else {const unsigned dest=1+j%(o.b_pages-1);p->src=B_IOVA;p->dst=B_IOVA+U64(dest)*PAGE;p->src_pa=B_PA;p->dst_pa=B_PA+U64(dest)*PAGE;}
+         Job* ptr=p.get();jobs.push_back(std::move(p));return ptr;
+@@ -518,24 +588,35 @@
+     void init_lane(unsigned l,unsigned quota) {lane[l]=Lane{};lane[l].lane=l;lane[l].quota=quota;lane[l].enabled=true;lane[l].finished=quota==0;}
+     void finish_job(Job& p) {
+         REQUIRE(p.done>=0&&p.issue>=0,"MMIO DONE arrived before true hardware completion");
+-        REQUIRE(p.ar==2&&p.aw==2&&p.r==512&&p.w==512&&p.b==2,"COPY transfer count mismatch");
+-        for(unsigned b=0;b<512;++b){REQUIRE(read64(p.dst_pa+b*8)==pattern(p.pattern_page,b),"full destination page mismatch");REQUIRE(read64(p.src_pa+b*8)==pattern(p.pattern_page,b),"source page mutated");}
+-        for(unsigned i=0;i<PAGE;++i)REQUIRE(p.r_seen[i]==1&&p.w_seen[i]==1,"COPY byte coverage");
+-        std::fprintf(jobs_file,"%s,%u,%u,%llu,%llu,%llu,%llu,%llu,%ld,%ld,%ld,%llu,%llu,%llu,%llu,%llu\n",era.c_str(),p.lane,p.index,
++        const unsigned bursts=(p.bytes+2047)/2048;
++        REQUIRE(p.ar==bursts&&p.aw==bursts&&p.r==p.bytes/8&&p.w==p.bytes/8&&p.b==bursts,"COPY transfer count mismatch");
++        for(unsigned b=0;b<512;++b){
++            if(b*8<p.bytes)REQUIRE(read64(p.dst_pa+b*8)==pattern(p.pattern_page,b),"destination payload mismatch");
++            REQUIRE(read64(p.src_pa+b*8)==pattern(p.pattern_page,b),"source page mutated");
++        }
++        for(unsigned i=0;i<PAGE;++i)REQUIRE(p.r_seen[i]==unsigned(i<p.bytes)&&p.w_seen[i]==unsigned(i<p.bytes),"COPY byte coverage including untouched page tail");
++        std::fprintf(jobs_file,"%s,%u,%u,%llu,%llu,%llu,%llu,%llu,%ld,%ld,%ld,%llu,%llu,%llu,%llu,%llu,%u\n",era.c_str(),p.lane,p.index,
+             (unsigned long long)p.src,(unsigned long long)p.dst,(unsigned long long)p.src_pa,(unsigned long long)p.dst_pa,(unsigned long long)p.next_id,
+-            p.issue,p.done,p.poll_done,(unsigned long long)p.ar,(unsigned long long)p.aw,(unsigned long long)p.r,(unsigned long long)p.w,(unsigned long long)p.b);
++            p.issue,p.done,p.poll_done,(unsigned long long)p.ar,(unsigned long long)p.aw,(unsigned long long)p.r,(unsigned long long)p.w,(unsigned long long)p.b,p.bytes);
+     }
+     void service_lane(unsigned l) {
+         Lane& s=lane[l];if(!s.enabled||s.finished||s.busy)return;
+-        if(s.stage==0){REQUIRE(!active[l],"host reused active DMA slot");active[l]=make_job(l,s.index);}
++        if(s.stage==0){
++            if(l==0&&measured&&o.b_background){
++                if(final_a>=0){s.finished=true;s.enabled=false;if(b_stop<0){b_stop=final_a;event("b_offer_stop",0,-1,0,b_offered);}return;}
++                if(cycle<b_next_offer)return;
++            }
++            REQUIRE(!active[l],"host reused active DMA slot");active[l]=make_job(l,s.index);
++            if(l==0&&measured){++b_offered;event("b_job_offer",0,s.index,0,active[l]->bytes,b_next_offer);}
++        }
+         Job* p=active[l];s.busy=true;
+         const U64 addrs[]={0x18,0,8,0x10,REG_NEXT,REG_DONE};
+-        const U64 vals[]={0,p->src,p->dst,PAGE,0,0};const unsigned stage=s.stage;
++        const U64 vals[]={0,p->src,p->dst,p->bytes,0,0};const unsigned stage=s.stage;
+         request(l,stage<4,addrs[stage],vals[stage],3,[this,l,p,stage](U64 value){
+             Lane& x=lane[l];x.busy=false;
+             if(stage==4){p->next_id=value;event("copy_next_id",l,p->index,0,value);x.stage=5;}
+             else if(stage==5){if(value==p->next_id){p->poll_done=cycle;event("copy_host_done",l,p->index,p->dst,value);finish_job(*p);active[l]=nullptr;
+-                    ++x.index;x.stage=0;if(x.index==x.quota)x.finished=true;}
++                    ++x.index;x.stage=0;if(l==0&&measured)b_next_offer=cycle+o.b_gap;if(x.index==x.quota)x.finished=true;}
+                 else x.stage=5;}
+             else ++x.stage;
+         });
+@@ -559,11 +640,14 @@
+         if(measured&&(lo&127)==1){CmdLatency c;c.submit=cycle;cmd_latency.push_back(c);}
+     }
+     void start_flush(U64 iova,bool force_wide=false) {
+-        REQUIRE(!flush.busy,"overlapping A flush groups");flush=Flush{};flush.busy=true;flush.iova=iova;flush.wide=force_wide;
++        REQUIRE(!flush.busy,"overlapping A flush groups");
++        if(measured){REQUIRE(!trace_open,"previous fence trace not closed");fence_trace=FenceTrace{};fence_trace.submit=cycle;trace_open=true;}
++        flush=Flush{};flush.busy=true;flush.iova=iova;flush.wide=force_wide;
+         flush.begin=cycle;flush.id=unsigned(rounds);if(measured)++rounds;
+         bool scoped=o.mainline()||(!force_wide&&(o.mode=="m2"||o.mode=="m3"));
+         bool av=!force_wide&&(o.mode=="m3"||o.mode=="ml-strict");
+         U64 lo=1|(U64(av)<<10)|(scoped?(U64(o.pscid_a())<<12)|(1ULL<<32):0);
++        if(trace_open){fence_trace.inval_lo=lo;fence_trace.inval_hi=av?(iova>>2):0;}
+         put_command(lo,av?(iova>>2):0);if(!o.mainline())put_command(2,0);flush.first_goal=tail;
+         event("cq_round_begin",1,int(a_index),iova,flush.id,scoped|(unsigned(av)<<1));
+     }
+@@ -576,6 +660,16 @@
+     void complete_flush() {
+         event("cq_round_complete",1,int(a_index),flush.iova,flush.id,cycle-flush.begin);
+         if(measured)total_waiting+=cycle-flush.begin;
++        if(trace_open){
++            const FenceTrace& f=fence_trace;
++            REQUIRE(f.submit>=0&&f.inval_decode>=f.submit&&f.inval>=f.inval_decode&&f.fence_submit>=f.submit&&f.decode>=f.fence_submit&&f.complete>=f.decode&&f.idle==f.complete+1&&cycle>=f.idle,"fence trace ordering");
++            REQUIRE(f.fetch+f.reg+f.decode_cycles+f.wait+f.other==f.host_samples,"fence state partition");
++            REQUIRE(f.host_samples==U64(cycle-f.submit),"submit-to-host samples partition");
++            REQUIRE(f.goal[1][0]==f.snapshot_done[1][0]&&f.goal[1][1]==f.snapshot_done[1][1]&&f.pending[1]==0,"A pre-fence cohort must already be drained");
++            std::vector<U64> values={rounds,flush.iova,f.inval_lo,f.inval_hi,f.fence_lo,f.fence_hi,U64(f.submit),U64(f.inval_decode),U64(f.inval),U64(f.fence_submit),U64(f.decode),U64(f.complete),U64(f.idle),U64(cycle),f.fetch,f.reg,f.decode_cycles,f.wait,f.blocked,f.other,f.host_samples,f.pending[1],f.pending[0],f.goal[0][0],f.snapshot_done[0][0],f.goal[0][1],f.snapshot_done[0][1],f.goal[1][0],f.snapshot_done[1][0],f.goal[1][1],f.snapshot_done[1][1],f.same_ar[0],f.same_aw[0],f.same_rlast[0],f.same_b[0],f.same_ar[1],f.same_aw[1],f.same_rlast[1],f.same_b[1],f.head_at_decode,f.head_at_idle,t->dbg_cq_head};
++            for(unsigned i=0;i<values.size();++i)std::fprintf(fences_file,"%s%llu",i?",":"",(unsigned long long)values[i]);std::fputc('\n',fences_file);
++            trace_open=false;
++        }
+         if(flush_fq){
+             for(Key key:fq_entries){REQUIRE(reserved_iovas.erase(key)==1,"FQ releases an unreserved IOVA");++fq_reclaimed;event("fq_release",1,-1,key.second<<12,key.first);}
+             fq_entries.clear();++fq_flushes;flush_fq=false;
+@@ -593,7 +687,9 @@
+                 request(2,true,0x24,tail,2,[this](U64){
+                     flush.cfg_busy=false;if(measured)++doorbells;
+                     event("cq_doorbell",1,int(a_index),0,tail,1);
+-                    put_command(2|(1ULL<<12)|(1ULL<<13),0);flush.last_goal=tail;flush.stage=2;
++                    U64 lo=2|(o.fence_policy=="global"?((1ULL<<12)|(1ULL<<13)):0);
++                    if(trace_open){fence_trace.fence_submit=cycle;fence_trace.fence_lo=lo;fence_trace.fence_hi=0;}
++                    put_command(lo,0);flush.last_goal=tail;flush.stage=2;
+                 });
+             }else if(flush.stage==2){
+                 request(2,true,0x24,tail,2,[this](U64){flush.cfg_busy=false;if(measured)++doorbells;
+@@ -677,8 +773,8 @@
+         drain();event("smoke_marker_verified",-1,-1,MARKER,token,all_marker_b);
+     }
+     void verify_counts() {
+-        REQUIRE(measured_done[0]==o.b_jobs&&measured_done[1]==o.a_jobs,"measured COPY count mismatch");
+-        REQUIRE(measured_issue[0]==o.b_jobs&&measured_issue[1]==o.a_jobs,"measured ISSUE count mismatch");
++        REQUIRE(measured_done[0]==b_offered&&measured_done[1]==o.a_jobs,"measured COPY count mismatch");
++        REQUIRE(measured_issue[0]==b_offered&&measured_issue[1]==o.a_jobs,"measured ISSUE count mismatch");
+         U64 expected_rounds=0;if(o.mode!="m0"){
+             const U64 maps=!o.mainline()&&o.map_policy=="full-api"?2*o.a_jobs:0;
+             const U64 unmaps=o.batch()?(2*o.a_jobs+o.batch()-1)/o.batch():2*o.a_jobs;
+@@ -691,7 +787,11 @@
+         REQUIRE(inval_verified_events==expected_rounds,"invalidation pulse/post-edge verification conservation");
+         REQUIRE(command_latency_count==expected_rounds&&cmd_latency.empty(),"per-command timing conservation");
+         REQUIRE(!prpw_active&&payload_reads_done==comp_reads&&payload_writes_done==comp_writes,"payload/fence cohort not drained");
+-        REQUIRE(prpw_fences==(o.mainline()?expected_rounds:0),"PR/PW fence count mismatch");
++        REQUIRE(prpw_fences==(o.fence_policy=="global"?expected_rounds:0),"PR/PW fence count mismatch");
++        REQUIRE(!trace_open&&cohort_wait[1]==0,"unclosed trace or unexpected A pending cohort");
++        for(unsigned l=0;l<2;++l)for(unsigned k=0;k<2;++k)REQUIRE(comp_lane[l][k]==done_lane[l][k],"per-lane completion conservation");
++        REQUIRE(completed_bytes[1]==U64(o.a_jobs)*PAGE,"A full COPY bytes mismatch");
++        REQUIRE(completed_bytes[0]==b_offered*o.b_bytes,"B all accepted bytes mismatch");
+         REQUIRE(wall_host+wall_flush+wall_copy_pte+wall_copy_payload_wait+wall_copy_other==U64(final_a-t0),"A wall-time partition does not sum");
+         REQUIRE(flush_cq_fetch+flush_cq_decode+flush_cq_fence+flush_other==wall_flush,"flush partition does not sum");
+         if(o.mainline())REQUIRE(reserved_iovas.empty(),"unreclaimed IOVA after full drain");
+@@ -703,8 +803,10 @@
+         setup_memory();reset_and_program();drain();if(o.smoke)smoke_marker();
+         if(!o.a_alone)warm();else{warm_resident=true;warm_no_walk=true;}
+         era="measure";t0=cycle;measured=true;last_progress=cycle;event("measure_begin");
+-        init_lane(0,o.b_jobs);lane[1].enabled=false;
+-        while(!lane[0].finished||a_state!=AState::FINISH||!fq_entries.empty()||flush.busy){service_lane(0);service_fq();service_a();step();}
++        for(unsigned l=0;l<2;++l)for(unsigned k=0;k<2;++k){work_comp_base[l][k]=comp_lane[l][k];work_done_base[l][k]=done_lane[l][k];}
++        b_next_offer=t0;init_lane(0,o.a_alone?0:~0u);lane[1].enabled=false;
++        while(!lane[0].finished||a_state!=AState::FINISH||flush.busy){service_a();service_lane(0);step();}
++        if(o.a_alone)b_stop=final_a;
+         drain();const U64 csr=blocking(2,false,0x48,0,2);
+         REQUIRE((csr&0xF00)==0,"CQCSR error status after all work");
+         REQUIRE(blocking(2,false,0x20,0,2)==tail,"final CQH/CQT mismatch");drain();
+@@ -720,33 +822,25 @@
+     }
+     void summary() {
+         FILE* f=std::fopen((o.out+"/summary.json").c_str(),"wx");REQUIRE(f,"summary already exists");
+-        const std::string base=o.domain+"-b"+std::to_string(o.b_pages)+"-m0-full-api";
+-        std::fprintf(f,"{\"schema_version\":1,\"config\":{\"case_id\":%s,\"domain\":%s,\"b_pages\":%u,\"mode\":%s,\"map_policy\":%s,\"a_jobs\":%u,\"b_jobs\":%u,\"bytes_per_copy\":4096,\"ddt_mode\":3,\"did_b\":10,\"did_a\":11,\"ddr_first_cycles\":16,\"ddr_beat_cycles\":1,\"baseline_case_id\":%s,\"smoke\":%s},\"timing\":{\"t0\":%ld,\"end_cycle\":%ld},\"metrics\":{",
+-            quoted(o.case_id).c_str(),quoted(o.domain).c_str(),o.b_pages,quoted(o.mode).c_str(),quoted(o.map_policy).c_str(),o.a_jobs,o.b_jobs,quoted(base).c_str(),o.smoke?"true":"false",t0,measure_end);
++        std::fprintf(f,"{\"schema_version\":2,\"config\":{\"case_id\":%s,\"domain\":%s,\"b_pages\":%u,\"mode\":%s,\"fence_policy\":%s,\"a_jobs\":%u,\"b_bytes\":%u,\"b_gap\":%u,\"b_background\":%s,\"a_alone\":%s},\"timing\":{\"t0\":%ld,\"end_cycle\":%ld},\"metrics\":{",
++            quoted(o.case_id).c_str(),quoted(o.domain).c_str(),o.b_pages,quoted(o.mode).c_str(),quoted(o.fence_policy).c_str(),o.a_jobs,o.b_bytes,o.b_gap,o.b_background?"true":"false",o.a_alone?"true":"false",t0,measure_end);
+         bool first=true;auto m=[&](const char* name,long long value){std::fprintf(f,"%s%s:%lld",first?"":",",quoted(name).c_str(),value);first=false;};
+         m("T_A",last_done[1]<0?-1:last_done[1]-t0);m("T_B",last_done[0]<0?-1:last_done[0]-t0);
+-        m("A_final_flush_end",final_a<0?-1:final_a-t0);m("T_end",final_a<0?-1:std::max(final_a,last_done[0])-t0);
+-        m("fq_drain_end",fq_drain_end<0?-1:fq_drain_end-t0);m("fq_timeout_cycles",FQ_TIMEOUT_CYCLES);m("fq_capacity",FQ_CAPACITY);
+-        m("fq_peak",fq_peak);m("fq_flushes",fq_flushes);m("fq_timer_flushes",fq_timer_flushes);m("fq_full_flushes",fq_full_flushes);m("fq_reclaimed",fq_reclaimed);
+-        m("dead_slot_cycles",dead_slot_cycles);m("dead_sample_cycles",dead_sample_cycles);m("dead_valid_cycles",dead_valid_cycles);m("dead_peak",dead_peak);
+-        m("dead_replacements",dead_replacements);m("live_replacements",live_replacements);m("empty_fills",empty_fills);
+-        m("A_wall_host",wall_host);m("A_wall_flush",wall_flush);m("A_wall_copy_pte",wall_copy_pte);
+-        m("A_wall_copy_payload_wait",wall_copy_payload_wait);m("A_wall_copy_other",wall_copy_other);
+-        m("A_flush_cq_fetch",flush_cq_fetch);m("A_flush_cq_decode",flush_cq_decode);m("A_flush_cq_fence",flush_cq_fence);m("A_flush_other",flush_other);
+-        m("command_latency_count",command_latency_count);m("command_latency_sum",command_latency_sum);
+-        m("command_latency_min",command_latency_count?command_latency_min:0);m("command_latency_max",command_latency_max);
+-        m("prpw_fences",prpw_fences);m("prpw_wait_cycles",prpw_wait_cycles);
+-        m("comp_read_requests",comp_reads);m("comp_write_requests",comp_writes);
+-        m("payload_read_completed",payload_reads_done);m("payload_write_completed",payload_writes_done);
+-        for(unsigned l=0;l<2;++l){std::string p=l?"A_":"B_";const Counters&s=stats[l];
+-            m((p+"hits").c_str(),s.hits);m((p+"misses").c_str(),s.misses);m((p+"walks").c_str(),s.walks);
+-            m((p+"invalidation_attributed_misses").c_str(),s.inval);m((p+"cold_misses").c_str(),s.cold);m((p+"replacement_misses").c_str(),s.replacement);
+-            m((p+"ptw_memory_bytes").c_str(),s.pte_bytes);m((p+"completed").c_str(),measured_done[l]);}
+-        m("cq_iotinval",inv_count);m("cq_iofence",fence_count);m("cq_decode_count",decode_count);m("cq_submit_commands",submit_count);
+-        m("cq_fence_completed",fence_completed);m("inval_post_edge_verified_events",inval_verified_events);m("inval_post_edge_verified_ways",inval_verified_ways);
+-        m("cq_doorbells",doorbells);m("cq_peak",cq_peak);m("cq_entry_cycles",cq_entry_cycles);m("cq_rounds",rounds);m("cq_total_waiting",total_waiting);
+-        m("map_regions",map_regions);m("unmap_regions",unmap_regions);
+-        std::fprintf(f,"},\"checks\":{\"passed\":%s,\"data\":%s,\"quiet\":%s,\"commands\":%s,\"warm_resident\":%s,\"warm_no_extra_walks\":%s},\"failure\":%s,\"limitations\":[\"Host PTE writes are direct model memory writes; CPU cost is not counted.\",\"Fixed F5 legacy RTL with disclosed functional repairs; no CPU/Linux execution.\",\"Mainline modes model enabled DMA-IOMMU, leaf-only 4KiB unmaps, one CPU FQ, successful commands.\",\"ML commands use one PR/PW=1 fence. Test-only CQ overlay waits for the previously processed device cohort at modeled DDR RLAST/B; production RTL omits PR/PW.\",\"ORACLE test-only ports clear valid on the first clock edge after unmap, no command or wait.\",\"FQ timeout=10ms at declared 50MHz/HZ1000 equivalence, 500000 cycles. A API completion and deferred drain are separate.\",\"Dead occupancy window ends at both A API completion and B COPYDONE; it excludes later idle timer drain.\",\"A wall partitions are mutually exclusive state occupancy, not individually causal wait savings.\",\"DDR startup16 at FIFO head, one 64-bit beat per cycle, no read reordering.\"]}\n",
++        m("A_final_flush_end",final_a<0?-1:final_a-t0);m("T_end",measure_end<0?-1:measure_end-t0);
++        m("B_offer_stop",b_stop<0?-1:b_stop-t0);m("B_offered_jobs",b_offered);
++        m("B_concurrent_busy_cycles",b_overlap_busy);m("B_window_read_bytes",b_window_read_bytes);m("B_window_write_bytes",b_window_write_bytes);
++        m("A_wall_host",wall_host);m("A_wall_flush",wall_flush);m("A_wall_copy_pte",wall_copy_pte);m("A_wall_copy_payload_wait",wall_copy_payload_wait);m("A_wall_copy_other",wall_copy_other);
++        m("A_flush_cq_fetch_register",flush_cq_fetch);m("A_flush_cq_inval_decode",flush_cq_decode);m("A_flush_cq_fence_decode_wait",flush_cq_fence);m("A_flush_other",flush_other);
++        m("command_latency_count",command_latency_count);m("command_latency_sum",command_latency_sum);m("command_latency_min",command_latency_count?command_latency_min:0);m("command_latency_max",command_latency_max);
++        m("prpw_fences",prpw_fences);m("wait_prpw_state_cycles",prpw_wait_cycles);m("prpw_blocked_cycles",prpw_blocked_cycles);m("A_cohort_pending_cycles",cohort_wait[1]);m("B_cohort_pending_cycles",cohort_wait[0]);
++        for(unsigned l=0;l<2;++l){std::string p=l?"A_":"B_";const Counters& c=stats[l];
++            m((p+"hits").c_str(),c.hits);m((p+"misses").c_str(),c.misses);m((p+"walks").c_str(),c.walks);m((p+"invalidation_attributed_misses").c_str(),c.inval);m((p+"cold_misses").c_str(),c.cold);m((p+"replacement_misses").c_str(),c.replacement);m((p+"pte_memory_bytes").c_str(),c.pte_bytes);
++            m((p+"accepted_jobs").c_str(),measured_issue[l]);m((p+"completed_jobs").c_str(),measured_done[l]);m((p+"payload_bytes_each_direction").c_str(),completed_bytes[l]);
++            m((p+"read_beats").c_str(),completed_rbeats[l]);m((p+"write_beats").c_str(),completed_wbeats[l]);m((p+"ar_bursts").c_str(),completed_ar[l]);m((p+"aw_bursts").c_str(),completed_aw[l]);m((p+"b_completions").c_str(),completed_b[l]);
++            m((p+"comp_ar_accepted").c_str(),comp_lane[l][0]-work_comp_base[l][0]);m((p+"comp_aw_accepted").c_str(),comp_lane[l][1]-work_comp_base[l][1]);m((p+"ddr_rlast_completed").c_str(),done_lane[l][0]-work_done_base[l][0]);m((p+"ddr_b_completed").c_str(),done_lane[l][1]-work_done_base[l][1]);
++        }
++        m("cq_iotinval",inv_count);m("cq_iofence",fence_count);m("cq_decode_count",decode_count);m("cq_submit_commands",submit_count);m("cq_fence_completed",fence_completed);m("inval_post_edge_verified_events",inval_verified_events);m("cq_doorbells",doorbells);m("cq_rounds",rounds);m("cq_total_waiting",total_waiting);m("map_regions",map_regions);m("unmap_regions",unmap_regions);
++        std::fprintf(f,"},\"checks\":{\"passed\":%s,\"data\":%s,\"quiet\":%s,\"commands\":%s,\"warm_resident\":%s,\"warm_no_extra_walks\":%s},\"failure\":%s,\"limitations\":[\"Corrected original 16-entry PLRU IOMMU baseline with simulation-only global PRPW overlay.\",\"Policy none clears only command PR/PW bits and is a diagnostic, not the mainline default.\",\"Fixed cohort includes comp AR/AW accepted on the decode edge and includes DDR RLAST/B completions on each sampled edge.\",\"Completion at modeled DDR is a conservative test observation point, not an implementation of every architectural ordering property.\",\"A=64 full 4KiB copies, leaf-only strict unmaps; B=4 persistent pages, serial jobs offered after previous host completion plus configured gap.\",\"B new offers stop at A API completion; all already offered jobs complete and quiet is verified. B total useful work varies with A window and is reported separately.\",\"DDR is one FIFO, 16-cycle head startup and one 8-byte beat per cycle; host MMIO/PTE writes do not model native CPU time.\",\"No CPU/Linux/FPGA execution; one deterministic repetition per configuration.\"]}\n",
+             passed?"true":"false",data_ok?"true":"false",quiet_ok?"true":"false",commands_ok?"true":"false",warm_resident?"true":"false",warm_no_walk?"true":"false",failure.empty()?"null":quoted(failure).c_str());std::fclose(f);
+     }
+ };
+@@ -754,16 +848,16 @@
+     Verilated::commandArgs(argc,argv);Options o;
+     for(int i=1;i<argc;++i){std::string k=argv[i];auto val=[&](){REQUIRE(i+1<argc,"missing argument value");return std::string(argv[++i]);};
+         if(k=="--out")o.out=val();else if(k=="--mode")o.mode=val();else if(k=="--domain")o.domain=val();
+-        else if(k=="--b-pages")o.b_pages=std::stoul(val());else if(k=="--map-policy")o.map_policy=val();
+-        else if(k=="--a-jobs")o.a_jobs=std::stoul(val());else if(k=="--b-jobs")o.b_jobs=std::stoul(val());else if(k=="--a-alone")o.a_alone=true;
+-        else if(k=="--case-id")o.case_id=val();else if(k=="--smoke")o.smoke=true;else throw Failure("unknown option: "+k);}
++        else if(k=="--fence-policy")o.fence_policy=val();else if(k=="--b-bytes")o.b_bytes=std::stoul(val());
++        else if(k=="--b-gap")o.b_gap=std::stoul(val());else if(k=="--b-background")o.b_background=true;
++        else if(k=="--a-alone")o.a_alone=true;else if(k=="--case-id")o.case_id=val();else throw Failure("unknown option: "+k);
++    }
+     REQUIRE(!o.out.empty(),"--out required");REQUIRE(o.domain=="same"||o.domain=="different","domain");
+-    REQUIRE(o.b_pages==4||o.b_pages==8,"B footprint");REQUIRE(o.map_policy=="full-api"||o.map_policy=="unmap-only","map policy");
+-    REQUIRE(o.mode=="m0"||o.mode=="m1"||o.mode=="m2"||o.mode=="m3"||o.mode=="ml-strict"||o.mode=="ml-fq"||o.mode=="oracle","mode");
+-    if(o.smoke){o.a_jobs=1;o.b_jobs=8;}
+-    if(o.a_alone)o.b_jobs=0;
+-    REQUIRE(o.a_jobs>0&&o.a_jobs<=256,"A jobs must fit frozen L0 page");
+-    if(o.case_id.empty())o.case_id=o.domain+"-b"+std::to_string(o.b_pages)+"-"+o.mode+"-"+o.map_policy;
++    REQUIRE(o.mode=="ml-strict","only strict mainline command sequence is supported");
++    REQUIRE(o.fence_policy=="global"||o.fence_policy=="none","fence policy");
++    REQUIRE(o.b_bytes==512||o.b_bytes==2048||o.b_bytes==4096,"B bytes");REQUIRE(o.b_gap==0||o.b_gap==2048,"B gap");
++    REQUIRE(o.a_alone!=o.b_background,"choose exactly one of --a-alone and --b-background");
++    if(o.case_id.empty())o.case_id=o.a_alone?"a-alone-"+o.fence_policy:o.domain+"-b"+std::to_string(o.b_bytes)+"-gap"+std::to_string(o.b_gap)+"-"+o.fence_policy;
+     Tb tb(o);try{tb.run();}catch(const std::exception&e){tb.failure=e.what();tb.event("failure",-1,-1,0,0);tb.dump_failure();}
+     tb.summary();std::printf("RESULT %s cycle=%ld failure=%s\n",tb.passed?"PASS":"FAIL",tb.cycle,tb.failure.c_str());return tb.passed?0:1;
+ }
