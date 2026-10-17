@@ -32,8 +32,9 @@ SPI模块使用实际新release、vmlinux.symvers及modules_prepare生成的modu
 模块仅为后续软件更新，正式测量不加载。
 
 CLI507项和软件入口9项有限检查已通过，见[CLI导航](../cli-validation/README.md)。
-当前**没有运行正式prepare/finalize，也没有G Image／payload／新G板测**。
-Root审实际CLI/builder并实跑有限检查后才执行本次唯一Image构建：
+原source候选阶段没有运行正式prepare/finalize；其原身份记录保留。Root接受并复跑CLI507/入口9项后，
+已批准并完成下述唯一构建，实际交付见文末。没有新G板测。
+Root审实际CLI/builder并实跑有限检查后执行的命令：
 
 ```sh
 python3 paper/ispass2027/exp/E6-mitigation/build_g_software.py prepare \
@@ -45,3 +46,31 @@ python3 paper/ispass2027/exp/E6-mitigation/build_g_software.py finalize \
 最终交付须以该目录`build-manifest.json` passed与实际Image/fw_payload.bin/SPI模块为准，
 planned/source_checked不等于ready。Root独占硬件；本builder没有SD/UART/JTAG操作。
 collector另小批：10区组×Solo/A8gap0/1000/2000共40点，不扩大协议。
+
+## 唯一构建正式交付
+
+Root接收66f小批并实跑507+9项后批准构建。2026-10-17T16:01:03.925166Z以
+[原board dispatcher副本](../source/dispatch.as-reused.py)启动[单次序列](../run_g_software_once.py)，
+PID/PGID2089409、child2089410；prepare/finalize各一次，无重试或repair。
+[原dispatch命令](build01/dispatch-command.json)、[完整receipt](build01/dispatch-result.json)、
+[原host日志](build01/dispatch-host.log)与[正式manifest](build01/build-manifest.json)、
+[完整build.log](build01/build.log)已保存。
+
+2026-10-17T16:02:37.726123Z passed，dispatcher return0。
+实际release `6.5.0-rc2-ispass2027-g-v1`，payload31460808B，32MiB余2093624B。
+原out manifest SHA256 `4bee1eadd8d8102e652129833f171ba869e5edd8a1a039973d13559a3a0b2f6c`。
+payload SHA256 `2c513ba02344ff71eba6a2a88be748949a836f23ae6d52953ba2ed4581ffd7e7`。
+Image、payload、rootfs与SPI模块在本机`../artifacts/g-software01/`保存，不进Git。
+
+[transport](../g-software-transport.json)沿用既有字段／gzip bytesack流程：
+gzip11346554B、SPI archive8864B，payload及tar主机解压逐字节一致；
+两个实际模块vermagic均为`6.5.0-rc2-ispass2027-g-v1 SMP mod_unload riscv`。
+[transport脚本](../prepare_g_transport.py)由[原full-E3脚本](../source/prepare_full_transport.as-reused.py)
+只调整G release/schema/文件名；不含硬件动作。实际gzip与模块SHA及路径完整保存在transport。
+
+实际编译driver SHA `dfdad8be6cc6ff1db7232c32694a57be30d7cbcdd4e7e794d2170bfcbae39158`，
+等于69d已接受原件。CLI源SHA等于507项检查；[ELF逐section/符号比较](build01/CLI-ELF-comparison.json)
+发现只有FILE符号basename `idma_g.as-tested.c`／`idma_g.c`不同，引起symtab/strtab/build-id变化，
+其余sections及所有非FILE解码符号逐字节／逐项相同；不声称两个完整ELF SHA相同。
+
+本交付不代表G BIT最终qualified或新G板测通过。实际board load、BOOT身份及后续实验归Root。
