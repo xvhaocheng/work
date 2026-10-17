@@ -30,9 +30,12 @@ PHASES = {
     "ds50-last": (5, ("Solo", "A1", "A8", "A16", "A64"), "50/50", tuple(range(5, 10))),
     "ds50-all": (10, ("Solo", "A1", "A8", "A16", "A64"), "50/50", tuple(range(10))),
     "ds0-all": (10, ("Solo", "A1", "A8", "A16", "A64"), "0/0", tuple(range(10))),
+    "ds25-all": (10, ("Solo", "A1", "A8", "A16", "A64"), "25/25", tuple(range(10))),
+    "ds100-all": (10, ("Solo", "A1", "A8", "A16", "A64"), "100/100", tuple(range(10))),
 }
 FORMAL = ("ds50-first", "ds0-middle", "ds50-last")
 FORMAL_AB = ("ds50-all", "ds0-all")
+DS_SWEEP = ("ds25-all", "ds100-all")
 MISSING = object()
 
 
@@ -287,7 +290,7 @@ def load_run(reader, run_dir):
         raise ValueError("Not a collector run manifest: "+relative(manifest_path))
     repeat, conditions, ds, blocks = PHASES[phase]
     run_id = tables.slug(run_dir.name)+"-"+sha_bytes(relative(run_dir).encode())[:8]
-    series = "g1" if phase == "g1" else "baseline100"
+    series = "g1" if phase == "g1" else "ds_sweep" if phase in DS_SWEEP else "baseline100"
     load_path = run_dir / "load.json"
     if not load_path.is_file() and manifest.get("load_manifest"):
         load_path = Path(manifest["load_manifest"])
@@ -559,6 +562,22 @@ def prepare(run_dirs, output, name, software_evidence=()):
                    "run_ids": [r["run_id"] for r in runs if r["phase"] == "g1"],
                    "accepted_points": sum(r["accepted_points"] for r in runs if r["phase"] == "g1"),
                    "all_named_runs_passed": all(r["phase_complete"] for r in runs if r["phase"] == "g1") if any(r["phase"] == "g1" for r in runs) else None}}
+    sweep_runs = [r for r in runs if r["series"] == "ds_sweep"]
+    if sweep_runs:
+        sweep_by_phase = {p: [r for r in sweep_runs if r["phase"] == p] for p in DS_SWEEP}
+        sweep_points = collections.Counter((r["ds"], a["block"], a["condition"])
+            for r in sweep_runs for a in r["attempts"] if a["accepted"])
+        sweep_duplicates = [{"ds": ds, "block": block, "condition": condition, "count": count}
+            for (ds, block, condition), count in sorted(sweep_points.items()) if count > 1]
+        summary["ds_sweep"] = {
+            "series_is_separate_from_formal100": True, "planned_points": 100,
+            "phase_run_counts": {p: len(sweep_by_phase[p]) for p in DS_SWEEP},
+            "accepted_points": sum(r["accepted_points"] for r in sweep_runs),
+            "attempted_points_with_evidence": sum(r["attempted_points_with_evidence"] for r in sweep_runs),
+            "failed_or_unretained_points": sum(r["failed_or_unretained_points"] for r in sweep_runs),
+            "duplicate_points": sweep_duplicates,
+            "complete": all(len(sweep_by_phase[p]) == 1 and sweep_by_phase[p][0]["phase_complete"]
+                            for p in DS_SWEEP) and not sweep_duplicates}
     summary_path = relative(output / "summary.json")
     rows = []
     for ri, run in enumerate(runs):
@@ -608,6 +627,8 @@ def prepare(run_dirs, output, name, software_evidence=()):
                 "missing_inputs": summary["missing_inputs"], "scalar_rows": len(rows),
                 "formal100": formal, "g1": summary["g1"],
                 "output_sha256": {p:sha_bytes(s.encode()) for p,s in files.items()}}
+    if "ds_sweep" in summary:
+        manifest["ds_sweep"] = summary["ds_sweep"]
     files["manifest.json"] = json_text(manifest)
     return files, config, summary
 
@@ -660,12 +681,16 @@ def main():
             (args.output/name).write_text(content)
     if args.install:
         install(config, args.incremental)
-    print(json.dumps({"status": "passed", "mode": "check" if args.check else "prepare",
+    result = {"status": "passed", "mode": "check" if args.check else "prepare",
         "installed": args.install, "scalar_rows": len(config["rows"]),
         "formal100_complete": summary["formal100"]["complete"],
         "formal100_accepted_points": summary["formal100"]["accepted_points"],
         "g1_accepted_points": summary["g1"]["accepted_points"],
-        "fixture_only": summary["fixture_only"]}, ensure_ascii=False))
+        "fixture_only": summary["fixture_only"]}
+    if "ds_sweep" in summary:
+        result.update(ds_sweep_complete=summary["ds_sweep"]["complete"],
+                      ds_sweep_accepted_points=summary["ds_sweep"]["accepted_points"])
+    print(json.dumps(result, ensure_ascii=False))
 
 
 if __name__ == "__main__":

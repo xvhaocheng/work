@@ -3991,3 +3991,34 @@ IOMMU与CVA6分别拆成12／27个功能提交，实际补丁顺序与语义依�
 DS0 V读内部Solo/A1/A8/A16/A64为25/25/142.505/186.569/222.646周期，写内部为11/11/94.183/97.001/100.151周期，入口1、出口地址反压0；完整后段及DS50对照见表，DS50 A8读内部600.914周期。统计输出20组（DS0、DS50两个boot及显式合并）×28指标，含中位、Type7 Q1/Q3/IQR、min/max及10000次percentile bootstrap中位数CI；基础种子20261017，合并按两个已观察boot各抽5次，条件于boot而非跨重启总体。原始100条全保留。
 
 已与既有摘要的40个关键值对照，并核对100个逐试次来源和524个有值统计的分位/区间边界；生成器--check逐字节重建通过，输入SHA256和输出清单一并保存。本条只记录本次离线分析，不改变其他并行实验的授权或状态。
+
+
+## 2026-10-17 E1b DS25/DS100构建、100次上板与四点曲线完成
+
+本轮用户单独授权补DS25/DS100。Codex复用同一固定平台`885ed0a7ea90ed42dae2b7a2dadfdd0acba15273`、
+CVA6`8aac3fcd345af7686a55af1867783fd6b91a0069`、IOMMU`85b157ebe71a623e326e51fff7b7126fe77e8eb9`，
+仅在导出顶层覆盖诊断延迟参数；PLRU16、observer v3、批量供给及无研究扩展与DS50相同。
+两BIT均50MHz、WNS +0.177ns，WHS +0.048/+0.045ns、WPWS +0.062ns，
+setup/hold/pulse失败端点与routing errors均0，delayer网表单元数120/145。未改约束或策略。
+完整来源、脚本原字节、三项参数差量及构建报告见[E1b包](paper/ispass2027/board/packages/ds-sweep-20261017/README.md)。
+
+[Campaign](paper/ispass2027/board/runs/ds-sweep-20261017-01/campaign.json)按DS25全部50次→DS100全部50次完成，
+每档Solo/A1/A8/A16/A64各10次、区组轮转，共100次通过，有限任务returncode 0，无失败、重试或补采。
+只切BIT，复用原SD的`6.5.0-rc2-ispass2027-pathv3`，无SD写入或回读。
+两次实际boot为`0a1ae461-d2a5-4b43-8580-4544f313e058`、`5cc1560a-b07e-4956-b1f2-e95e3cced13b`。
+2026-10-17 22:35:10 JST结束时保持DS100/原pathv3并[释放UART](paper/ispass2027/board/runs/ds-sweep-20261017-01/board-release.json)，
+本会话不再触板；后续任务以实际调度为准。
+
+[新导入包](paper/ispass2027/data/board_imports/ds-sweep-20261017-01/summary.json)独立`board_ds_sweep`系列，
+100次无重复/缺项，新增10140个标量行；实板27544行，仿真980行保持独立。
+新导入器不把此包冒充旧formal100。复用旧DS0/DS50，四档共200次、每点十配对，
+[完整硬件时间/吞吐/IQR](paper/ispass2027/data/ds-sweep-summary.md)及逐源JSON、PDF/PNG/SVG共9份均已生成。
+硬件时间和吞吐来自原始cycles/完成字节；额外慢化取同DS同区组Ak/A1比值的中位数，IQR为type-7 Q1—Q3。
+全部来源重建、图与报告逐字节检查通过；图2重建293行映射，含四档曲线160个独立cycles操作数。
+
+DS0/25/50/100的A8额外慢化为10.40/24.32/44.78/76.08%，
+A16为13.72/31.43/52.10/88.72%，A64为16.35/36.82/57.63/98.12%。
+初步为A64近线性，A8/A16高延迟段边际增幅趋缓，未见平台式饱和；
+DS0直连与正延迟诊断结构差异、DS50原双boot及HPM非原子窗口保持，不归因为纯PTW成本。
+[复现入口](paper/ispass2027/analysis/README.md)保存精确命令和matplotlib版本。
+共享IOMMU任务保持Codex-only；本轮没有使用DeepSeek。提交/推送由本会话最后核对，不以本段预报远端已完成。

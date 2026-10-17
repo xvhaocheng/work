@@ -7,6 +7,7 @@
 | [十组历史实验](history-20261017/README.md) | E1、batch/扩展/DS0/回切、path、E3v6、E2、P4M、composition；4096条长表行 | 每实验manifest配对既有提交、实际内核及本机BIT/payload路径；缺失为unknown |
 | [历史G1复现](g1-20261017/README.md) | 9个唯一实际试次，G1已通过；结果及失败/恢复来源均已关联 | 00082 payload + 历史batch DS50 BIT |
 | [统一100次基线](baseline100-20261017/README.md) | 正式100次全部完成；DS50/DS0下五条件各10次，实际ABA三阶段25/50/25、三个boot，结果/加载/执行源码均已关联 | 同一新payload + DS50/DS0两个BIT |
+| [E1b DS延迟曲线](ds-sweep-20261017/README.md) | 新增DS25/DS100各50次均通过，零失败/补采；复用旧DS0/DS50形成200试次四点曲线 | 同一已写SD的pathv3 payload，DS25/DS100两个50MHz合格BIT |
 
 包内`manifest.json`对应条件、二进制和结果，`source.json`指向代码commit、构建记录及`metadata/`中的版本锁、patch/bundle等恢复材料。G1已关联原始、失败、恢复和accepted结果；baseline100已关联三阶段原始records/review、三个load、campaign/launch结果及启动时协议和实际源码快照。G1的9次与正式100次分开统计。
 

@@ -11,12 +11,13 @@
 | 实板总表与口径 | [board_results.csv](data/board_results.csv)、[数据说明](data/README.md) | 历史、G1与正式100次分别追源；失效仿真另表 |
 | 前作对比 | [prior-work.md](related/prior-work.md) | 两篇全文与有界检索完成，未核项明列 |
 | G1及统一基线 | [G1配套包](board/packages/g1-20261017/README.md)、[baseline100配套包](board/packages/baseline100-20261017/README.md)、[运行说明](board/g1-reproduce.md) | G1九次通过；统一100次全部完成，三个实际启动 |
+| E1b DS四点曲线 | [四档五条件统计/IQR](data/ds-sweep-summary.md)、[执行报告](board/ds-sweep.md)、[实验包](board/packages/ds-sweep-20261017/README.md) | DS25/DS100新增100次通过，复用旧DS0/DS50；200次形成四点曲线 |
 | 统一100次离线补充分析 | [三个问题与表格](analysis/baseline100-extra.md)、[复现脚本](../../analysis/scripts/baseline100_extra.py) | 合计吞吐及跨窗界限、DS0读写四阶段、分boot与合并离散度/10000次bootstrap CI；原始数据只读 |
 | 大纲与图表清单 | [outline.md](outline.md) | 已完成十图清单及行映射 |
 | 可复用上板流程 | [skill](board/skill/genesys2-iommu-board/SKILL.md) | 实测流程已固化，通过仓库级发现链接启用；仅显式调用 |
 | E3负载形态准备 | [能力与变更请求](exp/E3-workloads/capability.md)、[矩阵/预算](exp/E3-workloads/run-package.md)、[未执行说明](exp/E3-workloads/subset-results.md) | pathv3/DS0 batch固定4KiB且V/A共享chunk；依用户修改范围停止，新板测0次，三类硬件流量尚未实现 |
 
-实板长表共17404个标量行（历史4096＋G1 828＋统一100次12480），失效仿真另表980行。
+实板长表共27544个标量行（历史4096＋G1 828＋统一100次12480＋E1b新增100次10140），失效仿真另表980行。
 新基线的十组中位数及关键稳定ID见[结果摘要](data/baseline100-summary.md)，
 全部来源与单位见[数据说明](data/README.md)。
 
@@ -24,6 +25,7 @@
 
 - 历史G1：batch DS50/50 BIT＋00082 payload，V0/A1，4KiB×4096、预热256，Solo/A1/A8轮转各3次。硬件时间中位数相对56.5/107/155ms偏差不超过2%；新配置不套用此阈值。
 - 统一100次：原版加必要修复、明示批量供给和被动path观测；DS0原始直连、DS50额外延迟诊断。各DS下Solo/A1/A8/A16/A64各10次；DS50五区组→DS0十区组→DS50五区组，每区组五条件轮转。
+- E1b：用户单独授权DS25/DS100补点；同一固定源码、同一已写SD的pathv3，仅切BIT，DS25全部50次→DS100全部50次已完成。图2的DS曲线采用同区组Ak/A1比值的中位数与IQR，旧DS0/DS50不重测。
 - 最新执行偏好：以后同配置全部测完再切另一套，100次默认DS50十区组→DS0十区组，两种DS共用Linux，不再默认回切。本轮提出调整时已完成前25次并进入DS0，保留既定实际顺序补完余点，不重新测一轮。
 - Codex负责构建、JTAG加载、UART控制及板测，沿已验证的恢复/返回流程直接更新SD、启动与采集；不格式化或重分区，不覆盖历史输出，失败原样保留。
 - 设备数2→3→4、三类负载及传输大小、4KiB/2MiB、延迟分布、统一基线缓解复测仅列待补，本次不自动执行。

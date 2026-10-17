@@ -6,7 +6,7 @@
 
 每个 `--run` 目录应有 `collect.py` 的 `manifest.json` 和 `records.json`，完成时另有 `review.json`；加载身份从本目录 `load.json` 或 manifest 的 `load_manifest` 取得。可同时输入多个 `--run`，顺序不影响生成字节。
 
-`manifest.json` 必须是六个受支持 phase 之一：`g1`、`ds50-first`、`ds0-middle`、`ds50-last`、`ds50-all`、`ds0-all`。失败时可以没有 `records.json/review.json`；已有样本、manifest 错误和 `uart/command-*.json` 原始命令仍保留。缺失文件不会补造。若只有一个未写入 records 的 UART 命令，依据采集器遇到首个失败即停的控制流关联到下一计划点；多个无法关联的命令保留为未知顺序，不能冒认属于某次完成试验。
+`manifest.json` 必须是八个受支持 phase 之一：`g1`、`ds50-first`、`ds0-middle`、`ds50-last`、`ds50-all`、`ds0-all`、`ds25-all`、`ds100-all`。失败时可以没有 `records.json/review.json`；已有样本、manifest 错误和 `uart/command-*.json` 原始命令仍保留。缺失文件不会补造。若只有一个未写入 records 的 UART 命令，依据采集器遇到首个失败即停的控制流关联到下一计划点；多个无法关联的命令保留为未知顺序，不能冒认属于某次完成试验。
 
 恢复运行使用 collector 的 `recovered_from`、`recovered_manifest_sha256`、`recovered_cases` 和 `recovered_raw_commands`。导入器递归核验旧 manifest 的原始哈希，保留失败状态；每项 `raw_command_path` 精确绑定原始命令 JSON、完整 CLI 对象、PRE_SEQ 与 boot。旧命令和新目录命令去重读取，恢复样本只计一次，不把旧解析失败再算成额外硬件试次。JSON 前同一行的 printk 前缀通过 `raw_decode` 处理；原始命令保持不改。恢复来源属于测量证据，不能冒充软件证据。
 
@@ -77,7 +77,7 @@ python3 paper/ispass2027/data/extract_results.py --check
 
 所有运行首先按 run、phase、实际 boot、条件分层。DS50-first 与 DS50-last 各只出现一个命名 run，且报告的 BIT 哈希、kernel release 一致、没有重复计划点时，才另生成 `pooled_first_and_last_with_explicit_boots`。它显式列出两个来源 phase 和实际 boot IDs；正常完整组的 `n=10` 是 10 次试验，`observed_boot_count=2` 是两个实际 boot，绝不称为 10 次独立重启。软件 payload 是否等价仍保留未推断状态和证据指针。
 
-AB 的 DS50-all、DS0-all 各自已包含每条件 10 次，始终使用 `within_one_run_phase_and_boot`，不标为 pooled；正常完整布局记录两个实际 boot。出现任意 `*-all` phase 时按 AB 判断，缺少另一半不能通过；把 AB 和 ABA 采集段混在一起也不能通过。
+AB 的 DS50-all、DS0-all 各自已包含每条件 10 次，始终使用 `within_one_run_phase_and_boot`，不标为 pooled；正常完整布局记录两个实际 boot。baseline100系列出现`ds50-all`或`ds0-all`时按 AB 判断，缺少另一半不能通过；把 AB 和 ABA 采集段混在一起也不能通过。
 
 `n` 始终是实际用于该标量统计的重复试次数。若某指标缺测，只对有数值的重复计算统计，并同时列 `n_trials`、缺测/不适用数。全缺测的统计为 JSON `null`，该指标有值重复数 `n=0`；导入主长表后为 `value=unknown`，不是零时间或零 miss。失败试次的 sample 行 `n=1` 表示一次有原始证据的尝试，不参与成功试次统计。
 
@@ -102,3 +102,12 @@ AB 的 DS50-all、DS0-all 各自已包含每条件 10 次，始终使用 `within
 运行 `python3 paper/ispass2027/data/test_import_board_runs.py`，结果在 [importer-validation.json](importer-validation.json)。fixture 由历史 raw 字段构造并明确标为 synthetic，全部在隔离临时目录生成和清理；正式增量清单前后哈希相同。
 
 覆盖：25+50+25 与独立 G1；两个 DS50 boot 的实际重复次数；原始 cycles 的中位数和 locator 全量接入主提取器；输入顺序与字节重建；CLI `--check` 和审核后 `--install`；安装幂等；原始字节篡改拒绝；原始失败 UART 与缺失 review 保留；重复点及不同 BIT 阻止合并；缺失计数不补 0；review 数值被改动时仍从原始 cycles 计算并暴露不一致；软件证据仅保留哈希指针。未运行任何新板测。
+
+## E1b独立DS补点
+
+`ds25-all`、`ds100-all`各十区组、每区组五条件，归入独立`board_ds_sweep`系列。
+`summary.ds_sweep.complete`要求两phase各一个完整run，无重复点；失败与未保留原始命令仍照常保留。
+本轮真实[导入包](board_imports/ds-sweep-20261017-01/summary.json)共100次通过、10140个标量行；
+本包不含旧formal100，故`formal100.complete=false`不表示E1b缺样。
+精确导入/安装/作图命令见[analysis入口](../analysis/README.md)，
+四档统计及120个配对的来源见[DS sweep](ds-sweep-summary.md)。旧100次包与原始记录不修改。

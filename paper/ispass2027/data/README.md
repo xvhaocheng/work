@@ -6,7 +6,7 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| [board_results.csv](board_results.csv) | 板测长表17404行：历史4096＋G1 828＋统一100点12480；行数不是实验重复次数 |
+| [board_results.csv](board_results.csv) | 板测长表27544行：历史4096＋G1 828＋统一100点12480＋E1b新增100点10140；行数不是实验重复次数 |
 | [invalidation_sim_results.csv](invalidation_sim_results.csv) | 28 个配置的独立失效仿真，980 行；不计入板测样本数 |
 | [key_rows.json](key_rows.json) | 按论文证据主题组织的稳定 `row_id`、值和条件入口 |
 | [source_manifest.json](source_manifest.json) | 本次读取的每个输入文件的相对路径、SHA256、长度及可用的历史哈希对照 |
@@ -105,3 +105,17 @@ E1 是软件窗口现象，batch 是自主供给下的硬件压力，DS 汇合�
 DS0的Solo/A1受害者HPM miss中位为0，A1双方为0；A8/A16/A64的受害者HPM miss中位为2，属于如实保留的合法差异，没有筛除这些样本。该指标来自非原子软件HPM快照，不能将这些条件写为“V零miss”，也不能只据此认定miss发生在硬件V计时窗口内。DS50完整10次的各条件V miss中位为0，不能把它推广到DS0或其他窗口。
 
 [图表映射](../figure-rows.csv)的图2选择完整n=10硬件时间、吞吐和有值miss中位；图3保留历史path独立系列，另加入统一100点Solo/A1/A8的V读写各4阶段均值（每试次sum/full，再取10次中位），不重复选择前后各n=5的DS50分段。
+
+## E1b DS0/25/50/100四点曲线
+
+[本轮导入包](board_imports/ds-sweep-20261017-01/summary.json)只包含新增DS25/DS100共100次，
+两个phase各50次、五条件各10次，无失败、重复或补采。`ds_sweep.complete=true`；
+它独立于历史`formal100`，本包`formal100_complete=false`表示不含旧矩阵，不是本轮缺样。
+新增10140个标量行，实板总计27544行；失效仿真980行保持独立。
+
+[四档统计](ds-sweep-summary.md)及[逐试次与配对JSON](ds-sweep-summary.json)复用旧DS0/DS50共100次，
+形成4×5×10共200个试次。硬件时间与吞吐逐试次计算，中位数、Q1、Q3及IQR宽度保留；
+曲线按同DS、同block的`T_V(Ak)/T_V(A1)-1`取十配对的中位数与Q1—Q3。
+DS50保留两个实际boot；所有配对均在各自同一boot内，不代表十次独立重启。
+图2新增DS25/DS100完整n=10中位数，并映射四档曲线的160个独立硬件cycles操作数行。
+作图入口与依赖见[analysis](../analysis/README.md)，[执行/时序/结束回执](../board/ds-sweep.md)另列。

@@ -13,6 +13,14 @@ DS0 使用直接 DS 连线；DS50 单独启用 50/50 delayer 诊断。两者共�
 四 DMA、16 项原 PLRU IOTLB，不引入 E3、O1、banked 或 P/N/PN。
 自主 batch 供给是明示的工作负载夹具，不称纯上游平台。
 
+E1b后续补点新增`--variant ds25`与`--variant ds100`：仍选择上述同一平台/CVA6/IOMMU
+commit，只在导出的诊断顶层将输入/输出延迟改为25/25、100/100。
+新profile由[baseline-source.json](baseline-source.json)声明，完整构建入口、参数差量及结果见
+[DS曲线报告](ds-sweep.md)与[实验包](packages/ds-sweep-20261017/README.md)。
+两档均50MHz、WNS +0.177ns；WHS分别+0.048/+0.045ns，WPWS均+0.062ns，
+setup/hold/pulse失败端点与routing errors均0，delayer单元数120/145。
+这两次构建将既有routed配置核查纳入构建收尾，并记录routing errors；未修改约束或实现策略。
+
 Linux 固定 `45bf76b15e36cf608dff95013d91f8bedb7b1b8e` 的驱动/UAPI；CLI、
 内核配置与 DTS 取历史平台 `a2e847539bb638662f98dc920de0e8fd63d046e3`。
 共用软件仅加入静态 timeout 和 SD updater，使用 UART 控制，不移植网口驱动。

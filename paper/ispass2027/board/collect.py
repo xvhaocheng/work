@@ -13,6 +13,9 @@ import sys
 from uart import Console, DEFAULT_PORT
 
 REFERENCE_MS = {'Solo': 56.5, 'A1': 107.0, 'A8': 155.0}
+PHASE_DS = {'g1': '50/50', 'ds50-first': '50/50', 'ds0-middle': '0/0',
+            'ds50-last': '50/50', 'ds50-all': '50/50', 'ds0-all': '0/0',
+            'ds25-all': '25/25', 'ds100-all': '100/100'}
 
 
 def save(path, value):
@@ -149,10 +152,12 @@ def review(records, expected_per_condition=None, g1=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--phase', choices=['g1', 'ds50-first', 'ds0-middle', 'ds50-last', 'ds50-all', 'ds0-all'], required=True)
+    parser.add_argument('--phase', choices=list(PHASE_DS), required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--expected-kernel', required=True)
     parser.add_argument('--load-manifest', type=Path, required=True)
+    parser.add_argument('--source-record', type=Path,
+                        help='Existing package source.json identifying the actual fixed commits')
     parser.add_argument('--port', default=None)
     parser.add_argument('--resume-run', type=Path,
                         help='Recover complete raw prefix cases; execute only remaining planned cases')
@@ -164,7 +169,7 @@ def main():
     g1 = args.phase == 'g1'
     conditions = ['Solo', 'A1', 'A8'] if g1 else ['Solo', 'A1', 'A8', 'A16', 'A64']
     rounds = range(3) if g1 else (range(5) if args.phase == 'ds50-first'
-                                else range(10) if args.phase in {'ds0-middle', 'ds50-all', 'ds0-all'} else range(5,10))
+                                else range(10) if args.phase == 'ds0-middle' or args.phase.endswith('-all') else range(5,10))
     plan = [(block, c) for block in rounds
             for c in conditions[block % len(conditions):]+conditions[:block % len(conditions)]]
     manifest = {'phase': args.phase, 'started_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -172,7 +177,11 @@ def main():
                 'load_manifest_sha256': hashlib.sha256(args.load_manifest.read_bytes()).hexdigest(),
                 'kernel_release': args.expected_kernel, 'planned_cases': plan,
                 'script_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                'status': 'running', 'bit_sha256': loaded['bit_sha256']}
+                'status': 'running', 'bit_sha256': loaded['bit_sha256'],
+                'boot_id': loaded['boot_id'], 'ds': PHASE_DS[args.phase]}
+    if args.source_record is not None:
+        manifest['source_record'] = str(args.source_record.resolve())
+        manifest['selected_source'] = json.loads(args.source_record.read_text())
     records = []
     if args.resume_run is not None:
         old_manifest = json.loads((args.resume_run/'manifest.json').read_text())
@@ -197,7 +206,7 @@ def main():
             assert (item['record']['result']['aggressor'] is None) == (condition == 'Solo')
             assert actual_pages == (1 if condition == 'Solo' else int(condition[1:])), 'recovery condition mismatch'
             item.update(case=index+1, block=block, condition=condition,
-                        ds='0/0' if args.phase in {'ds0-middle', 'ds0-all'} else '50/50',
+                        ds=PHASE_DS[args.phase],
                         raw_command_path=str(path.resolve()))
             records.append(item)
         manifest.update(recovered_from=str((args.resume_run/'manifest.json').resolve()),
@@ -226,13 +235,15 @@ def main():
             item = parse(raw['stdout'], args.expected_kernel, not g1)
             assert item['boot_id'] == loaded['boot_id'], 'boot changed mid-campaign'
             item.update(case=index+1, block=block, condition=condition,
-                        ds='0/0' if args.phase in {'ds0-middle', 'ds0-all'} else '50/50',
+                        ds=PHASE_DS[args.phase],
                         raw_command_path=raw['raw_path'])
             records.append(item)
             save(args.output/'records.json', records)
             print(json.dumps({'case': index+1, 'condition': condition, 'hardware_ms': item['metrics']['hardware_ms']}), flush=True)
-        result = review(records, 3 if g1 else (10 if args.phase in {'ds0-middle', 'ds50-all', 'ds0-all'} else 5), g1)
+        result = review(records, 3 if g1 else (10 if args.phase == 'ds0-middle' or args.phase.endswith('-all') else 5), g1)
         save(args.output/'review.json', result)
+        if not result['sample_count_complete'] or set(result['groups']) != set(conditions):
+            raise RuntimeError('incomplete condition matrix; all samples retained')
         if g1 and not result['passed']:
             raise RuntimeError('G1 performance criterion failed; all samples retained')
         manifest['status'] = 'passed'

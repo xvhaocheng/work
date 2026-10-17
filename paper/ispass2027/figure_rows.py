@@ -11,11 +11,15 @@ HERE = Path(__file__).resolve().parent
 def selected(figure, row):
     e, m, s, k = (row[x] for x in ['experiment','metric','statistic','row_id'])
     if figure == 2:
+        modes = dict(part.split('=', 1) for part in row['condition'].split(';') if '=' in part)
         return ((e.startswith('batch_') and '.v0-' in k and m in ['hardware_ms','hardware_MiB_s','victim_iotlb_miss','aggressor_iotlb_miss'] and s == 'median')
-                or (e == 'board_baseline100' and s == 'median' and row['n'] == '10'
+                or (e in ['board_baseline100', 'board_ds_sweep'] and s == 'median' and row['n'] == '10'
                     and row['sample_set'] in ['within_one_run_phase_and_boot',
                                               'pooled_first_and_last_with_explicit_boots']
-                    and m in ['hardware_ms','hardware_MiB_s','victim_iotlb_miss','aggressor_iotlb_miss']))
+                    and m in ['hardware_ms','hardware_MiB_s','victim_iotlb_miss','aggressor_iotlb_miss'])
+                or (e in ['board_baseline100', 'board_ds_sweep'] and s == 'sample'
+                    and m == 'hardware_cycles' and modes.get('attempt_status') == 'accepted'
+                    and modes.get('mode') in ['A1', 'A8', 'A16', 'A64']))
     if figure == 3:
         modes = dict(part.split('=', 1) for part in row['condition'].split(';') if '=' in part)
         return ((e == 'path' and m.startswith(('v_r_','v_w_')) and m.endswith('mean_cycles') and s == 'median')
@@ -56,6 +60,12 @@ def main():
               'csv_sha256':{p:hashlib.sha256((HERE/p).read_bytes()).hexdigest() for p in sources},
               'figures':{str(n):sum(r['figure']==n for r in result) for n in range(1,11)},
               'non_quantitative_figures':[1],'pending_measurement_figures':[7,8,9]}
+    if (HERE/'data/ds-sweep-summary.json').exists():
+        manifest['derived_figure_sources'] = {'2/E1b': {
+            'summary': 'data/ds-sweep-summary.json', 'generator': 'scripts/plot_ds_sweep.py',
+            'estimator': 'median of within-DS, within-block Ak/A1 hardware-cycle ratios minus one',
+            'error_bars': 'Type-7 Q1 to Q3 of ten paired ratios',
+            'operand_metric': 'hardware_cycles', 'operand_statistic': 'sample'}}
     (HERE/'figure-rows.json').write_text(json.dumps(manifest,indent=2)+'\n')
     print(json.dumps(manifest,indent=2))
 
