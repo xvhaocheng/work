@@ -1,0 +1,322 @@
+diff --git a/Makefile b/Makefile
+index dd6e2039..465baa3e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -118,9 +118,10 @@ ariane_pkg := \
+               corev_apu/tb/ariane_axi_soc_pkg.sv                                         \
+               corev_apu/iDMA/src/idma_pkg.sv                                             \
+ 			  corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend_reg_pkg.sv \
+-              corev_apu/riscv-iommu/packages/rv_iommu_pkg.sv                             \
+-              corev_apu/riscv-iommu/packages/rv_iommu_field_pkg.sv                       \
+-              corev_apu/riscv-iommu/packages/rv_iommu_reg_pkg.sv
++	              corev_apu/riscv-iommu/packages/rv_iommu_pkg.sv                             \
++	              corev_apu/riscv-iommu/packages/rv_iommu_field_pkg.sv                       \
++	              corev_apu/riscv-iommu/packages/rv_iommu_reg_pkg.sv                         \
++	              corev_apu/riscv-iommu/packages/rv_iommu_dti_ats_pkg.sv
+               
+ ariane_pkg := $(addprefix $(root-dir), $(ariane_pkg))
+ 
+diff --git a/core/cache_subsystem/wt_axi_adapter.sv b/core/cache_subsystem/wt_axi_adapter.sv
+index dd4cafb4..64cf882f 100644
+--- a/core/cache_subsystem/wt_axi_adapter.sv
++++ b/core/cache_subsystem/wt_axi_adapter.sv
+@@ -136,7 +136,9 @@ module wt_axi_adapter import ariane_pkg::*; import wt_cache_pkg::*; #(
+     axi_wr_be    = '0;
+     axi_wr_lock  = '0;
+     axi_wr_atop  = '0;
+-    amo_off_d    = '0;
++    // Keep the SC byte lane until its delayed B response is consumed.
++    // The request FIFO can be empty for many cycles after the grant.
++    amo_off_d    = amo_off_q;
+     amo_gen_r_d  = amo_gen_r_q;
+ 
+     // read channel
+diff --git a/corev_apu/fpga/scripts/run.tcl b/corev_apu/fpga/scripts/run.tcl
+index 9f323806..b611a82a 100644
+--- a/corev_apu/fpga/scripts/run.tcl
++++ b/corev_apu/fpga/scripts/run.tcl
+@@ -38,7 +38,7 @@ read_ip { \
+ }
+ # read_ip xilinx/xlnx_protocol_checker/ip/xlnx_protocol_checker.xci
+ 
+-set_property include_dirs { "src/axi_sd_bridge/include" "../../vendor/pulp-platform/common_cells/include" "../../vendor/pulp-platform/axi/include" "../register_interface/include" "../iDMA/src/include"} [current_fileset]
++set_property include_dirs { "src/axi_sd_bridge/include" "../../vendor/pulp-platform/common_cells/include" "../../vendor/pulp-platform/axi/include" "../register_interface/include" "../iDMA/src/include" "../riscv-iommu/include"} [current_fileset]
+ 
+ source scripts/add_sources.tcl
+ 
+diff --git a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+index 65192148..e370c5be 100644
+--- a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+@@ -12,6 +12,8 @@
+ 
+ `include "axi/assign.svh"
+ `include "axi/typedef.svh"
++`include "axi-iommu/assign.svh"
++`include "axi-iommu/typedef.svh"
+ `include "register_interface/assign.svh"
+ `include "register_interface/typedef.svh"
+ 
+@@ -860,7 +862,11 @@ module ariane_peripherals #(
+     typedef logic [ariane_soc::IdWidth-1:0]         iommu_id_t;
+     typedef logic [ariane_soc::IdWidthSlave-1:0]    iommu_slv_id_t;
+ 
+-    // AXI Bus between DMA-device and IOMMU TR IF
++    localparam int unsigned NumDMADevices = 4;
++    localparam int unsigned DmaAxiIdWidth =
++        ariane_soc::IdWidth - $clog2(NumDMADevices);
++
++    // AXI Bus between DMA devices and IOMMU TR IF
+     // Extended with AXI support for untranslated transactions
+     `AXI_TYPEDEF_EXT_ALL(axi_tr, iommu_addr_t, iommu_id_t, 
+                             iommu_data_t, iommu_strb_t, iommu_user_t, 
+@@ -868,6 +874,13 @@ module ariane_peripherals #(
+     axi_tr_req_t axi_iommu_tr_req;
+     axi_tr_resp_t axi_iommu_tr_resp;
+ 
++    typedef logic [DmaAxiIdWidth-1:0] dma_iommu_id_t;
++    `AXI_TYPEDEF_EXT_ALL(axi_dma_tr, iommu_addr_t, dma_iommu_id_t,
++                            iommu_data_t, iommu_strb_t, iommu_user_t,
++                            rv_iommu::device_id_t, logic, rv_iommu::process_id_t)
++    axi_dma_tr_req_t  [NumDMADevices-1:0] axi_dma_tr_req;
++    axi_dma_tr_resp_t [NumDMADevices-1:0] axi_dma_tr_resp;
++
+     // AXI Bus between System Interconnect and IOMMU Programming IF
+     `AXI_TYPEDEF_ALL(axi_prog, iommu_addr_t, iommu_slv_id_t, 
+                      iommu_data_t, iommu_strb_t, iommu_user_t)
+@@ -881,44 +894,100 @@ module ariane_peripherals #(
+     //------------
+     if (InclDMA) begin : gen_dma
+ 
+-		// AXI Bus between iDMA and IOMMU TR IF
++        AXI_BUS #(
++            .AXI_ADDR_WIDTH ( AxiAddrWidth             ),
++            .AXI_DATA_WIDTH ( AxiDataWidth             ),
++            .AXI_ID_WIDTH   ( ariane_soc::IdWidthSlave ),
++            .AXI_USER_WIDTH ( AxiUserWidth             )
++        ) dma_cfg_bus [NumDMADevices-1:0]();
++
++        axi_demux_intf #(
++            .AXI_ID_WIDTH   ( ariane_soc::IdWidthSlave ),
++            .ATOP_SUPPORT   ( 1'b0                     ),
++            .AXI_ADDR_WIDTH ( AxiAddrWidth             ),
++            .AXI_DATA_WIDTH ( AxiDataWidth             ),
++            .AXI_USER_WIDTH ( AxiUserWidth             ),
++            .NO_MST_PORTS   ( NumDMADevices            ),
++            .MAX_TRANS      ( 8                        )
++        ) i_dma_cfg_demux (
++            .clk_i,
++            .rst_ni,
++            .test_i           ( 1'b0                ),
++            .slv_aw_select_i  ( dma_cfg.aw_addr[13:12] ),
++            .slv_ar_select_i  ( dma_cfg.ar_addr[13:12] ),
++            .slv              ( dma_cfg             ),
++            .mst              ( dma_cfg_bus         )
++        );
++
++        // AXI Bus between iDMAs and IOMMU TR IF
+         // Extended with IOMMU AXI signals
+-		AXI_BUS_EXT #(
+-			.AXI_ADDR_WIDTH ( AxiAddrWidth          ),
+-			.AXI_DATA_WIDTH ( AxiDataWidth          ),
+-			.AXI_ID_WIDTH   ( ariane_soc::IdWidth   ),
+-			.AXI_USER_WIDTH ( AxiUserWidth          ),
+-			.AXI_SID_WIDTH  ( rv_iommu::DevIdWidth  ),
+-			.AXI_SSID_WIDTH ( rv_iommu::ProcIdWidth )
+-		) idma_axi_master ();
+-
+-        `AXI_ASSIGN_TO_REQ_EXT(axi_iommu_tr_req, idma_axi_master)
+-        `AXI_ASSIGN_FROM_RESP(idma_axi_master, axi_iommu_tr_resp)
+-
+-        dma_core_wrap_intf #(
+-            .AXI_ADDR_WIDTH     ( AxiAddrWidth             ),
+-            .AXI_DATA_WIDTH     ( AxiDataWidth             ),
+-            .AXI_ID_WIDTH       ( ariane_soc::IdWidth      ),
+-            .AXI_SLV_ID_WIDTH   ( ariane_soc::IdWidthSlave ),
+-            .AXI_USER_WIDTH     ( AxiUserWidth             ),
+-            .JOB_FIFO_DEPTH     ( 8                        ),
+-            .NUM_AX_IN_FLIGHT   ( 8                        ),
+-            .MEM_SYS_DEPTH      ( 0                        ),
+-            .RAW_COUPLING_AVAIL ( 0                        ),
+-            .IS_TWO_D           ( 0                        ),
+-
+-            .DEVICE_ID          ( 24'd10          ),
+-            .PROCESS_ID         ( 20'd20          ),
+-            .AxID               ( 4'd0            )
+-		) i_dma (
+-			.clk_i      		( clk_i           ),
+-			.rst_ni     		( rst_ni          ),
+-			.testmode_i 		( 1'b0            ),
+-			// slave port
+-			.axi_slave  		( dma_cfg         ),
+-			// master port
+-			.axi_master 		( idma_axi_master )
+-		);
++        AXI_BUS_EXT #(
++            .AXI_ADDR_WIDTH ( AxiAddrWidth          ),
++            .AXI_DATA_WIDTH ( AxiDataWidth          ),
++            .AXI_ID_WIDTH   ( DmaAxiIdWidth         ),
++            .AXI_USER_WIDTH ( AxiUserWidth          ),
++            .AXI_SID_WIDTH  ( rv_iommu::DevIdWidth  ),
++            .AXI_SSID_WIDTH ( rv_iommu::ProcIdWidth )
++        ) idma_axi_master [NumDMADevices-1:0]();
++
++        for (genvar i = 0; i < NumDMADevices; i++) begin : gen_idma_axi_assign
++            `AXI_ASSIGN_TO_REQ_EXT(axi_dma_tr_req[i], idma_axi_master[i])
++            `AXI_ASSIGN_FROM_RESP(idma_axi_master[i], axi_dma_tr_resp[i])
++        end
++
++        axi_mux #(
++            .SlvAxiIDWidth ( DmaAxiIdWidth        ),
++            .slv_aw_chan_t ( axi_dma_tr_aw_chan_t ),
++            .mst_aw_chan_t ( axi_tr_aw_chan_t     ),
++            .w_chan_t      ( axi_dma_tr_w_chan_t  ),
++            .slv_b_chan_t  ( axi_dma_tr_b_chan_t  ),
++            .mst_b_chan_t  ( axi_tr_b_chan_t      ),
++            .slv_ar_chan_t ( axi_dma_tr_ar_chan_t ),
++            .mst_ar_chan_t ( axi_tr_ar_chan_t     ),
++            .slv_r_chan_t  ( axi_dma_tr_r_chan_t  ),
++            .mst_r_chan_t  ( axi_tr_r_chan_t      ),
++            .slv_req_t     ( axi_dma_tr_req_t     ),
++            .slv_resp_t    ( axi_dma_tr_resp_t    ),
++            .mst_req_t     ( axi_tr_req_t         ),
++            .mst_resp_t    ( axi_tr_resp_t        ),
++            .NoSlvPorts    ( NumDMADevices        ),
++            .MaxWTrans     ( 8                    )
++        ) i_dma_iommu_tr_mux (
++            .clk_i,
++            .rst_ni,
++            .test_i      ( 1'b0              ),
++            .slv_reqs_i  ( axi_dma_tr_req    ),
++            .slv_resps_o ( axi_dma_tr_resp   ),
++            .mst_req_o   ( axi_iommu_tr_req  ),
++            .mst_resp_i  ( axi_iommu_tr_resp )
++        );
++
++        for (genvar i = 0; i < NumDMADevices; i++) begin : gen_dma_inst
++            dma_core_wrap_intf #(
++                .AXI_ADDR_WIDTH     ( AxiAddrWidth             ),
++                .AXI_DATA_WIDTH     ( AxiDataWidth             ),
++                .AXI_ID_WIDTH       ( DmaAxiIdWidth            ),
++                .AXI_SLV_ID_WIDTH   ( ariane_soc::IdWidthSlave ),
++                .AXI_USER_WIDTH     ( AxiUserWidth             ),
++                .JOB_FIFO_DEPTH     ( 8                        ),
++                .NUM_AX_IN_FLIGHT   ( 8                        ),
++                .MEM_SYS_DEPTH      ( 0                        ),
++                .RAW_COUPLING_AVAIL ( 0                        ),
++                .IS_TWO_D           ( 0                        ),
++
++                .DEVICE_ID          ( 24'(10 + i)              ),
++                .PROCESS_ID         ( 20'(20 + i)              ),
++                .AxID               ( '0                       )
++            ) i_dma (
++                .clk_i          ( clk_i              ),
++                .rst_ni         ( rst_ni             ),
++                .testmode_i     ( 1'b0               ),
++                // slave port
++                .axi_slave      ( dma_cfg_bus[i]     ),
++                // master port
++                .axi_master     ( idma_axi_master[i] )
++            );
++        end
+     end
+ 
+ 	//--------------
+diff --git a/corev_apu/iDMA/src/idma_backend.sv b/corev_apu/iDMA/src/idma_backend.sv
+index ac162c19..a963bb99 100644
+--- a/corev_apu/iDMA/src/idma_backend.sv
++++ b/corev_apu/iDMA/src/idma_backend.sv
+@@ -380,6 +380,10 @@ module idma_backend #(
+                 stream_id:      idma_req_i.opt.device_id,
+                 ss_id_valid:    idma_req_i.opt.pv,
+                 substream_id:   idma_req_i.opt.process_id,
++                mmu_flow:       '0,
++                mmu_atst:       1'b0,
++                mmu_valid:      1'b0,
++                mmu_secsid:     1'b0,
+                 addr:           { idma_req_i.src_addr[AddrWidth-1:OffsetWidth], {{OffsetWidth}{1'b0}} },
+                 len:            len,
+                 size:           axi_pkg::size_t'(OffsetWidth),
+@@ -398,6 +402,10 @@ module idma_backend #(
+                 stream_id:      idma_req_i.opt.device_id,
+                 ss_id_valid:    idma_req_i.opt.pv,
+                 substream_id:   idma_req_i.opt.process_id,
++                mmu_flow:       '0,
++                mmu_atst:       1'b0,
++                mmu_valid:      1'b0,
++                mmu_secsid:     1'b0,
+                 addr:           { idma_req_i.dst_addr[AddrWidth-1:OffsetWidth], {{OffsetWidth}{1'b0}} },
+                 len:            len,
+                 size:           axi_pkg::size_t'(OffsetWidth),
+diff --git a/corev_apu/iDMA/src/idma_legalizer.sv b/corev_apu/iDMA/src/idma_legalizer.sv
+index 10a471a8..3c52d564 100644
+--- a/corev_apu/iDMA/src/idma_legalizer.sv
++++ b/corev_apu/iDMA/src/idma_legalizer.sv
+@@ -328,6 +328,10 @@ module idma_legalizer #(
+             stream_id:      opt_tf_q.device_id,
+             ss_id_valid:    opt_tf_q.pv,
+             substream_id:   opt_tf_q.process_id,
++            mmu_flow:       '0,
++            mmu_atst:       1'b0,
++            mmu_valid:      1'b0,
++            mmu_secsid:     1'b0,
+             addr:           { r_tf_q.addr[AddrWidth-1:OffsetWidth], {{OffsetWidth}{1'b0}} },
+             len:            ((r_num_bytes + r_addr_offset - 'd1) >> OffsetWidth),
+             size:           axi_pkg::size_t'(OffsetWidth),
+@@ -346,6 +350,10 @@ module idma_legalizer #(
+             stream_id:      opt_tf_q.device_id,
+             ss_id_valid:    opt_tf_q.pv,
+             substream_id:   opt_tf_q.process_id,
++            mmu_flow:       '0,
++            mmu_atst:       1'b0,
++            mmu_valid:      1'b0,
++            mmu_secsid:     1'b0,
+             addr:           { w_tf_q.addr[AddrWidth-1:OffsetWidth], {{OffsetWidth}{1'b0}} },
+             len:            ((w_num_bytes + w_addr_offset - 'd1) >> OffsetWidth),
+             size:           axi_pkg::size_t'(OffsetWidth),
+diff --git a/corev_apu/riscv-iommu b/corev_apu/riscv-iommu
+index f8f918aa..85b157eb 160000
+--- a/corev_apu/riscv-iommu
++++ b/corev_apu/riscv-iommu
+@@ -1 +1 @@
+-Subproject commit f8f918aa251209a8b7fafde89ba46a01cf0f7c68
++Subproject commit 85b157ebe71a623e326e51fff7b7126fe77e8eb9
+diff --git a/corev_apu/tb/ariane_soc_pkg.sv b/corev_apu/tb/ariane_soc_pkg.sv
+index 1a4e53c5..b276574b 100644
+--- a/corev_apu/tb/ariane_soc_pkg.sv
++++ b/corev_apu/tb/ariane_soc_pkg.sv
+@@ -59,7 +59,7 @@ package ariane_soc;
+   localparam logic[63:0] SPILength      = 64'h800000;
+   localparam logic[63:0] EthernetLength = 64'h10000;
+   localparam logic[63:0] GPIOLength     = 64'h1000;
+-  localparam logic[63:0] DMALength      = 64'h1000;     
++  localparam logic[63:0] DMALength      = 64'h4000;
+   localparam logic[63:0] IOMMULength    = 64'h1000;     // Regmap occupies 4kiB of memory address space
+   localparam logic[63:0] DRAMLength     = 64'h40000000; // 1GByte of DDR (split between two chips on Genesys2)
+   localparam logic[63:0] SRAMLength     = 64'h1800000;  // 24 MByte of SRAM
+@@ -119,6 +119,7 @@ package ariane_soc;
+     InclPC              : 1'b1,
+     InclAxiBC           : 1'b1,
+     InclDbg             : 1'b1,
++    InclATS             : 1'b0,
+     MSITrans            : rv_iommu_cfg::MSI_BT_MRIF,
+     IGS                 : rv_iommu_cfg::BOTH,
+     NumIntVec           : 32'd16,
+@@ -128,7 +129,16 @@ package ariane_soc;
+     AxiDataWidth        : 32'd64,
+     AxiIdWidth          : IdWidth,
+     AxiProgIdWidth      : IdWidthSlave,
+-    AxiUserWidth        : ariane_pkg::AXI_USER_WIDTH
++    AxiUserWidth        : ariane_pkg::AXI_USER_WIDTH,
++    AxiProIdWidth       : 32'd20,
++    AxiDevIdWidth       : 32'd24,
++    AxisDataWidth       : 32'd160,
++    AxisUserWidth       : 32'd1,
++    AxisKeepWidth       : 32'd20,
++    AxisStrbWidth       : 32'd20,
++    AxisIdWidth         : 32'd1,
++    AxisDestWidth       : 32'd1,
++    Freq                : 32'd100
+   };
+ 
+ endpackage

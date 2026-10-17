@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Freeze a bounded Git-source closure and build the isolated invalidation top."""
+import argparse, hashlib, importlib.util, json, os, re, shlex, signal, subprocess, sys, time
+from pathlib import Path
+sys.dont_write_bytecode = True
+HERE=Path(__file__).resolve().parent
+TASK=HERE.parent
+ROOT=TASK.parents[1]
+FROZEN=TASK/'frozen'
+CVA6=ROOT/'cva6'
+IOMMU=CVA6/'corev_apu/riscv-iommu'
+CREF='ba8cdd10659a777ccff0080bf020be64b5c1e064'
+IREF='85b157ebe71a623e326e51fff7b7126fe77e8eb9'
+RREF='73de8e51b79f416350229b1d2420b2c527e002b8'
+SREF='aae8ca49dcfbfa8e44e1938a2e4a768db83006cb'
+TOP='invalidation_dma_top'
+def git(repo,*a):return subprocess.check_output(['git','-C',str(repo),*a],env=dict(os.environ,GIT_OPTIONAL_LOCKS='0'))
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def load(path,name):
+    spec=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
+def unique(seq):return list(dict.fromkeys(seq))
+def from_frozen():
+    """Read the published closure only; never fall back to production sources."""
+    saved=FROZEN/'source-manifest.json'
+    cached=json.loads(saved.read_text())
+    def inside(relative):
+        path=(FROZEN/relative).resolve()
+        if Path(relative).is_absolute() or not path.is_relative_to(FROZEN.resolve()):
+            raise RuntimeError('Frozen path escapes task closure: '+relative)
+        return path
+    ordered=[];seen=set()
+    for row in cached['files']:
+        relative=row['logical_path']
+        if relative in seen:raise RuntimeError('Duplicate frozen file: '+relative)
+        seen.add(relative)
+        if row['role'] not in ('source','include','license'):raise RuntimeError('Unknown frozen role: '+row['role'])
+        if sha(inside(relative))!=row['sha256']:raise RuntimeError('Frozen source identity changed: '+relative)
+        if row['role']=='source':ordered.append(relative)
+    if not ordered or ordered!=cached['source_order']:
+        raise RuntimeError('Frozen source role order differs from source_order')
+    for key,expected in [('cva6',CREF),('iommu',IREF),('register_interface',RREF),('axi_slice',SREF)]:
+        if cached[key]!=expected:raise RuntimeError('Unexpected frozen baseline: '+key)
+    return [inside(p) for p in ordered],[inside(p) for p in cached['include_roots']],cached
+def freeze():
+    saved=FROZEN/'source-manifest.json'
+    if saved.is_file():
+        cached=json.loads(saved.read_text())
+        if 'source_order' in cached and 'include_roots' in cached:
+            for row in cached['files']:
+                if sha(FROZEN/row['logical_path'])!=row['sha256']:raise RuntimeError('Frozen source identity changed: '+row['logical_path'])
+            return [FROZEN/p for p in cached['source_order']],[FROZEN/p for p in cached['include_roots']],cached
+    old=load(ROOT/'tests/test_nonblock_actual_dma.py','source_interfaces_only')
+    bank=load(ROOT/'tests/test_nonblock_banked.py','source_libraries_only')
+    libs=[]
+    for p in bank.SOURCES+old.idma_sources()+old.system_sources():
+        p=Path(p)
+        if p.is_relative_to(IOMMU/'vendor/common_cells'):
+            p=CVA6/'vendor/pulp-platform/common_cells'/p.relative_to(IOMMU/'vendor/common_cells')
+        elif p.is_relative_to(IOMMU/'vendor/axi'):
+            p=CVA6/'vendor/pulp-platform/axi'/p.relative_to(IOMMU/'vendor/axi')
+        elif p.is_relative_to(IOMMU) or p.is_relative_to(ROOT/'tests'):
+            continue
+        if p.name in ('idma_fullbuffer_certificate.sv','stream_delay.sv','axi_delayer.sv'):
+            continue
+        libs.append(p.relative_to(ROOT).as_posix())
+    libs += ['cva6/vendor/pulp-platform/common_cells/src/deprecated/fifo_v2.sv']
+    libs += ['cva6/corev_apu/fpga/src/axi_slice/src/axi_'+channel+'_buffer.sv' for channel in ['aw','ar','w','r','b']]
+    libs += ['cva6/corev_apu/fpga/src/axi_slice/src/axi_single_slice.sv']
+    bender=git(IOMMU,'show',IREF+':Bender.yml').decode()
+    ipaths=[]
+    for match in re.finditer(r'^  - ([\w/.-]+\.sv)\s*$',bender,re.M):
+        path=match.group(1)
+        if path.startswith('rtl/ats_dti/') or path=='rtl/rv_iommu_wrap.sv':continue
+        if path.startswith('vendor/register_interface/'):continue
+        ipaths.append('cva6/corev_apu/riscv-iommu/'+path)
+    # Packages always precede module definitions, with one AXI/common_cells family.
+    packages=['cva6/vendor/pulp-platform/common_cells/src/cf_math_pkg.sv','cva6/vendor/pulp-platform/axi/src/axi_pkg.sv']
+    packages += [p for p in ipaths if '/packages/' in p]
+    packages += [p for p in libs if p.endswith('_pkg.sv') and p not in packages]
+    ordered=unique(packages+[p for p in libs+ipaths if p not in packages])
+    include_roots=['cva6/vendor/pulp-platform/common_cells/include','cva6/vendor/pulp-platform/axi/include',
+                   'cva6/corev_apu/iDMA/src/include','cva6/corev_apu/register_interface/include',
+                   'cva6/corev_apu/register_interface/src/include','cva6/corev_apu/register_interface/vendor/lowrisc_opentitan/src',
+                   'cva6/corev_apu/riscv-iommu/include']
+    headerpaths=[]
+    for relative in include_roots:
+        if relative.startswith('cva6/corev_apu/riscv-iommu/'):
+            repo=IOMMU;ref=IREF;prefix=relative[len('cva6/corev_apu/riscv-iommu/'):]
+        elif relative.startswith('cva6/corev_apu/register_interface/'):
+            repo=CVA6/'corev_apu/register_interface';ref=RREF;prefix=relative[len('cva6/corev_apu/register_interface/'):]
+        else:repo=CVA6;ref=CREF;prefix=relative[len('cva6/'):]
+        for name in git(repo,'ls-tree','-r','--name-only',ref,'--',prefix).decode().splitlines():
+            if name.endswith(('.svh','.h')):
+                pre='cva6/corev_apu/riscv-iommu/' if repo==IOMMU else 'cva6/corev_apu/register_interface/' if repo!=CVA6 else 'cva6/'
+                headerpaths.append(pre+name)
+    licensepaths=[]
+    for repo,ref,inside,outer in [
+      (CVA6,CREF,'','cva6/'),(CVA6,CREF,'corev_apu/iDMA','cva6/'),
+      (CVA6,CREF,'vendor/pulp-platform/axi','cva6/'),(CVA6,CREF,'vendor/pulp-platform/common_cells','cva6/'),
+      (IOMMU,IREF,'','cva6/corev_apu/riscv-iommu/'),
+      (CVA6/'corev_apu/register_interface',RREF,'','cva6/corev_apu/register_interface/'),
+      (CVA6/'corev_apu/fpga/src/axi_slice',SREF,'','cva6/corev_apu/fpga/src/axi_slice/')]:
+        for name in git(repo,'ls-tree','--name-only',ref,('--' if inside else '.'),*([inside+'/'] if inside else [])).decode().splitlines():
+            if Path(name).name.upper().startswith(('LICENSE','COPYING')):licensepaths.append(outer+name)
+        if inside:
+            for name in git(repo,'ls-tree','-r','--name-only',ref,'--',inside).decode().splitlines():
+                if Path(name).parent.as_posix()==inside and Path(name).name.upper().startswith(('LICENSE','COPYING')):licensepaths.append(outer+name)
+    manifest=[]
+    for relative in unique(ordered+headerpaths+licensepaths):
+        if relative.startswith('cva6/corev_apu/riscv-iommu/'):
+            repo=IOMMU;ref=IREF;name=relative[len('cva6/corev_apu/riscv-iommu/'):]
+        elif relative.startswith('cva6/corev_apu/register_interface/'):
+            repo=CVA6/'corev_apu/register_interface';ref=RREF;name=relative[len('cva6/corev_apu/register_interface/'):]
+        elif relative.startswith('cva6/corev_apu/fpga/src/axi_slice/'):
+            repo=CVA6/'corev_apu/fpga/src/axi_slice';ref=SREF;name=relative[len('cva6/corev_apu/fpga/src/axi_slice/'):]
+        else:repo=CVA6;ref=CREF;name=relative[len('cva6/'):]
+        data=git(repo,'show',ref+':'+name)
+        dest=FROZEN/relative;dest.parent.mkdir(parents=True,exist_ok=True)
+        if dest.exists() and dest.read_bytes()!=data:raise RuntimeError('Frozen source changed: '+relative)
+        if not dest.exists():dest.write_bytes(data)
+        manifest.append(dict(logical_path=relative,commit=ref,git_blob=git(repo,'rev-parse',ref+':'+name).decode().strip(),sha256=hashlib.sha256(data).hexdigest(),role='source' if relative in ordered else 'license' if relative in licensepaths else 'include'))
+    source_manifest=dict(schema='invalidation-frozen-closure-v1',cva6=CREF,iommu=IREF,register_interface=RREF,axi_slice=SREF,files=manifest,
+                         source_order=ordered,include_roots=include_roots,
+                         note='Only selected source and required include roots, frozen from Git; no current research wrappers/frontend. No native CPU/Linux or FPGA model.')
+    (FROZEN/'source-manifest.json').write_text(json.dumps(source_manifest,indent=2)+'\n')
+    return [FROZEN/p for p in ordered],[FROZEN/p for p in include_roots],source_manifest
+def main():
+    ap=argparse.ArgumentParser();ap.add_argument('--out',required=True,type=Path);ap.add_argument('--cpp',type=Path);ap.add_argument('--lint-only',action='store_true');ap.add_argument('--freeze-only',action='store_true');ap.add_argument('--from-frozen',action='store_true',help='Require the published frozen closure; no Git reads or production helper imports');ap.add_argument('--jobs',type=int,default=8);args=ap.parse_args()
+    out=args.out.resolve()
+    if not out.is_relative_to(TASK/'build') or out.exists():ap.error('--out must be a new directory within task/build')
+    if args.from_frozen and args.cpp and not args.cpp.resolve().is_relative_to(TASK):
+        ap.error('--from-frozen --cpp must be within this task directory')
+    sources,incs,closure=from_frozen() if args.from_frozen else freeze()
+    build_cwd=TASK if args.from_frozen else ROOT
+    if args.freeze_only:
+        print(json.dumps(dict(sources=len(sources),includes=len(incs),manifest=str(FROZEN/'source-manifest.json'))));return
+    sources=[HERE/'ariane_pkg_stub.sv']+sources+[HERE/(TOP+'.sv')]
+    out.mkdir(parents=True)
+    # Handwritten inputs are frozen per attempt so concurrent review cannot
+    # silently alter a compiler input after its manifest hash was recorded.
+    input_dir=out/'inputs';input_dir.mkdir()
+    handwritten=[]
+    for original in [HERE/'ariane_pkg_stub.sv',HERE/(TOP+'.sv')]+([args.cpp.resolve()] if args.cpp else []):
+        copy=input_dir/original.name;copy.write_bytes(original.read_bytes())
+        handwritten.append(dict(original=str(original),snapshot=str(copy),sha256=sha(copy)))
+        sources=[copy if p==original else p for p in sources]
+    cpp_copy=input_dir/args.cpp.name if args.cpp else None
+    cmd=['verilator','--lint-only' if args.lint_only else '--cc']
+    if not args.lint_only:
+        if not args.cpp or not args.cpp.is_file():ap.error('--cpp required for executable build')
+        cmd+=['--exe','--build','-j',str(args.jobs)]
+    cmd+=['--assert','-Wno-fatal','+define+ASSERTS_OFF','--output-split','10000','--output-split-cfuncs','10000','--top-module',TOP,'--Mdir',str(out/'obj')]
+    cmd+=['-I'+str(p) for p in incs]+[str(p) for p in sources]
+    if not args.lint_only:cmd+=[str(cpp_copy)]
+    versions={}
+    for tool,argv in [('verilator',['verilator','--version']),('cxx',['g++','--version']),('make',['make','--version'])]:
+        versions[tool]=subprocess.check_output(argv).decode().splitlines()[0]
+    manifest=dict(schema='invalidation-build-v1',state='running',started_unix=time.time(),top=TOP,
+      build_driver=dict(path=str(Path(__file__).resolve()),sha256=sha(Path(__file__).resolve())),working_directory=str(build_cwd),driver_argv=sys.argv,source_mode='frozen-only' if args.from_frozen else 'freeze-or-cache',
+      sources=[dict(path=str(p),sha256=sha(p)) for p in sources],includes=closure['files'],include_directories=[str(p) for p in incs],handwritten_inputs=handwritten,argv=cmd,versions=versions,
+      frozen_source_manifest=dict(path=str(FROZEN/'source-manifest.json'),sha256=sha(FROZEN/'source-manifest.json')),
+      baseline_refs=dict(cva6=CREF,iommu=IREF,register_interface=RREF,axi_slice=SREF),parameters=dict(iotlb_entries=16,ddtc_entries=8,iommu_outstanding=8,w_fifo_depth=32,dma_buffer_depth=3,dma_ax_in_flight=8,dma_job_fifo_depth=8,msi=False,ats=False,pdt=False,banked=False,policy=False,early_hit=False,ds_delayer=False,ds_first_f4=False,stage1='host Sv39 as configured through real DC memory by CPP',device_table='CPP mode3 two-level DDT, base32B DC, DID10/11 (<64); common nonleaf read cost included in every mode',ddr_startup='CPP selects fixed16; no latency logic in SV'),
+      cpp=dict(path=str(cpp_copy),original_path=str(args.cpp.resolve()),sha256=sha(cpp_copy)) if args.cpp else None,
+      environment={'LC_ALL':os.environ.get('LC_ALL'),'LANG':os.environ.get('LANG')},lint_only=args.lint_only)
+    (out/'build-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n');(out/'command.sh').write_text('#!/bin/sh\nexec '+shlex.join(cmd)+'\n')
+    with (out/'build.log').open('w') as log:
+        proc=subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT,start_new_session=True,cwd=build_cwd)
+        try:rc=proc.wait(timeout=900)
+        except subprocess.TimeoutExpired:os.killpg(proc.pid,signal.SIGKILL);proc.wait();rc=124
+    manifest.update(state='passed' if rc==0 else 'failed',exit_code=rc,ended_unix=time.time())
+    binary=out/'obj'/('V'+TOP)
+    if rc==0 and binary.exists():manifest['executable']=dict(path=str(binary),sha256=sha(binary))
+    (out/'build-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+    print(json.dumps(dict(state=manifest['state'],source_count=len(sources),manifest=str(out/'build-manifest.json'))))
+    if rc:print('\n'.join((out/'build.log').read_text(errors='replace').splitlines()[-80:]))
+    return rc
+if __name__=='__main__':sys.exit(main())
