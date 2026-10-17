@@ -1,7 +1,8 @@
 # E3 变更请求：当前 batch 几何不能表达三类目标流量
 
 > 后续仅P0最小方案已获用户批准并实施中，见[p0-implementation.md](p0-implementation.md)。
-> 本页完整三形态请求仍未获扩展，不代表已经实现16–64KiB或2D。
+> 使用者最新已授权完整论文负载必要扩展；本页原请求为历史，新的[bounded接口与容量提案](full-bounded-design.md)待Root审后分批实现。
+> P0已构建交付；完整16–64KiB／三形态ABI5尚未实现。
 
 ## Material Passport
 

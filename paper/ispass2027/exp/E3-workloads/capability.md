@@ -2,6 +2,8 @@
 
 > 此页核查原pathv3，不把后来P0能力倒填旧版本。后续用户已批准仅P0最小driver/RTL修改与45点；
 > 当前实现、有限验证与构建状态见 [p0-implementation.md](p0-implementation.md)，新板测仍未完成。
+> 最新授权已允许完整论文负载的必要RTL/Linux扩展；现阶段仅提交[完整有界接口提案](full-bounded-design.md)，
+> 尚未实现ABI5。以下原pathv3能力证据及最初限制作为历史保留。
 
 ## Material Passport
 
