@@ -27,5 +27,8 @@ git clone --branch codex/organized-current-20261017 /absolute/path/iommu-platfor
 | 1．内部整合 | `8a2e42d8b3617b638f2033bd16eae6ed2531b88b` | 本页原完整平台包 |
 | 2．已完成失效实验归档 | `734592d18fdeff7e69b01163bb572ab2a0d3f39d` | [实验发布说明与增量包](../../iommu-platform/out/invalidation-interference-20261017/publication/README.md)，要求顺序1 |
 | 3．版本导航文档 | `6451764460bd015837a295410c49ef41227bf1f7` | [platform-navigation-delta.bundle](platform-navigation-delta.bundle)／[实际恢复核对](platform-navigation-delta.json)，要求顺序2 |
+| 4．历史实验版本身份补填 | `21430b531b0b2bc60c5fb6fd5933b078d68ddc2c` | [platform-history-identities-delta.bundle](platform-history-identities-delta.bundle)／[实际恢复核对](platform-history-identities-delta.json)，要求顺序3 |
 
 增量包均提供 `refs/heads/codex/organized-current-20261017`，按序 fetch 到恢复仓库同名分支即可；上述三个包已在全新 bare 目录中实际导入并通过 HEAD/tree 和完整对象检查。顺序3只修改四份平台文档，不改组件源码、gitlink或版本锁，不运行新实验。当前源码选择与实际实验输入从[版本导航](../../iommu-platform/docs/versions.md)进入。
+
+顺序4只新增历史身份表／静态生成核对脚本并更新三份平台入口文档，共14个文件；原实验manifest、数据、旧索引、源码、gitlink和锁保持。约642KB新增量及前三包已在另一个全新bare目录实际按序导入，HEAD／tree与完整对象检查通过，四主体子仓库HEAD保持且干净。补填的历史执行版本从[历史身份入口](../../iommu-platform/provenance/source-organization-20261017/history/README.md#历史版本身份补填)查，不把本次归档commit当作旧实验源码。

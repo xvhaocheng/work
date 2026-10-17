@@ -3925,3 +3925,16 @@ IOMMU与CVA6分别拆成12／27个功能提交，实际补丁顺序与语义依�
 [实验身份记录规范](docs/agent-policy.md#实验身份记录)明确要求构建/运行前留存各相关repo的checkout分支及完整commit、实际selected ref/commit、dirty补丁与overlay文件哈希、实际编译闭包/构建参数/产物哈希、运行身份与原始结果；后续归档commit单列。复用现有source/build/run manifest，缺项在下一轮运行前补齐，不回填旧分支伪造旧执行身份。本次只维护文档/导航和核对Git与链接，不改生产源码、锁、子仓库引用，不启动新构建、实验、综合或板测。Codex-only。
 
 平台文档已先提交为 `6451764460bd015837a295410c49ef41227bf1f7`；[原恢复入口](repository-recovery/internal-integration-20261017/README.md#后续平台提交按序恢复)串起原整合包、失效结果增量与本次6.5KB文档增量，已在全新bare目录导入三包并核对HEAD/tree及完整对象。旧实验与旧核验原件不改写，后续普通文档提交不冒充新的执行源码。
+
+
+## 2026-10-17 补齐历史实验的分支、commit与实际源码对应
+
+用户要求补已有记录的执行身份、未知标清且不重跑。新增[历史身份补填入口](iommu-platform/provenance/source-organization-20261017/history/README.md#历史版本身份补填)：原79条逐条、失效28测量配置与9准备项、成果索引另60个轮次／构建组。三组JSON／CSV引用原manifest、版本锁、dirty／overlay及完整源哈希组，不复制原实验数据，不把后来功能分支／归档提交写成当时执行身份。旧index、collector、verification与所有原实验manifest保持原字节。
+
+原79条有75条能证明至少一个具名角色的commit（70条checkout时点，37条来源／版本锁，统计重叠），不表示完整源码可还原。历史组件branch全部未记录；11条First-PTE仅能关联campaign输入时顶层work/main。EARLY-2DMA-BARRIER、ACTUAL-DMA-SYSTEM-PN、SHARED-READ-RTL、PROFILE-baseline-4dma仍无确定历史commit，已知表格、源码／配置hash仍保留。composition两份原stage build-inputs补回平台时点与旧锁；13核心build的1115显式输入沿旧源表关联，6个缺原字节出现项（4个SHA）及隐式依赖／环境闭包保持未知。
+
+失效28配置逐项对应build03，生产研究checkout与实际冻结CVA6 ba8cdd1／IOMMU85b157e分开；work当时身份、vendor checkout缺项不猜。早期lint01旧top字节未找到；build04只重编未模拟。补充60组区分源码、模型、功能执行、RTL、构建与板测；R107初版失败／repair1成功、Linux/OpenSBI冻结基座分列；mapping官方Linux只是来源，D-CS1后来增强脚本hash不能认证原生成器。覆盖按成果索引定向，不宣称穷尽全部out或单次运行。
+
+[17项静态检查](iommu-platform/provenance/source-organization-20261017/history/identity-verification.json)实际通过：1390引用文件、7255JSON pointer、行号／CSV关联／字段缺项原因、历史元数据副本与106去重源字节保全、114冻结文件与Git commit/path/blob吻合、28case与build03/binary身份一致。旧inventory中的活动docs/build.md在上一轮导航维护已变，历史副本保持；本轮未改该文件或旧回执。内部平台先归档本次补填，组件源码／HEAD／gitlink与锁不变；公开work按普通文件及既有增量恢复流程同步。无新构建、实验、数据归约、综合、板测或goal恢复，Codex-only。
+
+内部平台提交为 `21430b531b0b2bc60c5fb6fd5933b078d68ddc2c`；[641590B增量及恢复核对](repository-recovery/internal-integration-20261017/platform-history-identities-delta.json)以前一导航提交6451764为prerequisite，与前三包在全新bare仓库按序导入、HEAD/tree及完整对象检查通过。四主体子仓库保持原HEAD且干净，原bundle／回执未覆盖；根导航、CURRENT与成果索引已链接同一历史身份入口。

@@ -2,6 +2,31 @@
 
 本目录把已有历史报告、版本锁、构建清单、dirty/overlay 与实际运行参数串到本轮源码整理的 feature ID。它只整理既有证据，不改变历史题名、结论、日期、数据和接受记录；没有执行新实验、数据归约、构建、综合、布线或板测，也不恢复暂停分支或 MIG。
 
+## 历史版本身份补填
+
+2026-10-17 后续按用户要求补查当时 branch、commit 与实际源码。**以下表是新增的来源说明，原 `index`、build/run manifest、数据和旧核验回执保持原字节。** 查询一轮时先按实验 ID 找 CSV，再到同名 JSON 的字段证据；每处引用提供原文件路径、SHA256 和 JSON pointer／行号。不同表的行数不是相同统计口径，不能相加作为运行总次数。
+
+| 范围 | 可读表格 | 字段证据与源码对应 |
+| --- | --- | --- |
+| 原索引全部 79 条，包括源码变更、配置、准备失败和实际运行 | [historical-identities.csv](historical-identities.csv) | [historical-identities.json](historical-identities.json)：历史 checkout、具名旧锁、dirty／overlay、13 份核心构建源表及原运行清单 |
+| 失效实验 28 个测量配置，另列 9 个 lint／build／smoke 准备项 | [invalidation-identities.csv](invalidation-identities.csv) | [invalidation-identities.json](invalidation-identities.json)：生产 checkout 与冻结选源分开；28 测量逐项绑定 build03，Linux 只读核查另列 |
+| 成果导航原索引未单列的 60 个轮次／构建组 | [supplemental-identities.csv](supplemental-identities.csv) | [supplemental-identities.json](supplemental-identities.json)：R107、stage117、A／D／B、mapping、功能测试及 MIG 等；每组给原件及覆盖边界，非逐次运行计数 |
+
+字段按原件能证明的角色填写：`checkout_commit` 是具名时点工作树基座；`selected_commit` 可能是明确选源、版本锁配置、dirty 基座或只读来源，以 `identity_role`／`role` 为准。它们都不能吞掉未提交改动和测试副本。`selected_ref` 未记录时留 `null`，不从当前分支猜测。`null` 旁有具体原因；它不表示干净、detached HEAD 或未运行。后来功能分支与归档提交单列，只用于导航／恢复。
+
+已确认的关键边界：
+
+- 原 79 条中，75 条能找到至少一个具名角色的历史 commit；70 条含 checkout 时点证据，37 条含固定来源／版本锁等选源证据，统计有重叠。历史组件 checkout 分支均未留存；11 条 First-PTE 记录只能关联整轮输入记录中顶层 `work/main`，不能扩展为当时平台或子仓库分支。
+- `EARLY-2DMA-BARRIER`、`ACTUAL-DMA-SYSTEM-PN`、`SHARED-READ-RTL`、`PROFILE-baseline-4dma` 未找到可据此确认的历史 commit。各条保留已知表格、源码／配置哈希及各自原证据；源码哈希已知与 commit 未知可以同时成立。
+- E3 等 FPGA 构建的开始／结束 commit 不同时分别保留；旧锁只证明配置选择，dirty 和实际加载身份须另查。两份 composition 原构建输入补回了旧索引漏列的平台身份与旧锁。
+- First-PTE／DISCOVERY／PLRU 的 13 份核心清单继续关联 1115 个显式输入出现项及保存源字节。失败／准备轮有 6 个缺失原字节出现项（4 种 SHA256）；隐式 include、环境及全部生成输入仍不具备完整闭包，不宣称已复现。
+- 失效实验生产分支是 `codex/organized-current-20261017`，但真实编译选用 CVA6 `ba8cdd10659a777ccff0080bf020be64b5c1e064`／IOMMU `85b157ebe71a623e326e51fff7b7126fe77e8eb9` 的冻结源码及手写夹具。114 份冻结文件可核到具名 Git blob。早期 lint01 的旧 top 字节未找到；build04 只有重编记录，未作为测量运行。
+- 补充表沿成果索引及其原报告定向整理，不冒称穷尽全部 `out/`、退役树或所有单次运行。D-CS1 原生成缺少完整源哈希，后来增强脚本的哈希不能补成当时生成版本；纯源码、条件模型、功能执行、RTL、FPGA 构建与板测分别标注。
+
+[新增静态核验](identity-verification.json)由 [verify_identities.py](verify_identities.py) 检查引用哈希、JSON pointer、CSV 关联、旧证据保全以及 build03 → 28 case 的关系，不调用编译器、模拟器或原分析器。三个 `backfill_*_identities.py` 只生成这次补填表；不自动修订原实验记录，也不补造原来未记录的信息。新 agent 查阅现成表即可，无需重新收集或运行实验。
+
+旧 inventory 中 `docs/build.md` 已在上一轮版本导航维护中更新；其历史原字节仍在 `metadata/iommu-platform/docs/build.md`，本次未改该文件。新核验分别列出当前路径漂移与历史副本身份，不覆盖旧 `verification.json`，也不把旧回执的“当时一致”冒充所有活动文档永远不变。
+
 ## 从哪里查
 
 - [index.json](index.json)：79 条完整记录；[index.csv](index.csv) 是相同记录的表格入口。复杂字段为 JSON 单元格。

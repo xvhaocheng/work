@@ -2908,3 +2908,11 @@ HERO height32四案P/N/H1/H2在执行前冻结，一次调用两个固定普通�
 核对[失效干扰build03清单](../out/invalidation-interference-20261017/build/build03/build-manifest.json)：实际冻结CVA6 ba8cdd1／IOMMU F5 85b157e，与当前研究整合HEAD分开；96项显式source、3份手写输入快照及冻结source-manifest的现存字节均匹配记录SHA256。Linux f215540仅为来源C，未在该仿真执行。结果归档提交734592d按[原发布回执](../out/invalidation-interference-20261017/publication/receipt.json)保留，不作为永远当前平台tip；这些检查不重放28配置或替代原实验验收。
 
 新文档本地链接与只读查阅示例对象已核对，后续身份记录统一引用[实验身份记录](../../docs/agent-policy.md#实验身份记录)。本次仅文档、Git及已有输入哈希检查，没有新源码／构建／回归／RTL运行／性能实验／综合布线／板测，不切换工作树或恢复暂停任务；Codex-only，未使用DeepSeek或Claude。
+
+## 2026-10-17 历史实验版本身份补填
+
+按用户要求，复用[历史索引](../provenance/source-organization-20261017/history/README.md#历史版本身份补填)新增三组JSON／CSV：原79条逐条、失效28测量配置＋9准备项、另60个已导航轮次／构建组。原79条中75条存在至少一个明确角色的历史commit；历史组件branch仍无原记录，First-PTE的顶层main不外推子仓库。补查composition原stage输入、R107初版／repair1、mapping来源与原构建源表；D-CS1后补源hash不当原生成身份。
+
+[统一静态核验](../provenance/source-organization-20261017/history/identity-verification.json)17项通过：1390份引用文件及7255处JSON pointer、行号、CSV关联、空值原因／非空字段证据、13份核心build的1115输入／106去重源字节、114冻结文件的commit／路径／blob对应，以及build03与28个实际case的关联。236份历史元数据原字节可从原路径或保留副本核对；其中活动build.md已在上一轮导航维护更新，历史副本SHA相同，本次未改它或旧verification.json。
+
+原实验manifest、数据、源码和旧索引保持；只新增来源补填及更新入口。组件HEAD／父子指针／sources.lock不变。全部为Codex只读证据核查和文档／索引落盘，没有新构建、实验、归约、RTL执行、综合、板测或暂停任务恢复。

@@ -50,7 +50,7 @@
 
 这次是 Verilator 下真实 DMA/IOMMU 的 28 配置仿真；Linux `f215540ad19dfe88c91b43b82c09cf40c514f323` 仅作为来源 C 核查，CPU/Linux 未执行。原版 16 项 PLRU 加已列必要修复、无分区/旁路，不能把结果追认为 `upstream-original` 的运行。来源 registry 的 `source_fixed_only` 是整理时刻状态，后续实际编译/运行以各报告及清单为准。
 
-平台 `734592d18fdeff7e69b01163bb572ab2a0d3f39d` 是该批结果的**固定归档提交**，见[发布回执](../out/invalidation-interference-20261017/publication/receipt.json)；它不充当永远最新的平台 HEAD，也不替代实际 frozen 组件与输入哈希。更早实验从历史索引进入，继续绑定各自当时的 commit、dirty/overlay 和源码清单，不用后来整理提交倒填旧运行。
+平台 `734592d18fdeff7e69b01163bb572ab2a0d3f39d` 是该批结果的**固定归档提交**，见[发布回执](../out/invalidation-interference-20261017/publication/receipt.json)；它不充当永远最新的平台 HEAD，也不替代实际 frozen 组件与输入哈希。更早实验从[历史版本身份补填](../provenance/source-organization-20261017/history/README.md#历史版本身份补填)进入，查当时分支、checkout／选用 commit、dirty/overlay、实际构建清单和逐项缺失原因，不用后来整理提交倒填旧运行。失效实验的[28配置身份表](../provenance/source-organization-20261017/history/invalidation-identities.csv)另外列出生产 checkout 与冻结编译源。
 
 ## 只读核对与以后怎么记录
 
