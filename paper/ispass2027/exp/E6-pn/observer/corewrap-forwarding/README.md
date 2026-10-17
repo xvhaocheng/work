@@ -109,7 +109,11 @@ plus this forwarding commit; the patch contains only the forwarding commit.
 The original5.040 Verilator path is taken from accepted run09; no tool install
 or version upgrade occurs. Logs retain original vendor width/constant warnings.
 Keeping the outer `_intf` module byte-identical leaves its two new base outputs
-unconnected (`PINMISSING`); that interface is not this platform's typed instance.
+unconnected (`PINMISSING`). Subsequent direct source inspection corrected the
+earlier platform assumption: actual `ariane_peripherals_xilinx.sv:1018` calls
+`dma_core_wrap_intf`. This package tests the typed wrapper directly; the real
+peripheral still needs the separately authorized narrow interface forwarding
+batch. The original finite evidence is not a claim that this link was complete.
 The original2D popcount at its small size emits `ASCRANGE`. Neither warning is
 hidden by changing scope-excluded production files. There is no latch or
 UNOPTFLAT warning. Raw generated statistics/patch context keep original spaces;
