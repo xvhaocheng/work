@@ -1,0 +1,348 @@
+From 9befa577b153856990cb6c9c18bae1f5332e0685 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sun, 18 Oct 2026 03:30:15 +0900
+Subject: [PATCH] DMA wrapper: add default-off PN backend and real full-buffer
+ certificates
+
+---
+ Makefile                                      |   1 +
+ corev_apu/iDMA/Bender.yml                     |   1 +
+ .../iDMA/src/idma_fullbuffer_certificate.sv   |  50 +++++
+ .../src/systems/cva6_reg/dma_core_wrap.sv     | 182 ++++++++++++++++--
+ 4 files changed, 216 insertions(+), 18 deletions(-)
+ create mode 100644 corev_apu/iDMA/src/idma_fullbuffer_certificate.sv
+
+diff --git a/Makefile b/Makefile
+index 465baa3e..7a60c27c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -182,6 +182,7 @@ src :=  corev_apu/tb/axi_adapter.sv
+         corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv           \
+         corev_apu/iDMA/src/frontends/idma_transfer_id_gen.sv                         \
+         corev_apu/iDMA/src/idma_stream_fifo.sv                                       \
++        corev_apu/iDMA/src/idma_fullbuffer_certificate.sv                            \
+         corev_apu/iDMA/src/idma_buffer.sv                                            \
+         corev_apu/iDMA/src/idma_error_handler.sv                                     \
+         corev_apu/iDMA/src/idma_channel_coupler.sv                                   \
+diff --git a/corev_apu/iDMA/Bender.yml b/corev_apu/iDMA/Bender.yml
+index 95b1b081..6dae629b 100644
+--- a/corev_apu/iDMA/Bender.yml
++++ b/corev_apu/iDMA/Bender.yml
+@@ -24,6 +24,7 @@ sources:
+   # Level 0
+   - src/frontends/idma_transfer_id_gen.sv
+   - src/idma_pkg.sv
++  - src/idma_fullbuffer_certificate.sv
+   - src/idma_stream_fifo.sv
+   # Level 1
+   - src/idma_buffer.sv
+diff --git a/corev_apu/iDMA/src/idma_fullbuffer_certificate.sv b/corev_apu/iDMA/src/idma_fullbuffer_certificate.sv
+new file mode 100644
+index 00000000..8ed852c3
+--- /dev/null
++++ b/corev_apu/iDMA/src/idma_fullbuffer_certificate.sv
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: Solderpad-0.51
++// Permission for one complete, aligned 4 KiB copy in a sufficiently large
++// data buffer. Samples accepted frontend jobs and retired backend jobs only;
++// it never changes either handshake. The register frontend serializes jobs.
++// Unexpected overlap/retirement revokes this new permission until reset.
++module idma_fullbuffer_certificate #(
++    parameter int unsigned CapacityBytes = 0
++) (
++    input logic clk_i, rst_ni,
++    input logic job_fire_i, job_done_i, normal_copy_i,
++    input logic [63:0] length_i, src_i, dst_i,
++    output logic permit_o,
++    output logic pending_o, fault_o
++);
++    logic pending_q, eligible_q, fault_q;
++    logic eligible;
++    assign pending_o = pending_q;
++    assign fault_o = fault_q;
++    assign eligible = CapacityBytes >= 4096 && normal_copy_i &&
++                      length_i == 64'd4096 && src_i[11:0] == 0 && dst_i[11:0] == 0;
++    assign permit_o = pending_q && eligible_q && !fault_q && normal_copy_i;
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            pending_q <= 1'b0;
++            eligible_q <= 1'b0;
++            fault_q <= 1'b0;
++        end else begin
++            case ({job_fire_i, job_done_i})
++                2'b10: begin
++                    if (pending_q) fault_q <= 1'b1;
++                    pending_q <= 1'b1;
++                    eligible_q <= eligible;
++                end
++                2'b01: begin
++                    if (!pending_q) fault_q <= 1'b1;
++                    pending_q <= 1'b0;
++                    eligible_q <= 1'b0;
++                end
++                2'b11: begin
++                    // Replace a completed sole job; an immediately completed
++                    // job with no predecessor needs no read permission.
++                    pending_q <= pending_q;
++                    eligible_q <= pending_q && eligible;
++                end
++                default: ;
++            endcase
++        end
++    end
++endmodule
+diff --git a/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv b/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
+index 69a9596e..07c672c2 100644
+--- a/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
++++ b/corev_apu/iDMA/src/systems/cva6_reg/dma_core_wrap.sv
+@@ -35,7 +35,8 @@ module dma_core_wrap #(
+   parameter type                      axi_slv_rsp_t    = logic,
+   parameter logic [23:0]              DEVICE_ID        = 24'd1,
+   parameter logic [19:0]              PROCESS_ID       = 20'd0,
+-  parameter logic [(AxiIdWidth-1):0]  AxID             = 0
++  parameter logic [(AxiIdWidth-1):0]  AxID             = 0,
++  parameter bit PnEnable = 1'b0
+ ) (
+   input  logic          clk_i,
+   input  logic          rst_ni,
+@@ -52,7 +53,10 @@ module dma_core_wrap #(
+   output axi_mst_req_t  axi_mst_req_o,
+   input  axi_mst_rsp_t  axi_mst_rsp_i,
+   input  axi_slv_req_t  axi_slv_req_i,
+-  output axi_slv_rsp_t  axi_slv_rsp_o
++  output axi_slv_rsp_t  axi_slv_rsp_o,
++  input logic pn_nonblock_enable_i = 1'b0,
++  output logic pn_fullbuffer_permit_o, pn_backend_job_quiet_o,
++  output logic pn_certificate_pending_o, pn_certificate_fault_o
+ );
+ 
+   // local params
+@@ -270,6 +274,60 @@ module dma_core_wrap #(
+   `AXI_TYPEDEF_AW_CHAN_EXT_T(axi_mst_aw_chan_t, addr_t, axi_id_t, axi_user_t, iommu_sid_t, iommu_ssidv_t, iommu_ssid_t)
+   `AXI_TYPEDEF_AR_CHAN_EXT_T(axi_mst_ar_chan_t, addr_t, axi_id_t, axi_user_t, iommu_sid_t, iommu_ssidv_t, iommu_ssid_t)
+ 
++  // MODE[0] is supplied by an external complete-allquiet guard. This mux
++  // does not protect a busy mode change and never resets or flushes a branch.
++  localparam int unsigned PnBufferDepth = 512;
++  logic pn_select_n;
++  idma_req_t pn_small_request, pn_large_request;
++  idma_rsp_t pn_small_response, pn_large_response;
++  idma_pkg::idma_busy_t pn_small_busy, pn_large_busy;
++  axi_mst_req_t pn_small_axi_req, pn_large_axi_req;
++  axi_mst_rsp_t pn_small_axi_rsp, pn_large_axi_rsp;
++  logic pn_small_req_valid, pn_small_req_ready, pn_small_rsp_valid, pn_small_rsp_ready;
++  logic pn_large_req_valid, pn_large_req_ready, pn_large_rsp_valid, pn_large_rsp_ready;
++  logic [1:0] pn_small_ttype, pn_large_ttype;
++  data_t pn_small_wdata, pn_large_wdata, pn_small_rdata, pn_large_rdata;
++  logic pn_small_rdata_valid, pn_large_rdata_valid;
++  logic pn_small_permit, pn_large_permit, pn_small_pending, pn_large_pending;
++  logic pn_small_fault, pn_large_fault;
++  logic pn_job_fire, pn_job_done;
++
++  assign pn_select_n = PnEnable && !IsTwoD && pn_nonblock_enable_i;
++  assign pn_small_request = pn_select_n ? '0 : burst_req;
++  assign pn_large_request = pn_select_n ? burst_req : '0;
++  assign pn_small_req_valid = !pn_select_n && be_valid;
++  assign pn_large_req_valid = pn_select_n && be_valid;
++  assign be_ready = pn_select_n ? pn_large_req_ready : pn_small_req_ready;
++  assign idma_rsp = pn_select_n ? pn_large_response : pn_small_response;
++  assign idma_rsp_valid = pn_select_n ? pn_large_rsp_valid : pn_small_rsp_valid;
++  assign pn_small_rsp_ready = !pn_select_n && idma_rsp_ready;
++  assign pn_large_rsp_ready = pn_select_n && idma_rsp_ready;
++  assign idma_busy = pn_select_n ? pn_large_busy : pn_small_busy;
++  assign pn_small_ttype = pn_select_n ? idma_pkg::DEFAULT : ttype;
++  assign pn_large_ttype = pn_select_n ? ttype : idma_pkg::DEFAULT;
++  assign pn_small_wdata = pn_select_n ? '0 : wdata;
++  assign pn_large_wdata = pn_select_n ? wdata : '0;
++  assign rdata = pn_select_n ? pn_large_rdata : pn_small_rdata;
++  assign rdata_valid = pn_select_n ? pn_large_rdata_valid : pn_small_rdata_valid;
++  assign axi_mst_req_o = pn_select_n ? pn_large_axi_req : pn_small_axi_req;
++  assign pn_small_axi_rsp = pn_select_n ? '0 : axi_mst_rsp_i;
++  assign pn_large_axi_rsp = pn_select_n ? axi_mst_rsp_i : '0;
++
++  // Acceptance at the frontend->jobFIFO boundary, not the backend input.
++  assign pn_job_fire = !IsTwoD && be_valid_d && be_ready_d;
++  assign pn_job_done = !IsTwoD && idma_rsp_valid && idma_rsp_ready;
++  assign pn_fullbuffer_permit_o = pn_select_n && pn_large_permit;
++  assign pn_certificate_pending_o = pn_small_pending || pn_large_pending;
++  assign pn_certificate_fault_o = pn_small_fault || pn_large_fault;
++  // Backend/job domain only: no claim about frontend IDLE/launch/COUNT,
++  // control AXI, system AXI stock, IOMMU/TL/PTW or observer quiet.
++  assign pn_backend_job_quiet_o = !IsTwoD && !be_valid_d && !be_valid &&
++      !(|pn_small_busy) && !(|pn_large_busy) &&
++      !pn_small_rsp_valid && !pn_large_rsp_valid &&
++      !pn_small_axi_req.ar_valid && !pn_small_axi_req.aw_valid && !pn_small_axi_req.w_valid &&
++      !pn_large_axi_req.ar_valid && !pn_large_axi_req.aw_valid && !pn_large_axi_req.w_valid &&
++      !axi_mst_rsp_i.r_valid && !axi_mst_rsp_i.b_valid && !pn_certificate_pending_o;
++
+   idma_backend #(
+     .DataWidth           ( AxiDataWidth                ),
+     .AddrWidth           ( AxiAddrWidth                ),
+@@ -297,28 +355,109 @@ module dma_core_wrap #(
+     .rst_ni,
+     .testmode_i,
+ 
+-    .idma_req_i    ( burst_req         ),
+-    .req_valid_i   ( be_valid          ),
+-    .req_ready_o   ( be_ready          ),
++    .idma_req_i    ( pn_small_request         ),
++    .req_valid_i   ( pn_small_req_valid       ),
++    .req_ready_o   ( pn_small_req_ready       ),
+ 
+-    .idma_rsp_o    ( idma_rsp          ),
+-    .rsp_valid_o   ( idma_rsp_valid    ),
+-    .rsp_ready_i   ( idma_rsp_ready    ),
++    .idma_rsp_o    ( pn_small_response        ),
++    .rsp_valid_o   ( pn_small_rsp_valid       ),
++    .rsp_ready_i   ( pn_small_rsp_ready       ),
+ 
+     .idma_eh_req_i ( '0                ), // No error handling
+     .eh_req_valid_i( 1'b1              ),
+     .eh_req_ready_o( /*NOT CONNECTED*/ ),
+ 
+-    .protocol_req_o( axi_mst_req_o     ),
+-    .protocol_rsp_i( axi_mst_rsp_i     ),
+-    .busy_o        ( idma_busy         ),
++    .protocol_req_o( pn_small_axi_req         ),
++    .protocol_rsp_i( pn_small_axi_rsp         ),
++    .busy_o        ( pn_small_busy            ),
+ 
+-    .ttype_i       ( ttype             ),
+-    .wdata_i       ( wdata             ),
+-    .rdata_o       ( rdata             ),
+-    .rdata_valid_o ( rdata_valid       )
++    .ttype_i       ( pn_small_ttype           ),
++    .wdata_i       ( pn_small_wdata           ),
++    .rdata_o       ( pn_small_rdata           ),
++    .rdata_valid_o ( pn_small_rdata_valid     )
+   );
+ 
++  if (PnEnable && !IsTwoD) begin : gen_pn_backend
++    idma_backend #(
++      .DataWidth           ( AxiDataWidth                ),
++      .AddrWidth           ( AxiAddrWidth                ),
++      .UserWidth           ( AxiUserWidth                ),
++      .AxiIdWidth          ( AxiIdWidth                  ),
++      .NumAxInFlight       ( NumAxInFlight               ),
++      .BufferDepth         ( PnBufferDepth               ),
++      .TFLenWidth          ( TFLenWidth                  ),
++      .RAWCouplingAvail    ( RAWCouplingAvail            ),
++      .MaskInvalidData     ( 1'b0                        ),
++      .HardwareLegalizer   ( 1'b1                        ),
++      .RejectZeroTransfers ( 1'b1                        ),
++      .MemSysDepth         ( MemSysDepth                 ),
++      .ErrorCap            ( idma_pkg::NO_ERROR_HANDLING ),
++      .idma_req_t          ( idma_req_t                  ),
++      .idma_rsp_t          ( idma_rsp_t                  ),
++      .idma_eh_req_t       ( idma_pkg::idma_eh_req_t     ),
++      .idma_busy_t         ( idma_pkg::idma_busy_t       ),
++      .protocol_req_t      ( axi_mst_req_t               ),
++      .protocol_rsp_t      ( axi_mst_rsp_t               ),
++      .aw_chan_t           ( axi_mst_aw_chan_t           ),
++      .ar_chan_t           ( axi_mst_ar_chan_t           )
++    ) i_idma_backend_fullbuffer (
++      .clk_i,
++      .rst_ni,
++      .testmode_i,
++
++      .idma_req_i    ( pn_large_request         ),
++      .req_valid_i   ( pn_large_req_valid       ),
++      .req_ready_o   ( pn_large_req_ready       ),
++
++      .idma_rsp_o    ( pn_large_response        ),
++      .rsp_valid_o   ( pn_large_rsp_valid       ),
++      .rsp_ready_i   ( pn_large_rsp_ready       ),
++
++      .idma_eh_req_i ( '0                ), // No error handling
++      .eh_req_valid_i( 1'b1              ),
++      .eh_req_ready_o( /*NOT CONNECTED*/ ),
++
++      .protocol_req_o( pn_large_axi_req         ),
++      .protocol_rsp_i( pn_large_axi_rsp         ),
++      .busy_o        ( pn_large_busy            ),
++
++      .ttype_i       ( pn_large_ttype           ),
++      .wdata_i       ( pn_large_wdata           ),
++      .rdata_o       ( pn_large_rdata           ),
++      .rdata_valid_o ( pn_large_rdata_valid     )
++    );
++
++    // Static capacities describe each actual branch, not an assumed Linux mode.
++    idma_fullbuffer_certificate #(.CapacityBytes(BufferDepth * (AxiDataWidth / 8))) i_small_certificate (
++      .clk_i, .rst_ni,
++      .job_fire_i(pn_job_fire && !pn_select_n), .job_done_i(pn_job_done && !pn_select_n),
++      .normal_copy_i(!pn_select_n && ttype == idma_pkg::DEFAULT),
++      .length_i(64'(burst_req_d.length)), .src_i(64'(burst_req_d.src_addr)), .dst_i(64'(burst_req_d.dst_addr)),
++      .permit_o(pn_small_permit), .pending_o(pn_small_pending), .fault_o(pn_small_fault)
++    );
++    idma_fullbuffer_certificate #(.CapacityBytes(PnBufferDepth * (AxiDataWidth / 8))) i_large_certificate (
++      .clk_i, .rst_ni,
++      .job_fire_i(pn_job_fire && pn_select_n), .job_done_i(pn_job_done && pn_select_n),
++      .normal_copy_i(pn_select_n && ttype == idma_pkg::DEFAULT),
++      .length_i(64'(burst_req_d.length)), .src_i(64'(burst_req_d.src_addr)), .dst_i(64'(burst_req_d.dst_addr)),
++      .permit_o(pn_large_permit), .pending_o(pn_large_pending), .fault_o(pn_large_fault)
++    );
++  end else begin : gen_no_pn_backend
++    assign pn_large_req_ready = 1'b0;
++    assign pn_large_response = '0;
++    assign pn_large_rsp_valid = 1'b0;
++    assign pn_large_busy = '0;
++    assign pn_large_axi_req = '0;
++    assign pn_large_rdata = '0;
++    assign pn_large_rdata_valid = 1'b0;
++    assign pn_small_permit = 1'b0;
++    assign pn_large_permit = 1'b0;
++    assign pn_small_pending = 1'b0;
++    assign pn_large_pending = 1'b0;
++    assign pn_small_fault = 1'b0;
++    assign pn_large_fault = 1'b0;
++  end
++
+ endmodule : dma_core_wrap
+ 
+ 
+@@ -340,7 +479,8 @@ module dma_core_wrap_intf #(
+ 
+   parameter logic [23:0]               DEVICE_ID          = 24'd1,
+   parameter logic [19:0]               PROCESS_ID         = 20'd0,
+-  parameter logic [(AXI_ID_WIDTH-1):0] AxID               =     0
++  parameter logic [(AXI_ID_WIDTH-1):0] AxID               =     0,
++  parameter bit PnEnable = 1'b0
+ ) (
+   input  logic         clk_i,
+   input  logic         rst_ni,
+@@ -355,7 +495,10 @@ module dma_core_wrap_intf #(
+     output logic [7:0] obs_cfg_wstrb_o,
+     input logic [63:0] obs_cfg_rdata_i,
+   AXI_BUS_EXT.Master   axi_master,
+-  AXI_BUS.Slave        axi_slave
++  AXI_BUS.Slave        axi_slave,
++  input logic pn_nonblock_enable_i = 1'b0,
++  output logic pn_fullbuffer_permit_o, pn_backend_job_quiet_o,
++  output logic pn_certificate_pending_o, pn_certificate_fault_o
+ );
+ 
+   typedef logic [AXI_ADDR_WIDTH-1:0]     addr_t;
+@@ -402,7 +545,8 @@ module dma_core_wrap_intf #(
+     .axi_slv_rsp_t    ( axi_slv_resp_t     ),
+     .DEVICE_ID        ( DEVICE_ID          ),
+     .PROCESS_ID       ( PROCESS_ID         ),
+-    .AxID             ( AxID               )
++    .AxID             ( AxID               ),
++    .PnEnable         ( PnEnable           )
+   ) i_dma_core_wrap (
+       .obs_issue_o, .obs_done_o, .obs_poll_o, .batch_active_o,
+       .obs_issue_id_o, .obs_done_id_o, .obs_poll_id_o,
+@@ -411,6 +555,8 @@ module dma_core_wrap_intf #(
+     .clk_i,
+     .rst_ni,
+     .testmode_i,
++    .pn_nonblock_enable_i, .pn_fullbuffer_permit_o, .pn_backend_job_quiet_o,
++    .pn_certificate_pending_o, .pn_certificate_fault_o,
+     .axi_mst_req_o ( axi_mst_req  ),
+     .axi_mst_rsp_i ( axi_mst_resp ),
+     .axi_slv_req_i ( axi_slv_req  ),
+-- 
+2.34.1
+
