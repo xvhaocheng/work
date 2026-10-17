@@ -67,6 +67,13 @@ def main():
         receipt['source_sha256'] = {p.name: sha(p) for p in (
             HERE / 'pn_control.c', HERE / 'check_pn_control.c',
             Path(__file__).resolve(), HERE / 's15_gate.py', source_map)}
+        frozen = out / 'source-as-executed'
+        frozen.mkdir()
+        for name in receipt['source_sha256']:
+            source = source_map if name == 'tool-source-map.json' else HERE / name
+            shutil.copyfile(source, frozen / name)
+        check('S15 source map retains original locked bytes',
+              sha(source_map) == 'd9669346c23343117e2aa7408542c8c1ff7d6009abc6500b2fb9242dff2417fe')
         cc = shutil.which(original[0][0])
         check('original compiler name available', cc is not None)
         receipt['compiler'] = {'path': cc, 'sha256': sha(cc)}
@@ -78,8 +85,8 @@ def main():
              HERE / 'check_pn_control.c', '-o', host], 'host-compile.json')
         text = run([host], 'host-execution.json')
         rows = [json.loads(line) for line in text.splitlines()]
-        check('58 uniquely labeled finite C scenarios', len(rows) == 58 and
-              len({x['test_case'] for x in rows}) == 58)
+        check('71 uniquely labeled finite C scenarios', len(rows) == 71 and
+              len({x['test_case'] for x in rows}) == 71)
         by_name = {x['test_case']: x for x in rows}
         for row in rows:
             result = row.get('result', row)
@@ -93,10 +100,45 @@ def main():
                   result['mmio_base'] == 0x50000000 and
                   set(result['raw']) == {str(i) for i in range(192, 200)} and
                   result['success'] == (result['errno'] == 0))
+            word = result['raw']['193']
+            status = result['raw']['194']
+            check('lossless mode/history decode ' + row['test_case'],
+                  result['mode_word'] == word and
+                  result['mode'] == (None if word is None else word & 3) and
+                  result['history_shared'] == (None if word is None else bool(word & 4)) and
+                  result['history_control_supported'] ==
+                  (None if status is None else bool(status & (1 << 63))) and
+                  result['partition_history'] ==
+                  ({0: 'not_partitioned', 1: 'not_partitioned',
+                    2: 'isolated', 3: 'isolated', 6: 'shared'}.get(word)))
         valid = by_name['valid-mode-0']['result']
         check('full-width raw194/199 survive uninterpreted',
               valid['raw']['194'] == 2**64 - 1 and
               valid['raw']['199'] == 0x8000000000001234)
+        shared = by_name['valid-mode-6']['result']
+        check('P_shared keeps word6 and exposes mode2/shared history',
+              shared['success'] and shared['raw']['193'] == 6 and
+              shared['mode_word'] == 6 and shared['mode'] == 2 and
+              shared['history_shared'] and shared['history_control_supported'] and
+              shared['partition_history'] == 'shared')
+        unsupported = by_name['shared-without-history-support']['result']
+        check('unsupported shared is failure with original evidence retained',
+              not unsupported['success'] and unsupported['errno'] == 71 and
+              unsupported['stage'] == 'history_support' and
+              unsupported['raw']['193'] == 6 and unsupported['mode'] == 2 and
+              unsupported['history_shared'] and
+              not unsupported['history_control_supported'])
+        for name in ('invalid-mode', 'invalid-mode-word-5', 'invalid-mode-word-7',
+                     'invalid-mode-word-8', 'invalid-mode-word-4294967296',
+                     'invalid-mode-word-9223372036854775814'):
+            item = by_name[name]['result']
+            check('illegal full word refused ' + name,
+                  item['success'] is False and item['errno'] == 71 and
+                  item['stage'] == 'mode' and item['raw']['193'] == item['mode_word'])
+        bad_capture = by_name['invalid-capture-status-readable']['result']
+        check('capture invalid flags remain readable and do not qualify data',
+              bad_capture['success'] and bad_capture['raw']['199'] == 255 and
+              bad_capture['raw']['194'] == 2**64 - 1)
         check('unknown operation does no MMIO',
               by_name['invalid-operation-no-io']['result']['index_selector_write_attempts'] == 0)
         first_fault = by_name['access-error-at-4']['result']
@@ -143,7 +185,8 @@ def main():
                       'synthetic' in str(error))
             else:
                 raise AssertionError('fixture qualified for public S15')
-            for name in ('capabilities-full-snapshot', 'valid-mode-1', 'valid-gap-1000',
+            for name in ('capabilities-full-snapshot', 'valid-mode-1', 'valid-mode-6',
+                         'shared-without-history-support', 'valid-gap-1000',
                          'pn-cap-mismatch-no-fallback', 'mmio-fault-reported-eio'):
                 saved.write_text(json.dumps(raw(by_name[name]['result'])))
                 try:
@@ -185,7 +228,7 @@ def main():
             'fake MMIO actual snapshot/JSON; production /dev/mem/sigaction/mmap not run',
             'RV64 binary compiled and disassembled only; no emulator/board execution',
             'OBS busy detection is not an atomic lock; external sole-owner serialization required',
-            '194/199 bits and Aown/union validity are uninterpreted raw values']
+            'only194 bit63 is decoded; all other194/199 bits and capture validity stay raw']
         print(json.dumps({'status': receipt['status'], 'checks': len(checks),
                           'finite_C_scenarios': len(rows), 'source_board_cases': 0,
                           'binary_sha256': receipt['binary']['sha256']}))

@@ -14,7 +14,7 @@ static void fake_init(struct fake_mmio *f)
 {
     memset(f, 0, sizeof(*f));
     f->raw[0] = PN_CAP;
-    /* Unlocked words194/199 intentionally contain arbitrary bits. */
+    /* Only194 bit63 is decoded; all remaining194/199 bits stay raw. */
     f->raw[2] = UINT64_C(0xffffffffffffffff);
     f->raw[3] = 37;
     f->raw[4] = 91;
@@ -141,6 +141,19 @@ int main(void)
         snprintf(name, sizeof(name), "valid-mode-%u", i);
         run(name, &f, PN_READ, 0, "complete");
     }
+    fake_init(&f); f.raw[1] = 6;
+    run("valid-mode-6", &f, PN_READ, 0, "complete");
+    for (i = 0; i < 4; i++) {
+        fake_init(&f); f.raw[1] = i; f.raw[2] &= ~PN_HISTORY_SUPPORTED;
+        snprintf(name, sizeof(name), "valid-mode-%u-no-history-support", i);
+        run(name, &f, PN_READ, 0, "complete");
+    }
+    fake_init(&f); f.raw[1] = 6; f.raw[2] = PN_HISTORY_SUPPORTED;
+    run("valid-mode-6-support-bit-only", &f, PN_READ, 0, "complete");
+    fake_init(&f); f.raw[1] = 6; f.raw[2] &= ~PN_HISTORY_SUPPORTED;
+    run("shared-without-history-support", &f, PN_READ, EPROTO, "history_support");
+    fake_init(&f); f.raw[1] = 3; f.raw[7] = 0xff;
+    run("invalid-capture-status-readable", &f, PN_READ, 0, "complete");
     fake_init(&f);
     run("capabilities-full-snapshot", &f, PN_CAPABILITIES, 0, "complete");
     for (i = 0; i < 3; i++) {
@@ -156,6 +169,13 @@ int main(void)
     run("gap-cap-mismatch-no-fallback", &f, PN_READ, ENODEV, "gap_capability");
     fake_init(&f); f.raw[1] = 4;
     run("invalid-mode", &f, PN_READ, EPROTO, "mode");
+    for (i = 0; i < 5; i++) {
+        const uint64_t values[] = {5, 7, 8, UINT64_C(1) << 32,
+                                   (UINT64_C(1) << 63) | 6};
+        fake_init(&f); f.raw[1] = values[i];
+        snprintf(name, sizeof(name), "invalid-mode-word-%" PRIu64, f.raw[1]);
+        run(name, &f, PN_READ, EPROTO, "mode");
+    }
     fake_init(&f); f.gap = UINT64_C(1) << 32;
     run("invalid-gap-high-bits", &f, PN_READ, EPROTO, "gap_high_bits");
     for (i = 1; i <= 3; i++) {

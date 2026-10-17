@@ -160,11 +160,26 @@ selector writes are configuration-readonly as defined above; no DATA/MODE/GAP
 store exists. Saved raw words are decimal uint64 values, not split32-bit reads.
 
 The accepted constants are PN_CAP `0x49444d41504e0001` at word192 and GAP_CAP
-`0x49444d4147415001` at `+0xb8`. Word193 must be mode0..3. The direct gap read at
-`+0xb0` must have high32 bits zero; low32 bits are `v_gap_cycles`. Words194/199,
-including arbitrary high bits, are saved unchanged and have no interpreted
-status/validity/overflow fields in this batch. Words195..198 also remain raw;
-this read-only batch does not qualify Aown/union duration or N-accept metrics.
+`0x49444d4147415001` at `+0xb8`. Word193 must be exactly0/1/2/3/6. Word6 is
+P_shared and additionally requires word194 bit63 (`history_control_supported`);
+an absent support bit fails with `EPROTO` at `history_support`. Words4/5/7 and
+any other full-word value, including high bits, fail at `mode`. There is no
+fallback from unsupported P_shared to isolated P. The direct gap read at `+0xb0`
+must have high32 bits zero; low32 bits are `v_gap_cycles`.
+
+Schema `idma.pn_control.v1` retains full original word193 in `raw["193"]` and
+`mode_word`; `mode` is its low2 bits, `history_shared` is bit2, and
+`history_control_supported` is word194 bit63. An unread source gives JSON null.
+`partition_history` is `isolated` for P/PN (words2/3), `shared` for P_shared
+(word6), and `not_partitioned` for S/N (words0/1); unrecognized words give null.
+Decoded fields are diagnostic evidence even when `success=false`; they never
+override the failure or qualify a configuration. Reset S stays raw0/mode0/gap0.
+
+All8 raw words remain unchanged, including every other194/199 status, error or
+overflow bit. Only194 bit63 is interpreted by this tool. Capture-invalid bits
+do not prevent an operator reading the evidence; experiment validity belongs
+to the collector. Words195..198 also remain raw. This batch does not qualify
+Aown/union duration or N-accept metrics and adds no configuration-write API.
 
 Root must own the board execution lock and serialize the helper after the old
 CLI has exited and its actual STOP/drain has finished. Never interleave a PN
@@ -202,8 +217,8 @@ Its CLI-only UAPI `-I` is unnecessary for this standalone libc helper and is
 omitted. The installed compiler is RV64 GCC11.4.0, default `rv64imafdc/lp64d`;
 no compiler/tool installation or upgrade is performed. Actual argv, compiler
 bytes/version/defaults, source hashes, ELF SHA and readelf/objdump output are
-retained in the [137-check receipt](pn-control-host01/validation.json).
-The compiled production ELF stays local and ignored at
+retained in the original [137-check receipt](pn-control-host01/validation.json).
+That accepted batch and its evidence remain unchanged. Its production ELF stays local and ignored at
 `tools/artifacts/pn-control-host01/pn-control`; it is not committed.
 
 The58 labeled C scenarios cover four modes; gap0/1000/4000/u32max; raw194/199;
@@ -216,3 +231,20 @@ fence). Stack/RAM stores in those functions are not MMIO writes. Production
 open/mmap/signal-handler execution is source-reviewed and cross-compiled only;
 neither an emulator nor hardware was used. This evidence does not establish
 board success or permit any fixture to enter S15/DS50/paper results.
+
+The separate P_shared compatibility batch extends only snapshot qualification,
+JSON decoding and finite host checks. Its [244-check receipt](pn-control-shared-host01/validation.json)
+contains71 labeled actual-C fake-MMIO scenarios, with matching native and
+ASan+UBSan output. It retains source-as-executed,
+original compiler profile, static ELF identity and actual MMIO disassembly. It
+covers all five public words, shared with/without support, reserved/high words,
+lossless raw/decoded fields and capture-invalid reads, while rerunning every
+old access/argument/fault boundary and actual S15 fixture rejection. The S15 gate,
+its source map (`d9669346...2417fe`), original137-check receipt and original helper
+commit `c6e879c` are unchanged; the map is a historical fixed dependency and is
+not a claim about the new helper bytes. The new batch binds its own actual source.
+Its RV64 static ELF remains ignored at
+`tools/artifacts/pn-control-shared-host01/pn-control` (SHA
+`c1508a650f7010cee39d0ac1393a20ccb397c1dad5da334e2ba9b0ea48744f5e`).
+The actual sole MMIO store is `sd a5,112(a3)` at `0x10f1a`; the actual MMIO load
+is `ld a4,0(a4)` at `0x10fa6`, each with the two full I/O fences preserved.
