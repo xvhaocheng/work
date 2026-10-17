@@ -92,3 +92,7 @@ Linux65b427相对46df只改multi轮询合作点：N2/N3/N4每未完成轮请求c
 2026-10-17T15:53:15.877878+00:00：Root已接收G RUN69d8小批并实跑1176 G/329 CAPS及旧38/57/97/416+6回归，MMIO与nonmulti yield摘要均保持；尚未编G Image，A1只准备严格CLI/builder下一批。E2 irq-diagnosis只读证据2cac260已由Root直接审关键源码和vmlinux EPC、独立重算40源/7样本及calculations原字节一致；确认timer重试/再入现象，AXI根因未证。后续仅默认off的原生counter诊断小批准备，未编诊断Image/未跑新E2。
 
 2026-10-17T16:10:27.480597+00:00：当前唯一板动作是g-common-upload01-launch：E420/20与新软件passed门确认后，只上传当前full-e3-v1匹配SPI与新Ggzip到全新/tmp文件；未写SD或重启，等待传输bytesACK及新profile/后续BIT验收后由Root决定加载。G CLI507/software-entry9 Root实跑通过，原G软件manifest/transport已收ba3df；旧prepared note保持原文，以passed、Image及实际命令为准。E4论文图已接收ae8e2b3，Root直接读plotter、目视PNG、独立复跑CSV/数值/PNG/PDF全字节相同；SVG只自动ID不同，源/数值无变，E5区间附图仍待画。
+
+E6-PN首轮DS0已于19:27:11Z实际启动（PID2229246，source SHA b91327ec）；CVA109b/IOMMU86c2，真实顶层/外围elab已通过，功能有限检查并行。构建本机入口见`exp/E6-pn/build/dispatch-reference01.json`；不轮询中间日志，等待完成/失败事件。E8原DS0采集继续占唯一板，PN无板点。
+
+E8首50点已于19:36:23Z完整通过：A2/4的V miss/S1PTW均0；A12/14/32均2，分别n10一致。旧baseline另boot的A8已有2，不能把本轮A12称全局阈值。论文数据位于独立ispass/e8-e2-e9的`exp/E8-footprint/paper/e8-ds0-a-scan01/`，50新增点、17122长表标量行，不上传UART日志。原DS0同boot的V2/4/8×Solo/A1/A8/A64共60已于19:37:38Z开始，PID2235534；E6物理构建继续，真实外围有限检查已全部通过。

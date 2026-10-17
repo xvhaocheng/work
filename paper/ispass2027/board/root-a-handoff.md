@@ -1,3 +1,28 @@
+# 最新续接：2026-10-17T19:37:14.501204+00:00
+
+用户最新要求：更激进简化、不重复日志/同源验证/归档，E6-PN未完成持续推进，不以阶段交付结束。既有时序/S15硬停止仍保留。
+
+- **E6 DS0已实际构建**：A1 PID2229246，19:27:11Z；manifest `/home/xvhaocheng/work-e6-pn/paper/ispass2027/exp/E6-pn/artifacts/ds0-build01/build-manifest.json`，dispatch同树`build/dispatch01/`。只等最终退出结果，不读中间日志。实际输入Root `exp/E6-pn/build/source-manifest.json`，SHA b91327ecc81178ddb93df7d86181e5167c0b35df109f1d962cf6da08e502fea6。CV109b48fd/IOMMU86c2cee6/platform6a388625/AXI95f。
+- TL12712已直接审；top完整finite4项/1193checks过；A3实际外围finite05五项/11492cycles过，MODE/忙拒绝/S/N真实复制/自然排空/capture端点正确，199=7。真实Naccept0与195/196=0完全相等，不强加>0门。修过的失败均为测试入口/期望错误，不改冻结RTL。
+- DS50独立`build/build_pn_ds50.py`已准备、未执行，Root已读，严格真实S15过后；明确ds50元数据50/50不被模板0覆盖。
+- Root已导入S15 collector730d953、glue0024、TL1809、build aab41ac、top finite5da9cff、DS50 4f90be3、正式runner cb053c0（Root HEAD28b8a37附近，最新以git为准）。formal代码已Root完整读，150/30/40，合法N=0保留，gap4095*(g+1)，S15/gate/helper不改。A3分析独立worktree ispass/e6-pn-analysis准备图/统计，A2出口与runner已备。
+- 本机现成工具已打包 `board/packages/e6-pn-tools-20261018/artifacts/pn-tools.tar.gz`（542652B）；manifest复用accepted二进制hash，0编译/0上板。PN加载重启后才上传安装/usr/bin/pn-control、pn-config；S15只读、不执行writer。
+
+## 新E8/E2/E9（只用现有BIT，不构建）
+
+- 独立Root工作树 `/home/xvhaocheng/work-e8-e2-e9`，branch ispass/e8-e2-e9，from main225c；稀疏检出。首次普通checkout已中断，其专属partial目录已清理，未改main。今后新worktree用--no-checkout+sparse再read-tree，main有80万tracked。
+- E8总135：DS0 V1/A2,4,12,14,32各10=50；DS0 V2,4,8×Solo/A1/A8/A64各5=60；DS100 V1同5A各5=25。预算基于5个campaign：15.7–15.8秒/点，按20秒留裕；含一次DS100启动共约53min，无SD重写，无额外短测。
+- **当前唯一板任务** DS0首50：19:23:16Z，PID2226817，`/home/xvhaocheng/work-e8-e2-e9/paper/ispass2027/board/runs/e8-ds0-a-scan01`；完成receipt同`e8-ds0-a-scan01-launch/result.json`。最近见35/50 running无error（非当前完成数保证）。原DS0 e9b6554f/原45bf pathv3/boot04afe602-3051-410f-996f-778edb2fb94c。只复用已就位配置，没有加载/写卡。
+- collector `run_a_scan.py`于14ff778启动，原Root board/collect.py parser全部原门；点间stopflag `exp/E8-footprint/E6_PRIORITY`，E6物理就绪时优先交板。不要重复这50点。
+- 后续60/25入口已Root读并cherry021d711为fd2c6e5；`collect_e8.py --ds 0 --group victim`=60，`--ds100 --group aggressor`=25。传Root原load+source+software manifest，parser-source显式Rootboard/collect.py；只参数化V页数，原其他门保留。README示例尚指Root目录的脚本/输出，实际脚本在E8 worktree，调用时修路径。
+- E8 exporter dbda9f0已Root全读、cherry6110be2；统一17列/统计/同bootblock相邻A差分，Vcycles/A-S1PTW只跨窗描述，不是因果延迟。A2正等首50 result后导出、复制真实records/manifest、push论文数据（不传UART日志），然后通知Root。不要让A2触UART。
+- E2原ABI1仅pair、全局实验锁，无法2–3A与各自HPM；已按用户要求写E8分支`exp/E2-device-scaling/change-request.md`并停止新E2，新增0点，不改驱动RTL。旧multi两轮故障保持，不倒填原pathv3能力。
+- **E9用户消息截断在“每次”**，async已问每次条件/次数，尚无回复；不猜矩阵，不执行E9。E8已知预算可推进；E9补齐后算总预算，超过8h先汇报等确认。
+
+当前Root仍有小型metadata/helper包待提交推送，E8分支尚待首实际数据后push。Root旧分支远端上次3e5968f，后续cherry尚未push。0完整PN BIT、0 S15实际点，勿称全部通过。
+
+---
+
 # 当前续接 2026-10-17T19:07:49.361026+00:00
 
 板仍原DS0 e9b6554/原pathv3 Linux45bf，boot04afe602-3051-410f-996f-778edb2fb94c，18:39:20Z启动核验/TAINT0，无后续hardware动作或实验采集。不要重复写卡/重跑E2/补旧baseline点。PN完整BIT/真实S15/正式点均0，DS50构建仍硬锁实际S15全过。
