@@ -1,0 +1,336 @@
+From 968bec65dbf9fb0d85585574134be9597a6d24c6 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 21:36:38 +0900
+Subject: [PATCH] Add bounded multi-device HPM sessions while retaining pair
+ behavior
+
+---
+ drivers/iommu/riscv/iommu-hpm.c | 142 +++++++++++++++++++++-----------
+ include/linux/riscv_iommu_hpm.h |  43 +++++++++-
+ 2 files changed, 138 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/iommu/riscv/iommu-hpm.c b/drivers/iommu/riscv/iommu-hpm.c
+index c9be8f9c3009..65f38a88988a 100644
+--- a/drivers/iommu/riscv/iommu-hpm.c
++++ b/drivers/iommu/riscv/iommu-hpm.c
+@@ -4,19 +4,23 @@
+ #include <linux/bitfield.h>
+ #include <linux/export.h>
+ #include <linux/riscv_iommu_hpm.h>
++#include <linux/sched.h>
+ #include <linux/slab.h>
+ 
+ #include "iommu.h"
+ 
+-#define HPM_SESSION_COUNTERS	6
+-#define HPM_SESSION_INHIBIT	GENMASK(6, 1)
+-#define HPM_VICTIM_INHIBIT	GENMASK(3, 1)
++#define HPM_COUNTERS_PER_DEVICE	3U
++#define HPM_LEGACY_COUNTERS	6U
++#define HPM_MAX_COUNTERS		(HPM_COUNTERS_PER_DEVICE * RISCV_IOMMU_HPM_MAX_DEVICES)
+ 
+ struct riscv_iommu_hpm_session {
+ 	struct riscv_iommu_device *iommu;
+-	u32 saved_inhibit;
+-	u64 saved_event[HPM_SESSION_COUNTERS];
+-	u64 saved_counter[HPM_SESSION_COUNTERS];
++	struct task_struct *owner;
++	u32 saved_inhibit, owned_inhibit;
++	unsigned int nr_devices, counter_count;
++	bool legacy;
++	u64 saved_event[HPM_MAX_COUNTERS];
++	u64 saved_counter[HPM_MAX_COUNTERS];
+ };
+ 
+ /* The programming bridge uses 32-bit register accesses, even on RV64. */
+@@ -55,8 +59,8 @@ static void hpm_restore(struct riscv_iommu_hpm_session *session)
+ 	struct riscv_iommu_device *iommu = session->iommu;
+ 	unsigned int i;
+ 
+-	hpm_inhibit(iommu, session->saved_inhibit | HPM_SESSION_INHIBIT);
+-	for (i = 0; i < HPM_SESSION_COUNTERS; i++) {
++	hpm_inhibit(iommu, session->saved_inhibit | session->owned_inhibit);
++	for (i = 0; i < session->counter_count; i++) {
+ 		writeq(session->saved_counter[i],
+ 		       iommu->reg + RISCV_IOMMU_REG_IOHPMCTR(i));
+ 		writeq(session->saved_event[i],
+@@ -65,34 +69,40 @@ static void hpm_restore(struct riscv_iommu_hpm_session *session)
+ 	hpm_inhibit(iommu, session->saved_inhibit);
+ }
+ 
+-int riscv_iommu_hpm_acquire(struct device *victim, struct device *aggressor,
+-			   struct riscv_iommu_hpm_session **out)
++static int hpm_acquire(struct device *const devices[], unsigned int nr_devices,
++		       bool legacy, struct riscv_iommu_hpm_session **out)
+ {
+ 	static const u64 events[] = {
+ 		RISCV_IOMMU_EVENT_TLB_MISS,
+ 		RISCV_IOMMU_EVENT_S1_PTW,
+ 		RISCV_IOMMU_EVENT_S2_PTW,
+ 	};
+-	struct riscv_iommu_endpoint *ep[2];
++	struct riscv_iommu_endpoint *ep[RISCV_IOMMU_HPM_MAX_DEVICES] = {};
+ 	struct riscv_iommu_hpm_session *session;
+ 	struct riscv_iommu_device *iommu;
+ 	u32 enable, run_inhibit;
+ 	u64 selector;
+-	unsigned int i;
++	unsigned int i, j, counter_count;
+ 	int ret;
+ 
+ 	if (!out)
+ 		return -EINVAL;
+ 	*out = NULL;
+-	ep[0] = riscv_iommu_hpm_endpoint(victim);
+-	ep[1] = aggressor ? riscv_iommu_hpm_endpoint(aggressor) : NULL;
+-	if (!ep[0] || (aggressor && !ep[1]))
+-		return -EOPNOTSUPP;
+-	iommu = ep[0]->iommu;
+-	if (ep[1] && ep[1]->iommu != iommu)
+-		return -EXDEV;
+-	if (ep[1] && ep[1]->devid == ep[0]->devid)
++	if (!devices || !nr_devices || nr_devices > RISCV_IOMMU_HPM_MAX_DEVICES)
+ 		return -EINVAL;
++	for (i = 0; i < nr_devices; i++) {
++		ep[i] = riscv_iommu_hpm_endpoint(devices[i]);
++		if (!ep[i])
++			return -EOPNOTSUPP;
++		if (ep[i]->iommu != ep[0]->iommu)
++			return -EXDEV;
++		for (j = 0; j < i; j++)
++			if (ep[i]->devid == ep[j]->devid)
++				return -EINVAL;
++	}
++	iommu = ep[0]->iommu;
++	counter_count = legacy ? HPM_LEGACY_COUNTERS :
++		HPM_COUNTERS_PER_DEVICE * nr_devices;
+ 
+ 	session = kzalloc(sizeof(*session), GFP_KERNEL);
+ 	if (!session)
+@@ -108,35 +118,41 @@ int riscv_iommu_hpm_acquire(struct device *victim, struct device *aggressor,
+ 	}
+ 
+ 	session->iommu = iommu;
++	session->owner = current;
++	session->nr_devices = nr_devices;
++	session->counter_count = counter_count;
++	session->legacy = legacy;
++	session->owned_inhibit = GENMASK(counter_count, 1);
+ 	session->saved_inhibit = readl(iommu->reg + RISCV_IOMMU_REG_IOCOUNTINH);
+-	if ((hpm_inhibit(iommu, session->saved_inhibit | HPM_SESSION_INHIBIT) &
+-	     HPM_SESSION_INHIBIT) != HPM_SESSION_INHIBIT) {
++	if ((hpm_inhibit(iommu, session->saved_inhibit | session->owned_inhibit) &
++	     session->owned_inhibit) != session->owned_inhibit) {
+ 		/* No selector or event counter has been changed yet. */
+ 		hpm_inhibit(iommu, session->saved_inhibit);
+ 		ret = -EOPNOTSUPP;
+ 		goto unlock;
+ 	}
+-	for (i = 0; i < HPM_SESSION_COUNTERS; i++) {
++	for (i = 0; i < counter_count; i++) {
+ 		session->saved_event[i] = readq(iommu->reg + RISCV_IOMMU_REG_IOHPMEVT(i));
+ 		session->saved_counter[i] = hpm_read_counter(iommu,
+-						 RISCV_IOMMU_REG_IOHPMCTR(i));
++							     RISCV_IOMMU_REG_IOHPMCTR(i));
+ 	}
+ 
+ 	/*
+ 	 * This RTL exposes all 31 inhibit bits even with fewer actual counters,
+-	 * so their readback cannot discover the counter count. Verify the six
+-	 * required slots directly instead. Unimplemented registers read as zero
++	 * so their readback cannot discover the counter count. Verify all owned
++	 * slots directly instead. Unimplemented registers read as zero
+ 	 * and ignore writes on the current FPGA (regmap devmode is disabled).
+ 	 * Selector readback checks storage/filter support, not event accuracy;
+ 	 * cold/hot and per-DID calibration on the board is still required.
+ 	 */
+-	for (i = 0; i < HPM_SESSION_COUNTERS; i++) {
+-		struct riscv_iommu_endpoint *selected = ep[i / 3] ?: ep[0];
++	for (i = 0; i < counter_count; i++) {
++		struct riscv_iommu_endpoint *selected = ep[i / HPM_COUNTERS_PER_DEVICE] ?: ep[0];
++		unsigned int event = i % HPM_COUNTERS_PER_DEVICE;
+ 
+ 		selector = RISCV_IOMMU_IOHPMEVT_OF |
+ 			   RISCV_IOMMU_IOHPMEVT_DV_GSCV |
+ 			   FIELD_PREP(RISCV_IOMMU_IOHPMEVT_DID_GSCID, selected->devid) |
+-			   FIELD_PREP(RISCV_IOMMU_IOHPMEVT_EVENT_ID, events[i % 3]);
++			   FIELD_PREP(RISCV_IOMMU_IOHPMEVT_EVENT_ID, events[event]);
+ 		/* IDT=0, DMASK=0, PV=0: exact DID only; OF=1 suppresses IRQs. */
+ 		writeq(selector, iommu->reg + RISCV_IOMMU_REG_IOHPMEVT(i));
+ 		if (readq(iommu->reg + RISCV_IOMMU_REG_IOHPMEVT(i)) != selector) {
+@@ -151,11 +167,11 @@ int riscv_iommu_hpm_acquire(struct device *victim, struct device *aggressor,
+ 	}
+ 
+ 	/* Solo reserves all six slots but leaves the unused lane inhibited. */
+-	enable = (aggressor ? HPM_SESSION_INHIBIT : HPM_VICTIM_INHIBIT) |
++	enable = GENMASK(HPM_COUNTERS_PER_DEVICE * nr_devices, 1) |
+ 		 RISCV_IOMMU_IOCOUNTINH_CY;
+-	run_inhibit = (session->saved_inhibit | HPM_SESSION_INHIBIT) & ~enable;
++	run_inhibit = (session->saved_inhibit | session->owned_inhibit) & ~enable;
+ 	if ((hpm_inhibit(iommu, run_inhibit) ^ run_inhibit) &
+-	    (HPM_SESSION_INHIBIT | RISCV_IOMMU_IOCOUNTINH_CY)) {
++	    (session->owned_inhibit | RISCV_IOMMU_IOCOUNTINH_CY)) {
+ 		ret = -EOPNOTSUPP;
+ 		goto restore;
+ 	}
+@@ -170,35 +186,69 @@ int riscv_iommu_hpm_acquire(struct device *victim, struct device *aggressor,
+ 	kfree(session);
+ 	return ret;
+ }
++
++int riscv_iommu_hpm_acquire(struct device *victim, struct device *aggressor,
++			    struct riscv_iommu_hpm_session **out)
++{
++	struct device *devices[] = { victim, aggressor };
++
++	return hpm_acquire(devices, aggressor ? 2 : 1, true, out);
++}
+ EXPORT_SYMBOL_GPL(riscv_iommu_hpm_acquire);
+ 
+-void riscv_iommu_hpm_read(struct riscv_iommu_hpm_session *session,
+-			  struct riscv_iommu_hpm_sample *sample)
++int riscv_iommu_hpm_acquire_multi(struct device *const devices[],
++				  unsigned int nr_devices,
++				 struct riscv_iommu_hpm_session **out)
++{
++	return hpm_acquire(devices, nr_devices, false, out);
++}
++EXPORT_SYMBOL_GPL(riscv_iommu_hpm_acquire_multi);
++
++static void hpm_read(struct riscv_iommu_hpm_session *session, unsigned int lanes,
++		     u64 *cycles, u64 *iotlb_miss, u64 *s1_ptw, u64 *s2_ptw)
+ {
+ 	struct riscv_iommu_device *iommu;
+ 	unsigned int lane;
+ 
+-	memset(sample, 0, sizeof(*sample));
+-	if (!session)
+-		return;
+ 	iommu = session->iommu;
+ 	lockdep_assert_held(&iommu->hpm_lock);
+-	sample->cycles = hpm_read_counter(iommu, RISCV_IOMMU_REG_IOHPMCYCLES) &
++	*cycles = hpm_read_counter(iommu, RISCV_IOMMU_REG_IOHPMCYCLES) &
+ 			 RISCV_IOMMU_IOHPMCYCLES_COUNTER;
+-	for (lane = 0; lane < 2; lane++) {
+-		sample->iotlb_miss[lane] = hpm_read_counter(iommu,
+-					RISCV_IOMMU_REG_IOHPMCTR(lane * 3));
+-		sample->s1_ptw[lane] = hpm_read_counter(iommu,
+-					RISCV_IOMMU_REG_IOHPMCTR(lane * 3 + 1));
+-		sample->s2_ptw[lane] = hpm_read_counter(iommu,
+-					RISCV_IOMMU_REG_IOHPMCTR(lane * 3 + 2));
++	for (lane = 0; lane < lanes; lane++) {
++		iotlb_miss[lane] = hpm_read_counter(iommu,
++						    RISCV_IOMMU_REG_IOHPMCTR(lane * 3));
++		s1_ptw[lane] = hpm_read_counter(iommu,
++						RISCV_IOMMU_REG_IOHPMCTR(lane * 3 + 1));
++		s2_ptw[lane] = hpm_read_counter(iommu,
++						RISCV_IOMMU_REG_IOHPMCTR(lane * 3 + 2));
+ 	}
+ }
++
++void riscv_iommu_hpm_read(struct riscv_iommu_hpm_session *session,
++			  struct riscv_iommu_hpm_sample *sample)
++{
++	memset(sample, 0, sizeof(*sample));
++	if (!session || WARN_ON_ONCE(session->owner != current || !session->legacy))
++		return;
++	hpm_read(session, 2, &sample->cycles, sample->iotlb_miss,
++		 sample->s1_ptw, sample->s2_ptw);
++}
+ EXPORT_SYMBOL_GPL(riscv_iommu_hpm_read);
+ 
++void riscv_iommu_hpm_read_multi(struct riscv_iommu_hpm_session *session,
++				struct riscv_iommu_hpm_multi_sample *sample)
++{
++	memset(sample, 0, sizeof(*sample));
++	if (!session || WARN_ON_ONCE(session->owner != current || session->legacy))
++		return;
++	hpm_read(session, session->nr_devices, &sample->cycles, sample->iotlb_miss,
++		 sample->s1_ptw, sample->s2_ptw);
++}
++EXPORT_SYMBOL_GPL(riscv_iommu_hpm_read_multi);
++
+ void riscv_iommu_hpm_release(struct riscv_iommu_hpm_session *session)
+ {
+-	if (!session)
++	if (!session || WARN_ON_ONCE(session->owner != current))
+ 		return;
+ 	lockdep_assert_held(&session->iommu->hpm_lock);
+ 	hpm_restore(session);
+diff --git a/include/linux/riscv_iommu_hpm.h b/include/linux/riscv_iommu_hpm.h
+index 8476e2236228..7de99267afea 100644
+--- a/include/linux/riscv_iommu_hpm.h
++++ b/include/linux/riscv_iommu_hpm.h
+@@ -17,6 +17,15 @@ struct riscv_iommu_hpm_sample {
+ 	u64 s2_ptw[2];
+ };
+ 
++#define RISCV_IOMMU_HPM_MAX_DEVICES 4U
++
++struct riscv_iommu_hpm_multi_sample {
++	u64 cycles;
++	u64 iotlb_miss[RISCV_IOMMU_HPM_MAX_DEVICES];
++	u64 s1_ptw[RISCV_IOMMU_HPM_MAX_DEVICES];
++	u64 s2_ptw[RISCV_IOMMU_HPM_MAX_DEVICES];
++};
++
+ /*
+  * Sleepable API for the current platform's single-DID endpoints. The caller
+  * keeps both devices bound, serializes their workloads, and calls acquire,
+@@ -31,13 +40,28 @@ struct riscv_iommu_hpm_sample {
+  * sequentially, not atomically. Use differences around the desired window.
+  * Release restores saved selectors, event counts and inhibit state. Restored
+  * event counts exclude activity during the owned session; cycles retain it.
++ *
++ * acquire_multi accepts 1..4 unique single-DID devices on the same IOMMU.
++ * The caller keeps every device bound and calls acquire/read/release from
++ * the same task. It owns exactly 3 * nr_devices event counters, starting at
++ * counter 0, with miss/S1/S2 in device-array order. read_multi zeroes unused
++ * array elements. Selectors are checked before success, including slots 6..11
++ * when requested; the inhibit bitmap is not a counter-count capability probe.
++ * These samples are also sequential, not atomic, and do not define a DMA
++ * hardware window. Use read with legacy acquire and read_multi with
++ * acquire_multi. Both use release; legacy Solo still reserves all six slots.
+  */
+ #if IS_REACHABLE(CONFIG_RISCV_IOMMU)
+ bool riscv_iommu_hpm_supported(struct device *dev);
+ int riscv_iommu_hpm_acquire(struct device *victim, struct device *aggressor,
+-			   struct riscv_iommu_hpm_session **out);
++			    struct riscv_iommu_hpm_session **out);
+ void riscv_iommu_hpm_read(struct riscv_iommu_hpm_session *session,
+ 			  struct riscv_iommu_hpm_sample *sample);
++int riscv_iommu_hpm_acquire_multi(struct device *const devices[],
++				  unsigned int nr_devices,
++				 struct riscv_iommu_hpm_session **out);
++void riscv_iommu_hpm_read_multi(struct riscv_iommu_hpm_session *session,
++				struct riscv_iommu_hpm_multi_sample *sample);
+ void riscv_iommu_hpm_release(struct riscv_iommu_hpm_session *session);
+ #else
+ static inline bool riscv_iommu_hpm_supported(struct device *dev)
+@@ -61,6 +85,23 @@ riscv_iommu_hpm_read(struct riscv_iommu_hpm_session *session,
+ 	memset(sample, 0, sizeof(*sample));
+ }
+ 
++static inline int
++riscv_iommu_hpm_acquire_multi(struct device *const devices[],
++			      unsigned int nr_devices,
++			     struct riscv_iommu_hpm_session **out)
++{
++	if (out)
++		*out = NULL;
++	return -EOPNOTSUPP;
++}
++
++static inline void
++riscv_iommu_hpm_read_multi(struct riscv_iommu_hpm_session *session,
++			   struct riscv_iommu_hpm_multi_sample *sample)
++{
++	memset(sample, 0, sizeof(*sample));
++}
++
+ static inline void
+ riscv_iommu_hpm_release(struct riscv_iommu_hpm_session *session)
+ {
+-- 
+2.34.1
+
