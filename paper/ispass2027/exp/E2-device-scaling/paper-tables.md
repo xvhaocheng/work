@@ -20,6 +20,13 @@ For each metric/cell, output samples, actual non-null n, min/median/max, Type7 Q
 
 E2 produces nine independent n10 cells. Conditions retain device count, per-A pages and total A pages per direction. Every participating device's HPM and final completed work is separate. HPM/active counts use sequential software brackets; final A work includes startup/drain. PATH/overlap belongs only to V0/selected A1. DMA2/3 PATH rows are explicit N/A/n0; other devices' PATH is never inferred from combined unselected shared accepts.
 
+The separate [complete-run paired report](paired-report.md) adds the six approved
+same-boot/block E2 hardware-time ratios after a fresh complete90 raw validation.
+It leaves this default exporter unchanged, distinguishes increasing total A
+footprint from the two total6-page controls, and references original per-trial
+data without combining cumulative prefixes. It is prepared and host-validated;
+no real paired report has been run by A3.
+
 E6 produces Solo/A1/A8 n10 and ten hardware-time A8/A1 ratios paired by exactly the same boot and block. The paired ratio distribution is distinct from a ratio of independently summarized cell medians. V0 baseline and V1 role-swap boots are not pooled or paired by these tools; any cross-role comparison is independently descriptive.
 
 Any `fixture_only` marker or synthetic evidence marker in observed sources or decoded records refuses public CSV output. The CLI has no fixture override. Internal test-only calls retain synthetic evidence labels, zero board cases and incomplete-board status. The [focused validation receipt](paper-export-host-final03/validation.json) covers full90/30-point explicitly synthetic campaigns, original command/record mismatch, incomplete collection, unchanged inputs, cached metric recomputation, exact17 columns/CSV serialization/scalar locators, Type7 even/singleton/N/A, DMA2/3 PATH missingness, Solo N/A, same-block paired median2 versus independent median ratio101/3, cross-boot rejection, and both CLIs refusing fixture publication without creating output. No fixture CSV is published as board evidence.
