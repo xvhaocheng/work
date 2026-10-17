@@ -12,6 +12,7 @@
 
 | 本次材料 | 已完成与适用范围 | 入口 |
 | --- | --- | --- |
+| 统一100次离线补充 | DS0 A1合计吞吐约为配对Solo的105.579%，A8/A16/A64为95.665%/92.897%/90.766%；A响应折算16MiB，合法AXI/单任务合同下同窗W误差≤4096B。DS0 A8读内部142.505周期，对照DS50为600.914；分boot离散度与固定种子10000次bootstrap CI已输出，未上板或改历史数据 | [报告及CSV](../paper/ispass2027/analysis/baseline100-extra.md)、[脚本](../analysis/scripts/baseline100_extra.py) |
 | E3负载形态能力核查 | 实际pathv3 CLI/driver/DS0 batch RTL均限制4KiB，且V/A共用长度，无用户描述符/二维布局入口；按用户“需改driver/RTL则停止”要求写变更请求。完整矩阵及≤5.5小时的DS0候选子集仅规划，三类流量未实现、新板测0次；历史4KiB仅离线重算，不能填补64B/1KiB结果 | [能力证据](../paper/ispass2027/exp/E3-workloads/capability.md)、[change-request](../paper/ispass2027/exp/E3-workloads/change-request.md)、[运行包](../paper/ispass2027/exp/E3-workloads/run-package.md)、[结果边界](../paper/ispass2027/exp/E3-workloads/subset-results.md) |
 | 板测数据归集 | 实板17404个标量行（历史4096＋G1 828＋正式100次12480）已入表；正式100次接受100、失败0、重复0，跨3个boot。窗口、角色、版本和原始定位保留；失效仿真980行独立成表 | [数据说明](../paper/ispass2027/data/README.md)、[板测长表](../paper/ispass2027/data/board_results.csv)、[来源清单](../paper/ispass2027/data/source_manifest.json)、[验证回执](../paper/ispass2027/data/validation.json) |
 | 前作全文与差异 | 当前G2报告除Bermuda、ETH全文外，已纳入Rodríguez2024同平台四iDMA缓存/延迟实测、HERO/Kurth更早的共享翻译与miss阻塞hit前史，以及IEICE等近邻；Procedia2025与Hur/Ro2025全文仍未取得，不计入已排除集合。G2保持待补核，不宣称首次或无前作，也不据此新增机制门或补测 | [G2前作报告](../paper/ispass2027/related/prior-work.md)、[全文覆盖](../paper/ispass2027/related/prior-work.md#fulltext-coverage)、[同平台来源](../paper/ispass2027/related/prior-work.md#closest-origin)、[两篇全文未决](../paper/ispass2027/related/prior-work.md#procedia-hur-followup) |

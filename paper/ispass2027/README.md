@@ -11,6 +11,7 @@
 | 实板总表与口径 | [board_results.csv](data/board_results.csv)、[数据说明](data/README.md) | 历史、G1与正式100次分别追源；失效仿真另表 |
 | 前作对比 | [prior-work.md](related/prior-work.md) | 两篇全文与有界检索完成，未核项明列 |
 | G1及统一基线 | [G1配套包](board/packages/g1-20261017/README.md)、[baseline100配套包](board/packages/baseline100-20261017/README.md)、[运行说明](board/g1-reproduce.md) | G1九次通过；统一100次全部完成，三个实际启动 |
+| 统一100次离线补充分析 | [三个问题与表格](analysis/baseline100-extra.md)、[复现脚本](../../analysis/scripts/baseline100_extra.py) | 合计吞吐及跨窗界限、DS0读写四阶段、分boot与合并离散度/10000次bootstrap CI；原始数据只读 |
 | 大纲与图表清单 | [outline.md](outline.md) | 已完成十图清单及行映射 |
 | 可复用上板流程 | [skill](board/skill/genesys2-iommu-board/SKILL.md) | 实测流程已固化，通过仓库级发现链接启用；仅显式调用 |
 | E3负载形态准备 | [能力与变更请求](exp/E3-workloads/capability.md)、[矩阵/预算](exp/E3-workloads/run-package.md)、[未执行说明](exp/E3-workloads/subset-results.md) | pathv3/DS0 batch固定4KiB且V/A共享chunk；依用户修改范围停止，新板测0次，三类硬件流量尚未实现 |

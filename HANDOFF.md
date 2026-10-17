@@ -3980,3 +3980,14 @@ IOMMU与CVA6分别拆成12／27个功能提交，实际补丁顺序与语义依�
 [subset-results.md](paper/ispass2027/exp/E3-workloads/subset-results.md)明确45次均未执行，小传输趋势无法判断；旧DS0各n=10的4KiB参考单列、不改为本轮n=5。离线[analyze.py](paper/ispass2027/exp/E3-workloads/analyze.py)按原bytes/cycles回算既有50次，拒绝ABI1伪小chunk、重复sequence、失效字节/时间、缺Solo及以旧n=10充新n=5等；HPM仍为非原子软件包络。新ABI落地后需新adapter/collector，不把此脚本称为已经支持三类流量。
 
 准备开始时未见其他正在采集的板测；期间其他任务新增DS25/DS100 build-launch及DS sweep编辑，本轮全部保留，没有取得板子或影响当前运行状态。共享IOMMU保持Codex-only，未使用DeepSeek。仅提交本轮E3产物与必要导航；其他并发改动不纳入本次提交。后继需用户明确扩大driver/RTL范围后才实施，先做新版本与对应采集器，再核板子空闲并跑P0；不恢复旧机制探索或长仿真。
+
+
+## 2026-10-17 统一100次离线补充：合计吞吐、DS0路径与离散度
+
+按用户要求只读三个原始records，新增[baseline100-extra报告](paper/ispass2027/analysis/baseline100-extra.md)、[标准库脚本](analysis/scripts/baseline100_extra.py)及五份CSV；未调用采集器、构建、仿真或上板，未修改原始记录或既有board_results/summary。实际执行CVA6 8aac3fcd345af7686a55af1867783fd6b91a0069和Linux45bf76b15e36cf608dff95013d91f8bedb7b1b8e源码直接核读；不是活动研究checkout。共享IOMMU按约定Codex-only，未调用DeepSeek。
+
+80个共跑试次的A同窗B均8192，固定2048B/burst折算16MiB；整批completed_bytes含窗口外启动/排空，不能混用。严格W握手字节未记录，但合法AXI、固定4KiB单任务在途下，以W已握手未获B记账的边界stock可证误差≤4096B；未观测BRESP与逐次数据正确性不被该界限覆盖。path.aw3.full只在该阶段内完整，不能代替全程事务。DS0 A1合计298.814MiB/s，配对Solo百分比中位105.579%，V为Solo的52.790%，没有超出平分的损失；A8/A16/A64合计为95.665%/92.897%/90.766%。
+
+DS0 V读内部Solo/A1/A8/A16/A64为25/25/142.505/186.569/222.646周期，写内部为11/11/94.183/97.001/100.151周期，入口1、出口地址反压0；完整后段及DS50对照见表，DS50 A8读内部600.914周期。统计输出20组（DS0、DS50两个boot及显式合并）×28指标，含中位、Type7 Q1/Q3/IQR、min/max及10000次percentile bootstrap中位数CI；基础种子20261017，合并按两个已观察boot各抽5次，条件于boot而非跨重启总体。原始100条全保留。
+
+已与既有摘要的40个关键值对照，并核对100个逐试次来源和524个有值统计的分位/区间边界；生成器--check逐字节重建通过，输入SHA256和输出清单一并保存。本条只记录本次离线分析，不改变其他并行实验的授权或状态。

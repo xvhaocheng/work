@@ -6,6 +6,8 @@
 
 ## 交付与证据
 
+- [统一100次离线补充分析](paper/ispass2027/analysis/baseline100-extra.md)已补合计吞吐、DS0读写四阶段及分boot离散度/固定种子10000次bootstrap CI。DS0 A1合计约Solo的105.579%；A同窗响应折算16MiB，严格W字节边界误差≤4096B；DS0 A8读内部142.505周期，DS50为600.914。原始记录和既有数据表未改，本任务不上板。
+
 - [E3负载能力与准备包](paper/ispass2027/exp/E3-workloads/capability.md)：实际pathv3/DS0 batch固定4KiB、V/A共享chunk，无法仅改测试程序实现指定64B/1KiB对4KiB子集。已按用户规则写[change-request](paper/ispass2027/exp/E3-workloads/change-request.md)并停止；三类流量未实现、新板测0次。完整矩阵及DS0论文候选150次（预算≤5.5小时）仅规划，[结果页](paper/ispass2027/exp/E3-workloads/subset-results.md)明确未能判断小传输趋势。
 - 实板长表17404个标量行＝历史4096＋G1 828＋统一100次12480；行数不是重复次数。来源和确定性重建见[数据目录](paper/ispass2027/data/README.md)和[validation](paper/ispass2027/data/validation.json)。失效仿真980行独立成表，不计入实板。
 - [前作/G2报告](paper/ispass2027/related/prior-work.md)已覆盖Bermuda、ETH全文及Rodríguez2024同平台硕论、HERO/Kurth前史等近邻；Procedia2025与Hur/Ro2025全文仍未取得，G2待补核，不宣称首次或无前作。[十图大纲与待补项](paper/ispass2027/outline.md)保持，尚未测的扩展不填结果。
