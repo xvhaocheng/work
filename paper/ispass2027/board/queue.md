@@ -18,7 +18,7 @@ E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PT
 
 G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。
 
-E2 timer probe 已完成唯一 N2_A1 诊断对照，原 CLI/数据/排空/taint0 门通过；探针记录182次 handler、21条选取记录，时窗50,192,459周期。N4_A8 于17:53:23Z达到180秒主机超时，持续 softlockup；一次 Ctrl-C 和20秒只读监听均未恢复 shell，未发送 freeze/read，N4探针计数不可取得，不能据 N2 证明根因。原两轮各5点性能 partial 仍分开。原DS0恢复已于18:08:06Z成功，新boot517379a7-7f70-4a1d-a2d4-e9c18ddafc70、probe内核/taint0已核。当前唯一UART动作pn-original-upload01，上传原pathv3 payload；有限pn-original-deploy01仅在上传完成及bytesACK后写SD一次并验证原pathv3启动，不采实验、不加E2重试。
+E2 timer probe 已完成唯一 N2_A1 诊断对照，原 CLI/数据/排空/taint0 门通过；探针记录182次 handler、21条选取记录，时窗50,192,459周期。N4_A8 于17:53:23Z达到180秒主机超时，持续 softlockup；一次 Ctrl-C 和20秒只读监听均未恢复 shell，未发送 freeze/read，N4探针计数不可取得，不能据 N2 证明根因。原两轮各5点性能 partial 仍分开。原DS0恢复已于18:08:06Z成功，新boot517379a7-7f70-4a1d-a2d4-e9c18ddafc70、probe内核/taint0已核。原pathv3上传已于18:22:42Z成功且bytesACK；当前唯一UART动作为pn-original-deploy01中的原软件SD写入，成功后才加载原DS0验证pathv3启动，不采实验、不加E2重试。
 
 完整 E3 的唯一原设置续编已于17:45:03Z硬失败：WNS−2.646ns，setup失败3413，hold/pulse失败0，routing errors50014；RTSTAT-13禁止bitgen，无BIT。原route checkpoint/报告/DRC/失败manifest保留，不重试、不改约束。E3-lite只准备单文件时间戳存储写进程拆分和有限gold验证，实际RAM推断/fit/timing未知，任何Vivado任务排在E6-PN首构之后；完整E3正式板点仍0。
 

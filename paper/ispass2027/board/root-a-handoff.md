@@ -152,3 +152,6 @@ E2 timer probe 已完成唯一 N2_A1 诊断对照，原 CLI/数据/排空/taint0
 完整 E3 的唯一原设置续编已于17:45:03Z硬失败：WNS−2.646ns，setup失败3413，hold/pulse失败0，routing errors50014；RTSTAT-13禁止bitgen，无BIT。原route checkpoint/报告/DRC/失败manifest保留，不重试、不改约束。E3-lite只准备单文件时间戳存储写进程拆分和有限gold验证，实际RAM推断/fit/timing未知，任何Vivado任务排在E6-PN首构之后；完整E3正式板点仍0。
 
 E6-PN：P d2a813d、gap dd1a97e、S15 51项以及只读 helper 137项实际主机检查已接受；N 755cd723与独立被动 observer c913dd1已交付待 Root直接审查，均非整栈或板测。最新用户追加 P（不隔离替换历史），保持2/14分区不变；DS0主矩阵150点，加S15 15、独立gap补充30、DS50原四模式40，合计235。先评估开关风险，显著增险则完整构建前关闭并退回205；原约束/一次历史物理优化/失败即停及S15每格≤0.5%门不变。DS50仍须真实S15通过才构建。A1准备history小批，A2准备E3-lite，A3勘查observer接线；三席无硬件权限。
+
+
+2026-10-17T18:25:03.753260+00:00：原pathv3 transport upload return0/bytesACK于18:22:42Z完成；pn-original-deploy01现正唯一SD写入，之后仅boot身份验证。P_shared组件5b7dfbc已Root读两文件diff/actual gold、27938项原件核验接受并保留首构开关；完整PN尚未构建。独立backend测试首eval默认输入覆盖、AW阻塞分段边界等harness/调度失败原样保留，真实N容量仍在验证，不冒称已过。
