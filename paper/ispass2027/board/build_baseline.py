@@ -35,6 +35,7 @@ REF = "refs/heads/codex/ispass2027-baseline-20261017"
 PINNED_CVA6 = "8aac3fcd345af7686a55af1867783fd6b91a0069"
 PINNED_PLATFORM = "885ed0a7ea90ed42dae2b7a2dadfdd0acba15273"
 VIVADO_BIN = "/tools/Xilinx/Vivado/2023.1/bin"
+DS_CYCLES = {"ds0": 0, "ds25": 25, "ds50": 50, "ds100": 100}
 ENV = dict(os.environ, PATH=VIVADO_BIN + ":" + os.environ["PATH"],
            XILINXD_LICENSE_FILE="2100@opus4.apal.cs.waseda.ac.jp")
 ENV.setdefault("RISCV", "/home/xvhaocheng/RISCV/riscv_tools")
@@ -357,6 +358,9 @@ def fpga(out, source, variant):
     m = phase_manifest(out, source, "fpga-" + variant)
     manifest_path = out / "build-manifest.json"
     try:
+        cycles = DS_CYCLES[variant]
+        m.update(selected_platform=selected["selected_platform"],
+                 execution_repository=repo_identity(WORK))
         with (out / "build.log").open("xb") as log:
             stage = out / "src"
             exporter = load_module(PLATFORM / "provenance/source-organization-20261017/export_sources.py", "ispass_fpga_export")
@@ -366,9 +370,9 @@ def fpga(out, source, variant):
                 archive(PLATFORM / c["path"], c["commit"], stage / c["path"])
             cva6 = stage / "cva6"
             top = cva6 / "corev_apu/fpga/src/ariane_xilinx.sv"
-            if variant == "ds50":
+            if cycles:
                 text = top.read_text()
-                for name, value in [("IOMMUDSDelayEnable", 1), ("IOMMUDSFixedDelayInput", 50), ("IOMMUDSFixedDelayOutput", 50)]:
+                for name, value in [("IOMMUDSDelayEnable", 1), ("IOMMUDSFixedDelayInput", cycles), ("IOMMUDSFixedDelayOutput", cycles)]:
                     text, n = re.subn(r"(localparam (?:bit|int unsigned) " + name + r"\s*=\s*)\d+", lambda x: x[1] + str(value), text)
                     assert n == 1, name
                 top.write_text(text)
@@ -378,7 +382,7 @@ def fpga(out, source, variant):
             m.update(variant=variant, selected_cva6=selected["selected_cva6"],
                      selected_iommu=component_commits["cva6/corev_apu/riscv-iommu"],
                      components=components, sources=tree_hashes(stage),
-                     parameters={"ds_delay_enable": variant == "ds50", "ds_cycles": [50, 50] if variant == "ds50" else [0, 0],
+                     parameters={"ds_delay_enable": bool(cycles), "ds_cycles": [cycles, cycles],
                                  "iotlb_entries": 16, "observer_version": 3, "clock_hz": 50000000},
                      direct_ds_wire=variant == "ds0")
             save(manifest_path, m)
@@ -395,8 +399,23 @@ def fpga(out, source, variant):
             artifacts = [result / "ariane_xilinx.bit", result / "ariane_xilinx.mcs", timing,
                          result / "ariane_xilinx_route_status.rpt", result / "ariane_xilinx_utilization_placed.rpt"]
             m["artifacts"] = {str(p): sha(p) for p in artifacts}
+            routing = (result / "ariane_xilinx_route_status.rpt").read_text()
+            errors = re.search(r"# of nets with routing errors\.*\s*:\s*(\d+)", routing, re.I)
+            if errors is None:
+                raise ValueError("routing error count absent from route status report")
+            m["routing_errors"] = int(errors[1])
             m["status"] = "passed" if (m["timing"]["wns_ns"] >= 0 and m["timing"]["setup_failing"] == 0 and
-                                                  m["timing"]["hold_failing"] == 0 and m["timing"]["pulse_failing"] == 0) else "timing_failed"
+                                                  m["timing"]["hold_failing"] == 0 and m["timing"]["pulse_failing"] == 0 and
+                                                  m["routing_errors"] == 0) else "timing_failed"
+            if m["status"] != "passed":
+                raise RuntimeError("FPGA timing or routing acceptance failed; do not load")
+            if m["status"] == "passed":
+                boundary = out / "routed-boundary.json"
+                run([VIVADO_BIN + "/vivado", "-mode", "batch", "-nojournal", "-nolog",
+                     "-source", HERE / "verify_routed.tcl", "-tclargs",
+                     result / "ariane_xilinx_routed.dcp", int(bool(cycles)), boundary], out, log, m, manifest_path)
+                m["routed_boundary"] = json.loads(boundary.read_text())
+                m["routed_boundary_sha256"] = sha(boundary)
     except BaseException as exc:
         m.update(status="failed", error=repr(exc))
         raise
@@ -412,7 +431,7 @@ def main():
     ap.add_argument("action", choices=["prepare", "software", "fpga"])
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--source", type=Path)
-    ap.add_argument("--variant", choices=["ds0", "ds50"])
+    ap.add_argument("--variant", choices=list(DS_CYCLES))
     ap.add_argument("--jobs", type=int, default=16)
     args = ap.parse_args()
     if args.jobs <= 0:
