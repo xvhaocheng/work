@@ -38,6 +38,8 @@ python3 paper/ispass2027/exp/E6-mitigation/collect_role_swap.py \
 
 保留CLI原JSON、完整UART、同sequence的3条batch和16条PATH。保留原检查：内核/boot/taint、CLI状态、双方data_errors/quarantined、submitted=completed、V4096次及字节数、观测状态、窗口H+gap、固定前端cadence、AXI守恒与重叠、全部PATH计数/边界守恒。新增角色、DID、A页数与条件核对。非零错误立即停止并保留输出；没有性能筛选或自动补采。若仅主机解析失败，`--recover-run OLD_RUN_DIR` 会先解析原始已完成前缀，只执行剩余计划点；无法完整解析或板端执行失败的命令会拒绝恢复，不以新样本替换。
 
+共享计数按 [共同边界说明](../../board/observer-shared-counts.md)更新：shared AR/AW必须分别等于V与selected A的读/写PATH stage0 `full+carry`之和。私有入口经过mux spill，其shared减私有之差保留signed，允许负数，不据此拒绝结果；没有添加first offer与private accept之间未经证明的库存等式。host检查增加自洽closing spill=1样例（A私有read受理+1、期末私有在途+1，PATH ar0 entered/end/area各+1，shared握手不变）及篡改shared总数必拒。
+
 每个区组的内置命令等价于：
 
 ```sh
