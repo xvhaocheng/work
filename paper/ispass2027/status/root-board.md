@@ -104,3 +104,13 @@ E4/E5共同Linux`da6b69fc007ad5e671dc288dd8038d02e3ebe43d`已实际true merge并
 完整E3 frontend提交`2db78c0927d6e70b819b46651df86e82ab139710`已接受，Root读完整RTL、实际C++与双gold wrapper，核commit源与编译snapshot字节相同；206情境/102,190 COPY逐地址检查，旧BTC2 69场景、BTC1 27场景逐拍gold，STOP/active锁与tile/NIC边界原文保留。此为有限前端证据，不是AXI/缓存/时序/板测证明。A2继续独立OBS5/Depth64容量批，尚未构建完整E3 BIT。
 
 排程按用户尽早看小传输量级的要求优化：当前共同acece软件传输写入后，先P0新DS0 BIT的45点E3，再原DS0 BIT的90点E2。仍只需两次必要BIT加载，同一内核不回切，先前E2在前的记录据此更新。E4 20点与E5 hist待两批后接共同新软件及合格E5 BIT，不额外排独立E5 50点。
+
+## E5最终FPGA与共同采集验收（2026-10-17 14:10Z）
+
+E5独立DS0 BIT最终passed，Root直接核原timing159行、route原文及utilization：WNS+0.126ns、WHS+0.047ns、WPWS+0.062ns，setup/hold/pulse失败端点全0，290520/290520 routable nets全完成、routing errors0，CPU20ns、DS0 direct wire、delay/forbidden cells0。BIT SHA `d934846ecb7f2fd80bcb7d2f18889ae0fd8c9bbd28a0f5fef8e949614139221c`，本机产物与完整原始报告入口为`exp/E5-latency/build/completed02/acceptance.json`。相对P0原实现，LUT149400→166334、regs126265→142751，Slice50355→50581/50950（99.28%），BRAM50/DSP27不变；这是全设计同工具/约束的布局资源对照，不是单模块精确归因。后续Depth64须自身实现验收。
+
+Root完整审E4 20点collector、实际CLI/leaf proofs/共享PATH0等式/全部hist gate/同boot完整前缀恢复与递归合成身份门，整合后实际运行38协议、14身份和11递归拒绝检查全部通过；均0板数据、未导UART。E5离线分析原日志/最终CLI/PATH/512桶重绑、三向计划点绑定与递归合成拒绝已审，Root9项实际检查全过；请求分位仅nearest-rank桶区间，试次端点用Type7描述，不池化A请求。
+
+完整E3容量提交`1d587125eee690e623e6ffae13e70f9bbe989adc`已审：Root核4文件完整diff及实际测试源SHA等于commit，默认4的v3/v4逐拍gold、Depth64全port/role/channel/stage的64条full99且area=sum、年龄/overflow/wrap证据保留，top连接有限证据不冒称SoC编译。固定平台`dfebcc0425bab25567e8514d156650a608530be1`及独立builder已审，允许启动唯一full-E3 DS0构建。显式Vivado generic64在预合成记录，版本标签明示source-declared，Linux da6仅reference、ABI5软件尚未实现，不用E5验收冒替。
+
+acece共同压缩镜像10,520,154B已在913.29秒传入并正常bytes-ack，现`p0-common-software-write01`更新SD；模块已加载的旧boot不再作正式测量。写入成功后按新顺序P045→E290，下一正式boot要求新release且taint0。没有追加远端hash或SD回读。
