@@ -52,3 +52,9 @@ Root已直接审查E2 multi最终驱动/ABI/CLI、未知静默状态不标draine
 ## 首批新增论文数据（2026-10-17 13:04Z）
 
 已只读冻结实际DS25采集的前16个成功试次到`exp/E1b-ds-sweep/checkpoints/ds25-progress01/`，原始manifest/records字节另存as-observed，按实际n=3或4提供逐试次长表、中位数及Q1/Q3/IQR；显式引用历史100次后总116试次。当前四档矩阵仍partial，DS100尚未采集；未填补缺点、未绘部分曲线、未重测替换。该累积CSV用于阶段同步，不能与后续累计快照重复追加。新试次的BIT为已验收DS25，软件仍是原pathv3；原始命令/boot/sequence/来源完整保留。
+
+## 共用软件与合法长度backend验收（2026-10-17 13:09Z）
+
+共用内核/Image/payload已编译完成。初次构建在最后SPI模块link前因缺少`scripts/module.lds`失败；A2按现有恢复流程补`modules_prepare`，只编模块，原failed build-manifest/log保持不变，修复后新delivery-manifest为passed，正式release匹配。payload为29,363,656字节、32MiB分区余4,190,776字节；Root已用实际delivery通过E2 collector的纯主机版本/冻结CLI验证。E2采集器已整合，Root29项协议检查和90点合成矩阵通过，非板数据。
+
+P0真实固定backend的13个有限case/87个descriptor通过：合法64/1024/4096B在规定对齐环中每descriptor为1/1/2个AR和AW，实际字节/目的内容/越界guards/已接收请求排空一致。Root直接核实际SV/C++与生产调用参数，并将13个summary逐字段核对原始events。额外零长负向probe发现既有backend响应在backpressure下消失，run02明确failed并原样保留；P0的CLI、driver和batch RTL三层实际代码均拒0，故仅接受限定合法域，不声称整个backend通过，不改生产backend。NO_ERROR_HANDLING下SLVERR测试仅证明模拟响应下守恒和排空，不证明错误会上传软件。
