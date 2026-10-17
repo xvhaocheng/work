@@ -1,6 +1,7 @@
-# G observer错误与控制合同（待Root锁定，尚未实现）
+# G observer错误与控制合同（Root已锁定）
 
-前端小批2c7c68f已被Root接受。本文件仅定义下一小批的精确行为；不修改observer/Linux，不启动BIT。
+前端小批2c7c68f已被Root接受，本合同已锁定。
+observer/wrapper实现与有限证据见`observer-validation/`；Linux/完整BIT仍未启动。
 32word地址与两个cap沿用已锁布局。Root已确认现OBS4 RTL没有sequence寄存器，
 旧日志seq来自Linux `++idma_observation_sequence`，因此769锁定为reserved0。
 
@@ -88,5 +89,4 @@ clear不能终止仍在V窗外工作的A，拒绝时bit8且数据/计数继续�
 允许原observer在V窗中见到A batch inactive。否则保持旧bit5错误。
 G关闭时保留旧检查；G error非0时不能获得豁免。不能把A done当作对AXI/PATH守恒的免检。
 
-769 reserved0已由Root锁定；本文件其余error与控制时序仍需Root锁定。
-锁定后再实现observer/wrapper有限小批，Linux与BIT不随本文件自动启动。
+全合同已由Root锁定；实现仍须按实际diff/有限证据接受，Linux与BIT不随本文件自动启动。
