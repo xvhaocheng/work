@@ -1,0 +1,147 @@
+From dd1a97e890e3c9f587416891b3f006336f939619 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sun, 18 Oct 2026 02:38:57 +0900
+Subject: [PATCH] Add optional serialized batch cooldown with unchanged gap0
+ path
+
+---
+ .../register_64bit/idma_reg64_frontend.sv     | 50 +++++++++++++++++--
+ 1 file changed, 47 insertions(+), 3 deletions(-)
+
+diff --git a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+index 49b2f20fb24fc6eb26ad43db4b5b2d7f64b2562b..b2b718fb9b49be1351e215b8893298871835ebf6 100644
+--- a/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
++++ b/corev_apu/iDMA/src/frontends/register_64bit/idma_reg64_frontend.sv
+@@ -22,7 +22,8 @@ module idma_reg64_frontend #(
+     /// AXI ID width
+     parameter int unsigned  AxiIdWidth       = 32'd0,
+     /// AXI AxID
+-    parameter logic [(AxiIdWidth-1):0] AxID  = 0
++    parameter logic [(AxiIdWidth-1):0] AxID  = 0,
++    parameter bit PnGapEnable = 1'b0
+ ) (
+     input  logic          clk_i,
+     input  logic          rst_ni,
+@@ -58,7 +59,8 @@ module idma_reg64_frontend #(
+     typedef enum logic [1:0] { 
+         IDLE    = 2'b00,
+         COUNT   = 2'b01,
+-        WAIT    = 2'b10
++        WAIT    = 2'b10,
++        COOLDOWN = 2'b11
+     } idma_state_t;
+     idma_state_t state_q, state_n;
+ 
+@@ -88,6 +90,8 @@ module idma_reg64_frontend #(
+     logic [12:0] batch_pages_q;
+     logic [63:0] batch_id_q;
+     logic batch_cfg_ok, batch_task_issue, batch_task_done;
++    logic [31:0] pn_gap_q, gap_remaining_q, gap_remaining_n;
++    logic batch_stop_request;
+     assign full_addr = 8'(dma_ctrl_req_i.addr);
+     assign batch_access = BatchPort && dma_ctrl_req_i.valid && full_addr[7];
+     assign batch_active_o = BatchPort && batch_enable_q && state_q != IDLE;
+@@ -100,6 +104,8 @@ module idma_reg64_frontend #(
+                           dma_reg2hw.src_addr.q[11:0] == 0 && dma_reg2hw.dst_addr.q[11:0] == 0;
+     assign batch_task_issue = batch_active_o && state_q == COUNT && ready_i;
+     assign batch_task_done = batch_active_o && state_q == WAIT && trans_complete_i;
++    assign batch_stop_request = batch_access && dma_ctrl_req_i.write &&
++        dma_ctrl_req_i.wstrb == 8'hff && full_addr == 8'h88 && dma_ctrl_req_i.wdata == 2;
+ 
+     // The high 128-byte bank is explicitly decoded; the old register file remains 7-bit.
+     // Configuration is immutable while active. STOP drains the currently offered task.
+@@ -108,6 +114,7 @@ module idma_reg64_frontend #(
+             batch_enable_q <= 0; batch_stop_q <= 0; batch_stopped_q <= 0;
+             batch_error_q <= 0; batch_target_q <= 0; batch_pages_q <= 0;
+             batch_issued_q <= 0; batch_completed_q <= 0; batch_id_q <= 0;
++            pn_gap_q <= 0;
+         end else if (BatchPort) begin
+             if (batch_enable_q && issue) begin
+                 batch_issued_q <= 0; batch_completed_q <= 0;
+@@ -118,6 +125,8 @@ module idma_reg64_frontend #(
+                 batch_completed_q <= batch_completed_q + 1'b1;
+                 if (batch_stop_q) batch_stopped_q <= 1;
+             end
++            if (PnGapEnable && state_q == COOLDOWN && (batch_stop_q || batch_stop_request))
++                batch_stopped_q <= 1;
+             if (locked_write) batch_error_q <= 1;
+             if (batch_access && dma_ctrl_req_i.write) begin
+                 if (dma_ctrl_req_i.wstrb != 8'hff) batch_error_q <= 1;
+@@ -140,6 +149,11 @@ module idma_reg64_frontend #(
+                     8'h98: if (dma_ctrl_req_i.wdata > 0 && dma_ctrl_req_i.wdata <= 4096)
+                         batch_pages_q <= dma_ctrl_req_i.wdata[12:0];
+                         else batch_error_q <= 1;
++                    // A single COPY is serialized through WAIT; IDLE plus backend idle
++                    // therefore excludes an offered or queued job. Disable preserves gap.
++                    8'hb0: if (PnGapEnable && backend_idle_i && dma_ctrl_req_i.wdata[63:32] == 0)
++                        pn_gap_q <= dma_ctrl_req_i.wdata[31:0];
++                        else batch_error_q <= 1;
+                     default: batch_error_q <= 1;
+                 endcase
+             end
+@@ -284,6 +298,16 @@ module idma_reg64_frontend #(
+                 8'h98: dma_ctrl_rsp_o.rdata = 64'(batch_pages_q);
+                 8'ha0: dma_ctrl_rsp_o.rdata = 64'(batch_completed_q);
+                 8'ha8: dma_ctrl_rsp_o.rdata = 64'(batch_issued_q);
++                8'hb0: begin
++                    dma_ctrl_rsp_o.rdata = 64'(pn_gap_q);
++                    dma_ctrl_rsp_o.error = !PnGapEnable || (dma_ctrl_req_i.write &&
++                        (state_q != IDLE || !backend_idle_i || dma_ctrl_req_i.wstrb != 8'hff ||
++                         dma_ctrl_req_i.wdata[63:32] != 0));
++                end
++                8'hb8: begin
++                    dma_ctrl_rsp_o.rdata = PnGapEnable ? 64'h49444d4147415001 : 0;
++                    dma_ctrl_rsp_o.error = !PnGapEnable || dma_ctrl_req_i.write;
++                end
+                 default: dma_ctrl_rsp_o.error = 1;
+             endcase
+         end
+@@ -302,6 +326,7 @@ module idma_reg64_frontend #(
+         transf_offset_n   = transf_offset_q;
+         active_cycles_n   = active_cycles_q + DmaRegisterWidth'(!backend_idle_i);
+         state_n           = state_q;
++        gap_remaining_n   = gap_remaining_q;
+ 
+         unique case (state_q)
+ 
+@@ -358,11 +383,29 @@ module idma_reg64_frontend #(
+                     end
+ 
+                     else begin
+-                        state_n = COUNT;
++                        if (PnGapEnable && batch_enable_q && pn_gap_q != 0) begin
++                            gap_remaining_n = pn_gap_q - 1'b1;
++                            state_n = COOLDOWN;
++                        end else state_n = COUNT;
+                     end
+                 end
+             end
+ 
++            COOLDOWN: begin
++                // No next task has been offered. Accept STOP even on the expiry edge;
++                // retire the command once, without emitting another COPY done event.
++                if (!PnGapEnable) begin
++                    state_n = IDLE;
++                end else if (batch_stop_q || batch_stop_request) begin
++                    trans_complete = 1'b1;
++                    state_n = IDLE;
++                end else if (gap_remaining_q == 0) begin
++                    state_n = COUNT;
++                end else begin
++                    gap_remaining_n = gap_remaining_q - 1'b1;
++                end
++            end
++
+             default: begin
+                 state_n = IDLE;
+             end
+@@ -385,5 +428,6 @@ module idma_reg64_frontend #(
+     `FF(transf_counter_q,   transf_counter_n,   '0,     clk_i, rst_ni)
+     `FF(transf_offset_q,    transf_offset_n,    '0,     clk_i, rst_ni)
+     `FF(active_cycles_q,    active_cycles_n,    '0,     clk_i, rst_ni)
++    `FF(gap_remaining_q,    gap_remaining_n,    '0,     clk_i, rst_ni)
+ 
+ endmodule : idma_reg64_frontend
+-- 
+2.34.1
+
