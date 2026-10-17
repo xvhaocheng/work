@@ -233,7 +233,7 @@ def main():
     parser.add_argument('--expected-kernel', default='6.5.0-rc2-ispass2027-p0-multi-v1')
     parser.add_argument('--load-manifest', type=Path)
     parser.add_argument('--source-record', type=Path, help='Existing baseline100 DS0 source identity')
-    parser.add_argument('--software-manifest', type=Path, help='Completed common P0/multi build manifest')
+    parser.add_argument('--software-manifest', type=Path, help='Passed common P0/multi delivery manifest')
     parser.add_argument('--ds', choices=['0/0'])
     parser.add_argument('--port', default=DEFAULT_PORT)
     parser.add_argument('--recover-run', type=Path,

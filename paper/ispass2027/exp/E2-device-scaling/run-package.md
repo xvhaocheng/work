@@ -8,9 +8,9 @@ Required existing identities:
 
 - DS0 load receipt with verified current boot/kernel and `bit_sha256=e9b6554f2b3a64a19f910c672781ad38b7c91879b560d382506aca5ec5df1da6`.
 - Original [baseline100 DS0 source record](../../board/packages/baseline100-20261017/source.json) for actual BIT provenance. Its old Linux field is retained as the historical baseline, not presented as the new software identity.
-- Completed A2 common software `build-manifest.json`: selected Linux `acece3a3ab7d72ba1f936c1984b82a4a55f28d46`, kernel `6.5.0-rc2-ispass2027-p0-multi-v1`, included `idma_scaling`, matching frozen CLI source hash. Current builder output is `/home/xvhaocheng/work-a2-workloads/paper/ispass2027/exp/E3-workloads/artifacts/p0-software01/build-manifest.json`.
+- Passed A2 common software `delivery-manifest.json`: selected Linux `acece3a3ab7d72ba1f936c1984b82a4a55f28d46`, kernel `6.5.0-rc2-ispass2027-p0-multi-v1`, included `idma_scaling`, matching frozen CLI source hash. Current builder output is `/home/xvhaocheng/work-a2-workloads/paper/ispass2027/exp/E3-workloads/artifacts/p0-software01/delivery-manifest.json`.
 
-Use the existing board skill/package update and boot record. The collector compares these existing receipts and does not rehash BIT/payload or add board checks. The prior pathv3 boot receipt cannot describe the new kernel boot.
+Use the existing board skill/package update and boot record. The collector compares these existing receipts and does not rehash BIT/payload or add board checks. The prior pathv3 boot receipt cannot describe the new kernel boot. The initial common `build-manifest.json` preserves its module-only failure; the passed delivery manifest links that original and the successful modules-only repair.
 
 The plan can be rendered locally without opening UART:
 
@@ -26,7 +26,7 @@ python3 paper/ispass2027/exp/E2-device-scaling/collect_multi.py \
   --expected-kernel 6.5.0-rc2-ispass2027-p0-multi-v1 \
   --load-manifest /absolute/current-ds0-load/load.json \
   --source-record paper/ispass2027/board/packages/baseline100-20261017/source.json \
-  --software-manifest /home/xvhaocheng/work-a2-workloads/paper/ispass2027/exp/E3-workloads/artifacts/p0-software01/build-manifest.json \
+  --software-manifest /home/xvhaocheng/work-a2-workloads/paper/ispass2027/exp/E3-workloads/artifacts/p0-software01/delivery-manifest.json \
   --output /absolute/new-e2-output
 ```
 

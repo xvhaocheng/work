@@ -16,6 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fixture', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--software-manifest', type=Path)
     args = parser.parse_args()
     text = json.loads(args.fixture.read_text())['stdout'].replace('\r', '')
     previous = int(re.search(r'^PRE_SEQ=(\d+)$', text, re.M)[1])
@@ -130,6 +131,11 @@ def main():
         checks.append({'name': 'old_pair_software_rejected_without_hardware', 'passed': True})
     else:
         raise AssertionError('wrong Linux accepted')
+    if args.software_manifest:
+        collector.validate_software(json.loads(args.software_manifest.read_text()), kernel)
+        checks.append({'name': 'actual_common_delivery_manifest_contract', 'passed': True,
+                       'manifest': str(args.software_manifest.resolve()),
+                       'sha256': hashlib.sha256(args.software_manifest.read_bytes()).hexdigest()})
     fixture_path = args.output.with_name('multi-collector-fixtures.json')
     fixture_path.write_text(json.dumps({
         'scope': 'Explicitly synthetic protocol examples; never measured board data',
