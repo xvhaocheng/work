@@ -3970,3 +3970,13 @@ IOMMU与CVA6分别拆成12／27个功能提交，实际补丁顺序与语义依�
 本段只记录实际完成与最终数据归集的分界，没有触板、新检查或新检索；旧交接段保留为当时状态。共享IOMMU本轮保持Codex-only；提交、推送及发现链接由主会话收尾，本段不记录为已推送。
 
 正式数据归集已完成：实板17404个标量行＝历史4096＋G1 828＋统一100次12480，仿真980行独立。正式100次接受100、失败0、重复0、3个boot；来源重建与确定性检查通过，关键值/稳定ID见[统一基线简表](paper/ispass2027/data/baseline100-summary.md)。图2/3已映射新统一数据，未重复n=5分段；DS0 A8/A16/A64的V HPM miss中位2如实保留，不推定发生于硬件窗口。
+
+## 2026-10-17 E3负载形态准备：达到用户修改边界，未上板
+
+用户要求只改测试程序实现NIC环、storage大请求与2D跨步流量，并在DS0先测V=64B/1KiB/4KiB对none/A1/A8（A固定4KiB），每点5次；如需driver/RTL改动则写change-request并停下。实际冻结pathv3代码证实CLI、driver及DS0 batch前端都强制4096B；UAPI只有双方共享的chunk，没有descriptor/offset/stride入口。DS0实际实例IS_TWO_D=0；batch固定每次+4096、N页回环。删除CLI限制不能满足任务，故已写[change-request](paper/ispass2027/exp/E3-workloads/change-request.md)，未实现硬件流量、未改driver/RTL、未加载/更新/打开UART，新板测0次。
+
+[capability.md](paper/ispass2027/exp/E3-workloads/capability.md)绑定实际软件/硬件构建副本与原文行号；包含原CLI的19项主机参数/caps检查及二维1D展开算术，均不是内核/板测。[run-package.md](paper/ispass2027/exp/E3-workloads/run-package.md)定义9种V/A形态组合、独立六尺寸轴及Solo，共342条件×5=1710次完整DS0矩阵；论文候选150次预算≤5.5小时，内含用户指定45次P0。全矩阵与P1/P2仅规划，未获本轮启动授权。页数不冒充单描述符长度，A1/A8只在固定4KiB干扰者切片定义。
+
+[subset-results.md](paper/ispass2027/exp/E3-workloads/subset-results.md)明确45次均未执行，小传输趋势无法判断；旧DS0各n=10的4KiB参考单列、不改为本轮n=5。离线[analyze.py](paper/ispass2027/exp/E3-workloads/analyze.py)按原bytes/cycles回算既有50次，拒绝ABI1伪小chunk、重复sequence、失效字节/时间、缺Solo及以旧n=10充新n=5等；HPM仍为非原子软件包络。新ABI落地后需新adapter/collector，不把此脚本称为已经支持三类流量。
+
+准备开始时未见其他正在采集的板测；期间其他任务新增DS25/DS100 build-launch及DS sweep编辑，本轮全部保留，没有取得板子或影响当前运行状态。共享IOMMU保持Codex-only，未使用DeepSeek。仅提交本轮E3产物与必要导航；其他并发改动不纳入本次提交。后继需用户明确扩大driver/RTL范围后才实施，先做新版本与对应采集器，再核板子空闲并跑P0；不恢复旧机制探索或长仿真。

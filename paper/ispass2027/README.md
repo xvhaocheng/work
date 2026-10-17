@@ -13,6 +13,7 @@
 | G1及统一基线 | [G1配套包](board/packages/g1-20261017/README.md)、[baseline100配套包](board/packages/baseline100-20261017/README.md)、[运行说明](board/g1-reproduce.md) | G1九次通过；统一100次全部完成，三个实际启动 |
 | 大纲与图表清单 | [outline.md](outline.md) | 已完成十图清单及行映射 |
 | 可复用上板流程 | [skill](board/skill/genesys2-iommu-board/SKILL.md) | 实测流程已固化，通过仓库级发现链接启用；仅显式调用 |
+| E3负载形态准备 | [能力与变更请求](exp/E3-workloads/capability.md)、[矩阵/预算](exp/E3-workloads/run-package.md)、[未执行说明](exp/E3-workloads/subset-results.md) | pathv3/DS0 batch固定4KiB且V/A共享chunk；依用户修改范围停止，新板测0次，三类硬件流量尚未实现 |
 
 实板长表共17404个标量行（历史4096＋G1 828＋统一100次12480），失效仿真另表980行。
 新基线的十组中位数及关键稳定ID见[结果摘要](data/baseline100-summary.md)，
