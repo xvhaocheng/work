@@ -1,0 +1,653 @@
+From e3ca456a15d1952b97a2d5bde3a1021e27511893 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 22:51:45 +0900
+Subject: [PATCH] idma: add bounded fixed-work IOMMU leaf-size experiment ABI4
+
+---
+ drivers/misc/idma.c             | 413 +++++++++++++++++++++++++++++++-
+ include/uapi/linux/idma_pages.h |  95 ++++++++
+ 2 files changed, 496 insertions(+), 12 deletions(-)
+ create mode 100644 include/uapi/linux/idma_pages.h
+
+diff --git a/drivers/misc/idma.c b/drivers/misc/idma.c
+index 74da24ec7805..d65706548791 100644
+--- a/drivers/misc/idma.c
++++ b/drivers/misc/idma.c
+@@ -20,9 +20,11 @@
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ #include <linux/vmalloc.h>
++#include <linux/riscv_iommu_leaf.h>
+ #include <uapi/linux/idma.h>
+ #include <uapi/linux/idma_p0.h>
+ #include <uapi/linux/idma_multi.h>
++#include <uapi/linux/idma_pages.h>
+ #include <asm/cacheflush.h>
+ 
+ MODULE_DESCRIPTION("CVA6 iDMA versioned two-device experiment driver");
+@@ -83,6 +85,11 @@ struct idma_stream {
+ 	struct idma_experiment_stats *stats;
+ };
+ 
++struct idma_pages_context {
++	struct idma_pages_experiment request;
++	bool iova_assigned[2];
++};
++
+ static DEFINE_MUTEX(idma_devices_lock);
+ static struct idma_device *idma_devices[IDMA_MAX_DEVS];
+ /* All experiment preparation, IOVA mappings and DMA execution are serialized. */
+@@ -281,13 +288,11 @@ static void idma_stream_cleanup(struct idma_stream *s)
+ 			       DMA_ATTR_FORCE_CONTIGUOUS);
+ }
+ 
+-static int idma_stream_prepare(struct idma_stream *s, struct idma_device *idma,
++static int idma_stream_allocate(struct idma_stream *s, struct idma_device *idma,
+ 			       u32 pages, u32 chunk,
+ 			       struct idma_experiment_stats *stats)
+ {
+-	struct page *src_page, *dst_page;
+ 	size_t i;
+-	int ret;
+ 
+ 	s->idma = idma;
+ 	s->dev = idma->miscdev.parent;
+@@ -309,6 +314,19 @@ static int idma_stream_prepare(struct idma_stream *s, struct idma_device *idma,
+ 		((u64 *)s->src)[i] = idma_pattern(s, i);
+ 		((u64 *)s->dst)[i] = ~idma_pattern(s, i);
+ 	}
++	return 0;
++}
++
++static int idma_stream_prepare(struct idma_stream *s, struct idma_device *idma,
++			       u32 pages, u32 chunk,
++			       struct idma_experiment_stats *stats)
++{
++	struct page *src_page, *dst_page;
++	int ret;
++
++	ret = idma_stream_allocate(s, idma, pages, chunk, stats);
++	if (ret)
++		return ret;
+ 	src_page = idma_buffer_page(s->src);
+ 	dst_page = idma_buffer_page(s->dst);
+ 	if (!src_page || !dst_page)
+@@ -337,6 +355,219 @@ static void idma_quarantine(struct idma_stream *s)
+ 	dev_crit(s->dev, "experiment DMA not safely drained; buffers retained until reboot\n");
+ }
+ 
++static int idma_pages_verify_buffer(struct idma_stream *s,
++				    struct idma_pages_buffer *buffer,
++				    size_t pgsize, bool after)
++{
++	struct riscv_iommu_leaf_info info;
++	u32 *verified = after ? &buffer->verified_after_4k_pages :
++				&buffer->verified_before_4k_pages;
++	unsigned int expected_shift = pgsize == SZ_2M ? 21 : PAGE_SHIFT;
++	size_t off;
++	int ret;
++
++	for (off = 0; off < s->size; off += PAGE_SIZE) {
++		ret = riscv_iommu_query_leaf(s->domain, buffer->iova + off, &info);
++		if (ret)
++			goto out;
++		if (!off) {
++			if (after)
++				buffer->after_first_pte = info.raw_pte;
++			else {
++				buffer->before_first_pte = info.raw_pte;
++				buffer->first_leaf_iova_base = info.leaf_iova_base;
++			}
++		}
++		if (after)
++			buffer->after_last_pte = info.raw_pte;
++		else {
++			buffer->before_last_pte = info.raw_pte;
++			buffer->last_leaf_iova_base = info.leaf_iova_base;
++		}
++		if (!buffer->leaf_shift_min || info.leaf_shift < buffer->leaf_shift_min)
++			buffer->leaf_shift_min = info.leaf_shift;
++		buffer->leaf_shift_max = max(buffer->leaf_shift_max, info.leaf_shift);
++		/* The explicit COPY mapping requires RISC-V V/R/W (bits 0..2). */
++		if (info.leaf_shift != expected_shift || (info.raw_pte & 7) != 7 ||
++		    info.phys != buffer->phys + off ||
++		    info.leaf_iova_base != ALIGN_DOWN(buffer->iova + off, pgsize)) {
++			ret = -EIO;
++			goto out;
++		}
++		(*verified)++;
++	}
++	/* Check the final byte's superpage offset as well as each 4K base. */
++	ret = riscv_iommu_query_leaf(s->domain, buffer->iova + s->size - 1, &info);
++	if (!ret && (info.phys != buffer->phys + s->size - 1 ||
++	    info.leaf_shift != expected_shift || (info.raw_pte & 7) != 7 ||
++	    info.leaf_iova_base != ALIGN_DOWN(buffer->iova + s->size - 1, pgsize)))
++		ret = -EIO;
++out:
++	if (after)
++		buffer->after_error = ret;
++	else
++		buffer->before_error = ret;
++	return ret;
++}
++
++static int idma_pages_contiguous(void *ptr, size_t bytes, phys_addr_t *phys)
++{
++	struct page *page;
++	size_t off;
++
++	if (!IS_ALIGNED((unsigned long)ptr, PAGE_SIZE))
++		return -EINVAL;
++	page = idma_buffer_page(ptr);
++	if (!page)
++		return -EFAULT;
++	*phys = page_to_phys(page);
++	if (!IS_ALIGNED(*phys, SZ_2M))
++		return -EINVAL;
++	for (off = 0; off < bytes; off += PAGE_SIZE) {
++		page = idma_buffer_page(ptr + off);
++		if (!page || page_to_phys(page) != *phys + off)
++			return -EFAULT;
++	}
++	return 0;
++}
++
++static int idma_pages_map_buffer(struct idma_stream *s,
++				 struct idma_pages_buffer *buffer, size_t pgsize)
++{
++	size_t off;
++	int ret;
++
++	for (off = 0; off < s->size; off += pgsize) {
++		ret = iommu_map(s->domain, buffer->iova + off, buffer->phys + off,
++				pgsize, IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
++		if (ret)
++			return ret;
++		buffer->mapped_bytes += pgsize;
++	}
++	return 0;
++}
++
++static int idma_pages_prepare(struct idma_stream *s, struct idma_device *idma,
++			      struct idma_experiment_stats *stats,
++			      struct idma_pages_context *context, unsigned int lane)
++{
++	struct idma_pages_experiment *p = &context->request;
++	struct idma_pages_buffer *buffers = &p->buffers[2 * lane];
++	struct riscv_iommu_leaf_info info;
++	phys_addr_t phys;
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < 2; i++) {
++		buffers[i].bytes = IDMA_PAGES_BUFFER_BYTES;
++		buffers[i].requested_page_bytes = p->mapping_page_bytes;
++	}
++	ret = idma_stream_allocate(s, idma, IDMA_PAGES_BUFFER_BYTES / PAGE_SIZE,
++				   SZ_4K, stats);
++	if (ret)
++		return ret;
++	for (i = 0; i < 2; i++) {
++		phys = 0;
++		ret = idma_pages_contiguous(i ? s->dst : s->src, s->size, &phys);
++		buffers[i].phys = phys;
++		if (ret)
++			return ret;
++	}
++	ret = idma_find_iova(s->domain, s->size, &s->src_iova, &s->dst_iova);
++	if (ret)
++		return ret;
++	/* Reject unsupported query/domain contexts before creating a mapping. */
++	ret = riscv_iommu_query_leaf(s->domain, s->src_iova, &info);
++	if (ret != -ENOENT)
++		return ret ? ret : -EBUSY;
++	ret = riscv_iommu_query_leaf(s->domain, s->dst_iova, &info);
++	if (ret != -ENOENT)
++		return ret ? ret : -EBUSY;
++	context->iova_assigned[lane] = true;
++	buffers[0].iova = s->src_iova;
++	buffers[1].iova = s->dst_iova;
++	for (i = 0; i < 2; i++) {
++		if (!IS_ALIGNED(buffers[i].iova, SZ_2M))
++			return -EINVAL;
++		ret = idma_pages_map_buffer(s, &buffers[i], p->mapping_page_bytes);
++		if (ret)
++			return ret;
++		ret = idma_pages_verify_buffer(s, &buffers[i], p->mapping_page_bytes, false);
++		if (ret)
++			return ret;
++		p->verified_before_mask |= BIT(2 * lane + i);
++	}
++	p->prepared_lane_mask |= BIT(lane);
++	return 0;
++}
++
++static int idma_pages_cleanup(struct idma_stream *s,
++			      struct idma_pages_context *context, unsigned int lane)
++{
++	struct idma_pages_experiment *p = &context->request;
++	struct idma_pages_buffer *buffers = &p->buffers[2 * lane];
++	struct riscv_iommu_leaf_info info;
++	void **pointers[2] = { &s->src, &s->dst };
++	dma_addr_t dma[2] = { s->src_dma, s->dst_dma };
++	unsigned int i;
++	size_t off, unmapped;
++	int ret = 0, next;
++
++	if (!s->dev)
++		return 0;
++	if (s->in_flight || s->retain) {
++		if (!s->retain)
++			idma_quarantine(s);
++		p->retained_lane_mask |= BIT(lane);
++		return -EIO;
++	}
++	p->quiet_lane_mask |= BIT(lane);
++	if (context->iova_assigned[lane]) {
++		for (i = 0; i < 2; i++) {
++			struct idma_pages_buffer *b = &buffers[i];
++			int error = 0;
++
++			for (off = 0; off < b->mapped_bytes; off += p->mapping_page_bytes) {
++				unmapped = iommu_unmap(s->domain, b->iova + off,
++						       p->mapping_page_bytes);
++				if (unmapped <= p->mapping_page_bytes)
++					b->unmapped_bytes += unmapped;
++				if (unmapped != p->mapping_page_bytes)
++					error = -EIO;
++			}
++			b->empty_after_cleanup = 1;
++			for (off = 0; off < s->size; off += PAGE_SIZE) {
++				next = riscv_iommu_query_leaf(s->domain, b->iova + off, &info);
++				if (next != -ENOENT) {
++					b->empty_after_cleanup = 0;
++					if (!error)
++						error = next ? next : -EIO;
++				}
++			}
++			b->unmap_error = error;
++			if (!error)
++				p->unmapped_buffer_mask |= BIT(2 * lane + i);
++			else if (!ret)
++				ret = error;
++		}
++	}
++	if (ret) {
++		/* A dangling mapping keeps both original lane allocations alive. */
++		idma_quarantine(s);
++		p->retained_lane_mask |= BIT(lane);
++		return ret;
++	}
++	for (i = 0; i < 2; i++) {
++		if (*pointers[i]) {
++			dma_free_attrs(s->dev, s->size, *pointers[i], dma[i],
++				       DMA_ATTR_FORCE_CONTIGUOUS);
++			*pointers[i] = NULL;
++			p->freed_buffer_mask |= BIT(2 * lane + i);
++		}
++	}
++	return 0;
++}
++
+ static int idma_submit(struct idma_stream *s, bool measured)
+ {
+ 	u64 now;
+@@ -978,11 +1209,12 @@ static int idma_observation_finish(struct idma_observation *o,
+ 	return valid ? 0 : -EIO;
+ }
+ 
+-/* Both ABIs share all mappings, cache handling, locks, stop/drain and validation.
++/* Experiment ABIs share cache handling, locks, stop/drain and validation.
+  * ABI adaptation is outside this core; chunk_bytes is V's actual length.
+  */
+-static long idma_run_experiment_core(struct idma_device *victim,
+-		struct idma_experiment *request, bool batch, u32 aggressor_chunk, bool p0)
++static long idma_run_experiment_mapped(struct idma_device *victim,
++		struct idma_experiment *request, bool batch, u32 aggressor_chunk, bool p0,
++		struct idma_pages_context *pages)
+ {
+ 	struct idma_experiment e = *request;
+ 	struct idma_stream streams[2] = {};
+@@ -994,6 +1226,7 @@ static long idma_run_experiment_core(struct idma_device *victim,
+ 	u64 active_before[2], active_after[2];
+ 	u64 start, end = 0, deadline, stamp;
+ 	int ret, drain_ret, verify_ret, observation_ret;
++	unsigned int i, lane;
+ 
+ 	memset(&e.status, 0, sizeof(e) - offsetof(struct idma_experiment, status));
+ 	e.victim_did = victim->did;
+@@ -1023,10 +1256,21 @@ static long idma_run_experiment_core(struct idma_device *victim,
+ 		}
+ 		e.aggressor_did = aggressor->did;
+ 		a = &streams[1];
++		if (pages && (aggressor->id != 1 || aggressor->did != 11)) {
++			ret = -EOPNOTSUPP;
++			goto out_put;
++		}
+ 	}
+ 	ret = idma_observation_prepare(&observation, batch || READ_ONCE(idma_observe));
+ 	if (ret)
+ 		goto out_put;
++	if (pages) {
++		if (!observation.path) {
++			ret = -EOPNOTSUPP;
++			goto out_put;
++		}
++		pages->request.observer_sequence = observation.sequence;
++	}
+ 	if (batch && (!idma_batch_supported(victim, p0) ||
+ 	    (aggressor && !idma_batch_supported(aggressor, p0)))) {
+ 		ret = -EOPNOTSUPP;
+@@ -1037,12 +1281,14 @@ static long idma_run_experiment_core(struct idma_device *victim,
+ 		ret = -EBUSY;
+ 		goto out_put;
+ 	}
+-	ret = idma_stream_prepare(v, victim, e.victim_pages, e.chunk_bytes, &e.victim);
++	ret = pages ? idma_pages_prepare(v, victim, &e.victim, pages, 0) :
++		idma_stream_prepare(v, victim, e.victim_pages, e.chunk_bytes, &e.victim);
+ 	if (ret)
+ 		goto out_cleanup;
+ 	if (a) {
+-		ret = idma_stream_prepare(a, aggressor, e.aggressor_pages,
+-					  aggressor_chunk, &e.aggressor);
++		ret = pages ? idma_pages_prepare(a, aggressor, &e.aggressor, pages, 1) :
++			idma_stream_prepare(a, aggressor, e.aggressor_pages,
++					      aggressor_chunk, &e.aggressor);
+ 		if (ret)
+ 			goto out_cleanup;
+ 	}
+@@ -1099,6 +1345,16 @@ static long idma_run_experiment_core(struct idma_device *victim,
+ 	e.measurement_complete = !ret;
+ 	e.victim.in_flight_at_end = v->in_flight;
+ 	e.aggressor.in_flight_at_end = a && a->in_flight;
++	if (pages && a && a->batch_started) {
++		struct idma_pages_experiment *p = &pages->request;
++
++		p->pre_stop_A_control = readq(a->idma->reg + IDMA_BATCH_CONTROL_OFFSET);
++		p->pre_stop_A_issued = readq(a->idma->reg + IDMA_BATCH_ISSUED_OFFSET);
++		p->A_status_valid = 1;
++		if (!ret && (!(p->pre_stop_A_control & 2) || p->pre_stop_A_control >> 32 ||
++		    p->pre_stop_A_issued >= IDMA_EXPERIMENT_MAX_TRANSFERS))
++			ret = -EIO;
++	}
+ 	/* Stop autonomous A after V observation; hardware window is already frozen. */
+ 	if (batch) {
+ 		idma_batch_stop(a);
+@@ -1152,6 +1408,27 @@ static long idma_run_experiment_core(struct idma_device *victim,
+ 		}
+ 	}
+  out_cleanup:
++	if (pages && !v->in_flight && !v->retain &&
++	    (!a || (!a->in_flight && !a->retain))) {
++		for (lane = 0; lane < (a ? 2 : 1); lane++) {
++			struct idma_stream *s = &streams[lane];
++
++			if (!s->dev || !s->size || s->retain || s->in_flight)
++				continue;
++			for (i = 0; i < 2; i++) {
++				struct idma_pages_buffer *b = &pages->request.buffers[2 * lane + i];
++
++				if (b->mapped_bytes != s->size)
++					continue;
++				verify_ret = idma_pages_verify_buffer(s, b,
++						pages->request.mapping_page_bytes, true);
++				if (!verify_ret)
++					pages->request.verified_after_mask |= BIT(2 * lane + i);
++				else if (!ret)
++					ret = verify_ret;
++			}
++		}
++	}
+ 	observation_ret = idma_observation_finish(&observation, &e, ret);
+ 	if (observation_ret && !ret)
+ 		ret = observation_ret;
+@@ -1159,9 +1436,20 @@ static long idma_run_experiment_core(struct idma_device *victim,
+ 		idma_batch_disable(v);
+ 		idma_batch_disable(a);
+ 	}
+-	if (a)
+-		idma_stream_cleanup(a);
+-	idma_stream_cleanup(v);
++	if (pages) {
++		if (a) {
++			verify_ret = idma_pages_cleanup(a, pages, 1);
++			if (verify_ret && !ret)
++				ret = verify_ret;
++		}
++		verify_ret = idma_pages_cleanup(v, pages, 0);
++		if (verify_ret && !ret)
++			ret = verify_ret;
++	} else {
++		if (a)
++			idma_stream_cleanup(a);
++		idma_stream_cleanup(v);
++	}
+  out_put:
+ 	idma_put_instance(observation.control);
+ 	idma_put_instance(aggressor);
+@@ -1173,6 +1461,12 @@ static long idma_run_experiment_core(struct idma_device *victim,
+ 	return ret;
+ }
+ 
++static long idma_run_experiment_core(struct idma_device *victim,
++		struct idma_experiment *request, bool batch, u32 aggressor_chunk, bool p0)
++{
++	return idma_run_experiment_mapped(victim, request, batch, aggressor_chunk, p0, NULL);
++}
++
+ static long idma_run_experiment_mode(struct idma_device *victim,
+ 			       struct idma_experiment __user *uarg, bool batch)
+ {
+@@ -1540,6 +1834,97 @@ static long idma_caps_multi(struct idma_device *victim, void __user *uarg)
+ 	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
+ }
+ 
++static int idma_pages_validate(struct idma_device *victim,
++			       const struct idma_pages_experiment *p)
++{
++	if (p->abi_version != IDMA_PAGES_ABI || p->struct_size != sizeof(*p))
++		return -EPROTO;
++	if (!IS_REACHABLE(CONFIG_RISCV_IOMMU) || !IS_ENABLED(CONFIG_64BIT))
++		return -EOPNOTSUPP;
++	if (PAGE_SIZE != SZ_4K || victim->id != 0 || victim->did != 10)
++		return -EOPNOTSUPP;
++	if (p->flags || p->reserved0 || memchr_inv(p->reserved, 0, sizeof(p->reserved)) ||
++	    (p->mapping_page_bytes != SZ_4K && p->mapping_page_bytes != SZ_2M) ||
++	    p->buffer_bytes != IDMA_PAGES_BUFFER_BYTES || p->chunk_bytes != SZ_4K ||
++	    p->victim_transfers != 4096 || p->warmup_transfers != 256 ||
++	    !p->run_timeout_ms || p->run_timeout_ms > IDMA_MAX_RUN_TIMEOUT_MS)
++		return -EINVAL;
++	return 0;
++}
++
++static long idma_run_pages(struct idma_device *victim,
++			  struct idma_pages_experiment __user *uarg)
++{
++	struct idma_pages_context *context;
++	struct idma_pages_experiment *p;
++	struct idma_experiment *e;
++	long ret;
++
++	context = kzalloc(sizeof(*context), GFP_KERNEL);
++	if (!context)
++		return -ENOMEM;
++	p = &context->request;
++	if (copy_from_user(p, uarg, sizeof(*p))) {
++		ret = -EFAULT;
++		goto out_free;
++	}
++	memset(&p->status, 0, sizeof(*p) - offsetof(struct idma_pages_experiment, status));
++	ret = idma_pages_validate(victim, p);
++	if (ret)
++		goto out_copy;
++	e = &p->experiment;
++	e->abi_version = IDMA_EXPERIMENT_ABI;
++	e->struct_size = sizeof(*e);
++	e->aggressor_id = 1;
++	e->victim_pages = IDMA_PAGES_BUFFER_BYTES / PAGE_SIZE;
++	e->aggressor_pages = IDMA_PAGES_BUFFER_BYTES / PAGE_SIZE;
++	e->chunk_bytes = p->chunk_bytes;
++	e->run_timeout_ms = p->run_timeout_ms;
++	e->victim_transfers = p->victim_transfers;
++	e->warmup_transfers = p->warmup_transfers;
++	ret = idma_run_experiment_mapped(victim, e, true, SZ_4K, false, context);
++out_copy:
++	p->status = ret;
++	if (copy_to_user(uarg, p, sizeof(*p)))
++		ret = -EFAULT;
++out_free:
++	kfree(context);
++	return ret;
++}
++
++static long idma_caps_pages(struct idma_device *victim, void __user *uarg)
++{
++	struct iommu_domain *domain = iommu_get_domain_for_dev(victim->miscdev.parent);
++	struct idma_pages_caps caps = {
++		.abi_version = IDMA_PAGES_ABI,
++		.struct_size = sizeof(caps),
++		.device_id = victim->id,
++		.did = victim->did,
++		.kernel_page_bytes = PAGE_SIZE,
++		.buffer_bytes = IDMA_PAGES_BUFFER_BYTES,
++		.chunk_bytes = SZ_4K,
++		.max_run_timeout_ms = IDMA_MAX_RUN_TIMEOUT_MS,
++	};
++
++	if (PAGE_SIZE != SZ_4K || victim->id != 0 || victim->did != 10)
++		return -EOPNOTSUPP;
++	if (idma_batch_supported(victim, false))
++		caps.capabilities |= IDMA_PAGES_CAP_BATCH;
++	if (riscv_iommu_hpm_supported(victim->miscdev.parent))
++		caps.capabilities |= IDMA_PAGES_CAP_HPM;
++	if (readq(victim->reg + IDMA_OBS_MAGIC_OFFSET) == IDMA_OBS_MAGIC_V3)
++		caps.capabilities |= IDMA_PAGES_CAP_PATH;
++	if (IS_REACHABLE(CONFIG_RISCV_IOMMU) && IS_ENABLED(CONFIG_64BIT))
++		caps.capabilities |= IDMA_PAGES_CAP_LEAF_API;
++	if (domain) {
++		if (domain->pgsize_bitmap & SZ_4K)
++			caps.mapping_page_mask |= IDMA_PAGES_MAP_4K;
++		if (domain->pgsize_bitmap & SZ_2M)
++			caps.mapping_page_mask |= IDMA_PAGES_MAP_2M;
++	}
++	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
++}
++
+ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ {
+ 	struct idma_device *idma = fp->private_data;
+@@ -1555,6 +1940,10 @@ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ 	};
+ 
+ 	switch (cmd) {
++	case IDMA_IOC_CAPS_PAGES:
++		return idma_caps_pages(idma, (void __user *)arg);
++	case IDMA_IOC_RUN_BATCH_PAGES:
++		return idma_run_pages(idma, (struct idma_pages_experiment __user *)arg);
+ 	case IDMA_IOC_CAPS_MULTI:
+ 		return idma_caps_multi(idma, (void __user *)arg);
+ 	case IDMA_IOC_RUN_MULTI_BATCH:
+diff --git a/include/uapi/linux/idma_pages.h b/include/uapi/linux/idma_pages.h
+new file mode 100644
+index 000000000000..107811000f10
+--- /dev/null
++++ b/include/uapi/linux/idma_pages.h
+@@ -0,0 +1,95 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_LINUX_IDMA_PAGES_H
++#define _UAPI_LINUX_IDMA_PAGES_H
++
++#include <linux/idma.h>
++
++#define IDMA_PAGES_ABI 4U
++#define IDMA_PAGES_BUFFER_BYTES 2097152U
++#define IDMA_PAGES_CAP_HPM (1U << 0)
++#define IDMA_PAGES_CAP_BATCH (1U << 1)
++#define IDMA_PAGES_CAP_PATH (1U << 2)
++#define IDMA_PAGES_CAP_LEAF_API (1U << 3)
++#define IDMA_PAGES_MAP_4K (1U << 0)
++#define IDMA_PAGES_MAP_2M (1U << 1)
++
++struct idma_pages_caps {
++	__u32 abi_version;
++	__u32 struct_size;
++	__u32 capabilities;
++	__u32 device_id;
++	__u32 did;
++	__u32 kernel_page_bytes;
++	__u32 buffer_bytes;
++	__u32 chunk_bytes;
++	__u32 mapping_page_mask;
++	__u32 max_run_timeout_ms;
++	__u32 reserved[6];
++};
++
++struct idma_pages_buffer {
++	__u64 iova;
++	__u64 phys;
++	__u64 bytes;
++	__u64 mapped_bytes;
++	__u64 unmapped_bytes;
++	__u64 before_first_pte;
++	__u64 before_last_pte;
++	__u64 after_first_pte;
++	__u64 after_last_pte;
++	__u64 first_leaf_iova_base;
++	__u64 last_leaf_iova_base;
++	__u32 requested_page_bytes;
++	__u32 leaf_shift_min;
++	__u32 leaf_shift_max;
++	__u32 verified_before_4k_pages;
++	__u32 verified_after_4k_pages;
++	__u32 empty_after_cleanup;
++	__s32 before_error;
++	__s32 after_error;
++	__s32 unmap_error;
++	__u32 reserved;
++};
++
++/*
++ * Fixed V0/A1: each source/destination is 2MiB (8MiB total DMA buffers).
++ * COPY4096, 512-page ring, measured4096, warmup256. Only mapping_page_bytes
++ * differs (4096 or 2097152); allocation method/alignment is identical.
++ * All input flags/reserved fields must be zero. No fallback or retry.
++ */
++struct idma_pages_experiment {
++	__u32 abi_version;
++	__u32 struct_size;
++	__u32 flags;
++	__u32 mapping_page_bytes;
++	__u32 buffer_bytes;
++	__u32 chunk_bytes;
++	__u32 run_timeout_ms;
++	__u32 reserved0;
++	__u64 victim_transfers;
++	__u64 warmup_transfers;
++	__u32 reserved[8];
++	/* Output buffer bits: Vsrc=0,Vdst=1,Asrc=2,Adst=3; lane bits V=0,A=1. */
++	__s32 status;
++	__u32 prepared_lane_mask;
++	__u32 verified_before_mask;
++	__u32 verified_after_mask;
++	__u32 quiet_lane_mask;
++	__u32 unmapped_buffer_mask;
++	__u32 freed_buffer_mask;
++	__u32 retained_lane_mask;
++	__u64 observer_sequence;
++	/* Sequential software reads before STOP; not atomic V-window A progress. */
++	__u64 pre_stop_A_control;
++	__u64 pre_stop_A_issued;
++	__u32 A_status_valid;
++	__u32 reserved_output;
++	/* ABI1-shaped inputs/results; HPM software bracket, final A includes drain. */
++	struct idma_experiment experiment;
++	struct idma_pages_buffer buffers[4];
++};
++
++#define IDMA_IOC_CAPS_PAGES _IOR('i', 0x0d, struct idma_pages_caps)
++#define IDMA_IOC_RUN_BATCH_PAGES _IOWR('i', 0x0e, struct idma_pages_experiment)
++
++#endif /* _UAPI_LINUX_IDMA_PAGES_H */
+-- 
+2.34.1
+
