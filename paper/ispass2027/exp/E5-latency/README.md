@@ -1,7 +1,11 @@
 # E5 被动分段直方图
 
 当前没有E5板测或论文分布数据。已接受的真实RTL有限验证、驱动真实函数host测试与RISC-V driver.o均通过；
-唯一活动完整DS0构建在本工作树 `artifacts/e5-ds0-build01/`，最终实现验收仍待完成。
+完整DS0构建于2026-10-17T14:06:29Z通过，原始报告与验收入口为 `build/completed02/acceptance.json`。
+50MHz下WNS +0.126ns、WHS +0.047ns、WPWS +0.062ns，setup/hold/pulse失败端点和routing errors均0；
+DS直连且无研究机制单元。合格BIT原件及本机硬链接交付保存在 `artifacts/e5-ds0-build01/` 与 `artifacts/e5-ds0-delivery/`，不进Git。
+相对P0/multi同DS0基座，整个placed设计增加16934 LUT、16486 registers，BRAM/DSP不变；
+当前Slice打包50581/50950 (99.28%)，此数字不代表未来Depth64实现已通过。尚无E5板测数据。
 设计/原文采样口径见 `design.md`，组件patch与最小增量bundle见 `metadata/`，构建/取消修正入口见 `build/README.md`。
 
 生产来源为已接受的P0/multi，保留Depth4、原错误检查与P0 frontend字节。

@@ -1,8 +1,22 @@
 # E5 DS0 构建与恢复入口
 
-当前唯一活动构建输出为本工作树 `../artifacts/e5-ds0-build01/`，启动时间
-2026-10-17T13:28:41.205090Z。`launch02.as-started.json` 只是启动快照，
-最终状态以该输出的 `build-manifest.json` 为准，尚无合格 BIT 或板测结论。
+本工作树 `../artifacts/e5-ds0-build01/` 已于2026-10-17T14:06:29.967265Z通过，
+启动时间2026-10-17T13:28:41.205090Z，两个实际命令均exit0。
+`launch02.as-started.json` 只是启动快照，最终完整manifest与原始routed timing/route/utilization报告
+逐字复制到 `completed02/`。`completed02/acceptance.json` 关联实际路径、报告hash、BIT身份与资源比较。
+50MHz下WNS +0.126ns、WHS +0.047ns、WPWS +0.062ns，三种失败端点及routing errors均0；
+CPU周期20ns，DS delay cell和forbidden research cell均0。未上板，不声称完整IO/CDC签核。
+
+BIT为11443722字节，SHA256 `d934846ecb7f2fd80bcb7d2f18889ae0fd8c9bbd28a0f5fef8e949614139221c`，
+复用最终build manifest已计算的hash，未重复hash二进制。
+本机 `../artifacts/e5-ds0-delivery/ariane_xilinx.bit` 是完成后原件的硬链接；
+Root/A3可按共同包流程复制或硬链接实际字节，最终软件身份使用A3的共同E4/E5 Linux/payload manifest。
+本FPGA清单中的acece Linux引用保留实际原值，不能改写成随后共同软件的执行身份。
+
+相对同工具/DS0/50MHz的已接受P0/multi `8aeb9ac9b3aea82a975cc789cb47633fb29bf5c8`：
+placed LUT 149400→166334（+16934，11.33%），registers126265→142751（+16486，13.06%），
+BRAM50、DSP27不变，Slice50355→50581；当前Slice使用99.28%。这是整个设计的实测差值，
+不是独立hist模块面积归因，也不作为未来OBS5/Depth64的可实现证明。
 
 固定来源为 CVA6 `6c5c666d45979d3a03fb98cff89ba7ad095f6125`、platform
 `2f19f6c2de5530760f521bf771b6217066bc54d5`；Linux `acece3a3ab7d72ba1f936c1984b82a4a55f28d46`
