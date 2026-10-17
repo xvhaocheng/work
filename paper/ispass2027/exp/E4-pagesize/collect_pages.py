@@ -235,6 +235,8 @@ def parse(output,expected_kernel,condition,histogram):
             'coverage': {'path_devices': [0,1], 'A_final_counts_include_startup_and_drain': True,
                          'HPM_snapshots_atomic': False, 'per_A_exact_window_completions': None}}
     item['histogram'] = histogram.attach_from_output(output, item)
+    info = item['histogram']['info']
+    assert info['version'] == 4 and info['schema'] == 1 and 'depth' not in info, 'E4 requires OBS4/INFO1 without depth'
     return item
 
 

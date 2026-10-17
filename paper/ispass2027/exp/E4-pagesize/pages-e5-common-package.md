@@ -161,3 +161,11 @@ including five actual-main subprocesses, one nested evidence_level marker in eac
 identity source, all refusing collection with no directory and zero UART import
 attempts. The prior38 protocol/14 identity receipts remain byte-for-byte preserved
 for the earlier7efc8fe collector revision; no unchanged driver suite was rerun.
+
+## OBS4 experiment qualification remains fixed
+
+The shared histogram helper's accepted OBS5 extension does not widen E4. After
+attachment, E4 explicitly requires info.version4/schema1 with no depth field.
+[Two focused checks](pages-hist-version-host.json) accept the unchanged OBS4 case
+and reject a self-consistent OBS5/schema2/depth64 case that the shared helper
+correctly accepts. No driver suite or hardware run was added.
