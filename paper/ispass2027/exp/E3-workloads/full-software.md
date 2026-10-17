@@ -52,3 +52,23 @@ python3 paper/ispass2027/exp/E3-workloads/prepare_full_transport.py \
 
 这些程序不含SD、UART、JTAG或上板操作。新软件可在严格已注册known-profile下共用于E4/E5 OBS4，
 再由Root只切full-E3 BIT；旧da6 ready包与P0共同包均保留原字节。
+
+## 本次正式交付
+
+2026-10-17T15:03:30.110718Z完整构建passed，无repair/重编Image。
+[原始manifest副本](test-results/full-software01-build-manifest.json)、[原始完整build.log](test-results/full-software01-build.log)
+及[transport](full-software-transport.json)已保存；原out manifest SHA256为
+`7415dcc4d076fa434bc22294f4309582af84086964f1b47bb05c695555f0bcc4`。
+
+payload29363656B、32MiB余量4190776B；gzip11068218B，SHA256
+`78e181ddeeddebedb919f97f2eb1233a82dcd41511f3375782111b80cd2c1f20`。
+解压payload SHA256=`ca75a420c9321e89f5fbbe284e836421ec1b0f25c14a4ce0eca6084b068bff95`。
+匹配新release的SPI archive8871B，SHA256
+`fd6bb9d134f923440e957a6deb5019276597901dfa8bf76594e1860c8d124cbf`。
+两模块vermagic均为`6.5.0-rc2-ispass2027-full-e3-v1 SMP mod_unload riscv`。
+压缩payload及SPI archive主机解压逐字节通过；transport保留两模块各自大小/SHA/vermagic。
+
+实际新CLI binary与已测静态ELF逐字节相同：517448B、SHA7cd7ae4075404ec53bc3ef20437ac72a5341d8ae49ecb46350a1de6bf11a2119。
+Image编译记录的driver SHA38316b66af557509653d11c9035c7c9d0e093aa68b632449710c88f6adab13e5
+与65b427有限回归及对象相同。正式manifest的CVA6仅reference，未冒称加载了新BIT。
+Root负责实际上传/写SD/boot与实验；本批无硬件操作、无新board测量值。
