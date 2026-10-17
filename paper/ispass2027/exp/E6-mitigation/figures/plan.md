@@ -50,6 +50,9 @@ directory. The bundle copies the actual input bytes and every referenced
 snapshot, the as-executed script/statistics helper, per-trial CSV, statistics,
 and a manifest with all source/output SHAs. PDF/SVG/PNG use the existing
 `/tmp/ispass-ds-sweep-plot-venv/bin/python` matplotlib environment.
+The bundle's `inputs/` is also a complete replay source: its own nested
+`inputs/` retains the original analyzer snapshot layout, so replay needs no
+read from the original absolute raw paths in the provenance metadata.
 
 After Root supplies the actual complete40 export and reviewed input lock:
 

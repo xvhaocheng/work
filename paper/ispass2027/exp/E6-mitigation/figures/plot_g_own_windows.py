@@ -225,7 +225,7 @@ def main():
     args = parser.parse_args(); output = args.output.resolve()
     require(output.is_relative_to(HERE.resolve()) and not output.exists(), 'new figures-local output required')
     data, raw, snapshots, lock_raw, trials, statistics = load(args.source.resolve(), args.input_lock.resolve())
-    output.mkdir(); inputs = output/'inputs'; inputs.mkdir(); originals = inputs/'source-bytes'; originals.mkdir()
+    output.mkdir(); inputs = output/'inputs'; inputs.mkdir(); originals = inputs/'inputs'; originals.mkdir()
     for name, body in raw.items(): (inputs/name).write_bytes(body)
     for name, body in snapshots.items(): (originals/name).write_bytes(body)
     (inputs/'input-lock.json').write_bytes(lock_raw)
