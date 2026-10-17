@@ -5,7 +5,7 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: plan（既定论文实验的接口设计，不恢复机制探索）
 - Origin Date: 2026-10-17
-- Verification Status: UNVERIFIED（Root 已接受有界接口；尚无 E5 RTL 验证、构建或板测）
+- Verification Status: VERIFIED（有限真实RTL、host-MMIO与driver.o）；FPGA构建中，未板测
 - Version Label: e5_passive_histogram_v1
 
 Root 已接受下述有界接口，并明确首个产物使用已验收 P0/multi 基座及 DS0。独立工作树为 `/home/xvhaocheng/work-a1-e5-latency`，
@@ -91,7 +91,7 @@ Linux仅改 `drivers/misc/idma.c`：识别v4并记 `o->hist`，所有 capability
 不改 ioctl/UAPI、工作负载或 CLI 参数。E5专用采集器要求v4及完整直方图，不能以旧BIT静默过关。
 
 原 `idma_observation_finish()` 已在 drain/verify 后读冻结结果并打印，所有新MMIO读取和日志也只放在这里。
-每次只读一段32桶，使用至多32个u64的临时数组，避免增加4KiB内核栈数组。
+每次只读一段32桶，实际以单个u64与总和流式处理、672byte格式缓冲保存原值，避免增加4KiB内核栈数组。
 读HIST_INFO、核桶数/位宽/overflow、逐段检查 `sum(bins)==原PATH.full`；任何不符返回-EIO。
 沿用同 sequence/boot/kernel 身份，新增16条：
 
@@ -120,5 +120,6 @@ CDF只能由实际桶计数得到；分位数只能报告桶边界范围，不�
    计入真实新增资源。失败即停，不改时钟约束或实现策略。
 6. 所有完成组件先提交，再落实平台gitlink与来源锁；交Root代码/原始报告/image/BIT后才排队上板。
 
-当前未建立新Linux/BIT，也没有E5性能数据。先交第一小批 RTL 与有限真实 DUT 验证、接口证据供 Root 审核实际 diff，
-通过后再启动完整 Vivado；不扩大 Depth4 或放宽现有 overflow 检查。
+Root已接受第一小批 RTL 与有限真实 DUT 验证，唯一活动DS0完整构建位于本工作树 `artifacts/e5-ds0-build01/`。
+Linux v4读取小批已通过48项真实函数host fixture与RISC-V driver.o编译，等待Root软件整合审查。
+当前未建立新Linux image/合格BIT，也没有E5性能数据；不扩大 Depth4 或放宽现有 overflow 检查。
