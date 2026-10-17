@@ -96,3 +96,11 @@ E6原DS0/旧pathv3角色互换V1/A0共30/30通过，Solo/A1/A8各10，无失败�
 板卡已转共同软件传输；小型pathv3 SPI模块archive已完成UART传输，现传10,520,154字节压缩payload。未加载模块或写SD，待上传完整后沿既有updater直接更新，不加远端hash或SD回读。之后新Linux配原DS0 BIT测E2 90，再只换P0 DS0 BIT测45点。
 
 E4驱动/ABI4实际提交`e3ca456a15d1952b97a2d5bde3a1021e27511893`已直接审核接受：89有限生命周期场景、原38+57回归、45 CLI和实际RV64对象通过；未知静默、短unmap/残留映射保持整lane retain/quarantine。E5合并后需把E4 caps的PATH判别改用v3/v4共用函数并验证；A3随后固定共同SHA/平台锁，编译唯一E4/E5软件包。当前acece E2/P0正式包不改。
+
+## 共同软件已构建与小子集优先（2026-10-17 14:01Z）
+
+E4/E5共同Linux`da6b69fc007ad5e671dc288dd8038d02e3ebe43d`已实际true merge并修正caps_pages的v3/v4 PATH判别。Root直接核完整生产差异，仅包含已审E5逻辑及该1行修订。97 E4、旧38+57、同源码48 observer有限检查和RV64对象已通过，边界分别标明。平台`a68603f0fc668771bc0c9e3a86fcefe289bfa17b`绑定实际组件。一次完整Image/payload构建首次即passed（13:55:49Z–13:56:59Z），release `6.5.0-rc2-ispass2027-e4-e5-v1`，29,363,656B，余4,190,776B，含六CLI及同版恢复模块。Root已核正式manifest和源码/输入身份；当前acece上板包保持不动。
+
+完整E3 frontend提交`2db78c0927d6e70b819b46651df86e82ab139710`已接受，Root读完整RTL、实际C++与双gold wrapper，核commit源与编译snapshot字节相同；206情境/102,190 COPY逐地址检查，旧BTC2 69场景、BTC1 27场景逐拍gold，STOP/active锁与tile/NIC边界原文保留。此为有限前端证据，不是AXI/缓存/时序/板测证明。A2继续独立OBS5/Depth64容量批，尚未构建完整E3 BIT。
+
+排程按用户尽早看小传输量级的要求优化：当前共同acece软件传输写入后，先P0新DS0 BIT的45点E3，再原DS0 BIT的90点E2。仍只需两次必要BIT加载，同一内核不回切，先前E2在前的记录据此更新。E4 20点与E5 hist待两批后接共同新软件及合格E5 BIT，不额外排独立E5 50点。
