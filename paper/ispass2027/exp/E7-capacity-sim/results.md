@@ -17,8 +17,12 @@ Calibration: `passed_trend_only`; see [calibration.json](calibration.json) for r
 | 16 | A64 | 5186520 | 2.05895 | 1.16381 | 0 | 7810 | 4097 |
 | 32 | Solo | 2519013 | 1.00000 | 0.56524 | 0 | 0 | 0 |
 | 32 | A1 | 4456501 | 1.76915 | 1.00000 | 0 | 0 | 4097 |
+| 32 | A8 | 4456501 | 1.76915 | 1.00000 | 0 | 0 | 4097 |
+| 32 | A64 | 5138648 | 2.03995 | 1.15307 | 0 | 7298 | 4097 |
 | 64 | Solo | 2519013 | 1.00000 | 0.56524 | 0 | 0 | 0 |
 | 64 | A1 | 4456501 | 1.76915 | 1.00000 | 0 | 0 | 4097 |
+| 64 | A8 | 4456501 | 1.76915 | 1.00000 | 0 | 0 | 4097 |
+| 64 | A64 | 5042904 | 2.00194 | 1.13158 | 0 | 6274 | 4097 |
 
 No confidence interval is inferred from a single deterministic run. Capacity removes residency pressure only when the entire footprint fits.
 A zero-walk A1 co-run can still be slower than Solo because payload traffic shares resources. This matrix alone does not separate memory contention from arbitration or head-of-line blocking.
