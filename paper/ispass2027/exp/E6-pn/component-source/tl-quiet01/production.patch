@@ -1,0 +1,219 @@
+commit 12712e5f1a887178d1222aa6d5bd807efbf027c9
+Author:     xvhaocheng <xvhaocheng@gmail.com>
+AuthorDate: Sun Oct 18 04:19:01 2026 +0900
+Commit:     xvhaocheng <xvhaocheng@gmail.com>
+CommitDate: Sun Oct 18 04:19:01 2026 +0900
+
+    Expose passive TL walker idle and restrict MSI by stable normal origin
+
+diff --git a/rtl/translation_logic/rv_iommu_msiptw.sv b/rtl/translation_logic/rv_iommu_msiptw.sv
+index e217547..da225b5 100644
+--- a/rtl/translation_logic/rv_iommu_msiptw.sv
++++ b/rtl/translation_logic/rv_iommu_msiptw.sv
+@@ -32,7 +32,8 @@ module rv_iommu_msiptw #(
+ 
+     /// AXI data types
+     parameter type axi_req_t = logic,
+-    parameter type axi_resp_t = logic
++    parameter type axi_resp_t = logic,
++    parameter bit PnEnable = 1'b0
+ ) (
+     input  logic    clk_i,
+     input  logic    rst_ni,
+@@ -67,7 +68,8 @@ module rv_iommu_msiptw #(
+ 
+     // Memory interface
+     input  axi_resp_t   mem_resp_i,
+-    output axi_req_t    mem_req_o
++    output axi_req_t    mem_req_o,
++    output logic       pn_idle_o
+ );
+ 
+     localparam int unsigned PLEN = RVIOMMUCfg.PAddrWidth;
+@@ -98,6 +100,7 @@ module rv_iommu_msiptw #(
+ 
+     // Trigger MRIF-MSI FSM
+     logic init_msi_mrif;
++    logic pn_mrif_idle;
+ 
+     // Registers to propagate first-stage data
+     logic [(rv_iommu::GPPNW39-1):0]   vpn_q,         vpn_n;
+@@ -359,6 +362,7 @@ module rv_iommu_msiptw #(
+     if (RVIOMMUCfg.MSITrans == rv_iommu_cfg::MSI_BT_MRIF) begin : gen_mrif_support
+ 
+         state_mrif_t mrif_state_q, mrif_state_n;
++        assign pn_mrif_idle = (mrif_state_q == MRIF_PTE);
+ 
+         // Read ports
+         rv_iommu::msi_pte_mrif_t msi_pte_mrif;
+@@ -493,6 +497,7 @@ module rv_iommu_msiptw #(
+ 
+     // MRIF support disabled
+     else begin : gen_mrif_support_disabled
++        assign pn_mrif_idle = 1'b1;
+ 
+         assign mrifc_update_o   = '0;
+         assign ignore_o         = 1'b0;
+@@ -502,4 +507,16 @@ module rv_iommu_msiptw #(
+     end
+     endgenerate
+ 
++    if (PnEnable) begin : gen_pn_idle
++        // Successful BT/ignored MRIF can be locally idle before RLAST returns.
++        // The separate DS transport guard must still cover that external debt.
++        assign pn_idle_o = (bt_state_q == IDLE) && pn_mrif_idle &&
++            !(init_msi_ptw_i || init_msi_mrif || iotlb_update_o.update ||
++              mrifc_update_o.update || error_o || ignore_o ||
++              mem_req_o.aw_valid || mem_req_o.ar_valid || mem_req_o.w_valid ||
++              mem_resp_i.b_valid || mem_resp_i.r_valid);
++    end else begin : gen_no_pn_idle
++        assign pn_idle_o = 1'b0;
++    end
++
+ endmodule
+diff --git a/rtl/translation_logic/rv_iommu_tl_wrap.sv b/rtl/translation_logic/rv_iommu_tl_wrap.sv
+index 0c386bc..6b84327 100644
+--- a/rtl/translation_logic/rv_iommu_tl_wrap.sv
++++ b/rtl/translation_logic/rv_iommu_tl_wrap.sv
+@@ -50,7 +50,8 @@ module rv_iommu_tl_wrap
+ 
+     /// AXI data types
+     parameter type axi_req_t = logic,
+-    parameter type axi_resp_t = logic
++    parameter type axi_resp_t = logic,
++    parameter bit PnEnable = 1'b0
+ ) (
+     input  logic    clk_i,
+     input  logic    rst_ni,
+@@ -134,7 +135,8 @@ module rv_iommu_tl_wrap
+     // Translation fault reporting port
+     output fault_data_t fault_data_o,
+     output logic        fault_valid_o,
+-    input  logic        fault_ready_i
++    input  logic        fault_ready_i,
++    output logic        pn_idle_o
+ );
+ 
+     localparam int unsigned PLEN = RVIOMMUCfg.PAddrWidth;
+@@ -163,6 +165,7 @@ module rv_iommu_tl_wrap
+     pscid_t n_iotlb_pscid;
+     logic cache_ddtc_hit, cache_iotlb_hit, cache_iotlb_en1, cache_iotlb_en2;
+     logic ptw_active, restricted_msi;
++    logic pn_ddtw_active, pn_pdt_idle, pn_msi_idle;
+     trans_req_data_t    arb_req_data;
+     logic               arb_req_valid;
+     logic               arb_req_ready;
+@@ -284,7 +287,10 @@ module rv_iommu_tl_wrap
+     assign nonblock_fire_o = n_accept;
+     assign nonblock_did_o = trans_req_data_i.did;
+     assign nonblock_busy_o = n_busy;
+-    assign restricted_msi = NonblockEnable && nonblock_enable_i && restricted_bank_i;
++    // The restricted bank applies only to the stable normal slow request.
++    // Debug/ATS origins retain the shared original MSI path even in mode N.
++    assign restricted_msi = NonblockEnable && nonblock_enable_i && restricted_bank_i &&
++        !req_data.is_debug && !is_pcie_ats_req && !is_pcie_page_req;
+     assign policy_quiet_o = state_q == IDLE && !req_valid && !arb_req_valid &&
+         !trans_req_valid_i && !ats_trans_req_valid_i && !debug_req_valid_i &&
+         !ats_ddtc_valid_i && !n_busy && !n_intercept && !n_accept &&
+@@ -539,7 +545,7 @@ module rv_iommu_tl_wrap
+ 
+         .init_ddtw_i        (ddtw_init),
+ 
+-        .active_o           ( ),
++        .active_o           (pn_ddtw_active),
+         .error_o            (ddtw_error),
+         .cause_code_o       (ddtw_cause),
+ 
+@@ -565,6 +571,7 @@ module rv_iommu_tl_wrap
+     generate
+     // PC supported
+     if (RVIOMMUCfg.InclPC) begin : gen_pdt_modules
++        logic pn_pdtw_active;
+ 
+         // PDTC
+         logic                    pdtc_lu;
+@@ -616,7 +623,7 @@ module rv_iommu_tl_wrap
+ 
+             .init_pdtw_i        (pdtw_init),
+ 
+-            .active_o           ( ),
++            .active_o           (pn_pdtw_active),
+             .error_o            (pdtw_error),
+             .cause_code_o       (pdtw_cause),
+ 
+@@ -641,8 +648,11 @@ module rv_iommu_tl_wrap
+             .imp_err_i          (imp_err),
+             .pdt_ppn_i          (pdtw_pdt_ppn)
+         );
++        assign pn_pdt_idle = !pn_pdtw_active && !pdtw_init && !pdtw_error &&
++            !pdtw_imp_init && !pdtc_update.update;
+     end
+     else begin : no_pdt_modules
++        assign pn_pdt_idle = 1'b1;
+         assign pdtc_lu_content = '0;
+         assign pdtc_lu_hit     = 1'b0;
+ 
+@@ -765,6 +775,9 @@ module rv_iommu_tl_wrap
+             assign msi_ptw_init = !restricted_msi && (state_q == MSI) && !iotlb_lu_hit && !mrifc_lu_hit;
+ 
+             rv_iommu::mrifc_up_t mrifc_update;
++            logic pn_msiptw_idle;
++            assign pn_msi_idle = pn_msiptw_idle && !msi_ptw_init &&
++                !msi_ptw_error && !msi_ptw_ignore && !mrifc_update.update;
+ 
+             assign iova_is_msi  =   (ddtc_dc.msiptp.mode != 4'b0000) & (is_store) &
+                                     ((req_data.iova[rv_iommu::VLEN39-1:12] &
+@@ -783,7 +796,8 @@ module rv_iommu_tl_wrap
+                 .addr_t             (addr_t),
+                 .paddr_t            (paddr_t),
+                 .axi_req_t          (axi_req_t),
+-                .axi_resp_t         (axi_resp_t)
++                .axi_resp_t         (axi_resp_t),
++                .PnEnable           (PnEnable)
+             ) i_rv_iommu_msiptw (
+                 .clk_i              (clk_i),
+                 .rst_ni             (rst_ni),
+@@ -809,7 +823,8 @@ module rv_iommu_tl_wrap
+                 .mrifc_update_o     (mrifc_update),
+ 
+                 .mem_resp_i         (msiptw_axi_resp_i),
+-                .mem_req_o          (msiptw_axi_req_o)
++                .mem_req_o          (msiptw_axi_req_o),
++                .pn_idle_o          (pn_msiptw_idle)
+             );
+ 
+             //----------------------------------------
+@@ -862,6 +877,7 @@ module rv_iommu_tl_wrap
+ 
+         // MSI Translation Disabled
+         else begin : gen_msi_support_tl_disabled
++            assign pn_msi_idle = 1'b1;
+ 
+             assign iova_is_msi      = 1'b0;
+ 
+@@ -879,6 +895,25 @@ module rv_iommu_tl_wrap
+         end
+     endgenerate
+ 
++    if (PnEnable) begin : gen_pn_idle
++        // Local walker lifecycle only. External DS debts are aggregated later.
++        // policy_quiet_o remains the original, separately available predicate.
++        assign pn_idle_o = policy_quiet_o && !pn_ddtw_active &&
++            !ddtw_init && !ddtw_error && !ddtw_imp_init && pn_pdt_idle &&
++            !ptw_init && !ptw_error && pn_msi_idle &&
++            !ptw_iotlb_update.update && !msi_iotlb_update.update &&
++            !(ddtw_axi_req_o.aw_valid || ddtw_axi_req_o.ar_valid || ddtw_axi_req_o.w_valid ||
++              pdtw_axi_req_o.aw_valid || pdtw_axi_req_o.ar_valid || pdtw_axi_req_o.w_valid ||
++              ptw_axi_req_o.aw_valid || ptw_axi_req_o.ar_valid || ptw_axi_req_o.w_valid ||
++              msiptw_axi_req_o.aw_valid || msiptw_axi_req_o.ar_valid || msiptw_axi_req_o.w_valid ||
++              ddtw_axi_resp_i.b_valid || ddtw_axi_resp_i.r_valid ||
++              pdtw_axi_resp_i.b_valid || pdtw_axi_resp_i.r_valid ||
++              ptw_axi_resp_i.b_valid || ptw_axi_resp_i.r_valid ||
++              msiptw_axi_resp_i.b_valid || msiptw_axi_resp_i.r_valid);
++    end else begin : gen_no_pn_idle
++        assign pn_idle_o = 1'b0;
++    end
++
+     //---------------------
+     // Translation Control
+     //---------------------
