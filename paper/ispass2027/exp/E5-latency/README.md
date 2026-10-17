@@ -89,8 +89,13 @@ nearest-rank和跨试次Type7口径分开；保留mean整数分子/分母，零f
 合法原max=0仍保留。分位边界/均值的跨试次统计都不能解释为合并请求分布。
 
 公开CLI不提供fixture放行选项。测试仅用显式内部fixture参数，生成的临时报告永久标记fixture_only且测试后删除。
-`test_analyze_hist.py` 六项检查涵盖raw重绑/缓存篡改、最近秩/末桶、空full/carry/精确样本mean、
-Type7/真实n、重复trial拒绝、完整任务内CSV和fixture默认发布拒绝；原始输出见`analysis-validation.log`。
+递归继承manifest/load/raw/cached/decoded CLI任意层级的明确fixture或合成来源标记；内部报告与全部行/组均标记fixture并有source_board_cases=0。
+E4使用与A3锁定的20个dict计划点(block/condition/mapping_page_bytes)，case及三字段必须逐条匹配计划前缀，
+页大小同时重绑原CLI input.mapping_page_bytes，不允许对调或重标条件。
+`test_analyze_hist.py` 当前九项检查涵盖raw重绑/缓存篡改、最近秩/末桶、空full/carry/精确样本mean、
+Type7/真实n、重复trial拒绝、完整任务内CSV、各层级递归fixture拒绝/传播和E4计划/三向映射绑定；
+主证据`analysis-validation03.log`含实际REJECTED原因，旧`analysis-validation.log`保留f36版本，
+`analysis-validation02.log`保留新增拒绝门已生效但旧单测诊断文字正则未同步的失败，未抹去历史。
 
 `rtl-validation/runs/run03/`：真实生产stage/path/observer，923拍全部旧字段等价、18集成场景、98年龄边界等。
 `driver-validation/runs/run02/`：48项真实函数host-MMIO fixture，`driver-validation/object01/`：RISC-V目标编译0warnings。

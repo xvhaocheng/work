@@ -19,11 +19,30 @@ HERE = Path(__file__).resolve().parent
 PERCENTILES = (50, 95, 99)
 
 
+def synthetic_markers(value, path='$'):
+    """Retain explicit non-board evidence tags at every JSON nesting level."""
+    found = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            pointer = f'{path}.{key}'
+            flag = key in {'fixture_only', 'is_fixture', 'simulation_only', 'synthetic_fixture', 'mock_fixture'} \
+                and (child is True or str(child).lower() in {'true', '1'})
+            label = isinstance(child, str) and (
+                (key in {'evidence_level', 'evidence_kind', 'source_kind'} and
+                 any(token in child.lower() for token in ('fixture', 'synthetic', 'mock'))) or
+                (key in {'schema', 'condition'} and any(token in child.lower() for token in ('fixture', 'mock'))))
+            boot = key == 'boot_id' and isinstance(child, str) and child.startswith('HOST-FIXTURE')
+            if flag or label or boot:
+                found.append({'path': pointer, 'value': child})
+            found.extend(synthetic_markers(child, pointer))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.extend(synthetic_markers(child, f'{path}[{index}]'))
+    return found
+
+
 def fixture_only(value):
-    if not isinstance(value, dict):
-        return False
-    return bool(value.get('fixture_only')) or 'fixture' in str(value.get('condition', '')).lower() or \
-        str(value.get('boot_id', '')).startswith('HOST-FIXTURE')
+    return bool(synthetic_markers(value))
 
 
 def numbers(text):
@@ -32,8 +51,9 @@ def numbers(text):
 
 def rebind_trial(raw, cached, expected_kernel, *, _internal_fixture=False):
     """Reparse actual command/CLI/final observations/512 bins, then compare caches."""
-    internal = fixture_only(raw) or fixture_only(cached)
-    hist.require(not internal or _internal_fixture, 'fixture input forbidden for publication')
+    markers = synthetic_markers(raw, 'raw') + synthetic_markers(cached, 'cached')
+    internal = bool(markers)
+    hist.require(not internal or _internal_fixture, 'fixture input forbidden for publication: ' + (markers[0]['path'] if markers else ''))
     hist.require(raw.get('exit_code') == 0, 'raw UART command failed')
     text = raw['stdout'].replace('\r', '')
     hist.require(re.findall(r'^KERNEL=(.*)$', text, re.M) == [expected_kernel], 'raw kernel identity')
@@ -57,6 +77,10 @@ def rebind_trial(raw, cached, expected_kernel, *, _internal_fixture=False):
             objects.append(value)
     hist.require(len(objects) == 1 and objects[0] == cached['record'], 'raw CLI JSON/cache mismatch')
     cli = objects[0]
+    decoded_markers = synthetic_markers(cli, 'decoded_cli')
+    markers.extend(decoded_markers)
+    internal = bool(markers)
+    hist.require(not internal or _internal_fixture, 'decoded CLI synthetic evidence forbidden for publication')
     hist.require(cli.get('success') is True and cli.get('errno') == 0 and cli['result']['status'] == 0,
                  'raw CLI success/status invalid')
     if 'mapping_page_bytes' in cached and 'mapping_page_bytes' in cli.get('input', {}):
@@ -82,7 +106,8 @@ def rebind_trial(raw, cached, expected_kernel, *, _internal_fixture=False):
             paths[key] = value
     hist.require(observers == cached['observer'] and paths == cached['path'], 'raw batch/PATH cache mismatch')
     item = copy.deepcopy(cached)
-    item.update(record=cli, observer=observers, path=paths, fixture_only=internal)
+    item.update(record=cli, observer=observers, path=paths, fixture_only=internal or _internal_fixture,
+                observed_synthetic_markers=markers, source_board_cases=0 if internal or _internal_fixture else 1)
     attachment = hist.attach_from_output(text, item)
     hist.require(attachment == cached['histogram'], 'raw 512-bin attachment/cache mismatch')
     item['histogram'] = attachment
@@ -111,7 +136,9 @@ def trial_intervals(item, attachment, context, *, _internal_fixture=False):
         p, stage = item['path'][key], attachment['stages'][key]
         hist.require(sum(stage['counts']) == p['full'], 'trial histogram/full conservation')
         row = dict(context, boot_id=item['boot_id'], sequence=item['sequence'], role=key[0], channel=key[1], stage=int(key[2]),
-                   fixture_only=fixture_only(item), request_population='whole_window_full_only',
+                   fixture_only=fixture_only(item) or _internal_fixture,
+                   source_board_cases=0 if fixture_only(item) or _internal_fixture else 1,
+                   request_population='whole_window_full_only',
                    n_valid=int(p['full'] > 0), full=p['full'], carry=p['carry'], opening=p['start'], closing=p['end'],
                    sum_cycles=p['sum'], max_cycles=p['max'],
                    mean_cycles=p['sum'] / p['full'] if p['full'] else None,
@@ -154,6 +181,8 @@ def describe_trials(rows, group_fields):
     for key, trials in groups.items():
         valid = [r for r in trials if r['n_valid']]
         entry = {'group': dict(zip([*group_fields, 'role', 'channel', 'stage'], key)),
+                 'fixture_only': any(r['fixture_only'] for r in trials),
+                 'source_board_cases': 0 if any(r['fixture_only'] for r in trials) else len(trials),
                  'n_trials': len(trials), 'n_full_trials': len(valid),
                  'total_full': sum(r['full'] for r in trials), 'total_carry': sum(r['carry'] for r in trials),
                  'total_opening': sum(r['opening'] for r in trials), 'total_closing': sum(r['closing'] for r in trials),
@@ -180,17 +209,59 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def bind_plan(items, plan):
+    """Publication binds retained records to the exact planned prefix.
+
+    E4 plan is frozen with A3: 20 dicts, block1..10 x leaf4k/leaf2m,
+    each carrying mapping_page_bytes. Generic tuple(block, condition) plans
+    remain supported; generic pure interval/statistic functions need no plan.
+    """
+    hist.require(isinstance(plan, list) and len(items) <= len(plan), 'planned prefix length')
+    e4 = any(item['record']['schema'] == 'idma.pages.run.v1' for item in items)
+    if e4:
+        hist.require(all(item['record']['schema'] == 'idma.pages.run.v1' for item in items), 'mixed E4/non-E4 input')
+        expected = {(block, condition) for block in range(1, 11) for condition in ('leaf4k', 'leaf2m')}
+        hist.require(len(plan) == 20 and all(isinstance(point, dict) and
+                     set(point) == {'block', 'condition', 'mapping_page_bytes'} and
+                     type(point['block']) is int and type(point['mapping_page_bytes']) is int for point in plan), 'E4 frozen plan shape')
+        hist.require({(point['block'], point['condition']) for point in plan} == expected, 'E4 frozen plan points')
+        for point in plan:
+            size = {'leaf4k': 4096, 'leaf2m': 2097152}[point['condition']]
+            hist.require(point['mapping_page_bytes'] == size, 'E4 planned condition/mapping mismatch')
+    for index, item in enumerate(items):
+        hist.require(type(item['case']) is int and item['case'] == index + 1, 'case is not the retained planned prefix')
+        point = plan[index]
+        if isinstance(point, dict):
+            hist.require(all(item.get(key) == value for key, value in point.items()), 'cached item does not match planned point')
+        else:
+            hist.require(isinstance(point, list) and len(point) == 2 and
+                         (item['block'], item['condition']) == tuple(point), 'cached block/condition is not planned prefix')
+        if e4:
+            actual = item['record']['input']['mapping_page_bytes']
+            hist.require(type(item['block']) is int and type(item['mapping_page_bytes']) is int and type(actual) is int and
+                         item['mapping_page_bytes'] == actual == point['mapping_page_bytes'],
+                         'E4 CLI input/cached/planned mapping mismatch')
+    return e4
+
+
 def run_packet(a, *, _internal_fixture=False):
     source_root, out = a.source_root.resolve(), a.output.resolve()
     hist.require(out.is_relative_to(HERE) and not out.exists(), 'output must be a new E5 task-local directory')
     inputs = {}
+    observed_markers = []
 
     def read(path):
         path = path.resolve()
         hist.require(path.is_relative_to(source_root), 'source evidence crosses the explicit source root')
         raw = path.read_bytes()
-        inputs[str(path.relative_to(source_root))] = sha(raw)
-        return json.loads(raw)
+        name = str(path.relative_to(source_root))
+        inputs[name] = sha(raw)
+        value = json.loads(raw)
+        markers = synthetic_markers(value, name)
+        observed_markers.extend(markers)
+        hist.require(not markers or _internal_fixture, 'synthetic source forbidden for publication: ' +
+                     (markers[0]['path'] if markers else name))
+        return value
 
     def evidence(name):
         path = Path(name)
@@ -201,6 +272,7 @@ def run_packet(a, *, _internal_fixture=False):
     hist.require(isinstance(items, list) and bool(items), 'nonempty accepted trial list required')
     hist.require(manifest.get('recorded_cases') == len(items) and len(items) <= len(manifest.get('planned_cases', [])),
                  'retained records/count/plan mismatch; freeze the running prefix first')
+    bind_plan(items, manifest['planned_cases'])
     complete = manifest.get('status') in {'passed', 'completed'} and manifest.get('recorded_cases') == len(items) \
         and len(manifest.get('planned_cases', [])) == len(items)
     hist.require(complete or (a.allow_partial and bool(manifest.get('derived_snapshot'))),
@@ -219,13 +291,18 @@ def run_packet(a, *, _internal_fixture=False):
         hist.require(ident not in unique and ident[0] == boot, 'duplicate trial or boot mismatch')
         unique.add(ident)
         item = rebind_trial(read(evidence(cached['raw_command_path'])), cached, kernel, _internal_fixture=_internal_fixture)
+        observed_markers.extend(item['observed_synthetic_markers'])
         context = {field: item[field] for field in a.group_by}
         context.update({field: item[field] for field in ('case', 'block', 'condition', 'mapping_page_bytes', 'raw_command_path') if field in item})
         context.update(bit_sha256=bit, kernel_release=kernel)
         rows.extend(trial_intervals(item, item['histogram'], context, _internal_fixture=_internal_fixture))
         for row in hist.bin_rows(item, item['histogram']):
-            bins.append(dict(context, **row))
-    summary = {'status': 'passed', 'fixture_only': _internal_fixture, 'complete': complete, 'n_trials': len(items),
+            bins.append(dict(context, **row, fixture_only=item['fixture_only'], source_board_cases=item['source_board_cases']))
+    output_fixture = _internal_fixture or bool(observed_markers)
+    hist.require(not output_fixture or _internal_fixture, 'synthetic source forbidden before publication')
+    board_cases = 0 if output_fixture else len(items)
+    summary = {'status': 'passed', 'fixture_only': output_fixture, 'source_board_cases': board_cases,
+               'observed_synthetic_markers': observed_markers, 'complete': complete, 'n_trials': len(items),
                'group_by': a.group_by, 'request_quantile': 'nearest-rank ceil(percent*full/100), original bucket interval only',
                'trial_endpoint_statistics': 'Type7, equal trial weight, no pooled requests',
                'aggressor_population': 'whole/full window subset only; carry/opening/closing reported separately',
@@ -239,10 +316,11 @@ def run_packet(a, *, _internal_fixture=False):
     (out / 'analysis-manifest.json').write_text(json.dumps({'schema': 'ispass2027-e5-hist-analysis-v1', 'status': 'passed',
         'source_root': str(source_root), 'inputs': inputs, 'source_manifest': str(a.manifest.resolve()),
         'source_records': str(a.records.resolve()), 'script_sha256': sha(Path(__file__).read_bytes()),
-        'validator_sha256': sha((HERE / 'hist_records.py').read_bytes()), 'fixture_only': _internal_fixture,
+        'validator_sha256': sha((HERE / 'hist_records.py').read_bytes()), 'fixture_only': output_fixture,
+        'source_board_cases': board_cases, 'observed_synthetic_markers': observed_markers,
         'complete': complete, 'n_trials': len(items)}, indent=2) + '\n')
     print(json.dumps({'status': 'passed', 'n_trials': len(items), 'complete': complete,
-                      'fixture_only': _internal_fixture, 'output': str(out)}))
+                      'fixture_only': output_fixture, 'source_board_cases': board_cases, 'output': str(out)}))
 
 
 def main():
