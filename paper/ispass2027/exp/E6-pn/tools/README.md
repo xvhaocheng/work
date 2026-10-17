@@ -69,7 +69,7 @@ actions. Readbacks are stored separately and have this exact saved command:
 printf "KERNEL="; uname -r; printf "BOOT="; cat /proc/sys/kernel/random/boot_id; pre_seq=$(dmesg | sed -n 's/.*idma_batch_obs seq=\([0-9]*\).*/\1/p' | tail -n 1); printf "PRE_SEQ=%s\n" "${pre_seq:-0}"; pn-control read
 ```
 
-`pn-control` is a future independent helper, not implemented here. Its retained
+`pn-control` is the independent configuration-readonly helper described below. Its retained
 raw object has `command`, `exit_code=0`, `stdout`. Stdout has one KERNEL, BOOT and
 PRE_SEQ line, and exactly one JSON object starting with
 `"schema":"idma.pn_control.v1"`, containing `success=true`, `errno=0`,
@@ -139,3 +139,80 @@ campaigns are deleted afterward. Prior45/51-check receipts and one intermediate
 failed test expectation are retained with their own source identity/limits;
 they do not qualify the final code. The failure was a test expecting decoded-raw
 refusal while the same marker was correctly rejected earlier in cached records.
+
+## Independent PN read helper
+
+`pn_control.c` provides exactly two operations: `pn-control capabilities` and
+`pn-control read`. Both take a complete8-word snapshot at fixed DMA0 physical
+base `0x50000000`; they differ only in the JSON `operation` field. There is no
+MODE/GAP/configuration write operation, address override, alternate capability
+profile or fallback path. Invalid/extra arguments fail before opening the device.
+This batch compiles the helper and tests fake MMIO; it does not install or run it
+on the board, modify the original CLI/kernel/rootfs or collect any board point.
+
+Production uses `/dev/mem` with `O_RDWR|O_SYNC|O_CLOEXEC` and one page mapped by
+`mmap64(MAP_SHARED)`. All register accesses are aligned volatile64-bit accesses
+with `fence iorw,iorw` before and after. The IO interface has only `load64` and
+`select_index`; the latter can write only INDEX at `+0x70`, with indices192..199.
+Each successful INDEX store is followed by a64-bit INDEX readback equality check
+before DATA at `+0x78` is read. A complete scan leaves INDEX199 selected. These
+selector writes are configuration-readonly as defined above; no DATA/MODE/GAP
+store exists. Saved raw words are decimal uint64 values, not split32-bit reads.
+
+The accepted constants are PN_CAP `0x49444d41504e0001` at word192 and GAP_CAP
+`0x49444d4147415001` at `+0xb8`. Word193 must be mode0..3. The direct gap read at
+`+0xb0` must have high32 bits zero; low32 bits are `v_gap_cycles`. Words194/199,
+including arbitrary high bits, are saved unchanged and have no interpreted
+status/validity/overflow fields in this batch. Words195..198 also remain raw;
+this read-only batch does not qualify Aown/union duration or N-accept metrics.
+
+Root must own the board execution lock and serialize the helper after the old
+CLI has exited and its actual STOP/drain has finished. Never interleave a PN
+INDEX/DATA scan with original CLI/kernel PATH reads. OBS_CONTROL at `+0x60` is
+read before and after the scan; lowbits0/1 (ARMED/busy) reject the read. This is
+supplementary conflict detection, not an atomic kernel mutex, global quiet proof
+or protection against a concurrent writer. Neither the8 bank words nor their
+relation to direct gap/status reads is an atomic snapshot. Root serialization is
+the execution contract; this helper does not acquire or impersonate it.
+
+Every normal failure emits `success=false`, a positive Linux `errno` and a fixed
+`stage`, then exits nonzero. It preserves all values acquired before failure and
+uses JSON null for unread values. Capability mismatch is `ENODEV`; invalid mode
+or highgap is `EPROTO`; INDEX readback mismatch or synchronous MMIO SIGBUS/SIGSEGV
+is `EIO`; armed/busy is `EBUSY`. Open/map/signal setup/cleanup errors retain their
+actual errno. The first error survives later cleanup errors. The synchronous
+fault handler only jumps out of the guarded volatile access; JSON is emitted
+after normal cleanup. External fatal signals and stdout failure cannot guarantee
+a complete saved JSON; a nonzero/absent result must not qualify a readback.
+
+The native fake harness includes the actual `pn_snapshot`, argument parser and
+JSON emitter. It cannot open `/dev/mem`; every output is explicitly fixture-only,
+synthetic and source_board_cases0. There is no production command-line fixture
+switch. The public S15 gate rejects the actual emitted fake JSON; a private
+fixture protocol check verifies the same fields without removing its tags.
+
+```text
+python3 check_pn_control.py --software-manifest ORIGINAL_SOFTWARE_BUILD_JSON \
+  --output NEW_TOOLS_ARTIFACTS_DIRECTORY
+```
+
+The compiler name and `-O2 -static -Wall -Wextra` profile come from the unchanged
+original software manifest (SHA `d9f3df411c28628293d60e9a8689535b2119955cd3975bbfe29b8cdc576c7951`).
+Its CLI-only UAPI `-I` is unnecessary for this standalone libc helper and is
+omitted. The installed compiler is RV64 GCC11.4.0, default `rv64imafdc/lp64d`;
+no compiler/tool installation or upgrade is performed. Actual argv, compiler
+bytes/version/defaults, source hashes, ELF SHA and readelf/objdump output are
+retained in the [137-check receipt](pn-control-host01/validation.json).
+The compiled production ELF stays local and ignored at
+`tools/artifacts/pn-control-host01/pn-control`; it is not committed.
+
+The58 labeled C scenarios cover four modes; gap0/1000/4000/u32max; raw194/199;
+capability/mode/highgap refusal; both OBS guards; all8 INDEX readback mismatches;
+errors at all28 read/store positions with immediate stop and retained/null data;
+unknown/write/extra arguments and first-error retention. Native O2 and non-PIE
+ASan+UBSan runs agree. The actual RV64 static ELF has64-bit `ld` at the MMIO read
+and `sd` at INDEX offset112, both bracketed by instruction `0ff0000f` (full I/O
+fence). Stack/RAM stores in those functions are not MMIO writes. Production
+open/mmap/signal-handler execution is source-reviewed and cross-compiled only;
+neither an emulator nor hardware was used. This evidence does not establish
+board success or permit any fixture to enter S15/DS50/paper results.
