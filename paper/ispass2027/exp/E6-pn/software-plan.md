@@ -1,5 +1,12 @@
 # E6-PN 软件与collector准备方案
 
+> This original proposal is retained for source evidence. Current runtime words,
+> legal0/1/2/3/6, flag meanings and trial counts are frozen in
+> [runtime-contract-v1.md](runtime-contract-v1.md). Accepted implementations and
+> their limits are indexed by [README](README.md); the separate future writer
+> uses [writer-contract-v1.md](writer-contract-v1.md), keeping pn-control readonly.
+> “待实现” in the original body describes that proposal's original stage.
+
 ## Material Passport
 
 ARS `experiment-agent / plan`；2026-10-18 JST；**供Root审源码/接口，不是实施或执行回执**。
