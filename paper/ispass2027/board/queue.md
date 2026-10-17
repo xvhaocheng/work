@@ -24,7 +24,7 @@ E2 timer probe 已完成唯一 N2_A1 诊断对照，原 CLI/数据/排空/taint0
 
 E6-PN：五种合法配置S/N/P隔离/PN/P共享历史的合同已冻结（raw MODE0/1/2/3/6）。Root直接源码与实际原件核验已接受P/N/history、原前端gap、S15离线门、被动时长、原事实tap、新独立MODE控制、真实双backend及DS transport保护小批。真实N backend在WREADY0/AW可走时接收完整4096B；Root原raw重放109726项，另源绑定85项通过。只读helper已适配P共享历史且实际244项/71情境通过，无MODE/GAP写操作。真实MSIPTW首拍后24拍指定尾响应空窗始终nonquiet；Root实际重放168906项通过，默认关闭不实例17FF tracker。各结果仅有限组件证据，尚无完整PN构建/板点。
 
-历史开关只有现有local-touch输入门，无新增IOTLB状态；目前未见显著增险证据，纳入首DS0构建计划，物理风险仍待原设置构建。DS0主150+S15 15+独立gap30+DS50原四模式40，共235；如首构前发现显著时序风险，退回205且说明。原时序硬门/最多一次历史route后物理优化/S15每格≤0.5%不变，DS50只在实际S15过后构建。当前三席并行：A1准备TC/banked/vendor只读quiet，A2实施SW/program只读quiet，A3实施旧observer内MODE/capture接线；三席不触硬件，均须Root实际审查后整栈集成。
+历史开关只有现有local-touch输入门，无新增IOTLB状态；目前未见显著增险证据，纳入首DS0构建计划，物理风险仍待原设置构建。DS0主150+S15 15+独立gap30+DS50原四模式40，共235；如首构前发现显著时序风险，退回205且说明。原时序硬门/最多一次历史route后物理优化/S15每格≤0.5%不变，DS50只在实际S15过后构建。当前三席并行：A1实施TC/banked/vendor只读quiet，A2实施SW/program加现有DDTP pending共10文件只读quiet，A3透传corewrap前端STOP/quiet与gap参数（旧observer embedding a324已有限接受）；三席不触硬件，均须Root实际审查后整栈集成。
 
 E2两轮各接受5/90后在N4_A8失败，性能采集暂停，独立诊断；不会原样重试、换版本混池或放宽taint门。
 

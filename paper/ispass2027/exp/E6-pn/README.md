@@ -29,9 +29,9 @@
 
 - P/N/history：[P原件](root-validation/p-only01.json)、[N原件](root-validation/n-core01.json)、[历史开关27938项与首构风险决定](root-validation/history01.json)；历史开关未增加IOTLB状态，物理时序尚未测。
 - 原前端gap：[事件及兼容性](root-validation/gap-accepted01.json)。S15离线门：[Root实际51项](root-validation/s15-accepted01.json)；真实S15仍0点。
-- 被动模块与原事实：[capture](root-validation/observer01.json)、[tap](root-validation/taps-accepted01.json)、[独立MODE控制](root-validation/control-accepted01.json)；新bank与旧observer整合实施中。
+- 被动模块与原事实：[capture](root-validation/observer01.json)、[tap](root-validation/taps-accepted01.json)、[独立MODE控制](root-validation/control-accepted01.json)；[新bank与旧observer整合a324](root-validation/embedding-accepted01.json)已有限接受，Root126项实际源/raw绑定通过；外部STOP/N/quiet仍为测试接口。
 - 只读工具：[P共享历史适配244项/71情境](root-validation/pn-control-shared-accepted01.json)，原S15/source-map不变，无MODE/GAP写操作或板执行。
 - 双backend：[接受回执](root-validation/backend-accepted01.json)、[Root109726项真实原raw复核](root-validation/backend-raw01.json)。N实际4096B容量、自然退休与证书撤销通过；不是整栈或物理RAM/时序证明。
 - DS：[只读保护与真实MSIPTW尾拍](ds-validation/README.md)、[Root168906项复核](root-validation/ds-accepted01.json)。只新增17FF transport guard，不加论文诊断观测。
 
-Root已接受[旧observer内bank/capture接线方案](observer/integration-plan/bank-embedding-v1.md)及SW/program独立quiet提案；A1准备TC/vendor库存出口，A2实施SW，A3实施observer embedding。后续仍需全栈接线/真实有限gold、受限writer和采集脚本、源锁与DS0构建；这些小批回执不代表整栈或时序已过。E3-lite有限接受，综合排在PN首构之后。原pathv3/原DS0已于18:39:20Z启动核验成功，板空闲，等候合格PN BIT。
+Root已接受[旧observer内bank/capture接线方案](observer/integration-plan/bank-embedding-v1.md)及SW/program独立quiet提案；A1实施TC/vendor库存出口，A2实施SW/program并补既有DDTP pending只读出口（[最小补口决定](quiet-decision02.md)），A3透传corewrap前端事实和gap参数。后续仍需全栈接线/真实有限gold、受限writer和采集脚本、源锁与DS0构建；这些小批回执不代表整栈或时序已过。E3-lite有限接受，综合排在PN首构之后。原pathv3/原DS0已于18:39:20Z启动核验成功，板空闲，等候合格PN BIT。
