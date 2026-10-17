@@ -39,16 +39,18 @@ starting cell by block. **Root already owns the independent DS0 V1 50-point
 run; do not rerun it through this entry.** All135 samples are disjoint by
 DS/V/A/block; boot remains an explicit sample identity.
 
-After Root's source review, the DS0 remaining60 entry is:
+The actual DS0 remaining60 command is recorded below (already running; do not dispatch it again):
 
 ```sh
+E8_TASK=/home/xvhaocheng/work-e8-e2-e9/paper/ispass2027
 E8_ROOT=/home/xvhaocheng/work-root-a/paper/ispass2027
-python3 "$E8_ROOT/exp/E8-footprint/collect_e8.py" --ds 0 --group victim \
+python3 "$E8_TASK/exp/E8-footprint/collect_e8.py" --ds 0 --group victim \
   --load-manifest "$E8_ROOT/board/runs/pn-original-pathv3-load01/load.json" \
   --source-record "$E8_ROOT/board/packages/baseline100-20261017/source.json" \
   --software-manifest "$E8_ROOT/board/manifests/software-build.json" \
-  --stop-file /tmp/e8-stop \
-  --output "$E8_ROOT/exp/E8-footprint/runs/ds0-victim01"
+  --parser-source "$E8_ROOT/board/collect.py" \
+  --stop-file "$E8_TASK/exp/E8-footprint/E6_PRIORITY" \
+  --output "$E8_TASK/board/runs/e8-ds0-victim01"
 ```
 
 For DS10025, Root loads that BIT first, passes its actual new load receipt,
