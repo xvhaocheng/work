@@ -1,3 +1,11 @@
+# 当前续接（2026-10-17 15:03Z / 10-18 00:03 JST）
+
+板卡仍原DS0/acece boot2f31b9f4、taint16384，已排空，无活动板任务。旧E2 failed5+未接受第6点已冻结，禁止恢复旧轮或混入新90。Root实际复跑multi合作候选65b427全部回归通过（旧38/57/97、416新、6政策、原MMIO和nonmulti yield一致），CLI167通过，E4profile20通过，receipt均在各任务root-validation。A2已获准一次共用Image构建，Linux65b427/platform ec996/CVA6reference1d587/OpenSBI e8d/release6.5.0-rc2-ispass2027-full-e3-v1；out=A2/E3/artifacts/full-e3-software01，等status passed+transport后更新SD。必须用当前acece匹配SPI模块更新，不能先加载新内核模块。新软件供E2原BIT→E4/E5 d934 BIT→full-E3 BIT，仅切BIT。
+
+A3新分支准备E2/E4精确known-profile，新tuple已给但passed package还未生成；原da6包保留。A1原席完成后无法原位续接，新/root/a1_g_build沿原work-a1-e6-*接手；Root已接受0f0403 G observer/wrapper实际全diff/关键测试原件，下一小批上层参数/独立build入口交审后再构建。M不启动。A2 full-E3 FPGA1d587/dfeb唯一构建仍running，50MHz/所有违例和routing0独立验收，不改约束。Root已merge85367、cherry5dc90fb/fa945ec，未merge main。
+
+下方是历史续接，以上为准。
+
 # 当前续接（2026-10-17 14:55Z）
 
 E2首轮已failed，无板任务在跑！接受5点，6号N4_A8因softlockup/taint16384拒绝；原raw与manifest完整保留。Board仍原DS0+acece，所有lane已排空、数据校验通过但tainted，不能继续正式采。Root只读诊断完成，IOMMU IRQ0，timer/softirq source正在核。E2/checkpoints/e2-prefix-failed01-{snapshot,paper}已离线冻结5接受+1未接受尾，不能拿失败硬件时间充正式样本。

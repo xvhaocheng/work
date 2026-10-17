@@ -1,11 +1,11 @@
-# Root A 板测与代码线：2026-10-17 JST
+# Root A 板测与代码线：2026-10-18 JST
 
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Verification Status: PARTIAL（E1b、E3 P0、E6角色已完成；E2/E4/E5/完整E3/G按队列继续）
-- Updated: 2026-10-17 14:55 UTC
+- Updated: 2026-10-17 15:03 UTC / 2026-10-18 00:03 JST
 
-E2已因第6点N4_A8触发内核softlockup停止；当前无活动板任务。原90点轮仅5个taint0试次接受，已冻结为独立partial论文包；失败尾taint16384原样保留。板上原DS0+acece内核处于tainted且已排空状态，只做只读诊断。A2先准备multi合作调度修复，正式新软件验证后再开展新轮，旧失败和5点不替换混池。子agent不接触JTAG/UART/SD。
+E2已因第6点N4_A8触发内核softlockup停止；当前无活动板任务。原90点轮仅5个taint0试次接受，已冻结为独立partial论文包；失败尾taint16384原样保留。板上原DS0+acece内核处于tainted且已排空状态，只做只读诊断。multi合作调度候选65b427已通过Root源码审核和实际回归，共用Image已通过编译；新软件验证后再开展新轮，旧失败和5点不替换混池。子agent不接触JTAG/UART/SD。
 
 ## 已完成的论文数据
 
@@ -33,10 +33,10 @@ DS口径始终是IOMMU数据结构访存的附加延迟，DS0为主结果，DS25
 
 | 任务 | 实际状态 | 下一步 |
 | --- | --- | --- |
-| E2 设备数 | 原轮failed：5接受/90，第6点N4_A8 softlockup拒绝；已冻结5点partial和失败尾。Root已实跑prefix44及配对34检查通过。 | 先审multi调度修复、新软件构建与taint0新boot；原轮不恢复/替换，后续独立90点。 |
-| E4 页大小+E5分布 | 共同软件首次完整构建passed，Linux da6b69f/platform a68603f；release e4-e5-v1，payload29,363,656B。E5 BIT于14:06:29Z passed。 | E2后更新一次软件、加载E5 BIT，共采20点；E5附加采集，不另跑50点。 |
-| 完整E3 | CVA6 1d587/platform dfebcc，Depth64的唯一DS0构建14:10:50Z开始，仍running；ABI5 helper682a2ca已审，adapter46df97c正交验证。 | 最终源码审查、CLI/collector和完整软件构建；自身时序/资源验收后再排≤6小时子集。 |
-| E6 P4M G | 从E5 6c5基座独立准备；frontend2c7c68f已审，39情境/207332周期，与真实旧P0默认关闭/启用gap0逐拍比较。 | 接被动whole/window观测与小接口，逐批审查后编译；G固定V/A各4096×4KiB自然完成。 |
+| E2 设备数 | 原轮failed：5接受/90，第6点N4_A8 softlockup拒绝；已冻结5点partial和失败尾。Root已实跑prefix44及配对34检查通过。 | 调度候选已审；共用软件构建passed；更新SD后验证taint0新boot；原轮不恢复/替换，后续独立90点。 |
+| E4 页大小+E5分布 | 共同软件首次完整构建passed，Linux da6b69f/platform a68603f；release e4-e5-v1，payload29,363,656B。E5 BIT于14:06:29Z passed。 | 计划与E2共用新内核，仅切E5 BIT，共采20点；E5附加采集，不另跑50点。 |
+| 完整E3 | CVA6 1d587/platform dfebcc，Depth64的唯一DS0构建14:10:50Z开始，仍running；ABI5 helper682a2ca/adapter46df97c已审，含multi候选的新65b427共用软件15:01:52Z开始编译。 | CLI 167项Root实跑通过；collector准备与完整软件构建；自身时序/资源验收后再排≤6小时子集。 |
+| E6 P4M G | 从E5 6c5基座独立准备；frontend2c7c68f已审，39情境/207332周期，与真实旧P0默认关闭/启用gap0逐拍比较。 | observer0f0403已审（19场景、17逐拍对照、18 hist、真实wrapper69检查）；准备最小上层启用/build入口；G固定V/A各4096×4KiB自然完成。 |
 | E6 P/N/PN M | 完成历史来源/容量/接口设计与负结果追溯，未启动移植。 | 维持最后优先级，不恢复机制探索。 |
 
 E4/E5冻结包在`board/packages/e4-e5-20261017/`：小型元数据原字节复制，BIT/Image/payload/SPI模块仅本机硬链接，不进Git。E5最终BIT SHA d934846ecb7f2fd80bcb7d2f18889ae0fd8c9bbd28a0f5fef8e949614139221c，50MHz，WNS+0.126/WHS+0.047/WPWS+0.062ns，失败端点与routing errors均0，290520/290520 routable nets全完成。Slice50581/50950（99.28%）；LUT166334、regs142751、BRAM50、DSP27。完整E3和G必须各自验收，不能沿用E5通过结论。
@@ -52,3 +52,9 @@ Root worktree `/home/xvhaocheng/work-root-a`，分支`ispass/root-a`。不在主
 P0结束前的纯主机续接session27823以143终止，原因未建立，未启动E2硬件；独立P0 collector仍45/45成功。Root确认原result=0后才手动dispatch唯一E2加载，未重复任何试次，记录见`board/runs/e3-to-e2-continuation01.json`。下一步E2 collector由Root在boot验证后启动，不再依赖该已结束等待。
 
 E2失败与候选修复详情见[诊断记录](../exp/E2-device-scaling/softlockup-diagnosis.md)，已接受5点的[partial长表](../exp/E2-device-scaling/checkpoints/e2-prefix-failed01-paper/README.md)保留。新软件若及时验收，计划一套共同内核供E2/E4/full-E3，仅依次切BIT；A3正在准备精确known-profile兼容，旧da6包不改，未知新tuple拒绝。
+
+## 最新验收与共同软件（00:03 JST）
+
+Linux65b427相对46df只改multi轮询合作点：N2/N3/N4每未完成轮请求cond_resched，先检查V完成；旧pair/P0/pages/workload仍为原1024门。Root直接审生产diff/调用链，实跑旧38/57/97、ABI5 416与新增6政策情境全部通过；旧MMIO摘要9128914394721286305:498206、nonmulti调度摘要3976756370770541329:357一致。此候选不证明或保证消除softlockup，保留watchdog/taint/超时门，必须新boot/新run实测。
+
+新共用软件tuple固定Linux65b427946152e3aca27babab0a437821729805d4、platform ec99648e3c9a1e48c1e9721e3662bb632eb439bd、OpenSBI e8d21bfdc2dd753314627968e496c3a1188f6dfb、release6.5.0-rc2-ispass2027-full-e3-v1；CVA6 1d587仅软件构建reference，不能冒充E2/E4实际BIT来源。构建已于15:03:30Z passed（所有命令exit0），payload29,363,656B，headroom4,190,776B；尚未写SD。Root已启动唯一当前acece匹配SPI模块上传，随后上传新payload。A3已交并由Root实跑20项known-profile/package检查通过，正在准备新tuple的E2/E4有限兼容；未知tuple继续在UART前拒绝。旧da6 ready包原样保留。

@@ -14,7 +14,7 @@
 
 DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”的两档100次已全部完成；Root只读复核并冻结最终200试次包（含历史100）。用户授权协调后已统一排程。Root本地12:56:37Z重复启动被UART锁在触硬件前拒绝，失败原样保留，不计试次。
 
-E1b新增100点、E3 P0 45点、E6角色30点均完成通过。E2首轮于14:48:46Z停止：原DS0/acece内核，第6点N4_A8触发softlockup与taint16384，5个合格试次已冻结为partial论文包，失败尾不接受、不替换。当前无活动板任务，已排空tainted boot只做只读诊断。A2准备必要multi合作调度修复，Root审后编新共同软件，再按E2→E4/E5→完整E3串行；未知新软件profile不提前放行。
+E1b新增100点、E3 P0 45点、E6角色30点均完成通过。E2首轮于14:48:46Z停止：原DS0/acece内核，第6点N4_A8触发softlockup与taint16384，5个合格试次已冻结为partial论文包，失败尾不接受、不替换。当前无活动板任务，已排空tainted boot只做只读诊断。Root已接受multi合作调度候选65b427，A2正在编新共同软件，再按E2→E4/E5→完整E3串行；未知新软件profile不提前放行。
 
 
 | 原优先级 | 任务 | 状态 | 采集规模 | 预计板时 / 条件 |
@@ -22,7 +22,7 @@ E1b新增100点、E3 P0 45点、E6角色30点均完成通过。E2首轮于14:48:
 | 1 | E3 DS0 小子集 | 完成45/45，最终包每cell n=5 | 3 个 V 大小 × Solo/A1/A8 × 5 = 45 次 | 已完成；小传输A8/A1增幅约14%，4KiB约10.4% |
 | 2 | E1b DS25 | 完成50/50，五条件各10，全部接受；阶段CSV已冻结 | Solo/A1/A8/A16/A64 各 10 次 = 50 次 | 约 20–30 分钟，须 50MHz、WNS≥0、违例端点和 routing errors 全零 |
 | 3 | E1b DS100 | 完成50/50，五条件各10，全部接受；最终四档200试次包已冻结 | 同上 50 次 | 已完成；两档仅换 BIT，复用已写 pathv3 |
-| 4 | E2 DS0 设备数 | 多设备驱动/CLI/90点collector已审核，共用软件delivery已通过 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
+| 4 | E2 DS0 设备数 | 旧轮failed5/90；修正已审，新共用软件编译中 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
 | 5 | E3 DS0 论文子集 | BTC3/Depth64已审，14:10:50Z启动独立DS0构建；ABI5驱动分批审查 | 六种大小及三类流量组合；新协议等16MiB有效字节 | 用户上限6小时；候选150新点按实际用时定稿，不与P045混池 |
 | 6 | E4 DS0 页大小 | E4/E5共同软件首次完整构建通过；20点collector已审并通过Root38+14+11主机检查 | 4KiB 对2MiB，各点10次，未测 | 不混当前稳定软件；与已审E5 Linux后续共同编译 |
 | 7 | E6 DS0 角色互换 | 完成30/30，Solo/A1/A8各10；原DS0 BIT及旧pathv3 | V=DMA1、A=DMA0；Solo/A1/A8各10次 | 已完成；同boot/区组A8/A1中位数1.10434084，旧payload不再加测 |
@@ -66,3 +66,5 @@ full-E3 DS0唯一构建已于14:10:50Z启动，`exp/E3-workloads/artifacts/full-
 14:40Z更新：P0 45/45全部通过，最终包含首9点，不叠计。纯host续接27823以143结束、未启动E2，原因未建立；Root确认P0成功后已于14:38:06Z手动dispatch唯一E2加载。先前“自动续接E2”的描述已失效，后续由Root在启动验证后执行collector。软件formal delivery原字节已复制到Root E3/p0-common-software-delivery-manifest.json，E2将用此副本，便于source_root限定Root工作树。
 
 14:55Z实际失败更新：E2旧90点轮failed/accepted5，见E2/checkpoints/e2-prefix-failed01-paper及softlockup-diagnosis.md。原第6点硬件V262.105ms而软件收尾23.014s，不作为性能样本。Root已要求不关watchdog、不改HZ/PREEMPT、不放宽taint；仅评审multi未完成轮合作调度候选，失败原因仍待验证。新软件若验证通过将是新source/boot/run，不与本前5点合并。
+
+00:03 JST更新：multi合作候选65b427已通过Root实际回归和源码审核；ec996平台/同release-full-e3-v1共同Image正在唯一构建。旧5点partial与失败尾不并入新90点。G observer0f0403经Root直接审查接受，A1后继只准备上层启用和build入口，尚未编G BIT；E4 known-profile首批Root20检查通过。板卡仍tainted/排空、无正式采集。
