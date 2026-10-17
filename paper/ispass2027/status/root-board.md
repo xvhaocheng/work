@@ -3,11 +3,11 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Verification Status: PARTIAL（E1b、E3 P0、E6角色及E4/E5已完成；E2/完整E3/G按队列继续）
-- Updated: 2026-10-17T16:37:46.613829+00:00 / 2026-10-18 JST
+- Updated: 2026-10-17T16:45:49.663115+00:00 / 2026-10-18 JST
 
 E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PTE/PA/data/unmap/taint0/最终OBS4+PATH+16×32桶全部通过。V硬件时间中位数4KiB 139.19783ms、2MiB106.88277ms；逐block时间下降中位23.2191%、吞吐提升中位30.2406%，V软件HPM bracket的miss/S1 PTW中位8192→0。E4统一CSV3824行，E5同20点/320stage/10240桶，E5不另计新试次。完整论文包E4-pagesize/paper/e4-common-v2-final01、E5-latency/paper/e4-common-v2-final01；Root另以原record硬件cycles/Fraction独立复算10对通过。
 
-当前唯一板动作 g-common-load01-launch：16:35:52Z开始加载独立合格G BIT 8dd6993f，期待G公共Linux69d/platform6491/release g-v1新boot/taint0。G软件SD更新已16:33:53Z return0；G BIT最终16:34:36Z passed，50MHz、WNS+0.177/WHS+0.036/WPWS+0.062ns，setup/hold/pulse失败端点及routing errors全0，295368/295368 nets全路由，routed boundary通过。g-collect01-launch仅等待load result0后采一次固定40点，无重试/回填/重载；不要重复UART/JTAG/SD动作。完整E3唯一resume仍未qualified，故G先就绪先测完，之后与完整E3共用同一G内核只切BIT。G collector Root100+17、分析41+两campaign ID检查均通过；正式G仍0点，待新boot验证。E2专用默认off探针Image已passed、Root实核原driver/rootfs及config等价，最多两点诊断包待审，尚未跑新E2。
+当前唯一板任务 g-ds0-20261018-01 正式G40采集：2026-10-17T16:45:49.663115+00:00观测已接受9/40，status=running，无补采/重试。G BIT8dd6993f已成功加载，新boot 79a6975d-877d-4a9d-8e19-08834275be7a、Linux69d/g-v1、taint0验证通过。独立G最终资格为50MHz、WNS+0.177/WHS+0.036/WPWS+0.062ns，setup/hold/pulse失败端点/routing errors全0，295368/295368 nets全路由。完整E3唯一resume仍未qualified，因此G先就绪先测完，之后共用同G内核只切BIT。G collector Root100+17、分析41+两campaign ID检查均通过；完整40之前不宣称每条件n10或正式性能汇总。E2默认off probe Image已通过，Root审两点命令包并独立实跑23host检查通过，运行包/压缩payload/SPI均已准备，仅离线、尚未上板。
 
 E2两个版本均在第6点N4_A8失败，各5点分别冻结，不混池；timer重试/再入现象有证据，CPU AXI根因未定。65b候选不能称修复成功。
 
