@@ -10,7 +10,7 @@ Root已明确优先保留原pathv3 kernel45bf与原f911 CLI；不预设必须换
 ## 1. S15先保持原软件、原命令与reset S
 
 新DS0 BIT reset应为S、V/A gap0。S15不写MODE、不额外清缓存，不预跑测量点：
-Solo/A1/A8各5次硬件时间，仍为V0、A1、V/A源目的各k个4KiB页、COPY4096×4096、软件warmup256后autonomous batch。
+Solo/A1/A8各5次硬件时间，仍为V0、A1、V源/目的各1页、A源/目的各k页，均4KiB页、COPY4096×4096、软件warmup256后autonomous batch。
 原`idma_experiment --batch ...`及kernel payload保持相同。原S路径与旧mode0研究路径不能等同；
 硬件原路径等价由A1另审，最终时序和S15只验限定的实际行为。
 Root已选D1方向：S/P保留原controller与原backend BufferDepth3；N/PN用隔离的历史banked＋full4KiB backend/cert支路，
