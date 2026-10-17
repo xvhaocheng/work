@@ -15,20 +15,21 @@ import export_prefix
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--software-profile',choices=tuple(prefix.full.profiles.PROFILES),default='p0-multi-v1')
     a=parser.parse_args();a.output=a.output.resolve();a.output.mkdir(parents=True,exist_ok=False)
     build=a.output/'build';build.mkdir();p=prefix.full.protocol('E2');checks=[]
     full_source=Path(prefix.full.__file__).read_bytes()
     source_fixture=prefix.HERE/'multi-collector-fixtures.json';fixture=json.loads(source_fixture.read_text())
     sample=fixture['closing_spill_two_devices'];sequence=int(re.search(r'^PRE_SEQ=(\d+)$',sample,re.M)[1])+1
-    boot=re.search(r'^BOOT=(.+)$',sample,re.M)[1];kernel='6.5.0-rc2-ispass2027-p0-multi-v1'
+    boot=re.search(r'^BOOT=(.+)$',sample,re.M)[1];kernel=prefix.full.profiles.PROFILES[a.software_profile]['kernel_release']
     observations='\n'.join(dict.fromkeys(re.findall(r'idma_(?:batch|path)_obs seq='+str(sequence)+r'\b[^\n]+',sample.split('\nCASE_EXIT=0\n',1)[1].split('\nTAINT_AFTER=',1)[0])))
     cli=json.loads((prefix.HERE/'multi-cli-cases.json').read_text());templates={(r['output']['input']['nr_devices'],r['output']['input']['pages'][1]):r['output'] for r in cli if r['name']=='success'}
     def save(path,value):path.write_text(prefix.full.encoded(value))
     def make(name,n,status='running',recorded=None):
         run=build/name;(run/'uart').mkdir(parents=True)
         load={'fixture_only':True,'status':'boot_identity_verified','kernel_release':kernel,'boot_id':boot,'bit_sha256':p['DS0_BIT_SHA256']}
-        source={'fixture_only':True,'actual_commits':{'linux':'45bf76b15e36cf608dff95013d91f8bedb7b1b8e','cva6':'8aac3fcd345af7686a55af1867783fd6b91a0069'}}
-        software={'fixture_only':True,'status':'passed','selected_linux':p['LINUX_COMMIT'],'kernel_release':kernel,'handwritten_inputs':{'bench/idma_scaling.c':p['CLI_SHA256']},'artifacts':{'bin/idma_scaling':'fixture'}}
+        source={'fixture_only':True,'actual_commits':dict(prefix.full.profiles.BASELINE_COMMITS)}
+        software={**prefix.full.profiles.PROFILES[a.software_profile],'fixture_only':True,'status':'passed','handwritten_inputs':{'bench/idma_scaling.c':p['CLI_SHA256']},'artifacts':{'bin/idma_scaling':'fixture'}}
         for label,value in [('load',load),('source',source),('software',software)]:save(run/(label+'.json'),value)
         records=[]
         def append(index):
@@ -44,6 +45,9 @@ def main():
             'load_manifest':str(run/'load.json'),'load_manifest_sha256':prefix.sha((run/'load.json').read_bytes()),
             'source_record':str(run/'source.json'),'selected_source':source,'software_manifest':str(run/'software.json'),'selected_software':software,
             'kernel_release':kernel,'boot_id':boot,'bit_sha256':p['DS0_BIT_SHA256'],'script_sha256':p['source']['sha256']}
+        manifest.update(prefix.full.profiles.bind_identity(software,kernel,source,load),
+            source_record_sha256=prefix.sha((run/'source.json').read_bytes()),
+            software_manifest_sha256=prefix.sha((run/'software.json').read_bytes()))
         if recorded is not None:manifest['recorded_cases']=recorded
         if status=='failed':manifest['error']='EXPLICIT SYNTHETIC TIMEOUT TAIL'
         save(run/'manifest.json',manifest);save(run/'records.json',records);save(run/'review.json',p['review'](records))
@@ -120,7 +124,8 @@ def main():
     save(run/'records.json',records[:3]);header=freeze(run,'snapshot-success-tail')
     assert header['observed_cases']==3 and len(header['observed_unaccepted_commands'])==1 and header['observed_unaccepted_commands'][0]['exit_code']==0
     checks.append({'name':'unaccepted_success_tail_not_promoted_to_extra_point','passed':True})
-    for kind in ('case','order','boot','sequence','command','data','bytes','shared','source','load','software','plan','invalid_json'):
+    for kind in ('case','order','boot','sequence','command','data','bytes','shared','source','load','software','plan','invalid_json',
+                 'software_profile','software_profile_helper_sha256','runtime_commits','source_record_sha256','software_manifest_sha256'):
         run,records,manifest,_=make('bad-'+kind,3)
         if kind=='case':records[1]['case']=1;save(run/'records.json',records)
         elif kind=='order':records.reverse();save(run/'records.json',records)
@@ -136,6 +141,8 @@ def main():
         elif kind in ('source','load','software'):
             path=run/(kind+'.json');value=json.loads(path.read_text());value['changed']=True;save(path,value)
         elif kind=='plan':manifest['planned_cases'].reverse();save(run/'manifest.json',manifest)
+        elif kind in ('software_profile','software_profile_helper_sha256','runtime_commits','source_record_sha256','software_manifest_sha256'):
+            manifest[kind]='changed';save(run/'manifest.json',manifest)
         else:(run/'records.json').write_bytes(b'{partial')
         reject('bad_'+kind+'_rejected',lambda:freeze(run,'must-not-create-'+kind))
         assert not (build/('must-not-create-'+kind)).exists()
@@ -173,6 +180,7 @@ def main():
         return value
     for path in run.rglob('*.json'):save(path,untag(json.loads(path.read_text())))
     manifest=json.loads((run/'manifest.json').read_text());manifest['load_manifest_sha256']=prefix.sha((run/'load.json').read_bytes())
+    manifest.update(source_record_sha256=prefix.sha((run/'source.json').read_bytes()),software_manifest_sha256=prefix.sha((run/'software.json').read_bytes()))
     manifest['selected_source']=json.loads((run/'source.json').read_text());manifest['selected_software']=json.loads((run/'software.json').read_text());save(run/'manifest.json',manifest)
     path=Path(records[0]['raw_command_path']);raw=json.loads(path.read_text());opening=raw['stdout'].index('{"schema"');row,length=json.JSONDecoder().raw_decode(raw['stdout'][opening:])
     # Remove pre-existing CLI fixture flag embedded in stdout, then add only a nested label.

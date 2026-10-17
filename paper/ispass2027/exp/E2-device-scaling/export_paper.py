@@ -12,6 +12,8 @@ from pathlib import Path
 import re
 import statistics
 import sys
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import e2_software_profiles as profiles
 
 sys.dont_write_bytecode = True
 
@@ -72,7 +74,7 @@ def protocol(mode):
     nodes = [node for node in ast.parse(source).body
              if isinstance(node, ast.FunctionDef) and node.name in functions or
              isinstance(node, ast.Assign) and any(isinstance(x, ast.Name) and x.id in constants for x in node.targets)]
-    namespace = dict(defaultdict=defaultdict, json=json, re=re, statistics=statistics)
+    namespace = dict(defaultdict=defaultdict, json=json, re=re, statistics=statistics,profiles=profiles)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
     require(functions - {'validate_software'} <= namespace.keys(), 'pure protocol interface missing')
     namespace['source'] = {'path': str(path), 'sha256': hashlib.sha256(source.encode()).hexdigest()}
@@ -168,14 +170,18 @@ def read_collection(run, mode, *, _fixture_mode=False):
     require(hashlib.sha256(observed[load_path]).hexdigest() == manifest['load_manifest_sha256'], 'load receipt changed')
     p['validate_receipt'](loaded, manifest['kernel_release'])
     require(loaded['boot_id'] == manifest['boot_id'] and loaded['bit_sha256'] == manifest['bit_sha256'], 'load/boot identity')
-    _, source = read(manifest['source_record'])
+    source_path, source = read(manifest['source_record'])
     require(source == manifest['selected_source'], 'baseline source changed')
-    require(source['actual_commits']['linux'] == '45bf76b15e36cf608dff95013d91f8bedb7b1b8e'
-            and source['actual_commits']['cva6'] == '8aac3fcd345af7686a55af1867783fd6b91a0069', 'actual DS0 baseline source')
     if mode == 'E2':
-        _, software = read(manifest['software_manifest'])
+        software_path, software = read(manifest['software_manifest'])
         require(software == manifest['selected_software'], 'common software delivery changed')
-        p['validate_software'](software, manifest['kernel_release'])
+        identity=profiles.validate_recorded(manifest,software,source,loaded,
+            software_sha256=hashlib.sha256(observed[software_path]).hexdigest(),
+            source_sha256=hashlib.sha256(observed[source_path]).hexdigest(),
+            collector_sha256=p['source']['sha256'])
+    else:
+        require(source['actual_commits']['linux'] == '45bf76b15e36cf608dff95013d91f8bedb7b1b8e'
+                and source['actual_commits']['cva6'] == '8aac3fcd345af7686a55af1867783fd6b91a0069', 'actual DS0 baseline source')
     fresh, seen = [], set()
     for index, item in enumerate(records):
         block, condition = planned[index]
@@ -195,6 +201,7 @@ def read_collection(run, mode, *, _fixture_mode=False):
     _, review = read(run/'review.json')
     require(review == p['review'](fresh), 'collector review disagrees with original raw')
     result = summarize(fresh, manifest, mode)
+    if mode=='E2':result.update(identity)
     fixtures = [str(path) for path, data in observed.items() if fixture(json.loads(data))]
     fixtures += ['decoded_record:'+str(i+1) for i, item in enumerate(fresh) if fixture(item)]
     result.update(fixture_only=bool(fixtures), fixture_sources=fixtures,

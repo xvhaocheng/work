@@ -120,7 +120,7 @@ def main():
         checks.append({'name': 'wrong_DS_receipt_rejected_without_hardware', 'passed': True})
     else:
         raise AssertionError('wrong DS accepted')
-    software = {'status': 'passed', 'selected_linux': collector.LINUX_COMMIT,
+    software = {**collector.profiles.PROFILES['p0-multi-v1'],'status': 'passed',
                 'kernel_release': kernel, 'handwritten_inputs': {'bench/idma_scaling.c': collector.CLI_SHA256},
                 'artifacts': {'bin/idma_scaling': 'existing-build-sha'}}
     collector.validate_software(software, kernel)

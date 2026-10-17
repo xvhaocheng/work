@@ -57,12 +57,12 @@ def validate(manifest,records,read,*,fixture_mode=False):
     require(sha(raw)==manifest['load_manifest_sha256'],'load receipt bytes changed')
     p['validate_receipt'](loaded,manifest['kernel_release'])
     require(loaded['boot_id']==manifest['boot_id'] and loaded['bit_sha256']==manifest['bit_sha256'],'load/boot identity')
-    _,_,source=read(manifest['source_record'])
+    _,source_raw,source=read(manifest['source_record'])
     require(source==manifest['selected_source'],'original baseline source changed')
-    require(source['actual_commits']['linux']=='45bf76b15e36cf608dff95013d91f8bedb7b1b8e' and source['actual_commits']['cva6']=='8aac3fcd345af7686a55af1867783fd6b91a0069','actual DS0 baseline source')
-    _,_,software=read(manifest['software_manifest'])
+    _,software_raw,software=read(manifest['software_manifest'])
     require(software==manifest['selected_software'],'original software receipt changed')
-    p['validate_software'](software,manifest['kernel_release'])
+    full.profiles.validate_recorded(manifest,software,source,loaded,software_sha256=sha(software_raw),
+        source_sha256=sha(source_raw),collector_sha256=p['source']['sha256'])
     fresh=[];unique=set();markers=[]
     for index,cached in enumerate(records):
         block,condition=planned[index]
@@ -220,6 +220,7 @@ def summarize(header,manifest,records,markers):
         'producer_status_after_capture':header['producer_status_after_capture'],'producer_error_after_capture':header['producer_error_after_capture'],
         'producer_cases_after_capture':header['producer_cases_after_capture'],
         'overlap_policy':header['overlap_policy'],'bit_sha256':manifest['bit_sha256'],'kernel_release':manifest['kernel_release'],'boot_id':manifest['boot_id'],
+        **{key:manifest[key] for key in ('software_profile','software_profile_helper_sha256','runtime_commits','software_build_reference','source_roles')},
         'identity_status':'synthetic_protocol_fixture' if synthetic else 'frozen_partial_load_source_software_raw_bound',
         'groups':groups,'observed_synthetic_markers':markers,'quantile_method':full.QUANTILE_METHOD,'schema_source':full.SCHEMA_SOURCE,
         'scope':'exact accepted prefix only; per-cell observed n0..10; V0/A1..3 selectedA1 PATH; DMA2/3 PATH N/A; final A work includes startup/drain; HPM sequential software bracket; no extrapolation or pooled snapshots'}

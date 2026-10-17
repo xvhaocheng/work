@@ -19,6 +19,7 @@ def main():
     parser.add_argument('--fixture', type=Path, required=True)
     parser.add_argument('--schema-reference', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--software-profile',choices=tuple(analysis.profiles.PROFILES),default='p0-multi-v1')
     args = parser.parse_args()
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
@@ -50,17 +51,19 @@ def main():
         protocol = analysis.protocol(mode)
         run = build/(mode+'-synthetic')
         (run/'uart').mkdir(parents=True)
-        kernel = '6.5.0-rc2-ispass2027-'+('p0-multi-v1' if mode == 'E2' else 'pathv3')
+        kernel = analysis.profiles.PROFILES[args.software_profile]['kernel_release'] if mode=='E2' else '6.5.0-rc2-ispass2027-pathv3'
         loaded = {'fixture_only': True, 'status': 'boot_identity_verified', 'kernel_release': kernel,
                   'boot_id': boot, 'bit_sha256': protocol['DS0_BIT_SHA256']}
         save(run/'load.json', loaded)
         source = {'fixture_only': True, 'actual_commits': {'linux':'45bf76b15e36cf608dff95013d91f8bedb7b1b8e',
                   'cva6':'8aac3fcd345af7686a55af1867783fd6b91a0069'}}
+        if mode=='E2':source['actual_commits']=dict(analysis.profiles.BASELINE_COMMITS)
         save(run/'source.json', source)
         software = {'fixture_only': True, 'status':'passed', 'kernel_release':kernel,
                     'selected_linux':protocol.get('LINUX_COMMIT'),
                     'handwritten_inputs':{'bench/idma_scaling.c':protocol.get('CLI_SHA256')},
                     'artifacts':{'bin/idma_scaling':'explicit-fixture'}}
+        if mode=='E2':software.update(analysis.profiles.PROFILES[args.software_profile])
         save(run/'software.json', software)
         records = []
         for index, (block, condition) in enumerate(protocol['plan']()):
@@ -103,6 +106,10 @@ def main():
             'source_record':str((run/'source.json').resolve()), 'selected_source':source,
             'software_manifest':str((run/'software.json').resolve()), 'selected_software':software,
             'kernel_release':kernel, 'boot_id':boot, 'bit_sha256':loaded['bit_sha256'], 'script_sha256':protocol['source']['sha256']}
+        if mode=='E2':
+            manifest.update(analysis.profiles.bind_identity(software,kernel,source,loaded),
+                source_record_sha256=hashlib.sha256((run/'source.json').read_bytes()).hexdigest(),
+                software_manifest_sha256=hashlib.sha256((run/'software.json').read_bytes()).hexdigest())
         save(run/'manifest.json', manifest); save(run/'records.json', records); save(run/'review.json', protocol['review'](records))
         initial = {path: path.read_bytes() for path in run.rglob('*.json')}
         result = analysis.read_collection(run, mode, _fixture_mode=True)
@@ -152,6 +159,11 @@ def main():
         (run/'records.json').write_bytes(initial[run/'records.json'])
         changed = copy.deepcopy(manifest);changed['status']='running';save(run/'manifest.json',changed)
         reject(mode+'_incomplete_collection', lambda:analysis.read_collection(run,mode,_fixture_mode=True));(run/'manifest.json').write_bytes(initial[run/'manifest.json'])
+        if mode=='E2':
+            for key in ('software_profile','software_profile_helper_sha256','runtime_commits','source_record_sha256','software_manifest_sha256'):
+                changed=copy.deepcopy(manifest);changed[key]='changed';save(run/'manifest.json',changed)
+                reject('E2_'+key+'_rejected',lambda:analysis.read_collection(run,mode,_fixture_mode=True))
+                (run/'manifest.json').write_bytes(initial[run/'manifest.json'])
         assert all(path.read_bytes()==data for path,data in initial.items())
         checks.append({'name':mode+'_read_only_input_preservation', 'passed':True})
     assert analysis.describe([1,2,10,20]) == {'n':4,'min':1,'median':6,'max':20,'q1':1.75,'q3':12.5,'iqr':10.75}
