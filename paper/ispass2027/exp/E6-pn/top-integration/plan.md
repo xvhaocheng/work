@@ -8,6 +8,8 @@
 
 `PnEnable=0`沿原singleTC+原TL，不实例banked或新增DS tracker；PN输出保守置0且外围PN控制块不存在，不能把默认关闭时的常量当完整quiet证明。`PnEnable=1`只按稳定 `pn_mode_i[0]`选择原singleTC或新增restricted bankedTC；P只看bit1，history独立，**不按bit2选择backend/N**。
 
+外围CVA最终资源边界按Root最新锁定：额外512beat backend/certificate **只给DMA0/1（PnEnable && port<2，DID10/11）**，两份总驻留512×8×2=8192B；DMA2/3不复制该支路，原四路3beat backend全部保留。4口frontend事实tap和原backend/job quiet仍全部覆盖，PnTapEnable与PnEnable独立；PnEnable0的wrap也导出原backend/job quiet。PnGapEnable只DMA0，A保持gap0。这里记录后续集成合同，不声称本proposal已修改或验证CVA。
+
 | 内容 | 当前固定源入口 | 拟接线及保持条件 |
 | --- | --- | --- |
 | 原singleTC | `rtl/rv_iommu_top.sv:322–372`；TC配置直接RVIOMMUCfg | S/P/P_shared原实例/原8-slot header FIFO、WFifo32及完整MRIF路径；ReadAdmissionEnable保持0。新N支路不回写其READY/FSM。 |
