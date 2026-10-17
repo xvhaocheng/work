@@ -6,9 +6,9 @@
 observer/wrapper已由Root直接审阅接受，组件tip `0f0403f56aff3f1ee10e18dccea7a9fd6f2f26a4`，
 实际diff/原件入口`observer-validation/`。上层仅暴露默认off参数，新增CVA6 `cfb9a0a8`；
 独立构建export显式启用G，平台 `d5cc448`，见`build/README.md`。
-Root审builder后，唯一G DS0 BIT构建于2026-10-17 15:08:57Z启动，尚未通过全SoC/时序/面积验收。
+Root审builder后，唯一G DS0 BIT构建于2026-10-17 15:08:57Z启动，16:34:36Z原流程最终门通过，见`build/qualified01/`。
 G Linux首批UAPI/只读CAPS/纯decode已被Root接受；后继RUN tip`69d8b9d4`已由Root直接审实际源码并复跑有限检查接受。
-唯一正式G软件已构建passed，见`software-source/README.md`；未做新G板测。实际G BIT已通过合成结构门，仍在原place/route流程，尚未最终时序/面积验收。
+唯一正式G软件已构建passed，见`software-source/README.md`；未做新G板测。实际G BIT的合成结构、timing/route/routed边界门已通过；未做G板测。
 当前BIT构建的Linux65b仍仅作reference，不因后续caps首批修改而追认成G软件已完成。
 分支 `ispass/e6-mitigation` 从main `7123bbfe79cca298c36a880206ab85a2d68e6f67` 创建，
 本工作树只写本目录；组件独占工作树为`/home/xvhaocheng/work-a1-e6-cva6`，同名分支，从冻结6c5起。
