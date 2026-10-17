@@ -2,7 +2,9 @@
 
 实际代码为`../collect_g.py`和`../g_records.py`；[冻结源码身份](component.json)，
 [最终源码副本](../collector-validation/run02/source/)，[100项有限检查](../collector-validation/run02/report.json)。
-本批候选待Root实际审阅；未运行UART、板测或新G实验。
+Root已直接审原候选并要求两处聚焦修订，最新实际源码仍为`../collect_g.py`；
+[修订身份](revision01.json)、[实际diff](revision01-actual.diff)与[17项针对检查](../collector-validation/revision01/fixture-context.json)
+已补充，待Root审。原100项及run02源码快照保留；未运行UART、板测或新G实验。
 
 矩阵严格40点：10个block，每block恰有`solo/a8-gap0/a8-gap1000/a8-gap2000`各一次，
 按block%4轮换顺序。只生成`idma_g --device /dev/idma0 --condition <固定值> --timeout-ms 60000`，
@@ -68,3 +70,31 @@ python3 paper/ispass2027/exp/E6-mitigation/collect_g.py \
 输出`manifest.json`、完整`raw-01..40.json`、只含已验记录的`records.json`；
 每条保留原CLI/OBS4/PATH/hist/Gword，以及单列derived metrics，不把软件计算冒充hardware字段。
 分析计划见[analysis-plan.md](analysis-plan.md)，后续分析实现另小批，不自动生成正式结论。
+
+## Root审阅后的两处聚焦修订
+
+生产bindings要求正式原软件manifest字节SHA
+`4bee1eadd8d8102e652129833f171ba869e5edd8a1a039973d13559a3a0b2f6c`，
+并显式检查OpenSBI e8d21、CVA6 source_reference_not_loaded_bit角色、
+CLI prepared/built source与正式ELF来源，以及两份prepared/kernel UAPI一致性。
+只有内部明确fixture模式可使用合成软件manifest；上述来源字段检查不因此放宽。
+
+每点raw先保存，随后在parse之前递归拒绝raw顶层及嵌套synthetic标记；原item检查仍保留。
+内部fixture模式对manifest、每个raw及每条record均显式标fixture_only和synthetic evidence_level。
+这两处不改变40点、BIT/OBS、预算、数据、quiet或driver/Image。
+
+17项聚焦检查复跑（输出须新目录）：
+
+```sh
+python3 paper/ispass2027/exp/E6-mitigation/collector-validation/verify_g_collector_revision.py   --cli-report paper/ispass2027/exp/E6-mitigation/cli-validation/run01/report.json   --output paper/ispass2027/exp/E6-mitigation/collector-validation/root-revision01
+```
+
+原100项run02原件不覆盖。此次输入、source和boundary mock完整记录在revision01顶层
+`fixture-context.json`。production-mode第二点raw-only顶层／嵌套标记两负例只mock bindings和Console，
+实际collect/save/guard/parse执行；第一点parse一次，第二点raw保存但不parse，两次command即停止。
+未伪造production可用的qualified BIT清单。
+
+这些负例子目录的原as-executed manifest故意为fixture_only=false，以覆盖真实production路径；
+它们均status=failed，包顶层明确fixture_only=true、synthetic来源与boundary mock说明。
+原失败raw和manifest不改写，任何一份都不能单独作为板证据或进入paper出口。
+正式原软件身份与内部fixture全输出标记反例／正例也在17项内。
