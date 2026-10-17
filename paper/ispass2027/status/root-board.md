@@ -72,3 +72,9 @@ E4只读真实leaf查询内部提交`e61315397bd2bc925f74d76f7b8173f2b3256943`�
 E5首批被动RTL内部提交`6c5c666d45979d3a03fb98cff89ba7ad095f6125`已接受，Root核3文件完整diff、真实full事件、桶编码/MMIO/饱和粘错与状态传播。923拍HistEnable0与基座的35旧计数+128旧PATH字段逐拍相同；HistEnable1有限场景与192段桶/full守恒、98年龄边界、carry/clear/abort/timer/容量通过。首BIT改为共享已验收P0基座CVA6 8aeb、Linux acece，DS0，Depth4；16段×32桶×32bit，observer v4，P0 frontend字节不变。Root已授权先固定完整platform pins后立即构建DS0，不等Linux后批。新RTL从不驱动DMA/AXI ready/valid，实际面积/时序和板测仍待完成，不把有限模型当硬件结果。
 
 完整E3的真实长descriptor探针已确认旧Depth4在16/64KiB下可能overflow（64KiB实测AW库存9，不能直接当8）；A2正在给源级上界和实际工作集设计，不降低当前P0的检查。当前DS100已启动原pathv3，boot `5cc1560a-b07e-4956-b1f2-e95e3cced13b`，首次快照见15个成功试次，整档继续。
+
+## DS100中途数据及E5输出目录纠正（2026-10-17 13:29Z）
+
+已冻结DS100前30成功试次，各条件n=6，见`exp/E1b-ds-sweep/checkpoints/ds100-progress01/`；连同DS25全50，本轮80新增；显式引用历史100后总180，四档矩阵仍partial，无缺点填补或部分图。该包与此前累计快照不是独立新样本，合并须按实际boot/sequence去重。
+
+E5首次13:27:03Z构建错误指向共享main/out；Root发现后要求立即按worktree隔离规则纠正。经argv/cwd确认后停止其唯一PGID，20个当时进程全部退出、最终active=[]，session3258退出143。原manifest、logs、执行wrapper及取消原因按字节保存，明确为cancelled_output_scope而非时序失败；原输出树不移动。相同完整冻结源码/RTL/约束于13:28:41Z从A1独立worktree `exp/E5-latency/artifacts/e5-ds0-build01/`重新构建，session70397。当前仍仅DS100在板运行。

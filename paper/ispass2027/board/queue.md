@@ -12,7 +12,7 @@
 
 ## 当前资源与顺序
 
-DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”在12:53:13Z已启动同身份DS25→DS100，共100次；DS25已完成50点、当前DS100正在启动旧pathv3。Root本地12:56:37Z启动被UART锁在触硬件前拒绝，失败目录原样保留，不再启动替代任务。用户已明确授权联系该会话并统一排程，协调消息已送达：原campaign继续两档100次，随后保持DS100交还板卡，不自行写SD或加测。
+DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”在12:53:13Z已启动同身份DS25→DS100，共100次；DS25已完成50点、当前DS100已启动旧pathv3并采集。Root本地12:56:37Z启动被UART锁在触硬件前拒绝，失败目录原样保留，不再启动替代任务。用户已明确授权联系该会话并统一排程，协调消息已送达：原campaign继续两档100次，随后保持DS100交还板卡，不自行写SD或加测。
 
 唯一活动campaign为 `/home/xvhaocheng/work/paper/ispass2027/board/runs/ds-sweep-20261017-01/`，launch为同级`ds-sweep-20261017-01-launch/`；Root只读其稳定records冻结本任务快照。Root被锁拒绝的记录在本worktree `runs/ds-sweep-campaign-launch01/`及`runs/ds-sweep-20261017-01/`，不计为已加载或性能试次。
 
@@ -20,7 +20,7 @@ DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/h
 | --- | --- | --- | --- | --- |
 | 1 | E3 DS0 小子集 | P0源码/真实backend合法域已验收；共用软件就绪，等待P0新BIT最终时序 | 3 个 V 大小 × Solo/A1/A8 × 5 = 45 次 | 约45分钟采集，另需新构建；packed-ring，不扩三类完整形态 |
 | 2 | E1b DS25 | 完成50/50，五条件各10，全部接受；阶段CSV已冻结 | Solo/A1/A8/A16/A64 各 10 次 = 50 次 | 约 20–30 分钟，须 50MHz、WNS≥0、违例端点和 routing errors 全零 |
-| 3 | E1b DS100 | 验收通过；DS25全档完成后已开始加载/启动DS100 | 同上 50 次 | 约 20–30 分钟，同一档集中完成；两档仅换 BIT，复用已写 pathv3 |
+| 3 | E1b DS100 | 采集中；已冻结30/50，五条件各6，尚无失败 | 同上 50 次 | 约 20–30 分钟，同一档集中完成；两档仅换 BIT，复用已写 pathv3 |
 | 4 | E2 DS0 设备数 | 多设备驱动/CLI/90点collector已审核，共用软件delivery已通过 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
 | 5 | E3 DS0 论文子集 | A2 设计，运行包待能力核查 | 六种大小及三类流量组合的论文子集 | 用户上限 6 小时；以实际软件采集总时长估算 |
 | 6 | E4 DS0 页大小 | 用户已授权独立分支修改/编译；A3完成E2采集器后准备 | 4KiB 对 2MiB，各点 10 次，未测 | 需显式软件建图与实际leaf证据；先审设计再实施，不混当前稳定软件 |
@@ -47,3 +47,7 @@ Root 分支 `ispass/root-a`，worktree `/home/xvhaocheng/work-root-a`。A1/A2/A3
 用户明确补充：“未来还有实验需要修改rtl 和linux. 都可以加载agent进行, 先在单独branch里面修改然后编译. 然后轮流上班测试收集数据”。据此，现有论文实验清单中的必要RTL/Linux改动无需再因原只读/测试程序限制逐项等待：A1在backend证据后准备E5被动直方图，A3在E2采集器后准备E4显式2MiB映射，A2在当前共同软件后准备E3其余负载形态；E6历史缓解移至最后准备。各批先由Root审设计与实际代码，固定源码后验证/编译，验收通过才加入唯一板队列，不混改正在构建的源树。当前P0/Multi软件固定Linux `acece3a3ab7d72ba1f936c1984b82a4a55f28d46`、平台`52c5fdd028bbf3b07deaf1d0f7e13e3a271b29d0`，一次共同payload已开始编译。此授权不恢复新的机制探索，也不允许子agent自行争用板卡。
 
 DS25全50点已完成且无采集失败，最新累积论文包为`exp/E1b-ds-sweep/checkpoints/ds25-stage-50/`（含DS25新50+历史100，共150试次）。每条件n=10；四档矩阵仍partial，等待DS100。旧`ds25-progress01`仅为历史快照，不与本包重复追加。P0新DS0 BIT最终验收已通过：50MHz，WNS+0.177ns、WHS+0.035ns、WPWS+0.062ns，三类失败端点与routing errors均0。E2/P0硬件与共用软件已全部就绪，按旧payload集中顺序等待上板。
+
+DS100中途快照为`exp/E1b-ds-sweep/checkpoints/ds100-progress01/`：DS25 50+DS100 30共80新增试次，含历史100后总180；DS100各条件n=6，整档未完。该累计快照替代此前阶段包作当前查看，合并时只选最终包，不叠加计数。
+
+E5 hist构建首次输出误放共享main/out，已在早期停止该独占20进程树，旧session退出143，非timing失败；原manifest/log与取消/无遗留进程证据保存，原输出未移动。合规新构建于13:28:41Z在A1独立worktree `exp/E5-latency/artifacts/e5-ds0-build01/`启动，固定SHA/RTL/约束不变；后台编译不占板。
