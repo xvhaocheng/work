@@ -25,4 +25,4 @@
 
 通过检查的中途论文数据可提交推送；二进制留本机，失败和未完成证据保留但不冒称完整论文样本。Root 不合并 main，最终合并步骤与重叠点维护于 [合并说明](../../board/root-a-merge.md)。
 
-当前已审设计入口：[最小移植与硬门](port-plan.md)、[固定来源调用链](source-map.md)、[测量合同](measurement-contract.md)、[原软件与采集计划](software-plan.md)、[Root设计接受](root-validation/plan01.json)。A1只实施P IOTLB/TL首小批；A2并行原前端gap小批；A3并行纯主机S15门，均须真实源码与有限验证接受后再集成。
+当前已审设计入口：[最小移植与硬门](port-plan.md)、[固定来源调用链](source-map.md)、[测量合同](measurement-contract.md)、[原软件与采集计划](software-plan.md)、[Root设计接受](root-validation/plan01.json)。P IOTLB/TL小批已通过[Root源码/gold/逐拍证据核对](root-validation/p-only01.json)，S15工具已通过[Root实际51项主机检查](root-validation/s15-accepted01.json)。A1继续IOMMU N核心；A2收口原前端gap小批；A3实现只读pn-control。均须实际源码与有限验证接受后再集成，尚无完整PN构建或板点。
