@@ -1,3 +1,5 @@
+> 当前执行更新（2026-10-17 14:27Z）：P0已在Root独占板启动，首区组9/45通过并冻结为[真实partial论文包](checkpoints/p0-progress01/README.md)。完整三形态另按[full-bounded-design](full-bounded-design.md)准备；下文最初停止状态和16MiB旧设计为历史，当前以本更新及subset-results为准。
+
 # E3 負載形態：條件矩陣與待執行包
 
 > 此頁保留最初完整矩陣設計與原pathv3限制。後續僅P0修改、構建和45點已獲批准，

@@ -120,3 +120,9 @@ acece共同压缩镜像10,520,154B已在913.29秒传入并正常bytes-ack，现`
 共同软件SD更新于14:17:50Z返回0，P0新DS0 BIT加载在14:17:52Z启动，仍在正常启动过程；未记为已接受试次。唯一有限续接将在boot身份验证成功后启动45点collector，随后仍是同Linux切原DS0测E2。E4/E5纯host包已复制元数据并硬链接本机产物到`board/packages/e4-e5-20261017/`，无板操作。E4完整论文出口Root29项有限检查及OBS4限定2项通过；共享hist helper显式接受OBS5/INFO2/Depth64，Root26项parser/analysis/collector检查通过，E4父采集器仍锁OBS4。
 
 Root已直接读ABI5首批实际geometry/offset/prefix helper、固定64/544B UAPI及OBS4/5驱动差异，接受有界几何和日志合同，ABI5 ioctl尚未完成，不称软件已就绪。A2继续独立驱动小批，full-E3 DS0硬件在独立编译。A3准备E2不可变partial出口，必须保留真实N/90与原running/failed状态，原完整出口不放宽。E6来源包已审；按用户后续RTL/Linux准备授权，先做P4M G最小前端，V/A各固定4096×4KiB自然完成、分别计完整时间，M的S/N/P/PN仅保留设计。该准备不抢占E4/完整E3顺序，不恢复机制探索。
+
+## E3首个真实区组（2026-10-17 14:28Z）
+
+P0于14:25:44Z启动验证通过，boot `088d7493-26d3-4254-b49e-2e1e8f66e910`，taint0。45点采集继续，已冻结首区组9/45、各cell n=1的[论文长表与原始来源](../exp/E3-workloads/checkpoints/p0-progress01/README.md)。64B/1KiB/4KiB的A8/A1时间增幅分别14.2461%/13.8811%/10.3991%；当前仅描述首区组量级，最终判断等全部五区组。固定4096个V descriptor使不同size有效bytes不同，慢化仅在同大小内比较；A1已有带宽/仲裁共跑代价，A8/A1不是纯翻译成本。原字节副本15份已核hash，活动记录后来增至13而被冻结前9对象不变；没有重跑或填补。
+
+初批ABI5实际Linux `682a2caf0a7fdf69749ebdac146df60df55dcbe6` 已固定、顶层已推，Root实际复跑344个geometry情境和119个observer断言均通过；完整ioctl仍待后批。A1以这些实际函数的mock-MMIO日志核验共享helper接受v4/v5各16阶段512桶，明确0板点。Root有限续接只在P0 45/45正式passed后开始原DS0加载及E2采集，技术失败保留并停。

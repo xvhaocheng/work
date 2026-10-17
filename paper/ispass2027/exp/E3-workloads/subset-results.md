@@ -1,30 +1,29 @@
-# E3 DS0 小子集：P0產物就緒，未產生新測量
+# E3 DS0 小子集：采集中，已同步首区组9/45
 
 ## Material Passport
 
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Origin Date: 2026-10-17 JST
-- Verification Status: ARTIFACTS_VERIFIED / BOARD_UNMEASURED
-- Version Label: E3-subset-P0-ready-v2
+- Verification Status: PARTIAL（首区组各cell n=1）
+- Version Label: E3-subset-P0-progress01
 
-**一句話初判：目前仍無法判斷DS0小傳輸的干擾是否大於4KiB，45點尚未執行。**
-原pathv3確受4096B與共享chunk限制；後續已批准的P0改動及有限主機／RTL驗證已完成小批，
-獨立DS0 BIT時序／routing與共同P0+HPM+multi Linux產物已實際完成，
-見[p0-artifact-package.md](p0-artifact-package.md)；等待Root完成既有板排程後採集。
+**一句话初判：首区组64B/1KiB的A8相对A1增幅约14%，4KiB约10.4%；每格仅n=1，等待全部45点再作最终判断。**
 
-| 指定V descriptor | Solo | A1（4KiB） | A8（4KiB） |
-| --- | --- | --- | --- |
-| 64B | 未執行，0/5 | 未執行，0/5 | 未執行，0/5 |
-| 1KiB | 未執行，0/5 | 未執行，0/5 | 未執行，0/5 |
-| 4KiB | 未執行，0/5 | 未執行，0/5 | 未執行，0/5 |
+实际P0 DS0 BIT与共同内核已启动验证通过：release `6.5.0-rc2-ispass2027-p0-multi-v1`，
+boot `088d7493-26d3-4254-b49e-2e1e8f66e910`，taint=0。Root为唯一板操作者，
+已冻结的[首区组数据](checkpoints/p0-progress01/README.md)含9个真实接受试次、17列CSV与原字节来源。
+实际活动campaign仍在继续，其余点不补齐；累计前缀与最终包不得重复计样。
 
-本輪新板測0次；沒有為了湊子集而單獨重跑可用4KiB點。未觸碰UART、JTAG、SD，
-最初階段未改動driver或RTL，後續P0最小修改已有明確授權；始終未把軟體供給模式當batch模式。
-最初停止依據是使用者原文：「只改測試程序，不改內核驅動和RTL，確需修改時寫change-request.md並停下」。
-見 [能力證據](capability.md) 與 [具體變更請求](change-request.md)。
-Root可審查的P0最小修改選項已補在 [p0-change-option.md](p0-change-option.md)；
-該P0限定方案現已實作並構建；仍沒有解除本輪未測狀態。
+| V descriptor | Solo（ms，n=1） | A1（ms，n=1） | A8（ms，n=1） | 配对A8/A1额外慢化 |
+| --- | --- | --- | --- | --- |
+| 64B | 6.42780 | 59.12696 | 67.55024 | 14.2461% |
+| 1KiB | 16.59726 | 68.93826 | 78.50768 | 13.8811% |
+| 4KiB | 56.49434 | 107.03206 | 118.16248 | 10.3991% |
+
+每点V固定4096个descriptor，不同大小的有效工作不同；只在同大小内计算慢化。
+A保持既有4KiB背景供给至V结束，A1/A8仅改变其映射足迹，A完整完成量另记。
+上述为DS0实测共跑差异，不作纯翻译归因；完整三形态采用另一等16MiB协议，不与本45点混池。
 
 ## 已有4KiB參考（不是本輪E3結果）
 
@@ -46,11 +45,8 @@ HPM miss來自軟體前後非原子快照，不能當硬體窗口精確miss。
 舊4KiB A1本身已慢約89.4%，A8比A1再慢約10.4%；這是既有共跑觀察，
 無法據此補出64B/1KiB，也不能把全部共跑下降稱為純翻譯成本。
 
-## 已完成與尚缺
+## 余下工作
 
-已完成能力核查、主機參數拒絕驗證、完整矩陣/板時設計與舊數據離線分析。
-本席另完成21項可復現parser/caps檢查、15項分析完整性與拒絕檢查，及原CLI靜態交叉編譯；
-見 [host-validation.json](host-validation.json) 與 [analysis-validation-v2.json](analysis-validation-v2.json)。
-P0限定packed-ring的driver／RTL／CLI／collector及獨立產物已完成，
-45次新採集與其V吞吐/硬體時間/V與A miss/慢化表仍未完成。
-完整三形態、六種size矩陣和150次候選子集仍為後續設計，沒有拿P0合成測試補值。
+继续完成同一boot的45点固定矩阵，每cell目标5次；技术失败保留原始记录并停止，不重试替换。
+完成后从原始命令重算中位数、Q1/Q3/IQR及同区组A8/A1配对比较，更新一句话判断。
+完整三形态的BTC3/OBS5/Depth64硬件正在独立编译，ABI5软件分批审查；其结果另建实验包。
