@@ -169,3 +169,24 @@ attachment, E4 explicitly requires info.version4/schema1 with no depth field.
 [Two focused checks](pages-hist-version-host.json) accept the unchanged OBS4 case
 and reject a self-consistent OBS5/schema2/depth64 case that the shared helper
 correctly accepts. No driver suite or hardware run was added.
+
+## Ready host package after final E5 BIT passed
+
+[Preparation receipt](pages-package-preparation.json),
+[manifest copy](pages-package-manifest.json),[source copy](pages-package-source.json)
+bind the accepted final E5 BIT SHA
+`d934846ecb7f2fd80bcb7d2f18889ae0fd8c9bbd28a0f5fef8e949614139221c`
+and the already accepted common software. The ready local directory is
+`/home/xvhaocheng/work-a3-pagesize/paper/ispass2027/exp/E4-pagesize/artifacts/e4-e5-package01`.
+Its small metadata are copied from original passed manifests; binary artifacts
+are hardlinks to the exact frozen files. Inode/size equality was checked and all
+binary hashes reused from existing build/transport receipts; no binary rehash,
+load record, FPGA operation or new board sample was created.
+
+Root may copy these small manifest/source files and link binaries into its formal
+board/packages directory. Formal collector FPGA/software arguments should use
+Root's own exact metadata copies (E5/build/completed02/build-manifest.json and
+E4/pages-software-build-manifest.json), so complete paper export can constrain all
+original metadata/raw inputs to the Root worktree source root. Keep the original
+package/source identity bytes unchanged; place results in their separate run
+directory. The package is ready_for_collection, not a successful boot or result.
