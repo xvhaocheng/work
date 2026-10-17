@@ -152,6 +152,14 @@ def cap_value(value):
     return value
 
 
+def source_cap_value(value):
+    # The frozen build manifest uses hex strings; live helper JSON remains uint64.
+    if type(value) is str:
+        require(re.fullmatch(r'0x[0-9a-fA-F]{1,16}',value) is not None,'source capability hex required')
+        value=int(value,16)
+    return cap_value(value)
+
+
 def readback(reader,path,boot,caps):
     resolved,raw=reader.read(path)
     require(raw['exit_code']==0 and raw['command']==READ_COMMAND,'exact read-only control command required')
@@ -190,7 +198,7 @@ def analyze(run,source_root,fpga_manifest,source_manifest,expected_cva6,expected
     require(fpga['status']=='passed' and fpga['action']=='fpga-ds0' and fpga['variant']=='ds0','actual passed new DS0 FPGA manifest required')
     require(fpga['selected_cva6']==source['selected_cva6']==expected_cva6 and fpga['selected_iommu']==source['iommu']==expected_iommu,'Root-pinned candidate source mismatch')
     require(source['linux']==LINUX and type(source['reset_mode']) is int and source['reset_mode']==0 and type(source['v_gap_reset_cycles']) is int and source['v_gap_reset_cycles']==0,'actual source reset/software contract required')
-    caps=[cap_value(source[k]) for k in ('pn_cap','gap_cap')]
+    caps=[source_cap_value(source[k]) for k in ('pn_cap','gap_cap')]
     require(isinstance(fpga['source_manifest'],str) and fpga['source_manifest'],'original FPGA source-manifest reference missing')
     require(fpga['source_manifest_sha256']==sha(reader.observed[source_path])==manifest['source_manifest_sha256'],'actual source manifest bytes mismatch')
     require(sha(reader.observed[fpga_path])==manifest['fpga_manifest_sha256'],'Root-locked FPGA manifest bytes mismatch')

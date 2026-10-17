@@ -72,7 +72,7 @@ def preflight(args):
     gate.require(source['linux'] == gate.LINUX and type(source['reset_mode']) is int and
                  source['reset_mode'] == 0 and type(source['v_gap_reset_cycles']) is int and
                  source['v_gap_reset_cycles'] == 0, 'original software and resetS/gap0 required')
-    caps = [gate.cap_value(source[k]) for k in ('pn_cap', 'gap_cap')]
+    caps = [gate.source_cap_value(source[k]) for k in ('pn_cap', 'gap_cap')]
     source_path = reader.resolve(args.source_manifest)
     gate.require(reader.resolve(fpga['source_manifest']) == source_path and
                  fpga['source_manifest_sha256'] == gate.sha(reader.observed[source_path]),
