@@ -1,13 +1,13 @@
 # 完整E3／共用E4/E5软件构建入口
 
-当前冻结Linux=`46df97c9820d0d63878215cd553cfee1c1b6b760`，platform=`4788cd8e2f269dc70e11d75c994c6204fcad36fd`，
+当前冻结Linux=`65b427946152e3aca27babab0a437821729805d4`，platform=`ec99648e3c9a1e48c1e9721e3662bb632eb439bd`，
 CVA6=`1d587125eee690e623e6ffae13e70f9bbe989adc`。
 CVA6仅为software source-reference，软件构建不编RTL，也不表示加载了该BIT。
 现有E5 OBS4 BIT来自6c5，后续full-E3 OBS5 BIT来自1d587，运行时分别由实际load manifest绑定。
 正在运行的full-FPGA构建仍保留其原dfeb/da6 reference输入，不能事后改为46df。
 
-[platform组件记录](source/platform-full-e3-software.json)、[patch](source/platform-full-e3-software.patch)、
-[增量bundle](source/platform-full-e3-software.bundle)已固定；前提dfeb，实际verify通过。
+[platform组件记录](source/platform-full-e3-cooperative-software.json)、[patch](source/platform-full-e3-cooperative-software.patch)、
+[增量bundle](source/platform-full-e3-cooperative-software.bundle)已固定；前提4788，实际verify通过。
 实际platform独立branch已commit，既有Git DB无remote，本批未创建remote或冒称推送组件远端。
 
 `build_full_software.py`复用已审E4/E5 builder，仅更换固定pins、release、额外ABI5 CLI／critical源记录。
@@ -21,16 +21,19 @@ CVA6仅为software source-reference，软件构建不编RTL，也不表示加载
 使用实际vmlinux.symvers，不绕过modpost；正式内核release为`6.5.0-rc2-ispass2027-full-e3-v1`。
 模块只用于该release后续软件更新，正式测量不加载模块。旧acece启动需要自己的P0-multi匹配模块。
 
-Root验收CLI后执行一次：
+Root已验收CLI与65b427的multi合作调度候选，批准本次唯一构建。旧4788/46df候选未执行Image构建，
+原builder另存`source/build_full_software.46df-candidate.py`，原恢复包与Git历史保留。
+
+执行一次：
 
 ```sh
 python3 paper/ispass2027/exp/E3-workloads/build_full_software.py prepare \
   --out paper/ispass2027/exp/E3-workloads/artifacts/full-e3-software01 \
-  --platform-commit 4788cd8e2f269dc70e11d75c994c6204fcad36fd
+  --platform-commit ec99648e3c9a1e48c1e9721e3662bb632eb439bd
 python3 paper/ispass2027/exp/E3-workloads/build_full_software.py finalize \
   --out paper/ispass2027/exp/E3-workloads/artifacts/full-e3-software01 \
-  --platform-commit 4788cd8e2f269dc70e11d75c994c6204fcad36fd \
-  --linux-commit 46df97c9820d0d63878215cd553cfee1c1b6b760 --jobs 8
+  --platform-commit ec99648e3c9a1e48c1e9721e3662bb632eb439bd \
+  --linux-commit 65b427946152e3aca27babab0a437821729805d4 --jobs 8
 ```
 
 正式manifest将是`artifacts/full-e3-software01/build-manifest.json`，相邻`fw_payload.bin`、

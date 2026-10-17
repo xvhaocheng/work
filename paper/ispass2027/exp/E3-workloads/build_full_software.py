@@ -16,8 +16,8 @@ import stat
 HERE = Path(__file__).resolve().parent
 PLATFORM = Path('/home/xvhaocheng/work/iommu-platform')
 BASE_SW = PLATFORM / 'out/ispass2027-20261017-software01'
-M = '46df97c9820d0d63878215cd553cfee1c1b6b760'
-PLATFORM_COMMIT = '4788cd8e2f269dc70e11d75c994c6204fcad36fd'
+M = '65b427946152e3aca27babab0a437821729805d4'
+PLATFORM_COMMIT = 'ec99648e3c9a1e48c1e9721e3662bb632eb439bd'
 CVA6 = '1d587125eee690e623e6ffae13e70f9bbe989adc'
 RELEASE_SUFFIX = '-ispass2027-full-e3-v1'
 MAX_PAYLOAD = 33554432
