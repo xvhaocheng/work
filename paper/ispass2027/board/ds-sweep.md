@@ -5,7 +5,7 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Origin Date: 2026-10-17
-- Verification Status: UNVERIFIED
+- Verification Status: ANALYZED（构建通过；板测未执行）
 - Version Label: ds_sweep_v1
 
 用户本轮明确授权构建DS25、DS100并按顺序采集。已有DS0/DS50的正式100次保留不重测；
@@ -53,7 +53,11 @@ V=DMA0、A=DMA1，V工作集1页，4KiB×4096，预热256，与已有正式基�
 
 ## 当前状态
 
-构建进行中；尚未启动DS25/DS100正式采集，未形成四点曲线。
+两 BIT 构建已通过，均为50MHz、WNS +0.177ns，setup/hold/pulse失败端点和routing errors均0。
+DS25的WHS/WPWS为+0.048/+0.062ns，DS100为+0.045/+0.062ns；routed delayer单元数120/145，
+禁止研究单元均0。实际清单与原始报告保存在配套包metadata/ds25和metadata/ds100；
+包状态为ready_for_collection，本机已配套保存两BIT与共用payload/Image。
+尚未启动DS25/DS100正式采集，未形成四点曲线。
 两档冻结源码与DS50的差异已核对；17项采集/调度替身检查及6项独立导入检查已通过，
 这不替代构建或板测验收。Root执行命令、独立长表和交接见
 [E1b任务目录](../exp/E1b-ds-sweep/README.md)。

@@ -5,7 +5,7 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Origin Date: 2026-10-17
-- Verification Status: UNVERIFIED（新 BIT 构建及板测尚未完成）
+- Verification Status: ANALYZED（两 BIT 构建通过；新板测尚未执行）
 - Version Label: a1_ds_sweep_v1
 
 本目录由 A1 准备构建审核、采集和结果导入接口；FPGA/JTAG/UART 均由 Root 串行执行。
@@ -129,7 +129,24 @@ complete/status、缺点和实际配对操作数）；入口为 `paper-data.json
 
 ## 接续与风险
 
-当前构建仍在运行，包状态 `building`；新采集和新结果均未发生。时序验收失败必须停止，
+两构建于 2026-10-17 12:52 UTC 完成，包状态 `ready_for_collection`；新采集和新板测结果均未发生。
+
+| 变体 | WNS / WHS / WPWS (ns) | setup / hold / pulse 失败端点 | routing errors | CPU | delayer cells |
+| --- | --- | --- | ---: | --- | ---: |
+| DS25 | +0.177 / +0.048 / +0.062 | 0 / 0 / 0 | 0 | 50 MHz | 120 |
+| DS100 | +0.177 / +0.045 / +0.062 | 0 / 0 / 0 | 0 | 50 MHz | 145 |
+
+原始时序入口为包内 `metadata/ds25/` 与 `metadata/ds100/` 的
+`ariane_xilinx_timing_summary_routed.rpt:159`（总汇）、`:174`（CPU 时钟），
+路由错误在 `ariane_xilinx_route_status.rpt:10`；各目录同时保存实际 build manifest、完整 build log、
+routed-boundary 和利用率报告。禁止研究单元计数均为 0。
+实际已执行 builder 仍是原 `as-dispatched` 快照；本分支后补的非零失败退出没有用于这两次构建。
+
+本机包同时实际保存 11,443,722 字节的两 BIT、29,363,656 字节 payload 与 24,130,560 字节 Image。
+二进制 SHA256 复用原 build / delivery 清单；未额外重算、未写 SD、未访问板卡。
+Root 整合第三批元数据后，将上述 `artifacts/` 原字节复制到自己的同名包即可执行前述采集命令。
+
+时序验收失败必须停止，
 不通过约束或实现策略修改求过关。DS 横轴是附加诊断延迟参数，DS0 为直接连线；
 不得将其解释为纯 PTW 成本。跨 boot 配对/分位数统计由后续实际数据分析决定，
 不能从已有均值构造分位数。
