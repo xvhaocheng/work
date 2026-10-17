@@ -1,0 +1,200 @@
+From 5d8da4d4b16c06e7c2bd8e3eb8a14e1228404c9e Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sun, 18 Oct 2026 04:17:45 +0900
+Subject: [PATCH] Wire default-off PN peripheral control capture and complete
+ quiet facts
+
+---
+ .../fpga/src/ariane_peripherals_xilinx.sv     | 76 +++++++++++++++++--
+ corev_apu/fpga/src/ariane_xilinx.sv           |  4 +
+ 2 files changed, 75 insertions(+), 5 deletions(-)
+
+diff --git a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+index 68b0d655..27683436 100644
+--- a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
+@@ -31,7 +31,9 @@ module ariane_peripherals #(
+     parameter bit InclIOMMU    =  0,
+     parameter bit IOMMUDSDelayEnable = 0,
+     parameter int unsigned IOMMUDSFixedDelayInput  = 0,
+-    parameter int unsigned IOMMUDSFixedDelayOutput = 0
++    parameter int unsigned IOMMUDSFixedDelayOutput = 0,
++    parameter bit PnEnable = 0,
++    parameter bit HistoryControlEnable = 0
+ ) (
+     input  logic       clk_i           , // Clock
+     input  logic       clk_200MHz_i    ,
+@@ -868,6 +870,7 @@ module ariane_peripherals #(
+     localparam int unsigned NumDMADevices = 4;
+     localparam int unsigned DmaAxiIdWidth =
+         ariane_soc::IdWidth - $clog2(NumDMADevices);
++    localparam bit PnPresent = PnEnable && InclDMA && InclIOMMU;
+ 
+     // AXI Bus between DMA devices and IOMMU TR IF
+     // Extended with AXI support for untranslated transactions
+@@ -888,6 +891,31 @@ module ariane_peripherals #(
+     axi_dma_tr_req_t  [NumDMADevices-1:0] axi_dma_tr_req;
+     axi_dma_tr_resp_t [NumDMADevices-1:0] axi_dma_tr_resp;
+ 
++    logic [2:0] pn_mode_word;
++    logic pn_policy_clear, pn_private_quiet, pn_capture_busy;
++    logic [NumDMADevices-1:0] pn_stop_accepted, pn_frontend_quiet, pn_backend_job_quiet;
++    logic [NumDMADevices-1:0] pn_fullbuffer_permit, pn_certificate_pending, pn_certificate_fault;
++    logic [NumDMADevices-1:0] pn_private_boundary_quiet;
++    logic pn_n_fire, pn_iommu_quiet, pn_boundary_quiet, pn_dataflow_quiet;
++    logic [23:0] pn_n_did;
++
++    if (PnPresent) begin : gen_pn_dataflow_quiet
++        // Current held offers supplement the continuously tracked private debt.
++        // DMA configuration traffic is excluded: MODE must not reject itself.
++        assign pn_boundary_quiet = (&pn_private_boundary_quiet) &&
++            !(axi_iommu_tr_req.ar_valid || axi_iommu_tr_req.aw_valid ||
++              axi_iommu_tr_req.w_valid || axi_iommu_tr_resp.r_valid || axi_iommu_tr_resp.b_valid) &&
++            !(axi_iommu_comp_req.ar_valid || axi_iommu_comp_req.aw_valid ||
++              axi_iommu_comp_req.w_valid || axi_iommu_comp_resp.r_valid || axi_iommu_comp_resp.b_valid);
++        // Capture/OBS busy and certificate faults guard MODE separately. They
++        // must not prevent the capture from freezing after a natural drain.
++        assign pn_dataflow_quiet = (&pn_frontend_quiet) && (&pn_backend_job_quiet) &&
++            pn_private_quiet && pn_boundary_quiet && pn_iommu_quiet;
++    end else begin : gen_pn_dataflow_disabled
++        assign pn_boundary_quiet = 1'b0;
++        assign pn_dataflow_quiet = 1'b0;
++    end
++
+     // AXI Bus between System Interconnect and IOMMU Programming IF
+     `AXI_TYPEDEF_ALL(axi_prog, iommu_addr_t, iommu_slv_id_t, 
+                      iommu_data_t, iommu_strb_t, iommu_user_t)
+@@ -915,6 +943,9 @@ module ariane_peripherals #(
+             assign obs_awready[o] = axi_dma_tr_resp[o].aw_ready;
+             assign obs_rlast[o] = axi_dma_tr_resp[o].r_valid && axi_dma_tr_resp[o].r.last && axi_dma_tr_req[o].r_ready;
+             assign obs_b[o] = axi_dma_tr_resp[o].b_valid && axi_dma_tr_req[o].b_ready;
++            assign pn_private_boundary_quiet[o] =
++                !(axi_dma_tr_req[o].ar_valid || axi_dma_tr_req[o].aw_valid || axi_dma_tr_req[o].w_valid ||
++                  axi_dma_tr_resp[o].r_valid || axi_dma_tr_resp[o].b_valid);
+             // Each current iDMA emits AxID=0. Monitor its private mux-side ID.
+             assign obs_bad_id[o] = (obs_arvalid[o] && |axi_dma_tr_req[o].ar.id) ||
+                 (obs_awvalid[o] && |axi_dma_tr_req[o].aw.id) ||
+@@ -922,7 +953,8 @@ module ariane_peripherals #(
+                 (axi_dma_tr_resp[o].b_valid && |axi_dma_tr_resp[o].b.id);
+         end
+         dma_observer #(.NumPorts(NumDMADevices), .PathEnable(InclIOMMU),
+-                       .AxiIdWidth(ariane_soc::IdWidth)) i_dma_observer (
++                       .AxiIdWidth(ariane_soc::IdWidth), .PnEnable(PnPresent),
++                       .HistoryControlEnable(PnPresent && HistoryControlEnable)) i_dma_observer (
+             .clk_i, .rst_ni,
+             .cfg_valid_i(obs_cfg_valid[0]), .cfg_write_i(obs_cfg_write[0]),
+             .cfg_addr_i(obs_cfg_addr[0]), .cfg_wdata_i(obs_cfg_wdata[0]),
+@@ -943,7 +975,12 @@ module ariane_peripherals #(
+             .out_valid_i({axi_iommu_comp_req.aw_valid, axi_iommu_comp_req.ar_valid}),
+             .out_ready_i({axi_iommu_comp_resp.aw_ready, axi_iommu_comp_resp.ar_ready}),
+             .return_i({axi_iommu_comp_resp.b_valid && axi_iommu_comp_req.b_ready,
+-                       axi_iommu_comp_resp.r_valid && axi_iommu_comp_resp.r.last && axi_iommu_comp_req.r_ready})
++                       axi_iommu_comp_resp.r_valid && axi_iommu_comp_resp.r.last && axi_iommu_comp_req.r_ready}),
++            .pn_dataflow_quiet_i(pn_dataflow_quiet),
++            .pn_certificate_fault_i(|pn_certificate_fault), .pn_stop_accepted_i(pn_stop_accepted),
++            .pn_n_accept_i(pn_n_fire), .pn_n_did_i(pn_n_did),
++            .pn_mode_word_o(pn_mode_word), .pn_policy_clear_o(pn_policy_clear),
++            .pn_private_quiet_o(pn_private_quiet), .pn_capture_busy_o(pn_capture_busy)
+         );
+ 
+         AXI_BUS #(
+@@ -1031,7 +1068,10 @@ module ariane_peripherals #(
+ 
+                 .DEVICE_ID          ( 24'(10 + i)              ),
+                 .PROCESS_ID         ( 20'(20 + i)              ),
+-                .AxID               ( '0                       )
++                .AxID               ( '0                       ),
++                .PnEnable           ( PnPresent && i < 2        ),
++                .PnTapEnable        ( PnPresent                 ),
++                .PnGapEnable        ( PnPresent && i == 0       )
+             ) i_dma (
+                 .obs_issue_o(obs_issue[i]), .obs_done_o(obs_done[i]), .obs_poll_o(obs_poll[i]),
+                 .batch_active_o(batch_active[i]),
+@@ -1039,6 +1079,12 @@ module ariane_peripherals #(
+                 .obs_cfg_valid_o(obs_cfg_valid[i]), .obs_cfg_write_o(obs_cfg_write[i]),
+                 .obs_cfg_addr_o(obs_cfg_addr[i]), .obs_cfg_wdata_o(obs_cfg_wdata[i]),
+                 .obs_cfg_wstrb_o(obs_cfg_wstrb[i]), .obs_cfg_rdata_i(obs_cfg_rdata),
++                .pn_nonblock_enable_i(pn_mode_word[0]),
++                .pn_fullbuffer_permit_o(pn_fullbuffer_permit[i]),
++                .pn_backend_job_quiet_o(pn_backend_job_quiet[i]),
++                .pn_certificate_pending_o(pn_certificate_pending[i]),
++                .pn_certificate_fault_o(pn_certificate_fault[i]),
++                .pn_stop_accepted_o(pn_stop_accepted[i]), .pn_frontend_quiet_o(pn_frontend_quiet[i]),
+                 .clk_i          ( clk_i              ),
+                 .rst_ni         ( rst_ni             ),
+                 .testmode_i     ( 1'b0               ),
+@@ -1058,6 +1104,18 @@ module ariane_peripherals #(
+     // AXI transactions directed to the DMA config port are responded with error.
+     else begin : gen_dma_disabled
+ 
++        assign pn_mode_word = '0;
++        assign pn_policy_clear = 1'b0;
++        assign pn_private_quiet = 1'b0;
++        assign pn_capture_busy = 1'b0;
++        assign pn_stop_accepted = '0;
++        assign pn_frontend_quiet = '0;
++        assign pn_backend_job_quiet = '0;
++        assign pn_fullbuffer_permit = '0;
++        assign pn_certificate_pending = '0;
++        assign pn_certificate_fault = '0;
++        assign pn_private_boundary_quiet = '0;
++
+ 		// AXI Bus between System Interconnect (Mst) and iDMA Configuration Port (Slv)
+ 		ariane_axi_soc::req_slv_t axi_dma_cfg_req;
+ 		ariane_axi_soc::resp_slv_t axi_dma_cfg_resp;
+@@ -1136,6 +1194,7 @@ module ariane_peripherals #(
+         //--------------
+         rv_iommu_top #(
+             .RVIOMMUCfg   (ariane_soc::RVIOMMUCfg),
++            .PnEnable(PnPresent), .HistoryControlEnable(PnPresent && HistoryControlEnable),
+ 
+             .axi_tr_aw_chan_t       (axi_tr_aw_chan_t),
+             .axi_tr_w_chan_t        (axi_tr_w_chan_t),
+@@ -1179,7 +1238,10 @@ module ariane_peripherals #(
+             .ds_req_o     (axi_iommu_ds_req),
+             .prog_req_i   (axi_iommu_prog_req),
+             .prog_resp_o  (axi_iommu_prog_resp),
+-            .wsi_wires_o  (irq_sources[(ariane_soc::RVIOMMUCfg.NumIntVec-1)+7:7])
++            .wsi_wires_o  (irq_sources[(ariane_soc::RVIOMMUCfg.NumIntVec-1)+7:7]),
++            .pn_mode_i(pn_mode_word[1:0]), .pn_history_isolate_i(!pn_mode_word[2]),
++            .pn_policy_clear_i(pn_policy_clear), .pn_fullbuffer_jobs_i(pn_fullbuffer_permit[1:0]),
++            .pn_n_fire_o(pn_n_fire), .pn_n_did_o(pn_n_did), .pn_quiet_o(pn_iommu_quiet)
+         );
+ 
+     //----------
+@@ -1191,6 +1253,10 @@ module ariane_peripherals #(
+     //	All memory IF request xVALID/xREADY wires are set to zero.
+     end else begin : gen_iommu_disabled
+ 
++        assign pn_n_fire = 1'b0;
++        assign pn_n_did = '0;
++        assign pn_iommu_quiet = 1'b0;
++
+         axi_err_slv #(
+             .AxiIdWidth ( ariane_soc::IdWidthSlave   ),
+             .axi_req_t  ( ariane_axi_soc::req_slv_t  ),
+diff --git a/corev_apu/fpga/src/ariane_xilinx.sv b/corev_apu/fpga/src/ariane_xilinx.sv
+index c86a71b2..63280a7e 100644
+--- a/corev_apu/fpga/src/ariane_xilinx.sv
++++ b/corev_apu/fpga/src/ariane_xilinx.sv
+@@ -166,6 +166,8 @@ localparam AxiUserWidth = ariane_pkg::AXI_USER_WIDTH;
+ localparam bit IOMMUDSDelayEnable = 0;
+ localparam int unsigned IOMMUDSFixedDelayInput = 0;
+ localparam int unsigned IOMMUDSFixedDelayOutput = 0;
++localparam bit PnEnable = 0;
++localparam bit HistoryControlEnable = 0;
+ 
+ `AXI_TYPEDEF_ALL(axi_slave,
+                  logic [    AxiAddrWidth-1:0],
+@@ -815,6 +817,8 @@ ariane_peripherals #(
+     .IOMMUDSDelayEnable      ( IOMMUDSDelayEnable      ),
+     .IOMMUDSFixedDelayInput  ( IOMMUDSFixedDelayInput  ),
+     .IOMMUDSFixedDelayOutput ( IOMMUDSFixedDelayOutput ),
++    .PnEnable ( PnEnable ),
++    .HistoryControlEnable ( HistoryControlEnable ),
+     `ifdef KINTEX7
+     .InclSPI      ( 1'b1         ),
+     .InclEthernet ( 1'b1         )
+-- 
+2.34.1
+
