@@ -1,0 +1,125 @@
+--- 0b7939445298a23ea3e131ffd4e003cebb15ac59/rtl/transaction_controller/rv_iommu_banked_ctl.sv
++++ 755cd723b20457418734700fae9e8d6f91d988c8/rtl/transaction_controller/rv_iommu_banked_ctl.sv
+@@ -33,12 +33,9 @@
+ //     gating and their own permission-error slave (each bank instantiates its
+ //     own `axi_err_slv`).  A wrapper admission guard delays new non-owner reads to avoid DMA
+ //     R-to-W dependency cycles. The legacy controller default is unchanged.
+-//   * MRIF is required to be disabled (MSI_DISABLED or MSI_BT_ONLY); the single
+-//     wrapper MRIF port is tied to zero.
+-//   * The legacy `rv_iommu::e3_ctl_t` observer is INCOMPATIBLE with two owners
+-//     (the old counters are not valid shared-owner counters).  `e3_o` therefore
+-//     returns ZERO except for `.quiet = !in_flight_o`.  NO legacy E3 observer
+-//     may consume any other field of this instance.
++//   * Private banks have no MRIF handler. With RestrictedNormalOnly, the global
++//     configuration may retain MSI_BT_MRIF, but the paired TL must reject MSI
++//     requests through its ordinary fault/error path before replying here.
+ //   * The downstream translation engine must echo the `bank` field it received
+ //     in `trans_req_data_o` back in `trans_resp_data_i`.  At most one
+ //     translation is in flight per bank, which makes `bank` an unambiguous
+@@ -50,9 +47,10 @@
+ module rv_iommu_banked_ctl #(
+     /// RISC-V IOMMU configuration struct (global capacities, see RVIOMMUCfgBank)
+     parameter rv_iommu_cfg::rv_iommu_cfg_t RVIOMMUCfg = rv_iommu_cfg::NullCfg,
+-    /// Legacy E3 observer enable. Kept for interface compatibility. NOT USED:
+-    /// the legacy E3 path is incompatible with two bank owners (see header).
+-    parameter bit E3Enable = 1'b0,
++    /// Only the bounded normal-copy N branch may narrow its private banks.
++    /// Shared TL/capabilities and the original S/P branch retain MSI_BT_MRIF.
++    /// The paired TL must reject MSI requests through its normal fault path.
++    parameter bit RestrictedNormalOnly = 1'b0,
+ 
+     /// ORIGINAL AXI ID bit used to select the bank. MUST be < RVIOMMUCfg.AxiIdWidth.
+     parameter int BankIdBit = 0,
+@@ -123,8 +121,7 @@
+     output logic                mrif_fault_valid_o,
+     input  logic                mrif_fault_ready_i,
+ 
+-    output logic in_flight_o,
+-    output rv_iommu::e3_ctl_t e3_o
++    output logic in_flight_o
+ );
+ 
+     //=========================================================================
+@@ -140,7 +137,7 @@
+             $fatal(1, "rv_iommu_banked_ctl: BankIdBit (%0d) must be < AxiIdWidth (%0d)",
+                    BankIdBit, RVIOMMUCfg.AxiIdWidth);
+         end
+-        if (RVIOMMUCfg.MSITrans == rv_iommu_cfg::MSI_BT_MRIF) begin
++        if (RVIOMMUCfg.MSITrans == rv_iommu_cfg::MSI_BT_MRIF && !RestrictedNormalOnly) begin
+             $fatal(1, "rv_iommu_banked_ctl: MRIF is unsupported");
+         end
+         if (RVIOMMUCfg.InclATS) begin
+@@ -172,7 +169,9 @@
+         InclAxiBC           : RVIOMMUCfg.InclAxiBC,
+         InclDbg             : RVIOMMUCfg.InclDbg,
+         InclATS             : 1'b0,
+-        MSITrans            : RVIOMMUCfg.MSITrans,
++        MSITrans            : RestrictedNormalOnly &&
++                              RVIOMMUCfg.MSITrans == rv_iommu_cfg::MSI_BT_MRIF ?
++                              rv_iommu_cfg::MSI_BT_ONLY : RVIOMMUCfg.MSITrans,
+         IGS                 : RVIOMMUCfg.IGS,
+         NumIntVec           : RVIOMMUCfg.NumIntVec,
+         NumHpmCounters      : RVIOMMUCfg.NumHpmCounters,
+@@ -314,7 +313,6 @@
+     for (genvar b = 0; b < 2; b++) begin : gen_bank
+         rv_iommu_trans_ctl_wrap #(
+             .RVIOMMUCfg         (RVIOMMUCfgBank),
+-            .E3Enable           (1'b0),   // legacy E3 counters are per-owner only
+             .ReadAdmissionEnable(1'b1),
+             .FullBufferDID      (24'(10 + b)),
+             .addr_t             (addr_t),
+@@ -614,14 +612,4 @@
+     end
+     `endif
+ 
+-    //=========================================================================
+-    // Legacy E3 observer: INCOMPATIBLE with two owners.
+-    // Only `.quiet` (== !in_flight_o) is meaningful.  All other fields are zero.
+-    // No legacy E3 observer may be attached to this instance.
+-    //=========================================================================
+-    always_comb begin : legacy_e3
+-        e3_o       = '0;
+-        e3_o.quiet = !in_flight_o;
+-    end
+-
+ endmodule
+--- 0b7939445298a23ea3e131ffd4e003cebb15ac59/rtl/translation_logic/rv_iommu_nonblock_hit.sv
++++ 755cd723b20457418734700fae9e8d6f91d988c8/rtl/translation_logic/rv_iommu_nonblock_hit.sv
+@@ -30,8 +30,7 @@
+   input iotlb_content_t iotlb_content_i,
+   output resp_t response_o,
+   output logic response_valid_o,
+-  input logic response_ready_i,
+-  output logic [15:0] diag_o
++  input logic response_ready_i
+ );
+   typedef enum logic [2:0] {IDLE, DC, LEAF, OUT, REJECT} state_t;
+   state_t state_q;
+@@ -110,27 +109,6 @@
+ 
+   assign probe_stable = enable_i && candidate_valid_i && candidate_i == req_q &&
+                         !invalidate_i && ddtp_i == ddtp_q;
+-  // Passive reach/rejection events. They do not participate in any handshake.
+-  always_comb begin
+-    diag_o = '0;
+-    diag_o[1] = window_i;
+-    diag_o[2] = window_i && candidate_valid_i;
+-    diag_o[3] = start;
+-    diag_o[4] = state_q == DC;
+-    diag_o[5] = state_q == DC && dc_ok && probe_stable;
+-    diag_o[6] = state_q == LEAF;
+-    diag_o[7] = state_q == LEAF && leaf_ok;
+-    diag_o[8] = state_q == DC && ddtc_hit_i && !msi_safe;
+-    diag_o[9] = state_q == LEAF && iotlb_hit_i && !msi_leaf_safe;
+-    diag_o[10] = state_q == LEAF && !iotlb_hit_i;
+-    diag_o[11] = accept_o;
+-    diag_o[12] = state_q == DC && !ddtc_hit_i;
+-    diag_o[13] = state_q == DC && ddtc_hit_i && msi_safe &&
+-                 (!dc_ok || !probe_stable);
+-    diag_o[14] = state_q == LEAF && iotlb_hit_i && msi_leaf_safe && !accept_o;
+-    diag_o[15] = enable_i;
+-  end
+-
+   always_ff @(posedge clk_i or negedge rst_ni) begin
+     if (!rst_ni) begin
+       state_q <= IDLE;
