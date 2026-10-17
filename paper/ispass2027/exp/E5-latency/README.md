@@ -94,8 +94,12 @@ E4使用与A3锁定的20个dict计划点(block/condition/mapping_page_bytes)，c
 页大小同时重绑原CLI input.mapping_page_bytes，不允许对调或重标条件。
 `test_analyze_hist.py` 当前九项检查涵盖raw重绑/缓存篡改、最近秩/末桶、空full/carry/精确样本mean、
 Type7/真实n、重复trial拒绝、完整任务内CSV、各层级递归fixture拒绝/传播和E4计划/三向映射绑定；
-主证据`analysis-validation03.log`含实际REJECTED原因，旧`analysis-validation.log`保留f36版本，
+主证据`analysis-validation04.log/.json`含实际REJECTED原因和对应源码哈希，03保留前一通过，旧`analysis-validation.log`保留f36版本，
 `analysis-validation02.log`保留新增拒绝门已生效但旧单测诊断文字正则未同步的失败，未抹去历史。
+`protocol-compat01/receipt.json` 是A3实际冻结E4 collector/CLI协议的一次端到端兼容：
+leaf4k/leaf2m/closing_spill三个显式synthetic样本全部通过内部raw重绑，公开全部拒绝；
+以A3真实20点计划对一个内部fixture prefix生成16段/512桶报告，全部fixture且source_board_cases=0。
+完整原协议源码/CLI/fixture/分析输入与输出都保留，未重复执行A3驱动/CLI回归，也未做板测。
 
 `rtl-validation/runs/run03/`：真实生产stage/path/observer，923拍全部旧字段等价、18集成场景、98年龄边界等。
 `driver-validation/runs/run02/`：48项真实函数host-MMIO fixture，`driver-validation/object01/`：RISC-V目标编译0warnings。
