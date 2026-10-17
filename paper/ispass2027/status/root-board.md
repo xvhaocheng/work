@@ -3,7 +3,7 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Verification Status: PARTIAL（E1b、E3 P0、E6角色及E4/E5已完成；G已完成；E2诊断失败后恢复；完整E3失败停止，E6-PN/E3-lite准备）
-- Updated: 2026-10-17T19:07:49.361026+00:00 / 2026-10-18 JST
+- Updated: 2026-10-17T19:17:10.235166+00:00 / 2026-10-18 JST
 
 E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PTE/PA/data/unmap/taint0/最终OBS4+PATH+16×32桶全部通过。V硬件时间中位数4KiB 139.19783ms、2MiB106.88277ms；逐block时间下降中位23.2191%、吞吐提升中位30.2406%，V软件HPM bracket的miss/S1 PTW中位8192→0。E4统一CSV3824行，E5同20点/320stage/10240桶，E5不另计新试次。完整论文包E4-pagesize/paper/e4-common-v2-final01、E5-latency/paper/e4-common-v2-final01；Root另以原record硬件cycles/Fraction独立复算10对通过。
 
@@ -15,7 +15,7 @@ E2 timer probe 已完成唯一 N2_A1 诊断对照，原 CLI/数据/排空/taint0
 
 E6-PN：五种合法配置S/N/P隔离/PN/P共享历史的合同已冻结（raw MODE0/1/2/3/6）。Root直接源码与实际原件核验已接受P/N/history、原前端gap、S15离线门、被动时长、原事实tap、新独立MODE控制、真实双backend及DS transport保护小批。真实N backend在WREADY0/AW可走时接收完整4096B；Root原raw重放109726项，另源绑定85项通过。只读helper已适配P共享历史且实际244项/71情境通过，无MODE/GAP写操作。真实MSIPTW首拍后24拍指定尾响应空窗始终nonquiet；Root实际重放168906项通过，默认关闭不实例17FF tracker。各结果仅有限组件证据，尚无完整PN构建/板点。
 
-历史开关只有现有local-touch输入门，无新增IOTLB状态；目前未见显著增险证据，纳入首DS0构建计划，物理风险仍待原设置构建。DS0主150+S15 15+独立gap30+DS50原四模式40，共235；如首构前发现显著时序风险，退回205且说明。原时序硬门/最多一次历史route后物理优化/S15每格≤0.5%不变，DS50只在实际S15过后构建。当前三席并行：TC/vendor6082/95f和SW/program0dbd已Root有限接受；A1实施TL/MSIPTW完整只读quiet与稳定debug来源修正，A2新增独立受限pn-config writer，A3补实际外层_intf透传（typed30bc已有限接受，原“平台直接typed实例”判断已纠正，实际control-ID6新验证另行保留）；三席不触硬件，均须Root实际审查后整栈集成。
+历史开关只有现有local-touch输入门，无新增IOTLB状态；目前未见显著增险证据，纳入首DS0构建计划，物理风险仍待原设置构建。DS0主150+S15 15+独立gap30+DS50原四模式40，共235；如首构前发现显著时序风险，退回205且说明。原时序硬门/最多一次历史route后物理优化/S15每格≤0.5%不变，DS50只在实际S15过后构建。当前三席并行：A1收尾TL/MSIPTW并直接集成双TC/共享TL和已接受SW；A3外围两文件接线已形成，固定接口并行推进，等待实际top到齐后集中检查；A2受限pn-config writer已完成并接受，继续S15采集入口一次主机调度验证。实际_intf b44dc已接受，control-ID6/data-ID2有限验证81项通过。尚未启动完整PN FPGA编译。
 
 E2两个版本均在第6点N4_A8失败，各5点分别冻结，不混池；timer重试/再入现象有证据，CPU AXI根因未定。65b候选不能称修复成功。
 
