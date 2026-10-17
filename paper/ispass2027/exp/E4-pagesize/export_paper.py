@@ -147,6 +147,7 @@ def read_collection(run,source_root,e5_dir,*,_internal_fixture=False):
     require(manifest['script_sha256']==sha(Path(collector.__file__).read_bytes()),'actual collector source changed')
     require(manifest['histogram_validator_sha256']==sha((e5_dir/'hist_records.py').read_bytes()),'actual histogram validator changed')
     require(manifest['e5_identity_helper_sha256']==sha((e5_dir/'collect_e5.py').read_bytes()),'actual identity helper changed')
+    require(manifest['software_profile_helper_sha256']==sha(Path(collector.profiles.__file__).read_bytes()),'actual software profile helper changed')
     load_path,load=linked(manifest,'load_manifest')
     fpga_path,fpga=linked(manifest,'fpga_manifest')
     source_path,source=linked(manifest,'source_record')
@@ -155,13 +156,13 @@ def read_collection(run,source_root,e5_dir,*,_internal_fixture=False):
     delivery_path,delivery=read(package/'manifest.json')
     require(sha(observed[delivery_path])==manifest['package_manifest_sha256'],'package manifest bytes changed')
     require((package/delivery.get('source_record','source.json')).resolve()==source_path,'package/source binding')
-    collector.validate_software(software,manifest['kernel_release'])
     require(software==manifest['selected_software'],'selected software cache differs from original')
     bound=identity.identity(package,load_path,fpga_path)
     bound['workload']='E4: V0/A1, perbuffer2MiB/total8MiB, COPY4096,N4096,W256,4Kvs2M leaves,20trials'
     require(bound==manifest['e5_identity'] and all(manifest[k]==v for k,v in bound.items()),'actual package/load/FPGA/source identity differs')
-    require(bound['actual_commits']['linux']==collector.LINUX and bound['actual_commits']['platform']==collector.PLATFORM,'immutable common software source')
-    require(load['boot_id']==manifest['boot_id'] and load['kernel_release']==collector.KERNEL,'load/boot/kernel binding')
+    profile=collector.profiles.validate_bound_software(bound,software,source,fpga)
+    require(manifest['software_profile']==profile,'selected software profile differs')
+    require(load['boot_id']==manifest['boot_id'] and load['kernel_release']==software['kernel_release'],'load/boot/kernel binding')
     fresh,seen=[],set()
     for index,item in enumerate(cached):
         point=planned[index]
@@ -183,6 +184,9 @@ def read_collection(run,source_root,e5_dir,*,_internal_fixture=False):
     synthetic=bool(markers) or _internal_fixture
     result=summarize(fresh,manifest,synthetic=synthetic)
     result.update(observed_synthetic_markers=markers,
+        software_profile=profile,
+        software_profile_helper={'path':str(Path(collector.profiles.__file__).resolve()),
+                                 'sha256':sha(Path(collector.profiles.__file__).read_bytes())},
         sources=[{'path':str(path),'sha256':sha(raw)} for path,raw in observed.items()],source_root=str(source_root),
         parser_source={'path':str(Path(collector.__file__).resolve()),'sha256':sha(Path(collector.__file__).read_bytes())},
         histogram_helper={'path':str(e5_dir/'hist_records.py'),'sha256':sha((e5_dir/'hist_records.py').read_bytes())},
@@ -255,6 +259,7 @@ def export(run,source_root,e5_dir,output,sample_set,*,_internal_fixture=False):
         'evidence_level':result['evidence_level'],'campaign_complete':result['campaign_complete'],
         'source_cases':20,'run':str(Path(run).resolve()),'source_root':str(Path(source_root).resolve()),
         'converter_sha256':result['converter_sha256'],'parser_source':result['parser_source'],
+        'software_profile':result['software_profile'],'software_profile_helper':result['software_profile_helper'],
         'histogram_helper':result['histogram_helper'],'inputs':result['sources'],'rows':len(rows),
         'quantile_method':QUANTILE_METHOD,'sample_set':sample_set}))
     return result,rows

@@ -134,10 +134,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix='e4-recovery-host-') as directory:
         directory=Path(directory);(directory/'uart').mkdir()
         manifest={'schema':'ispass2027.e4_pagesize.run.v1','planned_cases':collector.plan(),
-                  'kernel_release':collector.KERNEL,'boot_id':boot,'ds':'0/0'}
+                  'kernel_release':collector.KERNEL,'boot_id':boot,'ds':'0/0','software_profile':'e4-e5-v1'}
         for key in ['bit_sha256','load_manifest_sha256','source_record_sha256','software_manifest_sha256',
                     'fpga_manifest_sha256','package_manifest_sha256','script_sha256','histogram_validator_sha256',
-                    'e5_identity_helper_sha256']:manifest[key]='HOST-FIXTURE-NO-BOARD'
+                    'e5_identity_helper_sha256','software_profile_helper_sha256']:manifest[key]='HOST-FIXTURE-NO-BOARD'
         (directory/'manifest.json').write_text(json.dumps(manifest))
         paths=[]
         for index,point in enumerate(collector.plan()[:5]):
@@ -146,10 +146,13 @@ def main():
         recovered,bound_paths=collector.recover_prefix(directory,manifest,histogram)
         assert len(recovered)==5 and len(bound_paths)==5 and recovered[-1]['case']==5
         checks.append({'name':'complete_same_boot_five_point_prefix_recovered_from_raw','passed':True})
-        for kind in ['identity','timeout','command','sequence','boot']:
+        for kind in ['identity','profile','profile_helper','source','timeout','command','sequence','boot']:
             saved=paths[2].read_bytes();changed=json.loads(saved)
             target=copy.deepcopy(manifest)
             if kind=='identity':target['software_manifest_sha256']='wrong'
+            if kind=='profile':target['software_profile']='unknown'
+            if kind=='profile_helper':target['software_profile_helper_sha256']='wrong'
+            if kind=='source':target['source_record_sha256']='wrong'
             if kind=='timeout':changed['exit_code']=None
             if kind=='command':changed['command']='wrong'
             if kind=='sequence':changed['stdout']=changed['stdout'].replace(f'PRE_SEQ={seq+1}',f'PRE_SEQ={seq+11}')

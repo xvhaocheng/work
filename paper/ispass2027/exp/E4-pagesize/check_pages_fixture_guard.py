@@ -9,7 +9,7 @@ import sys
 import tempfile
 import collect_pages as c
 
-WRAPPER='''import builtins,json,runpy,sys
+WRAPPER='''import builtins,json,pathlib,runpy,sys
 attempts=[]
 original=builtins.__import__
 def guarded(name,*args,**kwargs):
@@ -19,6 +19,7 @@ def guarded(name,*args,**kwargs):
     return original(name,*args,**kwargs)
 builtins.__import__=guarded
 sys.argv=sys.argv[1:]
+sys.path.insert(0,str(pathlib.Path(sys.argv[0]).resolve().parent))
 try:
     runpy.run_path(sys.argv[0],run_name='__main__')
 except AssertionError as error:
@@ -49,15 +50,15 @@ def main():
     with tempfile.TemporaryDirectory(prefix='e4-nested-guard-') as temporary:
         root=Path(temporary);package=root/'package';package.mkdir();(package/'test.bit').write_bytes(b'HOST ONLY')
         delivery={'status':'ready_for_collection','kernel_release':c.KERNEL,'source_record':'source.json',
-                  'artifacts':{'ds0_bit':{'file':'test.bit','sha256':'b'*64}}}
-        source={'actual_commits':{'platform':c.PLATFORM,'linux':c.LINUX,'cva6':identity.CVA6,'iommu':'c'*40,'opensbi':'e'*40}}
-        load={'status':'boot_identity_verified','kernel_release':c.KERNEL,'boot_id':'00000000-0000-0000-0000-000000000000','bit_sha256':'b'*64}
-        fpga={'status':'passed','selected_cva6':identity.CVA6,'selected_iommu':'c'*40,
+                  'artifacts':{'ds0_bit':{'file':'test.bit','sha256':c.profiles.BIT_SHA256}}}
+        source={'actual_commits':{'platform':c.PLATFORM,'linux':c.LINUX,'cva6':identity.CVA6,'iommu':c.profiles.HARDWARE_IOMMU,'opensbi':software['selected_opensbi']}}
+        load={'status':'boot_identity_verified','kernel_release':c.KERNEL,'boot_id':'00000000-0000-0000-0000-000000000000','bit_sha256':c.profiles.BIT_SHA256}
+        fpga={'status':'passed','selected_cva6':identity.CVA6,'selected_iommu':c.profiles.HARDWARE_IOMMU,
               'parameters':{'observer_version':4,'PathDepth':4,'histogram_stages':16,'histogram_bins':32,
                             'histogram_counter_bits':32,'histogram_scheme':1,'ds_delay_enable':False,'ds_cycles':[0,0],'clock_hz':50000000},
               'timing':{'wns_ns':.1,'setup_failing':0,'hold_failing':0,'pulse_failing':0},'routing_errors':0,
               'routed_boundary':{'passed':True,'cpu_period_ns':20,'expected_delay_enable':0,'delay_cell_count':0,'forbidden_research_cell_count':0},
-              'artifacts':{'test/ariane_xilinx.bit':'b'*64}}
+              'artifacts':{'test/ariane_xilinx.bit':c.profiles.BIT_SHA256}}
         originals={'package':delivery,'source':source,'load':load,'fpga':fpga,'software':software}
         paths={'package':package/'manifest.json','source':package/'source.json',
                'load':root/'load.json','fpga':root/'fpga.json','software':root/'software.json'}
