@@ -13,6 +13,13 @@ log = (HERE / 'driver-validation/runs/run02/fixture.log').read_text()
 FIXTURE = log.split('BEGIN_VALID_V4_FIXTURE_LOG\n', 1)[1].split('END_VALID_V4_FIXTURE_LOG', 1)[0]
 
 
+def v5_fixture():
+    """Explicit protocol fixture; only INFO changes, stage buckets stay schema1."""
+    return re.sub(r'idma_hist_info seq=(\d+) [^\n]+',
+                  r'idma_hist_info seq=\1 valid=1 version=5 schema=2 bins=32 count_bits=32 '
+                  r'time_bits=32 depth=64 overflow=0 raw=0x0040000020202002', FIXTURE)
+
+
 def item_from_fixture():
     paths = {}
     for seq, role, channel, stage, raw in re.findall(r'idma_path_obs seq=(\d+) role=([va]) channel=([rw]) stage=(\d+) ([^\n]+)', FIXTURE):
@@ -37,6 +44,55 @@ class HistTests(unittest.TestCase):
         self.assertEqual(hist.bucket_bounds(1), (1, 1))
         self.assertEqual(hist.bucket_bounds(2), (2, 3))
         self.assertEqual(hist.bucket_bounds(31), (1 << 30, (1 << 32) - 1))
+
+    def test_v5_explicit_info_and_unchanged_stage_schema(self):
+        item = item_from_fixture()
+        text = v5_fixture()
+        v4 = hist.parse_lines(FIXTURE, item)
+        v5 = hist.parse_lines(text, item)
+        self.assertNotIn('depth', v4['info'])
+        self.assertEqual(v5['info']['depth'], 64)
+        self.assertEqual(v5['info']['schema'], 2)
+        self.assertEqual(v5['info']['raw'], 0x0040000020202002)
+        self.assertEqual(v4['stages'], v5['stages'])
+        self.assertTrue(all(stage['schema'] == 1 for stage in v5['stages'].values()))
+        self.assertEqual(list(hist.bin_rows(item, v4)), list(hist.bin_rows(item, v5)))
+        full = '\nCASE_EXIT=0\n' + text + '\nTAINT_AFTER=0\n'
+        self.assertEqual(hist.attach_from_output(full, item), v5)
+
+    def test_v5_rejects_wrong_version_depth_format_and_overflow(self):
+        cases = [
+            ('unknown_version', 'version=5', 'version=6'),
+            ('wrong_depth', 'depth=64', 'depth=4'),
+            ('missing_depth', ' depth=64', ''),
+            ('wrong_info_schema', 'version=5 schema=2', 'version=5 schema=1'),
+            ('wrong_bins', 'schema=2 bins=32', 'schema=2 bins=16'),
+            ('wrong_count_bits', 'count_bits=32', 'count_bits=16'),
+            ('wrong_time_bits', 'time_bits=32', 'time_bits=64'),
+            ('overflow_flag', 'overflow=0 raw=', 'overflow=1 raw='),
+            ('raw_depth_mismatch', 'raw=0x0040000020202002', 'raw=0x0004000020202002'),
+            ('raw_reserved_high', 'raw=0x0040000020202002', 'raw=0x0140000020202002'),
+            ('raw_reserved_middle', 'raw=0x0040000020202002', 'raw=0x0040000120202002'),
+            ('raw_overflow', 'raw=0x0040000020202002', 'raw=0x0040001020202002'),
+            ('raw_schema_mismatch', 'raw=0x0040000020202002', 'raw=0x0040000020202001'),
+            ('stage_schema_changed', 'stage=0 valid=1 schema=1', 'stage=0 valid=1 schema=2'),
+        ]
+        for name, old, new in cases:
+            with self.subTest(name=name):
+                text = v5_fixture().replace(old, new, 1)
+                self.assertNotEqual(text, v5_fixture())
+                with self.assertRaises(ValueError) as error:
+                    hist.parse_lines(text, item_from_fixture())
+                print(f'REJECTED {name}: {error.exception}')
+
+    def test_v4_field_set_and_same_sequence_version_consistency(self):
+        for name, text in (
+                ('v4_extra_depth', FIXTURE.replace('version=4', 'depth=4 version=4')),
+                ('v4_wrong_schema', FIXTURE.replace('version=4 schema=1', 'version=4 schema=2')),
+                ('mixed_info_versions', FIXTURE + re.search(r'idma_hist_info[^\n]+', v5_fixture())[0] + '\n')):
+            with self.subTest(name=name), self.assertRaises(ValueError) as error:
+                hist.parse_lines(text, item_from_fixture())
+            print(f'REJECTED {name}: {error.exception}')
 
     def test_missing_stage(self):
         text = re.sub(r'idma_path_hist[^\n]+\n', '', FIXTURE, count=1)
