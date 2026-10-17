@@ -114,3 +114,9 @@ Root完整审E4 20点collector、实际CLI/leaf proofs/共享PATH0等式/全部h
 完整E3容量提交`1d587125eee690e623e6ffae13e70f9bbe989adc`已审：Root核4文件完整diff及实际测试源SHA等于commit，默认4的v3/v4逐拍gold、Depth64全port/role/channel/stage的64条full99且area=sum、年龄/overflow/wrap证据保留，top连接有限证据不冒称SoC编译。固定平台`dfebcc0425bab25567e8514d156650a608530be1`及独立builder已审，允许启动唯一full-E3 DS0构建。显式Vivado generic64在预合成记录，版本标签明示source-declared，Linux da6仅reference、ABI5软件尚未实现，不用E5验收冒替。
 
 acece共同压缩镜像10,520,154B已在913.29秒传入并正常bytes-ack，现`p0-common-software-write01`更新SD；模块已加载的旧boot不再作正式测量。写入成功后按新顺序P045→E290，下一正式boot要求新release且taint0。没有追加远端hash或SD回读。
+
+## P0加载与后续准备（2026-10-17 14:22Z）
+
+共同软件SD更新于14:17:50Z返回0，P0新DS0 BIT加载在14:17:52Z启动，仍在正常启动过程；未记为已接受试次。唯一有限续接将在boot身份验证成功后启动45点collector，随后仍是同Linux切原DS0测E2。E4/E5纯host包已复制元数据并硬链接本机产物到`board/packages/e4-e5-20261017/`，无板操作。E4完整论文出口Root29项有限检查及OBS4限定2项通过；共享hist helper显式接受OBS5/INFO2/Depth64，Root26项parser/analysis/collector检查通过，E4父采集器仍锁OBS4。
+
+Root已直接读ABI5首批实际geometry/offset/prefix helper、固定64/544B UAPI及OBS4/5驱动差异，接受有界几何和日志合同，ABI5 ioctl尚未完成，不称软件已就绪。A2继续独立驱动小批，full-E3 DS0硬件在独立编译。A3准备E2不可变partial出口，必须保留真实N/90与原running/failed状态，原完整出口不放宽。E6来源包已审；按用户后续RTL/Linux准备授权，先做P4M G最小前端，V/A各固定4096×4KiB自然完成、分别计完整时间，M的S/N/P/PN仅保留设计。该准备不抢占E4/完整E3顺序，不恢复机制探索。

@@ -14,7 +14,7 @@
 
 DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”的两档100次已全部完成；Root只读复核并冻结最终200试次包（含历史100）。用户授权协调后已统一排程。Root本地12:56:37Z重复启动被UART锁在触硬件前拒绝，失败原样保留，不计试次。
 
-已完成DS campaign为 `/home/xvhaocheng/work/paper/ispass2027/board/runs/ds-sweep-20261017-01/`，launch回执returncode=0。原DS0+旧pathv3加载和角色互换30次均已完成通过，结果为`exp/E6-mitigation/paper/e6-role-swap-ds0/`。当前唯一板任务是`runs/p0-common-software-write01/`：完整压缩payload已传入，正在用pathv3同版SPI模块沿既有updater更新一次SD。成功后加载P0新DS0 BIT/共同内核，先45点E3再90点E2。Root被锁拒绝的记录在本worktree `runs/ds-sweep-campaign-launch01/`及`runs/ds-sweep-20261017-01/`，不计为已加载或性能试次。
+已完成DS campaign为 `/home/xvhaocheng/work/paper/ispass2027/board/runs/ds-sweep-20261017-01/`，launch回执returncode=0。原DS0+旧pathv3加载和角色互换30次均已完成通过，结果为`exp/E6-mitigation/paper/e6-role-swap-ds0/`。共同软件SD更新于14:17:50Z成功，当前唯一板任务为`runs/p0-ds0-load01/`，加载P0新DS0 BIT并启动`6.5.0-rc2-ispass2027-p0-multi-v1`。boot身份验证通过后采45点E3，再换原DS0 BIT采90点E2。Root被锁拒绝的记录在本worktree `runs/ds-sweep-campaign-launch01/`及`runs/ds-sweep-20261017-01/`，不计为已加载或性能试次。
 
 | 原优先级 | 任务 | 状态 | 采集规模 | 预计板时 / 条件 |
 | --- | --- | --- | --- | --- |
@@ -22,11 +22,11 @@ DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/h
 | 2 | E1b DS25 | 完成50/50，五条件各10，全部接受；阶段CSV已冻结 | Solo/A1/A8/A16/A64 各 10 次 = 50 次 | 约 20–30 分钟，须 50MHz、WNS≥0、违例端点和 routing errors 全零 |
 | 3 | E1b DS100 | 完成50/50，五条件各10，全部接受；最终四档200试次包已冻结 | 同上 50 次 | 已完成；两档仅换 BIT，复用已写 pathv3 |
 | 4 | E2 DS0 设备数 | 多设备驱动/CLI/90点collector已审核，共用软件delivery已通过 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
-| 5 | E3 DS0 论文子集 | 已接受ABI5/BTC3、独立Depth64观测版本设计；A2实施首批前端 | 六种大小及三类流量组合；新协议等16MiB有效字节 | 用户上限6小时；候选150新点按实际用时定稿，不与P045混池 |
+| 5 | E3 DS0 论文子集 | BTC3/Depth64已审，14:10:50Z启动独立DS0构建；ABI5驱动分批审查 | 六种大小及三类流量组合；新协议等16MiB有效字节 | 用户上限6小时；候选150新点按实际用时定稿，不与P045混池 |
 | 6 | E4 DS0 页大小 | E4/E5共同软件首次完整构建通过；20点collector已审并通过Root38+14+11主机检查 | 4KiB 对2MiB，各点10次，未测 | 不混当前稳定软件；与已审E5 Linux后续共同编译 |
 | 7 | E6 DS0 角色互换 | 完成30/30，Solo/A1/A8各10；原DS0 BIT及旧pathv3 | V=DMA1、A=DMA0；Solo/A1/A8各10次 | 已完成；同boot/区组A8/A1中位数1.10434084，旧payload不再加测 |
 | 附加 | E5 延迟分布 | 被动直方图RTL/Linux已审，独立DS0 BIT最终通过，等待与E4共同采集 | 16阶段×32桶；当前尚无新直方图板测 | 保留carry/overflow/最终有效性，量化分位所在桶区间 |
-| 最后准备 | E6 P/N/PN/P4M 缓解 | 按现有论文清单独立分支准备，尚未分配实施 | 尚无 | 先审统一基座方案，再验证编译；不恢复新机制探索 |
+| 最后准备 | E6 P/N/PN/P4M 缓解 | 原始来源和设计已审，先分配P4M G前端小批；M保持设计 | G候选40点，未测 | G采用两lane各固定4096个4KiB任务；接口/验证后再编译入队 |
 
 板时暂以既有 DS0 50 次约 785 秒（约 15.7 秒/点）加配置切换与日志开销粗估，不是硬件运行时间或保证。构建耗时不计为占板。能力受阻的任务保持未测，可推进其余合法任务。
 
@@ -57,3 +57,5 @@ E5 hist构建首次输出误放共享main/out，已在早期停止该独占20进
 E5最终BIT于14:06:29Z通过：WNS+0.126ns/WHS+0.047ns/WPWS+0.062ns，全部失败端点0，290520/290520可布线net全路由、routing errors0，DS0直接wire、CPU20ns。正式完整manifest和原报告在`exp/E5-latency/build/completed02/`；BIT SHA `d934846ecb7f2fd80bcb7d2f18889ae0fd8c9bbd28a0f5fef8e949614139221c`。完整E3的1d587容量批和固定dfebcc builder已审，允许独立构建；尚未记为该版本时序通过。
 
 full-E3 DS0唯一构建已于14:10:50Z启动，`exp/E3-workloads/artifacts/full-e3-ds0-build01/`（A2独立worktree），当前running；CVA6 1d587、平台dfebcc、显式Depth64，Linux da6只作reference。构建不占板，当前板卡仍仅SD update。
+
+14:22Z更新：SD updater成功返回0后，Root有限续接已在14:17:52Z启动P0 BIT加载；另一个有限续接只在boot身份成功后启动45点collector，无第二上板任务。E4/E5只读运行包已复制元数据并硬链接冻结产物到`board/packages/e4-e5-20261017/`，没有启动硬件或重复hash。E2 immutable-prefix两个纯host出口已交A3实施，完整90点出口仍严格；E6只先准备G(P4M)最小批，P/N/PN的M移植未启动。
