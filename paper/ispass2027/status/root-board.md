@@ -11,7 +11,7 @@
 ## 今日进展
 
 - 已创建独立 worktree `/home/xvhaocheng/work-root-a`，分支 `ispass/root-a`，起点 main `01f981a9c603fa909fdb2fb22450aa7c5197271f`。未切主目录分支，未改共享汇总文件。
-- 已分派 A1 接续 DS25/DS100 构建与 E1b 运行包、A2 准备 E3、A3 核查 E2/E5/E4/E6。所有 agent 使用 gpt-6.1-sol / ultra，遵守共享 IOMMU Codex-only；子 agent 不操作板。
+- 已分派 A1 接续 DS25/DS100 构建与 E1b 运行包、A2 准备 E3、A3 核查 E2/E5/E4/E6。子席按用户指定的 gpt-6.1-sol / ultra 启动；主会话保持当前模型，不切配置，遵守共享 IOMMU Codex-only；子 agent 不操作板。
 - 已审核并将三席的第一批准备分支合入 `ispass/root-a`：E1b 构建/采集/任务内长表，E3 原始能力证据与 P0 方案，E6 DS0 角色互换采集器。Root 工作树的17项调度/采集接口、6项独立长表、15项历史分析拒绝检查、14项角色采集协议检查实际通过；均为主机检查，不记为新板测。
 - 已发现并接续原有两个运行中的 DS 构建，输出在主工作区 `iommu-platform/out/ispass2027-20261017-ds25-01`、`...-ds100-01`；不重复构建、不改变其输入。验收尚未完成。
 - 已建立[唯一板测队列](../board/queue.md)。UART 身份回执确认板仍为 DS50/pathv3，boot `b1eaa85f-01d7-4976-9dac-b57cc8af49b7`、taint=0，四 DMA 节点齐全；未切 BIT、未执行新增性能测量。
@@ -27,9 +27,15 @@
 
 E3 已直接核实真实 pathv3 batch 在 CLI、driver、RTL 均固定 4096B，并且 V/A 共用 chunk；全局实验锁也不允许通过两个进程拼接。A2 的 `exp/E3-workloads/p0-change-option.md` 给出只覆盖45点的 packed-ring、新独立长度操作、真实字节验证和 batch 地址推进方案。用户已明确回复“批准仅P0最小改动、构建和45点板测”。Root 接受该限定方案，已指派 A2 分小批实施和验证；完整三类负载、其他 RTL 扩展未获此次扩围。DS25/100 仍先使用已写 pathv3 payload，新版本身份和结果另存。
 
-E2 当前只有两条流、一个 `aggressor_id`，三至四路需软件接口扩展；E4 已确认实验driver逐4KiB建图，2MiB需显式软件映射及实际leaf验证，[请求](../exp/E4-pagesize/change-request.md)保持未实施。E5 baseline v3 仅导出 sum/count/max 等聚合，不导出逐请求样本或直方图，只能复用运行中已有的 mean/max。E6 角色互换的动态角色 ARM 与 PATH mux 已直接核读，现有 BIT/driver 可以执行，独立 collector 已通过14项主机协议检查。E4/E5 需要的内核、driver 或 RTL 变化及 E6 缓解构建仍只提交 change-request，等待用户决定。
+E2 当前只有两条流、一个 `aggressor_id`，三至四路需软件接口扩展；E4 已确认实验driver逐4KiB建图，2MiB需显式软件映射及实际leaf验证，[请求](../exp/E4-pagesize/change-request.md)保持未实施。E5 baseline v3 仅导出 sum/count/max 等聚合，不导出逐请求样本或直方图，只能复用运行中已有的 mean/max。E6 角色互换的动态角色 ARM 与 PATH mux 已直接核读，现有 BIT/driver 可以执行，独立 collector 已通过16项主机协议检查。E4/E5 需要的内核、driver 或 RTL 变化及 E6 缓解构建仍只提交 change-request，等待用户决定。
 
 E2 实际冻结硬件 `ariane_soc::RVIOMMUCfg.NumHpmCounters=31`，6槽是软件会话限制。Root 已接受先做有界 multi HPM 软件接口：四个DID×三event共12槽，保留旧pair/Solo六槽及安全恢复语义；不改 RTL。多干扰者驱动批次须在 P0 驱动接口稳定后审查整合，V精确硬件窗口保留，未被PATH选中的设备不得冒充已有逐设备PATH观测。
+
+P0 前端三处RTL变更已直接审查，79项有限真实frontend验证通过；独立DS0新BIT正在构建。P0驱动共用旧mapping/cache/排空路径，38项实际函数模型检查和RISC-V对象编译通过；已与通过68场景迭代及实际对象编译的multi HPM源码合入内部Linux稳定提交 `f81c82c24a8c6833c14a1d5c6fa315a8b26e1345`。新payload等待multi driver整合后统一生成，不提前写卡。上述检查不等于新板测或cache/RTL事件性能证明。
+
+新P0/E2/E6采集器的共享计数采用[同窗PATH stage0完成数](../board/observer-shared-counts.md)，保留私有入口和各stage的独立守恒，避免把mux spill库存边界误判为DMA错误。Root对既有100试次实际回放，200条读/写共享等式全部匹配；新几何仍不假定私有/共享残差恒为0。原E1b采集器当前不变，若实际触发解析问题保留完整raw后处理，不重测替换。
+
+软件配置集中排程已明确：旧pathv3先完成E1b两档和旧DS0上的角色互换，然后只更新一次共同新payload，继续原DS0 BIT的E2及P0新DS0 BIT的小子集。这样角色对照保留与历史baseline相同Linux，不回写旧镜像。P0以外的三形态、页大小、直方图和缓解扩展均不随编译许可顺带实施。
 
 ## 待合并内容
 

@@ -8,7 +8,7 @@
 `/home/xvhaocheng/work/iommu-platform/out/ispass2027-20261017-ds0-01/src/cva6`。
 
 - `HW/corev_apu/fpga/src/ariane_peripherals_xilinx.sv:910` 起将 observer 的私有 AR/AW 接入 `axi_dma_tr_req/resp`；共享 AR/AW 则接 `axi_iommu_tr_req/resp`。
-- 同文件 `990–1014` 的 `axi_mux` 实例不覆盖 `SpillAr` 或 `SpillAw`。`HW/vendor/pulp-platform/axi/src/axi_mux.sv:46`、`:50` 两参数默认均为1。因此私有握手和共享握手之间存在寄存器库存。
+- 同文件 `990–1014` 的 `axi_mux` 实例不覆盖 `SpillAr` 或 `SpillAw`。`HW/vendor/pulp-platform/axi/src/axi_mux.sv:49`、`:53` 两参数默认均为1。因此私有握手和共享握手之间存在寄存器库存。
 - `HW/corev_apu/fpga/src/dma_path_observer.sv:132–136`：stage0 的 enter 是选中端口首次 offer，leave 是带对应 mux ID 的共享 AR/AW 握手；每个 role/channel 独立统计。
 - 同文件 `37–44,73–87` 的 `full` 与 `carry` 只在 active 窗内 leave 时累加；前者在窗内进入，后者在窗前进入。同一窗内的全部 stage0 leave 数为 `full+carry`。
 
