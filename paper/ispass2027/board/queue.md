@@ -16,7 +16,7 @@ DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/h
 
 E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PTE/PA/data/unmap/taint0/最终OBS4+PATH+16×32桶全部通过。V硬件时间中位数4KiB 139.19783ms、2MiB106.88277ms；逐block时间下降中位23.2191%、吞吐提升中位30.2406%，V软件HPM bracket的miss/S1 PTW中位8192→0。E4统一CSV3824行，E5同20点/320stage/10240桶，E5不另计新试次。完整论文包E4-pagesize/paper/e4-common-v2-final01、E5-latency/paper/e4-common-v2-final01；Root另以原record硬件cycles/Fraction独立复算10对通过。
 
-当前唯一板任务 g-ds0-20261018-01 正式G40采集：2026-10-17T16:45:49.663115+00:00观测已接受9/40，status=running，无补采/重试。G BIT8dd6993f已成功加载，新boot 79a6975d-877d-4a9d-8e19-08834275be7a、Linux69d/g-v1、taint0验证通过。独立G最终资格为50MHz、WNS+0.177/WHS+0.036/WPWS+0.062ns，setup/hold/pulse失败端点/routing errors全0，295368/295368 nets全路由。完整E3唯一resume仍未qualified，因此G先就绪先测完，之后共用同G内核只切BIT。G collector Root100+17、分析41+两campaign ID检查均通过；完整40之前不宣称每条件n10或正式性能汇总。E2默认off probe Image已通过，Root审两点命令包并独立实跑23host检查通过，运行包/压缩payload/SPI均已准备，仅离线、尚未上板。
+G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。当前唯一板动作e2-probe-upload01-launch，只向当前G boot的新/tmp文件上传匹配G SPI与已编probe gzip，不写SD/重启/跑点；完成后Root据E3是否最终qualified再选下一加载。完整E3唯一resume仍未qualified；A2并行冻结真实G图表/结果报告。E2两点诊断包/Image/host23已接受，尚无新E2板点。
 
 E2两轮各接受5/90后在N4_A8失败，性能采集暂停，独立诊断；不会原样重试、换版本混池或放宽taint门。
 
@@ -30,7 +30,7 @@ E2两轮各接受5/90后在N4_A8失败，性能采集暂停，独立诊断；不
 | 6 | E4 DS0 页大小 | 20/20完成；真实leaf/data/直方图全部通过 | 4KiB 对2MiB，各10次，20/20完成 | 同boot十对、同负载、仅改变IOMMU leaf；已产正式CSV与图 |
 | 7 | E6 DS0 角色互换 | 完成30/30，Solo/A1/A8各10；原DS0 BIT及旧pathv3 | V=DMA1、A=DMA0；Solo/A1/A8各10次 | 已完成；同boot/区组A8/A1中位数1.10434084，旧payload不再加测 |
 | 附加 | E5 延迟分布 | 被动直方图随E420/20完成，正式桶CSV与原桶区间图已接受 | 完成同一E420点的16阶段×32桶；不另计20新试次 | 保留carry/overflow/最终有效性，量化分位所在桶区间 |
-| 最后准备 | E6 P/N/PN/P4M 缓解 | 原始来源和设计已审，先分配P4M G前端小批；M保持设计 | G正式软件/40点collector已审，独立BIT待最终qualified；未测 | G采用两lane各固定4096个4KiB任务；若先qualified可利用E3构建等待时间测完40点 |
+| 最后准备 | E6 P/N/PN/P4M 缓解 | 原始来源和设计已审，先分配P4M G前端小批；M保持设计 | G40/40完成，独立BIT/软件/collector/analysis均通过，四条件各n10 | G采用两lane各固定4096个4KiB任务；若先qualified可利用E3构建等待时间测完40点 |
 
 板时暂以既有 DS0 50 次约 785 秒（约 15.7 秒/点）加配置切换与日志开销粗估，不是硬件运行时间或保证。构建耗时不计为占板。能力受阻的任务保持未测，可推进其余合法任务。
 

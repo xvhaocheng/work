@@ -1,6 +1,6 @@
 # 实际板资源 2026-10-17T16:37:46.613829+00:00
 
-当前唯一板任务 g-ds0-20261018-01 正式G40采集：2026-10-17T16:45:49.663115+00:00观测已接受9/40，status=running，无补采/重试。G BIT8dd6993f已成功加载，新boot 79a6975d-877d-4a9d-8e19-08834275be7a、Linux69d/g-v1、taint0验证通过。独立G最终资格为50MHz、WNS+0.177/WHS+0.036/WPWS+0.062ns，setup/hold/pulse失败端点/routing errors全0，295368/295368 nets全路由。完整E3唯一resume仍未qualified，因此G先就绪先测完，之后共用同G内核只切BIT。G collector Root100+17、分析41+两campaign ID检查均通过；完整40之前不宣称每条件n10或正式性能汇总。E2默认off probe Image已通过，Root审两点命令包并独立实跑23host检查通过，运行包/压缩payload/SPI均已准备，仅离线、尚未上板。
+G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。当前唯一板动作e2-probe-upload01-launch，只向当前G boot的新/tmp文件上传匹配G SPI与已编probe gzip，不写SD/重启/跑点；完成后Root据E3是否最终qualified再选下一加载。完整E3唯一resume仍未qualified；A2并行冻结真实G图表/结果报告。E2两点诊断包/Image/host23已接受，尚无新E2板点。
 
 load已成功结束；当前只有g-collect01-launch实际采集，SD writer已成功结束。不能因dispatch成功宣称boot或40点已完成；以各result/正式manifest为准。
 

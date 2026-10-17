@@ -3,11 +3,11 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Verification Status: PARTIAL（E1b、E3 P0、E6角色及E4/E5已完成；E2/完整E3/G按队列继续）
-- Updated: 2026-10-17T16:45:49.663115+00:00 / 2026-10-18 JST
+- Updated: 2026-10-17T17:01:42.623645+00:00 / 2026-10-18 JST
 
 E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PTE/PA/data/unmap/taint0/最终OBS4+PATH+16×32桶全部通过。V硬件时间中位数4KiB 139.19783ms、2MiB106.88277ms；逐block时间下降中位23.2191%、吞吐提升中位30.2406%，V软件HPM bracket的miss/S1 PTW中位8192→0。E4统一CSV3824行，E5同20点/320stage/10240桶，E5不另计新试次。完整论文包E4-pagesize/paper/e4-common-v2-final01、E5-latency/paper/e4-common-v2-final01；Root另以原record硬件cycles/Fraction独立复算10对通过。
 
-当前唯一板任务 g-ds0-20261018-01 正式G40采集：2026-10-17T16:45:49.663115+00:00观测已接受9/40，status=running，无补采/重试。G BIT8dd6993f已成功加载，新boot 79a6975d-877d-4a9d-8e19-08834275be7a、Linux69d/g-v1、taint0验证通过。独立G最终资格为50MHz、WNS+0.177/WHS+0.036/WPWS+0.062ns，setup/hold/pulse失败端点/routing errors全0，295368/295368 nets全路由。完整E3唯一resume仍未qualified，因此G先就绪先测完，之后共用同G内核只切BIT。G collector Root100+17、分析41+两campaign ID检查均通过；完整40之前不宣称每条件n10或正式性能汇总。E2默认off probe Image已通过，Root审两点命令包并独立实跑23host检查通过，运行包/压缩payload/SPI均已准备，仅离线、尚未上板。
+G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。当前唯一板动作e2-probe-upload01-launch，只向当前G boot的新/tmp文件上传匹配G SPI与已编probe gzip，不写SD/重启/跑点；完成后Root据E3是否最终qualified再选下一加载。完整E3唯一resume仍未qualified；A2并行冻结真实G图表/结果报告。E2两点诊断包/Image/host23已接受，尚无新E2板点。
 
 E2两个版本均在第6点N4_A8失败，各5点分别冻结，不混池；timer重试/再入现象有证据，CPU AXI根因未定。65b候选不能称修复成功。
 
@@ -19,6 +19,7 @@ E2两个版本均在第6点N4_A8失败，各5点分别冻结，不混池；timer
 | E3 P0小子集 | 45 | DS0，64B/1KiB/4KiB×Solo/A1/A8×5，45/45全部通过；14:25:47Z–14:37:05Z，无失败或替换。 | [最终45点与统一CSV](../exp/E3-workloads/checkpoints/p0-final01/README.md) |
 | E6角色互换 | 30 | 原DS0/旧pathv3，V1/A0，Solo/A1/A8各10；同boot/block A8/A1时间比中位数1.10434084。 | [角色结果](../exp/E6-mitigation/role-swap-results.md) |
 | E4页大小＋E5分布 | 20（共享） | 20/20通过；2MiB较4KiB配对时间下降23.2191%、吞吐提升30.2406%；真实512桶/试次。 | [E4完整数据](../exp/E4-pagesize/paper/e4-common-v2-final01/README.md)、[E5同20点](../exp/E5-latency/paper/e4-common-v2-final01/README.md) |
+| E6 G固定gap | 40 | 40/40、四条件各10；gap1000/2000的V时间下降24.4416%/32.8843%，A own吞吐下降25.6741%/47.9490%。 | [严格40点长表](../exp/E6-mitigation/paper/g-ds0-final01/long-table.csv)、[原word独立复核](../exp/E6-mitigation/root-validation/g-final01.json) |
 
 E3关键口径是同boot、同区组、同V大小的A8/A1配对：
 
@@ -41,7 +42,7 @@ DS口径始终是IOMMU数据结构访存的附加延迟，DS0为主结果，DS25
 | E2 设备数 | 两个版本各接受5点，第6点N4_A8均失败；新65b轮host timeout，独立partial包不混池。 | 暂停性能采集；独立probe Image已通过，待Root审最多两点诊断包；不关闭watchdog/taint门，不原样重试。 |
 | E4 页大小+E5分布 | 已20/20完成，两个严格出口均通过，10对Fraction复算通过。 | 时间图和stage1原桶区间图均已接受、复跑；不为E5增加重复板点。 |
 | 完整E3 | CVA6 1d587/platform dfebcc，Depth64的原DS0构建exit143；唯一physopt续编15:46:07Z启动，未qualified。正式G软件69d/6491已通过并纳入精确profile。 | collector/exporter已审；pilot30调用及6小时预算门已审。自身BIT验收、G新boot通过后先30点再据实际wall决定续150。 |
-| E6 P4M G | 从E5 6c5基座独立准备；frontend2c7、observer0f0403与上层cfb9已审；G唯一BIT15:08:57Z开始构建。 | 独立BIT最终通过、Root源码与41+ID分析检查通过；正在加载/验证新boot，然后一次G40。V/A各4096×4KiB自然完成。 |
+| E6 P4M G | 从E5 6c5基座独立准备；frontend2c7、observer0f0403与上层cfb9已审；G唯一BIT15:08:57Z开始构建。 | 40/40已完成、严格出口与原word独立复核通过；图表/报告并行收尾，V/A各16MiB自然完成。 |
 | E6 P/N/PN M | 完成历史来源/容量/接口设计与负结果追溯，未启动移植。 | 维持最后优先级，不恢复机制探索。 |
 
 E4/E5冻结包在`board/packages/e4-e5-20261017/`：小型元数据原字节复制，BIT/Image/payload/SPI模块仅本机硬链接，不进Git。E5最终BIT SHA d934846ecb7f2fd80bcb7d2f18889ae0fd8c9bbd28a0f5fef8e949614139221c，50MHz，WNS+0.126/WHS+0.047/WPWS+0.062ns，失败端点与routing errors均0，290520/290520 routable nets全完成。Slice50581/50950（99.28%）；LUT166334、regs142751、BRAM50、DSP27。完整E3和G必须各自验收，不能沿用E5通过结论。
