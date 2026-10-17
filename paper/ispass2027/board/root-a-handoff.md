@@ -1,3 +1,11 @@
+# 实际板资源 2026-10-17T16:25:35.318166+00:00
+
+当前运行仍为E5 d934 BIT / Linux65b full-e3-v1、boot bf3063bb-b908-4333-bcb9-54a08511210e。G公共软件上传已于16:24:56Z return0、11,346,554字节ACK；唯一板动作 g-common-software-write01-launch 正按已排有限脚本写SD，不重启、不加载BIT、不启动试次。不要重复打开UART或写SD。完整E3与G将共用Linux69d/platform6491/release g-v1；Root已审精确E3 profile并实跑27项，G collector实跑100+17项通过。两个BIT仍在唯一原策略流程中，未最终qualified，任何加载须先各自满足50MHz、WNS≥0、三类失败端点及routing errors全0。E4时间图和E5桶区间图已Root目视及独立复跑通过；E2默认off timer探针源码1fac已审，专用Image builder仅prepared，尚未编译或跑新E2。
+
+上传及SD写入分别以 board/runs/g-common-upload01-launch/result.json 和 g-common-software-write01-launch/result.json 为准；后者无result时仍在执行，失败则停止。SD成功后仍需Root选择已合格的BIT并验证新boot，不存在自动load或collector后续。当前没有新正式性能试次。
+
+以下为保留历史，以上段落及实际result优先。
+
 # 实际板资源 2026-10-17T16:10:27.480597+00:00
 
 当前唯一板动作是g-common-upload01-launch：E420/20与新软件passed门确认后，只上传当前full-e3-v1匹配SPI与新Ggzip到全新/tmp文件；未写SD或重启，等待传输bytesACK及新profile/后续BIT验收后由Root决定加载。G CLI507/software-entry9 Root实跑通过，原G软件manifest/transport已收ba3df；旧prepared note保持原文，以passed、Image及实际命令为准。E4论文图已接收ae8e2b3，Root直接读plotter、目视PNG、独立复跑CSV/数值/PNG/PDF全字节相同；SVG只自动ID不同，源/数值无变，E5区间附图仍待画。

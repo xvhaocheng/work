@@ -49,6 +49,7 @@ E5图注候选：
 
 ```bash
 /tmp/ispass-ds-sweep-plot-venv/bin/python \
-  /home/xvhaocheng/work-a2-workloads/paper/ispass2027/exp/E4-pagesize/figures/plot_stage1_intervals.py \
-  --output /home/xvhaocheng/work-a2-workloads/paper/ispass2027/exp/E4-pagesize/figures/e5-stage1-review-new
+  /home/xvhaocheng/work-root-a/paper/ispass2027/exp/E4-pagesize/figures/plot_stage1_intervals.py \
+  --source /home/xvhaocheng/work-root-a/paper/ispass2027/exp/E4-pagesize/figures/e5-stage1-final01/inputs \
+  --output /home/xvhaocheng/work-root-a/paper/ispass2027/exp/E4-pagesize/figures/e5-stage1-review-new
 ```

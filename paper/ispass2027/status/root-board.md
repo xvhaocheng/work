@@ -2,12 +2,12 @@
 
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
-- Verification Status: PARTIAL（E1b、E3 P0、E6角色已完成；E2/E4/E5/完整E3/G按队列继续）
-- Updated: 2026-10-17T16:07:06.794904+00:00 / 2026-10-18 JST
+- Verification Status: PARTIAL（E1b、E3 P0、E6角色及E4/E5已完成；E2/完整E3/G按队列继续）
+- Updated: 2026-10-17T16:25:35.318166+00:00 / 2026-10-18 JST
 
 E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PTE/PA/data/unmap/taint0/最终OBS4+PATH+16×32桶全部通过。V硬件时间中位数4KiB 139.19783ms、2MiB106.88277ms；逐block时间下降中位23.2191%、吞吐提升中位30.2406%，V软件HPM bracket的miss/S1 PTW中位8192→0。E4统一CSV3824行，E5同20点/320stage/10240桶，E5不另计新试次。完整论文包E4-pagesize/paper/e4-common-v2-final01、E5-latency/paper/e4-common-v2-final01；Root另以原record硬件cycles/Fraction独立复算10对通过。
 
-当前板卡E5 d934/共同full-e3-v1内核，bootbf3063bb-b908-4333-bcb9-54a08511210e，正式采集已结束，无活动板任务。G正式软件6491/69d于16:02:37Z passed，payload31,460,808B/32MiB余2,093,624B；尚未写SD/启动G。Root准备共用G软件给尚无正式数据的full-E3及G，先审精确profile兼容以减少SD切换。完整E3唯一physopt续编resume01、G唯一BIT原流程仍未最终qualified；保持原约束/策略，失败停不重试。A2正在准备E4图，A1准备G40点collector，E2只读报告已审且新默认off探针待实际patch最终复核，未编诊断Image或跑新E2。
+当前运行仍为E5 d934 BIT / Linux65b full-e3-v1、boot bf3063bb-b908-4333-bcb9-54a08511210e。G公共软件上传已于16:24:56Z return0、11,346,554字节ACK；唯一板动作 g-common-software-write01-launch 正按已排有限脚本写SD，不重启、不加载BIT、不启动试次。不要重复打开UART或写SD。完整E3与G将共用Linux69d/platform6491/release g-v1；Root已审精确E3 profile并实跑27项，G collector实跑100+17项通过。两个BIT仍在唯一原策略流程中，未最终qualified，任何加载须先各自满足50MHz、WNS≥0、三类失败端点及routing errors全0。E4时间图和E5桶区间图已Root目视及独立复跑通过；E2默认off timer探针源码1fac已审，专用Image builder仅prepared，尚未编译或跑新E2。
 
 E2两个版本均在第6点N4_A8失败，各5点分别冻结，不混池；timer重试/再入现象有证据，CPU AXI根因未定。65b候选不能称修复成功。
 
@@ -39,7 +39,7 @@ DS口径始终是IOMMU数据结构访存的附加延迟，DS0为主结果，DS25
 | 任务 | 实际状态 | 下一步 |
 | --- | --- | --- |
 | E2 设备数 | 两个版本各接受5点，第6点N4_A8均失败；新65b轮host timeout，独立partial包不混池。 | 暂停采集，核timer/SBI原始证据；不关闭watchdog/taint门，不原样重试。 |
-| E4 页大小+E5分布 | 已20/20完成，两个严格出口均通过，10对Fraction复算通过。 | 论文图离线准备；不为E5增加重复板点。 |
+| E4 页大小+E5分布 | 已20/20完成，两个严格出口均通过，10对Fraction复算通过。 | 时间图和stage1原桶区间图均已接受、复跑；不为E5增加重复板点。 |
 | 完整E3 | CVA6 1d587/platform dfebcc，Depth64的原DS0构建14:10:50Z开始后exit143；唯一physopt续编15:46:07Z启动；ABI5 helper682a2ca/adapter46df97c已审，含multi候选的新65b427共用软件15:03:30Z已passed。 | CLI 167项Root实跑通过；collector准备与完整软件构建；自身时序/资源验收后再排≤6小时子集。 |
 | E6 P4M G | 从E5 6c5基座独立准备；frontend2c7、observer0f0403与上层cfb9已审；G唯一BIT15:08:57Z开始构建。 | 原约束/策略验收，失败停止；Linux ABI6只读caps/helper批审查中，RUN另批；G固定V/A各4096×4KiB自然完成。 |
 | E6 P/N/PN M | 完成历史来源/容量/接口设计与负结果追溯，未启动移植。 | 维持最后优先级，不恢复机制探索。 |
