@@ -65,3 +65,7 @@ Current runtime (14:10Z): common acece payload upload completed with byte-count 
 # 14:22Z续接补充
 
 `p0-common-software-write01-launch/result.json`已returncode0，完成14:17:50Z。P0加载于14:25:44Z完成且boot验证通过，有限等待session76190已结束，45点collector已dispatch到`p0-subset01-launch`，output=`runs/p0-ds0-subset-20261017-01`，这是唯一板任务。首区组9点的论文CSV已冻结为E3/checkpoints/p0-progress01，各n=1。另一个有限等待session27823在45/45正式passed后才自动加载原DS0（e2-ds0-load01-launch）并验证同release，然后dispatch E2（e2-device-scaling01-launch，output=e2-device-scaling-20261017-01）；不要手工重复这两步。失败即停，不补点。E4/E5后续包已在Root`board/packages/e4-e5-20261017/`备好，正式software/fpga manifest用Root现存副本。A3负责E2 immutable prefix实现；A1仅先准备E6 P4M G前端小批，M未开始；A2 full-E3 BIT构建及ABI5驱动并行。
+
+15:04Z实际部署更新：共用软件已passed，原始manifest SHA7415dcc4d076fa434bc22294f4309582af84086964f1b47bb05c695555f0bcc4；payload SHAca75a420c9321e89f5fbbe284e836421ec1b0f25c14a4ce0eca6084b068bff95，gzip11,068,218B。当前acece匹配SPI模块已上传/bytesACK，唯一活动板任务为common-v2-payload-upload01-launch；等待result=0且bytesACK后写SD，再新启动采集。当前无正式实验在跑。
+
+有限部署续接 common-v2-deploy01-launch已dispatch，只等待上述upload结果和bytesACK后执行一次SD写入、原DS0 BIT加载及新kernel boot验证；它在等待期间不占UART，任一步失败即停、无重试、不启动collector。执行源码保存在board/manifests/common-v2-deploy-as-dispatched.py；result=0才说明部署完成，dispatch本身不是完成。
