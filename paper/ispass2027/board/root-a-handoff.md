@@ -1,3 +1,13 @@
+# 当前续接 2026-10-17T19:07:49.361026+00:00
+
+板仍原DS0 e9b6554/原pathv3 Linux45bf，boot04afe602-3051-410f-996f-778edb2fb94c，18:39:20Z启动核验/TAINT0，无后续hardware动作或实验采集。不要重复写卡/重跑E2/补旧baseline点。PN完整BIT/真实S15/正式点均0，DS50构建仍硬锁实际S15全过。
+
+Root远端ispass/root-a已到98d147d，有限组件源码+回执已汇合：history5b7、DS9713、TC/IOMMU6082+AXI95f（Root实际13718项）、SW0dbd（Root19704 raw+10功能字节+36源绑定）、observer embedding a324、backend9befa、typedcorewrap30bc（Root203源/raw项、33自然job/19800gold）。同一批的数据不重测。Root最初误认平台typed直接实例已纠正：外围实际_intf，控制ID6/数据ID2；prior typed单位controlID2仅自身有限域。详见E6-pn/interface-callchain-correction01.md。实际Makefile编CVAflattened两个AXI文件，需后续将95f已接受字节精确同步，不能只pinIOMMU vendor。
+
+当前三席（只准备、不触板）：A1在6082后实施两文件TL/MSIPTW只读fullquiet+stable req_data限定restricted_msi，计划已Root接受；之后才IOMMU top。A2在新work-e6-pn-writer/ispass/e6-pn-writer实现独立pn-config，按writer-contract-v1，readonly pn-control/S15旧pin不动。A3在30bc后仅外_intf二参/二输出透传，真实interface控制ID6+高位0x2d/0x35有限验证，typed/adapter原字节，外围/顶层仍只读方案待Root。未来源码汇合/全栈有限验收后才唯一DS0 fullbuild，不启动E3-lite抢先。所有fallback/约束/physopt/stop规则见runtime-contract与README。235/205互斥逐点计划已冻结，均非结果。
+
+旧记录保留；以上段及实际result优先。
+
 # 当前续接 2026-10-17T18:43:36.100043+00:00
 
 原pathv3/原DS0部署实际全部成功，18:39:20Z return0；kernel6.5.0-rc2-ispass2027-pathv3、boot04afe602-3051-410f-996f-778edb2fb94c、TAINT=0。板空闲，不再打开UART或添加基线/E2点。原恢复/upload/SD/boot串行链已结束，未来PN只切合格BIT并保留原Linux。
