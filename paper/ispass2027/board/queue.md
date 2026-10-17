@@ -12,7 +12,7 @@
 
 ## 当前资源与顺序
 
-DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”在12:53:13Z已启动同身份DS25→DS100，共100次；当前DS25正在启动旧pathv3。Root本地12:56:37Z启动被UART锁在触硬件前拒绝，失败目录原样保留，不再启动替代任务。用户已明确授权联系该会话并统一排程，协调消息已送达：原campaign继续两档100次，随后保持DS100交还板卡，不自行写SD或加测。
+DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”在12:53:13Z已启动同身份DS25→DS100，共100次；DS25已完成50点、当前DS100正在启动旧pathv3。Root本地12:56:37Z启动被UART锁在触硬件前拒绝，失败目录原样保留，不再启动替代任务。用户已明确授权联系该会话并统一排程，协调消息已送达：原campaign继续两档100次，随后保持DS100交还板卡，不自行写SD或加测。
 
 唯一活动campaign为 `/home/xvhaocheng/work/paper/ispass2027/board/runs/ds-sweep-20261017-01/`，launch为同级`ds-sweep-20261017-01-launch/`；Root只读其稳定records冻结本任务快照。Root被锁拒绝的记录在本worktree `runs/ds-sweep-campaign-launch01/`及`runs/ds-sweep-20261017-01/`，不计为已加载或性能试次。
 
