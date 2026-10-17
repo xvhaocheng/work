@@ -9,7 +9,10 @@ Linux小批供Root与E4整合统一payload；A1不访问硬件。
 
 ## 采集端接口
 
-Root实际执行入口是 `collect_e5.py`，只为本批E5 OBS4/Depth4 DS0 BIT附加hist验证。
+当前板时方案为E4的20个4KiB/2MiB同负载点附加hist，A3的新E4 collector调用下述纯helper。
+不排专门E5的50点。区间分析合同见 `analysis-design.md`。
+
+备选独立入口是 `collect_e5.py`，只为本批E5 OBS4/Depth4 DS0 BIT附加hist验证。
 它调用当前工作树的既有 `board/collect.py`，固定沿用原 `ds0-all` 计划：
 Solo/A1/A8/A16/A64各10次、N4096/W256、4KiB，不增加或改变DMA命令，不加载BIT/写SD/自动重试。
 普通DS0/DS25/DS50/DS100及历史v3仍调用原collector，不受本模块影响。
@@ -61,6 +64,33 @@ item['histogram'] = hist_records.attach_from_output(raw['stdout'], item)
 分位数只能给桶边界范围，不能把PATH均值造作p95/p99或相加各段分位数。50MHz下每周期20ns。
 
 ## 有限验证入口
+
+`analyze_hist.py` 仅用标准库。对E4已冻结且完整的20试次输入，Root可执行：
+
+```sh
+python3 paper/ispass2027/exp/E5-latency/analyze_hist.py \
+  --records E4_FROZEN_RUN/records.json \
+  --manifest E4_FROZEN_RUN/manifest.json \
+  --source-root ROOT_OF_FROZEN_EVIDENCE \
+  --group-by mapping_page_bytes \
+  --output paper/ispass2027/exp/E5-latency/analysis/E4_NEW_CHECKPOINT
+```
+
+相对原始证据路径均从显式source-root解析，绝对路径必须仍在该根内；输出不得已存在。
+部分进度须先冻结derived snapshot、同步真实recorded_cases，再加`--allow-partial`，报告actual n/complete=false。
+逐试次16段结果在`trial-stage-intervals.csv`，真实512桶长表在`histogram-bins.csv`，跨试次端点统计在`summary.json`，
+原始manifest/records/load/command JSON的哈希入口在`analysis-manifest.json`。不写共享data、不覆盖快照。
+
+纯函数 `rebind_trial(raw, item, expected_kernel)` 从原stdout重取同`item['record']['schema']`的完整CLI JSON、
+最终time/axi_v/axi_a和16条PATH、512桶并与缓存逐字段核对；支持E4外层包装schema而不硬编码CLI schema。
+`trial_intervals(item, attachment, context)` 产生每stage nearest-rank区间及原sum/full/max；
+`describe_trials(rows, group_fields)` 按显式配置和role/channel/stage统计真实试次数，默认不pool A。
+nearest-rank和跨试次Type7口径分开；保留mean整数分子/分母，零full的n_valid=0且分位区间/mean为空，
+合法原max=0仍保留。分位边界/均值的跨试次统计都不能解释为合并请求分布。
+
+公开CLI不提供fixture放行选项。测试仅用显式内部fixture参数，生成的临时报告永久标记fixture_only且测试后删除。
+`test_analyze_hist.py` 六项检查涵盖raw重绑/缓存篡改、最近秩/末桶、空full/carry/精确样本mean、
+Type7/真实n、重复trial拒绝、完整任务内CSV和fixture默认发布拒绝；原始输出见`analysis-validation.log`。
 
 `rtl-validation/runs/run03/`：真实生产stage/path/observer，923拍全部旧字段等价、18集成场景、98年龄边界等。
 `driver-validation/runs/run02/`：48项真实函数host-MMIO fixture，`driver-validation/object01/`：RISC-V目标编译0warnings。
