@@ -55,7 +55,12 @@ item['histogram'] = hist_records.attach_from_output(raw['stdout'], item)
 但各自完整工作量/角色验证必须仍由原解析器负责。旧v3没有hist信息会明确失败，不能静默退化为E5合格样本。
 必须使用显式 `CASE_EXIT=0` 后、`TAINT_AFTER=0` 前的完整dmesg转储；不从可能截断/交错的实时console拣选行。
 
-验证要求同一实际sequence的v4 info、16段×32个有界桶、全部hist及最终batch/PATH有效、sum(bins)==full，
+当前E4/E5包仍要求OBS4/INFO1/Depth4。共享纯helper另显式接受后续OBS5/INFO2/Depth64：
+INFO行必须有且仅有新增`depth=64`，raw必须等于`0x0040000020202002`；
+OBS4原字段集合不增加depth，raw仍必须等于`0x20202001`。两者的stage行始终schema1。
+未知版本、版本/深度/格式不匹配、raw保留位、overflow或同sequence混合INFO均拒绝。
+共享helper支持不会使本包的`collect_e5.py`身份门接受OBS5；未来完整E3仍由A2自己的BIT/软件/负载身份门负责。
+验证要求同一实际sequence的匹配INFO、16段×32个有界桶、全部hist及最终batch/PATH有效、sum(bins)==full，
 且实际PATH sum/max落在桶边界允许范围；缺段/缺桶/错序列/冲突重复/overflow/格式失配均停止。
 历史sequence不混入，等值重复只保留一个stage且单独记重复数，不增加样本。
 新驱动逐段流式打印；后段失败时早先行可能仍是valid=1，因此最终batch/PATH全局有效是强制接受条件。
@@ -107,7 +112,10 @@ leaf4k/leaf2m/closing_spill三个显式synthetic样本全部通过内部raw重�
 
 `rtl-validation/runs/run03/`：真实生产stage/path/observer，923拍全部旧字段等价、18集成场景、98年龄边界等。
 `driver-validation/runs/run02/`：48项真实函数host-MMIO fixture，`driver-validation/object01/`：RISC-V目标编译0warnings。
-`test_hist_records.py` 的10项测试以明确标为fixture_only的实际驱动mock输出为输入，正向及错误门均通过；
-原始输出见 `parser-validation.log`。这些host日志与512行生成检查不是板测，也不进入论文数据。
+`test_hist_records.py` 保留原10项并新增3项版本兼容测试（内含17种明确拒绝变体），共13项通过；
+v5正例是从实际v4驱动mock日志修改INFO得到的显式协议fixture，不冒充实际v5驱动或板测。
+原10项输出仍在`parser-validation.log`，新版原始诊断见`hist-v5-validation01.log`，
+同一helper实际源码下9项离线区间分析回归见`hist-v5-analysis-validation01.log`；区间算法未改。
+来源/fixture边界与源码hash见`hist-v5-validation01.json`。这些host日志与512行生成检查不是板测，也不进入论文数据。
 `test_collect_e5.py` 的4项host fixture检查覆盖旧工作量参数原样传递、仅主机check-only、错误BIT/kernel/source/版本/depth及未验收时序拒绝，
 以及采集manifest的包装器/validator来源记录；原始输出见 `collector-validation.log`，没有导入或执行硬件控制。

@@ -58,10 +58,17 @@ def parse_lines(observation_text, item):
             continue
         if kind == 'hist_info':
             expected = {'seq', 'valid', 'version', 'schema', 'bins', 'count_bits', 'time_bits', 'overflow', 'raw'}
+            version = number(value.get('version', '0'))
+            require(version in (4, 5), 'histogram info version/format/overflow')
+            if version == 5:
+                expected.add('depth')
             require(set(value) == expected, 'histogram info fields')
             parsed = {key: number(value[key]) for key in value}
-            require(parsed == {'seq': seq, 'valid': 1, 'version': 4, 'schema': 1, 'bins': 32,
-                               'count_bits': 32, 'time_bits': 32, 'overflow': 0, 'raw': 0x20202001},
+            reference = {'seq': seq, 'valid': 1, 'version': version, 'schema': 1, 'bins': 32,
+                         'count_bits': 32, 'time_bits': 32, 'overflow': 0, 'raw': 0x20202001}
+            if version == 5:
+                reference.update(schema=2, depth=64, raw=0x0040000020202002)
+            require(parsed == reference,
                     'histogram info version/format/overflow')
             infos.append(parsed)
             continue
