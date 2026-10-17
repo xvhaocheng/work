@@ -14,7 +14,7 @@
 
 DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”的两档100次已全部完成；Root只读复核并冻结最终200试次包（含历史100）。用户授权协调后已统一排程。Root本地12:56:37Z重复启动被UART锁在触硬件前拒绝，失败原样保留，不计试次。
 
-已完成DS campaign为 `/home/xvhaocheng/work/paper/ispass2027/board/runs/ds-sweep-20261017-01/`，launch回执returncode=0。当前唯一板任务是本worktree `runs/e6-ds0-load01/`（launch `e6-ds0-load01-launch/`）：加载原DS0 BIT并启动旧pathv3，随后角色互换30次。Root被锁拒绝的记录在本worktree `runs/ds-sweep-campaign-launch01/`及`runs/ds-sweep-20261017-01/`，不计为已加载或性能试次。
+已完成DS campaign为 `/home/xvhaocheng/work/paper/ispass2027/board/runs/ds-sweep-20261017-01/`，launch回执returncode=0。原DS0+旧pathv3加载和角色互换30次均已完成通过，结果为`exp/E6-mitigation/paper/e6-role-swap-ds0/`。当前唯一板任务是`runs/p0-common-payload-upload01/`：传入E2/P0共同软件压缩payload，完成后使用原同版SPI模块更新一次SD，再启动新内核。Root被锁拒绝的记录在本worktree `runs/ds-sweep-campaign-launch01/`及`runs/ds-sweep-20261017-01/`，不计为已加载或性能试次。
 
 | 原优先级 | 任务 | 状态 | 采集规模 | 预计板时 / 条件 |
 | --- | --- | --- | --- | --- |
@@ -24,7 +24,7 @@ DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/h
 | 4 | E2 DS0 设备数 | 多设备驱动/CLI/90点collector已审核，共用软件delivery已通过 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
 | 5 | E3 DS0 论文子集 | 已接受ABI5/BTC3、独立Depth64观测版本设计；A2实施首批前端 | 六种大小及三类流量组合；新协议等16MiB有效字节 | 用户上限6小时；候选150新点按实际用时定稿，不与P045混池 |
 | 6 | E4 DS0 页大小 | 实际leaf查询小批已审通过；A3实施显式建图/清理/ABI4 | 4KiB 对2MiB，各点10次，未测 | 不混当前稳定软件；与已审E5 Linux后续共同编译 |
-| 7 | E6 DS0 角色互换 | 正在加载原DS0+旧pathv3；collector 16项主机检查通过 | V=DMA1、A=DMA0；Solo/A1/A8各10次 | 约20分钟，旧payload集中测完后再切新软件 |
+| 7 | E6 DS0 角色互换 | 完成30/30，Solo/A1/A8各10；原DS0 BIT及旧pathv3 | V=DMA1、A=DMA0；Solo/A1/A8各10次 | 已完成；同boot/区组A8/A1中位数1.10434084，旧payload不再加测 |
 | 附加 | E5 延迟分布 | 被动直方图RTL/Linux首批已审、parser 10检查通过，独立DS0 BIT编译中 | 16阶段×32桶；当前尚无新直方图板测 | 保留carry/overflow/最终有效性，量化分位所在桶区间 |
 | 最后准备 | E6 P/N/PN/P4M 缓解 | 按现有论文清单独立分支准备，尚未分配实施 | 尚无 | 先审统一基座方案，再验证编译；不恢复新机制探索 |
 

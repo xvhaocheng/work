@@ -3,7 +3,7 @@
 ## Material Passport
 
 - 类型：只读能力核查＋离线验证过的采集准备；2026-10-17。
-- 状态：**准备完成，尚未上板**。本包仅由 Root 在用户安排的 E6 顺序执行。
+- 状态：**30/30已上板通过**；结果见[角色互换结果](role-swap-results.md)。本包仅由 Root 执行。
 - 源码：统一 baseline100 的 CVA6 `8aac3fcd345af7686a55af1867783fd6b91a0069`、IOMMU `85b157ebe71a623e326e51fff7b7126fe77e8eb9`、Linux `45bf76b15e36cf608dff95013d91f8bedb7b1b8e`；实际镜像内核 `6.5.0-rc2-ispass2027-pathv3`。
 - 接口：现有 `idma_experiment --batch`，无驱动、内核、RTL变更。复用 [baseline100 来源](../../board/packages/baseline100-20261017/source.json)及本次实际 load receipt。
 - 模型：Codex-only；未调用 DeepSeek；A3 未访问 FPGA/JTAG/UART。

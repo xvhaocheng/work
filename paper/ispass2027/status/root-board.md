@@ -88,3 +88,11 @@ DS25/DS100全部100个新增试次通过，原campaign returncode=0，无替换�
 E5 Linux提交`22975965c89285f5510cb89fd3a3c865b91c0d36`已接受，Root直接核实际diff和prepare/finish/batch/PATH调用链：仅v4读取512桶，冻结窗外输出，最终任一失效使CLI/PATH拒绝。48实际函数host断言、RV64对象已过；Root另实际执行10项parser拒绝/守恒检查通过。后续与E4合并一次共同软件编译，当前acece正式包冻结。E5独立DS0 RTL构建继续，未有新hist板数据。
 
 完整E3已接受限定单COPY、CONF deburst/decouple=0、同S/D offset的最多33 burst（stage0保守34）容量证明，专用Depth64、OBS5/INFO格式2，保留现有E5 default4/OBS4不改。A2先做前端小批；三形态新协议用等16MiB有效数据和V一完整几何环预热，明确mapped/实际页集及A实际工作量；不与旧P045混池。E4实际leaf查询已审，第二批显式map/checked清理/ABI4正验证，当前未测。
+
+## 角色互换完成及软件切换（2026-10-17 13:54Z）
+
+E6原DS0/旧pathv3角色互换V1/A0共30/30通过，Solo/A1/A8各10，无失败或替换。硬件时间中位数56.56996/107.05280/118.23629ms，吞吐282.836/149.459/135.322MiB/s；同boot/区组A8/A1比中位数1.10434084（额外慢化10.4341%）。与历史V0各条件中位数的独立boot描述差异绝对值均<0.06%，不作跨boot配对或显著性断言。已从原始命令重算生成`exp/E6-mitigation/paper/e6-role-swap-ds0/paper.csv`（17列、2560行）及summary，完整角色结果见`role-swap-results.md`。实际boot为`09e1dddf-43ff-479e-921e-2bafd1e3277d`。
+
+板卡已转共同软件传输；小型pathv3 SPI模块archive已完成UART传输，现传10,520,154字节压缩payload。未加载模块或写SD，待上传完整后沿既有updater直接更新，不加远端hash或SD回读。之后新Linux配原DS0 BIT测E2 90，再只换P0 DS0 BIT测45点。
+
+E4驱动/ABI4实际提交`e3ca456a15d1952b97a2d5bde3a1021e27511893`已直接审核接受：89有限生命周期场景、原38+57回归、45 CLI和实际RV64对象通过；未知静默、短unmap/残留映射保持整lane retain/quarantine。E5合并后需把E4 caps的PATH判别改用v3/v4共用函数并验证；A3随后固定共同SHA/平台锁，编译唯一E4/E5软件包。当前acece E2/P0正式包不改。
