@@ -3905,3 +3905,10 @@ IOMMU与CVA6分别拆成12／27个功能提交，实际补丁顺序与语义依�
 [内部入口](iommu-platform/provenance/internal-repository-integration-20261017/README.md)保存操作前refs/patch/index、实际组件整合/平台分组提交、源码保持与恢复包回执。四组件全部heads按固定来源prereq导出增量bundle，含旧分支/功能锚/贡献分支；平台本身bundle及最终clean回执放[外部恢复目录](repository-recovery/internal-integration-20261017/README.md)，避免平台包包含自身。第三方upstream与无remote的平台配置保持，未向上游推送；内部Git是工作主体，work只作文件同步和包分发。
 
 没有新build/test/RTL仿真/性能实验/综合/布线/板测或MIG恢复，原版性能基线仍未运行。旧实验身份与结论保留；上轮“原HEAD/checkout保持”回执是当时时点，本轮新活动分支是用户明确要求后的后继变更，不覆盖旧证据。Codex-only。
+
+
+## 2026-10-17 删除过时生成物与重复备份
+
+用户要求老旧且不需要的文件实际删除。先核对已完成历史整理的18份payload、4份before备份和保存回执，23项以94e67443c17a6fb15a2d27d59eaf932a138d98b2提交；CSV为追加82行及更新16行，不冒称全历史核查完成。随后删除67个已由现有同步策略判为生成物、且在所在实际Git仓库未跟踪的旧文件，以及4份重复before工作副本，共80,113,799B。4份副本既与前一版正文逐字相同，也完整存在94e6744中；save-receipt增加后继清理及Git恢复路径，原18份payload内容保持。
+
+4个看似生成物的文件实际已在当前或旧恢复副本的组件Git中跟踪（CVA6预置测试程序／Linux打包输入），未当作未跟踪缓存删除，仅沿现有镜像筛选规则从外层Git提示排除。诊断日志6行既有追加随收尾保留。未删除原始研究事件或唯一源码、未改内部活动分支或版本锁，无新构建／测试／仿真／实验／板测。活动平台及21组件仍为此前已核对的干净版本。删除清单与保存身份检查在.git/sync-preparation/remaining-changes-20261017/。
