@@ -1,8 +1,8 @@
 # BTC3 frontend：第一批实际源码与有限验证
 
-2026-10-17，ARS experiment-agent/run，Codex-only。`FRONTEND_FINITE_PASSED`，等待 Root 对最终证据验收。
+2026-10-17，ARS experiment-agent/run，Codex-only。`FRONTEND_ACCEPTED`，Root已直接核原始源码与最终证据。
 没有新 BIT，没有 ABI5 driver，也没有板测。当前继承 E5 的 OBS4／INFO1／Depth4，
-仍不能用来采集长 COPY 的有效 PATH 数据；下一批独立实现已接受的 OBS5／INFO2／Depth64。
+仍不能用来采集长 COPY 的有效 PATH 数据；下一批[OBS5／INFO2／Depth64](path64.md)已单独实现、验证并交审。
 已交付的 P0 BIT、共同软件和 45 点合同不变。
 
 实际 CVA6 独立工作树 `/home/xvhaocheng/work-a2-p0-cva6`，分支 `ispass/a2-workloads`。
