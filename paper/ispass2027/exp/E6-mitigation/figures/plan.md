@@ -1,10 +1,12 @@
 # G own-window main figure
 
 Root accepted this design on 2026-10-17. This directory contains only offline
-figure preparation. At this draft stage there are **0 G figure input board
-trials bound and no rendered paper figure**. The actual complete40 export and
-its three immutable file SHAs will be frozen after Root supplies that export.
-No synthetic result can pass the public plotting entry point.
+figure preparation. The initial draft bound 0 board trials and generated no
+paper figure. Root subsequently supplied and independently accepted the
+complete40 export; its exact three SHAs and original snapshot bytes are now
+frozen in `g-ds0-final01/inputs/`. The actual figure was rendered once to
+`g-ds0-final01/`; see `g-results.md`. No synthetic result can pass the public
+plotting entry point.
 
 The left panel shows `V_whole_cycles(condition, block) /
 V_whole_cycles(a8-gap0, block)` for G Solo, gap0, gap1000 and gap2000. The
