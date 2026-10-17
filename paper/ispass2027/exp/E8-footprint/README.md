@@ -70,3 +70,6 @@ The multi-page subset has now independently passed60/60:
 Its own records/manifest are under data/e8-ds0-victim01; DS0 new totals110,
 without pooling historical baseline points. The corresponding DS10025 is not
 part of these two exported sample sets.
+DS100 was subsequently preempted for E6 after17 accepted points. See the
+[actual-data index](DATA_INDEX.md):127/135 planned new points are present,
+with the remaining8 unmeasured and each run/boot kept separate.
