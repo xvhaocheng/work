@@ -1,3 +1,5 @@
+> 2026-10-17解释优先：历史E3无条件因果表述受时序未闭合限定；详见本轮证据更正及文末增量。旧正文原样保留。
+
 # 2026年7月至10月14日研究时间线
 
 本时间线按原始提交时间、正文实验日期、阶段及运行身份排列，不按mtime。各节保留设计、实现、实验、失败、否定和转向。标题单元仅是阅读分配，跨月追加以正文为准；重复同步记录不计独立实验。当前状态以README及本次来源版本为准。原始CSV/UART未全读，抽核范围随章节注明。
@@ -724,3 +726,71 @@ H1“48/35”与“46/35”分别比较付费Z对完整O0离线下界、对可�
 当前按任务选模型强度，撤旧全树Sol/ultra默认；请求配置不冒充实际运行元数据。用户要求优先发展idea、精读最近前作、区分发表覆盖/普通构造/等价实现/离线上界。旧个人研究方法已删除，ARS-Codex按需导航；规范调整不恢复暂停实验。
 
 本轮独占阅读细节见 `evidence/daily-2026-10-15/daily-a-review.md` 和 `daily-archive-review.md`。私人wiki原稿仍未取得；10月19材料应加入上述完整进展，不能沿用“目前BR1”“A默认第一”“D未准入”“A2仅缺上板”或把MIG失败写成债务为0。
+
+
+---
+
+# 2026-10-16核查续作／截至2026-10-17新增（内容日期顺序）
+
+本节补入10月15日保存后产生的记录；10月16日读取中断、17日恢复，没有把采集日或mtime当研究日期。来源层级与实际阅读范围见本轮reading-ledger；文档审阅不是实验重验。
+
+## 10月15日后续：D从来源存在，转到准备与真实控制边界
+
+问题是上一任务观测的状态能否跨quiet/config/clear/warm用于下一任务P/PN选择。MQSim先发现缺完成，唯一身份链定位mapping-only回调丢弃事务，私有修复后四冻结输入完整完成，但完整排空边界活动GC均0；这不是整个SSD持续状态假设被否定。DRAM九run支持读前史排空后保留开行、warm可保留/改写/洗去；来源事实不等信息价值。
+
+随后四个prepare-only投影（P/PN×两前史）各完成V256/A257；同模式两前史准备后有效DRAM状态、clock及next refresh相同。只结束这对前史的残余观察版本，不声称所有准备清除所有状态。其B桥接为私有WR+16/34条件，不是原生AXI/MIG写完成保证；没有64/64完整动作测量。
+
+真实来源核查又区分：composition每ioctl重新alloc/init/map/warm并最终unmap/free；SPDK callback持续同task/buffer补发，但terminal drain释放资源，不是现成保池quiet→config→resume。故旧D下一任务选择版降优先级，不自动新增adapter/sensor/扫状态；未证明整个D无价值，也未自动提高I/A。
+
+来源：`iommu-platform/out/{d-mqsim-identity,d-dram-boundary,d-dram-action,d-boundary-source}-20261015/root/root-result-acceptance.json`。证据为具名模拟器/准备投影与源码；本轮只读接受及历史新增段，未复跑。
+
+## 10月15日启动、16日交付：投入重排与B1单条带成本
+
+旧两轨迹的合法补交分析没有给当前旧V PTE保护正例：最早软件返回可剩60模型tick，但下一A物理请求前已归零。B1单条带进一步核普通预热机会和一次性翻译结果表示；页集合紧上界14≤16不保证实际替换保留，但来源未给预热后强制驱逐残余。343/390等逻辑位是条件编码，非净面积。结束此证据卡、保留具体残余/成本触发；不认定普通预热已充分或B1全族无效。
+
+来源：`out/research-reprioritize-20261015/root/root-result-acceptance.json`、`out/b1-stripe-cost-20261016/root/root-result-acceptance.json`（本节及下文out均在`/home/xvhaocheng/work/iommu-platform/`下）。源码/旧轨迹分析与纸面算术，不是新性能实验。
+
+## 10月16日：映射组织从接纳阈值到owner、同步与地址预算
+
+从DMA_PMD＋XDP正常来源提出整页转交与copy/短map/持久接纳。累计超额版本按定义即普通O3，有限CPU小计40/30/29/27/25为说明单位，不能写原生净赢。此后V1把源物理page_pool owner、B可撤映射关联和一次TX使用分开；真实frame/全部片段寿命可条件替代额外逐TX token，但普通R/slot/O3同享接口，整合成本仍未知。
+
+后续明确：真正source退出、target关闭、请求接受/owner ACK/unmap/metadata退休分层；cache-only owner回收不保证返槽时限，也不等payload RAM下降。seqcount稳定值表可条件免reader锁，冲突须同writer锁重查；普通方案也可采用，未实现验证。合法streaming交接仍需B整页for_cpu等责任，持久映射句柄/A同步不能替代B可见性。IOVA live、rcache、FQ债务分账；K关联槽不保证普通回退地址供给或界多代FQ债务，IOVA不等物理RAM。
+
+取得的公开参考输入不匹配当前source/B map/CQ/fullCPU合同；匹配输入0不等再用或收益0。各轮均保留条件协议/来源/成本资产，未选论文主线，native CPU/RAM/有效完成收益null；原始素材下载和仓库整理不能计性能贡献。来源：本轮ledger中`out/mapping-*-20261016/root/root-result-acceptance.json`具名字段及HANDOFF新段；未逐篇重核全部Linux源码/前作PDF。
+
+## 10月16日：First-PTE条件模型→成对源码设计→局部RTL裁决
+
+原问题是已接受payload不能被后来PTE追越时，付费早PTW意图能否在首次承诺前保护一次顺序。一次冻结Python条件模型70模拟/82检查：cold完整quiet2066→2060，短gap反慢1、longgap快9、late无效；普通零暴露分段2058更快。同接口if/else等价仅排除策略独占，不证明接口已发表。单位是抽象模型时间。
+
+源码设计保留M-ID同钟f1关联及held/READY/escape责任；普通O-tail-prepared复用legalizer/metadata/TC保持，新增1sticky而非重型新FIFO。随后实际局部RTL六case（base/M/prepared×cold/hot）完成：base=M4481/1749，prepared4519/1794；M arm3514晚于A末源RLAST3507，mask0。故M比主动分段快不等于M有增量，结束这份正常COPY程序收益主张，不调相位救正例。
+
+O同锥局部综合增80SliceLUT/1FF/14CARRY4，M helper9FF/28原语LUT范围不同，不作全成本排名；20ns仅综合后分析，无place/route或板测。共同DS-first/F4不是stock免费能力，行为DDR非MIG。来源：`docs/first-pte-{interface-cost,paired-local}-20261016.md`、`out/first-pte-paired-local-20261016/root/{input-contract,root-result-acceptance,paired-analysis}.json`与`out/mechanism-construction-20261016/model/execution-receipt.json`。
+
+## 10月16日：RECONVERGENCE-1三个具体构造均不立项
+
+借TC状态续行PTW的核心共享FSM/部分walk被GPUMMU2014与Neighborhood2018限制；118bit避免副本不等相对强barrel净省。译后分段/返回预约允许保留一次原翻译，但REALM式fragmenter/credit已表达当前关键动作，未留下独立成本差项。范围旧代回收须先给精确失效、设备完成、分domain计数及VT-d定向drain机会；未取得匹配正常残余，不以driver扩大失效或PR/PW TODO制造需求。
+
+这轮仅源级设计、原文关键章节与旧结果算术，没有三次新机制实验；不强选主线、不启动无辨别力实验或两周开发，也不否定整个领域。p5失败具体根因、实板PN完整根因仍unknown；M0不能倒填它们。原报告的E3“受控因果”措辞同时受本次时序更正限制，原报告未改。来源：`docs/research-reconvergence-20261016.md`、同out根`root-result-acceptance.json`、`references/research-reconvergence-20261016.md`。
+
+## 10月17日：DISCOVERY-REUSE-1取得两项问题事实与普通映射干预
+
+准备合同先未授权，后用户“继续”再实际执行；不是拿旧计划的未运行状态覆盖后来结果。问题发现只需有价值未知、可区分解释和有界取证，不要求先有新机制或保证胜例。一次局部编译、六基础＋两触发诊断，各一个确定性条件；两真实iDMA各64个normal4096 COPY，共1024parent，不是1024次独立实验。P/PN共同承诺前DS-first/F4，原FIFO行为DDR startup31/DS50，M/O/CPU关闭，完整配置、补发、B/DONE与quiet保留。
+
+| A映射／目的环R | P完整T_return | PN完整T_return | 两模式walk | 研究事实 |
+|---|---:|---:|---:|---|
+| 4KiB／1 | 76331 | 76869 | 4 | PN长约0.70% |
+| 4KiB／8 | 90290 | 106570 | 39 | A9页仍重复walk；PN长约18.03% |
+| 4KiB／16 | 101334 | 130104 | 67 | 同walk仍PN长约28.39% |
+| A专用池2MiB／16 | 75797 | 75797 | 3 | 普通映射本arena已足够；N接受0 |
+
+单位是局部RTL仿真clock steps，非实测FPGA/CPU时间。R8的masked tree-PLRU热源/不等子树解释精确吻合偶数目的各8walk、奇数各1walk；内部victim未直接采样，具体way仍源码推导，invalid-first/LRU未实测。
+
+R16 PN中A j16第二PTE(ID48/occ129)在35006接受、35468才到FIFO头、35499返回；其前V j16两payload ID32/occ127/128在34790/34796已承诺，最后R至35467。队列等待461步有具体前驱，DS-first不能撤已承诺读；不把该局部等待扩为全部可回收净收益。P/PN闭环到达日历不同，供给/读腿/写腿分报。
+
+普通A专用池2MiB诊断保持COPY/物理内容/供给、V4KiB，均3次初始walk与75797完整步；parent CSV字节同，PN仅多两个未接受probe。A私有arena原本均预留2MiB，未测OS分配/不可回收RAM/CPU收益；PN大页还改变N资格，差额不能全叫纯walk节省。诊断前有六条件计数及直接原始链检查，但当时触发JSON原字节/hash未保存，当前trigger在八条件后重生成，此来源限制保留。
+
+裁决：新事实成功，当前归普通组织可解/替换局限，尚无新论文机制。普通替换校准仅为未执行建议，不能称修复已通过。来源：`docs/problem-discovery-{contract,results}-20261017.md`；`out/problem-discovery-run-20261017/{acceptance,diagnostic-acceptance}.json`、八份`runs/*/attempt01/{receipt,result}.json`、`analysis/{replacement-source.md,committed-debt-example.json}`。本轮全部读这些小记录；8MB summary仅顶层比较抽读，没有重读全部parent/events、运行归约器或独立复跑。
+
+## 覆盖与持续边界
+
+本轮不宣称全历史/全仓完整覆盖；原先分配正文完成统计不是原始证据全审。八月日志、早期Barrier原运行身份、私人wiki及大量原始CSV/PDF/源码仍有缺口；按coverage逐项区分全文/增量/抽读/仅索引。仓库同步、文档重构只记工程背景。MIG暂停、I not_ready、A5/A2保留、D与mapping/p5/CS1的具体停止范围保持，原10月15—28日窗口不重启。整理没有修改生产或实验源、恢复goal或授权新硬件动作。
