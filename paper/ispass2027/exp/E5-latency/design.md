@@ -5,28 +5,29 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: plan（既定论文实验的接口设计，不恢复机制探索）
 - Origin Date: 2026-10-17
-- Verification Status: UNVERIFIED（提案；尚无 E5 RTL、构建或板测）
+- Verification Status: UNVERIFIED（Root 已接受有界接口；尚无 E5 RTL 验证、构建或板测）
 - Version Label: e5_passive_histogram_v1
 
-本提案供 Root 审查后实施。独立工作树为 `/home/xvhaocheng/work-a1-e5-latency`，
+Root 已接受下述有界接口，并明确首个产物使用已验收 P0/multi 基座及 DS0。独立工作树为 `/home/xvhaocheng/work-a1-e5-latency`，
 顶层分支 `ispass/e5-latency`；不修改当前 DS 构建输入、P0 分支或板卡。
 
 ## 选择的基座
 
-选择已冻结、已用于正式 DS0/DS50 基线的 **4KiB batch + path v3**，不在尚在接续的 P0 前端/驱动上叠加 E5。
-这样 E5 只改变被动观测，不将新增传输大小接口混入延迟分布的版本差异。
+选择已冻结、已验收的 **P0/multi + path v3**；不叠加尚未验收的完整 E3 扩展。
+E5 只改变被动观测，P0 frontend 必须保持相同字节。后续 E2/P0/E3 可共用接受后的观测版本，
+但新负载的容量与采样有效性仍须另行验收。
 
 | 层级 | 固定基座 |
 | --- | --- |
-| platform | `885ed0a7ea90ed42dae2b7a2dadfdd0acba15273` |
-| CVA6 | `8aac3fcd345af7686a55af1867783fd6b91a0069` |
+| platform | `52c5fdd028bbf3b07deaf1d0f7e13e3a271b29d0` |
+| CVA6 | `8aeb9ac9b3aea82a975cc789cb47633fb29bf5c8` |
 | IOMMU | `85b157ebe71a623e326e51fff7b7126fe77e8eb9`，保持原 child |
-| Linux | `45bf76b15e36cf608dff95013d91f8bedb7b1b8e` |
+| Linux | `acece3a3ab7d72ba1f936c1984b82a4a55f28d46` |
 | OpenSBI | `e8d21bfdc2dd753314627968e496c3a1188f6dfb` |
 
-实际对照源来自原 DS0 导出副本与 software01 导出副本；组件修改时另建同名分支的独立 worktree，
+实际对照源为上述固定组件提交；组件修改时另建同名分支的独立 worktree，
 不切活动组件或在运行的构建导出目录上编辑。平台 gitlink / lock 随已完成组件提交后更新。
-第一套候选产物为 DS50/50 + histogram；若 Root 图表矩阵还需 DS0，再在同一来源下仅改变既有 DS overlay。
+第一套候选产物为 DS0 原始硬件 + histogram。DS50 仅留待未来敏感性实验，当前不构建。
 这不是新增机制、服务排序、缓存组织或 DMA 供给方式。
 
 ## 原文事件边界与采样总体
@@ -85,7 +86,8 @@ PATH原DATA口继续读原字段；新直方图DATA口是只读 mux，不控制�
 
 ## Linux与采集
 
-Linux仅改 `drivers/misc/idma.c`：识别v4并记 `o->hist`，继续接受旧v3路径接口，
+Linux仅改 `drivers/misc/idma.c`：识别v4并记 `o->hist`，所有 capability/prepare 判别（含 multi CAPS_SELECTED_PATH）
+一致接纳v4，继续接受旧v3路径接口，
 不改 ioctl/UAPI、工作负载或 CLI 参数。E5专用采集器要求v4及完整直方图，不能以旧BIT静默过关。
 
 原 `idma_observation_finish()` 已在 drain/verify 后读冻结结果并打印，所有新MMIO读取和日志也只放在这里。
@@ -107,7 +109,7 @@ CDF只能由实际桶计数得到；分位数只能报告桶边界范围，不�
 
 ## 接受条件与有限验证
 
-1. 原v3与新分支HistEnable=0逐周期对照：原35计时/AXI字段、16×8 PATH值及握手输入一致。
+1. P0 基座 `8aeb9ac` 的原v3与新分支HistEnable=0逐周期对照：原35计时/AXI字段、16×8 PATH值及握手输入一致。
 2. 全四段、读写/V/A、age0/1/2/3及每个二进制边界、同拍enter/leave、环形队列满时pop+push、
    carry-in/out、open/close边界、reset/clear/abort、ID/hold错误均有限覆盖；每段 `sum(bins)==full`。
 3. 缩小HistogramCountWidth与TimeWidth的独立测试强制桶饱和、timer wrap和队列容量错误，确认粘性失效，
@@ -118,4 +120,5 @@ CDF只能由实际桶计数得到；分位数只能报告桶边界范围，不�
    计入真实新增资源。失败即停，不改时钟约束或实现策略。
 6. 所有完成组件先提交，再落实平台gitlink与来源锁；交Root代码/原始报告/image/BIT后才排队上板。
 
-当前未实施RTL、未建立新Linux/BIT，也没有E5性能数据。Root审查本基座、四段样本口径、32桶边界和MMIO布局后再实施。
+当前未建立新Linux/BIT，也没有E5性能数据。先交第一小批 RTL 与有限真实 DUT 验证、接口证据供 Root 审核实际 diff，
+通过后再启动完整 Vivado；不扩大 Depth4 或放宽现有 overflow 检查。
