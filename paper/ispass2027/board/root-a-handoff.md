@@ -1,3 +1,13 @@
+# 当前续接（2026-10-17 14:55Z）
+
+E2首轮已failed，无板任务在跑！接受5点，6号N4_A8因softlockup/taint16384拒绝；原raw与manifest完整保留。Board仍原DS0+acece，所有lane已排空、数据校验通过但tainted，不能继续正式采。Root只读诊断完成，IOMMU IRQ0，timer/softirq source正在核。E2/checkpoints/e2-prefix-failed01-{snapshot,paper}已离线冻结5接受+1未接受尾，不能拿失败硬件时间充正式样本。
+
+A2被明确要求暂缓Image/payload。Root批准候选multi-only合作调度小批：warmup/测量每未完成poll轮cond_resched，先识别Vdone，旧pair/P0/pages/workload原1024策略；不改HZ/PREEMPT/watchdog/taint/RTL/UAPI/STOP/quiet。A2先finite+RV64+实际diff，Root再审，不先上板。CLI/backend首批38ad848待Root归档验收；4788/46df旧软件候选保留但未构建。
+
+新A3 /root/a3_pages_profile接续原work-a3-pagesize，纯host known software profile最小兼容已锁，新tuple未知拒绝。新Linux可能包含调度修复，不能先登记46df。若共用新软件通过，单次更新供E2原BIT→E4/E5 BIT→完整E3BIT，只切BIT；旧da6 ready包不改作后备。E5 source manifest的Linux reference实际acece（顶层无selected_linux）；full-E3 FPGA dfeb的da6是另一条reference，不要混说。
+
+G observer A1正交最终小批18场景+Goff17/hist18+实际wrapper69检查，尚未交最终diff、未编BIT。full-E3 FPGA唯一1d587/dfeb构建仍running。Root不得恢复失败E2或自动重试；新版本实验另起boot/run/身份，旧5点与失败尾独立保留。
+
 # 当前续接（2026-10-17 14:40Z）
 
 P0正式45/45已于14:37:05Z passed，最终包E3/checkpoints/p0-final01（4506行17列CSV、51份来源），subset-results已更新。首9点包只作历史，不叠计。

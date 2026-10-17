@@ -3,9 +3,9 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Verification Status: PARTIAL（E1b、E3 P0、E6角色已完成；E2/E4/E5/完整E3/G按队列继续）
-- Updated: 2026-10-17 14:40 UTC
+- Updated: 2026-10-17 14:55 UTC
 
-当前唯一板任务是原DS0 BIT加载`board/runs/e2-ds0-load01/`，14:38:06Z启动；继续使用已写入的共同内核`6.5.0-rc2-ispass2027-p0-multi-v1`。启动身份通过后由Root采E2 90点。子agent只做独立分支代码、主机验证和编译，不接触JTAG/UART/SD。
+E2已因第6点N4_A8触发内核softlockup停止；当前无活动板任务。原90点轮仅5个taint0试次接受，已冻结为独立partial论文包；失败尾taint16384原样保留。板上原DS0+acece内核处于tainted且已排空状态，只做只读诊断。A2先准备multi合作调度修复，正式新软件验证后再开展新轮，旧失败和5点不替换混池。子agent不接触JTAG/UART/SD。
 
 ## 已完成的论文数据
 
@@ -33,7 +33,7 @@ DS口径始终是IOMMU数据结构访存的附加延迟，DS0为主结果，DS25
 
 | 任务 | 实际状态 | 下一步 |
 | --- | --- | --- |
-| E2 设备数 | 实际Linux acece3已在板；原DS0正在启动。90点collector、完整出口、不可变prefix出口已审；Root实跑prefix44检查通过。 | 同Linux完成90点；A3补六项同block配对离线报告。 |
+| E2 设备数 | 原轮failed：5接受/90，第6点N4_A8 softlockup拒绝；已冻结5点partial和失败尾。Root已实跑prefix44及配对34检查通过。 | 先审multi调度修复、新软件构建与taint0新boot；原轮不恢复/替换，后续独立90点。 |
 | E4 页大小+E5分布 | 共同软件首次完整构建passed，Linux da6b69f/platform a68603f；release e4-e5-v1，payload29,363,656B。E5 BIT于14:06:29Z passed。 | E2后更新一次软件、加载E5 BIT，共采20点；E5附加采集，不另跑50点。 |
 | 完整E3 | CVA6 1d587/platform dfebcc，Depth64的唯一DS0构建14:10:50Z开始，仍running；ABI5 helper682a2ca已审，adapter46df97c正交验证。 | 最终源码审查、CLI/collector和完整软件构建；自身时序/资源验收后再排≤6小时子集。 |
 | E6 P4M G | 从E5 6c5基座独立准备；frontend2c7c68f已审，39情境/207332周期，与真实旧P0默认关闭/启用gap0逐拍比较。 | 接被动whole/window观测与小接口，逐批审查后编译；G固定V/A各4096×4KiB自然完成。 |
@@ -50,3 +50,5 @@ Root worktree `/home/xvhaocheng/work-root-a`，分支`ispass/root-a`。不在主
 已保留的实际异常：Root重复DS启动在触硬件前被UART锁拒绝；E5首次输出误放共享out后取消独占进程树（非timing失败）；初P0软件最后SPI link缺module.lds，原失败保留、仅模块恢复后正式delivery通过；合法长度backend通过，零长度backpressure负例仍failed且CLI/driver/RTL三层拒零；普通PIE ASan启动失败未冒称通过，non-PIE有限检查另存。上述不作为性能试次或被替换点。
 
 P0结束前的纯主机续接session27823以143终止，原因未建立，未启动E2硬件；独立P0 collector仍45/45成功。Root确认原result=0后才手动dispatch唯一E2加载，未重复任何试次，记录见`board/runs/e3-to-e2-continuation01.json`。下一步E2 collector由Root在boot验证后启动，不再依赖该已结束等待。
+
+E2失败与候选修复详情见[诊断记录](../exp/E2-device-scaling/softlockup-diagnosis.md)，已接受5点的[partial长表](../exp/E2-device-scaling/checkpoints/e2-prefix-failed01-paper/README.md)保留。新软件若及时验收，计划一套共同内核供E2/E4/full-E3，仅依次切BIT；A3正在准备精确known-profile兼容，旧da6包不改，未知新tuple拒绝。

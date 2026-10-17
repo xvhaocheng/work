@@ -14,7 +14,7 @@
 
 DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/hold/pulse失败端点及routing errors均0。独立会话“构建并采集 DS 延迟曲线”的两档100次已全部完成；Root只读复核并冻结最终200试次包（含历史100）。用户授权协调后已统一排程。Root本地12:56:37Z重复启动被UART锁在触硬件前拒绝，失败原样保留，不计试次。
 
-已完成DS campaign为 `/home/xvhaocheng/work/paper/ispass2027/board/runs/ds-sweep-20261017-01/`，launch回执returncode=0。角色互换30/30及P0小子集45/45也全部完成。P0实际boot为088d7493-26d3-4254-b49e-2e1e8f66e910、taint0，45点在14:37:05Z完成；最终论文包`exp/E3-workloads/checkpoints/p0-final01/`每cell n=5。当前唯一板任务为14:38:06Z启动的`runs/e2-ds0-load01/`：原DS0 BIT，复用共同p0-multi内核；boot通过后Root启动E2 90点。
+E1b新增100点、E3 P0 45点、E6角色30点均完成通过。E2首轮于14:48:46Z停止：原DS0/acece内核，第6点N4_A8触发softlockup与taint16384，5个合格试次已冻结为partial论文包，失败尾不接受、不替换。当前无活动板任务，已排空tainted boot只做只读诊断。A2准备必要multi合作调度修复，Root审后编新共同软件，再按E2→E4/E5→完整E3串行；未知新软件profile不提前放行。
 
 
 | 原优先级 | 任务 | 状态 | 采集规模 | 预计板时 / 条件 |
@@ -64,3 +64,5 @@ full-E3 DS0唯一构建已于14:10:50Z启动，`exp/E3-workloads/artifacts/full-
 首区组论文数据见`exp/E3-workloads/checkpoints/p0-progress01/`：V64/1024/4096B的同区组A8/A1额外慢化分别14.2461%/13.8811%/10.3991%，各n=1、running/partial；不将其当完整45点结果，不与最终包相加。Root有限续接session27823只在P0正式passed且45/45后才加载原DS0、验证同内核并启动E2；任一步失败即停，无自动替代试次。
 
 14:40Z更新：P0 45/45全部通过，最终包含首9点，不叠计。纯host续接27823以143结束、未启动E2，原因未建立；Root确认P0成功后已于14:38:06Z手动dispatch唯一E2加载。先前“自动续接E2”的描述已失效，后续由Root在启动验证后执行collector。软件formal delivery原字节已复制到Root E3/p0-common-software-delivery-manifest.json，E2将用此副本，便于source_root限定Root工作树。
+
+14:55Z实际失败更新：E2旧90点轮failed/accepted5，见E2/checkpoints/e2-prefix-failed01-paper及softlockup-diagnosis.md。原第6点硬件V262.105ms而软件收尾23.014s，不作为性能样本。Root已要求不关watchdog、不改HZ/PREEMPT、不放宽taint；仅评审multi未完成轮合作调度候选，失败原因仍待验证。新软件若验证通过将是新source/boot/run，不与本前5点合并。
