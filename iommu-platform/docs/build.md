@@ -1,5 +1,9 @@
 # 构建与恢复
 
+新任务先从[版本入口](versions.md)选择当前开发树、原版/适配/修复锚或历史实验的冻结源码。源码组合 registry 只供静态导出，不能作为下文的 Make `PROFILE`；原版 CVA6 的原始 IOMMU child 与单独上游目标版本也不可混配。
+
+每次后续实验按[实验身份记录](../../docs/agent-policy.md#实验身份记录)保留平台及实际组件的 branch/完整 commit、dirty patch/overlay、锁与父子指针、实际编译输入哈希、构建/运行参数和结果关联。仅引用源码而未执行的 Linux/固件须单列；当前 checkout 不替代独立导出副本的身份。已有 manifest 字段不足时，另存实验身份文件并与原 manifest 互链，保留原件。
+
 工具：本机已用 Vivado 2023.1、riscv64-linux-gnu GCC 11.4.0、riscv64-unknown-elf GCC 10.2.0、Verilator 4.038、Python 3.10 完成本次相应尝试。HPM 定向测试不需要 Bender；当前 FPGA Makefile 使用固定源文件清单和固定子模块，不在构建时拉取依赖。
 
 可选本机配置：在不跟踪的 `local.json` 中写 `riscv_prefix`、`cross_compile`、`bare_cross_compile`。`RISCV` 环境变量可覆盖默认前缀，`vivado` 从 PATH 查找。许可证使用 Vivado 自身的环境和配置；脚本不自动建立 SSH 隧道。

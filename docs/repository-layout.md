@@ -36,7 +36,7 @@
 | 文档与补丁来历 | [docs](../iommu-platform/docs/)、[validation](../iommu-platform/docs/validation.md)、[patches](../iommu-platform/docs/patches.md)、[provenance](../iommu-platform/provenance/) | 协议、报告与已纳入提交的迁移补丁；provenance 是审查副本，不要重复应用 |
 | 基础镜像 | [assets/README](../iommu-platform/assets/README.md) | 固定 rootfs 基础与来源限制；不是全用户空间已从源重建 |
 
-原版、必要适配、独立修复与研究扩展的固定提交见[源码组织](../iommu-platform/provenance/source-organization-20261017/README.md)，历史运行身份见[对应索引](../iommu-platform/provenance/source-organization-20261017/history/README.md)。新增引用与恢复包保留原组件历史；五个源码profile仅供静态导出，不是已构建／已运行的Make配置。
+选分支先看[版本与分支导航](../iommu-platform/docs/versions.md)，其中统一链接原版、必要适配、独立修复、研究扩展及历史运行身份。五个源码profile仅供静态导出，不是Make配置；运行证据须查具体实验，不能从当前工作树或分支名推断。
 
 内部活动分支、实际组件HEAD与恢复方式见[内部仓库整合](../iommu-platform/provenance/internal-repository-integration-20261017/README.md)。代码先在内部Git提交并同步父子指针／lock，再同步work文件；公开恢复包保留内部历史，并不把顶层目录变成gitlink。
 

@@ -2899,3 +2899,12 @@ HERO height32四案P/N/H1/H2在执行前冻结，一次调用两个固定普通�
 平台已按依赖提交21项版本锁与父子指针、8组102个源码／配置／脚本／测试路径、既有报告／迁移及来源包。只新增Vivado .Xil会话缓存忽略，原缓存／时序记录／补丁残留／out数据保持；不靠隐藏源码清空状态。复用scripts/platform.py现有check()核对组件clean、gitlinks、lock和无alternates，另核旧refs/历史祖先及保留文件。此处是Git／源身份检查，不是编译或功能测试。
 
 [内部整理与活动分支入口](../provenance/internal-repository-integration-20261017/README.md)／[实际分组提交](../provenance/internal-repository-integration-20261017/platform-commits.json)／[最终回执与平台恢复包](../../repository-recovery/internal-integration-20261017/README.md)。无新构建／主机回归／RTL仿真／性能实验／综合／布线／板测，未恢复MIG，原版性能基线仍未运行。Codex-only。
+
+
+## 2026-10-17 版本导航与实验身份文档核对
+
+新增[稳定版本入口](versions.md)，由平台README及构建说明链接。只读Git核查确认平台与四主体组件的活动分支，21项组件HEAD、父级gitlink与版本锁逐项一致；五组source-profile的全部commit实存，四组CVA6→IOMMU配对与各commit树一致。明确原版child为f8f918a而非单独上游目标c80bba7，静态导出组合不等于Make PROFILE。
+
+核对[失效干扰build03清单](../out/invalidation-interference-20261017/build/build03/build-manifest.json)：实际冻结CVA6 ba8cdd1／IOMMU F5 85b157e，与当前研究整合HEAD分开；96项显式source、3份手写输入快照及冻结source-manifest的现存字节均匹配记录SHA256。Linux f215540仅为来源C，未在该仿真执行。结果归档提交734592d按[原发布回执](../out/invalidation-interference-20261017/publication/receipt.json)保留，不作为永远当前平台tip；这些检查不重放28配置或替代原实验验收。
+
+新文档本地链接与只读查阅示例对象已核对，后续身份记录统一引用[实验身份记录](../../docs/agent-policy.md#实验身份记录)。本次仅文档、Git及已有输入哈希检查，没有新源码／构建／回归／RTL运行／性能实验／综合布线／板测，不切换工作树或恢复暂停任务；Codex-only，未使用DeepSeek或Claude。

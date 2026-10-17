@@ -12,6 +12,7 @@
 - “停止”只限具名版本、动作、费用与证据覆盖范围。普通程序在同新增付费接口上复现策略，不单独证明接口已发表、所有实现等成本或整个思想族无价值。
 - 问题发现不要求先有论文机制；机制增量不足与问题尚未证实分开。2026-10-17的[有界发现合同](../iommu-platform/docs/problem-discovery-contract-20261017.md)经用户继续后已实际执行，结果见[发现报告](../iommu-platform/docs/problem-discovery-results-20261017.md)；发现新事实与形成论文机制分别判断。
 - M（占用计费候选）、M0（完整任务测量合同）、首 PTE 的 M-ID（具体接口候选）不是同一个对象；P 是容量分区，N 是命中旁路，PN 是组合。V/A 通常指受保护前台/后台干扰者，角色和分母须按各轮合同核对。
+- 失效实验的M0–M4是该轮失效策略编号，其中M0为持久映射/无失效基线，不等于上条历史“完整COPY M0”合同。实际源码从[版本导航](../iommu-platform/docs/versions.md)与各轮manifest定位。
 
 ## 测量平台与局部因果证据
 
@@ -24,6 +25,7 @@
 | 9 月 16 日 batch / DS / path：形成真实压力 | 自主有限批次形成约 99.7% 在途重叠并测得硬件慢化；DS0/回切支持延迟敏感性，path 定位内部排队。实板多轮 | DS 汇合多类请求，不能把差值叫纯 PTW 成本；路径统计不能直接相加归因全部慢化。复用连续供给、分段观测与回切对照 | [batch](../iommu-platform/docs/batch-results-review.md)、[DS0](../iommu-platform/docs/ds0-batch-results-review.md)、[DS50 回切](../iommu-platform/docs/ds50-retest-results-review.md)、[path](../iommu-platform/docs/path-results-review.md) |
 | 9 月 17–18 日 E3：miss 会不会拖住后来 hit？ | v4/诊断/v5 存在触发、前史、身份或截断问题；v6 独立 64B 受控配对中，四组 cold 的 A 剩余服务与 V 剩余等待同步增加，支持本实现局部 A-miss→V-hit 等待传播。实板 | v5/v6 后续已上板；旧“v5 未上板”是早期快照。此结果不解释全部自然 4KiB 慢化，不证明通用 HOL 或新方法 | [早期 E3](../iommu-platform/docs/e3-results-review.md)、[诊断](../iommu-platform/docs/e3-diag-results-review.md)、[v5 配对](../iommu-platform/docs/e3-queue-results-review.md)、[v6 受控结果/原始验收](../iommu-platform/docs/e3-controlled-results-review.md) |
 | 10 月 3 日 E2：容量替换因果链 | 64 项实板记录串联 V 驻留→A 覆盖→探测前 V 条目消失→V 首次再用 miss；16 项 IOTLB 的 W7/W8 为该布局边界 | 有限布局的替换与首 miss 成立，不等于全部稳态慢化归因；复用可控状态与首再用协议 | [E2 正式报告及原始证据](../iommu-platform/out/e2-results-review-20261003/RESULTS.md) |
+| 10 月 17 日：IOTLB失效粒度 | 固定原版IOTLB＋必要修复、真实双iDMA/CQ、行为DDR；24主配置＋4对照通过。宽失效使B慢14.8%–17.6%；异域PSCID/域内地址失效消除失效归因miss，A完整时间增加9.7%–10.0% | Linux主线/开发/本地来源分开；当前活动研究checkout未用于该轮编译。仅支持具名版本与新IOVA工作负载，不是Linux原生/板测或通用最优结论；M0仍有替换压力 | [一页报告](../iommu-platform/out/invalidation-interference-20261017/README.md)、[28组原始核对](../iommu-platform/out/invalidation-interference-20261017/analysis/validation.json)、[实际构建](../iommu-platform/out/invalidation-interference-20261017/build/build03/build-manifest.json) |
 
 ## 缓解基线、组合效应与完整任务
 

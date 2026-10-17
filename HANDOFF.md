@@ -3912,3 +3912,16 @@ IOMMU与CVA6分别拆成12／27个功能提交，实际补丁顺序与语义依�
 用户要求老旧且不需要的文件实际删除。先核对已完成历史整理的18份payload、4份before备份和保存回执，23项以94e67443c17a6fb15a2d27d59eaf932a138d98b2提交；CSV为追加82行及更新16行，不冒称全历史核查完成。随后删除67个已由现有同步策略判为生成物、且在所在实际Git仓库未跟踪的旧文件，以及4份重复before工作副本，共80,113,799B。4份副本既与前一版正文逐字相同，也完整存在94e6744中；save-receipt增加后继清理及Git恢复路径，原18份payload内容保持。
 
 4个看似生成物的文件实际已在当前或旧恢复副本的组件Git中跟踪（CVA6预置测试程序／Linux打包输入），未当作未跟踪缓存删除，仅沿现有镜像筛选规则从外层Git提示排除。诊断日志6行既有追加随收尾保留。未删除原始研究事件或唯一源码、未改内部活动分支或版本锁，无新构建／测试／仿真／实验／板测。活动平台及21组件仍为此前已核对的干净版本。删除清单与保存身份检查在.git/sync-preparation/remaining-changes-20261017/。
+
+
+## 2026-10-17 失效仿真完成及版本入口维护
+
+用户随后单独授权的失效来源核查与仿真已完成并归档：[一页报告](iommu-platform/out/invalidation-interference-20261017/README.md)、[28组逐项核对](iommu-platform/out/invalidation-interference-20261017/analysis/validation.json)。24主配置＋4对照各一次，真实CQ/双iDMA、原版16项PLRU IOTLB加必要修复，无P/PN分区/提前旁路；宽失效使B慢14.8%–17.6%，异域PSCID或域内地址失效消除失效归因miss，但A完整时间增加9.7%–10.0%。Linux A/B/C来源分开；结果限于具名Verilator/行为DDR工作负载，不是Linux原生或板测。首次单层DDT预检失败原件保留，合法两层DDT后通过；未改生产RTL/Linux，MIG保持暂停。
+
+实际编译基线为CVA6 `ba8cdd10659a777ccff0080bf020be64b5c1e064`、IOMMU `85b157ebe71a623e326e51fff7b7126fe77e8eb9`，与生产checkout的研究整合HEAD不同。内部平台结果归档提交为 `734592d18fdeff7e69b01163bb572ab2a0d3f39d`，公开work归档为 `a88a38b7c99f1c04df37a93a380cdf015e2f94ce`；两者不是实验执行源码。原build/run manifest与恢复包实际导入记录保持原字节。
+
+用户要求新agent更容易找到最近新增的分支和版本。本次维护新增单一[版本与分支导航](iommu-platform/docs/versions.md)，根/平台README、AGENTS、研究导航、代码地图和构建入口均直接指向它；CURRENT、计划与成果索引接入上述已完成实验，纠正“仍只有静态整理、完全没有修复基线仿真”的过期概述。纯上游整体平台/板上原版性能基线仍未运行，不混淆两者。实际核对21项组件HEAD/父子gitlink/lock和静态profile配对，版本表的commit为固定来源或核对时点，活动分支tip须读取Git。
+
+[实验身份记录规范](docs/agent-policy.md#实验身份记录)明确要求构建/运行前留存各相关repo的checkout分支及完整commit、实际selected ref/commit、dirty补丁与overlay文件哈希、实际编译闭包/构建参数/产物哈希、运行身份与原始结果；后续归档commit单列。复用现有source/build/run manifest，缺项在下一轮运行前补齐，不回填旧分支伪造旧执行身份。本次只维护文档/导航和核对Git与链接，不改生产源码、锁、子仓库引用，不启动新构建、实验、综合或板测。Codex-only。
+
+平台文档已先提交为 `6451764460bd015837a295410c49ef41227bf1f7`；[原恢复入口](repository-recovery/internal-integration-20261017/README.md#后续平台提交按序恢复)串起原整合包、失效结果增量与本次6.5KB文档增量，已在全新bare目录导入三包并核对HEAD/tree及完整对象。旧实验与旧核验原件不改写，后续普通文档提交不冒充新的执行源码。

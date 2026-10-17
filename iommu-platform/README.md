@@ -9,6 +9,7 @@
 ## 当前入口
 
 - 当前安排：[唯一总计划](../研究计划.md)、[研究导航](../研究导航.md)、[当前状态](../CURRENT_STATUS.md)；阶段背景见[HANDOFF](../HANDOFF.md)。研究方向与暂停状态仅由这些入口维护，本说明不另设主线或授权新实验。
+- 版本与分支：[稳定版本入口](docs/versions.md)，先区分当前开发、原版/适配/修复及实验实际冻结源码；后续实验遵守[实验身份记录](../docs/agent-policy.md#实验身份记录)。
 - 平台使用、构建、交付：本文件、[构建说明](docs/build.md)。
 - 历史 E3 v5 协议与有限矩阵：[E3_QUEUE_PAIR.md](E3_QUEUE_PAIR.md)。
 - E3 原协议/字段：[E3_SERVICE.md](E3_SERVICE.md)；D0/D0 软件诊断字段：[E3_DIAGNOSTIC.md](E3_DIAGNOSTIC.md)。
@@ -73,7 +74,7 @@ FPGA 输出示例（历史 v5配置）：
 
 - 顶层仓库管理脚本、配置、测试以及组件提交指针；CVA6、IOMMU、Linux、OpenSBI 保留各自来源历史。
 - 修改 IOMMU 后，按 IOMMU → CVA6 子模块指针 → 顶层 CVA6 指针的顺序提交，并更新 `sources.lock.json`；`make check` 会检查工作树、各级指针和 lock 是否一致，并会写 `out/manifests`。
-- 具体当前工作树和提交以 `git status`、`git rev-parse HEAD` 及 `sources.lock.json` 为准，不在文档中硬编码 HEAD。
+- 具体当前工作树和提交以 `git status`、`git rev-parse HEAD` 及 `sources.lock.json` 为准；[版本入口](docs/versions.md)列明固定锚及只读核对方法。分支可移动，实验还须保存组件 commit、dirty 差异与实际编译输入哈希，不能只写当前分支名。
 - 当前内部整理与恢复入口见 [活动仓库整合记录](provenance/internal-repository-integration-20261017/README.md)：原历史与功能分层链已合入新的 `codex/organized-current-20261017` 活动分支，普通源码保持。后续改动先在实际内部仓库提交、更新父级指针与锁，再同步公开 `work`；顶层文件快照不能替代这一步。
 - 组件远端以其实际配置为准；`upstream`只表示来源。顶层公开工作区同步与组件自身上游提交分开，不由一次`clone --recursive`保证取回所有本地提交。
 - 现有 bundle/恢复副本来自迁移阶段，不能假定包含最新实验修改；迁移新版前重新运行 `make bundle`。

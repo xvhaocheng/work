@@ -1,8 +1,14 @@
-# 当前状态：内部平台与子仓库已整合；既有实验保持
+# 当前状态：失效干扰仿真完成；版本入口统一
 
-2026年10月17日（JST）。按用户纠正，将[版本整理真正落实到内部平台及子仓库](iommu-platform/provenance/internal-repository-integration-20261017/README.md)：新的活动分支保全原历史并合入功能链，父子gitlink与21项版本锁同步。原版／适配／修复锚仍见[来源整理](iommu-platform/provenance/source-organization-20261017/README.md)。本轮仅Git与源码身份核验，没有新构建或实验；原版性能基线尚未运行。既有 DISCOVERY 与 PLRU 消融结果保留，当前归普通优化及刻画证据，未立新机制主线。总入口为[计划](研究计划.md)与[导航](研究导航.md)。
+2026年10月17日（JST）。最近已完成[失效干扰来源核查与仿真](iommu-platform/out/invalidation-interference-20261017/README.md)：24组主配置＋4组对照均通过。新agent涉及代码/实验时先读[版本与分支导航](iommu-platform/docs/versions.md)，再按[研究导航](研究导航.md)定位目标；活动开发工作树不等于该实验实际编译源码。内部整合与原历史保留，21项组件锁未因这轮独立仿真改变。
 
-## 全局安排与本轮裁决
+## 最近完成与下一步
+
+- 原版16项PLRU IOTLB加既有必要修复、无分区/旁路，经真实CQ与两iDMA运行：宽失效使B完整时间增加14.8%–17.6%；异域按PSCID或域内按地址消除失效归因miss，但A完整时间较宽失效增加9.7%–10.0%。局部Verilator/行为DDR结论，未运行Linux或板测。
+- 最新主线、开发分支、本地Linux分别固定核查，不能混用结论；源码、参数、失败预检、24＋4原始结果与逐项核对均在报告目录。实际构建用CVA6修复基线 `ba8cdd1`／IOMMU `85b157e`，不是当前研究整合checkout。
+- 已有“原版IOTLB＋必要修复”的同负载无失效仿真基线；纯上游整体平台和板上原版性能基线仍未运行。当前无追加实验排期，MIG、旧goal和暂停分支保持；本次入口维护不重选研究方向、不启动新实验。
+
+## 既有发现与保留结论
 
 - 两真实iDMA各64次normal4096 COPY，只变A目的再用R1/8/16；普通P/PN共同DS-first/F4，非stock；冷前缀、配置/补发、双方B/DONE与quiet全部保留。
 - R8时两设备合计39次walk，其中A为37次。既有[PLRU消融](iommu-platform/out/plru-ablation-20261017/README.md)已直接追踪victim：A热源常驻way8，30次有效逐出集中way2/3、7个允许条目空闲。V1近均衡重排仍有热源偏置；V2精确LRU／空项优先／fill-MRU使总walk降至11。名义14项mask不等于14项有效驻留保证。
@@ -20,7 +26,7 @@
 
 ## 硬件与执行状态
 
-本轮已在新的codex/organized-current-20261017活动分支提交原有改动、正常合入功能链并更新父子指针与锁；旧refs和源码字节保持。平台及21组件以现有纯Git检查核对干净状态；无新编译、测试、仿真、综合/布线或板测。此前DISCOVERY的8条件及PLRU的18配置／24次有效运行保持原运行身份，未在新提交重跑。行为DDR时间非FPGA/原生时间，NO_ERROR_HANDLING缺项不变；MIG继续暂停。共享IOMMU整理为Codex-only。
+此前已在 `codex/organized-current-20261017` 活动分支正常合入功能链并更新父子指针/锁，旧refs保留；随后失效仿真只增加独立输出和冻结测试副本，生产RTL/Linux未改。版本导航核对21项组件HEAD与父子gitlink，当前分支tip以实际Git为准。DISCOVERY和PLRU旧结果未重跑；最新失效测量也不能追认为当前研究checkout或全平台已验证。行为DDR时间非FPGA/原生时间，NO_ERROR_HANDLING缺项不变；无新综合/布线/加载/板测，MIG继续暂停。共享IOMMU保持Codex-only。
 
 ## 独立工程事项
 

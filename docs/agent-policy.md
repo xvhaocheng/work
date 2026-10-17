@@ -54,6 +54,23 @@
 - 在同一工作负载、设备数量、映射、供给/完成过程和时钟/内存模型下，先完成原版功能检查与完整任务基线，再按依赖逐项加入本轮需要的扩展。原版无法完成时，保留实际失败与原因；必要修复另列并验证，不用扩展配置代替原版成功。输入和检查完全相同的既有有效基线可复用，不要求重跑全部历史或枚举无关组合。
 - 每个结果绑定实际源码hash、组件commit与未提交差异、编译和运行参数、测试夹具及内存服务模型。历史结果继续绑定当时输入；历史未包含原版对照的，只支持相应扩展配置结论，不能追认为已完成原版实验。后续整理提交或分支不改变旧数据、日期与来源记录。
 
+## 实验身份记录
+
+分支名方便人查找，**完整 commit 和实际输入哈希固定版本**。以后每轮已授权实验在构建/运行前记录以下信息；复用现有 source/build/run manifest，由实验 README 链接它们，不再复制一套独立记录体系。
+
+| 层 | 必须保留的信息 |
+| --- | --- |
+| 仓库与工作树 | 记录时间、仓库路径/来源、当时 `checkout_branch` 与完整 `checkout_commit`；detached HEAD 如实写明。`work`、平台及本次相关子仓库分别记录；其余依赖由具名版本锁及其 SHA256 覆盖 |
+| 实际选用源码 | `selected_ref`、解析后的完整 `selected_commit`、原版/必要适配/修复/研究扩展分类；父子 gitlink 与依赖配对。若从其他 commit 导出冻结源码，明确它与当前 checkout 的区别 |
+| 未提交和测试副本 | dirty 状态；已暂存/未暂存 patch、本轮用到的未跟踪源码/overlay 的文件清单与 SHA256。只写 dirty=true 不足以复原；源码干净也不代表测试副本没有变化 |
+| 构建身份 | 实际编译源/include/夹具的路径和 SHA256、完整构建命令、编译/elaboration 参数、工具版本、内存/时钟模型；输出二进制/镜像/BIT 哈希及对应 build manifest |
+| 运行身份 | 唯一 run/case ID、构建/二进制身份、完整运行参数/工作负载、必要非秘密环境与计时口径、起止时间、退出状态、原始日志/结果路径和哈希；板测另记实际加载身份与时钟/时序 |
+| 结果归档 | 后续内部平台/组件与公开 work 的归档 commit 或恢复包入口；它们晚于执行，不冒充执行时的源码版本。原始 build/run manifest 保持原字节 |
+
+README 用一张简表回答“选了哪个版本、运行了哪个构建、结果在哪里”，完整 SHA 和文件清单留在已链接的 manifest。先看[版本导航](../iommu-platform/docs/versions.md)选基座；现有[平台构建 manifest](../iommu-platform/scripts/platform.py)和本轮 runner 各按实际已记录字段复用，缺少的分支/差异等信息在运行前补入本轮记录，不能宣称旧工具已自动收集完整字段。
+
+历史实验不因今天新增了一个分支就回填成该分支执行；能由原 manifest、冻结源码或原始 Git 证明的对应关系可以补充，缺失项写 unknown。此次失效仿真可参照其 [build03](../iommu-platform/out/invalidation-interference-20261017/build/build03/build-manifest.json)、[运行记录](../iommu-platform/out/invalidation-interference-20261017/runs/matrix01/campaign.json)及[后续归档记录](../iommu-platform/out/invalidation-interference-20261017/publication/receipt.json)：实际编译的修复基线与生产活动 checkout 不同。
+
 ## 文件、交接与同步
 
 - 先按导航定向阅读；不为熟悉环境扫描完整Linux、RTL、构建树或凭据目录。已通过且输入未变的验证不重复；有价值且可区分的新问题可以提出有界探索，不要求先证明机制收益。独立分析用新目录，不覆盖历史输出。

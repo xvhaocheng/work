@@ -17,3 +17,15 @@ git clone --branch codex/organized-current-20261017 /absolute/path/iommu-platfor
 这个操作恢复平台 Git 和跟踪文件。子组件有独立 Git 对象库：先准备各自清单中固定来源的仓库与完整 prerequisite 历史，使用平台内 `component_bundle_package.py restore` 导入对应包的全部 head，再在干净的新组件目录选择 `codex/organized-current-20261017`。其他 vendor 仍使用锁文件点名的既有版本。详情与防覆盖规则见组件恢复说明；父仓库的 gitlink 不包含子仓库对象。
 
 没有改动第三方 upstream，也没有向其分支推送。本地原始分支、数据和缓存保留；Git 整理不代表原版性能基线或新版本运行验证。无新编译、回归、仿真、性能实验、综合／布线或板测。
+
+## 后续平台提交按序恢复
+
+上面的完整包和 `verification.json` 固定在整合时点 `8a2e42d8b3617b638f2033bd16eae6ed2531b88b`，不持续冒充最新 HEAD。后续在新恢复目录中按下面顺序导入，既有包和回执不改写：
+
+| 顺序 | 平台提交 | 恢复入口 |
+| --- | --- | --- |
+| 1．内部整合 | `8a2e42d8b3617b638f2033bd16eae6ed2531b88b` | 本页原完整平台包 |
+| 2．已完成失效实验归档 | `734592d18fdeff7e69b01163bb572ab2a0d3f39d` | [实验发布说明与增量包](../../iommu-platform/out/invalidation-interference-20261017/publication/README.md)，要求顺序1 |
+| 3．版本导航文档 | `6451764460bd015837a295410c49ef41227bf1f7` | [platform-navigation-delta.bundle](platform-navigation-delta.bundle)／[实际恢复核对](platform-navigation-delta.json)，要求顺序2 |
+
+增量包均提供 `refs/heads/codex/organized-current-20261017`，按序 fetch 到恢复仓库同名分支即可；上述三个包已在全新 bare 目录中实际导入并通过 HEAD/tree 和完整对象检查。顺序3只修改四份平台文档，不改组件源码、gitlink或版本锁，不运行新实验。当前源码选择与实际实验输入从[版本导航](../../iommu-platform/docs/versions.md)进入。
