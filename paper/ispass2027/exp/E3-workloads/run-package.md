@@ -2,6 +2,8 @@
 
 > 此頁保留最初完整矩陣設計與原pathv3限制。後續僅P0修改、構建和45點已獲批准，
 > 新實作／採集入口與當前實際狀態見 [p0-implementation.md](p0-implementation.md)。其餘矩陣仍僅規劃。
+> P0實際產物已就緒，見[p0-artifact-package](p0-artifact-package.md)。使用者最新授權允許完整E3必要擴展，
+> 新bounded提案／Depth64論證／1MiB幾何見[full-bounded-design](full-bounded-design.md)；下文16MiB canonical及最初停止敘述保留為歷史。
 
 ## Material Passport
 
