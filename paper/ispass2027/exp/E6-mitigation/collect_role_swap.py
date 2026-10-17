@@ -18,6 +18,7 @@ sys.path.insert(0, str(BOARD))
 from uart import Console, DEFAULT_PORT
 
 CONDITIONS = ['Solo', 'A1', 'A8']
+DS0_BIT_SHA256 = 'e9b6554f2b3a64a19f910c672781ad38b7c91879b560d382506aca5ec5df1da6'
 PARSER_SOURCE_SHA256 = 'b7b4f2b012a21ef8d16eaa3b699070f609546f3a496fad93bf2e0c34ccbf8274'
 
 
@@ -63,6 +64,7 @@ def parse(output, expected_kernel, condition, expected_n=4096, expected_warmup=2
         if lane is not None:
             assert lane['data_errors'] == lane['quarantined'] == 0, 'data/quiet'
             assert lane['submitted'] == lane['completed'], 'drain'
+            assert lane['completed_bytes'] == lane['completed'] * 4096, 'completed byte count'
     assert result['victim']['completed'] == n and result['victim']['completed_bytes'] == n*4096
     observations = defaultdict(dict)
     def numbers(line):
@@ -174,6 +176,12 @@ def review(records):
             'scope': 'V DMA1 / A DMA0; per-trial stage means and observed maxima; no request quantiles'}
 
 
+def validate_receipt(loaded, expected_kernel):
+    assert loaded['status'] == 'boot_identity_verified', 'existing verified load receipt required'
+    assert loaded['kernel_release'] == expected_kernel, 'kernel identity'
+    assert loaded['bit_sha256'] == DS0_BIT_SHA256, 'E6 requires the existing DS0 BIT receipt'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan-only', action='store_true')
@@ -181,7 +189,7 @@ def main():
     parser.add_argument('--expected-kernel', default='6.5.0-rc2-ispass2027-pathv3')
     parser.add_argument('--load-manifest', type=Path)
     parser.add_argument('--source-record', type=Path)
-    parser.add_argument('--ds', choices=['0/0', '25/25', '50/50', '100/100'])
+    parser.add_argument('--ds', choices=['0/0'])
     parser.add_argument('--port', default=DEFAULT_PORT)
     parser.add_argument('--recover-run', type=Path,
                         help='Parse a complete saved UART prefix, then run only remaining points')
@@ -196,8 +204,7 @@ def main():
     if any(value is None for value in [args.output, args.load_manifest, args.source_record, args.ds]):
         parser.error('--output, --load-manifest, --source-record and --ds are required to collect')
     loaded = json.loads(args.load_manifest.read_text())
-    assert loaded['status'] == 'boot_identity_verified', 'existing verified load receipt required'
-    assert loaded['kernel_release'] == args.expected_kernel, 'kernel identity'
+    validate_receipt(loaded, args.expected_kernel)
     source = json.loads(args.source_record.read_text())
     assert source['actual_commits']['linux'] == '45bf76b15e36cf608dff95013d91f8bedb7b1b8e', 'pathv3 source'
     assert source['actual_commits']['cva6'] == '8aac3fcd345af7686a55af1867783fd6b91a0069', 'baseline source'

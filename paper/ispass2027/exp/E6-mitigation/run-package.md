@@ -8,7 +8,7 @@
 - 接口：现有 `idma_experiment --batch`，无驱动、内核、RTL变更。复用 [baseline100 来源](../../board/packages/baseline100-20261017/source.json)及本次实际 load receipt。
 - 模型：Codex-only；未调用 DeepSeek；A3 未访问 FPGA/JTAG/UART。
 
-V=DMA1/DID11，A=DMA0/DID10。Solo、A1、A8 各10次，总30点；10个区组内轮转三条件。V源/目的各1页，A源/目的各1或8页；4KiB COPY，4096次，预热256。无额外短测、重启或重载。沿用 Root 运行时的有效 baseline BIT；`--ds` 应照实填写该BIT配置，主机不猜测板端DS状态。
+V=DMA1/DID11，A=DMA0/DID10。**本轮仅DS0**。Solo、A1、A8 各10次，总30点；10个区组内轮转三条件。V源/目的各1页，A源/目的各1或8页；4KiB COPY，4096次，预热256。无额外短测或独立重启；在 Root 安排的DS0阶段复用有效配置。采集器仅接受`--ds 0/0`，并将既有load receipt的`bit_sha256`与已知DS0 `e9b6554f2b3a64a19f910c672781ad38b7c91879b560d382506aca5ec5df1da6`比较，拒绝DS50误标；不重新hash硬件产物。
 
 ## 为什么可直接运行
 
@@ -31,10 +31,10 @@ python3 paper/ispass2027/exp/E6-mitigation/collect_role_swap.py \
   --load-manifest CURRENT_VALID_LOAD_RECEIPT \
   --source-record paper/ispass2027/board/packages/baseline100-20261017/source.json \
   --expected-kernel 6.5.0-rc2-ispass2027-pathv3 \
-  --ds ACTUAL_DS
+  --ds 0/0
 ```
 
-`NEW_E6_RUN_DIR`、`CURRENT_VALID_LOAD_RECEIPT` 和 `ACTUAL_DS` 由 Root 的当前配置替换。复用上板skill的串口独占和既有receipt，不增加硬件hash/SD回读步骤。必须以普通Python运行；Python `-O` 会禁用原采集器保留的断言检查。
+`NEW_E6_RUN_DIR`和`CURRENT_VALID_LOAD_RECEIPT`由 Root 的DS0阶段配置替换。复用上板skill的串口独占和既有receipt，不增加硬件hash/SD回读步骤。必须以普通Python运行；采集器明确拒绝Python `-O`，以保留原有断言检查。
 
 保留CLI原JSON、完整UART、同sequence的3条batch和16条PATH。保留原检查：内核/boot/taint、CLI状态、双方data_errors/quarantined、submitted=completed、V4096次及字节数、观测状态、窗口H+gap、固定前端cadence、AXI守恒与重叠、全部PATH计数/边界守恒。新增角色、DID、A页数与条件核对。非零错误立即停止并保留输出；没有性能筛选或自动补采。若仅主机解析失败，`--recover-run OLD_RUN_DIR` 会先解析原始已完成前缀，只执行剩余计划点；无法完整解析或板端执行失败的命令会拒绝恢复，不以新样本替换。
 

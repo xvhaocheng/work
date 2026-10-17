@@ -54,6 +54,7 @@ def main():
     reject('wrong_pages', fixture(lambda r: r['input'].update(aggressor_pages=1)))
     reject('data_error', fixture(lambda r: r['result']['victim'].update(data_errors=1)))
     reject('undrained_A', fixture(lambda r: r['result']['aggressor'].update(completed=0)))
+    reject('wrong_A_bytes', fixture(lambda r: r['result']['aggressor'].update(completed_bytes=1)))
     reject('taint', fixture().replace('TAINT_AFTER=0', 'TAINT_AFTER=4096'))
     reject('missing_PATH', re.sub(r'^.*idma_path_obs[^\n]*\n?', '', fixture(), flags=re.M))
     reject('stale_sequence', fixture().replace('PRE_SEQ=', 'PRE_SEQ=9'))
@@ -64,6 +65,17 @@ def main():
     assert '--aggressor 0 ' in collector.command('A8')
     assert '--aggressor none ' in collector.command('Solo')
     checks.append({'name': 'thirty_points_and_commands', 'passed': True})
+    receipt = {'status': 'boot_identity_verified', 'kernel_release': kernel,
+               'bit_sha256': collector.DS0_BIT_SHA256}
+    collector.validate_receipt(receipt, kernel)
+    checks.append({'name': 'existing_DS0_receipt_accepted', 'passed': True})
+    receipt['bit_sha256'] = '580b34014914a1bee8541ed1e23b36a164bfc0fea3a2f691f56870b44dc35e77'
+    try:
+        collector.validate_receipt(receipt, kernel)
+    except AssertionError:
+        checks.append({'name': 'existing_DS50_receipt_rejected', 'passed': True})
+    else:
+        raise AssertionError('DS50 receipt unexpectedly accepted')
     args.output.write_text(json.dumps({
         'schema': 'ispass2027.e6_role_swap.host_checks.v1',
         'scope': 'Offline checks using explicitly synthetic role/input mutations; no board run',
