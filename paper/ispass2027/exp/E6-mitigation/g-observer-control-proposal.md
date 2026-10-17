@@ -1,37 +1,36 @@
 # G observer错误与控制合同（待Root锁定，尚未实现）
 
 前端小批2c7c68f已被Root接受。本文件仅定义下一小批的精确行为；不修改observer/Linux，不启动BIT。
-32word地址与两个cap沿用已锁布局，另需纠正769的来源事实：现OBS4 RTL没有sequence寄存器，
-旧日志seq来自Linux `++idma_observation_sequence`。不能凭空锁存一个旧硬件seq。
+32word地址与两个cap沿用已锁布局。Root已确认现OBS4 RTL没有sequence寄存器，
+旧日志seq来自Linux `++idma_observation_sequence`，因此769锁定为reserved0。
 
-## 769与唯一ARM事件
+## 769 reserved0与唯一ARM事件
 
-建议769改名`arm_generation`：64bit，reset为0，每次**实际接受**测量ARM递增1，
-clear不清它，非法/繁忙ARM不递增，最大值时拒绝新ARM并置bit10，不绕回。
-Linux保留原software sequence，在同一次互斥的ARM前/后读generation，验证恰增加1，
-再把实际generation与原software seq一并输出；不要求两数相等，不改旧seq语义，不加软件可写新bank。
-这只用于原观测回执绑定，不建立新的实验身份体系。
+769始终读0，不可写；不增加generation或任何新身份计数。
+复用既有全局experiment_lock下的单一prepare→ARM→finish，把同一次原software sequence写入日志。
+硬件只在这次真实接受ARM时清本次数据/锁存实际配置，完成后保留冻结值；不声称硬件回显software sequence。
+G whole尚busy时拒绝clear/重ARM，包括V已关闭但A仍活跃的期间。
+若未来软件接入发现锁链不覆盖这一完整过程，必须先报告实际调用链，不以新增身份计数绕过。
 
 新增tap均来自真实硬件：frontend32bit gap、33bit target，ARM时锁存对应lane值。
 batch enable/active、真实issue/done/ID与原AXI/PATH事件也都读实际信号，不抄软件期望。
 target必须V4096、A4096（Solo不要求A）；V gap0，A gap32按实际锁存，采集计划再限定0/1000/2000。
 配置须在两lane测量ARM前完成；warmup已自然完成/排空，不能把warmup算入固定预算。
 
-## 771 error mask（bits63:11保留0）
+## 771 error mask（bits63:10保留0）
 
 | bit | 名称 | 精确触发 |
 | --- | --- | --- |
 | 0 | ARM_CONFIG | G ARM的batch/path模式、V0/A1选lane/has-A、真实target或V gap不符合固定合同；不部分接受ARM |
 | 1 | ISSUE_ORDER | 选中lane出现ID0、首ID非1、后续ID不连续，或已有pending且本拍没有匹配done又收到新issue |
 | 2 | DONE_ORDER | 无pending收到done、done ID与真实pending ID不同；无前驱pending的同拍issue+done也拒绝 |
-| 3 | BUDGET | whole issued/done超ARM锁存target，whole完成后又有新测量issue/done，或batch inactive而该lane尚未完成目标且非abort |
+| 3 | BUDGET | whole issued/done超ARM锁存target，whole完成后又有新测量issue/done，或该lane已开始且batch inactive却尚未完成目标、非abort |
 | 4 | COUNTER_OVERFLOW | ARM起算timer、whole/window计数、gap累计的64bit饱和；不绕回 |
 | 5 | WINDOW_SEQUENCE | V open不是该测量首V issue、重复open/close、close不是第4096个V done，或原窗口cycles与新窗口计数不一致 |
 | 6 | WINDOW_CONSERVATION | 关窗时start+window A issues−window A dones不等于end，或start/end超一任务在途，或carry/ID边界自相矛盾 |
 | 7 | ABORTED | 实际接受显式abort时G观测仍armed/whole live，冻结数据为invalid；不是DMA STOP，也不强制完成计数 |
-| 8 | CONTROL_REJECTED | active/不quiet的clear/ARM、非法控制写/strobe，拒绝变更；不清计数、timer、generation或pending |
+| 8 | CONTROL_REJECTED | active/不quiet的clear/ARM、非法控制写/strobe，拒绝变更；不清计数、timer或pending |
 | 9 | CONFIG_CHANGED | ARM后、该lane whole完成前，其真实gap/target/read-only配置tap与ARM锁存值不符 |
-| 10 | GENERATION_EXHAUSTED | generation已为2^64−1而请求ARM，拒绝ARM，不复用旧generation |
 
 局部error各bit粘住，直到一次合法clear或下一次合法ARM；原AXI/PATH/协议sticky错误不被新clear擦除。
 连续lane追踪若出现不可信的issue/done顺序，单独live故障保持至硬件reset，禁止通过clear/ARM伪造同步。
@@ -46,9 +45,9 @@ target必须V4096、A4096（Solo不要求A）；V gap0，A gap32按实际锁存�
 
 **ARM**沿用原0x60控制写、full strobe和原bit集合。G启用时再要求：
 原observer可ARM、两选中batch inactive、真实job pending0、原AXI outstanding0且PATH idle，
-本拍无选中issue/done、没有live追踪故障、generation未耗尽、实际配置合格。
-任一失败不改变原phase、测量数据、pending或generation，置对应错误及原非法配置错误。
-接受时原phase正常转ARMED，同时清本次测量数据/flags/local error、锁存真实角色/target/gap，generation加1，
+本拍无选中issue/done、没有live追踪故障、实际配置合格。
+任一失败不改变原phase、测量数据或pending，置对应错误及原非法配置错误。
+接受时原phase正常转ARMED，同时清本次测量数据/flags/local error、锁存真实角色/target/gap，
 测量timer从0开始；不清真实持续lane tracker，不影响DMA。
 
 **正常事件**每lane先消耗旧pending的匹配done，再接受新issue，允许真正的同拍任务交接。
@@ -72,7 +71,7 @@ V窗口与原PATH/hist保持原冻结边界。不能把现有`phase_n==FROZEN`�
 
 **clear**沿用0x60=4/full strobe，G启用时除原条件外还要求没有G whole live、两个batch inactive、
 持续lane pending0、原AXI outstanding0/PATH idle、无同拍issue/done、无live追踪故障。
-合法clear清本次数据/flags/local errors回OFF，保留generation和原持续tracker；
+合法clear清本次数据/flags/local errors回OFF，保留原持续tracker；
 clear不能终止仍在V窗外工作的A，拒绝时bit8且数据/计数继续照实运行。
 
 **abort**只取显式0x60=2/full strobe，不能从正常FROZEN推断。
@@ -89,5 +88,5 @@ clear不能终止仍在V窗外工作的A，拒绝时bit8且数据/计数继续�
 允许原observer在V窗中见到A batch inactive。否则保持旧bit5错误。
 G关闭时保留旧检查；G error非0时不能获得豁免。不能把A done当作对AXI/PATH守恒的免检。
 
-本文件仍需Root锁定，尤其769从错误的“旧硬件seq”表述改为实际ARM generation。
+769 reserved0已由Root锁定；本文件其余error与控制时序仍需Root锁定。
 锁定后再实现observer/wrapper有限小批，Linux与BIT不随本文件自动启动。
