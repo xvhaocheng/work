@@ -7,7 +7,8 @@ observer/wrapper已由Root直接审阅接受，组件tip `0f0403f56aff3f1ee10e18
 实际diff/原件入口`observer-validation/`。上层仅暴露默认off参数，新增CVA6 `cfb9a0a8`；
 独立构建export显式启用G，平台 `d5cc448`，见`build/README.md`。
 Root审builder后，唯一G DS0 BIT构建于2026-10-17 15:08:57Z启动，尚未通过全SoC/时序/面积验收。
-未修改G Linux/UAPI、未做新G板测；Linux65b仅作构建身份reference。
+G Linux首批UAPI/只读CAPS/纯decode已有限验证，tip`889f75b0`；RUN尚未接入，未做新G板测。
+当前BIT构建的Linux65b仍仅作reference，不因后续caps首批修改而追认成G软件已完成。
 分支 `ispass/e6-mitigation` 从main `7123bbfe79cca298c36a880206ab85a2d68e6f67` 创建，
 本工作树只写本目录；组件独占工作树为`/home/xvhaocheng/work-a1-e6-cva6`，同名分支，从冻结6c5起。
 Root审实际frontend diff后才进入下一小批；E4、完整E3优先。
@@ -17,6 +18,8 @@ Root审实际frontend diff后才进入下一小批；E4、完整E3优先。
 - `frontend-validation/README.md`：本批实际frontend范围、原始失败/通过、bundle恢复与有限命令。
 - `observer-validation/README.md`：实际observer/wrapper小批，G-on19、G-off17+hist18、真实配置整链69项，明确未验证的完整系统边界。
 - `build/README.md`：Root已审最小顶层diff、精确source/lock、复用builder及恢复包；一次50MHz构建实际dispatch，不含板操作。
+- `linux-validation/README.md`：独立ABI6/CAPS0x11/RUN保留0x12、60s输入边界、真实函数329checks及RV64对象/异常表原件；未接RUN。
+- `linux-design/README.md`：原锁与STOP调用链原文、已锁定G独立256+4096自然完成合同、待审下一批RUN设计。
 - `source-map.md`：可导航的实际组件commit、文件行号、历史执行输入与新组织commit的区别。
 - `evidence/index.json`：34份只读Git源码/原报告的路径、blob/SHA256、来源角色。
 - `evidence/isolated-source-comparison.json`：7份IOMMU关键源码与历史isolated实际构建副本逐字节相同。
