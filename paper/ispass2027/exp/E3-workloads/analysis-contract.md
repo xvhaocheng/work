@@ -9,7 +9,7 @@ backend fixture也始終拒絕。拒絕發生在任何snapshot／analysis／CSV�
 沒有公開CLI參數繞過此限制。內部有限測試必須顯式使用`_fixture_mode=True`，
 結果傳播`fixture_only`並標`source_board_cases=0`；CSV的experiment、evidence_level與sample_set均明確synthetic。
 
-長表的18列欄位與E1b完全相同：
+長表的17列欄位與E1b完全相同：
 `row_id,experiment,condition,metric,statistic,value,unit,n,bitstream_id,kernel_id,raw_path,source_locator,evidence_level,value_status,identity_status,boot_id,sample_set`。
 本目錄[table_schema.py](table_schema.py)是E1b該檔的逐byte副本，原提交
 `3a124edc7e026bfabcb01323f712bd215cc5e103`，SHA256

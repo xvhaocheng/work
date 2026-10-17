@@ -55,3 +55,5 @@ E5 hist构建首次输出误放共享main/out，已在早期停止该独占20进
 14:01Z排程更新：共同软件写入后直接加载P0新DS0 BIT先跑45点，再换原DS0 BIT跑E2 90；仍是同一Linux、两次必要BIT加载，切换数不增加，提前回答小传输干扰量级。E4/E5共同Linux已冻结`da6b69fc007ad5e671dc288dd8038d02e3ebe43d`，平台`a68603f0fc668771bc0c9e3a86fcefe289bfa17b`；唯一新软件构建已passed，release `6.5.0-rc2-ispass2027-e4-e5-v1`，payload29,363,656B。E5 BIT已进入routing，尚未最终验收。该后续软件不替换当前正在传输的acece正式包。
 
 E5最终BIT于14:06:29Z通过：WNS+0.126ns/WHS+0.047ns/WPWS+0.062ns，全部失败端点0，290520/290520可布线net全路由、routing errors0，DS0直接wire、CPU20ns。正式完整manifest和原报告在`exp/E5-latency/build/completed02/`；BIT SHA `d934846ecb7f2fd80bcb7d2f18889ae0fd8c9bbd28a0f5fef8e949614139221c`。完整E3的1d587容量批和固定dfebcc builder已审，允许独立构建；尚未记为该版本时序通过。
+
+full-E3 DS0唯一构建已于14:10:50Z启动，`exp/E3-workloads/artifacts/full-e3-ds0-build01/`（A2独立worktree），当前running；CVA6 1d587、平台dfebcc、显式Depth64，Linux da6只作reference。构建不占板，当前板卡仍仅SD update。
