@@ -1,0 +1,456 @@
+diff --git a/drivers/misc/idma.c b/drivers/misc/idma.c
+index 886065cd184d..a5e9ef7b5a74 100644
+--- a/drivers/misc/idma.c
++++ b/drivers/misc/idma.c
+@@ -60,6 +60,11 @@ MODULE_LICENSE("GPL v2");
+ #define IDMA_BATCH_PAGES_OFFSET 0x98
+ #define IDMA_BATCH_COMPLETED_OFFSET 0xa0
+ #define IDMA_BATCH_ISSUED_OFFSET 0xa8
++#define IDMA_BATCH_GEOMETRY_OFFSET 0xb0
++#define IDMA_BATCH_ROWS_OFFSET 0xb8
++#define IDMA_BATCH_PITCH_OFFSET 0xc0
++#define IDMA_BATCH_MATRIX_ROWS_OFFSET 0xc8
++#define IDMA_BATCH_COLUMNS_OFFSET 0xd0
+ #define IDMA_BATCH_MAGIC 0x49444d4142544301ULL
+ #define IDMA_XFER_TIMEOUT_US 2000000
+ #define IDMA_MAX_DEVS 8
+@@ -75,6 +80,19 @@ struct idma_device {
+ 	bool quarantined;
+ };
+ 
++struct idma_workload_stream {
++	const struct idma_workload_geometry *geometry;
++	u64 warmup_issued, warmup_completed;
++	bool data_verified;
++	DECLARE_BITMAP(warmup, IDMA_WORKLOAD_BITMAP_BITS);
++	DECLARE_BITMAP(measured, IDMA_WORKLOAD_BITMAP_BITS);
++};
++
++struct idma_workload_context {
++	struct idma_workload_experiment request;
++	struct idma_workload_stream streams[2];
++};
++
+ struct idma_stream {
+ 	struct idma_device *idma;
+ 	struct device *dev;
+@@ -88,6 +106,8 @@ struct idma_stream {
+ 	bool mapped_src, mapped_dst, in_flight, retain;
+ 	bool batch_configured, batch_started;
+ 	struct idma_experiment_stats *stats;
++	/* NULL for all older ABIs; allocated with the private ABI5 request context. */
++	struct idma_workload_stream *workload;
+ };
+ 
+ struct idma_pages_context {
+@@ -600,9 +620,15 @@ static int idma_submit(struct idma_stream *s, bool measured)
+ 	s->last_complete_ns = 0;
+ 	s->deadline_ns = now + (u64)IDMA_XFER_TIMEOUT_US * NSEC_PER_USEC;
+ 	s->in_flight = true;
+-	s->next_offset += s->chunk;
+-	if (s->next_offset == s->size)
+-		s->next_offset = 0;
++	if (s->workload && !s->batch_configured) {
++		s->workload->warmup_issued++;
++		s->next_offset = idma_workload_offset(s->workload->geometry,
++						     s->workload->warmup_issued);
++	} else {
++		s->next_offset += s->chunk;
++		if (s->next_offset == s->size)
++			s->next_offset = 0;
++	}
+ 	if (measured)
+ 		s->stats->submitted++;
+ 	return 0;
+@@ -621,6 +647,8 @@ static int idma_poll(struct idma_stream *s, bool measured)
+ 	s->last_complete_ns = ktime_get_ns();
+ 	s->in_flight = false;
+ 	s->touched_end = max(s->touched_end, s->offset + s->chunk);
++	if (s->workload && !s->batch_configured)
++		s->workload->warmup_completed++;
+ 	if (measured) {
+ 		s->stats->completed++;
+ 		s->stats->completed_bytes += s->chunk;
+@@ -720,6 +748,8 @@ static int idma_drain(struct idma_stream *s)
+ 	}
+ 	s->in_flight = false;
+ 	s->touched_end = max(s->touched_end, s->offset + s->chunk);
++	if (s->workload && !s->batch_configured)
++		s->workload->warmup_completed++;
+ 	return 0;
+ }
+ 
+@@ -733,7 +763,11 @@ static int idma_verify(struct idma_stream *s)
+ 	for (i = 0; i < s->size; i++) {
+ 		u64 pattern = idma_pattern(s, i / sizeof(u64));
+ 		u8 value = ((u8 *)&pattern)[i % sizeof(u64)];
+-		u8 expected = i < s->touched_end ? value : (u8)~value;
++		bool touched = s->workload ?
++			(test_bit(i / IDMA_WORKLOAD_GRANULE, s->workload->warmup) ||
++			 test_bit(i / IDMA_WORKLOAD_GRANULE, s->workload->measured)) :
++			i < s->touched_end;
++		u8 expected = touched ? value : (u8)~value;
+ 		u8 src = READ_ONCE(((u8 *)s->src)[i]);
+ 		u8 dst = READ_ONCE(((u8 *)s->dst)[i]);
+ 
+@@ -768,6 +802,8 @@ static int idma_verify(struct idma_stream *s)
+ 			return -EILSEQ;
+ 		}
+ 	}
++	if (s->workload)
++		s->workload->data_verified = true;
+ 	return 0;
+ }
+ 
+@@ -776,7 +812,8 @@ static bool idma_batch_supported(struct idma_device *idma, bool p0)
+ {
+ 	u64 magic = readq(idma->reg + IDMA_BATCH_MAGIC_OFFSET);
+ 
+-	return magic == IDMA_P0_BATCH_MAGIC || (!p0 && magic == IDMA_BATCH_MAGIC);
++	return magic == IDMA_WORKLOAD_BATCH_MAGIC || magic == IDMA_P0_BATCH_MAGIC ||
++	       (!p0 && magic == IDMA_BATCH_MAGIC);
+ }
+ 
+ static int idma_batch_configure(struct idma_stream *s, u64 count, bool p0)
+@@ -785,9 +822,20 @@ static int idma_batch_configure(struct idma_stream *s, u64 count, bool p0)
+ 
+ 	if (!idma_batch_supported(s->idma, p0))
+ 		return -EOPNOTSUPP;
++	if (s->workload && readq(base + IDMA_BATCH_MAGIC_OFFSET) != IDMA_WORKLOAD_BATCH_MAGIC)
++		return -EOPNOTSUPP;
+ 	if (readq(base + IDMA_BATCH_CONTROL_OFFSET) & 2)
+ 		return -EBUSY;
+ 	writeq(0, base + IDMA_BATCH_CONTROL_OFFSET);
++	if (s->workload) {
++		const struct idma_workload_geometry *g = s->workload->geometry;
++
++		writeq(g->geometry, base + IDMA_BATCH_GEOMETRY_OFFSET);
++		writeq(g->rows_per_operation, base + IDMA_BATCH_ROWS_OFFSET);
++		writeq(g->row_pitch_bytes, base + IDMA_BATCH_PITCH_OFFSET);
++		writeq(g->matrix_rows, base + IDMA_BATCH_MATRIX_ROWS_OFFSET);
++		writeq(g->columns, base + IDMA_BATCH_COLUMNS_OFFSET);
++	}
+ 	writeq(count, base + IDMA_BATCH_TARGET_OFFSET);
+ 	writeq(s->size / PAGE_SIZE, base + IDMA_BATCH_PAGES_OFFSET);
+ 	writeq(1, base + IDMA_BATCH_CONTROL_OFFSET);
+@@ -825,8 +873,12 @@ static int idma_batch_collect(struct idma_stream *s)
+ 		if (check_mul_overflow(completed, (u64)s->chunk, &bytes))
+ 			return -EOVERFLOW;
+ 		s->stats->completed_bytes = bytes;
+-		/* Packed-ring lengths divide PAGE_SIZE. Keep the union with warmup. */
+-		s->touched_end = max(s->touched_end, (size_t)min(bytes, (u64)s->size));
++		if (s->workload)
++			idma_workload_prefix_bitmap(s->workload->measured,
++						    s->workload->geometry, completed);
++		else
++			/* Old ABIs retain their contiguous-prefix validation contract. */
++			s->touched_end = max(s->touched_end, (size_t)min(bytes, (u64)s->size));
+ 	}
+ 	return status >> 32 ? -EIO : 0;
+ }
+@@ -1284,7 +1336,7 @@ static int idma_observation_finish(struct idma_observation *o,
+  */
+ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 		struct idma_experiment *request, bool batch, u32 aggressor_chunk, bool p0,
+-		struct idma_pages_context *pages)
++		struct idma_pages_context *pages, struct idma_workload_context *workload)
+ {
+ 	struct idma_experiment e = *request;
+ 	struct idma_stream streams[2] = {};
+@@ -1301,8 +1353,9 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 	memset(&e.status, 0, sizeof(e) - offsetof(struct idma_experiment, status));
+ 	e.victim_did = victim->did;
+ 	e.aggressor_did = IDMA_EXPERIMENT_NO_AGGRESSOR;
+-	ret = idma_validate(&e);
+-	if (!ret && batch && ((!p0 && e.chunk_bytes != PAGE_SIZE) ||
++	/* ABI5 was bounded and expanded by its adapter before entering this core. */
++	ret = workload ? (pages || !batch || p0 ? -EINVAL : 0) : idma_validate(&e);
++	if (!ret && batch && ((!workload && !p0 && e.chunk_bytes != PAGE_SIZE) ||
+ 			      e.victim_transfers > IDMA_BATCH_MAX_TRANSFERS))
+ 		ret = -EINVAL;
+ 	if (ret)
+@@ -1326,7 +1379,7 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 		}
+ 		e.aggressor_did = aggressor->did;
+ 		a = &streams[1];
+-		if (pages && (aggressor->id != 1 || aggressor->did != 11)) {
++		if ((pages || workload) && (aggressor->id != 1 || aggressor->did != 11)) {
+ 			ret = -EOPNOTSUPP;
+ 			goto out_put;
+ 		}
+@@ -1341,6 +1394,28 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 		}
+ 		pages->request.observer_sequence = observation.sequence;
+ 	}
++	if (workload) {
++		/* The new bounded geometry requires both the BTC3 producer and the
++		 * OBS5/Depth64 observer. Check after clearing, under the same lock.
++		 */
++		if (!observation.hist_v5 || !observation.path ||
++		    readq(victim->reg + IDMA_BATCH_MAGIC_OFFSET) != IDMA_WORKLOAD_BATCH_MAGIC ||
++		    (aggressor && readq(aggressor->reg + IDMA_BATCH_MAGIC_OFFSET) !=
++		     IDMA_WORKLOAD_BATCH_MAGIC)) {
++			ret = -EOPNOTSUPP;
++			goto out_put;
++		}
++		writeq(192, observation.control->reg + IDMA_OBS_INDEX_OFFSET);
++		if (readq(observation.control->reg + IDMA_OBS_DATA_OFFSET) !=
++		    0x0040000020202002ULL) {
++			ret = -EOPNOTSUPP;
++			goto out_put;
++		}
++		workload->request.observer_sequence = observation.sequence;
++		v->workload = &workload->streams[0];
++		if (a)
++			a->workload = &workload->streams[1];
++	}
+ 	if (batch && (!idma_batch_supported(victim, p0) ||
+ 	    (aggressor && !idma_batch_supported(aggressor, p0)))) {
+ 		ret = -EOPNOTSUPP;
+@@ -1415,14 +1490,17 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 	e.measurement_complete = !ret;
+ 	e.victim.in_flight_at_end = v->in_flight;
+ 	e.aggressor.in_flight_at_end = a && a->in_flight;
+-	if (pages && a && a->batch_started) {
+-		struct idma_pages_experiment *p = &pages->request;
+-
+-		p->pre_stop_A_control = readq(a->idma->reg + IDMA_BATCH_CONTROL_OFFSET);
+-		p->pre_stop_A_issued = readq(a->idma->reg + IDMA_BATCH_ISSUED_OFFSET);
+-		p->A_status_valid = 1;
+-		if (!ret && (!(p->pre_stop_A_control & 2) || p->pre_stop_A_control >> 32 ||
+-		    p->pre_stop_A_issued >= IDMA_EXPERIMENT_MAX_TRANSFERS))
++	if ((pages || workload) && a && a->batch_started) {
++		u64 control = readq(a->idma->reg + IDMA_BATCH_CONTROL_OFFSET);
++		u64 issued = readq(a->idma->reg + IDMA_BATCH_ISSUED_OFFSET);
++
++		if (pages) {
++			pages->request.pre_stop_A_control = control;
++			pages->request.pre_stop_A_issued = issued;
++			pages->request.A_status_valid = 1;
++		}
++		if (!ret && (!(control & 2) || control >> 32 ||
++		    issued >= IDMA_EXPERIMENT_MAX_TRANSFERS))
+ 			ret = -EIO;
+ 	}
+ 	/* Stop autonomous A after V observation; hardware window is already frozen. */
+@@ -1465,6 +1543,12 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 			ret = -EIO;
+ 	}
+ 	riscv_iommu_hpm_release(hpm);
++	if (workload)
++		for (lane = 0; lane < (a ? 2 : 1); lane++) {
++			struct idma_workload_stream *w = &workload->streams[lane];
++
++			idma_workload_prefix_bitmap(w->warmup, w->geometry, w->warmup_completed);
++		}
+ 	if (!ret) {
+ 		/* Both lanes are drained: reacquire CPU visibility before any check. */
+ 		local_flush_icache_all();
+@@ -1478,6 +1562,37 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ 		}
+ 	}
+  out_cleanup:
++	if (workload)
++		for (lane = 0; lane < (a ? 2 : 1); lane++) {
++			struct idma_workload_stream *w = &workload->streams[lane];
++			struct idma_workload_experiment *p = &workload->request;
++			struct idma_workload_coverage *coverage = lane ?
++				&p->aggressor_coverage : &p->victim_coverage;
++			u64 bytes;
++
++			coverage->measured_distinct_bytes =
++				(u64)bitmap_weight(w->measured, IDMA_WORKLOAD_BITMAP_BITS) *
++				IDMA_WORKLOAD_GRANULE;
++			coverage->measured_distinct_pages =
++				idma_workload_distinct_pages(w->measured, w->geometry);
++			coverage->warmup_distinct_pages =
++				idma_workload_distinct_pages(w->warmup, w->geometry);
++			if (w->data_verified)
++				coverage->verified_union_bytes =
++					idma_workload_union_bytes(w->warmup, w->measured);
++			if (check_mul_overflow(w->warmup_completed, (u64)w->geometry->row_bytes, &bytes)) {
++				bytes = 0;
++				if (!ret)
++					ret = -EOVERFLOW;
++			}
++			if (lane) {
++				p->aggressor_warmup_descriptors = w->warmup_completed;
++				p->aggressor_warmup_bytes = bytes;
++			} else {
++				p->victim_warmup_descriptors = w->warmup_completed;
++				p->victim_warmup_bytes = bytes;
++			}
++		}
+ 	if (pages && !v->in_flight && !v->retain &&
+ 	    (!a || (!a->in_flight && !a->retain))) {
+ 		for (lane = 0; lane < (a ? 2 : 1); lane++) {
+@@ -1534,7 +1649,7 @@ static long idma_run_experiment_mapped(struct idma_device *victim,
+ static long idma_run_experiment_core(struct idma_device *victim,
+ 		struct idma_experiment *request, bool batch, u32 aggressor_chunk, bool p0)
+ {
+-	return idma_run_experiment_mapped(victim, request, batch, aggressor_chunk, p0, NULL);
++	return idma_run_experiment_mapped(victim, request, batch, aggressor_chunk, p0, NULL, NULL);
+ }
+ 
+ static long idma_run_experiment_mode(struct idma_device *victim,
+@@ -1952,7 +2067,7 @@ static long idma_run_pages(struct idma_device *victim,
+ 	e->run_timeout_ms = p->run_timeout_ms;
+ 	e->victim_transfers = p->victim_transfers;
+ 	e->warmup_transfers = p->warmup_transfers;
+-	ret = idma_run_experiment_mapped(victim, e, true, SZ_4K, false, context);
++	ret = idma_run_experiment_mapped(victim, e, true, SZ_4K, false, context, NULL);
+ out_copy:
+ 	p->status = ret;
+ 	if (copy_to_user(uarg, p, sizeof(*p)))
+@@ -1995,6 +2110,140 @@ static long idma_caps_pages(struct idma_device *victim, void __user *uarg)
+ 	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
+ }
+ 
++static int idma_workload_validate(struct idma_device *victim,
++		const struct idma_workload_experiment *p, u64 *count, u64 *warmup)
++{
++	int ret;
++
++	if (p->abi_version != IDMA_WORKLOAD_ABI || p->struct_size != sizeof(*p))
++		return -EPROTO;
++	if (!IS_REACHABLE(CONFIG_RISCV_IOMMU) || !IS_ENABLED(CONFIG_64BIT) ||
++	    PAGE_SIZE != SZ_4K || victim->id != 0 || victim->did != 10)
++		return -EOPNOTSUPP;
++	if (p->flags || p->reserved0 || p->reserved1 ||
++	    memchr_inv(p->reserved, 0, sizeof(p->reserved)) ||
++	    p->supply != IDMA_WORKLOAD_SUPPLY_HW_BATCH ||
++	    (p->aggressor_id != IDMA_EXPERIMENT_NO_AGGRESSOR && p->aggressor_id != 1) ||
++	    !p->run_timeout_ms || p->run_timeout_ms > IDMA_WORKLOAD_MAX_TIMEOUT_MS)
++		return -EINVAL;
++	ret = idma_workload_geometry_validate(&p->victim_geometry);
++	if (ret)
++		return ret;
++	if (p->aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR) {
++		if (memchr_inv(&p->aggressor_geometry, 0, sizeof(p->aggressor_geometry)))
++			return -EINVAL;
++	} else {
++		ret = idma_workload_geometry_validate(&p->aggressor_geometry);
++		if (ret)
++			return ret;
++	}
++	if (!p->victim_operations ||
++	    check_mul_overflow(p->victim_operations,
++			       (u64)p->victim_geometry.rows_per_operation, count) ||
++	    check_mul_overflow(p->victim_warmup_operations,
++			       (u64)p->victim_geometry.rows_per_operation, warmup) ||
++	    *count > IDMA_WORKLOAD_MAX_DESCRIPTORS ||
++	    *warmup > IDMA_WORKLOAD_MAX_WARMUP_DESCRIPTORS)
++		return -EINVAL;
++	return 0;
++}
++
++static long idma_run_workload(struct idma_device *victim,
++			      struct idma_workload_experiment __user *uarg)
++{
++	struct idma_workload_context *context;
++	struct idma_workload_experiment *p;
++	struct idma_experiment e = {};
++	u64 count, warmup;
++	long ret;
++
++	/* Both prefix bitmaps live on the heap, outside the kernel stack and the
++	 * timed path. No user pointer survives the initial request copy.
++	 */
++	context = kzalloc(sizeof(*context), GFP_KERNEL);
++	if (!context)
++		return -ENOMEM;
++	p = &context->request;
++	if (copy_from_user(p, uarg, sizeof(*p))) {
++		ret = -EFAULT;
++		goto out_free;
++	}
++	memset(&p->status, 0, sizeof(*p) - offsetof(struct idma_workload_experiment, status));
++	p->victim_did = victim->did;
++	p->aggressor_did = IDMA_EXPERIMENT_NO_AGGRESSOR;
++	ret = idma_workload_validate(victim, p, &count, &warmup);
++	if (ret)
++		goto out_copy;
++	context->streams[0].geometry = &p->victim_geometry;
++	context->streams[1].geometry = &p->aggressor_geometry;
++	e.abi_version = IDMA_EXPERIMENT_ABI;
++	e.struct_size = sizeof(e);
++	e.aggressor_id = p->aggressor_id;
++	e.victim_pages = p->victim_geometry.ring_pages;
++	e.aggressor_pages = p->aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR ? 1 :
++		p->aggressor_geometry.ring_pages;
++	e.chunk_bytes = p->victim_geometry.row_bytes;
++	e.run_timeout_ms = p->run_timeout_ms;
++	e.victim_transfers = count;
++	e.warmup_transfers = warmup;
++	ret = idma_run_experiment_mapped(victim, &e, true,
++		p->aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR ? SZ_4K :
++		p->aggressor_geometry.row_bytes, false, NULL, context);
++	/* Keep ABI layouts independent; completion counts are actual row COPYs. */
++	p->victim_did = e.victim_did;
++	p->aggressor_did = e.aggressor_did;
++	p->hpm_configured = e.hpm_configured;
++	p->measurement_started = e.measurement_started;
++	p->measurement_complete = e.measurement_complete;
++	p->victim_elapsed_ns = e.victim_elapsed_ns;
++	p->snapshot_before_ns = e.snapshot_before_ns;
++	p->snapshot_after_ns = e.snapshot_after_ns;
++	p->drain_ns = e.drain_ns;
++	p->victim = e.victim;
++	p->aggressor = e.aggressor;
++out_copy:
++	p->status = ret;
++	if (copy_to_user(uarg, p, sizeof(*p)))
++		ret = -EFAULT;
++out_free:
++	kfree(context);
++	return ret;
++}
++
++static long idma_caps_workload(struct idma_device *victim, void __user *uarg)
++{
++	struct idma_workload_caps caps = {
++		.abi_version = IDMA_WORKLOAD_ABI,
++		.struct_size = sizeof(caps),
++		.capabilities = IDMA_EXPERIMENT_CAP_HW_BATCH,
++		.device_id = victim->id,
++		.did = victim->did,
++		.max_pages = IDMA_WORKLOAD_MAX_PAGES,
++		.max_rows_per_op = IDMA_WORKLOAD_MAX_ROWS,
++		.max_operation_bytes = IDMA_WORKLOAD_MAX_OPERATION_BYTES,
++		.batch_magic = IDMA_WORKLOAD_BATCH_MAGIC,
++		.observer_magic = IDMA_WORKLOAD_OBSERVER_MAGIC,
++		.geometry_mask = BIT(IDMA_WORKLOAD_LINEAR_RING) |
++			BIT(IDMA_WORKLOAD_PAGE_PACKED_RING) | BIT(IDMA_WORKLOAD_TILE_ROWS),
++		.row_length_mask = IDMA_WORKLOAD_LENGTH_64 | IDMA_WORKLOAD_LENGTH_256 |
++			IDMA_WORKLOAD_LENGTH_1024 | IDMA_WORKLOAD_LENGTH_1536 |
++			IDMA_WORKLOAD_LENGTH_4096 | IDMA_WORKLOAD_LENGTH_16384 |
++			IDMA_WORKLOAD_LENGTH_65536,
++		.path_queue_depth = IDMA_WORKLOAD_PATH_DEPTH,
++		.max_run_timeout_ms = IDMA_WORKLOAD_MAX_TIMEOUT_MS,
++	};
++
++	/* CAPS is read-only. RUN checks exact INFO2/depth after locked reset. */
++	if (!IS_REACHABLE(CONFIG_RISCV_IOMMU) || !IS_ENABLED(CONFIG_64BIT) ||
++	    PAGE_SIZE != SZ_4K || victim->id != 0 || victim->did != 10 ||
++	    readq(victim->reg + IDMA_BATCH_MAGIC_OFFSET) != IDMA_WORKLOAD_BATCH_MAGIC ||
++	    readq(victim->reg + IDMA_OBS_MAGIC_OFFSET) != IDMA_WORKLOAD_OBSERVER_MAGIC)
++		return -EOPNOTSUPP;
++	if (riscv_iommu_hpm_supported(victim->miscdev.parent))
++		caps.capabilities |= IDMA_EXPERIMENT_CAP_DID_HPM;
++	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
++}
++
+ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ {
+ 	struct idma_device *idma = fp->private_data;
+@@ -2010,6 +2259,10 @@ static long idma_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ 	};
+ 
+ 	switch (cmd) {
++	case IDMA_IOC_CAPS_WORKLOAD:
++		return idma_caps_workload(idma, (void __user *)arg);
++	case IDMA_IOC_RUN_WORKLOAD:
++		return idma_run_workload(idma, (struct idma_workload_experiment __user *)arg);
+ 	case IDMA_IOC_CAPS_PAGES:
+ 		return idma_caps_pages(idma, (void __user *)arg);
+ 	case IDMA_IOC_RUN_BATCH_PAGES:
