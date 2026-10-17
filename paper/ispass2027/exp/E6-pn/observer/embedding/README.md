@@ -105,8 +105,9 @@ accept/return,256-accept stock overflow, underflow and sticky bad IDs.
 Warnings are saved unchanged: only original PATH width conversions/test bit
 parameter overrides (`WIDTH`) and the renamed gold filename (`DECLFILENAME`).
 There is no UNOPTFLAT/latch warning. Original statistics table separators have
-trailing spaces; focused whitespace checking excludes only those unmodified
-tool statistics, preserving their actual bytes.
+trailing spaces, and the original patch contains a blank context line prefixed
+by the required space. Focused whitespace checking excludes these unmodified
+tool statistics and the exact raw patch, preserving their actual bytes.
 
 All quiet/certificate/N/STOP/AXI inputs are synthetic test-interface facts.
 Some guard-isolation cases deliberately provide independent quiet rather than
