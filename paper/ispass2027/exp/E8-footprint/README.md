@@ -86,3 +86,8 @@ positive median adjacent per-page slope is only a descriptive breakpoint
 candidate, not a fitted threshold or causal per-PTW latency. V hardware and
 broader non-atomic HPM snapshot windows stay distinct; no CI. Old baseline200
 is referenced separately and never duplicated into the new sample set.
+
+Actual DS0 V1 scan:50/50 passed, exported at
+[paper/e8-ds0-a-scan01/results.md](paper/e8-ds0-a-scan01/results.md).
+Full original records/manifest are under data/e8-ds0-a-scan01; raw UART stays
+local. This is the separate V1 scan, not the pending multi-page60-point subset.
