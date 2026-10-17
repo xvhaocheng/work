@@ -1,5 +1,7 @@
 # Root A：FPGA 板测队列
 
+最新 2026-10-17T20:12Z：E6-PN 首个DS0 BIT实际通过，构建19:27:11–20:09:58Z（42m47s），WNS+0.177ns、WHS+0.039ns、WPWS+0.062ns，三类失败端点/routing errors均0；原设置首次即过，无物理补试或约束修改。BIT37554105，完整原manifest已复制到E6-pn/build/completed-ds0-01，source b91327ec保持原件。E8 DS100于20:10:49Z在点间让板，17/25真实接受、preempted，新增总127/135，余8未跑，不补造。当前唯一硬件动作是E6 PN DS0加载PID2305006；有限续接PID2305198仅在加载成功后上传既有工具、运行原命令S15并离线判门，任一步失败即停，无MODE/GAP写。DS50尚未启动，必须真实S15通过。
+
 ## Material Passport
 
 - Origin Skill: academic-research-suite / experiment-agent
