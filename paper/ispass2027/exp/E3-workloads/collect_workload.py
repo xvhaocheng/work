@@ -14,6 +14,27 @@ LINUX='65b427946152e3aca27babab0a437821729805d4'
 PLATFORM='ec99648e3c9a1e48c1e9721e3662bb632eb439bd'
 CVA6='1d587125eee690e623e6ffae13e70f9bbe989adc'
 RELEASE='6.5.0-rc2-ispass2027-full-e3-v1'
+FROZEN_RESUME_FIELDS=('schema','script_sha256','parser_sha256','hist_helper_sha256',
+                      'geometry_model_sha256','protocol','P0_protocol_independent','kernel_release',
+                      'boot_id','bit_sha256','ds','clock_hz','evidence_level','fixture_only',
+                      'planned_cases','sources')
+
+
+def synthetic_markers(value,path='$'):
+    """Accepted E2/E4 explicit tags, recursively, plus nonempty fixtures containers."""
+    found=[]
+    if isinstance(value,dict):
+        for key,child in value.items():
+            pointer=f'{path}.{key}'
+            flag=key in {'fixture_only','is_fixture','simulation_only','synthetic_fixture','mock_fixture'} and (child is True or str(child).lower() in {'true','1'})
+            label=isinstance(child,str) and ((key in {'evidence_level','evidence_kind','source_kind'} and any(t in child.lower() for t in ('fixture','synthetic','mock'))) or (key in {'schema','condition'} and any(t in child.lower() for t in ('fixture','mock'))))
+            boot=key=='boot_id' and isinstance(child,str) and child.startswith('HOST-FIXTURE')
+            if flag or label or boot or (key=='fixtures' and bool(child)):
+                found.append({'path':pointer,'value':child})
+            found.extend(synthetic_markers(child,pointer))
+    elif isinstance(value,list):
+        for index,child in enumerate(value):found.extend(synthetic_markers(child,f'{path}[{index}]'))
+    return found
 
 
 def save(path,value):path.write_text(json.dumps(value,indent=2)+'\n')
@@ -80,7 +101,7 @@ def main(_test_fixture=False):
            'p0_backend':a.p0_backend,'long_backend':a.long_backend,'packet_backend':a.packet_backend}
     bound={name:json.loads(path.read_text()) for name,path in paths.items()}
     loaded,fpga,software=(bound[k] for k in ['load','fpga','software'])
-    fixture_only=_test_fixture or any(d.get('fixture_only',False) for d in bound.values())
+    fixture_only=_test_fixture or any(synthetic_markers(d) for d in bound.values())
     require(not fixture_only or _test_fixture,'synthetic bound input forbidden in actual collector')
     backend=backend_evidence(a.p0_backend,a.long_backend,a.packet_backend)
     require(loaded['status']=='boot_identity_verified','verified load required')
@@ -103,12 +124,20 @@ def main(_test_fixture=False):
               'script_sha256':sha(__file__),'parser_sha256':sha(HERE/'workload_records.py'),
               'hist_helper_sha256':sha(HIST_PATH),'geometry_model_sha256':sha(HERE/'model_full_coverage.py'),
               'sources':{k:{'path':str(v.resolve()),'sha256':sha(v)} for k,v in paths.items()},'recorded_cases':0}
+    manifest['target_case_limit']=a.max_cases
     save(a.output/'manifest.json',manifest)
-    def accept(raw,path,index,wall):
+    def accept(raw,path,index,wall,cached=None):
         require(raw['exit_code']==0,'ABI5 command failed; preserve raw without retry')
-        item=parse(raw['stdout'],a.expected_kernel,backend);point=manifest['planned_cases'][index];matches(item,point)
+        point=manifest['planned_cases'][index]
+        require(raw.get('command')==command(point),'ABI5 raw command differs from frozen plan')
+        item=parse(raw['stdout'],a.expected_kernel,backend);matches(item,point)
+        require(not synthetic_markers(item) or _test_fixture,'synthetic decoded trial forbidden in actual collector')
+        if cached is not None:
+            require(cached['case']==index+1 and all(cached[k]==v for k,v in point.items()),'ABI5 cached prefix order differs')
+            require(all(cached[k]==item[k] for k in ('record','observer','path','histogram','sequence','boot_id')),'ABI5 cached prefix differs from original raw')
         require(item['boot_id']==loaded['boot_id'],'ABI5 boot changed')
         key=item['boot_id'],item['sequence'];require(key not in seen,'ABI5 duplicate seq');seen.add(key)
+        require(not records or item['sequence']==records[-1]['sequence']+1,'ABI5 observer sequence gap across prefix/live trials')
         item.update(point,case=index+1,ds='0/0',raw_command_path=str(path.resolve()),wall_seconds=wall,
                     fixture_only=fixture_only,evidence_level=manifest['evidence_level'])
         records.append(item);save(a.output/'records.json',records)
@@ -116,13 +145,14 @@ def main(_test_fixture=False):
     try:
         if a.resume_run:
             old=json.loads((a.resume_run/'manifest.json').read_text())
-            require(old['status'] in ('partial_limit','partial_budget','passed') and old['planned_cases']==manifest['planned_cases'] and old['sources']==manifest['sources']
-                    and old['boot_id']==manifest['boot_id'] and old['fixture_only']==fixture_only,'ABI5 resume identity/status')
+            require(old['status'] in ('partial_limit','partial_budget','passed'),'ABI5 failed/unknown source cannot resume')
+            require(all(old.get(k)==manifest[k] for k in FROZEN_RESUME_FIELDS),'ABI5 frozen resume identity changed')
+            require(a.max_cases>=old['target_case_limit'],'ABI5 resume target limit decreased')
             prefix=json.loads((a.resume_run/'records.json').read_text())
             require(len(prefix)==old['recorded_cases']<=a.max_cases,'ABI5 resume prefix count')
             elapsed_before=old.get('accumulated_wall_seconds',old['wall_seconds'])
             for i,row in enumerate(prefix):
-                path=Path(row['raw_command_path']);accept(json.loads(path.read_text()),path,i,row['wall_seconds'])
+                path=Path(row['raw_command_path']);accept(json.loads(path.read_text()),path,i,row['wall_seconds'],row)
             manifest.update(recovered_from=str(a.resume_run.resolve()),recovered_cases=len(records))
         for index,point in enumerate(manifest['planned_cases'][:a.max_cases]):
             if index<len(records):continue

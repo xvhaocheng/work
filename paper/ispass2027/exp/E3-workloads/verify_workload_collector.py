@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sys
 import types
 import collect_workload as collect
@@ -17,6 +18,9 @@ def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--CLI-report',type=Path,required=True)
     p.add_argument('--p0-backend',type=Path,required=True);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
     a.output.mkdir(parents=True,exist_ok=False);inputs=a.output/'inputs';inputs.mkdir()
+    sources=a.output/'sources';sources.mkdir()
+    for name in ['collect_workload.py','workload_records.py','verify_workload_collector.py']:
+        shutil.copyfile(HERE/name,sources/name)
     cli=json.loads(a.CLI_report.read_text());templates={}
     for x in cli['cases']:
         if x['expected_success'] and not x['record']['input']['caps_only']:
@@ -29,7 +33,7 @@ def main():
     for name,d in [('fpga',fpga),('software',software),('load',loaded)]:
         (inputs/(name+'.json')).write_text(json.dumps(d)+'\n')
     fixtures.KERNEL=collect.RELEASE
-    state={'next':0,'calls':0,'closed':False,'fail_at':None}
+    state={'next':0,'calls':0,'closed':False,'fail_at':None,'command_at':None,'jump_at':None}
     class Console:
         def __init__(self,port,output):
             assert port=='/NO-REAL-UART-ABI5-FIXTURE';self.output=output;output.mkdir()
@@ -38,16 +42,18 @@ def main():
             point=collect.plan()[index];assert text==collect.command(point)
             ap=point['aggressor_pages'] or (collect.model.geometry(point['aggressor_shape'],point['aggressor_size'])['mapped_pages'] if point['aggressor_shape'] else 0)
             key=point['victim_shape'],point['victim_size'],point['aggressor_shape'],point['aggressor_size'],ap
-            item=fixtures.fixture(templates[key]);item['sequence']=index+1;item['record']['result']['observer_sequence']=index+1
+            seq=index+1+(state['jump_at']==index)
+            item=fixtures.fixture(templates[key]);item['sequence']=seq;item['record']['result']['observer_sequence']=seq
             raw=fixtures.output(item)
             if state['fail_at']==index:raw=raw.replace('TAINT_AFTER=0','TAINT_AFTER=16384')
-            path=self.output/f'command-{index+1:03}.json';value={'stdout':raw,'exit_code':0,'raw_path':str(path.resolve())}
+            path=self.output/f'command-{index+1:03}.json';value={'stdout':raw,'exit_code':0,'raw_path':str(path.resolve()),
+                'command':text+(' --forged' if state['command_at']==index else '')}
             path.write_text(json.dumps(value)+'\n');return value
         def close(self):state['closed']=True
     sys.modules['uart']=types.SimpleNamespace(Console=Console,DEFAULT_PORT='/NO-REAL-UART-ABI5-FIXTURE')
-    def run(path,max_cases=150,resume=None,test=True):
-        argv=['collect_workload.py','--output',str(path),'--board-tools',str(inputs),'--load-manifest',str(inputs/'load.json'),
-              '--fpga-manifest',str(inputs/'fpga.json'),'--software-manifest',str(inputs/'software.json'),
+    def run(path,max_cases=150,resume=None,test=True,input_dir=inputs):
+        argv=['collect_workload.py','--output',str(path),'--board-tools',str(input_dir),'--load-manifest',str(input_dir/'load.json'),
+              '--fpga-manifest',str(input_dir/'fpga.json'),'--software-manifest',str(input_dir/'software.json'),
               '--p0-backend',str(a.p0_backend),'--long-backend',str(HERE/'test-results/long-backend04-summary.json'),
               '--packet-backend',str(HERE/'test-results/packet-backend01-summary.json'),'--max-cases',str(max_cases)]
         if resume:argv+=['--resume-run',str(resume)]
@@ -82,6 +88,60 @@ def main():
     else:raise AssertionError('fixture accepted by production CLI')
     assert not (a.output/'publication-rejected').exists() and state['calls']==0
     checks.append('default production entry rejects bound fixtures before UART/output creation')
+    pilot=a.output/'pilot'
+    for field in collect.FROZEN_RESUME_FIELDS:
+        changed=a.output/('changed-'+field);changed.mkdir()
+        old=json.loads((pilot/'manifest.json').read_text());value=old[field]
+        if isinstance(value,bool):old[field]=not value
+        elif isinstance(value,int):old[field]=value+1
+        elif isinstance(value,list):old[field]=[]
+        elif isinstance(value,dict):old[field]={}
+        else:old[field]=str(value)+'-changed'
+        (changed/'manifest.json').write_text(json.dumps(old));shutil.copyfile(pilot/'records.json',changed/'records.json')
+        state.update(next=30,calls=0,closed=False)
+        try:run(a.output/('rejected-'+field),resume=changed)
+        except ValueError:pass
+        else:raise AssertionError('changed resume identity accepted: '+field)
+        assert state['calls']==0;checks.append('resume rejects changed '+field+' before UART')
+    for kind in ('command','prefix-sequence','cached-record'):
+        changed=a.output/('raw-change-'+kind);changed.mkdir()
+        old=json.loads((pilot/'manifest.json').read_text());rows=json.loads((pilot/'records.json').read_text())
+        if kind=='cached-record':rows[1]['record']['result']['victim']['completed_bytes']+=1
+        else:
+            raw=json.loads(Path(rows[1]['raw_command_path']).read_text())
+            if kind=='command':raw['command']+=' --forged'
+            else:raw['stdout']=raw['stdout'].replace('PRE_SEQ=1','PRE_SEQ=2').replace('"observer_sequence": 2','"observer_sequence": 3').replace('seq=2 ','seq=3 ')
+            path=changed/'raw.json';path.write_text(json.dumps(raw));rows[1]['raw_command_path']=str(path.resolve())
+        (changed/'manifest.json').write_text(json.dumps(old));(changed/'records.json').write_text(json.dumps(rows))
+        state.update(next=30,calls=0,closed=False)
+        try:run(a.output/('raw-rejected-'+kind),resume=changed)
+        except ValueError:pass
+        else:raise AssertionError('changed prefix accepted: '+kind)
+        assert state['calls']==0;checks.append('resume rejects '+kind+' without UART')
+    for kind,index in [('command',0),('live-sequence',1),('resume-live-gap',30)]:
+        state.update(next=30 if index==30 else 0,calls=0,closed=False,command_at=0 if kind=='command' else None,
+                     jump_at=index if kind!='command' else None)
+        target=a.output/('live-rejected-'+kind)
+        try:run(target,resume=pilot if index==30 else None)
+        except ValueError:pass
+        else:raise AssertionError('live tamper accepted: '+kind)
+        failed=json.loads((target/'manifest.json').read_text())
+        assert failed['status']=='failed' and failed['recorded_cases']==index and state['calls']==(1 if index==30 else index+1) and state['closed']
+        checks.append('actual collector rejects '+kind+' and retains failing raw, no retry')
+    state.update(next=0,calls=0,closed=False,command_at=None,jump_at=None)
+    for name,marker in [('nested-flag',{'metadata':[{'fixture_only':True}]}),
+                        ('nested-evidence',{'metadata':{'origin':{'evidence_level':'synthetic_protocol_fixture'}}}),
+                        ('fixtures-container',{'metadata':{'fixtures':[{'name':'test-only'}]}})]:
+        location=a.output/name;location.mkdir()
+        for k in ['load','fpga','software']:
+            d=json.loads((inputs/(k+'.json')).read_text());d.pop('fixture_only',None)
+            if k=='software':d.update(marker)
+            (location/(k+'.json')).write_text(json.dumps(d))
+        target=a.output/(name+'-rejected')
+        try:run(target,test=False,input_dir=location)
+        except ValueError:pass
+        else:raise AssertionError('nested synthetic marker accepted: '+name)
+        assert state['calls']==0 and not target.exists();checks.append('production entry rejects '+name+' before UART/output')
     report={'status':'passed','fixture_only':True,'new_board_measurements':0,'checks':checks,
             'collector_sha256':hashlib.sha256((HERE/'collect_workload.py').read_bytes()).hexdigest(),
             'parser_sha256':hashlib.sha256((HERE/'workload_records.py').read_bytes()).hexdigest()}

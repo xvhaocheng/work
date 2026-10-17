@@ -54,3 +54,28 @@ failed run不得续接、默认生产入口拒绝任何bound fixture。
 
 本批没有新FPGA实测。正式命令由Root在实际full-E3 BIT与新boot0冻结后执行；
 所需参数为output、load/fpga/software manifest、三份backend evidence、board-tools，output必须新建。
+
+## Root审查后的聚焦身份修订
+
+原126项/5项结果与9b中间源码原样保留。本批只改host collector，不重编Image/不改driver或RTL。
+当前collector SHA=`dc2802d0ff240dd0801a0db6f49bb7372ee4d71e45f43040b28f78ac4a3c7fcc`。
+
+resume逐项比较schema、四工具SHA（script/parser/hist-helper/geometry-model）、protocol、P0独立标记、
+kernel、boot、BIT、ds、clock、evidence_level、fixture_only、计划及所有bound source路径/SHA。
+max-cases可增大，不能缩小原target；原source改变不能沿用旧prefix。
+现场与resume共用accept：raw.command须逐字等于该planned point的实际shell命令，
+cached数据须与原raw解析一致，同boot整个prefix＋后续seq严格连续。首点仍依真实PRE_SEQ核fresh＋1。
+
+实际启动前递归识别E2/E4已接受的fixture_only/is_fixture/simulation_only/synthetic_fixture/mock_fixture、
+synthetic/mock/fixture evidence标签、HOST-FIXTURE boot；并识别非空fixtures容器。
+标记可藏在dict/list任意层，默认actual入口在构造UART/输出前拒绝；解码后trial同样检查。
+internal test模式仍只能代码调用且始终synthetic，不能由CLI开放旁路。
+
+[30项actual collector入口修订回归](test-results/workload-collector02-report.json)通过：
+原partial30→120完整续接/首错停止/failed不续接全部保留；每个冻结字段独立篡改均在UART前拒绝；
+现场及prefix命令篡改、prefix/live/续接边界跳seq、cached-vs-raw不一致拒绝；
+nested flag、synthetic evidence标签、fixtures容器均在actual-start拒绝。
+[完整新原始输出](test-results/workload-collector02-run.log)与as-tested source snapshot另存。
+[独立gap定向检查](test-results/workload-resume-gap03-report.json)还将cached和raw一起改成合法seq3，
+二者一致、单点fresh有效，仍因全prefix1→3断档在UART前拒绝，证明未仅靠cache不一致挡住反例。
+没有新增板测、没有重试错误点或发布synthetic为paper data。
