@@ -3894,3 +3894,14 @@ DeepSeek Flash共4次工具／修订提案，实际返回合计301,415 tokens；
 IOMMU与CVA6分别拆成12／27个功能提交，实际补丁顺序与语义依赖分列；Linux保留既有分立历史并拆当前dirty修复／研究接口，OpenSBI单独固定reset适配。历史索引79行、13份核心build共1115显式源条目、106去重源字节、236份选定元数据副本；16份旧manifest版本锁从点名commit取回且SHA逐项一致。早期dirty全量、隐式include／环境闭包缺口仍unknown；功能映射明确不主张新旧源码等价或重现旧数值。
 
 复用现有platform archive staging，仅导出原版与修复基座并核对源身份，不调用Make或实验入口；原sources.lock/configs未改。所有新基线仍source-fixed-only，原版性能基线尚未建立。此前PLRU消融已取得victim与18配置证据，本次未重跑；CURRENT纠正A37／总39及“替换未执行”的过时概述。无新编译／测试／仿真／综合／板测，暂停研究和MIG保持。Codex-only，无DeepSeek或Claude。完整静态回执及限制见整理入口。
+
+
+## 2026-10-17 内部平台及子仓库的实际Git整合
+
+用户指出仅整理work不够，内部iommu-platform及子仓库才是主体。已保留所有旧refs，在五主体repo新建同名活动分支codex/organized-current-20261017；原dirty源码先形成与上轮功能终点同tree的保全提交，再正常merge功能链，旧历史和功能链均成为当前祖先。IOMMU活动46ad745、Linux f215540、OpenSBI8d3779f；CVA6活动74991bd另行pin实际IOMMU整合HEAD，普通RTL内容不变。未重置或改写旧分支，也未删除或移动数据。
+
+平台自身按依赖提交组件gitlinks＋sources.lock、8组102源码/配置/脚本/测试路径、文档迁移/报告/工程导航及上轮513项provenance；共享build/rootfs接入最后提交，不主张任意中间commit已独立编译。原822项状态均有明确归属，只为.Xil会话缓存新增ignore；时序原件及validation.orig/.rej原字节保留，out旧规则不变。现有check()只核Git状态/21组件锁/父子pin/无alternates，不运行实验、不覆盖旧manifest。
+
+[内部入口](iommu-platform/provenance/internal-repository-integration-20261017/README.md)保存操作前refs/patch/index、实际组件整合/平台分组提交、源码保持与恢复包回执。四组件全部heads按固定来源prereq导出增量bundle，含旧分支/功能锚/贡献分支；平台本身bundle及最终clean回执放[外部恢复目录](repository-recovery/internal-integration-20261017/README.md)，避免平台包包含自身。第三方upstream与无remote的平台配置保持，未向上游推送；内部Git是工作主体，work只作文件同步和包分发。
+
+没有新build/test/RTL仿真/性能实验/综合/布线/板测或MIG恢复，原版性能基线仍未运行。旧实验身份与结论保留；上轮“原HEAD/checkout保持”回执是当时时点，本轮新活动分支是用户明确要求后的后继变更，不覆盖旧证据。Codex-only。

@@ -38,6 +38,8 @@
 
 原版、必要适配、独立修复与研究扩展的固定提交见[源码组织](../iommu-platform/provenance/source-organization-20261017/README.md)，历史运行身份见[对应索引](../iommu-platform/provenance/source-organization-20261017/history/README.md)。新增引用与恢复包保留原组件历史；五个源码profile仅供静态导出，不是已构建／已运行的Make配置。
 
+内部活动分支、实际组件HEAD与恢复方式见[内部仓库整合](../iommu-platform/provenance/internal-repository-integration-20261017/README.md)。代码先在内部Git提交并同步父子指针／lock，再同步work文件；公开恢复包保留内部历史，并不把顶层目录变成gitlink。
+
 ## 按问题进入代码
 
 | 问题 | 最小入口链 |

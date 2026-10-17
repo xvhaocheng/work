@@ -74,6 +74,7 @@ FPGA 输出示例（历史 v5配置）：
 - 顶层仓库管理脚本、配置、测试以及组件提交指针；CVA6、IOMMU、Linux、OpenSBI 保留各自来源历史。
 - 修改 IOMMU 后，按 IOMMU → CVA6 子模块指针 → 顶层 CVA6 指针的顺序提交，并更新 `sources.lock.json`；`make check` 会检查工作树、各级指针和 lock 是否一致，并会写 `out/manifests`。
 - 具体当前工作树和提交以 `git status`、`git rev-parse HEAD` 及 `sources.lock.json` 为准，不在文档中硬编码 HEAD。
+- 当前内部整理与恢复入口见 [活动仓库整合记录](provenance/internal-repository-integration-20261017/README.md)：原历史与功能分层链已合入新的 `codex/organized-current-20261017` 活动分支，普通源码保持。后续改动先在实际内部仓库提交、更新父级指针与锁，再同步公开 `work`；顶层文件快照不能替代这一步。
 - 组件远端以其实际配置为准；`upstream`只表示来源。顶层公开工作区同步与组件自身上游提交分开，不由一次`clone --recursive`保证取回所有本地提交。
 - 现有 bundle/恢复副本来自迁移阶段，不能假定包含最新实验修改；迁移新版前重新运行 `make bundle`。
 

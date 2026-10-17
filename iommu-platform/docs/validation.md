@@ -2890,3 +2890,12 @@ HERO height32四案P/N/H1/H2在执行前冻结，一次调用两个固定普通�
 实际检查包括组件补丁逐步应用与commit tree一致、冻结源字节／模式一致、增量bundle在独立bare仓库恢复精确commit、旧组件HEAD／索引／refs／工作树保全，以及复用原archive staging导出的源码身份。历史79条记录、13份核心源清单和16份Git原件版本锁另有哈希回执；缺失源码／隐式依赖／环境闭包仍明确unknown，不声称新提交复现旧运行。
 
 [总入口](../provenance/source-organization-20261017/README.md)／[汇总静态回执](../provenance/source-organization-20261017/verification.json)／[导出身份](../provenance/source-organization-20261017/source-export-verification.json)／[历史索引](../provenance/source-organization-20261017/history/README.md)。原有结果、数据与暂停状态保持，Codex-only。
+
+
+## 2026-10-17 内部仓库实际整合
+
+按用户纠正，将整理落实到内部平台及子仓库，而非仅提交顶层work。四源码组件在新的codex/organized-current-20261017分支保全原dirty源码并正常合入功能链；IOMMU/Linux/OpenSBI完整tree与既有功能终点相同，CVA6仅另行绑定实际IOMMU整合提交。旧分支／功能锚／贡献refs保留原指向，普通源字节与模式保持。
+
+平台已按依赖提交21项版本锁与父子指针、8组102个源码／配置／脚本／测试路径、既有报告／迁移及来源包。只新增Vivado .Xil会话缓存忽略，原缓存／时序记录／补丁残留／out数据保持；不靠隐藏源码清空状态。复用scripts/platform.py现有check()核对组件clean、gitlinks、lock和无alternates，另核旧refs/历史祖先及保留文件。此处是Git／源身份检查，不是编译或功能测试。
+
+[内部整理与活动分支入口](../provenance/internal-repository-integration-20261017/README.md)／[实际分组提交](../provenance/internal-repository-integration-20261017/platform-commits.json)／[最终回执与平台恢复包](../../repository-recovery/internal-integration-20261017/README.md)。无新构建／主机回归／RTL仿真／性能实验／综合／布线／板测，未恢复MIG，原版性能基线仍未运行。Codex-only。

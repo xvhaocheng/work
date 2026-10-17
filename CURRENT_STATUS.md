@@ -1,6 +1,6 @@
-# 当前状态：源码基线与扩展整理；既有实验保持
+# 当前状态：内部平台与子仓库已整合；既有实验保持
 
-2026年10月17日（JST）。按用户要求完成[原版／适配基线、功能扩展与历史源码对应整理](iommu-platform/provenance/source-organization-20261017/README.md)。本轮仅静态源码、补丁和恢复核验，没有新构建或实验；原版性能基线尚未运行。既有 DISCOVERY 与 PLRU 消融结果保留，当前归普通优化及刻画证据，未立新机制主线。总入口为[计划](研究计划.md)与[导航](研究导航.md)。
+2026年10月17日（JST）。按用户纠正，将[版本整理真正落实到内部平台及子仓库](iommu-platform/provenance/internal-repository-integration-20261017/README.md)：新的活动分支保全原历史并合入功能链，父子gitlink与21项版本锁同步。原版／适配／修复锚仍见[来源整理](iommu-platform/provenance/source-organization-20261017/README.md)。本轮仅Git与源码身份核验，没有新构建或实验；原版性能基线尚未运行。既有 DISCOVERY 与 PLRU 消融结果保留，当前归普通优化及刻画证据，未立新机制主线。总入口为[计划](研究计划.md)与[导航](研究导航.md)。
 
 ## 全局安排与本轮裁决
 
@@ -20,7 +20,7 @@
 
 ## 硬件与执行状态
 
-本轮只新增源码组织引用、补丁、bundle与证据索引，原checkout、旧refs、索引和源码保持；无新编译、测试、仿真、综合/布线或板测。此前DISCOVERY的8条件及PLRU的18配置／24次有效运行保持原运行身份，未在新提交重跑。行为DDR时间非FPGA/原生时间，NO_ERROR_HANDLING缺项不变；MIG继续暂停。共享IOMMU整理为Codex-only。
+本轮已在新的codex/organized-current-20261017活动分支提交原有改动、正常合入功能链并更新父子指针与锁；旧refs和源码字节保持。平台及21组件以现有纯Git检查核对干净状态；无新编译、测试、仿真、综合/布线或板测。此前DISCOVERY的8条件及PLRU的18配置／24次有效运行保持原运行身份，未在新提交重跑。行为DDR时间非FPGA/原生时间，NO_ERROR_HANDLING缺项不变；MIG继续暂停。共享IOMMU整理为Codex-only。
 
 ## 独立工程事项
 
