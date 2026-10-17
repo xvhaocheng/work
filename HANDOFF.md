@@ -1,3 +1,13 @@
+# 2026年10月17日 DISCOVERY-REUSE-1：问题发现合同准备完成，未运行
+
+纠正准入顺序：[三道门槛](docs/agent-policy.md#问题发现机制原型与论文贡献)分别判断问题发现、机制原型与论文贡献；三个当前版本不立项，不等于没有值得取得的新事实，也不是三次新机制实验失败。目标仍是方法/机制论文。
+
+[具体合同](iommu-platform/docs/problem-discovery-contract-20261017.md)：真实DMA/翻译夹具上，固定每lane64个normal4096 COPY，A源固定、只变目的再用R={1,8,16}；已实现P/PN＋承诺前DS-first/F4共6条件，最多2个按观察触发的普通2MiB叶诊断。逐parent身份/承诺/完成与数据守恒，区分翻译、已承诺payload/回压及供给/写腿解释；不运行M，不保证发现新缺口。
+
+[夹具核查](iommu-platform/out/problem-discovery-plan-20261017/fixture-feasibility.md)／[既有覆盖](iommu-platform/out/problem-discovery-plan-20261017/existing-coverage.md)：旧paired只有一次pair，需新固定工作补发器；旧M0同时转源/目的且不同供给合同，直接复用其历史结论，不重跑。full-era关闭legacy事件，不能声称已有aw_wait_change轨迹；新观察尚未实现。合同地址表覆盖附件的A目的IOVA建议，以保留合法普通大页对照。
+
+用户粘贴材料明确新实验尚未获准，本轮仅完成规则修正、源码核查和可审阅计划；新模型/仿真/构建/生产修改/板测均0。只待具体合同的实施与运行决定，不再等待一般研究授权、CPU/内存价值或用户保证痛点。B1/I/D/A5/A2、历史结果、MIG暂停与原10月15—28日窗口保持；以下旧交接全文保留。
+
 # 2026年10月16日 RECONVERGENCE-1：三个具体版本未达到立项条件
 
 以`c981e01`为输入，[七段研究报告](iommu-platform/docs/research-reconvergence-20261016.md)完成原始失败复核、TC借用续行PTW、译后分段/返回预约和范围旧代回收的建设性设计/原文比较。GPUMMU2014与Neighborhood2018直接限制续行核心新意；118bit是可选副本机会，非相对强barrel净节省。REALM/credit表达译后分段关键动作；范围回收尚缺普通精确失效/完成证据/VT-d定向drain之后的匹配正常残余。三者当前均不立项，不强选主线、不排无辨别力实验，不因未知费用追加开发；不否定整个问题域。[原始失败证据](iommu-platform/out/research-reconvergence-20261016/failure-evidence.md)／[原文增量](references/research-reconvergence-20261016.md)／[接受](iommu-platform/out/research-reconvergence-20261016/root-result-acceptance.json)。

@@ -1,16 +1,16 @@
-# 当前状态：重新立题比较完成，三个具体版本均不进入论文立项
+# 当前状态：问题发现合同已准备，实验尚未运行
 
-2026年10月16日（JST）。以`c981e01`为输入完成RECONVERGENCE-1：复核原始负结果，并建设性比较TC借用续行PTW、译后分段/返回预约、范围旧代回收。**前两版没有留下相对具名强普通的具体能力或成本差项，第三版缺必须使用该能力的正常残余；本轮不强选论文主线，不发布无辨别力的实验或自动开发任务。**不否定整个共享IOMMU方向。总入口继续为[计划](研究计划.md)与[导航](研究导航.md)。
+2026年10月17日（JST）。已按用户修正分开“问题发现、机制原型、论文贡献”：**尚无创新机制不禁止有价值、可区分且有上限的探索。**DISCOVERY-REUSE-1已形成具体合同和源码可行性：固定源/供给，只改变A目的再用距离，P/PN共6个基础条件，最多2个有条件普通大页诊断。用户材料明确此建议尚非新实验授权，因此本轮未改夹具、未运行。总入口为[计划](研究计划.md)与[导航](研究导航.md)。
 
 ## 全局安排与本轮裁决
 
-- 原始E2驻留/覆盖/first-miss和E3四对127/129/129/130等待增量定向复核；p5四格负收益保留，具体失败根因仍unknown。M0 DS优先仅为行为DDR返回选择，不能倒填实板PN根因；CS1等时间等待/O3/R107的覆盖各有范围。
-- 续行版直接核GPUMMU2014 §4.4/Fig9及Neighborhood2018：共享FSM/部分walk已有；TC头118bit可避免重复副本，但不是相对强barrel的净节省。译后分段可保留一次原翻译，比legalizer-only更强，但REALM式fragmenter/credit已表达关键动作；均不追加等价模型/RTL。
-- 范围回收不以driver扩大失效或PR/PW TODO制造差异；精确失效、设备完成证据、per-domain计数及VT-d定向drain先获机会。未取得匹配正常残余，不自动采集/开发；仍不重开I。
-- First-PTE原裁决保留：base/M完整quiet cold4481/hot1749、A末源3507早于M arm3514、mask0。局部RTL/行为DDR，不调相位/特殊冷态，不重跑旧70，不扩M；原M/O实现与成本结果保留。
-- 本轮无通过的优先候选，论文实验及两周实施排期不启动；B1/I/D/A5/A2、mapping/p5/D-CS1与MIG边界保持。MIG1792023314 paused，WNS −0.391ns、598项setup失败、0新加载、实际债务unknown；原10月15—28日窗口不重启。
+- 唯一待执行提案：两真实iDMA各64个normal4096、batch-OFF COPY，源固定；V目的不变，A目的环R=1/8/16；普通P与PN同享承诺前DS-first/F4。初始冷历史及全部配置/补发/B/quiet纳入，不假装stock或原生CPU/DDR。
+- 竞争解释为翻译链、已承诺payload/回压、供给/写腿/完成发现；逐parent身份和真实承诺端点取证，重叠不相加为可回收收益。仅在R16已有重复walk/必要等待证据时，最多加P/PN各一A专用池2MiB叶诊断；不为凑数补点。
+- 可行性核查不是执行：paired原入口只有一对COPY，需新独立测试补发器/逐parent核验及只读观察；legacy aw_wait_change在旧paired full-era不落盘，不能冒称已有owner因果链。所核E2/E3/M0/旧70/六case均非本合同同输入。
+- RECONVERGENCE-1三个版本停止范围保持：前两项机制增量不足，第三项问题尚未证实，不合并为三次机制实验失败。First-PTE仍为base=M4481/1749、A3507早于arm3514、mask0，不运行M翻案；旧负结果不改写。
+- 无论文主线成立结论；发现结果才决定缩小范围、普通优化或围绕一项差异推导机制。B1/I/D/A5/A2、mapping/p5/D-CS1与MIG暂停保持，原10月15—28日窗口不重启；MIG WNS−0.391ns/598setup/0newloads/debtunknown。
 
-[本轮七段报告](iommu-platform/docs/research-reconvergence-20261016.md)／[原始失败核查](iommu-platform/out/research-reconvergence-20261016/failure-evidence.md)／[root接受](iommu-platform/out/research-reconvergence-20261016/root-result-acceptance.json)／[原文核读增量](references/research-reconvergence-20261016.md)／[前轮First-PTE结果](iommu-platform/docs/first-pte-paired-local-20261016.md)。
+[问题发现合同](iommu-platform/docs/problem-discovery-contract-20261017.md)／[夹具可行性](iommu-platform/out/problem-discovery-plan-20261017/fixture-feasibility.md)／[已有覆盖与观察缺口](iommu-platform/out/problem-discovery-plan-20261017/existing-coverage.md)／[三道门规则](docs/agent-policy.md#问题发现机制原型与论文贡献)／[前轮三个机制裁决](iommu-platform/docs/research-reconvergence-20261016.md)／[First-PTE结果](iommu-platform/docs/first-pte-paired-local-20261016.md)。
 
 ## 各分支最新进展
 
@@ -20,7 +20,7 @@
 
 ## 硬件与执行状态
 
-本轮仅源码/原始结果/论文核读、只读算术和机制设计；新模型、旧实验重跑、RTL仿真、综合、生产修改、加载/板测均0。前轮6个局部RTL case、有限M单测和4次OOC调用仍按原报告保留。NO_ERROR_HANDLING共同缺项未改变。Codex-only；历史核查请求Sol/high、服务设计Sol/xhigh、开放walker设计Astra/xhigh，实际独立metadata unknown；未声称切换root。硬件暂停保持。
+本轮仅已有合同/源码核查、地址算术及计划/规则修改；夹具实现、编译、模型/仿真、综合、生产修改、加载/板测均0。前轮局部RTL/OOC结果原样保留；NO_ERROR_HANDLING缺项不变。Codex-only；两个独占核查席请求Sol/high，实际独立metadata unknown，未声称切换root。MIG暂停不因问题发现方法修正而解除。
 
 ## 独立工程事项
 

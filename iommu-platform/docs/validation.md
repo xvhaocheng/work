@@ -1,3 +1,9 @@
+# 2026年10月17日 DISCOVERY-REUSE-1：准备检查，无新实验
+
+[问题发现合同](problem-discovery-contract-20261017.md)与[源码可行性](../out/problem-discovery-plan-20261017/fixture-feasibility.md)/[已查覆盖](../out/problem-discovery-plan-20261017/existing-coverage.md)为计划/静态证据，不是RTL执行结果。6个P/PN基础条件、最多2个普通大页诊断；旧paired需新增补发与只读观察，当前没有新可执行命令。用户材料明确未授权新实验，故本轮仿真/构建/生产修改/旧实验重跑/板测均0。
+
+本轮仅检查地址/工作量算术、本轮链接、文档差异及旧正文/生产和历史证据保留；具体检查见合同末尾。源码可行不等于持续竞争成立，时间重叠不等于可回收收益。历史停止、其他分支与MIG暂停不变；以下旧验证全文保留。
+
 # 2026年10月16日 RECONVERGENCE-1：源码/原文研究比较，未启动新实验
 
 [七段报告](research-reconvergence-20261016.md)及[接受/检查](../out/research-reconvergence-20261016/root-result-acceptance.json)：按`c981e01`输入，复核历史原始记录，具体发展TC借用续行、译后分段/返回预约、范围旧代回收。前两版无具名强普通之后的具体差项，第三缺匹配正常残余；本轮不立项/不强选主线，不排等价实验。原文实际范围见[文献增量](../../references/research-reconvergence-20261016.md)，PDF结构预检UNAVAILABLE不写PASS。
