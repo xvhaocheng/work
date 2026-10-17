@@ -1,0 +1,107 @@
+--- discovery/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_iotlb.sv
++++ v2/cva6/corev_apu/riscv-iommu/rtl/translation_logic/rv_iommu_iotlb.sv
+@@ -419,9 +419,69 @@
+                 if (new_index[0]) en &= choose_right;
+                 else en &= ~choose_right;
+             end
+-            replace_en[i] = en && allocation_mask[i];
++            legacy_replace_en[i] = en && allocation_mask[i];
+         end
+         if (PolicyEnable && policy_clear_i) plru_tree_n = '0;
++    end
++
++
++    // V2: total recency order, rank 0 = oldest and N-1 = newest.
++    // Empty eligible ways have priority; lowest physical index breaks cold ties.
++    localparam int LruRankW = $clog2(RVIOMMUCfg.NumIotlbEntries);
++    logic [RVIOMMUCfg.NumIotlbEntries-1:0][LruRankW-1:0] lru_rank_q, lru_rank_n;
++    logic [RVIOMMUCfg.NumIotlbEntries-1:0] legacy_replace_en;
++    always_comb begin : exact_lru_selection
++        int victim, oldest;
++        bit found_invalid;
++        victim = -1; oldest = RVIOMMUCfg.NumIotlbEntries; found_invalid = 0;
++        replace_en = '0;
++        for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++) begin
++            if (allocation_mask[i] && !tags_q[i].valid && !found_invalid) begin
++                victim = i; found_invalid = 1;
++            end
++        end
++        if (!found_invalid) begin
++            for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++) begin
++                if (allocation_mask[i] && int'(lru_rank_q[i]) < oldest) begin
++                    victim = i; oldest = int'(lru_rank_q[i]);
++                end
++            end
++        end
++        if (victim >= 0) replace_en[victim] = 1'b1;
++    end
++    always_comb begin : exact_lru_history
++        lru_rank_n = lru_rank_q;
++        // Same explicit touch permission as V0/V1; process duplicate matches in
++        // ascending way order, the same deterministic order as the original RTL.
++        for (int touched = 0; touched < RVIOMMUCfg.NumIotlbEntries; touched++) begin
++            if (lu_hit[touched] && (!TouchEnable || touch_i)) begin
++                for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++) begin
++                    if (i != touched && lru_rank_n[i] > lru_rank_n[touched])
++                        lru_rank_n[i] = lru_rank_n[i] - 1'b1;
++                end
++                lru_rank_n[touched] = LruRankW'(RVIOMMUCfg.NumIotlbEntries-1);
++            end
++        end
++        // A committed fill becomes MRU after any same-edge old-entry hit.
++        if (update_i.update && !inval_i.inval_vma && !inval_i.inval_gvma &&
++            !(PolicyEnable && policy_clear_i)) begin
++            for (int filled = 0; filled < RVIOMMUCfg.NumIotlbEntries; filled++) begin
++                if (replace_en[filled]) begin
++                    for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++) begin
++                        if (i != filled && lru_rank_n[i] > lru_rank_n[filled])
++                            lru_rank_n[i] = lru_rank_n[i] - 1'b1;
++                    end
++                    lru_rank_n[filled] = LruRankW'(RVIOMMUCfg.NumIotlbEntries-1);
++                end
++            end
++        end
++        if (PolicyEnable && policy_clear_i)
++            for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++) lru_rank_n[i] = LruRankW'(i);
++    end
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni)
++            for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++) lru_rank_q[i] <= LruRankW'(i);
++        else lru_rank_q <= lru_rank_n;
+     end
+ 
+     // Only read the actual pre-edge and next state. Snapshot readers must
+@@ -473,4 +533,33 @@
+         end
+     end
+ 
++`ifndef SYNTHESIS
++    // CSV prefix,variant,local_cycle,instance,pscid,gscid,request_vpn,victim,
++    // evicted_vpn,evicted_valid,valid_bitmap,eligible_mask,legacy_plru,kind,
++    // active_tree,lru_ranks. Values are pre-edge; cycle 0 is first reset release.
++    longint unsigned ablation_cycle_q;
++    logic [RVIOMMUCfg.NumIotlbEntries-1:0] ablation_valid;
++    always_comb begin
++        for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++)
++            ablation_valid[i] = tags_q[i].valid;
++    end
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) ablation_cycle_q <= 0;
++        else begin
++            ablation_cycle_q <= ablation_cycle_q + 1;
++            if (update_i.update && !inval_i.inval_vma && !inval_i.inval_gvma &&
++                !(PolicyEnable && policy_clear_i)) begin
++                for (int i = 0; i < RVIOMMUCfg.NumIotlbEntries; i++) begin
++                    if (replace_en[i])
++                        $display("IOTLB_VICTIM,2,%0d,%m,%0d,%0d,%h,%0d,%h,%0d,%h,%h,%h,%s,%h,%h",
++                            ablation_cycle_q, update_i.pscid, update_i.gscid,
++                            update_i.vpn, i, {tags_q[i].vpn2,tags_q[i].vpn1,tags_q[i].vpn0},
++                            tags_q[i].valid, ablation_valid, allocation_mask, plru_tree_q,
++                            tags_q[i].valid ? "valid_evict" : "invalid_fill", plru_tree_q, lru_rank_q);
++                end
++            end
++        end
++    end
++`endif
++
+ endmodule
