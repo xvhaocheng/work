@@ -8,6 +8,8 @@ import argparse
 import copy
 import csv
 import hashlib
+import contextlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -78,9 +80,10 @@ def main():
                 'kernel_release': KERNEL, 'sources': sources, 'fixture_only': True}
     records_path, manifest_path = run/'records.json', run/'manifest.json'
     records_path.write_text(json.dumps(records)); manifest_path.write_text(json.dumps(manifest))
-    full, observed = analysis.read_collection(records_path, manifest_path, a.backend_evidence)
+    full, observed = analysis.read_collection(records_path, manifest_path, a.backend_evidence, _fixture_mode=True)
     assert len(full['rows']) == 9 and all(x['n'] == 5 for x in full['rows'])
     assert all(x['n'] == 5 for x in full['paired_comparisons'])
+    assert full['fixture_only'] and full['source_board_cases'] == 0 and full['source_cases'] == 45
     checks.append({'check': '45 ordered fixtures produce nine n5 cells and three n5 matched-block distributions', 'passed': True})
     row = next(x for x in full['rows'] if x['condition']=='A8' and x['victim_chunk_bytes']==64)
     assert full['paired_comparisons'][0]['statistics']['median'] == 2
@@ -97,6 +100,7 @@ def main():
         assert list(row) == analysis.tables.FIELDS
         assert analysis.tables.locate(full, row['source_locator']) == row['value']
         if row['statistic']=='ratio_of_medians': assert row['n'] == ''
+        assert row['evidence_level'] == 'synthetic_protocol_fixture' and row['experiment'] == 'synthetic_p0_protocol'
     checks.append({'check': 'all long rows use exact E1b columns, unique IDs and scalar JSON pointers; unpaired ratio n blank', 'passed': True})
     solo = next(x for x in full['rows'] if x['condition']=='Solo')
     assert solo['statistics']['aggressor_iotlb_miss']['n'] == 0
@@ -106,7 +110,7 @@ def main():
     partial_records, partial_manifest = records[:12], copy.deepcopy(manifest)
     partial_manifest.update(status='running', recorded_cases=12)
     partial = analysis.summarize(partial_records, partial_manifest, BURSTS, True)
-    assert not partial['campaign_complete'] and partial['source_board_cases']==12
+    assert not partial['campaign_complete'] and partial['source_board_cases']==0 and partial['source_cases']==12
     assert [p['n'] for p in partial['paired_comparisons']] == [1, 2, 1]
     checks.append({'check': 'partial prefix uses only complete same-block same-size pairs; actual cell n retained', 'passed': True})
     unmatched = analysis.summarize(records[:10], dict(partial_manifest, recorded_cases=10), BURSTS, True)
@@ -129,17 +133,17 @@ def main():
     raw_path = Path(records[0]['raw_command_path']); original_raw=raw_path.read_bytes()
     raw = json.loads(original_raw); raw['exit_code']=1; raw_path.write_text(json.dumps(raw))
     check('failed retained raw command rejected', lambda: rejects(
-        lambda: analysis.read_collection(records_path, manifest_path, a.backend_evidence), 'did not succeed'))
+        lambda: analysis.read_collection(records_path, manifest_path, a.backend_evidence, _fixture_mode=True), 'did not succeed'))
     raw_path.write_bytes(original_raw)
     source_path = Path(sources['load']['path']); original_source = source_path.read_bytes()
     source_path.write_text('{}')
     check('bound build/load receipt hash drift rejected', lambda: rejects(
-        lambda: analysis.read_collection(records_path, manifest_path, a.backend_evidence), 'source changed'))
+        lambda: analysis.read_collection(records_path, manifest_path, a.backend_evidence, _fixture_mode=True), 'source changed'))
     source_path.write_bytes(original_source)
     raw = json.loads(original_raw); raw['stdout']=raw['stdout'].replace('BOOT='+BOOT, 'BOOT='+'2'*36)
     raw_path.write_text(json.dumps(raw))
     check('raw/record disagreement rejected', lambda: rejects(
-        lambda: analysis.read_collection(records_path, manifest_path, a.backend_evidence), 'differs from raw'))
+        lambda: analysis.read_collection(records_path, manifest_path, a.backend_evidence, _fixture_mode=True), 'differs from raw'))
     raw_path.write_bytes(original_raw)
     # Keep only the accepted prefix; candidate-013 deliberately malformed and must never be read.
     (run/'uart/candidate-013.json').write_text('INCOMPLETE CANDIDATE MUST NOT BE READ')
@@ -149,18 +153,31 @@ def main():
     command=[sys.executable, str(Path(analysis.__file__).resolve()), '--records',str(records_path),
         '--manifest',str(manifest_path), '--backend-evidence',str(a.backend_evidence), '--allow-partial',
         '--snapshot-dir',str(snapshot), '--output',str(summary), '--long-table',str(table)]
-    result=subprocess.run(command,text=True,capture_output=True)
-    assert result.returncode==0, result.stderr
+    rejected=subprocess.run(command,text=True,capture_output=True)
+    assert rejected.returncode!=0 and 'fixture_only input cannot publish' in rejected.stderr
+    assert not snapshot.exists() and not summary.exists() and not table.exists()
+    checks.append({'check':'default actual CLI rejects fixture publication before creating any snapshot, summary or CSV','passed':True})
+    stdout, stderr=io.StringIO(), io.StringIO()
+    old_argv=sys.argv
+    try:
+        sys.argv=command[1:]
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            analysis.main(_fixture_mode=True)  # Internal finite test only; no exposed CLI bypass.
+    finally:
+        sys.argv=old_argv
     assert before == {str(p):p.read_bytes() for p in run.rglob('*') if p.is_file()}
-    got=json.loads(summary.read_text()); assert got['source_board_cases']==12 and not got['campaign_complete']
+    got=json.loads(summary.read_text())
+    assert got['source_board_cases']==0 and got['source_cases']==12 and not got['campaign_complete']
+    assert got['fixture_only'] and got['evidence_level']=='synthetic_protocol_fixture'
     assert len(got['raw_command_sources'])==12
     for source in got['snapshot']['sources']:
         assert sha(Path(source['snapshot_path']))==source['sha256']
         assert Path(source['snapshot_path']).read_bytes()==Path(source['original_path']).read_bytes()
     with table.open() as stream:
         reader=csv.DictReader(stream); assert reader.fieldnames==analysis.tables.FIELDS
-        assert all(r['sample_set'].startswith('p0:partial:accepted_prefix:') for r in reader)
-    checks.append({'check': 'actual partial CLI snapshots exact observed bytes, ignores candidate, writes E1b CSV, leaves all sources unchanged', 'passed':True})
+        assert all(r['sample_set'].startswith('p0:synthetic_fixture:') and
+                   r['evidence_level']=='synthetic_protocol_fixture' for r in reader)
+    checks.append({'check': 'explicit internal test path snapshots exact observed bytes, ignores candidate, labels CSV synthetic and leaves all sources unchanged', 'passed':True})
     again=subprocess.run(command,text=True,capture_output=True)
     assert again.returncode!=0 and 'no overwrite' in again.stderr
     checks.append({'check': 'existing snapshot/analysis outputs never overwritten', 'passed':True})
@@ -169,11 +186,45 @@ def main():
     assert all(x['n']==0 and x['hardware_ms'] is None for x in empty['rows'])
     assert all(x['n']==0 for x in empty['paired_comparisons'])
     checks.append({'check':'empty prefix produces n0/null; no imputation or completion claim','passed':True})
+    # Each boundary must reject independently, rather than passing only because
+    # some other fixture marker happens to exist in the same synthetic packet.
+    saved={path:path.read_bytes() for path in [manifest_path, *[Path(sources[n]['path'])
+        for n in ('load','fpga','software')], *[Path(r['raw_command_path']) for r in partial_records]]}
+    try:
+        clean=copy.deepcopy(partial_manifest); clean.pop('fixture_only',None)
+        for source in ('load','fpga','software'):
+            path=Path(sources[source]['path']);value=json.loads(path.read_text());value.pop('fixture_only',None)
+            path.write_text(json.dumps(value));clean['sources'][source]['sha256']=sha(path)
+        for record in partial_records:
+            path=Path(record['raw_command_path']);value=json.loads(path.read_text());value.pop('fixture_only',None)
+            path.write_text(json.dumps(value))
+        clean_bytes={path:path.read_bytes() for path in saved if path!=manifest_path}
+        for boundary in ('collection','load','fpga','software','raw'):
+            selected=copy.deepcopy(clean)
+            if boundary=='collection':
+                selected['fixture_only']=True
+            else:
+                path=Path(sources[boundary]['path']) if boundary!='raw' else Path(partial_records[0]['raw_command_path'])
+                value=json.loads(path.read_text());value['fixture_only']=True;path.write_text(json.dumps(value))
+                if boundary!='raw': selected['sources'][boundary]['sha256']=sha(path)
+            manifest_path.write_text(json.dumps(selected))
+            rejects(lambda:analysis.read_collection(records_path,manifest_path,a.backend_evidence,True),
+                    'fixture_only input cannot publish')
+            marked,_=analysis.read_collection(records_path,manifest_path,a.backend_evidence,True,_fixture_mode=True)
+            assert marked['fixture_only'] and marked['source_board_cases']==0
+            assert all(r['evidence_level']=='synthetic_protocol_fixture'
+                       for r in analysis.long_rows(marked,summary,'fixture-'+boundary))
+            checks.append({'check':boundary+' fixture flag alone rejects publication and propagates synthetic evidence','passed':True})
+            for path,body in clean_bytes.items():path.write_bytes(body)
+    finally:
+        for path,body in saved.items():path.write_bytes(body)
     report={'status':'passed','fixture_only':True,'new_board_measurements':0,
             'scope':'synthetic UART analysis fixtures; real bounded backend receipt is only a loader input',
             'analysis_sha256':sha(Path(analysis.__file__)), 'table_schema_sha256':sha(Path(analysis.tables.__file__)),
             'backend_receipt':{'path':str(a.backend_evidence.resolve()),'sha256':sha(a.backend_evidence)},
-            'checks':checks,'command':command,'stdout':result.stdout,'stderr':result.stderr}
+            'checks':checks,'command':command,'internal_fixture_mode':True,
+            'default_publication_rejection':{'returncode':rejected.returncode,'stderr':rejected.stderr},
+            'stdout':stdout.getvalue(),'stderr':stderr.getvalue()}
     (a.output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps({'status':'passed','checks':len(checks),'new_board_measurements':0,
                       'report':str((a.output/'report.json').resolve())}))

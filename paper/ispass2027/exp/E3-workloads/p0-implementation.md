@@ -108,5 +108,5 @@ python3 paper/ispass2027/exp/E3-workloads/collect_p0.py \
 完成後 [analyze_p0.py](analyze_p0.py) 從raw-derived bytes/cycles重算全部45次，
 輸出E1b同列長表與n/median/Q1/Q3/IQR；同block同size的A8/A1時間配對比，
 與原cell時間中位數之比分開列出。支援明確partial成功前綴的只讀不可覆寫快照；
-完整合同、Type7與18項finite回執見[analysis-contract](analysis-contract.md)。
+完整合同、Type7、fixture發布拒絕與24項finite回執見[analysis-contract](analysis-contract.md)。
 完整三形態與16/64KiB／2D仍僅設計，不在此次授權或實作中。
