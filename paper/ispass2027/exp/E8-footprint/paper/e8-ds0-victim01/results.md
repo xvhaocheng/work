@@ -36,6 +36,9 @@ cost is undefined there, never zero or infinite. For A8, A S1 PTW median
 [min,max] is6168 [6168,6168],8220 [8220,8220],8221 [8221,8221] for V2/V4/V8.
 For A64 it is9384 [8512,9898],9660 [8892,10438],8272 [8250,9282]. All those
 A8/A64 counters are positive5/5. Counters alone do not identify a stall source.
+Specifically V8_A1 A-own iotlb_miss and S1 PTW each have n5, median0,
+range[0,0], positive0/5. These are direct counts for assessing the domain of
+an A-walk-only description, without assigning a causal explanation.
 
 `paper.csv` has25650 unified17-column rows with all original point metrics and
 per-cell n/median/Q1/Q3/IQR, including V/A miss/PTW, observer and every PATH
