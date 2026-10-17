@@ -1,0 +1,134 @@
+diff --git a/Bender.yml b/Bender.yml
+index 6ba7540..494199c 100644
+--- a/Bender.yml
++++ b/Bender.yml
+@@ -51,6 +51,7 @@ sources:
+ 
+   - vendor/register_interface/src/axi_to_reg_v2.sv
+ 
++  - rtl/ext_interfaces/rv_iommu_ds_debt.sv
+   - rtl/ext_interfaces/rv_iommu_ds_if.sv
+   - rtl/ext_interfaces/rv_iommu_prog_if.sv
+ 
+diff --git a/rtl/ext_interfaces/rv_iommu_ds_debt.sv b/rtl/ext_interfaces/rv_iommu_ds_debt.sv
+new file mode 100644
+index 0000000..0f6e8c5
+--- /dev/null
++++ b/rtl/ext_interfaces/rv_iommu_ds_debt.sv
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
++// Passive transport accounting for the optional PN configuration guard.
++// These are transaction debts, not advertised credits. No output gates AXI.
++module rv_iommu_ds_debt (
++    input  logic clk_i,
++    input  logic rst_ni,
++    input  logic read_issue_i,
++    input  logic read_last_i,
++    input  logic write_issue_i,
++    input  logic write_done_i,
++    output logic quiet_o
++);
++    logic [7:0] read_q, read_n, write_q, write_n;
++    logic bad_q, bad_n;
++
++    always_comb begin
++        read_n = read_q;
++        write_n = write_q;
++        bad_n = bad_q;
++        // Simultaneous issue/retirement is a net zero, including at 0/255.
++        unique case ({read_issue_i, read_last_i})
++            2'b10: if (&read_q) bad_n = 1'b1;
++                   else read_n = read_q + 8'd1;
++            2'b01: if (read_q == '0) bad_n = 1'b1;
++                   else read_n = read_q - 8'd1;
++            default: ;
++        endcase
++        unique case ({write_issue_i, write_done_i})
++            2'b10: if (&write_q) bad_n = 1'b1;
++                   else write_n = write_q + 8'd1;
++            2'b01: if (write_q == '0) bad_n = 1'b1;
++                   else write_n = write_q - 8'd1;
++            default: ;
++        endcase
++    end
++
++    always_ff @(posedge clk_i or negedge rst_ni) begin
++        if (!rst_ni) begin
++            read_q <= '0;
++            write_q <= '0;
++            bad_q <= 1'b0;
++        end else begin
++            read_q <= read_n;
++            write_q <= write_n;
++            bad_q <= bad_n;
++        end
++    end
++    // A range/protocol anomaly cannot be cleared by ARM, STOP or policy clear.
++    assign quiet_o = !bad_q && (read_q == '0) && (write_q == '0);
++endmodule
+diff --git a/rtl/ext_interfaces/rv_iommu_ds_if.sv b/rtl/ext_interfaces/rv_iommu_ds_if.sv
+index ac66855..7da40f9 100644
+--- a/rtl/ext_interfaces/rv_iommu_ds_if.sv
++++ b/rtl/ext_interfaces/rv_iommu_ds_if.sv
+@@ -26,7 +26,8 @@ module rv_iommu_ds_if #(
+     parameter type r_chan_t     = logic,
+ 
+     parameter type axi_req_t    = logic,
+-    parameter type axi_resp_t   = logic
++    parameter type axi_resp_t   = logic,
++    parameter bit PnEnable      = 1'b0
+ ) (
+     input  logic        clk_i,
+     input  logic        rst_ni,
+@@ -71,7 +72,11 @@ module rv_iommu_ds_if #(
+ 
+     // MSI IG
+     input  axi_req_t    msi_ig_req_i,
+-    output axi_resp_t   msi_ig_resp_o
++    output axi_resp_t   msi_ig_resp_o,
++
++    // Read-only PN configuration guards; not full-system lifecycle idle.
++    output logic       pn_buffers_quiet_o,
++    output logic       pn_transport_quiet_o
+ );
+ 
+     // AR Channel (DDTW, PDTW, PTW, CQ, MSIPTW, MRIF handler)
+@@ -322,6 +327,38 @@ module rv_iommu_ds_if #(
+         .oup_ready_i ({pq_req_i.b_ready, msi_ig_req_i.b_ready, mrif_handler_req_i.b_ready, fq_req_i.b_ready, cq_req_i.b_ready})
+     );
+ 
++    if (PnEnable) begin : gen_pn_quiet
++        logic debt_quiet;
++        rv_iommu_ds_debt i_debt (
++            .clk_i, .rst_ni,
++            .read_issue_i  (ds_req_o.ar_valid && ds_resp_i.ar_ready),
++            .read_last_i   (ds_resp_i.r_valid && ds_req_o.r_ready && ds_resp_i.r.last),
++            .write_issue_i (ds_req_o.aw_valid && ds_resp_i.aw_ready),
++            .write_done_i  (ds_resp_i.b_valid && ds_req_o.b_ready),
++            .quiet_o       (debt_quiet)
++        );
++        // Spill output VALID covers both entries of each non-bypass spill.
++        // Include current producer offers, even channels unused by a producer,
++        // external responses and W ownership. READY/stale payload are not work.
++        assign pn_buffers_quiet_o = w_fifo_empty &&
++            !(ar_valid || aw_valid || w_valid || r_valid || b_valid ||
++              ds_req_o.ar_valid || ds_req_o.aw_valid || ds_req_o.w_valid ||
++              ds_resp_i.r_valid || ds_resp_i.b_valid ||
++              ddtw_req_i.ar_valid || ddtw_req_i.aw_valid || ddtw_req_i.w_valid ||
++              pdtw_req_i.ar_valid || pdtw_req_i.aw_valid || pdtw_req_i.w_valid ||
++              ptw_req_i.ar_valid || ptw_req_i.aw_valid || ptw_req_i.w_valid ||
++              msiptw_req_i.ar_valid || msiptw_req_i.aw_valid || msiptw_req_i.w_valid ||
++              mrif_handler_req_i.ar_valid || mrif_handler_req_i.aw_valid || mrif_handler_req_i.w_valid ||
++              cq_req_i.ar_valid || cq_req_i.aw_valid || cq_req_i.w_valid ||
++              fq_req_i.ar_valid || fq_req_i.aw_valid || fq_req_i.w_valid ||
++              pq_req_i.ar_valid || pq_req_i.aw_valid || pq_req_i.w_valid ||
++              msi_ig_req_i.ar_valid || msi_ig_req_i.aw_valid || msi_ig_req_i.w_valid);
++        assign pn_transport_quiet_o = pn_buffers_quiet_o && debt_quiet;
++    end else begin : gen_no_pn_quiet
++        assign pn_buffers_quiet_o = 1'b0;
++        assign pn_transport_quiet_o = 1'b0;
++    end
++
+     //# Unused signals
+     // Read-only modules
+     assign ptw_resp_o.aw_ready  = 1'b0;
