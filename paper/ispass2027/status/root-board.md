@@ -5,7 +5,7 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Origin Date: 2026-10-17 JST
-- Verification Status: UNVERIFIED（尚无本轮新增板测）
+- Verification Status: PARTIAL（DS25前16个新增试次已冻结并逐原始命令检核，整轮未完）
 - Version Label: root-a-status-v1
 
 ## 今日进展
@@ -48,3 +48,7 @@ P0 前端三处RTL变更已直接审查，79项有限真实frontend验证通过�
 用户已补充授权未来清单中的必要RTL/Linux改动由agent在独立branch实现、编译，随后统一排队上板。原E4/E5及其余负载的只读请求状态据此转为准备：E4交A3、E5交A1、E3其余形态交A2，均先完成当前关键交付，再给出有界设计和实际代码审查；E6历史缓解最后准备，不恢复新机制探索。先前等待决定的段落保留为当时状态，以本更新为准。
 
 Root已直接审查E2 multi最终驱动/ABI/CLI、未知静默状态不标drained与STOP前in-flight修正，实际源码hash吻合最终有限测试：旧pair/P0 38场景有序MMIO trace与稳定M完全相同，新multi57有限场景和45CLI场景通过，真实RV64 idma.o/iommu-hpm.o编译通过，multi栈1312B。Linux稳定提交`acece3a3ab7d72ba1f936c1984b82a4a55f28d46`已被接受，平台`52c5fdd028bbf3b07deaf1d0f7e13e3a271b29d0`固定其gitlink和lock；A2已开始一次共同payload编译，含原三程序、P0和多设备CLI，release后缀`-ispass2027-p0-multi-v1`。主机验证不代替板测。
+
+## 首批新增论文数据（2026-10-17 13:04Z）
+
+已只读冻结实际DS25采集的前16个成功试次到`exp/E1b-ds-sweep/checkpoints/ds25-progress01/`，原始manifest/records字节另存as-observed，按实际n=3或4提供逐试次长表、中位数及Q1/Q3/IQR；显式引用历史100次后总116试次。当前四档矩阵仍partial，DS100尚未采集；未填补缺点、未绘部分曲线、未重测替换。该累积CSV用于阶段同步，不能与后续累计快照重复追加。新试次的BIT为已验收DS25，软件仍是原pathv3；原始命令/boot/sequence/来源完整保留。

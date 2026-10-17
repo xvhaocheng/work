@@ -1,6 +1,6 @@
 # Root A integration handoff (live)
 
-Status: preparation and builds in progress; this file is updated with actual collection packets as they become available. No new performance sample has been published yet. All Root edits are on `ispass/root-a` in `/home/xvhaocheng/work-root-a`.
+Status: preparation and builds in progress; this file is updated with actual collection packets as they become available. The first immutable snapshot now contains 16 actual new DS25 trials, with explicit n and incomplete-matrix status. All Root edits are on `ispass/root-a` in `/home/xvhaocheng/work-root-a`.
 
 ## Board ownership
 
@@ -12,7 +12,8 @@ The next sequence is old DS0 BIT + old pathv3 role swap (30 trials), one common 
 
 - `exp/E1b-ds-sweep/checkpoints/baseline100-reference/`: immutable reuse of the 100 historical DS0/DS50 trials, not new measurements. It contains trial CSV and actual sample counts. Later cumulative checkpoints must not be appended together as independent samples.
 - `exp/E5-latency/baseline100/trial-stages.csv`: 1600 stage rows from the same 100 historical trials; 160 groups with n=10. Request CDF/p99 are unavailable.
-- New E1b, E2, E3 and role-swap result packets remain pending. Logs and timing reports provide provenance; they do not replace paper data.
+- `exp/E1b-ds-sweep/checkpoints/ds25-progress01/`: 16 actual new DS25 trials plus the explicit 100-trial historical reference (116 total). Each cell has n=3 or4. This cumulative partial packet is for interim synchronization; do not append it alongside a later cumulative packet.
+- Complete E1b, E2, E3 and role-swap result packets remain pending. Logs and timing reports provide provenance; they do not replace paper data.
 
 Root does not edit shared `data/board_results.csv`, `README.md` or `CURRENT_STATUS.md`. Import only one final selected packet for each newly measured matrix; avoid importing the historical reference a second time. Keep the configuration, actual sample n, boot/sequence and command links attached to each row.
 
