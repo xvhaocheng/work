@@ -3,13 +3,13 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Verification Status: PARTIAL（E1b、E3 P0、E6角色及E4/E5已完成；G已完成；E2/完整E3/E6-PN按队列继续）
-- Updated: 2026-10-17T17:26:00+00:00 / 2026-10-18 JST
+- Updated: 2026-10-17T17:24:49.272327+00:00 / 2026-10-18 JST
 
 E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PTE/PA/data/unmap/taint0/最终OBS4+PATH+16×32桶全部通过。V硬件时间中位数4KiB 139.19783ms、2MiB106.88277ms；逐block时间下降中位23.2191%、吞吐提升中位30.2406%，V软件HPM bracket的miss/S1 PTW中位8192→0。E4统一CSV3824行，E5同20点/320stage/10240桶，E5不另计新试次。完整论文包E4-pagesize/paper/e4-common-v2-final01、E5-latency/paper/e4-common-v2-final01；Root另以原record硬件cycles/Fraction独立复算10对通过。
 
 G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。E2 probe上传已于17:16:45Z成功（bytesACK，无额外回读）；当前唯一板动作e2-probe-software-write01-launch，在当前G内核用匹配模块写一次诊断payload，未加载或跑诊断点。完整E3唯一resume仍在原设置route，未qualified；不打断。真实G论文图/报告已验收：figures/g-ds0-final01及figures/g-results.md，Root独立重放数值/CSV/PDF/PNG一致。E2两点诊断须新boot及逐阶段Root接受，不能自动连跑。
 
-E6-PN核心任务已按用户新授权启动并行准备：A1独占ispass/e6-pn RTL来源/最小移植，A3独占ispass/e6-pn-tools接口与采集工具；均无硬件权限。用户已批准最小被动A/共同硬件时长计数。先DS0时序门，再原kernel/CLI的S15逐格≤0.5%回归；通过后才测120+30并允许同源DS50构建/40点。总205独立试次，gap0各phase不复用；不打断已在跑的完整E3构建。详见exp/E6-pn/README.md。
+E6-PN核心任务已按用户新授权启动并行准备：A1独占ispass/e6-pn的P/TL首小批，A2独占ispass/e6-pn-gap原前端cooldown，A3独占ispass/e6-pn-tools纯host S15门；三席并行且均无硬件权限。用户已批准最小被动A/共同硬件时长计数。先DS0时序门，再原kernel/CLI的S15逐格≤0.5%回归；通过后才测120+30并允许同源DS50构建/40点。总205独立试次，gap0各phase不复用；不打断已在跑的完整E3构建。详见exp/E6-pn/README.md。
 
 E2两个版本均在第6点N4_A8失败，各5点分别冻结，不混池；timer重试/再入现象有证据，CPU AXI根因未定。65b候选不能称修复成功。
 

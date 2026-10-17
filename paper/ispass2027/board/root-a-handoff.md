@@ -1,8 +1,8 @@
-# 实际板资源 2026-10-17T17:26:00+00:00
+# 实际板资源 2026-10-17T17:22:17+00:00
 
 G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。E2 probe上传已于17:16:45Z成功（bytesACK，无额外回读）；当前唯一板动作e2-probe-software-write01-launch，在当前G内核用匹配模块写一次诊断payload，未加载或跑诊断点。完整E3唯一resume仍在原设置route，未qualified；不打断。真实G论文图/报告已验收：figures/g-ds0-final01及figures/g-results.md，Root独立重放数值/CSV/PDF/PNG一致。E2两点诊断须新boot及逐阶段Root接受，不能自动连跑。
 
-E6-PN核心任务已按用户新授权启动并行准备：A1独占ispass/e6-pn RTL来源/最小移植，A3独占ispass/e6-pn-tools接口与采集工具；均无硬件权限。用户已批准最小被动A/共同硬件时长计数。先DS0时序门，再原kernel/CLI的S15逐格≤0.5%回归；通过后才测120+30并允许同源DS50构建/40点。总205独立试次，gap0各phase不复用；不打断已在跑的完整E3构建。详见exp/E6-pn/README.md。
+E6-PN核心任务已按用户新授权启动并行准备：A1独占ispass/e6-pn的P/TL首小批，A2独占ispass/e6-pn-gap原前端cooldown，A3独占ispass/e6-pn-tools纯host S15门；三席并行且均无硬件权限。用户已批准最小被动A/共同硬件时长计数。先DS0时序门，再原kernel/CLI的S15逐格≤0.5%回归；通过后才测120+30并允许同源DS50构建/40点。总205独立试次，gap0各phase不复用；不打断已在跑的完整E3构建。详见exp/E6-pn/README.md。
 
 G load/collector/analyzer均已成功结束；当前只有E2 probe SD writer活动。诊断加载和两点均未开始，以各result/正式manifest为准。
 

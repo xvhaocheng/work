@@ -2,7 +2,7 @@
 
 - Origin Skill/Mode：ARS-Codex / experiment-agent / plan；2026-10-18 JST。
 - Status：准备中，尚无 E6-PN 新 RTL、BIT 或板测结果。历史结果仅为动机。
-- 主分支 `ispass/e6-pn`，独立工作树 `/home/xvhaocheng/work-e6-pn`；Root 在 `ispass/root-a` 审查、保存验收与排板。工具席独占 `ispass/e6-pn-tools`，不并改组件树。
+- 主分支 `ispass/e6-pn`，独立工作树 `/home/xvhaocheng/work-e6-pn`；Root 在 `ispass/root-a` 审查、保存验收与排板。工具席独占 `ispass/e6-pn-tools`；gap 席独占 `ispass/e6-pn-gap` 的原前端小批，经 Root 接受后集成，不并改组件树。
 
 要回答三个问题：原始 DS0 下 PN 是否仍比 P 慢；V 与 A 是否同时变慢；差额是否随 V 供给间隔变化。历史 DS50 研究 BIT 的约 12.7% 退化不能替代本次验证，也不能据仿真直接认定真实 MIG 的根因。
 
@@ -24,3 +24,5 @@
 正式输出保留实际 BIT、kernel、源码和命令身份、原始证据，并产统一17列长表 CSV 与分析脚本。指标包括 V/A 硬件时间、各自吞吐、双方完整工作共同吞吐、双方 miss/PTW、真实 N accept、V 分段等待、入口 AW 等待；HPM 软件采样区间、V 窗口、A 自身窗口和共同窗口分别标明，不能互换分母。零完整段为 N/A。比较先逐同 boot/block 配对计算，再报告 n、中位数、四分位与范围；不预设 PN 结果或因果结论。
 
 通过检查的中途论文数据可提交推送；二进制留本机，失败和未完成证据保留但不冒称完整论文样本。Root 不合并 main，最终合并步骤与重叠点维护于 [合并说明](../../board/root-a-merge.md)。
+
+当前已审设计入口：[最小移植与硬门](port-plan.md)、[固定来源调用链](source-map.md)、[测量合同](measurement-contract.md)、[原软件与采集计划](software-plan.md)、[Root设计接受](root-validation/plan01.json)。A1只实施P IOTLB/TL首小批；A2并行原前端gap小批；A3并行纯主机S15门，均须真实源码与有限验证接受后再集成。
