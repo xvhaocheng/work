@@ -3,8 +3,6 @@
 import argparse
 from collections import defaultdict
 import csv
-import hashlib
-import importlib.util
 import json
 import math
 from pathlib import Path
@@ -14,6 +12,7 @@ sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 GROUP = ('phase', 'ds', 'boot_id', 'condition', 'v_gap_cycles')
 METRICS = ('V_ms', 'A_ms', 'union_ms', 'V_MiB_s', 'A_MiB_s', 'union_MiB_s')
+PHASES = {'e6-pn-main': ('0/0', 150), 'e6-pn-gap': ('0/0', 30), 'e6-pn-ds50': ('50/50', 40)}
 
 
 def require(value, message):
@@ -52,119 +51,46 @@ def describe(values):
     return dict(n=len(ordered), median=q(.5), q1=q(.25), q3=q(.75), iqr=q(.75)-q(.25))
 
 
-def imported(path, name):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def load_accepted(run):
+    """Read only the two accepted collector products; never reopen raw/source."""
+    run = Path(run).resolve()
+    manifest = json.loads((run / 'manifest.json').read_text())
+    records = json.loads((run / 'records.json').read_text())
+    require(not synthetic(manifest) and not synthetic(records), 'synthetic products cannot enter paper analysis')
+    require(manifest['status'] == 'passed', 'only complete collector-passed phases are accepted')
+    expected_ds, expected_n = PHASES[manifest['phase']]
+    require(manifest['ds'] == expected_ds and manifest['recorded_cases'] == len(records) == expected_n and
+            len(manifest['planned_cases']) == expected_n, 'complete phase/n required')
+    seen = set()
+    for item in records:
+        require(all(item[k] == manifest[k] for k in ('phase', 'ds', 'boot_id')), 'mixed phase/DS/boot')
+        key = item['boot_id'], item['sequence']
+        require(type(item['sequence']) is int and item['sequence'] > 0 and key not in seen, 'duplicate/invalid boot+sequence')
+        seen.add(key)
+    return manifest, records
 
 
-def load_run(run, root, formal, gate):
-    reader = gate.Inputs(root, run, False)
-    def read(path):
-        resolved, value = reader.read(path)
-        require(not synthetic(value), 'synthetic source cannot enter paper analysis: ' + str(resolved))
-        return resolved, value
-    _, manifest = read(run / 'manifest.json')
-    _, cached = read(run / 'records.json')
-    require(manifest['status'] == 'passed', 'only complete actual passed phases are accepted')
-    phase = next(k for k, v in formal.PHASES.items() if v[0] == manifest['phase'])
-    script = reader.resolve(manifest['script_source'])
-    require(script == Path(formal.__file__).resolve(), 'use the actual saved formal runner source')
-    raw_script = script.read_bytes()
-    require(gate.sha(raw_script) == manifest['script_sha256'], 'as-executed formal source changed')
-    reader.observed[script] = raw_script
-    plan = reader.resolve(manifest['plan_source'])
-    reader.observed[plan] = plan.read_bytes()
-    require(gate.sha(reader.observed[plan]) == manifest['plan_sha256'], 'actual plan changed')
-    points = formal.read_plan(plan, phase)
-    require(manifest['planned_cases'] == points, 'cached plan differs from actual plan')
-    require(manifest['recorded_cases'] == len(cached) == len(points), 'complete phase count required')
-    receipts = {}
-    for name in ('load_manifest', 'source_manifest', 'software_manifest', 's15_gate'):
-        path, value = read(manifest[name])
-        require(gate.sha(reader.observed[path]) == manifest[name+'_sha256'], 'receipt changed: '+name)
-        receipts[name] = value
-    loaded, source, admission = (receipts[x] for x in ('load_manifest', 'source_manifest', 's15_gate'))
-    require(loaded['status'] == 'boot_identity_verified' and loaded['kernel_release'] == gate.KERNEL,
-            'actual original kernel/load identity required')
-    require(manifest['kernel_release'] == gate.KERNEL and manifest['boot_id'] == loaded['boot_id'] and
-            manifest['bit_sha256'] == loaded['bit_sha256'], 'collection/load identity mismatch')
-    require(source['linux'] == gate.LINUX and admission['status'] == 'passed' and
-            admission['eligible_for_DS50'] is True, 'qualified same-source S15 required')
-    require(admission['selected_cva6'] == source['selected_cva6'] and
-            admission['selected_iommu'] == source['iommu'], 'S15/source mismatch')
-    require((loaded['bit_sha256'] != admission['bit_sha256']) if phase == 'ds50'
-            else (loaded['bit_sha256'] == admission['bit_sha256']), 'phase BIT/S15 mismatch')
-    require(manifest['ds'] == formal.PHASES[phase][1], 'phase DS mismatch')
-    if 'ds' in loaded:
-        require(loaded['ds'] == manifest['ds'], 'load DS mismatch')
-    mapping_path = Path(formal.__file__).resolve().parent.parent / 'tool-source-map.json'
-    mapping_raw = mapping_path.read_bytes()
-    require(gate.sha(mapping_raw) == gate.MAP_SHA, 'original source map changed')
-    reader.observed[mapping_path] = mapping_raw
-    mapping = json.loads(mapping_raw)
-    require(not synthetic(mapping), 'synthetic source map')
-    gate.software(reader, mapping, reader.resolve(manifest['software_manifest']))
-    parse, identity = formal.formal_parser(gate, reader, mapping)
-    require(identity == manifest['parser'], 'actual parser/adaptation identity mismatch')
-    actions = manifest['control_actions']
-    require(len(actions) == 2*len(points), 'exact two actual control actions per trial required')
-    trials, previous = [], None
-    for number, (point, item) in enumerate(zip(points, cached), 1):
-        require(all(item[k] == v for k, v in point.items()) and item['case'] == number,
-                'trial order/point relabeling')
-        raw_path, raw = read(item['raw_command_path'])
-        require(raw['exit_code'] == 0 and raw['command'] == gate.command(point['condition']),
-                'actual original CLI command/success required')
-        parsed = parse(raw['stdout'], point['v_gap_cycles'])
-        require(not synthetic(parsed) and all(parsed[k] == item[k] for k in
-                ('record', 'observer', 'path', 'metrics', 'boot_id', 'sequence')), 'raw/cache mismatch')
-        require(item['boot_id'] == manifest['boot_id'] and
-                (previous is None or item['sequence'] == previous+1), 'actual same-boot consecutive sequence required')
-        previous = item['sequence']
-        record = parsed['record']
-        require(record['input']['aggressor_id'] == 1 and
-                record['input']['aggressor_pages'] == point['a_pages'] and
-                record['result']['victim_did'] == 10 and record['result']['aggressor_did'] == 11,
-                'actual roles/pages differ from plan')
-        for action, operation, value in zip(actions[2*(number-1):2*number],
-                                            ('set-mode', 'set-gap'), (point['mode_word'], point['v_gap_cycles'])):
-            require(action['trial_id'] == point['trial_id'] and action['operation'] == operation,
-                    'control action order mismatch')
-            _, control_raw = read(action['raw_command_path'])
-            sent = formal.control_command(f'pn-config {operation} {value}', item['boot_id'], gate.KERNEL)
-            control = formal.decode(gate, control_raw, sent, 'idma.pn_config.v1', item['boot_id'])
-            require(not synthetic(control) and control['read_only'] is False and control['operation'] == operation and
-                    control['requested_value'] == value and control['functional_write_attempts'] == 1 and
-                    control['readback_verified'] is True and control['after']['mode_word'] == point['mode_word'],
-                    'actual guarded control write/readback required')
-            if operation == 'set-gap':
-                require(control['after']['gap_word'] == point['v_gap_cycles'], 'gap readback mismatch')
-        pn_path, pn_raw = read(item['pn_readback_path'])
-        control = formal.decode(gate, pn_raw, formal.control_command('pn-control read', item['boot_id'], gate.KERNEL),
-                                'idma.pn_control.v1', item['boot_id'])
-        require(not synthetic(control) and control == item['pn_readback'] and
-                control['operation'] == 'read' and control['read_only'] is True, 'post-read raw/cache mismatch')
-        whole = formal.validate_capture(control, point, parsed)
-        require(whole == item['whole_work'], 'whole-work cache mismatch')
-        v, a = (record['result'][role] for role in ('victim', 'aggressor'))
-        cycles = parsed['observer']['time']['cycles']
-        require(cycles > 0 and v['completed_bytes'] > 0, 'positive actual V work/time required')
+def load_run(run):
+    manifest, records = load_accepted(run)
+    trials = []
+    for index, item in enumerate(records):
+        whole = item['whole_work']
+        v, a = (item['record']['result'][role] for role in ('victim', 'aggressor'))
+        v_cycles, a_cycles, union_cycles = item['observer']['time']['cycles'], whole['a_own_cycles'], whole['union_cycles']
+        v_bytes, a_bytes = v['completed_bytes'], a['completed_bytes']
+        require(min(v_cycles, a_cycles, union_cycles, v_bytes, a_bytes) > 0, 'positive actual work/time required')
         trial = {k: item[k] for k in (*GROUP, 'block', 'case', 'trial_id', 'mode', 'mode_word', 'sequence')}
-        trial.update(V_ms=cycles/50000, A_ms=whole['a_own_cycles']/50000,
-                     union_ms=whole['union_cycles']/50000,
-                     V_MiB_s=parsed['metrics']['hardware_MiB_s'], A_MiB_s=whole['a_own_MiB_s'],
-                     union_MiB_s=whole['union_MiB_s'], V_bytes=v['completed_bytes'], A_bytes=a['completed_bytes'],
+        trial.update(V_ms=v_cycles/50000, A_ms=a_cycles/50000, union_ms=union_cycles/50000,
+                     V_MiB_s=v_bytes*50e6/(1048576*v_cycles), A_MiB_s=a_bytes*50e6/(1048576*a_cycles),
+                     union_MiB_s=(v_bytes+a_bytes)*50e6/(1048576*union_cycles), V_bytes=v_bytes, A_bytes=a_bytes,
                      n_accept_v=whole['n_accept_v'], n_accept_a=whole['n_accept_a'],
-                     raw_command_path=str(raw_path), raw_sha256=gate.sha(reader.observed[raw_path]),
-                     pn_readback_path=str(pn_path), pn_sha256=gate.sha(reader.observed[pn_path]))
-        require(math.isclose(trial['V_MiB_s'], (trial['V_bytes']/1048576)*50e6/cycles, rel_tol=1e-12),
-                'V rate/own hardware denominator mismatch')
+                     raw_command_path=item['raw_command_path'], pn_readback_path=item['pn_readback_path'],
+                     records_path=str(run / 'records.json'), record_index=index)
         trials.append(trial)
-    reader.unchanged()
-    return trials, dict(path=str(run), phase=manifest['phase'], ds=manifest['ds'],
-                        boot_id=manifest['boot_id'], n=len(trials), sources=reader.sources())
+    references = {k: manifest[k] for k in ('script_source', 'plan_source', 'load_manifest', 'source_manifest',
+                                           'software_manifest', 's15_gate') if k in manifest}
+    return trials, dict(path=str(run), manifest_path=str(run/'manifest.json'), phase=manifest['phase'],
+                        ds=manifest['ds'], boot_id=manifest['boot_id'], n=len(trials), source_references=references)
 
 
 def statistics(trials):
@@ -238,7 +164,6 @@ def plots(output, absolute, paired):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--run', type=Path, action='append', default=[])
-    ap.add_argument('--source-root', type=Path)
     ap.add_argument('--output', type=Path)
     ap.add_argument('--plots', action='store_true')
     ap.add_argument('--check', action='store_true', help='tiny pure math/boundary check; no collection or paper output')
@@ -249,19 +174,17 @@ def main():
         require(synthetic({'nested': [{'synthetic': True}]}), 'recursive fixture boundary')
         print('passed three pure helper checks; 0 board records; no output or figures')
         return
-    require(args.run and args.source_root and args.output, '--run, --source-root and --output required')
-    root, output = args.source_root.resolve(), args.output.resolve()
+    require(args.run and args.output, '--run and --output required')
+    output = args.output.resolve()
     require(output.is_relative_to(HERE) and output != HERE and not output.exists(), 'new output directory under this analysis task required')
-    formal = imported(root/'paper/ispass2027/exp/E6-pn/tools/collect_formal.py', 'e6_analysis_formal')
-    gate = imported(Path(formal.__file__).parent/'s15_gate.py', 'e6_analysis_gate')
     trials, runs, unique, collections = [], [], set(), set()
     for run in args.run:
-        rows, receipt = load_run(run.resolve(), root, formal, gate)
+        rows, receipt = load_run(run.resolve())
         collection = tuple(receipt[k] for k in ('phase', 'ds', 'boot_id'))
         require(collection not in collections, 'choose one collection per actual phase/DS/boot; no cumulative pooling')
         collections.add(collection)
         for row in rows:
-            key = row['boot_id'], row['sequence'], row['raw_sha256']
+            key = row['boot_id'], row['sequence']
             require(key not in unique, 'overlapping actual trial cannot be counted twice')
             unique.add(key)
         trials.extend(rows)

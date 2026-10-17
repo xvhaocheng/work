@@ -2,27 +2,27 @@
 
 Preparation only: no formal board records have been analyzed and no result
 figures generated. The separate `ispass/e6-pn-analysis` branch contains no
-observer/production/collector change. It reuses A2's accepted `collect_formal.py`
-(cb053c0d source interface), `formal_parser`, `decode` and `validate_capture`.
-Imports are host-only; UART is imported only by the collector's uncalled
-`collect()` function. No hardware or collection entry exists here.
+observer/production/collector change. It consumes A2's accepted
+`collect_formal.py` products directly. `load_accepted(run)` returns the existing
+`(manifest, records)` and opens only those two JSON files. No collector, parser,
+UART or hardware module is imported.
 
 After Root reports actual completed runs:
 
 ```text
-/home/xvhaocheng/work-root-a/paper/ispass2027/exp/E1b-ds-sweep/artifacts/plot-venv/bin/python analyze.py --source-root /home/xvhaocheng/work-root-a \
+/home/xvhaocheng/work-root-a/paper/ispass2027/exp/E1b-ds-sweep/artifacts/plot-venv/bin/python analyze.py \
   --run /actual/formal-main --run /actual/formal-gap \
   --output /absolute/path/to/this/analysis/NEW_RESULT --plots
 ```
 
 Use actual complete `passed` phase directories. Output must be a new directory
 inside this analysis task. No partial/failed prefix is relabeled complete,
-no cumulative runs pooled, no missing point filled. The script rebinds original
-source/load/software/S15 receipts, saved as-executed runner, exact plan/order,
-guarded writer commands, unchanged original CLI raw and post-read raw. It reuses
-the formal gap-aware parser (not S15's gap0-only instance), retains all accepted
-data/drain/PATH checks and requires cached fields equal reconstructed fields.
-All JSON inputs recursively reject explicit synthetic/fixture markers.
+no cumulative runs pooled, no missing point filled. The collector owns raw,
+source, data/drain/PATH and control acceptance. Analysis trusts those accepted
+records and checks only complete phase/n, unique same-boot sequence membership,
+and the actual statistics/denominators/pairing. Original raw/source pointers
+are retained for navigation; none are reopened or rehashed. Manifest and records
+recursively reject explicit synthetic/fixture markers.
 
 At50MHz, using actual measured completed bytes (batch collection replaces the
 warmup stats, not accumulates them):
@@ -43,7 +43,7 @@ medians is not used. Main A1/A8/A64 and the independent gap A8 g0/1000/4000
 phase remain separate. DS50's four modes have only independent descriptive
 statistics/plots; historical/cross-boot partners are never constructed.
 
-`trials.csv` retains boot/sequence and both raw paths/hashes, actual A bytes and
+`trials.csv` retains boot/sequence, both raw paths, record location, actual A bytes and
 true N accepts. `descriptive.csv`, `paired_blocks.csv`, `paired_summary.csv` and
 `summary.json` give actual n, median, Type7 Q1/Q3/IQR. Optional Matplotlib PDF/PNG
 plots show those medians/IQRs; they contain no CI or significance test. Main/gap
