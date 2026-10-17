@@ -69,6 +69,8 @@ release為`6.5.0-rc2-ispass2027-p0-multi-v1`（最終以實際kernel.release為�
 payload 29,363,656 bytes，32MiB餘4,190,776 bytes。
 正式交付manifest為本機`artifacts/p0-software01/delivery-manifest.json`，
 完整回執副本見[software-final01](test-results/p0-software-final01.json)。
+已生成`artifacts/p0-software01/fw_payload.bin.gz`，10,520,154 bytes；
+[運輸回執](test-results/p0-software-transport01.json)記錄原payload／gzip的SHA與host解壓相等檢查。
 Image／lloader／OpenSBI先成功；最後恢復模組因缺`linux-build/scripts/module.lds`失敗。
 原[failed manifest](test-results/p0-software-build01.failed.json)與[原log](test-results/p0-software-build01.failed.log)不改寫。
 [repair_p0_software.py](repair_p0_software.py)依既有board recovery流程補`modules_prepare`，
@@ -102,5 +104,7 @@ python3 paper/ispass2027/exp/E3-workloads/collect_p0.py \
 五區組輪換，單point kernel60秒／外層90秒／host120秒；失敗立即停止並保留raw，無自動重試。
 若只是parser修正，可`--resume-run`恢復完整成功raw前綴，只執行餘點，不能繞過實際失敗。
 完成後 [analyze_p0.py](analyze_p0.py) 從raw-derived bytes/cycles重算全部45次，
-只在同V大小內列Solo/A1比，保留n=5、min/max、V/A miss的非原子HPM口徑。
+輸出E1b同列長表與n/median/Q1/Q3/IQR；同block同size的A8/A1時間配對比，
+與原cell時間中位數之比分開列出。支援明確partial成功前綴的只讀不可覆寫快照；
+完整合同、Type7與18項finite回執見[analysis-contract](analysis-contract.md)。
 完整三形態與16/64KiB／2D仍僅設計，不在此次授權或實作中。
