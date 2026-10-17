@@ -2,14 +2,18 @@
 
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
-- Verification Status: PARTIAL（E1b、E3 P0、E6角色及E4/E5已完成；G已完成；E2/完整E3/E6-PN按队列继续）
-- Updated: 2026-10-17T17:41:51.096522+00:00 / 2026-10-18 JST
+- Verification Status: PARTIAL（E1b、E3 P0、E6角色及E4/E5已完成；G已完成；E2诊断失败后恢复；完整E3失败停止，E6-PN/E3-lite准备）
+- Updated: 2026-10-17T18:05:17.931527+00:00 / 2026-10-18 JST
 
 E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PTE/PA/data/unmap/taint0/最终OBS4+PATH+16×32桶全部通过。V硬件时间中位数4KiB 139.19783ms、2MiB106.88277ms；逐block时间下降中位23.2191%、吞吐提升中位30.2406%，V软件HPM bracket的miss/S1 PTW中位8192→0。E4统一CSV3824行，E5同20点/320stage/10240桶，E5不另计新试次。完整论文包E4-pagesize/paper/e4-common-v2-final01、E5-latency/paper/e4-common-v2-final01；Root另以原record硬件cycles/Fraction独立复算10对通过。
 
-G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。E2 probe上传已于17:16:45Z成功（bytesACK，无额外回读）；SD已于17:28:52Z return0；原DS0/probe加载已于17:36:47Z验证新boot e96e8ccc-aa05-42ce-83f8-714b8a17060d、taint0；当前唯一板动作e2-probe-preflight01，只读检查探针初态/proc，诊断点尚未运行。完整E3唯一resume仍在原设置route，未qualified；不打断。真实G论文图/报告已验收：figures/g-ds0-final01及figures/g-results.md，Root独立重放数值/CSV/PDF/PNG一致。E2两点诊断须新boot及逐阶段Root接受，不能自动连跑。
+G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。
 
-E6-PN核心任务已按用户新授权启动并行准备：P小批d2a813d已Root直接审源码/gold/逐拍证据并独立15项核对接受；S15 gate 288e7c2由Root实际复跑51项通过，均非板测。A1独占ispass/e6-pn继续IOMMU N核心，A2独占ispass/e6-pn-gap收口原前端cooldown，A3独占ispass/e6-pn-tools实现只读pn-control；三席并行且均无硬件权限。用户已批准最小被动A/共同硬件时长计数。先DS0时序门，再原kernel/CLI的S15逐格≤0.5%回归；通过后才测120+30并允许同源DS50构建/40点。总205独立试次，gap0各phase不复用；不打断已在跑的完整E3构建。详见exp/E6-pn/README.md。
+E2 timer probe 已完成唯一 N2_A1 诊断对照，原 CLI/数据/排空/taint0 门通过；探针记录182次 handler、21条选取记录，时窗50,192,459周期。N4_A8 于17:53:23Z达到180秒主机超时，持续 softlockup；一次 Ctrl-C 和20秒只读监听均未恢复 shell，未发送 freeze/read，N4探针计数不可取得，不能据 N2 证明根因。原两轮各5点性能 partial 仍分开。原DS0恢复已于18:08:06Z成功，新boot517379a7-7f70-4a1d-a2d4-e9c18ddafc70、probe内核/taint0已核。当前唯一UART动作pn-original-upload01，上传原pathv3 payload；有限pn-original-deploy01仅在上传完成及bytesACK后写SD一次并验证原pathv3启动，不采实验、不加E2重试。
+
+完整 E3 的唯一原设置续编已于17:45:03Z硬失败：WNS−2.646ns，setup失败3413，hold/pulse失败0，routing errors50014；RTSTAT-13禁止bitgen，无BIT。原route checkpoint/报告/DRC/失败manifest保留，不重试、不改约束。E3-lite只准备单文件时间戳存储写进程拆分和有限gold验证，实际RAM推断/fit/timing未知，任何Vivado任务排在E6-PN首构之后；完整E3正式板点仍0。
+
+E6-PN：P d2a813d、gap dd1a97e、S15 51项以及只读 helper 137项实际主机检查已接受；N 755cd723与独立被动 observer c913dd1已通过Root直接源码与有限证据审查（N原件5291项、observer绑定/端点39项），均非整栈或板测。最新用户追加 P（不隔离替换历史），保持2/14分区不变；DS0主矩阵150点，加S15 15、独立gap补充30、DS50原四模式40，合计235。先评估开关风险，显著增险则完整构建前关闭并退回205；原约束/一次历史物理优化/失败即停及S15每格≤0.5%门不变。DS50仍须真实S15通过才构建。A1准备history小批，A2准备E3-lite，A3勘查observer接线；三席无硬件权限。
 
 E2两个版本均在第6点N4_A8失败，各5点分别冻结，不混池；timer重试/再入现象有证据，CPU AXI根因未定。65b候选不能称修复成功。
 
@@ -43,9 +47,9 @@ DS口径始终是IOMMU数据结构访存的附加延迟，DS0为主结果，DS25
 | --- | --- | --- |
 | E2 设备数 | 两个版本各接受5点，第6点N4_A8均失败；新65b轮host timeout，独立partial包不混池。 | 暂停性能采集；独立probe Image已通过，待Root审最多两点诊断包；不关闭watchdog/taint门，不原样重试。 |
 | E4 页大小+E5分布 | 已20/20完成，两个严格出口均通过，10对Fraction复算通过。 | 时间图和stage1原桶区间图均已接受、复跑；不为E5增加重复板点。 |
-| 完整E3 | CVA6 1d587/platform dfebcc，Depth64的原DS0构建exit143；唯一physopt续编15:46:07Z启动，未qualified。正式G软件69d/6491已通过并纳入精确profile。 | collector/exporter已审；pilot30调用及6小时预算门已审。自身BIT验收、G新boot通过后先30点再据实际wall决定续150。 |
+| 完整E3 / E3-lite | 完整版本route硬失败，无BIT；单文件存储改写已有限验证，未综合。 | 保留原失败，不继续原版本；E3-lite等PN首构后才综合/验收，合格后再pilot30。 |
 | E6 P4M G | 从E5 6c5基座独立准备；frontend2c7、observer0f0403与上层cfb9已审；G唯一BIT15:08:57Z开始构建。 | 40/40已完成、严格出口与原word独立复核通过；图表/报告并行收尾，V/A各16MiB自然完成。 |
-| E6 P/N/PN M | 完成历史来源/容量/接口设计与负结果追溯，未启动移植。 | 维持最后优先级，不恢复机制探索。 |
+| E6-PN | P/gap/helper/S15小批已接受，N/被动observer有限组件已接受；新增P共享历史小批准备。 | 独立批接受后整合，DS0首构优先于E3-lite；真实S15通过后才正式矩阵及DS50。 |
 
 E4/E5冻结包在`board/packages/e4-e5-20261017/`：小型元数据原字节复制，BIT/Image/payload/SPI模块仅本机硬链接，不进Git。E5最终BIT SHA d934846ecb7f2fd80bcb7d2f18889ae0fd8c9bbd28a0f5fef8e949614139221c，50MHz，WNS+0.126/WHS+0.047/WPWS+0.062ns，失败端点与routing errors均0，290520/290520 routable nets全完成。Slice50581/50950（99.28%）；LUT166334、regs142751、BRAM50、DSP27。完整E3和G必须各自验收，不能沿用E5通过结论。
 

@@ -16,9 +16,13 @@ DS25/DS100 构建已完成并验收：两档WNS均+0.177ns，CPU 50MHz，setup/h
 
 E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PTE/PA/data/unmap/taint0/最终OBS4+PATH+16×32桶全部通过。V硬件时间中位数4KiB 139.19783ms、2MiB106.88277ms；逐block时间下降中位23.2191%、吞吐提升中位30.2406%，V软件HPM bracket的miss/S1 PTW中位8192→0。E4统一CSV3824行，E5同20点/320stage/10240桶，E5不另计新试次。完整论文包E4-pagesize/paper/e4-common-v2-final01、E5-latency/paper/e4-common-v2-final01；Root另以原record硬件cycles/Fraction独立复算10对通过。
 
-G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。E2 probe上传已于17:16:45Z成功（bytesACK，无额外回读）；SD已于17:28:52Z return0；原DS0/probe加载已于17:36:47Z验证新boot e96e8ccc-aa05-42ce-83f8-714b8a17060d、taint0；当前唯一板动作e2-probe-preflight01，只读检查探针初态/proc，诊断点尚未运行。完整E3唯一resume仍在原设置route，未qualified；不打断。真实G论文图/报告已验收：figures/g-ds0-final01及figures/g-results.md，Root独立重放数值/CSV/PDF/PNG一致。E2两点诊断须新boot及逐阶段Root接受，不能自动连跑。
+G已于16:56:32Z完成40/40（10完整区组），无失败/重试/替代，boot79a6975d-877d-4a9d-8e19-08834275be7a，BIT8dd6/Linux69d/g-v1、逐点taint0/自然完成/数据与观察门均通过。strict原raw重解析出口16:56:34Z return0，正式包E6-mitigation/paper/g-ds0-final01；Root另从40原CLI words以Fraction独立复核10pairs全部匹配。相对本Ggap0，gap1000/2000的V时间下降中位24.4416%/32.8843%，A own16MiB吞吐下降25.6741%/47.9490%，各n10配对；保留合法较快gap0点，不宣称整体净收益。
 
-E6-PN核心任务已按用户新授权启动并行准备：P小批d2a813d已Root直接审源码/gold/逐拍证据并独立15项核对接受；S15 gate 288e7c2由Root实际复跑51项通过，均非板测。A1独占ispass/e6-pn继续IOMMU N核心，A2独占ispass/e6-pn-gap收口原前端cooldown，A3独占ispass/e6-pn-tools实现只读pn-control；三席并行且均无硬件权限。用户已批准最小被动A/共同硬件时长计数。先DS0时序门，再原kernel/CLI的S15逐格≤0.5%回归；通过后才测120+30并允许同源DS50构建/40点。总205独立试次，gap0各phase不复用；不打断已在跑的完整E3构建。详见exp/E6-pn/README.md。
+E2 timer probe 已完成唯一 N2_A1 诊断对照，原 CLI/数据/排空/taint0 门通过；探针记录182次 handler、21条选取记录，时窗50,192,459周期。N4_A8 于17:53:23Z达到180秒主机超时，持续 softlockup；一次 Ctrl-C 和20秒只读监听均未恢复 shell，未发送 freeze/read，N4探针计数不可取得，不能据 N2 证明根因。原两轮各5点性能 partial 仍分开。原DS0恢复已于18:08:06Z成功，新boot517379a7-7f70-4a1d-a2d4-e9c18ddafc70、probe内核/taint0已核。当前唯一UART动作pn-original-upload01，上传原pathv3 payload；有限pn-original-deploy01仅在上传完成及bytesACK后写SD一次并验证原pathv3启动，不采实验、不加E2重试。
+
+完整 E3 的唯一原设置续编已于17:45:03Z硬失败：WNS−2.646ns，setup失败3413，hold/pulse失败0，routing errors50014；RTSTAT-13禁止bitgen，无BIT。原route checkpoint/报告/DRC/失败manifest保留，不重试、不改约束。E3-lite只准备单文件时间戳存储写进程拆分和有限gold验证，实际RAM推断/fit/timing未知，任何Vivado任务排在E6-PN首构之后；完整E3正式板点仍0。
+
+E6-PN：P d2a813d、gap dd1a97e、S15 51项以及只读 helper 137项实际主机检查已接受；N 755cd723与独立被动 observer c913dd1已通过Root直接源码与有限证据审查（N原件5291项、observer绑定/端点39项），均非整栈或板测。最新用户追加 P（不隔离替换历史），保持2/14分区不变；DS0主矩阵150点，加S15 15、独立gap补充30、DS50原四模式40，合计235。先评估开关风险，显著增险则完整构建前关闭并退回205；原约束/一次历史物理优化/失败即停及S15每格≤0.5%门不变。DS50仍须真实S15通过才构建。A1准备history小批，A2准备E3-lite，A3勘查observer接线；三席无硬件权限。
 
 E2两轮各接受5/90后在N4_A8失败，性能采集暂停，独立诊断；不会原样重试、换版本混池或放宽taint门。
 
@@ -28,11 +32,11 @@ E2两轮各接受5/90后在N4_A8失败，性能采集暂停，独立诊断；不
 | 2 | E1b DS25 | 完成50/50，五条件各10，全部接受；阶段CSV已冻结 | Solo/A1/A8/A16/A64 各 10 次 = 50 次 | 约 20–30 分钟，须 50MHz、WNS≥0、违例端点和 routing errors 全零 |
 | 3 | E1b DS100 | 完成50/50，五条件各10，全部接受；最终四档200试次包已冻结 | 同上 50 次 | 已完成；两档仅换 BIT，复用已写 pathv3 |
 | 4 | E2 DS0 设备数 | 两轮各接受5/90；N4_A8均失败，暂停采集、独立诊断 | 1/2/3 个干扰设备、每设备 1/8 页，加同总足迹6页对照，共9条件各10次 | 共90次，约25–40分钟，不改既有DS0 BIT |
-| 5 | E3 DS0 论文子集 | BTC3/Depth64已审，原构建exit143，15:46:07Z唯一physopt续编；collector/exporter已审 | 六种大小及三类流量组合；新协议等16MiB有效字节 | 用户上限6小时；先30点pilot按实际用时定稿，不与P045混池 |
+| 5 | E3 DS0 论文子集 | 完整版本route硬失败、无BIT；E3-lite仅离线准备，实际RAM/fit未知 | 六种大小及三类流量组合；新协议等16MiB有效字节 | 用户上限6小时；先30点pilot按实际用时定稿，不与P045混池 |
 | 6 | E4 DS0 页大小 | 20/20完成；真实leaf/data/直方图全部通过 | 4KiB 对2MiB，各10次，20/20完成 | 同boot十对、同负载、仅改变IOMMU leaf；已产正式CSV与图 |
 | 7 | E6 DS0 角色互换 | 完成30/30，Solo/A1/A8各10；原DS0 BIT及旧pathv3 | V=DMA1、A=DMA0；Solo/A1/A8各10次 | 已完成；同boot/区组A8/A1中位数1.10434084，旧payload不再加测 |
 | 附加 | E5 延迟分布 | 被动直方图随E420/20完成，正式桶CSV与原桶区间图已接受 | 完成同一E420点的16阶段×32桶；不另计20新试次 | 保留carry/overflow/最终有效性，量化分位所在桶区间 |
-| 新核心任务 | E6-PN 统一基座 | 三席并行P/gap/S15门小批，尚未构建；DS0 S15门通过后才DS50 | S15+主120+补30+DS50 40，共205独立点 | 采集粗估55分钟另加部署；不打断现有E3，须时序及原命令S回归 |
+| 新核心任务 | E6-PN 统一基座 | 三席并行小批，N/被动observer有限组件已接受；DS0 S15门通过后才DS50 | 含P共享历史：S15+主150+补30+DS50 40，共235；风险回退205 | 采集粗估62分钟另加部署；PN首构早于E3-lite，须时序及原命令S回归 |
 | 已完成 | E6 G固定gap | 40/40及论文图/数据已验收 | 四条件各10；双方独立W256+4096自然完成 | 已完成，协议与PN原后台A分开 |
 
 板时暂以既有 DS0 50 次约 785 秒（约 15.7 秒/点）加配置切换与日志开销粗估，不是硬件运行时间或保证。构建耗时不计为占板。能力受阻的任务保持未测，可推进其余合法任务。

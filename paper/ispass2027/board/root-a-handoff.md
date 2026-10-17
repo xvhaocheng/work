@@ -143,3 +143,12 @@ Current runtime (14:10Z): common acece payload upload completed with byte-count 
 2026-10-17T15:19:03.830410+00:00：Root已审并接收5a61c68共用软件E4包，实跑22项检查全过，正式新包board/packages/e4-e5-common-v2-20261018由Root准备并固定manifest/source hash，元数据原字节复制、二进制仅硬链接。有限后续e4-e5-common-v2-collect01-launch已排队，仅在新E2完整90点passed后加载E5 BIT并采20点+直方图；E2若失败则此后续也停止，不自动继续。当前仍上传新payload，未开始新试次。
 
 2026-10-17T15:27:48.209584+00:00：完整E3 collector修订afaa3ca已由Root接收，实跑30项实际入口模拟串口与独立self-consistent seq-gap拒绝通过；当前采集器SHA dc2802d0ff240dd0801a0db6f49bb7372ee4d71e45f43040b28f78ac4a3c7fcc冻结，均synthetic/0新板测。G Linux首批889f75b已审，Root实跑329项通过并直接核RV64异常表/单次ld/fence证据；独立RUN生命周期小批已放行准备，未编G Image。
+
+
+## 2026-10-18 JST 更新（2026-10-17T18:05:17.931527+00:00）
+
+E2 timer probe 已完成唯一 N2_A1 诊断对照，原 CLI/数据/排空/taint0 门通过；探针记录182次 handler、21条选取记录，时窗50,192,459周期。N4_A8 于17:53:23Z达到180秒主机超时，持续 softlockup；一次 Ctrl-C 和20秒只读监听均未恢复 shell，未发送 freeze/read，N4探针计数不可取得，不能据 N2 证明根因。原两轮各5点性能 partial 仍分开。当前唯一硬件动作是原 DS0 的 e2-probe-recovery-load01，恢复后准备原 pathv3 软件供 PN S15，不增加 E2 重试。
+
+完整 E3 的唯一原设置续编已于17:45:03Z硬失败：WNS−2.646ns，setup失败3413，hold/pulse失败0，routing errors50014；RTSTAT-13禁止bitgen，无BIT。原route checkpoint/报告/DRC/失败manifest保留，不重试、不改约束。E3-lite只准备单文件时间戳存储写进程拆分和有限gold验证，实际RAM推断/fit/timing未知，任何Vivado任务排在E6-PN首构之后；完整E3正式板点仍0。
+
+E6-PN：P d2a813d、gap dd1a97e、S15 51项以及只读 helper 137项实际主机检查已接受；N 755cd723与独立被动 observer c913dd1已交付待 Root直接审查，均非整栈或板测。最新用户追加 P（不隔离替换历史），保持2/14分区不变；DS0主矩阵150点，加S15 15、独立gap补充30、DS50原四模式40，合计235。先评估开关风险，显著增险则完整构建前关闭并退回205；原约束/一次历史物理优化/失败即停及S15每格≤0.5%门不变。DS50仍须真实S15通过才构建。A1准备history小批，A2准备E3-lite，A3勘查observer接线；三席无硬件权限。

@@ -1,7 +1,7 @@
 # E6-PN：统一基座上的翻译与整体性能
 
 - Origin Skill/Mode：ARS-Codex / experiment-agent / plan；2026-10-18 JST。
-- Status：准备中，尚无 E6-PN 新 RTL、BIT 或板测结果。历史结果仅为动机。
+- Status：准备中，P、原前端 gap、S15 门和只读 helper 已接受；N 核心与被动时长模块已通过 Root 有限组件审查。尚无完整 PN BIT 或板测结果。历史结果仅为动机。
 - 主分支 `ispass/e6-pn`，独立工作树 `/home/xvhaocheng/work-e6-pn`；Root 在 `ispass/root-a` 审查、保存验收与排板。工具席独占 `ispass/e6-pn-tools`；gap 席独占 `ispass/e6-pn-gap` 的原前端小批，经 Root 接受后集成，不并改组件树。
 
 要回答三个问题：原始 DS0 下 PN 是否仍比 P 慢；V 与 A 是否同时变慢；差额是否随 V 供给间隔变化。历史 DS50 研究 BIT 的约 12.7% 退化不能替代本次验证，也不能据仿真直接认定真实 MIG 的根因。
@@ -13,16 +13,16 @@
 | 阶段 | 配置与每格重复 | 独立试次 | 接受条件 |
 | --- | --- | ---: | --- |
 | DS0 S 回归 | Solo/A1/A8，各 5；gap0 | 15 | 原 kernel、原 CLI、reset S，不写 MODE；逐格硬件时间中位数相对原 DS0 偏差 ≤0.5% |
-| DS0 主矩阵 | S/N/P/PN × A1/A8/A64，各 10；gap0 | 120 | S15 全过后；配置内按完整区组轮转 |
+| DS0 主矩阵 | S/N/P（隔离）/PN/P（共享历史） × A1/A8/A64，各 10；gap0 | 150（含新增30） | S15 全过后；配置内按完整区组轮转 |
 | DS0 供给补充 | P/PN × A8 × V gap0/1000/4000，各 5 | 30 | 独立 phase，gap0 不从主矩阵借点 |
 | DS50 历史对照 | S/N/P/PN × A8，各 10；gap0 | 40 | 仅实际 DS0 S15 通过后才允许同源 DS50 构建 |
 
-共预登记 205 个独立试次，各 phase 分开计数。V=DMA0、A=DMA1，V 为 4KiB×4096，软件预热256。保留原基线 A 连续批量供给、V 完成后 STOP/drain 的合同；A 最终工作量按实测报告，不改成双方各固定4096自然结束的 G 协议。S15 的原 DS0 参考中位数为 Solo 56.53868ms、A1 107.09009ms、A8 118.22441ms。
+含历史开关时共预登记 235 个独立试次，各 phase 分开计数。用户追加的 P（共享历史）保持 2/14 容量分区，仅恢复整棵共享 PLRU 的 touch；P 与 PN 默认仍隔离。先在独立小批审查控制位扇出和实际展开；若显著增加时序风险，则完整构建前关闭该功能，回退原隔离版本的 205 点计划，并明确标记新增30点未运行及原因。不为该开关反复完整构建或改约束。DS50 仍只有原四模式40点，供给间隔补充仍只有隔离 P 与 PN。V=DMA0、A=DMA1，V 为 4KiB×4096，软件预热256。保留原基线 A 连续批量供给、V 完成后 STOP/drain 的合同；A 最终工作量按实测报告，不改成双方各固定4096自然结束的 G 协议。S15 的原 DS0 参考中位数为 Solo 56.53868ms、A1 107.09009ms、A8 118.22441ms。
 
-先 DS0，50MHz、WNS≥0、setup/hold/pulse 失败端点均0、routing errors0。只允许一次历史 post-route 物理优化流程；仍不通过即停，不改约束或继续尝试。S15 任一格超出0.5%或内置错误门失败即停，不进入正式测量或 DS50 构建。构建在 E1b 之后、尚未启动的 E3-lite 之前；不打断本轮已经在跑的完整 E3 构建及板任务。Root 是唯一硬件操作者。
+先 DS0，50MHz、WNS≥0、setup/hold/pulse 失败端点均0、routing errors0。只允许一次历史 post-route 物理优化流程；仍不通过即停，不改约束或继续尝试。S15 任一格超出0.5%或内置错误门失败即停，不进入正式测量或 DS50 构建。构建在 E1b 之后、尚未启动的 E3-lite 之前；完整 E3 版本已因布线/时序失败停止，保留失败原件，不再重试。当前板恢复与原软件准备串行完成，不提前进行 PN 测量。Root 是唯一硬件操作者。
 
 正式输出保留实际 BIT、kernel、源码和命令身份、原始证据，并产统一17列长表 CSV 与分析脚本。指标包括 V/A 硬件时间、各自吞吐、双方完整工作共同吞吐、双方 miss/PTW、真实 N accept、V 分段等待、入口 AW 等待；HPM 软件采样区间、V 窗口、A 自身窗口和共同窗口分别标明，不能互换分母。零完整段为 N/A。比较先逐同 boot/block 配对计算，再报告 n、中位数、四分位与范围；不预设 PN 结果或因果结论。
 
 通过检查的中途论文数据可提交推送；二进制留本机，失败和未完成证据保留但不冒称完整论文样本。Root 不合并 main，最终合并步骤与重叠点维护于 [合并说明](../../board/root-a-merge.md)。
 
-当前已审设计入口：[最小移植与硬门](port-plan.md)、[固定来源调用链](source-map.md)、[测量合同](measurement-contract.md)、[原软件与采集计划](software-plan.md)、[Root设计接受](root-validation/plan01.json)。P IOTLB/TL小批已通过[Root源码/gold/逐拍证据核对](root-validation/p-only01.json)，S15工具已通过[Root实际51项主机检查](root-validation/s15-accepted01.json)。A1继续IOMMU N核心；A2收口原前端gap小批；A3实现只读pn-control。均须实际源码与有限验证接受后再集成，尚无完整PN构建或板点。
+当前已审设计入口：[最小移植与硬门](port-plan.md)、[固定来源调用链](source-map.md)、[测量合同](measurement-contract.md)、[原软件与采集计划](software-plan.md)、[Root设计接受](root-validation/plan01.json)。P IOTLB/TL小批已通过[Root源码/gold/逐拍证据核对](root-validation/p-only01.json)，S15工具已通过[Root实际51项主机检查](root-validation/s15-accepted01.json)。原前端 gap 已通过[Root真实事件核对](root-validation/gap-accepted01.json)，只读 helper 已实际通过137项主机检查并交叉编译。历史开关已通过[Root 27938项实际原件核验与风险审查](root-validation/history01.json)，纳入首构计划；[运行时接口增补](runtime-contract-v1.md)固定合法值及235点矩阵。A1勘查双TC及IOMMU完整quiet；A2准备双backend与真实容量证书；A3准备observer/frontend被动事实tap。E3-lite单文件存储已有限接受，待PN首构后才综合。均须实际源码与有限验证接受后再集成，尚无完整PN构建或板点。
