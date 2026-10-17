@@ -1,5 +1,8 @@
 # E3 变更请求：当前 batch 几何不能表达三类目标流量
 
+> 后续仅P0最小方案已获用户批准并实施中，见[p0-implementation.md](p0-implementation.md)。
+> 本页完整三形态请求仍未获扩展，不代表已经实现16–64KiB或2D。
+
 ## Material Passport
 
 - 日期：2026-10-17（JST）。状态：`REQUIRED_NOT_IMPLEMENTED`。

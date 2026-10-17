@@ -1,5 +1,8 @@
 # A2 交接：E3 準備與 P0 修改邊界
 
+> 本頁保留第一批能力核查交接。後續使用者已批准P0，當前實作、真實內部提交、
+> 構建及採集狀態統一見[p0-implementation.md](p0-implementation.md)與[source.json](source.json)。
+
 ## Material Passport
 
 - Origin Skill: academic-research-suite / experiment-agent，run準備／主機驗收。
