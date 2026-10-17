@@ -18,6 +18,17 @@ Root 已接受本接口（2026-10-17）。E5不新增独立50点上板计划：�
 E4尚未定稿时，保持通用validated-item+attachment接口；分组字段由E4真实配置显式传入，不猜测映射粒度/负载。
 默认拒绝fixture公开发布。单测可显式内部fixture并在输出永久标为fixture_only，不写入论文可用数据。
 
+Root复审后的修正明确递归遍历manifest/load/raw/cached/实际decoded CLI中的dict和list：
+`fixture_only`等显式标记或`evidence_level=synthetic_protocol_fixture`无论嵌套位置都拒绝公开导出。
+内部fixture保留所有观察到的JSON路径/原标记，summary、manifest、stage行、bin行和各组均标fixture，source_board_cases始终0。
+原f36历史不重写，修订以新commit与新诊断日志保留。
+
+与A3已锁定E4计划：planned_cases是20个dict点，每点只含block(1..10)、condition(leaf4k/leaf2m)、mapping_page_bytes(4096/2097152)，
+数组按真实采集顺序；默认每block leaf4k后leaf2m。item.case从1连续编号，每条必须等于计划前缀对应位置。
+条件与页大小固定对应，且cached mapping_page_bytes必须同时等于原CLI input.mapping_page_bytes与对应planned point。
+任一对调、跳case、条件重标或缓存/CLI/计划页大小不一致均拒绝。通用纯统计函数不依赖E4计划；
+非E4的(block,condition)计划也按其显式前缀核对，不猜测非E4的工作量接口。
+
 ## 每试次统计
 
 每段使用真实full计数，p50/p95/p99的秩固定为 **nearest-rank `ceil(p*full)`**，
