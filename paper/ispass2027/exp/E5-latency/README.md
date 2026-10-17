@@ -9,6 +9,32 @@ Linux小批供Root与E4整合统一payload；A1不访问硬件。
 
 ## 采集端接口
 
+Root实际执行入口是 `collect_e5.py`，只为本批E5 OBS4/Depth4 DS0 BIT附加hist验证。
+它调用当前工作树的既有 `board/collect.py`，固定沿用原 `ds0-all` 计划：
+Solo/A1/A8/A16/A64各10次、N4096/W256、4KiB，不增加或改变DMA命令，不加载BIT/写SD/自动重试。
+普通DS0/DS25/DS50/DS100及历史v3仍调用原collector，不受本模块影响。
+
+完整构建验收与共同软件包发布后，Root在自己的工作树调用：
+
+```sh
+python3 paper/ispass2027/exp/E5-latency/collect_e5.py \
+  --package E4_E5_FINAL_PACKAGE \
+  --load-manifest E5_VERIFIED_LOAD_JSON \
+  --fpga-manifest E5_FINAL_BUILD_MANIFEST_JSON \
+  --output paper/ispass2027/board/runs/E5_NEW_RUN/ds0-all \
+  --check-only
+```
+
+三个大写参数必须换成Root已发布的共同包目录、已验证当前boot的load.json及本次最终FPGA build-manifest.json。
+`--check-only`只读主机回执，成功后去掉该选项即进入原collector；`--port`与显式`--resume-run`按原接口透传。
+默认board-dir是运行脚本所在工作树的 `paper/ispass2027/board`，也可显式 `--board-dir` 指向Root实际入口。
+
+身份门复用现有manifest：共同包status/kernel/source.json五个完整commit；package ds0_bit hash必须同时等于
+本次已验收CVA6 `6c5c666d45979d3a03fb98cff89ba7ad095f6125` 构建产物hash与已验证load/boot的BIT身份。
+要求50MHz、WNS及失败端点/routing/routed边界通过、OBS4/INFO1/Depth4/16×32×32；旧v3或后续OBS5/Depth64明确拒绝。
+BIT/Image/payload不重复hash。运行manifest保留原collector身份，并附wrapper/validator源码hash和所复用回执的路径/hash；
+新raw、records和manifest都写入Root显式新output，证据不会跨根写进A1。
+
 `hist_records.py` 是纯解析/验证模块，没有串口、JTAG、执行器或共享表写入。
 Root现有每种负载解析器仍先验证CLI、实际BIT/Linux/load身份、boot、taint、sequence、数据/排空和完整工作量；
 然后在接受并保存该试次 **之前** 调用：
@@ -40,3 +66,5 @@ item['histogram'] = hist_records.attach_from_output(raw['stdout'], item)
 `driver-validation/runs/run02/`：48项真实函数host-MMIO fixture，`driver-validation/object01/`：RISC-V目标编译0warnings。
 `test_hist_records.py` 的10项测试以明确标为fixture_only的实际驱动mock输出为输入，正向及错误门均通过；
 原始输出见 `parser-validation.log`。这些host日志与512行生成检查不是板测，也不进入论文数据。
+`test_collect_e5.py` 的4项host fixture检查覆盖旧工作量参数原样传递、仅主机check-only、错误BIT/kernel/source/版本/depth及未验收时序拒绝，
+以及采集manifest的包装器/validator来源记录；原始输出见 `collector-validation.log`，没有导入或执行硬件控制。
