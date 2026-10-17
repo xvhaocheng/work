@@ -148,3 +148,16 @@ rebind→interval analysis: leaf4k/leaf2m/closing-spill and a one-point internal
 All public publication paths rejected the fixtures. Accepted evidence is E5
 commit`6eaa15b10dd0ed6158bfa29255704cbe1cc82b0e`,
 [compatibility receipt](../E5-latency/protocol-compat01/receipt.json).
+
+## Focused recursive startup guard revision
+
+Root requested the accepted E5 `synthetic_markers` recursion at actual collection
+startup. The collector now uses those exact marker semantics for every nesting
+level of package/source/load/FPGA/software JSON, after host check-only returns but
+before output-directory creation or UART import. This changes only the explicit
+synthetic-evidence startup boundary; parsing, plan, recovery and production Linux
+are unchanged. [Focused receipt](pages-nested-guard-host.json) has11 checks,
+including five actual-main subprocesses, one nested evidence_level marker in each
+identity source, all refusing collection with no directory and zero UART import
+attempts. The prior38 protocol/14 identity receipts remain byte-for-byte preserved
+for the earlier7efc8fe collector revision; no unchanged driver suite was rerun.
