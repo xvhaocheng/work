@@ -117,5 +117,9 @@ v5正例是从实际v4驱动mock日志修改INFO得到的显式协议fixture，�
 原10项输出仍在`parser-validation.log`，新版原始诊断见`hist-v5-validation01.log`，
 同一helper实际源码下9项离线区间分析回归见`hist-v5-analysis-validation01.log`；区间算法未改。
 来源/fixture边界与源码hash见`hist-v5-validation01.json`。这些host日志与512行生成检查不是板测，也不进入论文数据。
+`actual-v5-compat02/receipt.json`另直接读取A2实际提取驱动函数的V4/V5 mocked-MMIO输出，
+共享helper接受两者16段/512桶，除实际独立试次sequence4/5外测量相同；输入原件/实际函数/driver源码与hash均保留。
+未重跑A2驱动回归，仍fixture_only/source_board_cases=0。`actual-v5-compat01`保留兼容runner原失败：
+它错误要求两个独立试次的sequence完全相同；两版原日志解析均已成功，修正仅限跨fixture测量比较，未改driver或helper。
 `test_collect_e5.py` 的4项host fixture检查覆盖旧工作量参数原样传递、仅主机check-only、错误BIT/kernel/source/版本/depth及未验收时序拒绝，
 以及采集manifest的包装器/validator来源记录；原始输出见 `collector-validation.log`，没有导入或执行硬件控制。
