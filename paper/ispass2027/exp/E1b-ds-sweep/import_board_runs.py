@@ -283,6 +283,8 @@ def load_run(reader, run_dir):
     run_dir = Path(run_dir).resolve()
     manifest_path = run_dir / "manifest.json"
     manifest = reader.load(manifest_path)
+    for source in manifest.get("snapshot_inputs", []):
+        reader.file(ROOT / source["raw_path"], expected=source["sha256"])
     phase = manifest.get("phase")
     if phase not in PHASES:
         raise ValueError("Not a collector run manifest: "+relative(manifest_path))

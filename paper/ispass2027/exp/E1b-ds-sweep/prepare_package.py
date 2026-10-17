@@ -104,6 +104,19 @@ def main():
                 'measurements_per_condition': 10, 'planned_measurements': 100,
                 'results': {'status': 'not_started', 'completed_measurements': 0},
                 'automatic_retries': 0}
+    (package/'artifacts').mkdir(exist_ok=True)
+    for role in ['sd_payload', 'linux_Image']:
+        artifact = dict(delivery['artifacts'][role])
+        original = Path(artifact['original_file'])
+        if not original.is_absolute():
+            original = build_root/original
+        if not original.is_file():
+            raise FileNotFoundError('Existing software artifact missing: ' + str(original))
+        destination = package/artifact['file']
+        if not destination.is_file():
+            shutil.copy2(original, destination)
+        artifact['packaged_from'] = str(original)
+        delivery['artifacts'][role] = artifact
     ready, failed = True, False
     for variant, cycles in VARIANTS.items():
         build_dir = build_root / f'iommu-platform/out/ispass2027-20261017-{variant}-01'
