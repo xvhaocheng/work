@@ -13,6 +13,7 @@
 #define GAP_CAP UINT64_C(0x49444d4147415001)
 #define PN_FIRST 192U
 #define PN_WORDS 8U
+#define PN_HISTORY_SUPPORTED (UINT64_C(1) << 63)
 #define OBS_CONTROL 0x60U
 #define OBS_INDEX 0x70U
 #define OBS_DATA 0x78U
@@ -111,8 +112,10 @@ static int pn_snapshot(struct pn_io *io, enum pn_operation operation,
         return pn_fail(r, ENODEV, "pn_capability");
     if (r->gap_cap != GAP_CAP)
         return pn_fail(r, ENODEV, "gap_capability");
-    if (r->raw[1] > 3U)
+    if (r->raw[1] > 3U && r->raw[1] != 6U)
         return pn_fail(r, EPROTO, "mode");
+    if (r->raw[1] == 6U && !(r->raw[2] & PN_HISTORY_SUPPORTED))
+        return pn_fail(r, EPROTO, "history_support");
     if (r->gap >> 32)
         return pn_fail(r, EPROTO, "gap_high_bits");
     return 0;
@@ -124,6 +127,11 @@ static void pn_value(FILE *out, bool valid, uint64_t value)
         fprintf(out, "%" PRIu64, value);
     else
         fputs("null", out);
+}
+
+static void pn_bool(FILE *out, bool valid, bool value)
+{
+    fputs(valid ? (value ? "true" : "false") : "null", out);
 }
 
 static void pn_json(FILE *out, const struct pn_result *r)
@@ -142,7 +150,24 @@ static void pn_json(FILE *out, const struct pn_result *r)
     fputs("\"cap\":", out);
     pn_value(out, r->raw_valid & 1U, r->raw[0]);
     fputs(",\"mode\":", out);
+    pn_value(out, r->raw_valid & 2U, r->raw[1] & 3U);
+    fputs(",\"mode_word\":", out);
     pn_value(out, r->raw_valid & 2U, r->raw[1]);
+    fputs(",\"history_shared\":", out);
+    pn_bool(out, r->raw_valid & 2U, r->raw[1] & 4U);
+    fputs(",\"history_control_supported\":", out);
+    pn_bool(out, r->raw_valid & 4U, r->raw[2] & PN_HISTORY_SUPPORTED);
+    fputs(",\"partition_history\":", out);
+    if (!(r->raw_valid & 2U))
+        fputs("null", out);
+    else if (r->raw[1] == 0U || r->raw[1] == 1U)
+        fputs("\"not_partitioned\"", out);
+    else if (r->raw[1] == 2U || r->raw[1] == 3U)
+        fputs("\"isolated\"", out);
+    else if (r->raw[1] == 6U)
+        fputs("\"shared\"", out);
+    else
+        fputs("null", out);
     fputs(",\"v_gap_cycles\":", out);
     pn_value(out, r->scalar_valid & HAVE_GAP, r->gap);
     fputs(",\"gap_cap\":", out);
