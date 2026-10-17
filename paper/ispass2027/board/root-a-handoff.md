@@ -1,3 +1,11 @@
+# 实际板资源 2026-10-17T16:37:46.613829+00:00
+
+当前唯一板动作 g-common-load01-launch：16:35:52Z开始加载独立合格G BIT 8dd6993f，期待G公共Linux69d/platform6491/release g-v1新boot/taint0。G软件SD更新已16:33:53Z return0；G BIT最终16:34:36Z passed，50MHz、WNS+0.177/WHS+0.036/WPWS+0.062ns，setup/hold/pulse失败端点及routing errors全0，295368/295368 nets全路由，routed boundary通过。g-collect01-launch仅等待load result0后采一次固定40点，无重试/回填/重载；不要重复UART/JTAG/SD动作。完整E3唯一resume仍未qualified，故G先就绪先测完，之后与完整E3共用同一G内核只切BIT。G collector Root100+17、分析41+两campaign ID检查均通过；正式G仍0点，待新boot验证。E2专用默认off探针Image已passed、Root实核原driver/rootfs及config等价，最多两点诊断包待审，尚未跑新E2。
+
+当前两个有效有限job只有 g-common-load01-launch 与 g-collect01-launch（等待前者成功）。SD writer已成功结束。不能因dispatch成功宣称boot或40点已完成；以各result/正式manifest为准。
+
+以下保留历史，顶部与实际result优先。
+
 # 实际板资源 2026-10-17T16:25:35.318166+00:00
 
 当前运行仍为E5 d934 BIT / Linux65b full-e3-v1、boot bf3063bb-b908-4333-bcb9-54a08511210e。G公共软件上传已于16:24:56Z return0、11,346,554字节ACK；唯一板动作 g-common-software-write01-launch 正按已排有限脚本写SD，不重启、不加载BIT、不启动试次。不要重复打开UART或写SD。完整E3与G将共用Linux69d/platform6491/release g-v1；Root已审精确E3 profile并实跑27项，G collector实跑100+17项通过。两个BIT仍在唯一原策略流程中，未最终qualified，任何加载须先各自满足50MHz、WNS≥0、三类失败端点及routing errors全0。E4时间图和E5桶区间图已Root目视及独立复跑通过；E2默认off timer探针源码1fac已审，专用Image builder仅prepared，尚未编译或跑新E2。
