@@ -1,6 +1,6 @@
 # E6 历史缓解的有界移植设计
 
-来源设计已由Root接受，选择G(P4M)先行，M(S/N/P/PN)只保留设计。
+来源设计已由Root接受，选择G(P4M)先行，M(S/N/P/PN)由新[E6-PN任务](../E6-pn/README.md)独立在统一原版上推进；本目录保留G及历史设计。
 第一小批frontend已经独立实现并有限编译/验证，见`frontend-validation/component.json`和原diff；
 组件commit `2c7c68f59190b9ce8739efd7b67d92262b0021f0`，39场景通过。
 observer/wrapper已由Root直接审阅接受，组件tip `0f0403f56aff3f1ee10e18dccea7a9fd6f2f26a4`，
@@ -8,7 +8,8 @@ observer/wrapper已由Root直接审阅接受，组件tip `0f0403f56aff3f1ee10e18
 独立构建export显式启用G，平台 `d5cc448`，见`build/README.md`。
 Root审builder后，唯一G DS0 BIT构建于2026-10-17 15:08:57Z启动，16:34:36Z原流程最终门通过，见`build/qualified01/`。
 G Linux首批UAPI/只读CAPS/纯decode已被Root接受；后继RUN tip`69d8b9d4`已由Root直接审实际源码并复跑有限检查接受。
-唯一正式G软件已构建passed，见`software-source/README.md`；未做新G板测。实际G BIT的合成结构、timing/route/routed边界门已通过；未做G板测。
+唯一正式G软件已构建passed，见`software-source/README.md`。G正式40点已于16:56:32Z全部通过，原始数据、统一长表及论文图已验收。
+实际结果与重放入口见[论文图与结果](figures/g-results.md)、[冻结40点](paper/g-ds0-final01/snapshot.json)及[Root图复核](root-validation/g-figure01.json)。
 当前BIT构建的Linux65b仍仅作reference，不因后续caps首批修改而追认成G软件已完成。
 分支 `ispass/e6-mitigation` 从main `7123bbfe79cca298c36a880206ab85a2d68e6f67` 创建，
 本工作树只写本目录；组件独占工作树为`/home/xvhaocheng/work-a1-e6-cva6`，同名分支，从冻结6c5起。
