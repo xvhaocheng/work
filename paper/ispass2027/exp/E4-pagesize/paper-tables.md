@@ -52,7 +52,7 @@ any original metadata, cached record, raw object or decoded CLI JSON. Private
 finite-test mode marks summary/analysis metadata and every CSV row synthetic,
 with source_board_cases0 and campaign_completefalse. It is not a CLI option.
 
-[Final29-check receipt](paper-export-host-final/validation.json) uses only the
+[Current29-check receipt](paper-export-host-final02/validation.json) uses only the
 already locked[protocol fixtures](pages-collector-fixtures.json), constructing an
 explicit synthetic20-point campaign. It checks exact17 columns, all scalar
 locators, n10/Type7/singletons/N/A, ten per-block ratios versus ratio-of-medians,
@@ -64,3 +64,8 @@ marker only inside raw decoded CLI, and unchanged input bytes/no UART import.
 The earlier25-check receipt is retained under paper-export-host01. Internal CSVs
 and constructed source fixtures remain in ignored host build directories; neither
 receipt reports board data. No E4 paper CSV from actual hardware exists yet.
+
+The shared histogram helper later gained explicit OBS5 support. E4's accepted
+collector now independently requires OBS4/INFO1 and absence of depth. The same29
+export checks passed again with that final parser and widened helper; the prior
+25/29 receipts remain preserved. No driver/build source changed.
