@@ -1,0 +1,191 @@
+From e61315397bd2bc925f74d76f7b8173f2b3256943 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sat, 17 Oct 2026 22:22:15 +0900
+Subject: [PATCH] iommu/riscv: expose bounded read-only leaf evidence query
+
+---
+ drivers/iommu/riscv/io_pgtable.c | 45 ++++++++++++++++++++++++++++++++
+ drivers/iommu/riscv/iommu.c      | 30 +++++++++++++++++++++
+ drivers/iommu/riscv/iommu.h      |  5 ++++
+ include/linux/riscv_iommu_leaf.h | 42 +++++++++++++++++++++++++++++
+ 4 files changed, 122 insertions(+)
+ create mode 100644 include/linux/riscv_iommu_leaf.h
+
+diff --git a/drivers/iommu/riscv/io_pgtable.c b/drivers/iommu/riscv/io_pgtable.c
+index 85767588a741..30422947590a 100644
+--- a/drivers/iommu/riscv/io_pgtable.c
++++ b/drivers/iommu/riscv/io_pgtable.c
+@@ -17,6 +17,7 @@
+ #include <linux/slab.h>
+ #include <linux/types.h>
+ #include <linux/dma-mapping.h>
++#include <linux/riscv_iommu_leaf.h>
+ 
+ #include "iommu.h"
+ 
+@@ -225,6 +226,50 @@ static phys_addr_t riscv_iommu_iova_to_phys(struct io_pgtable_ops *ops,
+ 	return pfn_to_phys(pte_pfn(*pte)) | (iova & ((1UL << leaf_shift) - 1));
+ }
+ 
++/* Caller owns the mapping lifetime; leave the existing map/fetch/free alone. */
++int riscv_iommu_pgtable_query_leaf(struct riscv_iommu_domain *domain,
++				   unsigned long iova,
++				   struct riscv_iommu_leaf_info *out)
++{
++	pmd_t *table = (pmd_t *)domain->pgd_root;
++	unsigned int shift = PGDIR_SHIFT;
++	unsigned long pfn, mask;
++	phys_addr_t base;
++	u64 raw;
++
++	for (;;) {
++		if (!IS_ALIGNED((unsigned long)table, PAGE_SIZE) ||
++		    !virt_addr_valid(table))
++			return -EFAULT;
++		raw = pmd_val(READ_ONCE(table[(iova >> shift) & (PTRS_PER_PMD - 1)]));
++		if (!(raw & _PAGE_PRESENT))
++			return -ENOENT;
++		if (raw & ~(_PAGE_PFN_MASK | GENMASK_ULL(9, 0)))
++			return -EOPNOTSUPP;
++		if ((raw & _PAGE_WRITE) && !(raw & _PAGE_READ))
++			return -EINVAL;
++		pfn = __page_val_to_pfn(raw);
++		if (raw & _PAGE_LEAF) {
++			mask = (1UL << shift) - 1;
++			base = pfn_to_phys(pfn);
++			if (base & mask)
++				return -EINVAL;
++			out->raw_pte = raw;
++			out->phys = base | (iova & mask);
++			out->leaf_iova_base = iova & ~mask;
++			out->leaf_shift = shift;
++			return 0;
++		}
++		if (shift == PAGE_SHIFT ||
++		    (raw & (_PAGE_USER | _PAGE_ACCESSED | _PAGE_DIRTY)))
++			return -EINVAL;
++		if (!pfn_valid(pfn))
++			return -EFAULT;
++		table = (pmd_t *)pfn_to_virt(pfn);
++		shift -= 9;
++	}
++}
++
+ static void riscv_iommu_tlb_inv_all(void *cookie)
+ {
+ 	// cookie is domain
+diff --git a/drivers/iommu/riscv/iommu.c b/drivers/iommu/riscv/iommu.c
+index de626442fcfc..266fe59a9011 100644
+--- a/drivers/iommu/riscv/iommu.c
++++ b/drivers/iommu/riscv/iommu.c
+@@ -25,6 +25,7 @@
+ #include <linux/irqdomain.h>
+ #include <linux/platform_device.h>
+ #include <linux/dma-map-ops.h>
++#include <linux/riscv_iommu_leaf.h>
+ #include <asm/page.h>
+ 
+ #include "../dma-iommu.h"
+@@ -1841,6 +1842,35 @@ static phys_addr_t riscv_iommu_iova_to_phys(struct iommu_domain *iommu_domain,
+ 	return domain->pgtbl.ops.iova_to_phys(&domain->pgtbl.ops, iova);
+ }
+ 
++int riscv_iommu_query_leaf(struct iommu_domain *iommu_domain, unsigned long iova,
++			   struct riscv_iommu_leaf_info *out)
++{
++	struct riscv_iommu_domain *domain;
++
++	if (!out)
++		return -EINVAL;
++	memset(out, 0, sizeof(*out));
++	if (!iommu_domain || iommu_domain->ops != &riscv_iommu_domain_ops)
++		return -EOPNOTSUPP;
++	if (iommu_domain->type != IOMMU_DOMAIN_DMA &&
++	    iommu_domain->type != IOMMU_DOMAIN_DMA_FQ &&
++	    iommu_domain->type != IOMMU_DOMAIN_UNMANAGED)
++		return -EOPNOTSUPP;
++	/* Only after the driver/type check is container_of valid. */
++	domain = iommu_domain_to_riscv(iommu_domain);
++	if (!IS_ENABLED(CONFIG_64BIT) || domain->g_stage || domain->nested ||
++	    !domain->iommu || !domain->pgd_root || domain->mode != satp_mode >> 60 ||
++	    PGDIR_SHIFT < PAGE_SHIFT || PGDIR_SHIFT > BITS_PER_LONG - 9 ||
++	    (PGDIR_SHIFT - PAGE_SHIFT) % 9)
++		return -EOPNOTSUPP;
++	/* The current driver exposes only the positive canonical half. */
++	if (iova < iommu_domain->geometry.aperture_start ||
++	    iova > iommu_domain->geometry.aperture_end || iova >> (PGDIR_SHIFT + 8))
++		return -ERANGE;
++	return riscv_iommu_pgtable_query_leaf(domain, iova, out);
++}
++EXPORT_SYMBOL_GPL(riscv_iommu_query_leaf);
++
+ /*
+  * Translation mode setup
+  */
+diff --git a/drivers/iommu/riscv/iommu.h b/drivers/iommu/riscv/iommu.h
+index 6eaf0083cc5f..6ede1fd7bc6a 100644
+--- a/drivers/iommu/riscv/iommu.h
++++ b/drivers/iommu/riscv/iommu.h
+@@ -186,6 +186,11 @@ int riscv_iommu_sysfs_add(struct riscv_iommu_device *iommu);
+ 
+ struct riscv_iommu_endpoint *riscv_iommu_hpm_endpoint(struct device *dev);
+ 
++struct riscv_iommu_leaf_info;
++int riscv_iommu_pgtable_query_leaf(struct riscv_iommu_domain *domain,
++				   unsigned long iova,
++				   struct riscv_iommu_leaf_info *out);
++
+ static inline bool riscv_iommu_hpm_register(unsigned int offset)
+ {
+ 	return offset >= RISCV_IOMMU_REG_IOCOUNTOVF &&
+diff --git a/include/linux/riscv_iommu_leaf.h b/include/linux/riscv_iommu_leaf.h
+new file mode 100644
+index 000000000000..30540f131b74
+--- /dev/null
++++ b/include/linux/riscv_iommu_leaf.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_RISCV_IOMMU_LEAF_H
++#define _LINUX_RISCV_IOMMU_LEAF_H
++
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/string.h>
++#include <linux/types.h>
++
++struct iommu_domain;
++
++struct riscv_iommu_leaf_info {
++	u64 raw_pte;
++	phys_addr_t phys;
++	unsigned long leaf_iova_base;
++	u32 leaf_shift;
++};
++
++/*
++ * Read a normal leaf of the current driver's positive-aperture, RV64
++ * single-stage domain. Svnapot/Svpbmt and reserved PTE encodings are rejected.
++ * The caller keeps the domain and its mappings alive and excludes modification
++ * of the queried range for the whole walk. This is not a concurrent page-table
++ * snapshot or an IOTLB query; it neither maps, invalidates nor drains anything.
++ * Errors zero *out when out is non-NULL. A NULL out returns -EINVAL.
++ */
++#if IS_REACHABLE(CONFIG_RISCV_IOMMU)
++int riscv_iommu_query_leaf(struct iommu_domain *domain, unsigned long iova,
++			   struct riscv_iommu_leaf_info *out);
++#else
++static inline int
++riscv_iommu_query_leaf(struct iommu_domain *domain, unsigned long iova,
++		       struct riscv_iommu_leaf_info *out)
++{
++	if (!out)
++		return -EINVAL;
++	memset(out, 0, sizeof(*out));
++	return -EOPNOTSUPP;
++}
++#endif
++
++#endif /* _LINUX_RISCV_IOMMU_LEAF_H */
+-- 
+2.34.1
+
