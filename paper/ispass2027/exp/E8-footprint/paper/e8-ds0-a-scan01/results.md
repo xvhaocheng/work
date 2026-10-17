@@ -23,6 +23,23 @@ not a continuous capacity threshold or sustained V thrashing. V S2 PTW is0
 throughout. The HPM counts use the original broader software before/after
 bracket; they are not atomic counts over the V hardware time window.
 
+For context only, the existing DS0 baseline100/ds0-middle cohort (different
+boot a816f6c1-b928-4801-98ea-9a55296159a7) already has these observations:
+
+| Historical A pages | n | V miss median [min,max]; positive | V S1 PTW median [min,max]; positive |
+| ---: | ---: | --- | --- |
+| 1 | 10 | 0 [0,0];0/10 | 0 [0,0];0/10 |
+| 8 | 10 | 2 [2,2];10/10 | 2 [2,2];10/10 |
+| 16 | 10 | 2 [2,2];10/10 | 2 [2,2];10/10 |
+| 64 | 10 | 2 [2,2];10/10 | 2 [2,2];10/10 |
+
+Thus the smallest positive A footprint among these separately cited cohorts
+is historical A8, not a global A12 threshold. They are not pooled or paired,
+and no unmeasured intermediate footprint is inferred. The historical record
+reference is `/home/xvhaocheng/work-root-a/paper/ispass2027/board/runs/baseline100-20261017-01/ds0-middle/records.json`,
+SHA25698d74fa889634f9da1959121271e951a94f5574356382bdb095b9a8c7d349373.
+Those old points are not copied or counted as new E8 samples/CSV rows.
+
 A S1 PTW median [min,max] is0 [0,0],0 [0,0],6581 [6194,7158],
 6794 [6490,7272],7589 [7484,8612], respectively. Its positive counts are0/10,
 0/10,10/10,10/10,10/10. V median COPY throughput is149.40348,149.43376,
