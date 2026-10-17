@@ -2,7 +2,7 @@
 
 # G2：ISPASS 2027 前作新颖性判别
 
-**G2裁决：待补核，暂不能无条件通过。** 已核原文支持若干限定实现和负载的刻画增量；Procedia2025、Hur/Ro2025等高相关性能研究尚缺全文。当前不是发现完全重复而否决，也不触发新机制开发、实验停止审查或补测。
+**G2裁决：待补核，暂不能无条件通过。** 2026-10-17对Procedia2025、Hur/Ro2025的定向续查仍未取得可逐页核读的全文；新增公开渠道、并发判定条件及剩余风险见§5.3、§8.5。已核原文支持若干限定实现和负载的刻画增量，但这两篇不计入已排除集合。当前不是发现完全重复而否决，也不触发新机制开发、实验停止审查或补测。
 
 最接近的证据链为：[Rodríguez2024硕论，§6.1、§6.3、§7.1](https://hdl.handle.net/1822/99350)的同平台四iDMA、缓存／延迟评价及设备争用认识；[Bermuda，§III–V](https://arxiv.org/pdf/2508.19670v1)的Arm多DMA干扰；[DATE2025 SVA，§III–IV](https://arxiv.org/pdf/2502.17398v1)的同开源IOMMU族RISC-V FPGA性能／host噪声；[Kurth2018，§II(b)、§IV-C](https://arxiv.org/pdf/1808.09751v1)更早明确的miss阻塞hit。因此，新意须落到具体并发条件下的实板量化、局部等待证据及缓解的条件性结果。
 
@@ -56,8 +56,8 @@
 | **Kurth等，Scalable and Efficient Virtual Memory Sharing in Heterogeneous SoCs with TLB Prefetching and MMU-Aware DMA Engine，ICCD2018**（局部、窗口外；[v1](https://arxiv.org/pdf/1808.09751v1)） | Zynq7045，ARM A9 host＋multi-cluster PMCA | hybrid/shared IOMMU、软件PTW；L1 32/L2 256（§V-A） | 指针追踪／stream；实验8笔在途、burst≤2 KiB（§V-B/D） | 实系统运行时间、walk／buffer成本 | **明确miss满会阻塞hit**；锁定限制多cluster DMA（§II(b)、§IV-C） | 预取、并行walk、DMA retry | 机制前史极近；本文只能主张固定标准实现的实板定量与诊断增量 |
 | **Hao等，Supporting Address Translation for Accelerator-Centric Architectures，HPCA2017**（局部；[作者稿](https://www.sfu.ca/~zhenman/files/C10-HPCA2017-ARA-Addr-Translation.pdf)） | x86 PARADE／多加速器DMA（§III） | 32项IOTLB基线及私有／共享TLB | tiling／double buffering、4 KiB页、64 outstanding/accelerator（§III） | 全系统仿真／理想翻译对照 | 私有和共享TLB已支持hit-under-miss（§IV-B/C） | 两级TLB、host MMU复用 | 非RISC-V FPGA；hit旁路不是新机制 |
 | **MASK，ASPLOS2018**（局部；[作者稿](https://ghose.cs.illinois.edu/papers/18asplos_mask.pdf)） | 多应用GPU，Mosaic/GPGPU-Sim（§6） | 共享TLB／PTW层级 | GPU kernels，非DMA COPY | 翻译／数据争用及模拟消融（§4–7） | 翻译与数据服务相互影响（§4.2/4.3） | fill tokens、cache bypass、PTE优先和应用感知DRAM调度（§5.2–5.4） | 控制点不同；资源控制与协同思路不属本文首创 |
-| **Zhao等，Performance optimization and research of data center-level IOMMU based on RISC-V，Procedia2025**（**仅摘要**；[出版社](https://www.sciencedirect.com/science/article/pii/S1877050925024263)） | 摘要：UVM、BC-Linux／Panshi DPU4.0 | distributed IOATC、Walk Cache IOATS（摘要） | 负载／大小／独立设备并发矩阵未核 | 只知摘要称仿真／网络测试 | 不以摘要数值作正式对照 | 摘要称结构优化，细节未核 | **最高优先级全文风险**；不能假定只有单设备，DOI10.1016/j.procs.2025.08.115 |
-| **Hur、Ro，Enhancing IOMMU Efficiency in Heterogeneous SaCs: A Study on Cache Policy Impacts，ICEIC2025**（**仅摘要**；[机构](https://yonsei.elsevierpure.com/en/publications/enhancing-iommu-efficiency-in-heterogeneous-sacs-a-study-on-cache/)） | ISA／仿真或实机未核 | 摘要明确多devices共享TLB | 未核 | 全文未得 | 摘要讨论TLB／walk-cache替换与性能 | 摘要称adaptive policy，细节未核 | 高相关未决；DOI10.1109/ICEIC64972.2025.10879735 |
+| **Zhao等，Performance optimization and research of data center-level IOMMU based on RISC-V，Procedia2025**（**仅摘要**；[出版社](https://www.sciencedirect.com/science/article/pii/S1877050925024263)） | 摘要：UVM、BC-Linux／Panshi DPU4.0 | distributed IOATC、Walk Cache IOATS（摘要） | 独立设备数、并发供给及干扰对照未核；索引中的IOATC数量表不是已核正文（§5.3） | 摘要称仿真／网络测试；续查仍未取得正文 | 不以摘要／索引数值作正式对照 | 摘要称结构优化，细节未核 | **最高优先级全文风险**；开放许可已核不等于全文已取得，不能按分布式缓存排除同题，DOI10.1016/j.procs.2025.08.115 |
+| **Hur、Ro，Enhancing IOMMU Efficiency in Heterogeneous SaCs: A Study on Cache Policy Impacts，ICEIC2025**（**仅摘要**；[机构](https://yonsei.elsevierpure.com/en/publications/enhancing-iommu-efficiency-in-heterogeneous-sacs-a-study-on-cache/)；作者列表写SoCs，§5.3） | ISA／仿真或实机未核 | 机构Abstract明确多devices共享TLB | 独立DMA数、实际并发／工作集／大小未核 | 全文未得；作者公开列表没有该条PDF链接 | 机构Abstract讨论TLB／walk-cache替换与性能 | Abstract称adaptive policy，细节未核 | **高优先级未决**；不能由引用Arm／gem5等推定平台并排除，DOI10.1109/ICEIC64972.2025.10879735 |
 | **王镇道等，基于RISC-V的IOMMU设计，2024**（**仅摘要**；[出版社](https://cjournal.hep.com.cn/1674-2974/CN/10.16339/j.cnki.hdxbzkb.2024238)） | RISC-V，具体平台未核 | 摘要为I/O虚拟化IP | 未核 | 全文登录／验证码，未得 | 仅确认设计／效率主题 | 未核 | Procedia所引近邻，未排除并发评估；51(6):187–194 |
 | **Kumar等，Rethinking IOMMU for Future IO Devices，YArch2025**（**仅摘要／题录**；[机构](https://infoscience.epfl.ch/entities/publication/6366166d-7142-457b-b340-8df795675d9f)） | ISA／实验未核 | 摘要提出VMA粒度集中式IOVLB | 未核 | 机构PDF429/405 | 只确认覆盖率／安全设计提案 | 未核 | 机制近邻，不能把索引局部正文当全文实验结论 |
 | **Han、Ro，FBI: Framework for Efficient Batching of IOMMU TLB Invalidations，ICEIC2025议程**（**仅题录**；[公开议程](https://lab.hanbat.ac.kr/powervision/conferences/document/3118/download)） | 未核 | 未核 | 未核 | Jan21 PS5/03，PDF27/印刷94 | 题名不能补造结果 | 未核 | 合批失效已有具名条目；未见摘要／正文，不能认定已覆盖本文矩阵 |
@@ -169,6 +169,33 @@ Kurth2018 §II(b)明确描述outstanding-miss／数据缓冲满时，后续即�
 
 ANDARE2018 HERO是同族另一篇文章；其§4.1实际评估ARM A9 host＋单8核cluster，L1 32／L2 1024项hybrid MMU，不与2017多cluster或ICCD2018的L2 256项混写。正式PDF结构预检有xref覆盖告警，状态UNAVAILABLE，仅采用章节锚。[机构原文§2、§3.4、§4.1–4.2](https://www.research-collection.ethz.ch/server/api/core/bitstreams/f62fdb50-8f38-4ee9-bd84-ead60430dd70/content)
 
+<a id="procedia-hur-followup"></a>
+### 5.3 Procedia与Hur/Ro：定向续查后的具体未决项
+
+**本轮未取得两篇可逐页核读的全文，不作“已排除同题”判断。** 2026-10-17新增检索覆盖作者、机构、会议材料、公开工件及原生OA位置；合法公开入口的获取结果详见§8.5。开放获取元数据、搜索索引正文片段、另一份讲稿和完整论文是不同层次的证据。
+
+| 同题判定所需内容 | Procedia2025 | Hur/Ro2025 |
+|---|---|---|
+| RISC-V IOMMU及共享翻译结构 | 出版社Abstract确认RISC-V、distributed IOATC与Walk Cache IOATS；共享组织的原图／配置未核 | 机构Abstract确认多设备共享TLB；ISA与具体翻译结构未报告于摘要 |
+| 多个独立DMA流实际同时供给 | 未核。IOATC数量不自动等于独立DMA数，接线支持并发也不自动等于实验并发 | 未核。摘要的multiple devices是问题背景，不能据此补出实际并发设备数 |
+| 并发共享相对基线的争用影响 | 未核。须辨别固定总工作量的分摊／扩展效率、每流服务时间和共享IOATS排队 | 未核。须取得负载混合、替换策略比较及独立设备的指标／对照 |
+| 可直接比较的干扰或缓解结果 | 摘要不能回答零miss邻居、他人PTW、数据访存竞争控制和失效范围 | 摘要称自适应缓存策略可缓解性能下降；未核其覆盖哪种竞争与缓解 |
+| 全文／关键图表阅读状态 | **仅摘要**；未取得原PDF，未给原论文SHA或声称结构PASS | **仅摘要**；未取得原PDF，未给原论文SHA或声称结构PASS |
+
+表内摘要事实分别来自[Procedia出版社Abstract](https://www.sciencedirect.com/science/article/pii/S1877050925024263)、[Yonsei机构Abstract](https://yonsei.elsevierpure.com/en/publications/enhancing-iommu-efficiency-in-heterogeneous-sacs-a-study-on-cache/)，其余单元格是本次核查状态，不是论文不存在相应实验的结论。
+
+**Procedia的新增线索及边界。** 出版商API的`coredata`明确标开放获取及CC-BY-NC-ND 4.0，但本次取得的1951字节XML没有正文；`view=FULL`返回401。OpenAlex该DOI记录仅有DOI落地页、`pdf_url=null`，这是索引状态，不能扩大为全网无全文。[出版商元数据](https://api.elsevier.com/content/article/pii/S1877050925024263)、[OpenAlex位置字段](https://api.openalex.org/works/https://doi.org/10.1016/j.procs.2025.08.115)
+
+Scribd搜索索引露出自称§5.3／Table 1的IOATC_NUM=1/2/4及并行服务描述；**这是未核镜像的索引提示，不是已核原文实验**。正常页面只取得描述、13页占位及订阅入口，没有取得可逐页核验的表图。本笔记不采纳其中时间、大小、时钟或“无额外延迟”作为正式比较值，也不由片段推定该文只有单设备。[公开索引入口](https://www.scribd.com/document/1046293233/基於RISC-V的資料中心級IOMMU性能優化及研究)
+
+作者报告追查找到赵顺通的openEuler官方活动回顾及其材料仓库线索；相关RVSC2024公开材料另取得郑律的X100讲稿。**该讲稿不是Procedia论文**：其PDF13页可见DMA／PCIe端经DTI连接IOATS，IOATC的数据地址走System Bus；只核该图，不能把其配置或实验移植给Procedia。[openEuler回顾“赵顺通”段及材料入口](https://www.openeuler.org/zh/news/openEuler/20241220-meetuop/20241220-meetuop.html)、[X100讲稿PDF第13页](https://github.com/cnrv/RVSC2024/blob/main/slides/0822A/029-%E9%83%91%E5%BE%8B.pdf)
+
+**Hur/Ro的新增线索及边界。** 作者实验室公开列表的ICEIC2025条目写作“Enhancing IOMMU Efficiency in Heterogeneous **SoCs**”；Crossref／Yonsei题录为“**SaCs**”，按同作者、同会场、同题名其余部分合并检索，保留拼写差异。该作者条目未附有效PDF／slides链接，机构“Access to Document”只有DOI。[作者列表2025条目](http://escal.yonsei.ac.kr/publications.html)、[机构题录及Abstract](https://yonsei.elsevierpure.com/en/publications/enhancing-iommu-efficiency-in-heterogeneous-sacs-a-study-on-cache/)
+
+Crossref参考文献元数据包含Arm MMU-700／SMMUv3、ChampSim、gem5、XSBench等线索；**引用不能证明被测ISA、模拟器或并发负载**，不能据此判成Arm而排除RISC-V。[Crossref该DOI的`reference`字段](https://api.crossref.org/works/10.1109/ICEIC64972.2025.10879735)
+
+**对最终裁决的影响。** 私有IOATC不排除共享IOATS／PTW竞争，PCIe等设备的独立请求流也不因未用iDMA而排除；不要求论文使用victim/aggressor名称。若全文证实实际并发共享翻译资源并评价争用影响，即按同题／实质重叠重新比较，不能靠分布式结构、仿真或平台不同规避。若原文只评价缓存命中成本或模块数量扩展，则该结果仍是性能前作，是否覆盖本文干扰问题须由供给、工作量和指标决定。**现阶段两种情况均未被全文裁定，故G2保持待补核；候选新意1与3尤须保留这两篇的覆盖风险，不能保证其未做候选新意2的内部诊断。**
+
 <a id="comparison"></a>
 ## 6. 本文可成立的具体差异及当前证据边界
 
@@ -206,7 +233,7 @@ Solo→A1中双方miss为0，V已明显变慢；Solo→A64的全部损失因此�
 
 | 可写的具体增量 | 最近前作的具体缺项／已有内容 | 本文证据与条件 |
 |---|---|---|
-| 1. 固定标准开源IOMMU中，持续并发4 KiB批量DMA的总慢化、零miss共跑基线与翻译压力增量的定量刻画 | 硕论§6.3.2为缓存／平均latency、关联bench逐笔等待；Bermuda§IV-C的4 KiB近汇合；DATE§IV为应用及host噪声。已核评估没有本文这组同条件数据链 | 批量＋路径报告；不能把总损失全归PTW，也不能认领“首次分离翻译与内存竞争”；仍需补Procedia／Hur全文 |
+| 1. 固定标准开源IOMMU中，持续并发4 KiB批量DMA的总慢化、零miss共跑基线与翻译压力增量的定量刻画 | 硕论§6.3.2为缓存／平均latency、关联bench逐笔等待；Bermuda§IV-C的4 KiB近汇合；DATE§IV为应用及host噪声。已核评估没有本文这组同条件数据链 | 批量＋路径报告；不能把总损失全归PTW，也不能认领“首次分离翻译与内存竞争”；仍待§5.3两项全文核实；不能保证它们未覆盖此增量 |
 | 2. 本控制器中A的具名S1 PTW响应延长如何传导到一个随后首次命中的V read的局部实板证据 | Bermuda§III–V、DATE§III–IV未采用此有界逐请求响应干预；但HERO§3.4／Kurth§II(b)已知可见性和hit-under-miss／阻塞，故不是新现象 | E3§3–5，64 B、cold互补对n=4，A剩余服务与V剩余等待增量127–130周期；不解释全部宏观慢化或构成通用HOL定理 |
 | 3. 同一硬件路径普通缓解的条件性取舍：等A miss计数下PN仍比P慢，并记录保护V的A侧代价 | Bermuda§V-C未实验评价其候选；DATE§IV评LLC与DMA数据绕cache；MASK§5已有翻译／数据协同，故不认领组合思想或“组合会冲突”的普遍认识 | P/PN§3–4与P4M§6；PN n=3为描述性负结果，两套试验不能拼成统一完整矩阵，唯一根因未定 |
 | 4. 特定RISC-V失效范围／驱动行为下，邻居miss与双方完整时间代价的量化 | Bermuda§IV、DATE§IV未评这类CQ失效范围矩阵；IEICE§5.5明确将global invalidation pressure置于范围外；FBI及其他失效近邻未全文排除 | 失效28配置仿真；相对M0/M1、同／异域分别报walk与双方时间，不能认领收窄／合批方法首创，不能冒充Linux实板 |
@@ -514,10 +541,112 @@ site:dac.com IOMMU RISC-V 2024 2025 2026
 "IOMMU" "Real-Time and Embedded Technology and Applications" contention
 ~~~
 
+### 8.5 本次定向续查：公开全文获取记录（2026-10-17，JST）
+
+本次只续查Procedia与Hur/Ro的正文及可确定其并发方法的公开材料。新增66条外部网页索引查询（Procedia28、Hur/Ro28、主会话10，重复保留），不是66次数据库站内检索，也不重写§8.4的既有记录。中文／韩文人名变体仅为检索字符串，不据猜测确认身份。所有新来源均按实际取得内容降级；没有取得这两篇的正文、原始PDF或可核实验工件，没有新增“全文已读”标记。
+
+| 实际公开渠道／入口 | 本次获取结果与阅读范围 | 可用于本次裁决的边界 |
+|---|---|---|
+| [ScienceDirect目标页](https://www.sciencedirect.com/science/article/pii/S1877050925024263)、同PII的/pdf路径及via=ihub变体 | 普通请求403，返回访问拦截HTML，不是论文；网页工具也403 | 没有完成浏览器访问：Playwright依赖npx缺失，仅执行可用性检查。访问受阻不能证明未公开 |
+| [Elsevier原生PII接口](https://api.elsevier.com/content/article/pii/S1877050925024263?httpAccept=text%2Fxml)、[DOI FULL接口](https://api.elsevier.com/content/article/doi/10.1016/j.procs.2025.08.115?view=FULL&httpAccept=text%2Fxml) | 前者200、1951字节，仅coredata；后者401；text/plain返回400；ScienceDirect中国域代理连接失败 | 开放许可已核，正文未得；不把题录XML写成全文 |
+| [Procedia OpenAlex位置](https://api.openalex.org/works/https://doi.org/10.1016/j.procs.2025.08.115)、[S2 DOI接口](https://api.semanticscholar.org/graph/v1/paper/DOI:10.1016/j.procs.2025.08.115?fields=title,authors,openAccessPdf,url,externalIds) | OpenAlex200，仅DOI落地页、无PDF URL；S2 404 | 仅为当前索引位置；不是无作者稿的证明 |
+| [ITQM2025 Program页](https://itqm-meeting.org/2025/program.html)、[官方HTTP Program](http://itqm-meeting.org/2025/files/ITQM2025%20Program.pdf) | HTTPS证书错误／网页工具502；正常官网HTTP取得Program。已提取全文，检索IOMMU／Shuntong／Mingsen等未匹配 | Program不是proceedings全文，未匹配不否定发表。三个解析器均34页但ARS对象偏移告警，状态UNAVAILABLE；不用其页锚支持论文结论 |
+| [openEuler回顾](https://www.openeuler.org/zh/news/openEuler/20241220-meetuop/20241220-meetuop.html)“赵顺通”段／材料末段；[公开材料仓库](https://gitee.com/openeuler/presentations/tree/master/meetup) | 回顾正文已读，追查其讲稿；Gitee页面／公开API超时。[官方GitHub镜像目录](https://github.com/openeuler-mirror/presentations/tree/master/meetup)仅查到2024年8月材料，未找到目标报告 | 回顾是讲稿线索，不是Procedia方法；镜像可能滞后，不认定Gitee无稿 |
+| [RVSC2024公开材料](https://github.com/cnrv/RVSC2024)、[郑律X100讲稿](https://github.com/cnrv/RVSC2024/blob/main/slides/0822A/029-%E9%83%91%E5%BE%8B.pdf) | 刘亚南相关报告Slides／Video为TBA；另取得郑律讲稿，子任务局部读PDF12–18页，主会话渲染核第13页；19/19/19页ARS PASS | 原图仅归此讲稿，不当Procedia全文／同版图，也不据其缺少干扰矩阵排除Procedia |
+| [Scribd目标页](https://www.scribd.com/document/1046293233/基於RISC-V的資料中心級IOMMU性能優化及研究)／外部索引，[Procedia ResearchGate题录](https://www.researchgate.net/publication/394841384_Performance_optimization_and_research_of_data_center-level_IOMMU_based_on_RISC-V) | Scribd普通请求200但只得描述、13页占位及订阅入口；网页工具超时，索引露出§5.3／Table 1提示。RG为request-only | 没有获得可逐页核读的正文或原表，不从受限页面重建全文，不采纳索引参数作科学事实；未向作者发请求 |
+| [Hur/Ro作者publications](http://escal.yonsei.ac.kr/publications.html)、[project](http://escal.yonsei.ac.kr/project.html)、[member](http://escal.yonsei.ac.kr/member.html)、[机构题录](https://yonsei.elsevierpure.com/en/publications/enhancing-iommu-efficiency-in-heterogeneous-sacs-a-study-on-cache/) | 公开HTTP页面200，目标列表条目、项目关联及完整机构Abstract已读；列表无有效PDF／slides；此前HTTPS失败不能再写成整站不可访问 | 目标条目中的IEEE9138941仅为注释掉的重复占位，不是目标10879735；项目／成员背景不证明论文平台 |
+| [IEEE标准PDF按钮入口](https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=10879735) | 普通请求418、15410字节HTML；网页工具不可读；未取得PDF | 不记全文，不据失败认定论文只有摘要 |
+| [Hur/Ro Crossref](https://api.crossref.org/works/10.1109/ICEIC64972.2025.10879735)、[OpenAlex](https://api.openalex.org/works/https://doi.org/10.1109/ICEIC64972.2025.10879735)、[OpenAIRE](https://api.openaire.eu/search/publications?doi=10.1109/ICEIC64972.2025.10879735&format=json) | 均200。Crossref给17条reference；OpenAlex closed／无PDF；OpenAIRE只有DOI／dblp元数据入口，无新增稿件。Crossref另有similarity-checking用途链接，未作为一般公开稿获取 | 元数据不代替正文；来源页码1–4不等于已核PDF四页；引用Arm／模拟器不能推出方法 |
+| [GitHub仓库搜索IOMMU Yonsei](https://api.github.com/search/repositories?q=IOMMU+Yonsei)、[IOMMU Hur](https://api.github.com/search/repositories?q=IOMMU+Hur)；[同组个人公开页](https://jiwon24lee.github.io/) | 两个原生查询均200、total_count=0；个人页未见目标稿／工件 | 搜索仅覆盖匹配的仓库元数据，不是全GitHub内容排除；未登录私有库或联系作者 |
+| Hur/Ro的DOI直达、lab HTTPS index／member、Ro简历WonWooRo_Resume.pdf、[ResearchGate题录](https://www.researchgate.net/publication/389108151_Enhancing_IOMMU_Efficiency_in_Heterogeneous_SaCs_A_Study_on_Cache_Policy_Impacts) | 前几项网页工具不可读；lab project与publications的工具读取／find也失败，后由普通HTTP成功补读；RG索引显示No full-text available／request-only | 工具find失败不代表页面没有目标；列表目标与2024 ARM条目均已从实际HTML核到，但都未得正文 |
+
+**新增辅助PDF身份。** X100讲稿SHA256 e7101aad13d96d0e7bf4be8a6e742d214ea637a093502748a3ae259f1b82404a；ITQM Program SHA256 dd15b258f9034db030496fbdf94d07048529e3115d524c20e7722703419cee23。前者PASS、后者UNAVAILABLE均为本次实际ARS检查；它们都不是Procedia或Hur/Ro原文，不能给两篇借用结构通过或全文阅读标记。文档已自含新查询、原件入口、接受／未决状态和必要哈希，不依赖未提交的临时收据。
+
+#### Procedia作者／会议／公开稿查询（28条）
+
+~~~text
+"10.1016/j.procs.2025.08.115" pdf -site:scribd.com -site:patents.google.com -site:researchgate.net
+"Performance optimization and research of data center-level IOMMU" proceedings
+ITQM 2025 proceedings "IOMMU"
+"Shuntong Zhao" IOMMU "China Mobile"
+ITQM 2025 "Procedia" "266" proceedings
+ITQM 2025 IOMMU Zhao paper PDF China Mobile Suzhou
+"IOMMU" "洪铭森"
+"IOMMU" "赵顺通"
+"面向云数据中心的RISC-V IOMMU" pdf
+"赵顺通" "IOMMU" pdf
+"ITQM 2025" "program" pdf
+"Performance optimization" "IOMMU" "pdf" "Zhao" -site:scribd.com -site:researchgate.net
+"IOMMU" site:gitee.com/openeuler/presentations
+"赵顺通" "面向" "云" filetype:pdf
+"云数据中心" "IOMMU" "ppt"
+"ITQM2025" "IOMMU" "Zhao"
+"赵顺通" RISC-V IOMMU 讲稿
+"面向云数据中心" "IOMMU" filetype:pdf
+"赵顺通" "洪" IOMMU
+"IOMMU" "Shuntong" "pdf" -site:researchgate.net -site:scribd.com -site:patents.google.com
+"IOMMU" "赵顺通" "移动云"
+"data center-level IOMMU" author manuscript repository
+"S1877050925024263" pdf download
+"IOMMU" "923–935" -site:scribd.com -site:sciencedirect.com -site:patents.google.com
+"基于RISC-V" "IOMMU" "性能优化" "赵"
+"IOMMU" "赵顺通" site:10086.cn
+"IOATS" "赵" "洪" RISC-V
+"云数据中心" "IOMMU" filetype:pdf -site:scribd.com
+~~~
+
+#### Hur/Ro作者／机构／公开稿查询（28条）
+
+~~~text
+"Enhancing IOMMU Efficiency" pdf
+"Won Hur" "Won Woo Ro" IOMMU
+"10879735" "pdf"
+"Enhancing IOMMU" "SoCs"
+"Won Hur" Yonsei computer architecture website
+"Won Woo Ro" laboratory publications IOMMU
+"10879735" -site:researchgate.net -site:proceedings.com -site:ftp.math.utah.edu
+"Enhancing IOMMU Efficiency" -site:researchgate.net -site:yonsei.elsevierpure.com
+site:escal.yonsei.ac.kr "Enhancing"
+site:yonsei.ac.kr "Cache Policy Impacts"
+"Won Hur" "IOMMU" "ARM"
+"Enhancing IOMMU Efficiency" "pdf" -site:researchgate.net
+"Enhancing IOMMU Efficiency" download
+"Enhancing IOMMU Efficiency" 허원
+"Won Hur" IOMMU github.io
+"10879735" IEEE author pdf yonsei
+"A Study on Cache Policy Impacts" -site:researchgate.net -site:yonsei.elsevierpure.com
+"ICEIC" "IOMMU" "ChampSim"
+"Hur" "IOMMU" "cache" "github"
+"허원" "IOMMU"
+"Enhancing IOMMU Efficiency in Heterogeneous SoCs"
+"Enhancing IOMMU" "허"
+"ICEIC 2025" "proceedings" "pdf" "cache"
+"Won Hur" "IOMMU" repository OR artifact OR simulation
+"Performance Implication of Hashed Page Tables" pdf -site:researchgate.net
+"Enhancing IOMMU Efficiency" "code"
+"Enhancing IOMMU Efficiency" "simulation"
+"IOMMU" "Hur" site:github.com
+~~~
+
+#### 主会话出版商／全文定位查询（10条，重复保留）
+
+~~~text
+"S1877050925024263" pdf
+"Performance optimization and research" "IOMMU" pdf
+"10.1016/j.procs.2025.08.115" pdf
+"S1877050925024263" "pdf.sciencedirectassets"
+"Performance optimization and research of data center-level IOMMU" filetype:pdf
+"Performance optimization and research" "5.2" IOMMU
+"Performance optimization and research of data center-level IOMMU" "IOATC_NUM"
+"S1877050925024263" "pdf"
+"IOMMU" "IOATC_NUM=4"
+"Performance optimization and research of data center-level IOMMU" "5.2."
+~~~
+
 <a id="open-items"></a>
 ## 9. 未决项与裁决适用范围
 
-1. 首要补核是Procedia2025的独立设备数、IOATC/IOATS共享组织、并发供给、solo/co-run对照与结论，以及Hur/Ro2025的ISA／实验矩阵。中文2024设计、YArch提案仍缺可验全文。这些是具名证据缺口，不是无限新增文献门槛。
+1. **本轮续查后仍未决：** Procedia2025的独立DMA流、共享IOATS细部、实际并发供给与争用对照；Hur/Ro2025的ISA、独立设备／供给及缓存策略实验矩阵（§5.3）。新增渠道没有取得两篇正文，不能写成已全文排除；G2保持待补核，不给无条件通过。解除这两项未决需可核原文的方法与结果，不能由访问失败、他文结构或参考文献代替。中文2024设计、YArch提案仍缺可验全文；这些是具名缺口，不是无限新增文献门槛。
 2. 硕论Fig.6.31/32实际源码／配置unknown；公开bench串行有代码依据，不能替代论文所有运行。其同平台性能评价和共享争用认识必须引用。
 3. Bermuda Fig.8单位／频率／timer／重复数与出版版差异未解；DATE正式正文是否修复<2%及表格冲突未解。只引用实际读过的版本及一致结果。
 4. Wheel、HeroSDK、Penguin／2024验证talk等按阅读级别保留；缺全文不是排除依据。数据库访问限制尤其限制负面检索结论。
