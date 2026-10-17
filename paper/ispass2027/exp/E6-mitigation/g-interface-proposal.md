@@ -2,7 +2,8 @@
 
 Root已选择G先行，M只保留设计；V/A各固定4096×4096字节自然完成。
 Root已锁定e0/e8、两个cap magic、32word语义布局与只读硬件配置tap。
-observer/Linux尚未实施；error mask/clear/abort/ARM细节仍需下一批前另锁。
+error mask/clear/abort/ARM细节已在`g-observer-control-proposal.md`锁定；
+observer/wrapper首批实现与有限验证见`observer-validation/`，待实际diff审查。Linux尚未实施。
 
 ## 本批frontend
 
