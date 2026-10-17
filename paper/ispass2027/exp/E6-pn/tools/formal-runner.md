@@ -44,3 +44,12 @@ Preparation checked syntax, CSV cell/block legality/counts150/30/40 and actual
 accepted parser compilation only. No extra fixture matrix, raw parsing,
 collection, board case or hardware access occurred. Root source review precedes
 use; actual capture/whole-work results are not claimed by this preparation.
+
+`export_formal_long.py --run /passed/formal/run --output /new/long-table`
+provides only raw17-column paper.csv plus source/window summary.json, leaving
+statistics/pairing/figures to A3. It directly reuses
+`../analysis/analyze.py::load_accepted` (A3 revision282c213; override path with
+--analysis-source if needed), with no duplicate raw/source/identity replay.
+Mode/history/gap/block metadata, original CLI/HPM/observer/PATH, actual N accepts,
+A own/union cycles/rates and all raw PN words remain separately named. Multiple
+--run arguments cannot duplicate a boot/sequence. No real PN table exists yet.
