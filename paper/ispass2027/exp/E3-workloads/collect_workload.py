@@ -9,6 +9,7 @@ import sys
 import time
 from workload_records import backend_evidence,parse,require,HIST_PATH
 import model_full_coverage as model
+from workload_software_profiles import select as software_profile
 HERE=Path(__file__).resolve().parent
 LINUX='65b427946152e3aca27babab0a437821729805d4'
 PLATFORM='ec99648e3c9a1e48c1e9721e3662bb632eb439bd'
@@ -17,7 +18,7 @@ RELEASE='6.5.0-rc2-ispass2027-full-e3-v1'
 FROZEN_RESUME_FIELDS=('schema','script_sha256','parser_sha256','hist_helper_sha256',
                       'geometry_model_sha256','protocol','P0_protocol_independent','kernel_release',
                       'boot_id','bit_sha256','ds','clock_hz','evidence_level','fixture_only',
-                      'planned_cases','sources')
+                      'planned_cases','sources','software_profile','software_profile_helper_sha256')
 
 
 def synthetic_markers(value,path='$'):
@@ -92,24 +93,23 @@ def main(_test_fixture=False):
     p=argparse.ArgumentParser(description=__doc__)
     for name in ['output','load-manifest','fpga-manifest','software-manifest','p0-backend','long-backend','packet-backend','board-tools']:
         p.add_argument('--'+name,required=True,type=Path)
-    p.add_argument('--expected-kernel',default=RELEASE);p.add_argument('--port')
+    p.add_argument('--expected-kernel');p.add_argument('--port')
     p.add_argument('--max-cases',type=int,default=150,help='30 gives one full candidate block for timing; continuation uses resume-run')
     p.add_argument('--max-wall-seconds',type=float,default=21600)
     p.add_argument('--resume-run',type=Path)
     a=p.parse_args();require(1<=a.max_cases<=150 and a.max_wall_seconds>130,'ABI5 collector bounds')
     paths={'load':a.load_manifest,'fpga':a.fpga_manifest,'software':a.software_manifest,
            'p0_backend':a.p0_backend,'long_backend':a.long_backend,'packet_backend':a.packet_backend}
-    bound={name:json.loads(path.read_text()) for name,path in paths.items()}
+    bound_bytes={name:path.read_bytes() for name,path in paths.items()}
+    bound={name:json.loads(raw) for name,raw in bound_bytes.items()}
     loaded,fpga,software=(bound[k] for k in ['load','fpga','software'])
     fixture_only=_test_fixture or any(synthetic_markers(d) for d in bound.values())
     require(not fixture_only or _test_fixture,'synthetic bound input forbidden in actual collector')
     backend=backend_evidence(a.p0_backend,a.long_backend,a.packet_backend)
     require(loaded['status']=='boot_identity_verified','verified load required')
-    require(a.expected_kernel==loaded['kernel_release']==software['kernel_release']==RELEASE or _test_fixture,'ABI5 kernel identity')
-    require(software['status']=='passed' and software['selected_linux']==LINUX and software['selected_platform']==PLATFORM and software['selected_cva6']==CVA6
-            and software['selected_cva6_reference_only'] is True,'ABI5 frozen software tuple')
-    require(software['kernel_critical_sources']['drivers/misc/idma.c']=='38316b66af557509653d11c9035c7c9d0e093aa68b632449710c88f6adab13e5'
-            and software['kernel_critical_sources']['include/uapi/linux/idma_workload.h']=='f7b17880f29d2fe2f785952919281a2f66eadbbde9288d20684ba7ae0d03713f','ABI5 software critical sources')
+    profile=software_profile(software,hashlib.sha256(bound_bytes['software']).hexdigest())
+    a.expected_kernel=a.expected_kernel or profile['kernel_release']
+    require(a.expected_kernel==loaded['kernel_release']==software['kernel_release']==profile['kernel_release'] or _test_fixture,'ABI5 kernel identity')
     q=fpga['parameters']
     require(fpga['status']=='passed' and fpga['direct_ds_wire'] and fpga['selected_cva6']==CVA6
             and q['clock_hz']==50000000 and q['ds_cycles']==[0,0] and q['batch_version']==3
@@ -123,7 +123,8 @@ def main(_test_fixture=False):
               'boot_id':loaded['boot_id'],'bit_sha256':loaded['bit_sha256'],'ds':'0/0','clock_hz':50000000,
               'script_sha256':sha(__file__),'parser_sha256':sha(HERE/'workload_records.py'),
               'hist_helper_sha256':sha(HIST_PATH),'geometry_model_sha256':sha(HERE/'model_full_coverage.py'),
-              'sources':{k:{'path':str(v.resolve()),'sha256':sha(v)} for k,v in paths.items()},'recorded_cases':0}
+              'software_profile':profile,'software_profile_helper_sha256':sha(HERE/'workload_software_profiles.py'),
+              'sources':{k:{'path':str(v.resolve()),'sha256':hashlib.sha256(bound_bytes[k]).hexdigest()} for k,v in paths.items()},'recorded_cases':0}
     manifest['target_case_limit']=a.max_cases
     save(a.output/'manifest.json',manifest)
     def accept(raw,path,index,wall,cached=None):

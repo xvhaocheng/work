@@ -1,5 +1,8 @@
 # 完整 E3 论文数据出口
 
+后续精确G共用软件profile见[软件profile小批](workload-software-profiles.md)。新增helper及其SHA共同绑定到collector、resume和出口快照；
+原65b/四工具/26项冻结结果保留，最新profile回归另列，不回写旧证据。
+
 本入口只处理 ABI5 的 `equal16MiB_fullVring_v1` 新协议。P045 的原始45点和统计独立保存，不能合池。
 截至本批，full-E3 尚无本入口可发表的板测值；候选150点不是已测150点。
 Root先采30点完整候选block，再依据实际命令耗时和板卡开销决定150点是否满足≤6小时。

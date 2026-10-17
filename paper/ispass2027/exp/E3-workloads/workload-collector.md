@@ -1,5 +1,8 @@
 # 完整E3采集协议与候选150点
 
+后续窄软件profile准备见[两个精确profile](workload-software-profiles.md)：保留原65b路径，新增Root要求的正式G软件，
+实际硬件仍只接纳1d587。下列原126/5/30项冻结证据原样保留，不冒充新profile的执行源。
+
 `collect_workload.py`只供Root执行，A2没有访问硬件。它使用独立ABI5 CLI，绝不改P045。
 默认新协议：V有效16MiB＋V一完整几何环预热；burst预期由几何源码模型与已审真实backend有限证据共同约束，
 再独立检查实际AXI计数。64/1024/4096来自A1 run03，16/64KiB来自long04，256/1536槽位来自packet01。

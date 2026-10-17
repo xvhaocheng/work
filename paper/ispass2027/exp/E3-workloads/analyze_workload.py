@@ -12,6 +12,7 @@ from analyze_p0 import describe,QUANTILE_METHOD,METRICS
 import table_schema as tables
 from collect_workload import plan,matches,command,synthetic_markers,LINUX,PLATFORM,CVA6,RELEASE,model
 from workload_records import backend_evidence,parse,validate,require,geometry,HIST,HIST_PATH
+from workload_software_profiles import select as software_profile
 
 HERE=Path(__file__).resolve().parent
 KEYS=('family','victim_shape','victim_size','condition','aggressor_shape','aggressor_size','aggressor_pages')
@@ -156,18 +157,17 @@ def read_collection(records_path,manifest_path,allow_partial=False,*,_fixture_mo
         path=Path(path).resolve();documents[path]=json.loads(blob(path));return documents[path]
     manifest,records=read(manifest_path),read(records_path);bound={}
     tool_paths={'script_sha256':HERE/'collect_workload.py','parser_sha256':HERE/'workload_records.py',
-                'geometry_model_sha256':HERE/'model_full_coverage.py','hist_helper_sha256':HIST_PATH}
+                'geometry_model_sha256':HERE/'model_full_coverage.py','hist_helper_sha256':HIST_PATH,
+                'software_profile_helper_sha256':HERE/'workload_software_profiles.py'}
     require(all(manifest[k]==hashlib.sha256(blob(path)).hexdigest() for k,path in tool_paths.items()),'full-E3 frozen collector/parser/model/hist helper changed')
     require(set(manifest['sources'])=={'load','fpga','software','p0_backend','long_backend','packet_backend'},'full-E3 bound-source set')
     for name,source in manifest['sources'].items():
         bound[name]=read(source['path']);require(hashlib.sha256(observed[Path(source['path']).resolve()]).hexdigest()==source['sha256'],'full-E3 source bytes changed: '+name)
     loaded,fpga,software=(bound[k] for k in ('load','fpga','software'))
+    profile=software_profile(software,manifest['sources']['software']['sha256'])
+    require(profile==manifest['software_profile'],'full-E3 selected software profile differs')
     require(loaded['status']=='boot_identity_verified' and loaded['boot_id']==manifest['boot_id'] and loaded['bit_sha256']==manifest['bit_sha256']
-            and loaded['kernel_release']==software['kernel_release']==manifest['kernel_release']==RELEASE,'full-E3 load/kernel identity')
-    require(software['status']=='passed' and software['selected_linux']==LINUX and software['selected_platform']==PLATFORM and software['selected_cva6']==CVA6
-            and software['selected_cva6_reference_only'] is True,'full-E3 software tuple')
-    require(software['kernel_critical_sources']['drivers/misc/idma.c']=='38316b66af557509653d11c9035c7c9d0e093aa68b632449710c88f6adab13e5'
-            and software['kernel_critical_sources']['include/uapi/linux/idma_workload.h']=='f7b17880f29d2fe2f785952919281a2f66eadbbde9288d20684ba7ae0d03713f','full-E3 software critical source bytes')
+            and loaded['kernel_release']==software['kernel_release']==manifest['kernel_release']==profile['kernel_release'],'full-E3 load/kernel identity')
     q=fpga['parameters'];require(fpga['status']=='passed' and fpga['direct_ds_wire'] and fpga['selected_cva6']==CVA6 and q['clock_hz']==50000000 and q['ds_cycles']==[0,0]
         and q['batch_version']==3 and q['observer_version']==5 and q['PathQueueDepth']==64 and q['hist_info_format']==2
         and [v for k,v in fpga['artifacts'].items() if k.endswith('.bit')]==[manifest['bit_sha256']],'full-E3 FPGA/load identity')
@@ -179,6 +179,7 @@ def read_collection(records_path,manifest_path,allow_partial=False,*,_fixture_mo
         parsed=parse(raw['stdout'],manifest['kernel_release'],backend)
         require(all(item[k]==parsed[k] for k in ('record','observer','path','histogram','sequence','boot_id')),'full-E3 cached/raw mismatch')
     result=summarize(records,manifest,backend,allow_partial,board_overhead_seconds)
+    result['software_profile']=profile
     markers=[]
     for path,value in documents.items():markers+=synthetic_markers(value,str(path))
     markers+=synthetic_markers(records,'records')
