@@ -5,7 +5,7 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Origin Date: 2026-10-17 JST
-- Verification Status: PARTIAL（DS25全50个新增试次已冻结并逐原始命令检核，DS100未完）
+- Verification Status: PARTIAL（E1b新增100点已完成，含历史共200点；E2/E3/E4/E5/E6仍依队列）
 - Version Label: root-a-status-v1
 
 ## 今日进展
@@ -78,3 +78,13 @@ E5首批被动RTL内部提交`6c5c666d45979d3a03fb98cff89ba7ad095f6125`已接受
 已冻结DS100前30成功试次，各条件n=6，见`exp/E1b-ds-sweep/checkpoints/ds100-progress01/`；连同DS25全50，本轮80新增；显式引用历史100后总180，四档矩阵仍partial，无缺点填补或部分图。该包与此前累计快照不是独立新样本，合并须按实际boot/sequence去重。
 
 E5首次13:27:03Z构建错误指向共享main/out；Root发现后要求立即按worktree隔离规则纠正。经argv/cwd确认后停止其唯一PGID，20个当时进程全部退出、最终active=[]，session3258退出143。原manifest、logs、执行wrapper及取消原因按字节保存，明确为cancelled_output_scope而非时序失败；原输出树不移动。相同完整冻结源码/RTL/约束于13:28:41Z从A1独立worktree `exp/E5-latency/artifacts/e5-ds0-build01/`重新构建，session70397。当前仍仅DS100在板运行。
+
+## E1b完成与后续并行准备（2026-10-17 13:43Z）
+
+DS25/DS100全部100个新增试次通过，原campaign returncode=0，无替换试次。最终累积论文包为`exp/E1b-ds-sweep/checkpoints/ds-sweep-final02/`，含历史DS0/DS50共200试次、每条件n=10；接受长表、真实来源、统计及9个PDF/PNG/SVG图已生成。Root重验原命令绑定并检查图面；DS0仍是论文主结果。以同boot/区组A1为分母，DS0的A8/A16/A64额外慢化中位数10.3962%/13.7155%/16.3512%，DS100为76.0753%/88.7220%/98.1181%。完整表见`exp/E1b-ds-sweep/final-results.md`，IQR为描述范围，不作置信区间。旧累计包及独立DS会话可能已入main的同一批试次均须去重。
+
+首次最终导出在绘图时发现系统Python缺matplotlib，既有冻结文件原样保留本机，不当采集失败；任务局部venv安装matplotlib3.10.9后另建final02，不重测。Root已于13:38:55Z开始原DS0 BIT+旧pathv3加载，接续E6角色互换30点，随后一次更新已通过的共同软件，顺序E2 90→P0 45。
+
+E5 Linux提交`22975965c89285f5510cb89fd3a3c865b91c0d36`已接受，Root直接核实际diff和prepare/finish/batch/PATH调用链：仅v4读取512桶，冻结窗外输出，最终任一失效使CLI/PATH拒绝。48实际函数host断言、RV64对象已过；Root另实际执行10项parser拒绝/守恒检查通过。后续与E4合并一次共同软件编译，当前acece正式包冻结。E5独立DS0 RTL构建继续，未有新hist板数据。
+
+完整E3已接受限定单COPY、CONF deburst/decouple=0、同S/D offset的最多33 burst（stage0保守34）容量证明，专用Depth64、OBS5/INFO格式2，保留现有E5 default4/OBS4不改。A2先做前端小批；三形态新协议用等16MiB有效数据和V一完整几何环预热，明确mapped/实际页集及A实际工作量；不与旧P045混池。E4实际leaf查询已审，第二批显式map/checked清理/ABI4正验证，当前未测。
