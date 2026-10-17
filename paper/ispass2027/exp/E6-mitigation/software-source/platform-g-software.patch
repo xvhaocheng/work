@@ -1,0 +1,380 @@
+From 6491dfd76fc92dc020d17166b327da93605f58b1 Mon Sep 17 00:00:00 2001
+From: xvhaocheng <xvhaocheng@gmail.com>
+Date: Sun, 18 Oct 2026 00:56:04 +0900
+Subject: [PATCH] Add fixed ABI6 G CLI and pin accepted natural-completion
+ Linux
+
+---
+ bench/idma_g.c    | 338 ++++++++++++++++++++++++++++++++++++++++++++++
+ linux             |   2 +-
+ sources.lock.json |   2 +-
+ 3 files changed, 340 insertions(+), 2 deletions(-)
+ create mode 100644 bench/idma_g.c
+
+diff --git a/bench/idma_g.c b/bench/idma_g.c
+new file mode 100644
+index 0000000..c05c7d1
+--- /dev/null
++++ b/bench/idma_g.c
+@@ -0,0 +1,338 @@
++// SPDX-License-Identifier: GPL-2.0
++/* One fixed ABI6 G trial. All returned fields are retained on failure. */
++#define _POSIX_C_SOURCE 200809L
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <linux/idma_g.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++_Static_assert(sizeof(struct idma_g_caps) == 96, "G CAPS layout");
++_Static_assert(sizeof(struct idma_g_experiment) == 680, "G RUN layout");
++_Static_assert(offsetof(struct idma_g_experiment, status) == 96, "G input layout");
++_Static_assert(offsetof(struct idma_g_experiment, words) == 232, "G bank layout");
++
++struct options {
++	const char *device, *condition;
++	int caps_only;
++	struct idma_g_experiment request;
++};
++
++static void usage(void)
++{
++	puts("Usage: idma_g [--condition solo|a8-gap0|a8-gap1000|a8-gap2000]\n"
++	     "  --device /dev/idma0  Fixed V0/DID10, optional A1/DID11\n"
++	     "  --timeout-ms N      Positive, at most 60000 (default 60000)\n"
++	     "  --caps              Read-only CAPS; no DMA or new sequence\n"
++	     "  --help              Show this help (alone)\n"
++	     "Independent ABI6 G protocol: V1 page/A8 pages; COPY4096.\n"
++	     "Each participating lane completes 256 gap0 software warmups, then\n"
++	     "4096 measured hardware-batch COPYs naturally. Default: solo.\n"
++	     "All four G conditions share this warmup; compare to G a8-gap0.\n"
++	     "Do not pool with older pair/P0 baselines. No ioctl retry or fallback.");
++}
++
++static int decimal(const char *s, uint32_t *value)
++{
++	uint32_t n = 0;
++	const unsigned char *p = (const unsigned char *)s;
++
++	if (!*p)
++		return -1;
++	for (; *p; p++) {
++		if (*p < '0' || *p > '9' || n > (UINT32_MAX - (*p - '0')) / 10)
++			return -1;
++		n = n * 10 + *p - '0';
++	}
++	*value = n;
++	return 0;
++}
++
++static int parse(int argc, char **argv, struct options *o, char *error, size_t size)
++{
++	static const char *const names[] = {
++		"--condition", "--device", "--timeout-ms", "--caps", "--help"
++	};
++	unsigned int seen = 0;
++	int i;
++
++	for (i = 1; i < argc; i++) {
++		unsigned int k;
++		const char *value;
++
++		for (k = 0; k < sizeof(names) / sizeof(names[0]); k++)
++			if (!strcmp(argv[i], names[k]))
++				break;
++		if (k == sizeof(names) / sizeof(names[0]) || (seen & (1U << k))) {
++			snprintf(error, size, "unknown or duplicate argument: %s", argv[i]);
++			return -1;
++		}
++		seen |= 1U << k;
++		if (k == 4) {
++			if (argc == 2) { usage(); return 1; }
++			snprintf(error, size, "--help must be used alone");
++			return -1;
++		}
++		if (k == 3) { o->caps_only = 1; continue; }
++		if (++i == argc) {
++			snprintf(error, size, "missing value for %s", names[k]);
++			return -1;
++		}
++		value = argv[i];
++		if (k == 0) o->condition = value;
++		if (k == 1) o->device = value;
++		if (k == 2 && decimal(value, &o->request.run_timeout_ms)) {
++			snprintf(error, size, "invalid unsigned decimal for --timeout-ms");
++			return -1;
++		}
++	}
++	if (!strcmp(o->condition, "solo")) {
++		o->request.aggressor_id = IDMA_EXPERIMENT_NO_AGGRESSOR;
++	} else {
++		if (!strcmp(o->condition, "a8-gap0")) o->request.aggressor_gap_cycles = 0;
++		else if (!strcmp(o->condition, "a8-gap1000")) o->request.aggressor_gap_cycles = 1000;
++		else if (!strcmp(o->condition, "a8-gap2000")) o->request.aggressor_gap_cycles = 2000;
++		else goto invalid;
++		o->request.aggressor_id = 1;
++		o->request.aggressor_pages = 8;
++		o->request.aggressor_transfers = IDMA_G_TRANSFERS;
++	}
++	if (strcmp(o->device, "/dev/idma0") || !o->request.run_timeout_ms ||
++	    o->request.run_timeout_ms > IDMA_G_MAX_TIMEOUT_MS)
++		goto invalid;
++	return 0;
++invalid:
++	snprintf(error, size, "arguments exceed the four fixed G conditions");
++	return -1;
++}
++
++static void string(const char *s)
++{
++	const unsigned char *p = (const unsigned char *)s;
++
++	putchar('"');
++	for (; *p; p++) {
++		if (*p == '"' || *p == '\\') printf("\\%c", *p);
++		else if (*p < 0x20 || *p >= 0x80) printf("\\u%04x", *p);
++		else putchar(*p);
++	}
++	putchar('"');
++}
++
++static void number(const char *key, uint64_t value)
++{
++	printf("\"%s\":%" PRIu64, key, value);
++}
++
++static void hex(const char *key, uint64_t value)
++{
++	printf("\"%s\":\"0x%016" PRIx64 "\"", key, value);
++}
++
++static void stats(const struct idma_experiment_stats *s)
++{
++	putchar('{');
++#define S(name) do { number(#name, s->name); putchar(','); } while (0)
++	S(submitted); S(completed); S(completed_bytes); S(active_cycles);
++	S(iotlb_miss); S(s1_ptw); S(s2_ptw);
++	S(refill_gap_ns_sum); S(refill_gap_ns_max); S(refill_gap_samples);
++	S(in_flight_at_start); S(in_flight_at_end); S(data_errors);
++#undef S
++	number("quarantined", s->quarantined); putchar('}');
++}
++
++static void print_caps(const struct idma_g_caps *c)
++{
++	putchar('{');
++#define C(name) do { number(#name, c->name); putchar(','); } while (0)
++	C(abi_version); C(struct_size); C(capabilities); C(device_id); C(did);
++	C(page_bytes); C(victim_pages); C(aggressor_pages); C(chunk_bytes);
++	C(measured_transfers); C(warmup_transfers); C(max_run_timeout_ms);
++#undef C
++	hex("batch_magic", c->batch_magic); putchar(',');
++	hex("observer_magic", c->observer_magic); putchar(',');
++	hex("gap_magic", c->gap_magic); putchar(',');
++	hex("bank_magic", c->bank_magic);
++	printf(",\"gap_mask\":%u,\"bank_first\":%u,\"bank_words\":%u,\"reserved\":%u}",
++	       c->gap_mask, c->bank_first, c->bank_words, c->reserved);
++}
++
++/* The same printer covers input and the complete post-ioctl buffer. No value
++ * is hidden because a run failed or a lane did not participate.
++ */
++static void print_request(const struct idma_g_experiment *r, int outputs)
++{
++	unsigned int i;
++
++	putchar('{');
++#define R(name) do { number(#name, r->name); putchar(','); } while (0)
++	R(abi_version); R(struct_size); R(flags); R(aggressor_id);
++	R(victim_pages); R(aggressor_pages); R(chunk_bytes); R(run_timeout_ms);
++	R(victim_transfers); R(aggressor_transfers); R(warmup_transfers);
++	R(victim_gap_cycles); R(aggressor_gap_cycles);
++	printf("\"reserved\":[");
++	for (i = 0; i < 8; i++) { if (i) putchar(','); printf("%u", r->reserved[i]); }
++	putchar(']');
++	if (!outputs) { putchar('}'); return; }
++	printf(",\"status\":%d,", r->status);
++	R(observer_validation_errors); R(victim_did); R(aggressor_did);
++	R(hpm_configured); R(measurement_started); R(measurement_complete);
++	R(prepared_lane_mask); R(quiet_lane_mask); R(retained_lane_mask);
++	R(verified_lane_mask); R(reserved_output); R(observer_sequence);
++	R(victim_elapsed_ns); R(whole_software_elapsed_ns);
++	R(snapshot_before_ns); R(snapshot_after_ns); R(drain_ns);
++#undef R
++	hex("old_observer_status", r->old_observer_status);
++	printf(",\"warmup_completed\":[%llu,%llu],\"warmup_bytes\":[%llu,%llu],\"words_hex\":[",
++	       (unsigned long long)r->warmup_completed[0], (unsigned long long)r->warmup_completed[1],
++	       (unsigned long long)r->warmup_bytes[0], (unsigned long long)r->warmup_bytes[1]);
++	for (i = 0; i < IDMA_G_BANK_WORDS; i++) {
++		if (i) putchar(',');
++		printf("\"0x%016llx\"", (unsigned long long)r->words[i]);
++	}
++	printf("],\"victim\":"); stats(&r->victim);
++	printf(",\"aggressor\":"); stats(&r->aggressor); putchar('}');
++}
++
++static int validate_caps(const struct idma_g_caps *c)
++{
++	const uint32_t required = IDMA_G_CAP_HPM | IDMA_G_CAP_BATCH | IDMA_G_CAP_GAP |
++		IDMA_G_CAP_WHOLE | IDMA_G_CAP_HIST | IDMA_G_CAP_RUN_READY;
++
++	return c->abi_version != IDMA_G_ABI || c->struct_size != sizeof(*c) ||
++		c->capabilities != required || c->device_id || c->did != 10 ||
++		c->page_bytes != 4096 || c->victim_pages != 1 || c->aggressor_pages != 8 ||
++		c->chunk_bytes != IDMA_G_CHUNK_BYTES || c->measured_transfers != IDMA_G_TRANSFERS ||
++		c->warmup_transfers != IDMA_G_WARMUP_TRANSFERS ||
++		c->max_run_timeout_ms != IDMA_G_MAX_TIMEOUT_MS ||
++		c->batch_magic != IDMA_G_BATCH_MAGIC || c->observer_magic != IDMA_G_OBSERVER_MAGIC ||
++		c->gap_magic != IDMA_G_GAP_MAGIC || c->bank_magic != IDMA_G_BANK_MAGIC ||
++		c->gap_mask != (IDMA_G_GAP_0 | IDMA_G_GAP_1000 | IDMA_G_GAP_2000) ||
++		c->bank_first != IDMA_G_BANK_FIRST || c->bank_words != IDMA_G_BANK_WORDS || c->reserved;
++}
++
++static int validate_result(const struct idma_g_experiment *r, const struct options *o)
++{
++	const struct idma_experiment_stats zero = {0};
++	unsigned int i, lanes = o->request.aggressor_id == IDMA_EXPERIMENT_NO_AGGRESSOR ? 1 : 2;
++	unsigned int mask = lanes == 1 ? 1 : 3;
++
++	if (memcmp(r, &o->request, offsetof(struct idma_g_experiment, status)) ||
++	    r->status || r->observer_validation_errors || r->victim_did != 10 ||
++	    r->aggressor_did != (lanes == 1 ? IDMA_EXPERIMENT_NO_AGGRESSOR : 11) ||
++	    r->hpm_configured != 1 || r->measurement_started != 1 || r->measurement_complete != 1 ||
++	    r->prepared_lane_mask != mask || r->quiet_lane_mask != mask ||
++	    r->verified_lane_mask != mask || r->retained_lane_mask || r->reserved_output ||
++	    !r->observer_sequence || !r->victim_elapsed_ns || !r->whole_software_elapsed_ns ||
++	    r->whole_software_elapsed_ns < r->victim_elapsed_ns ||
++	    r->words[0] != IDMA_G_BANK_MAGIC || r->words[1] || r->words[31] ||
++	    r->words[2] != (lanes == 1 ? 0x0c : 0x3c) || r->words[3] ||
++	    r->words[4] != IDMA_G_TRANSFERS || r->words[5] != o->request.aggressor_transfers ||
++	    r->words[6] || r->words[7] != o->request.aggressor_gap_cycles ||
++	    !r->words[10] || r->words[10] != r->words[16])
++		return -1;
++	for (i = 0; i < lanes; i++) {
++		const struct idma_experiment_stats *s = i ? &r->aggressor : &r->victim;
++		unsigned int issue = i ? 11 : 8;
++
++		if (r->warmup_completed[i] != IDMA_G_WARMUP_TRANSFERS ||
++		    r->warmup_bytes[i] != (uint64_t)IDMA_G_WARMUP_TRANSFERS * IDMA_G_CHUNK_BYTES ||
++		    s->submitted != IDMA_G_TRANSFERS || s->completed != IDMA_G_TRANSFERS ||
++		    s->completed_bytes != (uint64_t)IDMA_G_TRANSFERS * IDMA_G_CHUNK_BYTES ||
++		    s->data_errors || s->quarantined || r->words[issue] != IDMA_G_TRANSFERS ||
++		    r->words[issue + 1] != IDMA_G_TRANSFERS || !r->words[issue + 2])
++			return -1;
++	}
++	if (lanes == 1 && (r->warmup_completed[1] || r->warmup_bytes[1] ||
++			   memcmp(&r->aggressor, &zero, sizeof(zero))))
++		return -1;
++	/* The locked kernel decoder additionally validates timestamps, window IDs,
++	 * carry conservation and old OBS4/PATH/hist. It must return status zero.
++	 */
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	struct options o = {.device = "/dev/idma0", .condition = "solo", .request = {
++		.abi_version = IDMA_G_ABI, .struct_size = sizeof(struct idma_g_experiment),
++		.aggressor_id = IDMA_EXPERIMENT_NO_AGGRESSOR, .victim_pages = 1,
++		.chunk_bytes = IDMA_G_CHUNK_BYTES, .run_timeout_ms = IDMA_G_MAX_TIMEOUT_MS,
++		.victim_transfers = IDMA_G_TRANSFERS, .warmup_transfers = IDMA_G_WARMUP_TRANSFERS}};
++	struct idma_g_caps c = {0};
++	struct idma_g_experiment r = {0};
++	char error[256] = "";
++	const char *stage = "arguments";
++	int fd = -1, rc, saved_errno = 0, success = 0, caps_attempted = 0, run_attempted = 0;
++	int caps_rc = 0, caps_errno = 0, run_rc = 0, run_errno = 0, i;
++
++	rc = parse(argc, argv, &o, error, sizeof(error));
++	if (rc > 0) return EXIT_SUCCESS;
++	if (rc < 0) goto done;
++	stage = "open"; fd = open(o.device, O_RDWR | O_CLOEXEC);
++	if (fd < 0) goto syscall_error;
++	stage = "capabilities"; caps_attempted = 1;
++	caps_rc = ioctl(fd, IDMA_IOC_CAPS_G, &c);
++	caps_errno = caps_rc < 0 ? errno : 0;
++	if (caps_rc < 0) goto syscall_error;
++	if (caps_rc || validate_caps(&c)) {
++		snprintf(error, sizeof(error), "G ABI6/BTC2/OBS4/gap/bank capabilities mismatch"); goto done;
++	}
++	if (o.caps_only) { success = 1; goto done; }
++	stage = "run"; r = o.request; run_attempted = 1;
++	/* Never retry a RUN, including EINTR: DMA may already have started. */
++	run_rc = ioctl(fd, IDMA_IOC_RUN_G, &r);
++	run_errno = run_rc < 0 ? errno : 0;
++	if (run_rc < 0) goto syscall_error;
++	if (run_rc || validate_result(&r, &o)) {
++		snprintf(error, sizeof(error), "G result ABI/status/whole work/warmup/data/quiet mismatch"); goto done;
++	}
++	success = 1; goto done;
++syscall_error:
++	saved_errno = errno;
++	snprintf(error, sizeof(error), "%s: %s", stage, strerror(saved_errno));
++done:
++	if (fd >= 0 && close(fd) < 0 && success) {
++		saved_errno = errno; success = 0; stage = "close";
++		snprintf(error, sizeof(error), "close: %s", strerror(saved_errno));
++	}
++	printf("{\"schema\":\"idma.g.v6\",\"success\":%s,\"stage\":", success ? "true" : "false");
++	string(stage); printf(",\"errno\":%d,\"error\":", saved_errno);
++	if (*error) string(error); else printf("null");
++	printf(",\"argv\":[");
++	for (i = 0; i < argc; i++) { if (i) putchar(','); string(argv[i]); }
++	printf("],\"device\":"); string(o.device);
++	printf(",\"condition\":"); string(o.condition);
++	printf(",\"caps_only\":%s,\"input\":", o.caps_only ? "true" : "false");
++	print_request(&o.request, 0);
++	printf(",\"caps_attempted\":%s,\"caps_return\":", caps_attempted ? "true" : "false");
++	if (caps_attempted) printf("%d", caps_rc); else printf("null");
++	printf(",\"caps_errno\":%d,\"caps_buffer\":", caps_errno);
++	if (caps_attempted) print_caps(&c); else printf("null");
++	printf(",\"run_attempted\":%s,\"run_return\":", run_attempted ? "true" : "false");
++	if (run_attempted) printf("%d", run_rc); else printf("null");
++	printf(",\"run_errno\":%d,\"result_buffer\":", run_errno);
++	if (run_attempted) print_request(&r, 1); else printf("null");
++	printf(",\"derived\":{\"clock_hz\":50000000,\"throughput_unit\":\"MiB/s\",\"victim_whole_mib_s\":");
++	if (success && run_attempted) printf("%.12g", 16.0 * 50000000.0 / r.words[10]);
++	else printf("null");
++	printf(",\"aggressor_whole_mib_s\":");
++	if (success && run_attempted && o.request.aggressor_id != IDMA_EXPERIMENT_NO_AGGRESSOR)
++		printf("%.12g", 16.0 * 50000000.0 / r.words[13]);
++	else printf("null");
++	printf("},\"semantics\":{\"warmup\":\"G only: 256 gap0 software COPY4096 per participating lane, naturally completed and drained before measured ARM\","
++	       "\"work\":\"4096 COPY4096 per participating lane, natural whole completion; no STOP on success\","
++	       "\"hpm\":\"non-atomic software V bracket; not A whole time\","
++	       "\"V_whole_throughput\":\"16777216 bytes / (words_hex[10] / 50000000 cycles per second)\","
++	       "\"A_whole_throughput\":\"16777216 bytes / (words_hex[13] / 50000000 cycles per second)\","
++	       "\"V_window\":\"words_hex[16]; A window counts [17,18], carry [21], open-edge issue [22]\","
++	       "\"comparison\":\"same G warmup for all conditions; G a8-gap0 control; do not pool P0/history\","
++	       "\"raw_buffer\":\"post-ioctl bytes as fields even on error; negative return may leave untouched or partially copied data\"}}\n");
++	return success ? EXIT_SUCCESS : EXIT_FAILURE;
++}
+diff --git a/linux b/linux
+index 65b4279..69d8b9d 160000
+--- a/linux
++++ b/linux
+@@ -1 +1 @@
+-Subproject commit 65b427946152e3aca27babab0a437821729805d4
++Subproject commit 69d8b9d4549c473477bcdc1df7c09ee1bb55528c
+diff --git a/sources.lock.json b/sources.lock.json
+index 7218097..4d2347c 100644
+--- a/sources.lock.json
++++ b/sources.lock.json
+@@ -9,7 +9,7 @@
+     },
+     {
+       "path": "linux",
+-      "commit": "65b427946152e3aca27babab0a437821729805d4",
++      "commit": "69d8b9d4549c473477bcdc1df7c09ee1bb55528c",
+       "upstream": "https://github.com/malejo97/linux.git",
+       "legacy_head": "48185ad5dc62d32bd4429bf63b955ba1daceb47d"
+     },
+-- 
+2.34.1
+
