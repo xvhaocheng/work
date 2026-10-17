@@ -82,6 +82,51 @@ python3 paper/ispass2027/exp/E1b-ds-sweep/import_board_runs.py \
 不增加既有 `formal100` 的样本数；同一导入命令加 `--check` 可确定性回验，无写入。
 本入口不写 `data/`，也不自动合入共享表。失败、未保留、未知与无触发值均保留原标记。
 
+## 采集中同步论文数据
+
+[快照入口](snapshot_partial.py)复用既有 `scripts/plot_ds_sweep.py --allow-partial` 的完整副本
+[分析脚本](plot_ds_sweep.py)，只调整本地导入与输出位置，保留原统计公式。
+每个有用的完整区组或 DS25 阶段结束时，冻结当时所有已 retained 的试次，不选择样本。
+原 `manifest.json` / `records.json` 字节另存在 `raw/*/as-observed/`；规范化副本明确标为
+`derived_snapshot`，仅将 `recorded_cases` 设为真实前缀长度并改为冻结证据路径。
+running collector 只在关闭时更新 recorded_cases，因此绝不拿该旧字段补齐试次。
+数值、次序、DS、条件、boot、源码和实际 campaign status 均保持；已完成命令和 load 原字节复制。
+
+先一次性冻结已有 DS0 / DS50 的真实 100 点，之后每个新检查点复用该 packet：
+
+```sh
+python3 paper/ispass2027/exp/E1b-ds-sweep/snapshot_partial.py \
+  --name historical-baseline100-reference \
+  --run /home/xvhaocheng/work/paper/ispass2027/board/runs/baseline100-20261017-01/ds50-first \
+  --run /home/xvhaocheng/work/paper/ispass2027/board/runs/baseline100-20261017-01/ds0-middle \
+  --run /home/xvhaocheng/work/paper/ispass2027/board/runs/baseline100-20261017-01/ds50-last \
+  --output paper/ispass2027/exp/E1b-ds-sweep/checkpoints/baseline100-reference
+
+python3 paper/ispass2027/exp/E1b-ds-sweep/snapshot_partial.py \
+  --name ds25-stage-50 \
+  --run paper/ispass2027/board/runs/ds-sweep-20261017-01/ds25-all \
+  --reference-packet paper/ispass2027/exp/E1b-ds-sweep/checkpoints/baseline100-reference/import \
+  --output paper/ispass2027/exp/E1b-ds-sweep/checkpoints/ds25-stage-50
+```
+
+第二条在 DS25 完成 50 点时执行；若较早按完整区组执行，使用准确的新检查点名称，
+统计完全按当时真实样本数。包括旧基线后，DS25 完成时为 **150/200**，
+新 DS25 / DS100 矩阵为 **50/100、complete=false**。不传 reference packet 时，
+四档分析明确只含新 DS25 50 点，即 50/200，并明确旧 DS0 / DS50 未纳入。
+DS100 最终完成后，命令同时传入 `--run .../ds25-all` 与 `--run .../ds100-all`，
+继续仅引用历史 baseline100 packet，得到新矩阵 100/100 与四档 200/200。
+
+每个检查点可同步的论文数据是 `accepted-board-results.csv`（共享长表字段，实际 accepted
+逐试次标量，n=1）与 `analysis/ds-sweep-summary.json/.md`（真实 n、median/Q1/Q3/IQR、
+complete/status、缺点和实际配对操作数）；入口为 `paper-data.json`。
+`import/` 保留带失败/未知标记的完整来源包，原始日志只是追溯证据，不称为论文数据更新。
+任何不完整四档结果均不绘四点图。没有新样本时不制造新快照；不同检查点是累计视图，
+不得将同一试次重复并入最终样本数。既有目录拒绝覆盖；最终共享表只合入选定的最终数据包。
+
+[5 项快照检查](host-snapshot-validation.json)已实际通过：包括 running 5 点/每条件 n=1、
+源文件继续增长后快照字节与哈希仍不变、真实历史 100 点的独立回放，以及 partial 分析确定性。
+没有在这些检查中生成 DS25 / DS100 板测数据。
+
 ## 接续与风险
 
 当前构建仍在运行，包状态 `building`；新采集和新结果均未发生。时序验收失败必须停止，
