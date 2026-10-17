@@ -10,7 +10,7 @@ HARDWARE_CVA6 = '6c5c666d45979d3a03fb98cff89ba7ad095f6125'
 HARDWARE_IOMMU = '85b157ebe71a623e326e51fff7b7126fe77e8eb9'
 BIT_SHA256 = 'd934846ecb7f2fd80bcb7d2f18889ae0fd8c9bbd28a0f5fef8e949614139221c'
 CLI_SHA256 = '264e75c6dc20d597e97831038c15b87b9d8274440661dbfb75505c9cedbe5314'
-PROFILE_FIELDS = ('selected_linux', 'selected_platform', 'selected_cva6', 'kernel_release')
+PROFILE_FIELDS = ('selected_linux', 'selected_platform', 'selected_cva6', 'selected_opensbi', 'kernel_release')
 SOFTWARE_CVA6_ROLE = 'software build reference only; not loaded hardware'
 FPGA_LINUX_ROLE = 'Linux in the original FPGA source manifest is a build reference only; running Linux is actual_commits.linux'
 PROFILES = {
@@ -18,7 +18,15 @@ PROFILES = {
         'selected_linux': 'da6b69fc007ad5e671dc288dd8038d02e3ebe43d',
         'selected_platform': 'a68603f0fc668771bc0c9e3a86fcefe289bfa17b',
         'selected_cva6': HARDWARE_CVA6,
+        'selected_opensbi': 'e8d21bfdc2dd753314627968e496c3a1188f6dfb',
         'kernel_release': '6.5.0-rc2-ispass2027-e4-e5-v1',
+    },
+    'full-e3-v1': {
+        'selected_linux': '65b427946152e3aca27babab0a437821729805d4',
+        'selected_platform': 'ec99648e3c9a1e48c1e9721e3662bb632eb439bd',
+        'selected_cva6': '1d587125eee690e623e6ffae13e70f9bbe989adc',
+        'selected_opensbi': 'e8d21bfdc2dd753314627968e496c3a1188f6dfb',
+        'kernel_release': '6.5.0-rc2-ispass2027-full-e3-v1',
     },
 }
 
@@ -49,7 +57,7 @@ def validate_bound_software(bound, software, source, fpga):
     if name != 'e4-e5-v1':
         assert source['software_profile'] == name, 'source software profile binding'
         reference = source['software_build_reference']
-        assert all(reference.get(key) == software[key] for key in PROFILE_FIELDS + ('selected_opensbi',)), 'software build reference binding'
+        assert all(reference.get(key) == software[key] for key in PROFILE_FIELDS), 'software build reference binding'
         assert reference['cva6_role'] == SOFTWARE_CVA6_ROLE, 'software CVA6 is only a build reference'
         reference = source['fpga_build_reference']
         keys = ('selected_platform', 'selected_cva6', 'selected_iommu', 'source_manifest', 'source_manifest_sha256')

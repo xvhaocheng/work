@@ -15,6 +15,16 @@ import software_profiles as profiles
 HERE=Path(__file__).resolve().parent
 CVA6=profiles.HARDWARE_CVA6
 BIT=profiles.BIT_SHA256
+FROZEN_DELIVERIES={
+    'full-e3-v1':{
+        'software_manifest_sha256':'7415dcc4d076fa434bc22294f4309582af84086964f1b47bb05c695555f0bcc4',
+        'fpga_manifest_sha256':'94fff46f7f87d6687f431f96f570c934a84f0dcc9b3726fd9c36893b611ceb5c',
+        'transport_metadata_sha256':'babd0036df89b9b78191f170c72f7c49729d610959e282619ebc699177944f31',
+        'artifact_bytes':{'ds0_bit':11443722,'sd_payload':29363656,'linux_Image':24130560,
+                          'payload_gzip':11068218,'spi_recovery_archive':8871,
+                          'spi-bitbang.ko':14008,'spi-xilinx.ko':17640},
+    },
+}
 
 
 def save(path,value):path.write_text(json.dumps(value,indent=2)+'\n')
@@ -28,6 +38,7 @@ def main():
     p.add_argument('--software-manifest',type=Path,required=True)
     p.add_argument('--fpga-manifest',type=Path,required=True)
     p.add_argument('--transport-metadata',type=Path,required=True)
+    p.add_argument('--build-root',type=Path,help='Existing binary build directory; default is software manifest parent')
     p.add_argument('--platform-repo',type=Path,default=Path('/home/xvhaocheng/work/iommu-platform'))
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--receipt',type=Path,required=True)
@@ -43,10 +54,28 @@ def main():
     assert len(bits)==1 and bits[0][1]==BIT
     assert transport['delivery_manifest']['sha256']==metadata_sha(a.software_manifest)
     assert transport['kernel_release']==software['kernel_release']
+    build=(a.build_root or a.software_manifest.resolve().parent).resolve()
+    original_manifest=Path(transport['delivery_manifest']['path']).resolve()
+    assert build==original_manifest.parent and original_manifest.read_bytes()==a.software_manifest.read_bytes(),'binary build root/original software manifest binding'
+    assert set(transport['spi_archive']['members'])=={'spi-bitbang.ko','spi-xilinx.ko'},'exact two SPI archive members required'
+    for name,member in transport['spi_archive']['members'].items():
+        assert member['sha256']==software['artifacts']['spi-recovery/'+name],'SPI member hash differs from passed software'
+        assert member['vermagic'].startswith(software['kernel_release']+' '),'SPI member release differs'
+        assert member['bytes']==(build/'spi-recovery'/name).stat().st_size,'SPI member size differs'
+    assert Path(transport['payload']['path']).resolve()==build/'fw_payload.bin','payload build root binding'
+    assert transport['payload']['sha256']==software['artifacts']['fw_payload.bin'],'payload hash differs from passed software'
+    assert transport['payload']['bytes']==software['payload_bytes']==(build/'fw_payload.bin').stat().st_size,'payload size differs'
+    for key in ('gzip','spi_archive'):
+        assert Path(transport[key]['path']).resolve().parent==build and transport[key]['bytes']==Path(transport[key]['path']).stat().st_size,'transport root/size binding: '+key
+    if profile in FROZEN_DELIVERIES:
+        frozen=FROZEN_DELIVERIES[profile]
+        assert metadata_sha(a.software_manifest)==frozen['software_manifest_sha256'],'frozen passed software manifest bytes required'
+        assert metadata_sha(a.fpga_manifest)==frozen['fpga_manifest_sha256'],'frozen passed FPGA manifest bytes required'
+        assert metadata_sha(a.transport_metadata)==frozen['transport_metadata_sha256'],'frozen transport metadata bytes required'
     lock=subprocess.check_output(['git','-C',str(a.platform_repo),'show',software['selected_platform']+':sources.lock.json'])
     components={c['path']:c['commit'] for c in json.loads(lock)['components']}
     assert components['linux']==software['selected_linux'] and components['cva6']==software['selected_cva6']
-    software_reference={**{key:software[key] for key in profiles.PROFILE_FIELDS+('selected_opensbi',)},
+    software_reference={**{key:software[key] for key in profiles.PROFILE_FIELDS},
                         'cva6_role':profiles.SOFTWARE_CVA6_ROLE}
     fpga_reference={**{key:fpga[key] for key in ('selected_platform','selected_cva6','selected_iommu','source_manifest','source_manifest_sha256')},
                     'linux_role':profiles.FPGA_LINUX_ROLE}
@@ -54,11 +83,12 @@ def main():
     for source,name in [(a.software_manifest,'software-build-manifest.json'),(a.fpga_manifest,'fpga-build-manifest.json'),(a.transport_metadata,'transport.json')]:
         shutil.copyfile(source,out/'metadata'/name)
     (out/'metadata/sources.lock.json').write_bytes(lock)
-    build=a.software_manifest.resolve().parent
     artifacts={}
     def link(label,original,name,digest):
         original=Path(original).resolve();target=out/'artifacts'/name
         assert original.is_file()
+        if profile in FROZEN_DELIVERIES:
+            assert original.stat().st_size==FROZEN_DELIVERIES[profile]['artifact_bytes'][label],'frozen artifact size differs: '+label
         target.hardlink_to(original)
         assert target.stat().st_ino==original.stat().st_ino and target.stat().st_size==original.stat().st_size
         artifacts[label]={'file':str(target.relative_to(out)),'original_file':str(original),'sha256':digest,
@@ -94,6 +124,7 @@ def main():
              'artifacts':artifacts,'binary_hash_policy':'reused existing manifest hashes; hardlink inode/size match only',
              'kernel_release':software['kernel_release'],'software_profile':profile,
              'software_profile_helper_sha256':metadata_sha(Path(profiles.__file__)),
+             'binary_build_root':str(build),
              'actual_commits':source['actual_commits']}
     with a.receipt.open('x') as stream:stream.write(json.dumps(receipt,indent=2)+'\n')
     print(json.dumps({'status':'prepared','package':str(out),'bit_sha256':BIT,'board_operations':False}))
