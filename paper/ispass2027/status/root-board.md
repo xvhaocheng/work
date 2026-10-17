@@ -19,6 +19,10 @@ E6-PN：五种合法配置S/N/P隔离/PN/P共享历史的合同已冻结（raw M
 
 E2两个版本均在第6点N4_A8失败，各5点分别冻结，不混池；timer重试/再入现象有证据，CPU AXI根因未定。65b候选不能称修复成功。
 
+当前新增E8任务仅用既有BIT/pathv3，不构建。已依据baseline100和DS扫描5份campaign时间预算：约15.7–15.8秒/点，按20秒/点预留；135新点含一次DS100加载约53分钟。DS0 V1/A2,4,12,14,32各10正式50点已于19:23:16Z派发并接受首点，独立分支ispass/e8-e2-e9；仍是boot04afe602、原DS0/原pathv3，无加载或SD动作。E2原ABI1仅pair，依新任务要求写change-request并停止该矩阵；E9消息末尾缺每boot条件/次数，已请求补齐。E6准备就绪在单点间优先交板。
+
+E6-PN完整源码已冻结：CVA109b48fd、IOMMU86c2cee6（TL12712+SW0dbd集成）、platform6a38862，PN/history开启。IOMMU top真实on/off elaboration已过，A3正做真实四DMA外围elaboration；通过后DS0首构与剩余必要有限功能检查并行。原时序及S15门保留，不再重复单元审计或等待日志归档。
+
 ## 已完成的论文数据
 
 | 实验 | 新试次 | 完成与关键结果 | 论文入口 |
