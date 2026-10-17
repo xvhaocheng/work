@@ -1,6 +1,6 @@
 # Minimal artifact and anonymous-release plan
 
-Status: preparation plan, 2026-10-17 JST. Nothing is uploaded, published, or submitted by this plan. The manuscript promises release **upon acceptance**. Existing public development history is not an anonymous artifact link.
+Status: local preparation and independent build checks, 2026-10-17 JST. The paper-source package and all three E7 capacity configurations now compile from new extraction directories; the data-only analysis package reproduces the accepted statistics and figures. See the [prepared-artifact index](prepared-artifacts.md), [paper-package.md](paper-package.md), [analysis-package.md](analysis-package.md) and [e7-package.md](e7-package.md). The selected-input closure for numerical replay is documented in [replay-input-audit.md](replay-input-audit.md). Archives, binaries and logs stay under ignored local `packages/`; builders and readable validation reports are synchronized to the task branch. No review artifact is uploaded or submitted. The manuscript promises release **upon acceptance**. Existing public development history is not an anonymous artifact link.
 
 The smallest useful artifact has two entry points: replay the accepted measurements into tables/figures/PDF without hardware, and optionally rebuild/run the documented FPGA configuration. The first is the mandatory reproducibility path; the second requires the board, licensed FPGA tools and the existing explicit board workflow. A successful offline replay is not a repeated board measurement.
 
@@ -11,7 +11,7 @@ The smallest useful artifact has two entry points: replay the accepted measureme
 | Anonymous paper | `tex/main.tex`, `tex/sections/`, `tex/references.bib`, `tex/numbers.tex`, figure PDFs, short build instructions | Compilable 10pt IEEE double-column draft; exclude internal claim paths and author-identifying metadata from the review upload. |
 | Analysis entry | `analysis/build.sh`, pinned `requirements.txt`, `analysis/scripts/`, `baseline100-extra.json`, `inputs/baseline100-source-audit.json`, `history-number-inputs.json` | Deterministic statistics and actual source-counter semantics, including byte-proxy limits; source-export identities retain original commits and lines. |
 | Provenance | `data/source_manifest.json`, stable row IDs/locators, `data/board_imports/`, `data/incremental_sources.json`, baseline package `source.json` and used build/run manifests; `analysis/figure-trace.json`, `figure-statistics.json`, `numbers-provenance.json`, `merge-manifest.json` | Every figure point and numerical macro joins back to an accepted source. Row counts are not trial counts; base IDs and evidence levels stay explicit. |
-| Accepted measurement inputs | The exact raw `records.json`, per-run manifests/load receipts and UART logs referenced by the selected figures; necessary historical E2/E3/P4M/composition source records and accepted validation summaries | Use manifests to enumerate the transitive selected-input set. Retain failures and recovery chains; do not archive only favorable trials or overwrite original records. |
+| Accepted measurement inputs | The exact raw `records.json`, per-run manifests/load receipts and source-counter audit used by the baseline calculation; the canonical historical long table, selected history snapshots and accepted validation summaries | Numerical replay needs no UART log or full `out/` tree. Keep the original complete evidence locally, including failures and recovery chains; never overwrite it. The compact replay package reproduces curated numerical inputs, rather than rerunning historical extraction from all raw sources. |
 | Simulation supplement | `data/invalidation_sim_results.csv` plus its selected-input manifests and raw summaries; accepted `exp/E7-capacity-sim/` source/commands/results/import receipt | Invalidation and capacity have separate simulation base IDs. Behavioral memory and MMIO supply are disclosed; no FPGA time conversion. Pending configurations are excluded until accepted. |
 | Fixed executable sources | Necessary platform adaptation/fix patches; fixed Git commits/bundles/locks from baseline package metadata; matching driver/UAPI, autonomous frontend and observer sources | Do not substitute the current research checkout or a branch name for the actual experiment inputs. Preserve component provenance and licenses. |
 | Optional board assets | Locally archived actual Linux payload and DS0/DS50 BIT files, associated delivery manifests, tool/version instructions and board skill | Binary images remain outside Git under the established artifact-storage rule. Match the existing manifests; do not introduce another identity framework. |
@@ -21,7 +21,7 @@ Do not redistribute the user-supplied publisher PDFs with the artifact. Keep the
 
 ## Offline replay
 
-Run from the released artifact root after restoring the manifest-listed selected inputs. The current development worktree does not contain all historical `out/` inputs, so its local source exports alone are not a complete raw-data release.
+Run from the artifact root after restoring the manifest-listed selected inputs. The compact numerical closure contains 17 data files and 10 control files before the package entry, notices and provenance mappings. It reproduces the current statistics, tables and figures without all historical `out/` inputs; it is not a complete raw-data release or a hardware reproduction. Derived path/identity redactions must be explicit and separately hash-bound to the untouched original inputs.
 
 ```sh
 python3 -m venv paper/ispass2027/analysis/.venv
@@ -34,7 +34,7 @@ make -C paper/ispass2027/tex
 
 Expected outputs are the reviewed baseline statistics, ten figure slots with explicit missing-data status where applicable, stable trace/number provenance and a compilable PDF. `build.sh` validates its analysis inputs and refuses incompatible bases; it must not silently replace missing measurements with synthetic values. Exact PDF bytes may vary by LaTeX/font versions; numeric outputs, stable IDs, source hashes and declared tolerances are the acceptance surface. Rendering must still be inspected for layout defects.
 
-The data extractor's `--check` additionally verifies the source-linked long tables where the full selected raw-data set is present:
+The data extractor's `--check` additionally verifies the source-linked long tables where the full selected raw-data set is present. This is a separate audit, outside the compact replay closure:
 
 ```sh
 python3 paper/ispass2027/data/extract_results.py --check
