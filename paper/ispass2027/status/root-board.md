@@ -3,13 +3,13 @@
 - Origin Skill: academic-research-suite / experiment-agent
 - Origin Mode: run
 - Verification Status: PARTIAL（E1b、E3 P0、E6角色已完成；E2/E4/E5/完整E3/G按队列继续）
-- Updated: 2026-10-17T15:48:04.863602+00:00 / 2026-10-18 JST
+- Updated: 2026-10-17T16:07:06.794904+00:00 / 2026-10-18 JST
 
-新E2轮 `e2-device-scaling-20261018-02` 于15:41:06Z失败：Linux65b427/full-e3-v1、原DS0，前5点taint0接受；第6点N4_A8再次softlockup并host timeout。调度候选不足以修复。新5点和原失败尾已独立冻结 `E2-device-scaling/checkpoints/e2-prefix-failed02-{snapshot,paper}`（5841行17列，partial、各已测cell n=1），不与旧5点或后续轮混合。旧E4依赖job随E2失败停止，未加载硬件。
+E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PTE/PA/data/unmap/taint0/最终OBS4+PATH+16×32桶全部通过。V硬件时间中位数4KiB 139.19783ms、2MiB106.88277ms；逐block时间下降中位23.2191%、吞吐提升中位30.2406%，V软件HPM bracket的miss/S1 PTW中位8192→0。E4统一CSV3824行，E5同20点/320stage/10240桶，E5不另计新试次。完整论文包E4-pagesize/paper/e4-common-v2-final01、E5-latency/paper/e4-common-v2-final01；Root另以原record硬件cycles/Fraction独立复算10对通过。
 
-Root在旧命令结束后一次CTRL-C观察到shell prompt，仅做两组只读/proc诊断，exit0；timer_list显示nr_hangs10836、nr_retries32547，短恢复窗口不再增长，尚不证明DMA quiet或根因。原字节在board/runs/e2-softlockup-console02。当前唯一板动作 `e4-e5-common-v2-load02-launch`：JTAG重载已合格E5 d934 BIT并启动同一full-e3-v1内核；先验新boot/taint0，再独立E420+E5 hist。无需再次写SD。E2暂停性能采集，独立Codex席只读诊断timer/CSR/SBI路径。
+当前板卡E5 d934/共同full-e3-v1内核，bootbf3063bb-b908-4333-bcb9-54a08511210e，正式采集已结束，无活动板任务。G正式软件6491/69d于16:02:37Z passed，payload31,460,808B/32MiB余2,093,624B；尚未写SD/启动G。Root准备共用G软件给尚无正式数据的full-E3及G，先审精确profile兼容以减少SD切换。完整E3唯一physopt续编resume01、G唯一BIT原流程仍未最终qualified；保持原约束/策略，失败停不重试。A2正在准备E4图，A1准备G40点collector，E2只读报告已审且新默认off探针待实际patch最终复核，未编诊断Image或跑新E2。
 
-完整E3原build01以143终止、sender未知，原manifest stale running保持原字节；非时序通过或失败。Root已审实际runner/TCL及原约束/route命令并接受5f7a306，唯一检查点续编于15:46:07Z detached启动，out=A2/E3/artifacts/full-e3-ds0-resume01，PID2083297、6小时界限；原physopt DCP只读、原RTL/XDC/RuntimeOptimized不变，不重综合/布局、不重试。最终所有门通过前没有合格完整E3 BIT。G唯一BIT仍离线构建；G RUN候选69d8接受审查中、未编G Image。
+E2两个版本均在第6点N4_A8失败，各5点分别冻结，不混池；timer重试/再入现象有证据，CPU AXI根因未定。65b候选不能称修复成功。
 
 ## 已完成的论文数据
 
@@ -18,6 +18,7 @@ Root在旧命令结束后一次CTRL-C观察到shell prompt，仅做两组只读/
 | E1b DS曲线 | 100 | DS25/DS100各50、五条件各10；两档WNS均+0.177ns，失败端点/routing errors均0。含历史DS0/DS50后最终200试次。 | [完整数据与9个图](../exp/E1b-ds-sweep/final-results.md) |
 | E3 P0小子集 | 45 | DS0，64B/1KiB/4KiB×Solo/A1/A8×5，45/45全部通过；14:25:47Z–14:37:05Z，无失败或替换。 | [最终45点与统一CSV](../exp/E3-workloads/checkpoints/p0-final01/README.md) |
 | E6角色互换 | 30 | 原DS0/旧pathv3，V1/A0，Solo/A1/A8各10；同boot/block A8/A1时间比中位数1.10434084。 | [角色结果](../exp/E6-mitigation/role-swap-results.md) |
+| E4页大小＋E5分布 | 20（共享） | 20/20通过；2MiB较4KiB配对时间下降23.2191%、吞吐提升30.2406%；真实512桶/试次。 | [E4完整数据](../exp/E4-pagesize/paper/e4-common-v2-final01/README.md)、[E5同20点](../exp/E5-latency/paper/e4-common-v2-final01/README.md) |
 
 E3关键口径是同boot、同区组、同V大小的A8/A1配对：
 
@@ -38,7 +39,7 @@ DS口径始终是IOMMU数据结构访存的附加延迟，DS0为主结果，DS25
 | 任务 | 实际状态 | 下一步 |
 | --- | --- | --- |
 | E2 设备数 | 两个版本各接受5点，第6点N4_A8均失败；新65b轮host timeout，独立partial包不混池。 | 暂停采集，核timer/SBI原始证据；不关闭watchdog/taint门，不原样重试。 |
-| E4 页大小+E5分布 | 新共同软件65b/ec996已passed、Root新包22检查通过；旧da6包保留。E5 BIT于14:06:29Z passed。 | 计划与E2共用新内核，仅切E5 BIT，共采20点；E5附加采集，不另跑50点。 |
+| E4 页大小+E5分布 | 已20/20完成，两个严格出口均通过，10对Fraction复算通过。 | 论文图离线准备；不为E5增加重复板点。 |
 | 完整E3 | CVA6 1d587/platform dfebcc，Depth64的原DS0构建14:10:50Z开始后exit143；唯一physopt续编15:46:07Z启动；ABI5 helper682a2ca/adapter46df97c已审，含multi候选的新65b427共用软件15:03:30Z已passed。 | CLI 167项Root实跑通过；collector准备与完整软件构建；自身时序/资源验收后再排≤6小时子集。 |
 | E6 P4M G | 从E5 6c5基座独立准备；frontend2c7、observer0f0403与上层cfb9已审；G唯一BIT15:08:57Z开始构建。 | 原约束/策略验收，失败停止；Linux ABI6只读caps/helper批审查中，RUN另批；G固定V/A各4096×4KiB自然完成。 |
 | E6 P/N/PN M | 完成历史来源/容量/接口设计与负结果追溯，未启动移植。 | 维持最后优先级，不恢复机制探索。 |
@@ -76,3 +77,5 @@ Linux65b427相对46df只改multi轮询合作点：N2/N3/N4每未完成轮请求c
 2026-10-17T15:33:13.632922+00:00：E3 P0图已完成，见exp/E3-workloads/figures/p0-main01（2张PDF/SVG/PNG，15配对/10对比；Root视觉检查和独立paper.csv/Fraction复算通过，9个输出字节相同重现）。45个原试次再利用、新增0；原producer脚本/图/manifest保留，当前plotter只许新output防覆盖。full-E3 exporter warmup_only标签修订已收，Root最新26项真实host入口检查passed，全synthetic/0新板测。
 
 2026-10-17T15:53:15.877878+00:00：Root已接收G RUN69d8小批并实跑1176 G/329 CAPS及旧38/57/97/416+6回归，MMIO与nonmulti yield摘要均保持；尚未编G Image，A1只准备严格CLI/builder下一批。E2 irq-diagnosis只读证据2cac260已由Root直接审关键源码和vmlinux EPC、独立重算40源/7样本及calculations原字节一致；确认timer重试/再入现象，AXI根因未证。后续仅默认off的原生counter诊断小批准备，未编诊断Image/未跑新E2。
+
+2026-10-17T16:10:27.480597+00:00：当前唯一板动作是g-common-upload01-launch：E420/20与新软件passed门确认后，只上传当前full-e3-v1匹配SPI与新Ggzip到全新/tmp文件；未写SD或重启，等待传输bytesACK及新profile/后续BIT验收后由Root决定加载。G CLI507/software-entry9 Root实跑通过，原G软件manifest/transport已收ba3df；旧prepared note保持原文，以passed、Image及实际命令为准。E4论文图已接收ae8e2b3，Root直接读plotter、目视PNG、独立复跑CSV/数值/PNG/PDF全字节相同；SVG只自动ID不同，源/数值无变，E5区间附图仍待画。

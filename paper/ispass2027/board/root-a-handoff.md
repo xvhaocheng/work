@@ -1,3 +1,17 @@
+# 实际板资源 2026-10-17T16:10:27.480597+00:00
+
+当前唯一板动作是g-common-upload01-launch：E420/20与新软件passed门确认后，只上传当前full-e3-v1匹配SPI与新Ggzip到全新/tmp文件；未写SD或重启，等待传输bytesACK及新profile/后续BIT验收后由Root决定加载。G CLI507/software-entry9 Root实跑通过，原G软件manifest/transport已收ba3df；旧prepared note保持原文，以passed、Image及实际命令为准。E4论文图已接收ae8e2b3，Root直接读plotter、目视PNG、独立复跑CSV/数值/PNG/PDF全字节相同；SVG只自动ID不同，源/数值无变，E5区间附图仍待画。
+
+不要并行打开UART，也不要在upload接收中发送命令。现有匹配模块只对应当前full-e3-v1；新G模块只供未来g-v1使用。
+
+# 最新续接 2026-10-17T16:07:06.794904+00:00
+
+E4/E5已于16:01:33Z完成20/20（10个同boot/block配对），原数据/CLI/PTE/PA/data/unmap/taint0/最终OBS4+PATH+16×32桶全部通过。V硬件时间中位数4KiB 139.19783ms、2MiB106.88277ms；逐block时间下降中位23.2191%、吞吐提升中位30.2406%，V软件HPM bracket的miss/S1 PTW中位8192→0。E4统一CSV3824行，E5同20点/320stage/10240桶，E5不另计新试次。完整论文包E4-pagesize/paper/e4-common-v2-final01、E5-latency/paper/e4-common-v2-final01；Root另以原record硬件cycles/Fraction独立复算10对通过。
+
+当前板卡E5 d934/共同full-e3-v1内核，bootbf3063bb-b908-4333-bcb9-54a08511210e，正式采集已结束，无活动板任务。G正式软件6491/69d于16:02:37Z passed，payload31,460,808B/32MiB余2,093,624B；尚未写SD/启动G。Root准备共用G软件给尚无正式数据的full-E3及G，先审精确profile兼容以减少SD切换。完整E3唯一physopt续编resume01、G唯一BIT原流程仍未最终qualified；保持原约束/策略，失败停不重试。A2正在准备E4图，A1准备G40点collector，E2只读报告已审且新默认off探针待实际patch最终复核，未编诊断Image或跑新E2。
+
+任何旧E2/E4依赖waiter均已完成/失败，不再有效。下一实际板动作尚未dispatch；不要重新跑E4、写旧65b或重复G软件编译。Root已接受CLI507/software-entry9，G Image结果已passed，等待读取/复制正式manifest/transport。
+
 # 新审核补充 2026-10-17T15:53:15.877878+00:00
 
 Root已接收G RUN69d8小批并实跑1176 G/329 CAPS及旧38/57/97/416+6回归，MMIO与nonmulti yield摘要均保持；尚未编G Image，A1只准备严格CLI/builder下一批。E2 irq-diagnosis只读证据2cac260已由Root直接审关键源码和vmlinux EPC、独立重算40源/7样本及calculations原字节一致；确认timer重试/再入现象，AXI根因未证。后续仅默认off的原生counter诊断小批准备，未编诊断Image/未跑新E2。

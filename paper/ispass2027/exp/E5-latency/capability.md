@@ -1,3 +1,7 @@
+## 最新实测（2026-10-18 JST）
+
+[真实直方图与分位桶区间](paper/e4-common-v2-final01/README.md)已完成验证：20trial、320stage、10240桶，复用[E4同20试次](../E4-pagesize/paper/e4-common-v2-final01/README.md)，不另计新点。旧observer v3的限制保留为历史；本轮采用独立构建验收的observer v4。
+
 # E5 延迟分布能力入口
 
 实际 baseline observer v3 只导出逐阶段 count/sum/max 与边界库存，不能获得逐请求样本、CDF、p50 或 p99。历史 v6 的有限目标记录也不能替代完整分布。
