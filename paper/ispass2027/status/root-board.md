@@ -5,7 +5,7 @@
 - Verification Status: PARTIAL（E1b、E3 P0、E6角色已完成；E2/E4/E5/完整E3/G按队列继续）
 - Updated: 2026-10-17T15:21:42.110277+00:00 / 2026-10-18 JST
 
-当前唯一板动作是新共同payload写SD：11,068,218B gzip已于15:20:40Z上传成功/bytesACK；有限部署正在执行一次更新，成功后加载原DS0并验证新内核。新E2 90点、随后E4/E5 20点已按依赖串行排队，等待时不占UART。G与完整E3 FPGA在隔离树并行构建，A4离线制图。
+新共同payload写SD已成功返回0；当前唯一板动作是加载原DS0、启动并验证新共用内核。11,068,218B gzip于15:20:40Z上传成功/bytesACK，未重复写SD。新E2 90点、随后E4/E5 20点已按依赖串行排队，等待时不占UART。G与完整E3 FPGA在隔离树并行构建，A4离线制图。
 
 E2旧轮第6点N4_A8 softlockup后停止：5个taint0试次已独立冻结为partial，失败尾taint16384保留；全部lane已排空，该boot不再正式采。multi合作候选65b427已通过Root源码审核和回归，共同Image/transport已passed，新实验必须新boot/source/run，旧5点不混入新90。
 
@@ -59,7 +59,7 @@ E2失败与候选修复详情见[诊断记录](../exp/E2-device-scaling/softlock
 
 Linux65b427相对46df只改multi轮询合作点：N2/N3/N4每未完成轮请求cond_resched，先检查V完成；旧pair/P0/pages/workload仍为原1024门。Root直接审生产diff/调用链，实跑旧38/57/97、ABI5 416与新增6政策情境全部通过；旧MMIO摘要9128914394721286305:498206、nonmulti调度摘要3976756370770541329:357一致。此候选不证明或保证消除softlockup，保留watchdog/taint/超时门，必须新boot/新run实测。
 
-新共用软件tuple固定Linux65b427946152e3aca27babab0a437821729805d4、platform ec99648e3c9a1e48c1e9721e3662bb632eb439bd、OpenSBI e8d21bfdc2dd753314627968e496c3a1188f6dfb、release6.5.0-rc2-ispass2027-full-e3-v1；CVA6 1d587仅软件构建reference，不能冒充E2/E4实际BIT来源。构建已于15:03:30Z passed（所有命令exit0），payload29,363,656B，headroom4,190,776B；尚未写SD。Root已启动唯一当前acece匹配SPI模块上传，随后上传新payload。A3已交并由Root实跑20项known-profile/package检查通过，正在准备新tuple的E2/E4有限兼容；未知tuple继续在UART前拒绝。旧da6 ready包原样保留。
+新共用软件tuple固定Linux65b427946152e3aca27babab0a437821729805d4、platform ec99648e3c9a1e48c1e9721e3662bb632eb439bd、OpenSBI e8d21bfdc2dd753314627968e496c3a1188f6dfb、release6.5.0-rc2-ispass2027-full-e3-v1；CVA6 1d587仅软件构建reference，不能冒充E2/E4实际BIT来源。构建已于15:03:30Z passed（所有命令exit0），payload29,363,656B，headroom4,190,776B；SD写入已返回0，当前正加载原DS0并验证新启动。A3已交并由Root实跑20项known-profile/package检查通过，正在准备新tuple的E2/E4有限兼容；未知tuple继续在UART前拒绝。旧da6 ready包原样保留。
 
 15:04Z实际部署更新：共用软件已passed，原始manifest SHA7415dcc4d076fa434bc22294f4309582af84086964f1b47bb05c695555f0bcc4；payload SHAca75a420c9321e89f5fbbe284e836421ec1b0f25c14a4ce0eca6084b068bff95，gzip11,068,218B。当前acece匹配SPI模块已上传/bytesACK，唯一活动板任务为common-v2-payload-upload01-launch；等待result=0且bytesACK后写SD，再新启动采集。当前无正式实验在跑。
 
@@ -70,3 +70,5 @@ Linux65b427相对46df只改multi轮询合作点：N2/N3/N4每未完成轮请求c
 2026-10-17T15:19:03.830410+00:00：Root已审并接收5a61c68共用软件E4包，实跑22项检查全过，正式新包board/packages/e4-e5-common-v2-20261018由Root准备并固定manifest/source hash，元数据原字节复制、二进制仅硬链接。有限后续e4-e5-common-v2-collect01-launch已排队，仅在新E2完整90点passed后加载E5 BIT并采20点+直方图；E2若失败则此后续也停止，不自动继续。当前仍上传新payload，未开始新试次。
 
 2026-10-17T15:27:48.209584+00:00：完整E3 collector修订afaa3ca已由Root接收，实跑30项实际入口模拟串口与独立self-consistent seq-gap拒绝通过；当前采集器SHA dc2802d0ff240dd0801a0db6f49bb7372ee4d71e45f43040b28f78ac4a3c7fcc冻结，均synthetic/0新板测。G Linux首批889f75b已审，Root实跑329项通过并直接核RV64异常表/单次ld/fence证据；独立RUN生命周期小批已放行准备，未编G Image。
+
+2026-10-17T15:33:13.632922+00:00：E3 P0图已完成，见exp/E3-workloads/figures/p0-main01（2张PDF/SVG/PNG，15配对/10对比；Root视觉检查和独立paper.csv/Fraction复算通过，9个输出字节相同重现）。45个原试次再利用、新增0；原producer脚本/图/manifest保留，当前plotter只许新output防覆盖。full-E3 exporter warmup_only标签修订已收，Root最新26项真实host入口检查passed，全synthetic/0新板测。

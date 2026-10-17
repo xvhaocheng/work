@@ -1,3 +1,13 @@
+# 当前续接 2026-10-17T15:33:13.633050+00:00
+
+SD common-v2-software-write01已成功return0；同一部署job正加载原DS0/新共用full-e3-v1内核，load.json尚programming，部署result仍pending。不要重复SD/加载。e2-common-v2-collect01-launch和e4-e5-common-v2-collect01-launch依赖等待均有效；先新boot新90，只有成功才切E5采20+hist。若任何失败，后续停。
+
+Root已收afaa完整E3collector与07eb最新exporter，Root实际30+1 collector、26 exporter checks都通过，均synthetic0板测；正式full-E3还没采，先30点pilot必须等自身FPGA passed。A2仅跟进唯一旧FPGA最终验收不重构建。G Linux首批889已收、Root329通过与native ex-table查过；A1正独立RUN小批，不编G Image。
+
+已收A4 d06c2c8 P045论文图，Root实际视觉检查/精确CSV复算及9文件字节一致复现；新增0试次。A4席结束无法原位续接，Root只加3行机械new-output guard，原producer脚本保存figures/p0-main01/plot_p0_figures.as-executed.py以匹配原manifest SHA，原图/manifest/验证不改。当前graph脚本要求--output全新目录。图/26项最新receipt正随本次推送。
+
+以下历史状态已被覆盖。
+
 # 当前续接 2026-10-17T15:21:42.110277+00:00
 
 唯一板动作：common-v2-software-write01（Root有限common-v2-deploy01-launch已在upload15:20:40Z结果0/bytesACK后自动开始）。不要再手工写SD或重复加载！部署脚本成功后会加载原DS0、验证full-e3-v1新boot；有限e2-common-v2-collect01-launch已等待其result0，自动独立采新90到runs/e2-device-scaling-20261018-02；有限e4-e5-common-v2-collect01-launch已等待新E2完整passed90/结果0，再加载E5d934+同kernel采20+hist到e4-pagesize-20261018-01。所有等待不占UART、任一步失败停，无自动替代。4份dispatcher command/result与board/manifests/*common-v2*是实际入口。旧E2 failed5+尾永久分开，当前旧boot2f31 taint16384只是更新不再采。

@@ -44,9 +44,12 @@ Run from the repository root with an accepted checkpoint directory. No UART/JTAG
 python3 -m venv /tmp/e3-p0-plot-venv
 /tmp/e3-p0-plot-venv/bin/pip install matplotlib==3.10.9 numpy==2.2.6
 /tmp/e3-p0-plot-venv/bin/python paper/ispass2027/exp/E3-workloads/plot_p0_figures.py \
-  --input /home/xvhaocheng/work-root-a/paper/ispass2027/exp/E3-workloads/checkpoints/p0-final01
+  --input /home/xvhaocheng/work-root-a/paper/ispass2027/exp/E3-workloads/checkpoints/p0-final01 \
+  --output /tmp/e3-p0-reproduced01
 /tmp/e3-p0-plot-venv/bin/python paper/ispass2027/exp/E3-workloads/figures/p0-main01/verify_numbers.py \
   --input /home/xvhaocheng/work-root-a/paper/ispass2027/exp/E3-workloads/checkpoints/p0-final01
 ```
 
 Actual checks used the existing `/tmp/ispass-ds-sweep-plot-venv/bin/python` (Python 3.10.12, Matplotlib 3.10.9, NumPy 2.2.6). [numerical-verification.json](numerical-verification.json) records an independent `paper.csv` + exact-Fraction formula check, with standard-library inclusive quartiles, rather than importing the plotter. [reproducibility-verification.json](reproducibility-verification.json) records byte-identical regeneration. [validation.md](validation.md) records the statistical-boundary and rendering review; [render-verification.json](render-verification.json) binds the inspected PDF renders. Root's completed raw-source audit was not repeated.
+
+Root preserved the original producer source as [plot_p0_figures.as-executed.py](plot_p0_figures.as-executed.py), whose SHA matches the frozen figure manifest. The current top-level plotter requires an explicit, new `--output` directory and refuses to replace an existing figure set. Its formulas and rendering code are unchanged; the original rendering/reproduction receipts continue to describe the preserved producer version.

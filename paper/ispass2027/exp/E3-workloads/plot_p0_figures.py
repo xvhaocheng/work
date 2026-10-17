@@ -293,14 +293,15 @@ def plot_points(output: Path, name: str, samples: list[dict], statistics: list[d
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True, help="Frozen p0-final01 checkpoint")
-    parser.add_argument("--output", type=Path, default=Path(__file__).parent / "figures/p0-main01")
+    parser.add_argument("--output", type=Path, required=True, help="New independent output directory")
     args = parser.parse_args()
     source, output = args.input.resolve(), args.output.resolve()
     require(source != output and source not in output.parents and output not in source.parents,
             "Input and output directories must not overlap")
+    require(not output.exists(), "Output must be a new directory; retain existing figure sets")
     summary, effects, trials, bindings = load_trials(source)
     pairs, contrasts, statistics = derive(summary, effects, trials)
-    output.mkdir(parents=True, exist_ok=True)
+    output.mkdir(parents=True, exist_ok=False)
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 8,
                          "axes.labelsize": 8.5, "xtick.labelsize": 8, "ytick.labelsize": 8,
                          "axes.linewidth": 0.6, "pdf.fonttype": 42, "ps.fonttype": 42,
