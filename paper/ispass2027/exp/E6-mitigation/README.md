@@ -3,9 +3,11 @@
 来源设计已由Root接受，选择G(P4M)先行，M(S/N/P/PN)只保留设计。
 第一小批frontend已经独立实现并有限编译/验证，见`frontend-validation/component.json`和原diff；
 组件commit `2c7c68f59190b9ce8739efd7b67d92262b0021f0`，39场景通过。
-observer/wrapper下一小批已独立实现并有限验证，组件tip `0f0403f56aff3f1ee10e18dccea7a9fd6f2f26a4`，
-实际diff/原件入口`observer-validation/`，待Root审查。新增参数仍默认关闭，上层没有启用G。
-尚未修改Linux、构建BIT或做板测。
+observer/wrapper已由Root直接审阅接受，组件tip `0f0403f56aff3f1ee10e18dccea7a9fd6f2f26a4`，
+实际diff/原件入口`observer-validation/`。上层仅暴露默认off参数，新增CVA6 `cfb9a0a8`；
+独立构建export显式启用G，平台 `d5cc448`，见`build/README.md`。
+Root审builder后，唯一G DS0 BIT构建于2026-10-17 15:08:57Z启动，尚未通过全SoC/时序/面积验收。
+未修改G Linux/UAPI、未做新G板测；Linux65b仅作构建身份reference。
 分支 `ispass/e6-mitigation` 从main `7123bbfe79cca298c36a880206ab85a2d68e6f67` 创建，
 本工作树只写本目录；组件独占工作树为`/home/xvhaocheng/work-a1-e6-cva6`，同名分支，从冻结6c5起。
 Root审实际frontend diff后才进入下一小批；E4、完整E3优先。
@@ -14,6 +16,7 @@ Root审实际frontend diff后才进入下一小批；E4、完整E3优先。
 - `g-interface-proposal.md`：Root已锁定的G cap/地址、32word observer布局及有限A兼容点；observer尚未实现。
 - `frontend-validation/README.md`：本批实际frontend范围、原始失败/通过、bundle恢复与有限命令。
 - `observer-validation/README.md`：实际observer/wrapper小批，G-on19、G-off17+hist18、真实配置整链69项，明确未验证的完整系统边界。
+- `build/README.md`：Root已审最小顶层diff、精确source/lock、复用builder及恢复包；一次50MHz构建实际dispatch，不含板操作。
 - `source-map.md`：可导航的实际组件commit、文件行号、历史执行输入与新组织commit的区别。
 - `evidence/index.json`：34份只读Git源码/原报告的路径、blob/SHA256、来源角色。
 - `evidence/isolated-source-comparison.json`：7份IOMMU关键源码与历史isolated实际构建副本逐字节相同。
